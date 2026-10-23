@@ -79,3 +79,21 @@ mod subnet_resolution_and_error_envelope;
 mod query_error_envelope;
 #[path = "all/cache_parameter_group_delete.rs"]
 mod cache_parameter_group_delete;
+
+// Appended for the same reason: the `DescribeCacheParameters` suite.
+#[path = "all/describe_cache_parameters.rs"]
+mod describe_cache_parameters;
+
+// Appended for the same reason: the `DeleteServerlessCache` suite.
+#[path = "all/serverless_cache_delete.rs"]
+mod serverless_cache_delete;
+
+// Appended for the same reason: the maintenance-window, cluster-state-gate,
+// cache-security-group-closure and cluster-message suite.
+#[path = "all/cache_cluster_gates_and_messages.rs"]
+mod cache_cluster_gates_and_messages;
+
+// Appended for the same reason: the RBAC access-string, `DeleteUser` and error-envelope
+// suite.
+#[path = "all/rbac_user_access_string_and_deletion.rs"]
+mod rbac_user_access_string_and_deletion;

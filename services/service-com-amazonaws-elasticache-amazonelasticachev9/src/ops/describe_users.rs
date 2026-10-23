@@ -155,11 +155,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
 
-        // A pure read: a user has no lifecycle the clock drives — `CreateUser`
-        // answers with it already active, and the built-in `default` user is in
-        // the store from the moment it is built — so this handler writes nothing
-        // at all.
+        // A read, with the ONE write a reporting operation may make: the removal
+        // of a user `DeleteUser` moved to `deleting` falls due
+        // `state::USER_DELETION_TRANSITION` after that call, whether or not
+        // anybody describes it, so it is materialised below before anything is
+        // reported. Nothing else about a user changes with the clock —
+        // `CreateUser` answers with it already active, and the built-in
+        // `default` user is in the store from the moment it is built.
         let _ = ctx;
+        let now = ::std::time::SystemTime::now();
 
         // This operation models no `InvalidParameterValueException`, so a
         // `MaxRecords` that cannot be a page size and a `Marker` this service did
@@ -209,7 +213,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 })
         };
 
-        let store = state.lock();
+        let mut store = state.lock();
+        store.settle_users(now);
 
         // With `UserId` the answer is that one user, or the modelled not-found;
         // pagination does not apply to a single-resource lookup.

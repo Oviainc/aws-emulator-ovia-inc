@@ -27,7 +27,17 @@ pub struct ListEventBridgeRuleTemplatesOutput {
     pub next_token: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.medialive#EventBridgeRuleTemplateSummary")]
+/// `EventBridgeRuleTemplateSummary`, with its schema written out instead of derived
+/// because `CreatedAt` and `ModifiedAt` target `__timestampIso8601`, which is
+/// `@timestampFormat("date-time")`; the note in `shared_types` says why that cannot be
+/// derived here. Member for member this is the model's shape: same ids, same order, same
+/// indices, and the `@required` members (`Arn`, `CreatedAt`, `EventTargetCount`,
+/// `EventType`, `GroupId`, `Id`, `Name`) are bare fields refused by name when absent,
+/// exactly as the derive has them.
+///
+/// Like `SignalMapSummary` beside it this one DOES carry a deserializer: it is the element
+/// of `ListEventBridgeRuleTemplatesResponse$EventBridgeRuleTemplates`, and the derive on
+/// that shape reads each element through `DeserializableStruct`.
 #[derive(Debug, Clone)]
 pub struct EventBridgeRuleTemplateSummary {
     pub arn: String,
@@ -40,5 +50,173 @@ pub struct EventBridgeRuleTemplateSummary {
     pub modified_at: Option<::aws_smithy_types::DateTime>,
     pub name: String,
     pub tags: Option<std::collections::HashMap<String, String>>,
+}
+
+impl EventBridgeRuleTemplateSummary {
+    const M_ARN: ::aws_smithy_schema::Schema =
+        shared_types::member_of!("EventBridgeRuleTemplateSummary", "Arn", "arn", String, 0);
+    const M_CREATED_AT: ::aws_smithy_schema::Schema = shared_types::date_time_member_of!(
+        "EventBridgeRuleTemplateSummary",
+        "CreatedAt",
+        "createdAt",
+        1
+    );
+    const M_DESCRIPTION: ::aws_smithy_schema::Schema = shared_types::member_of!(
+        "EventBridgeRuleTemplateSummary",
+        "Description",
+        "description",
+        String,
+        2
+    );
+    const M_EVENT_TARGET_COUNT: ::aws_smithy_schema::Schema = shared_types::member_of!(
+        "EventBridgeRuleTemplateSummary",
+        "EventTargetCount",
+        "eventTargetCount",
+        Integer,
+        3
+    );
+    // `EventBridgeRuleTemplateEventType` is an enum shape, which the generator writes as
+    // `ShapeType::String`.
+    const M_EVENT_TYPE: ::aws_smithy_schema::Schema = shared_types::member_of!(
+        "EventBridgeRuleTemplateSummary",
+        "EventType",
+        "eventType",
+        String,
+        4
+    );
+    const M_GROUP_ID: ::aws_smithy_schema::Schema = shared_types::member_of!(
+        "EventBridgeRuleTemplateSummary",
+        "GroupId",
+        "groupId",
+        String,
+        5
+    );
+    const M_ID: ::aws_smithy_schema::Schema =
+        shared_types::member_of!("EventBridgeRuleTemplateSummary", "Id", "id", String, 6);
+    const M_MODIFIED_AT: ::aws_smithy_schema::Schema = shared_types::date_time_member_of!(
+        "EventBridgeRuleTemplateSummary",
+        "ModifiedAt",
+        "modifiedAt",
+        7
+    );
+    const M_NAME: ::aws_smithy_schema::Schema =
+        shared_types::member_of!("EventBridgeRuleTemplateSummary", "Name", "name", String, 8);
+    const M_TAGS: ::aws_smithy_schema::Schema =
+        shared_types::member_of!("EventBridgeRuleTemplateSummary", "Tags", "tags", Map, 9);
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.medialive#EventBridgeRuleTemplateSummary",
+            shared_types::NAMESPACE,
+            "EventBridgeRuleTemplateSummary",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[
+            &Self::M_ARN,
+            &Self::M_CREATED_AT,
+            &Self::M_DESCRIPTION,
+            &Self::M_EVENT_TARGET_COUNT,
+            &Self::M_EVENT_TYPE,
+            &Self::M_GROUP_ID,
+            &Self::M_ID,
+            &Self::M_MODIFIED_AT,
+            &Self::M_NAME,
+            &Self::M_TAGS,
+        ],
+    );
+}
+
+pub static EVENT_BRIDGE_RULE_TEMPLATE_SUMMARY_SCHEMA: &::aws_smithy_schema::Schema =
+    &EventBridgeRuleTemplateSummary::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for EventBridgeRuleTemplateSummary {
+    fn serialize_members(
+        &self,
+        serializer: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        serializer.write_string(&Self::M_ARN, self.arn.as_str())?;
+        serializer.write_timestamp(&Self::M_CREATED_AT, &self.created_at)?;
+        if let Some(value) = self.description.as_ref() {
+            serializer.write_string(&Self::M_DESCRIPTION, value.as_str())?;
+        }
+        serializer.write_integer(&Self::M_EVENT_TARGET_COUNT, self.event_target_count)?;
+        serializer.write_string(&Self::M_EVENT_TYPE, self.event_type.as_str())?;
+        serializer.write_string(&Self::M_GROUP_ID, self.group_id.as_str())?;
+        serializer.write_string(&Self::M_ID, self.id.as_str())?;
+        if let Some(value) = self.modified_at.as_ref() {
+            serializer.write_timestamp(&Self::M_MODIFIED_AT, value)?;
+        }
+        serializer.write_string(&Self::M_NAME, self.name.as_str())?;
+        if let Some(value) = self.tags.as_ref() {
+            serializer.write_map(&Self::M_TAGS, &|entries| {
+                for (key, tag) in value.iter() {
+                    entries.write_string(&Self::M_TAGS, key.as_str())?;
+                    entries.write_string(&Self::M_TAGS, tag.as_str())?;
+                }
+                Ok(())
+            })?;
+        }
+        Ok(())
+    }
+}
+
+impl ::aws_smithy_schema_server::DeserializableStruct for EventBridgeRuleTemplateSummary {
+    fn deserialize(
+        deserializer: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+    ) -> ::std::result::Result<Self, ::aws_smithy_schema::serde::SerdeError> {
+        let mut arn = ::std::option::Option::None;
+        let mut created_at = ::std::option::Option::None;
+        let mut description = ::std::option::Option::None;
+        let mut event_target_count = ::std::option::Option::None;
+        let mut event_type = ::std::option::Option::None;
+        let mut group_id = ::std::option::Option::None;
+        let mut id = ::std::option::Option::None;
+        let mut modified_at = ::std::option::Option::None;
+        let mut name = ::std::option::Option::None;
+        let mut tags = ::std::option::Option::None;
+        deserializer.read_struct(&Self::SCHEMA, &mut |member, reader| {
+            match member.member_index() {
+                Some(0) => arn = Some(reader.read_string(&Self::M_ARN)?),
+                Some(1) => created_at = Some(reader.read_timestamp(&Self::M_CREATED_AT)?),
+                Some(2) => description = Some(reader.read_string(&Self::M_DESCRIPTION)?),
+                Some(3) => {
+                    event_target_count =
+                        Some(reader.read_integer(&Self::M_EVENT_TARGET_COUNT)?);
+                }
+                Some(4) => event_type = Some(reader.read_string(&Self::M_EVENT_TYPE)?),
+                Some(5) => group_id = Some(reader.read_string(&Self::M_GROUP_ID)?),
+                Some(6) => id = Some(reader.read_string(&Self::M_ID)?),
+                Some(7) => modified_at = Some(reader.read_timestamp(&Self::M_MODIFIED_AT)?),
+                Some(8) => name = Some(reader.read_string(&Self::M_NAME)?),
+                Some(9) => {
+                    let mut entries: ::std::collections::HashMap<String, String> =
+                        ::std::collections::HashMap::new();
+                    reader.read_map(&Self::M_TAGS, &mut |key, value| {
+                        entries.insert(key, value.read_string(&Self::M_TAGS)?);
+                        Ok(())
+                    })?;
+                    tags = Some(entries);
+                }
+                _ => {}
+            }
+            Ok(())
+        })?;
+        Ok(Self {
+            arn: arn.ok_or_else(|| ::aws_smithy_schema_server::missing_member("Arn"))?,
+            created_at: created_at
+                .ok_or_else(|| ::aws_smithy_schema_server::missing_member("CreatedAt"))?,
+            description,
+            event_target_count: event_target_count
+                .ok_or_else(|| ::aws_smithy_schema_server::missing_member("EventTargetCount"))?,
+            event_type: event_type
+                .ok_or_else(|| ::aws_smithy_schema_server::missing_member("EventType"))?,
+            group_id: group_id
+                .ok_or_else(|| ::aws_smithy_schema_server::missing_member("GroupId"))?,
+            id: id.ok_or_else(|| ::aws_smithy_schema_server::missing_member("Id"))?,
+            modified_at,
+            name: name.ok_or_else(|| ::aws_smithy_schema_server::missing_member("Name"))?,
+            tags,
+        })
+    }
 }
 

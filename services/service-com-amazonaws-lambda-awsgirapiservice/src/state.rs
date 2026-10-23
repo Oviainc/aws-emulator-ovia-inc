@@ -17,6 +17,12 @@
 //! the clock already made due. Nothing sleeps, and no read invents a transition that
 //! was not owed.
 //!
+//! An update to a function is owed the same way. `UpdateFunctionCode` and
+//! `UpdateFunctionConfiguration` report `LastUpdateStatus` `InProgress` on the call that
+//! accepted the change, and [`FunctionRecord::begin_update`] stores the instant the move
+//! to `Successful` becomes due, which `materialize` applies exactly as it applies the
+//! move to `Active`.
+//!
 //! The resource-policy slice hangs off the same record. A function's resource-based
 //! policy is attached to the ARN the permission names, so [`FunctionRecord::policies`]
 //! holds one [`PolicyRecord`] per qualifier a statement was added to — the
@@ -35,12 +41,39 @@
 //! reason; nothing invents a result, a log tail or a duration for a function that did
 //! not run.
 //!
+//! The runtime-management slice hangs off the same record, one entry per version:
+//! `PutRuntimeManagementConfig` "sets the runtime management configuration for a
+//! function's version", so what it persists lives on
+//! [`FunctionRecord::runtime_management_configs`] keyed by the version label the call
+//! addressed, and `GetRuntimeManagementConfig` reports exactly that. A version nobody
+//! has configured carries the documented default rather than nothing at all (see
+//! [`RuntimeManagementConfigRecord::default`]).
+//!
+//! The capacity-provider slice is the other resource this store holds, in
+//! [`ComAmazonawsLambdaAwsgirapiserviceState::capacity_providers`]: one
+//! [`CapacityProviderRecord`] per provider `CreateCapacityProvider` persisted, keyed by
+//! its name so `ListCapacityProviders` pages through them deterministically. A provider
+//! has a lifetime of its own too — it is created `Pending` and the move to `Active` is
+//! owed by the CLOCK (see [`CapacityProviderRecord::materialize`]) — and every member
+//! reported for it comes out of the record.
+//!
 //! `GetAccountSettings` reports on the same records at the account level:
 //! "Retrieves details about your account's limits and usage in an Amazon Web Services
 //! Region", so its usage is what the store holds and its unreserved concurrency is what
 //! those records reserve (see
 //! [`ComAmazonawsLambdaAwsgirapiserviceState::account_usage`] and
 //! [`ComAmazonawsLambdaAwsgirapiserviceState::account_limit`]).
+//!
+//! The capacity-provider slice is the account's other top-level resource:
+//! [`ComAmazonawsLambdaAwsgirapiserviceState::capacity_providers`] holds one
+//! [`CapacityProviderRecord`] per provider, keyed by its bare name, so every operation
+//! that reports a provider answers from the single record `CreateCapacityProvider`
+//! persisted. A provider has a lifetime of its own in exactly the way a function does:
+//! the model's `CapacityProviderState` enum carries `Pending` beside `Active`, so a
+//! freshly created provider is `Pending` and the move to `Active` is owed by the CLOCK
+//! rather than by anybody calling — the record stores the instant that move becomes due
+//! and [`CapacityProviderRecord::materialize`] brings it up to whatever the clock has
+//! already made due.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, SystemTime};
@@ -49,10 +82,18 @@ use base64::Engine as _;
 use sha2::Digest as _;
 
 use crate::ops::types::{
-    AccountLimit, AccountUsage, AliasRoutingConfiguration, Cors, CreateAliasOutput,
-    CreateFunctionOutput, EnvironmentResponse, EphemeralStorage, FunctionCodeLocation,
-    GetLayerVersionOutput, Layer, LayerVersionContentOutput, PutFunctionConcurrencyOutput,
-    ResolvedS3Object, TracingConfigResponse,
+    AccountLimit, AccountUsage, AliasRoutingConfiguration, AmazonManagedKafkaEventSourceConfig,
+    CapacityProvider, CapacityProviderConfig, CapacityProviderPermissionsConfig,
+    CapacityProviderScalingConfig, CapacityProviderTelemetryConfig, CapacityProviderVpcConfig,
+    Cors, CreateAliasOutput, CreateEventSourceMappingOutput, CreateFunctionOutput,
+    DeadLetterConfig, DestinationConfig, DocumentDBEventSourceConfig, DurableConfig, Environment,
+    EnvironmentResponse, EphemeralStorage, EventSourceMappingLoggingConfig,
+    EventSourceMappingMetricsConfig, FileSystemConfig, FilterCriteria, FunctionCodeLocation,
+    GetLayerVersionOutput, ImageConfig, ImageConfigResponse, InstanceRequirements, Layer,
+    LayerVersionContentOutput, LoggingConfig, PropagateTags, ProvisionedPollerConfig,
+    PutFunctionConcurrencyOutput, ResolvedS3Object, ScalingConfig, SelfManagedEventSource,
+    SelfManagedKafkaEventSourceConfig, SnapStartResponse, SourceAccessConfiguration,
+    TenancyConfig, TracingConfigResponse, VpcConfig, VpcConfigResponse,
 };
 
 /// The ARN namespace this service stamps into every ARN it mints
@@ -92,6 +133,16 @@ pub const STATE_REASON_CREATING: &str = "The function is being created.";
 /// function is still `Pending`.
 pub const LAST_UPDATE_STATUS_SUCCESSFUL: &str = "Successful";
 
+/// The `LastUpdateStatus` a function carries while an update is still being applied,
+/// from the model's `LastUpdateStatus` enum. `UpdateFunctionConfiguration`'s own
+/// documentation describes the window it covers: "When you update a function, Lambda
+/// provisions an instance of the function and its supporting resources. [...] During
+/// this time, you can't modify the function, but you can still invoke it. The
+/// LastUpdateStatus [...] fields in the response from GetFunctionConfiguration indicate
+/// when the update is complete". A code update is a change to the same function, so
+/// `UpdateFunctionCode` reports it too; see [`FunctionRecord::begin_update`].
+pub const LAST_UPDATE_STATUS_IN_PROGRESS: &str = "InProgress";
+
 /// How long after `CreateFunction` the move from `Pending` to `Active` becomes due.
 ///
 /// An EMULATOR-CHOSEN span (the real provisioning time depends on the package and on
@@ -99,6 +150,30 @@ pub const LAST_UPDATE_STATUS_SUCCESSFUL: &str = "Successful";
 /// non-zero, so a caller that acts immediately after `CreateFunction` still observes
 /// the `Pending` state the model documents and the state errors that go with it.
 pub const ACTIVATION_DELAY: Duration = Duration::from_millis(500);
+
+/// How long after an accepted update (of a function's code or of its configuration) the
+/// move from [`LAST_UPDATE_STATUS_IN_PROGRESS`] to [`LAST_UPDATE_STATUS_SUCCESSFUL`]
+/// becomes due.
+///
+/// An EMULATOR-CHOSEN span, for the same reason as [`ACTIVATION_DELAY`]: the real time
+/// to provision a new instance of the function is not in the model ("If your function
+/// connects to a VPC, this process can take a minute"). It is deliberately non-zero, so
+/// a caller that modifies the function again immediately still meets the refusal the
+/// same documentation describes ("During this time, you can't modify the function").
+pub const UPDATE_DELAY: Duration = Duration::from_millis(500);
+
+/// The `SnapStart$ApplyOn` value that asks Lambda to snapshot an initialized execution
+/// environment, from the model's `SnapStartApplyOn` enum (`PublishedVersions | None`).
+pub const SNAP_START_APPLY_ON_PUBLISHED_VERSIONS: &str = "PublishedVersions";
+
+/// `SnapStartResponse$OptimizationStatus` values, from the model's
+/// `SnapStartOptimizationStatus` enum (`On | Off`). The member reports, "When you
+/// provide a qualified Amazon Resource Name (ARN), this response element indicates
+/// whether SnapStart is activated for the specified function version", so a version
+/// whose configuration applies SnapStart reports `On` and everything else reports `Off`.
+pub const SNAP_START_OPTIMIZATION_STATUS_ON: &str = "On";
+/// See [`SNAP_START_OPTIMIZATION_STATUS_ON`].
+pub const SNAP_START_OPTIMIZATION_STATUS_OFF: &str = "Off";
 
 /// The default `MemorySize`, in MB: "The default value is 128 MB", as AWS documents
 /// for the member (the model carries only its 128..32768 range).
@@ -128,6 +203,20 @@ pub const DEFAULT_TRACING_MODE: &str = "PassThrough";
 /// `GetFunctionRecursionConfig`'s output and on `PutFunctionRecursionConfig`'s input:
 /// "By default, Lambda sets your function's configuration to Terminate."
 pub const DEFAULT_RECURSIVE_LOOP: &str = "Terminate";
+
+/// The `UpdateRuntimeOn` values a runtime management configuration may carry, from the
+/// model's `UpdateRuntimeOn` enum (`Auto | Manual | FunctionUpdate`).
+pub const UPDATE_RUNTIME_ON_AUTO: &str = "Auto";
+/// See [`UPDATE_RUNTIME_ON_AUTO`]. In this mode "You specify a runtime version in your
+/// function configuration", so it is the only mode that carries a `RuntimeVersionArn`.
+pub const UPDATE_RUNTIME_ON_MANUAL: &str = "Manual";
+/// See [`UPDATE_RUNTIME_ON_AUTO`].
+pub const UPDATE_RUNTIME_ON_FUNCTION_UPDATE: &str = "FunctionUpdate";
+
+/// The runtime update mode a function version has before anyone sets one, which the
+/// model's own `UpdateRuntimeOn` member documentation states: "Auto (default) -
+/// Automatically update to the most recent and secure runtime version".
+pub const DEFAULT_UPDATE_RUNTIME_ON: &str = UPDATE_RUNTIME_ON_AUTO;
 
 /// The `FunctionCodeLocation` `RepositoryType` of a .zip file archive package: Lambda
 /// keeps the archive in its own S3 bucket and vends a download location for it.
@@ -234,6 +323,15 @@ pub struct CodeRecord {
     pub s3_key: Option<String>,
     /// The S3 object version of the deployment package.
     pub s3_object_version: Option<String>,
+    /// How the deployment package is stored, when the caller said: `COPY` (the default,
+    /// "Uploads a copy of your deployment package to Lambda") or `REFERENCE` ("Lambda
+    /// references the deployment package from the specified Amazon S3 bucket"). See
+    /// [`S3_OBJECT_STORAGE_MODE_COPY`] and [`S3_OBJECT_STORAGE_MODE_REFERENCE`].
+    pub s3_object_storage_mode: Option<String>,
+    /// The ARN of the customer managed KMS key the .zip deployment package is encrypted
+    /// with, when the caller named one; `FunctionCodeLocation$SourceKMSKeyArn` reports
+    /// it back.
+    pub source_kms_key_arn: Option<String>,
     /// The container image URI, for an `Image` package.
     pub image_uri: Option<String>,
 }
@@ -243,6 +341,113 @@ impl CodeRecord {
     #[must_use]
     pub fn is_image(&self) -> bool {
         self.image_uri.is_some()
+    }
+}
+
+/// The members of a request that name a deployment package.
+///
+/// `CreateFunction` carries them on its `Code` member and `UpdateFunctionCode` carries
+/// them on the request itself, but they name the same package in the same forms, so both
+/// resolve them through [`resolve_package_code`] rather than each deciding for itself
+/// what a package may be.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct PackageMembers<'a> {
+    /// `ZipFile` — the deployment package bytes, uploaded inline.
+    pub zip_file: Option<&'a [u8]>,
+    /// `S3Bucket` — the bucket holding the deployment package.
+    pub s3_bucket: Option<&'a str>,
+    /// `S3Key` — the key of the deployment package.
+    pub s3_key: Option<&'a str>,
+    /// `S3ObjectVersion` — "For versioned objects, the version of the deployment package
+    /// object to use."
+    pub s3_object_version: Option<&'a str>,
+    /// `S3ObjectStorageMode` — `COPY` or `REFERENCE`.
+    pub s3_object_storage_mode: Option<&'a str>,
+    /// `ImageUri` — the container image in the Amazon ECR registry.
+    pub image_uri: Option<&'a str>,
+    /// `SourceKMSKeyArn` — the customer managed key the .zip package is encrypted with.
+    pub source_kms_key_arn: Option<&'a str>,
+}
+
+impl PackageMembers<'_> {
+    /// Whether any member that only an S3-sourced package has was named.
+    fn names_s3_object(&self) -> bool {
+        self.s3_bucket.is_some()
+            || self.s3_key.is_some()
+            || self.s3_object_version.is_some()
+            || self.s3_object_storage_mode.is_some()
+    }
+}
+
+/// The [`CodeRecord`] `package_type` admits for `members`, or the message of the refusal.
+///
+/// The model states the rule on both operations: "If the function's package type is
+/// Image, then you must specify the code package in ImageUri as the URI of a container
+/// image in the Amazon ECR registry. If the function's package type is Zip, then you must
+/// specify the deployment package as a .zip file archive. Enter the Amazon S3 bucket and
+/// key of the code .zip file location. You can also provide the function code inline
+/// using the ZipFile field."
+pub fn resolve_package_code(
+    package_type: &str,
+    members: PackageMembers<'_>,
+) -> Result<CodeRecord, String> {
+    if package_type == PACKAGE_TYPE_IMAGE {
+        let Some(image_uri) = members.image_uri else {
+            return Err(
+                "ImageUri is required for a function whose PackageType is Image".to_string(),
+            );
+        };
+        if members.zip_file.is_some() || members.names_s3_object() {
+            return Err(
+                "Only ImageUri may name the code of a function whose PackageType is Image"
+                    .to_string(),
+            );
+        }
+        return Ok(CodeRecord {
+            image_uri: Some(image_uri.to_string()),
+            ..CodeRecord::default()
+        });
+    }
+
+    if members.image_uri.is_some() {
+        return Err(
+            "ImageUri may only name the code of a function whose PackageType is Image"
+                .to_string(),
+        );
+    }
+    match (members.zip_file, members.s3_bucket, members.s3_key) {
+        (Some(zip_file), None, None) if !members.names_s3_object() => {
+            // `AccountLimit$CodeSizeZipped` is "The maximum size of a deployment package
+            // when it's uploaded directly to Lambda", which is the ceiling on these
+            // bytes — and, since they are held in memory here, on the store too.
+            if i64::try_from(zip_file.len()).unwrap_or(i64::MAX) > CODE_SIZE_ZIPPED_LIMIT {
+                return Err(format!(
+                    "ZipFile must be smaller than {CODE_SIZE_ZIPPED_LIMIT} bytes for a direct \
+                     upload; use S3Bucket and S3Key for a larger deployment package"
+                ));
+            }
+            Ok(CodeRecord {
+                zip_bytes: Some(zip_file.to_vec()),
+                source_kms_key_arn: members.source_kms_key_arn.map(str::to_string),
+                ..CodeRecord::default()
+            })
+        }
+        (None, Some(bucket), Some(key)) => Ok(CodeRecord {
+            s3_bucket: Some(bucket.to_string()),
+            s3_key: Some(key.to_string()),
+            s3_object_version: members.s3_object_version.map(str::to_string),
+            s3_object_storage_mode: members.s3_object_storage_mode.map(str::to_string),
+            source_kms_key_arn: members.source_kms_key_arn.map(str::to_string),
+            ..CodeRecord::default()
+        }),
+        // Either neither form was named, or both were: the inline bytes and the S3
+        // object each name a whole package, so a request carrying members of both names
+        // no single one.
+        _ => Err(
+            "The code must name either ZipFile or both S3Bucket and S3Key for a function \
+             whose PackageType is Zip"
+                .to_string(),
+        ),
     }
 }
 
@@ -305,6 +510,30 @@ pub struct FunctionConfig {
     pub last_modified: String,
     /// The revision this configuration is at.
     pub revision_id: String,
+    /// The VPC the function is attached to, when the caller named one.
+    pub vpc_config: Option<VpcConfig>,
+    /// The dead-letter queue for failed asynchronous invocations, when the caller named
+    /// one.
+    pub dead_letter_config: Option<DeadLetterConfig>,
+    /// The file systems the function mounts, in the order the caller named them (the
+    /// model's `FileSystemConfigList` holds at most one).
+    pub file_system_configs: Vec<FileSystemConfig>,
+    /// The container image overrides, when the caller named any.
+    pub image_config: Option<ImageConfig>,
+    /// `SnapStart$ApplyOn`, when the caller set it.
+    pub snap_start_apply_on: Option<String>,
+    /// The CloudWatch Logs configuration, when the caller named one.
+    pub logging_config: Option<LoggingConfig>,
+    /// The capacity provider that manages this function's compute, when the caller
+    /// named one.
+    pub capacity_provider_config: Option<CapacityProviderConfig>,
+    /// The durable-execution settings, when the caller named them.
+    pub durable_config: Option<DurableConfig>,
+    /// The tenant isolation settings, when the caller named them. `CreateFunction` is
+    /// the only operation that sets this one: "Tenant isolation configuration cannot be
+    /// modified after function creation", and `UpdateFunctionConfiguration` models no
+    /// member for it.
+    pub tenancy_config: Option<TenancyConfig>,
 }
 
 /// One published version of a function: its frozen configuration plus when it was
@@ -614,6 +843,36 @@ impl FunctionUrlConfigRecord {
     }
 }
 
+/// The runtime management configuration of one function version: "the runtime update
+/// mode" and, in [`UPDATE_RUNTIME_ON_MANUAL`] mode only, the runtime version the
+/// version is pinned to.
+///
+/// Held per version label on [`FunctionRecord::runtime_management_configs`], because
+/// `PutRuntimeManagementConfig` "sets the runtime management configuration for a
+/// function's version" and takes a `Qualifier` to say which one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeManagementConfigRecord {
+    /// One of the model's `UpdateRuntimeOn` values, as supplied.
+    pub update_runtime_on: String,
+    /// The pinned runtime version ARN, as supplied. Present only in
+    /// [`UPDATE_RUNTIME_ON_MANUAL`] mode — "The ARN of the runtime the function is
+    /// configured to use. If the runtime update mode is manual, the ARN is returned,
+    /// otherwise null is returned" — and never invented here, because no mode but
+    /// `Manual` names one.
+    pub runtime_version_arn: Option<String>,
+}
+
+impl Default for RuntimeManagementConfigRecord {
+    /// The configuration a version carries until a `PutRuntimeManagementConfig` call
+    /// stores another: [`DEFAULT_UPDATE_RUNTIME_ON`], with no pinned runtime version.
+    fn default() -> Self {
+        Self {
+            update_runtime_on: DEFAULT_UPDATE_RUNTIME_ON.to_string(),
+            runtime_version_arn: None,
+        }
+    }
+}
+
 /// What has become of one queued asynchronous invocation.
 ///
 /// A queued event is NOT a run: the queue is the only thing an asynchronous
@@ -784,6 +1043,10 @@ pub struct FunctionRecord {
     pub state_reason_code: Option<String>,
     /// The model's `LastUpdateStatus`, first set once creation completes.
     pub last_update_status: Option<String>,
+    /// When the move from [`LAST_UPDATE_STATUS_IN_PROGRESS`] to
+    /// [`LAST_UPDATE_STATUS_SUCCESSFUL`] becomes due, while an update is in flight. Set
+    /// by [`FunctionRecord::begin_update`].
+    pub last_update_due: Option<SystemTime>,
     /// When the move to [`STATE_ACTIVE`] becomes due.
     pub active_due: SystemTime,
     /// Function-level tags, as supplied.
@@ -819,21 +1082,37 @@ pub struct FunctionRecord {
     /// The asynchronous invocations accepted for this function, oldest first, bounded
     /// by [`MAX_QUEUED_ASYNC_INVOCATIONS`].
     pub async_invocations: VecDeque<AsyncInvocationRecord>,
+    /// The runtime management configuration of each version that has had one stored,
+    /// keyed by the version label it belongs to — [`VERSION_LATEST`] or a published
+    /// version number. A version with no entry carries
+    /// [`RuntimeManagementConfigRecord::default`]; see
+    /// [`Self::runtime_management_config`].
+    pub runtime_management_configs: BTreeMap<String, RuntimeManagementConfigRecord>,
 }
 
 impl FunctionRecord {
     /// Bring this record up to whatever the clock has already made due.
     ///
-    /// The ONLY transition it applies is the one the clock owed at `now`: a function
-    /// that has finished provisioning becomes `Active`. It would have been owed at the
-    /// same instant even if nobody had called, so applying it on a read reports the
-    /// truth rather than inventing a change.
+    /// The ONLY transitions it applies are the ones the clock owed at `now`: a function
+    /// that has finished provisioning becomes `Active`, and an update that has finished
+    /// being applied becomes `Successful`. Both would have been owed at the same instant
+    /// even if nobody had called, so applying them on a read reports the truth rather
+    /// than inventing a change.
     pub fn materialize(&mut self, now: SystemTime) {
         if self.state == STATE_PENDING && now >= self.active_due {
             self.state = STATE_ACTIVE.to_string();
             self.state_reason = None;
             self.state_reason_code = None;
+            // "This is first set to Successful after function creation completes" — an
+            // update accepted while the function was still being provisioned is settled
+            // by its own due instant below, so creation completing does not settle it.
+            if self.last_update_status.is_none() {
+                self.last_update_status = Some(LAST_UPDATE_STATUS_SUCCESSFUL.to_string());
+            }
+        }
+        if self.last_update_due.is_some_and(|due| now >= due) {
             self.last_update_status = Some(LAST_UPDATE_STATUS_SUCCESSFUL.to_string());
+            self.last_update_due = None;
         }
         // The same rule for the asynchronous event queue: a queued event whose delivery
         // attempt the clock has already made due has had that attempt, and this emulator
@@ -847,6 +1126,50 @@ impl FunctionRecord {
                     AsyncInvocationOutcome::Failed(ASYNC_NOT_EXECUTED_REASON.to_string());
             }
         }
+    }
+
+    /// Record that an update to this function's code or configuration was accepted at
+    /// `now`: the model's `LastUpdateStatus` is [`LAST_UPDATE_STATUS_IN_PROGRESS`] until
+    /// the clock makes the move to [`LAST_UPDATE_STATUS_SUCCESSFUL`] due,
+    /// [`UPDATE_DELAY`] later.
+    pub fn begin_update(&mut self, now: SystemTime) {
+        self.last_update_status = Some(LAST_UPDATE_STATUS_IN_PROGRESS.to_string());
+        self.last_update_due = Some(now + UPDATE_DELAY);
+    }
+
+    /// Freeze `config` as this function's next published version, answering the number
+    /// it got.
+    ///
+    /// Versions are numbered from 1 upwards and a number is never reused, so the next
+    /// one follows the highest ever published rather than the count held. `None` when no
+    /// further number can be assigned.
+    pub fn publish_next_version(
+        &mut self,
+        config: FunctionConfig,
+        now: SystemTime,
+    ) -> Option<u64> {
+        let version = self.latest_version.checked_add(1)?;
+        self.versions.insert(
+            version,
+            FunctionVersionRecord {
+                version,
+                config,
+                created: iso8601(now),
+            },
+        );
+        self.latest_version = version;
+        Some(version)
+    }
+
+    /// Whether an update of this function is still being applied — the window
+    /// `UpdateFunctionConfiguration` documents as "During this time, you can't modify
+    /// the function, but you can still invoke it".
+    ///
+    /// Read it only after [`FunctionRecord::materialize`], so an update the clock has
+    /// already settled is not reported as still in flight.
+    #[must_use]
+    pub fn update_in_progress(&self) -> bool {
+        self.last_update_due.is_some()
     }
 
     /// Queue one asynchronous invocation of `version` carrying `payload`, accepted at
@@ -993,14 +1316,110 @@ impl FunctionRecord {
             state: Some(self.state.clone()),
             state_reason: self.state_reason.clone(),
             state_reason_code: self.state_reason_code.clone(),
-            last_update_status: self.last_update_status.clone(),
+            last_update_status: if version == VERSION_LATEST {
+                self.last_update_status.clone()
+            } else {
+                // `LastUpdateStatus` is "The status of the last update that was
+                // performed on the function", and the update
+                // `UpdateFunctionConfiguration` describes is applied to the UNPUBLISHED
+                // version only ("You can't modify the configuration of a published
+                // version, only the unpublished version"). A published version froze its
+                // configuration before any such update began, so it is not the thing
+                // being updated and reports the settled status rather than the in-flight
+                // one.
+                self.last_update_status.as_ref().map(|status| {
+                    if status == LAST_UPDATE_STATUS_IN_PROGRESS {
+                        LAST_UPDATE_STATUS_SUCCESSFUL.to_string()
+                    } else {
+                        status.clone()
+                    }
+                })
+            },
             package_type: Some(config.package_type.clone()),
             architectures: Some(config.architectures.clone()),
             ephemeral_storage: Some(EphemeralStorage {
                 size: config.ephemeral_storage_mb,
             }),
+            // `VpcConfig` goes in and `VpcConfigResponse` comes out: the two differ only
+            // by the `VpcId` of the VPC the subnets belong to, which lives in EC2. This
+            // emulator resolves no EC2 state, so it reports no id it did not look up.
+            vpc_config: config.vpc_config.as_ref().map(|vpc| VpcConfigResponse {
+                subnet_ids: vpc.subnet_ids.clone(),
+                security_group_ids: vpc.security_group_ids.clone(),
+                vpc_id: None,
+                ipv6_allowed_for_dual_stack: vpc.ipv6_allowed_for_dual_stack,
+            }),
+            dead_letter_config: config.dead_letter_config.clone(),
+            // A function the caller mounted no file system on carries no
+            // `FileSystemConfigs` member at all, for the same reason as `Layers` above.
+            file_system_configs: (!config.file_system_configs.is_empty())
+                .then(|| config.file_system_configs.clone()),
+            // `ImageConfigResponse` wraps the stored overrides together with the error
+            // of resolving them; nothing here resolves an image, so there is no error
+            // to report.
+            image_config_response: config.image_config.clone().map(|image_config| {
+                ImageConfigResponse {
+                    image_config: Some(image_config),
+                    error: None,
+                }
+            }),
+            snap_start: config
+                .snap_start_apply_on
+                .clone()
+                .map(|apply_on| SnapStartResponse {
+                    optimization_status: Some(
+                        if version != VERSION_LATEST
+                            && apply_on == SNAP_START_APPLY_ON_PUBLISHED_VERSIONS
+                        {
+                            SNAP_START_OPTIMIZATION_STATUS_ON
+                        } else {
+                            SNAP_START_OPTIMIZATION_STATUS_OFF
+                        }
+                        .to_string(),
+                    ),
+                    apply_on: Some(apply_on),
+                }),
+            logging_config: config.logging_config.clone(),
+            capacity_provider_config: config.capacity_provider_config.clone(),
+            durable_config: config.durable_config.clone(),
+            tenancy_config: config.tenancy_config.clone(),
             ..CreateFunctionOutput::default()
         }
+    }
+
+    /// The runtime management configuration of the version `qualifier` names.
+    ///
+    /// A version nobody has configured carries the documented default
+    /// ([`RuntimeManagementConfigRecord::default`]), so every version always has one —
+    /// the configuration is a value, not a resource that may be absent. An alias reads
+    /// the configuration of the version it invokes, because the configuration belongs
+    /// to the version; see [`Self::resolved_version`].
+    #[must_use]
+    pub fn runtime_management_config(&self, qualifier: &str) -> RuntimeManagementConfigRecord {
+        self.runtime_management_configs
+            .get(&self.runtime_management_key(qualifier))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Store `config` as the runtime management configuration of the version
+    /// `qualifier` names, replacing whatever that version held: the configuration is
+    /// one value a version always has rather than a list to append to.
+    pub fn set_runtime_management_config(
+        &mut self,
+        qualifier: &str,
+        config: RuntimeManagementConfigRecord,
+    ) {
+        let key = self.runtime_management_key(qualifier);
+        self.runtime_management_configs.insert(key, config);
+    }
+
+    /// The version label a runtime management configuration is keyed by: the version
+    /// `qualifier` resolves to, so a call addressed by an alias and one addressed by
+    /// the version that alias invokes reach the same configuration.
+    fn runtime_management_key(&self, qualifier: &str) -> String {
+        self.resolved_version(qualifier)
+            .unwrap_or_else(|| qualifier.to_string())
     }
 
     /// The `FunctionCodeLocation` `GetFunction` reports for this function's package.
@@ -1024,11 +1443,27 @@ impl FunctionRecord {
                 &self.config.name,
                 &self.config.revision_id,
             )),
-            resolved_s3_object: self.code.s3_bucket.as_ref().map(|bucket| ResolvedS3Object {
-                s3_bucket: Some(bucket.clone()),
-                s3_key: self.code.s3_key.clone(),
-                s3_object_version: self.code.s3_object_version.clone(),
-            }),
+            // "The resolved Amazon S3 object that contains the deployment package" — in
+            // `REFERENCE` mode that object is the caller's, because "Lambda references
+            // the deployment package from the specified Amazon S3 bucket". In the default
+            // `COPY` mode Lambda "uploads a copy of your deployment package" and serves it
+            // from storage of its own, so the caller's object is no longer where the
+            // package is served from and none is reported — the same rule
+            // [`LayerVersionRecord::content`] applies to a layer archive.
+            resolved_s3_object: self
+                .code
+                .s3_bucket
+                .clone()
+                .filter(|_| {
+                    self.code.s3_object_storage_mode.as_deref()
+                        == Some(S3_OBJECT_STORAGE_MODE_REFERENCE)
+                })
+                .map(|bucket| ResolvedS3Object {
+                    s3_bucket: Some(bucket),
+                    s3_key: self.code.s3_key.clone(),
+                    s3_object_version: self.code.s3_object_version.clone(),
+                }),
+            source_kms_key_arn: self.code.source_kms_key_arn.clone(),
             ..FunctionCodeLocation::default()
         }
     }
@@ -1199,6 +1634,505 @@ impl LayerRecord {
     }
 }
 
+/// `CapacityProviderState` values this slice moves a capacity provider through, from
+/// the model's `CapacityProviderState` enum (`Pending | Active | Failed | Deleting`).
+pub const CAPACITY_PROVIDER_STATE_PENDING: &str = "Pending";
+/// See [`CAPACITY_PROVIDER_STATE_PENDING`].
+pub const CAPACITY_PROVIDER_STATE_ACTIVE: &str = "Active";
+
+/// How long after `CreateCapacityProvider` the move from `Pending` to `Active` becomes
+/// due.
+///
+/// An EMULATOR-CHOSEN span (how long Lambda takes to stand the compute resources up is
+/// not in the model), deliberately non-zero for the same reason as
+/// [`ACTIVATION_DELAY`]: a caller that reads the provider straight after creating it
+/// sees the `Pending` state the create answered with. The instant it becomes due is
+/// stored on the record and nothing sleeps for it.
+pub const CAPACITY_PROVIDER_ACTIVATION_DELAY: Duration = Duration::from_millis(500);
+
+/// The most capacity providers this emulator keeps.
+///
+/// An EMULATOR-CHOSEN ceiling, not an AWS quota: the store is in memory and every
+/// `CreateCapacityProvider` adds to it, so past this point the slice answers the
+/// modelled `CapacityProviderLimitExceededException` ("The maximum number of capacity
+/// providers for your account has been exceeded") rather than growing without bound.
+pub const MAX_CAPACITY_PROVIDERS: usize = 100;
+
+/// One capacity provider this emulator holds.
+///
+/// `CreateCapacityProvider` "creates a capacity provider that manages compute resources
+/// for Lambda Event Functions", so what it persists is the configuration the request
+/// described — the VPC it launches instances in, the role it manages them with, the
+/// instance requirements, the scaling configuration, the encryption key, the tag
+/// propagation and the telemetry configuration — beside the lifecycle this emulator
+/// owns. Every member `GetCapacityProvider` reports comes back out of this record (see
+/// [`CapacityProviderRecord::reported`]), so nothing of a request is echoed straight
+/// back to its caller.
+#[derive(Debug, Clone)]
+pub struct CapacityProviderRecord {
+    /// The provider's bare name, which is also the key it is stored under.
+    pub name: String,
+    /// The ARN minted for it once, at creation; see [`capacity_provider_arn`].
+    pub arn: String,
+    /// The region that ARN carries.
+    pub region: String,
+    /// `VpcConfig`: the subnets and security groups instances are launched in.
+    pub vpc_config: CapacityProviderVpcConfig,
+    /// `PermissionsConfig`: the operator role the provider manages compute with.
+    pub permissions_config: CapacityProviderPermissionsConfig,
+    /// `InstanceRequirements`, when the request stated any.
+    pub instance_requirements: Option<InstanceRequirements>,
+    /// `CapacityProviderScalingConfig`, when the request stated one.
+    pub scaling_config: Option<CapacityProviderScalingConfig>,
+    /// `KmsKeyArn`, when the request named a key.
+    pub kms_key_arn: Option<String>,
+    /// The tags associated with the provider, kept in key order.
+    pub tags: BTreeMap<String, String>,
+    /// `PropagateTags`, when the request stated it.
+    pub propagate_tags: Option<PropagateTags>,
+    /// `TelemetryConfig`, when the request stated one.
+    pub telemetry_config: Option<CapacityProviderTelemetryConfig>,
+    /// The provider's `State`, one of the model's `CapacityProviderState` values.
+    pub state: String,
+    /// When the move from `Pending` to `Active` becomes due; see
+    /// [`CapacityProviderRecord::materialize`].
+    pub active_due: SystemTime,
+    /// `LastModified`: "The date and time when the capacity provider was last
+    /// modified", in the same ISO-8601 form as every other timestamp this service
+    /// reports.
+    pub last_modified: String,
+}
+
+impl CapacityProviderRecord {
+    /// Bring this record up to whatever the clock has already made due.
+    ///
+    /// The ONLY transition it applies is the one the clock owed at `now`: a provider
+    /// whose compute resources have finished being stood up becomes `Active`. It would
+    /// have been owed at the same instant even if nobody had called, so applying it on a
+    /// read reports the truth rather than inventing a change.
+    pub fn materialize(&mut self, now: SystemTime) {
+        if self.state == CAPACITY_PROVIDER_STATE_PENDING && now >= self.active_due {
+            self.state = CAPACITY_PROVIDER_STATE_ACTIVE.to_string();
+        }
+    }
+
+    /// The `CapacityProvider` the wire reports for this record, built entirely out of
+    /// what is stored.
+    #[must_use]
+    pub fn reported(&self) -> CapacityProvider {
+        CapacityProvider {
+            capacity_provider_arn: self.arn.clone(),
+            state: self.state.clone(),
+            vpc_config: self.vpc_config.clone(),
+            permissions_config: self.permissions_config.clone(),
+            instance_requirements: self.instance_requirements.clone(),
+            capacity_provider_scaling_config: self.scaling_config.clone(),
+            kms_key_arn: self.kms_key_arn.clone(),
+            last_modified: Some(self.last_modified.clone()),
+            propagate_tags: self.propagate_tags.clone(),
+            telemetry_config: self.telemetry_config.clone(),
+        }
+    }
+}
+
+/// `State` values this slice moves an event source mapping through, from the model's
+/// `EventSourceMappingConfiguration$State` documentation: "The state of the event source
+/// mapping. It can be one of the following: Creating, Enabling, Enabled, Disabling,
+/// Disabled, Updating, or Deleting."
+pub const EVENT_SOURCE_MAPPING_STATE_CREATING: &str = "Creating";
+/// See [`EVENT_SOURCE_MAPPING_STATE_CREATING`].
+pub const EVENT_SOURCE_MAPPING_STATE_ENABLED: &str = "Enabled";
+/// See [`EVENT_SOURCE_MAPPING_STATE_CREATING`].
+pub const EVENT_SOURCE_MAPPING_STATE_DISABLED: &str = "Disabled";
+
+/// `StateTransitionReason`: "Indicates whether a user or Lambda made the last change to
+/// the event source mapping." A mapping this store holds only ever changes because a
+/// caller asked it to, which Lambda reports as `USER_INITIATED`.
+pub const EVENT_SOURCE_MAPPING_USER_INITIATED: &str = "USER_INITIATED";
+
+/// How long after `CreateEventSourceMapping` the move out of `Creating` becomes due.
+///
+/// An EMULATOR-CHOSEN span (how long Lambda takes to stand a poller up is not in the
+/// model), deliberately non-zero for the same reason as [`ACTIVATION_DELAY`]: a caller
+/// that reads the mapping straight after creating it sees the `Creating` state the
+/// create answered with. The instant it becomes due is stored on the record and nothing
+/// sleeps for it.
+pub const EVENT_SOURCE_MAPPING_SETTLE_DELAY: Duration = Duration::from_millis(500);
+
+/// The most event source mappings this emulator keeps.
+///
+/// An EMULATOR-CHOSEN ceiling, not an AWS quota: the store is in memory and every
+/// `CreateEventSourceMapping` adds to it, so past this point the slice refuses rather
+/// than growing without bound.
+pub const MAX_EVENT_SOURCE_MAPPINGS: usize = 1_000;
+
+/// The most event source mappings one `ListEventSourceMappings` page reports, from that
+/// operation's own `MaxItems` documentation: "Note that ListEventSourceMappings returns
+/// a maximum of 100 items in each response, even if you set the number higher."
+pub const MAX_EVENT_SOURCE_MAPPING_PAGE_SIZE: usize = 100;
+
+/// `BatchSize` when the request states none, from the member's own documentation:
+/// "Default value: Varies by service. For Amazon SQS, the default is 10. For all other
+/// services, the default is 100."
+pub const DEFAULT_BATCH_SIZE_QUEUE: i32 = 10;
+/// See [`DEFAULT_BATCH_SIZE_QUEUE`].
+pub const DEFAULT_BATCH_SIZE_STREAM: i32 = 100;
+
+/// `MaximumBatchingWindowInSeconds` when the request states none, from the member's own
+/// documentation: "For Kinesis, DynamoDB, and Amazon SQS event sources, the default
+/// batching window is 0 seconds. For Amazon MSK, Self-managed Apache Kafka, Amazon MQ,
+/// and DocumentDB event sources, the default batching window is 500 ms" — which is not
+/// expressible in this member's unit, so those sources report none at all.
+pub const DEFAULT_BATCHING_WINDOW_SECONDS: i32 = 0;
+
+/// `ParallelizationFactor` when the request states none, from the member's own
+/// documentation: "(Kinesis and DynamoDB Streams only) The number of batches to process
+/// concurrently from each shard. The default value is 1."
+pub const DEFAULT_PARALLELIZATION_FACTOR: i32 = 1;
+
+/// `MaximumRecordAgeInSeconds` and `MaximumRetryAttempts` when the request states
+/// neither: both are documented as "The default value is -1, which sets the maximum
+/// \[age|number of retries\] to infinite."
+pub const INFINITE_RETENTION: i32 = -1;
+
+/// The ARN vendor field of the event sources whose documented defaults differ: a queue
+/// batches 10 records, a stream 100 ("Amazon Simple Queue Service – The ARN of the
+/// queue").
+pub const EVENT_SOURCE_VENDOR_QUEUE: &str = "sqs";
+/// The two event sources `StartingPosition` is documented as "Required for": "Amazon
+/// Kinesis – The ARN of the data stream or a stream consumer" and "Amazon DynamoDB
+/// Streams – The ARN of the stream".
+pub const EVENT_SOURCE_VENDOR_KINESIS: &str = "kinesis";
+/// See [`EVENT_SOURCE_VENDOR_KINESIS`].
+pub const EVENT_SOURCE_VENDOR_DYNAMODB: &str = "dynamodb";
+/// The ARN vendor field of an Amazon MSK cluster ("Amazon Managed Streaming for Apache
+/// Kafka – The ARN of the cluster").
+pub const EVENT_SOURCE_VENDOR_KAFKA: &str = "kafka";
+/// The ARN vendor field of an Amazon DocumentDB cluster ("Amazon DocumentDB – The ARN of
+/// the DocumentDB change stream"), whose ARNs are in the `rds` namespace.
+pub const EVENT_SOURCE_VENDOR_DOCUMENT_DB: &str = "rds";
+
+/// The `EventSourcePosition` value that reads "from which to start reading" at a stated
+/// instant, from the model's enum (`AT_TIMESTAMP | LATEST | TRIM_HORIZON`).
+pub const STARTING_POSITION_AT_TIMESTAMP: &str = "AT_TIMESTAMP";
+
+/// The ARN of an event source mapping:
+/// `arn:aws:lambda:<region>:<account>:event-source-mapping:<uuid>`, as the model's
+/// `EventSourceMappingArn` pattern requires.
+#[must_use]
+pub fn event_source_mapping_arn(region: &str, uuid: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_NAMESPACE,
+        region,
+        &format!("event-source-mapping:{uuid}"),
+    )
+}
+
+/// A fresh event source mapping identifier. The model's `UUIDString` is
+/// `@length(min: 36, max: 36)` and `EventSourceMappingArn`'s pattern spells out the
+/// hyphenated UUID form, so the id is a UUID.
+#[must_use]
+pub fn mint_event_source_mapping_uuid() -> String {
+    ::uuid::Uuid::new_v4().to_string()
+}
+
+/// The service an `EventSourceArn` names, which is what the per-source defaults and
+/// requirements documented for `BatchSize`, `MaximumBatchingWindowInSeconds` and
+/// `StartingPosition` are keyed on.
+///
+/// Read through `service_common::arn` — the one parse this repository states for a
+/// caller-supplied ARN — so `None` means the value is not a resource ARN at all.
+#[must_use]
+pub fn event_source_vendor(event_source_arn: &str) -> Option<&str> {
+    service_common::arn::vendor(event_source_arn)
+}
+
+/// Whether `vendor` names one of the two sources that deliver records per SHARD, which
+/// is the scope the model gives `ParallelizationFactor` and `TumblingWindowInSeconds`
+/// ("Kinesis and DynamoDB Streams only") and the two sources `StartingPosition` is
+/// "Required for".
+#[must_use]
+pub fn is_shard_source(vendor: Option<&str>) -> bool {
+    matches!(
+        vendor,
+        Some(EVENT_SOURCE_VENDOR_KINESIS | EVENT_SOURCE_VENDOR_DYNAMODB)
+    )
+}
+
+/// Whether the event source is one of the STREAM sources the model scopes its error
+/// handling options to: "The following error handling options are available for stream
+/// sources (DynamoDB, Kinesis, Amazon MSK, and self-managed Apache Kafka)".
+///
+/// `self_managed` says whether the request named a self-managed Apache Kafka cluster
+/// instead of an event source ARN, which is a stream source with no ARN to read a vendor
+/// from.
+#[must_use]
+pub fn is_stream_source(vendor: Option<&str>, self_managed: bool) -> bool {
+    self_managed || is_shard_source(vendor) || vendor == Some(EVENT_SOURCE_VENDOR_KAFKA)
+}
+
+/// Whether the event source supports reading from a stated instant, from
+/// `StartingPosition`'s own documentation: "AT_TIMESTAMP is supported only for Amazon
+/// Kinesis streams, Amazon DocumentDB, Amazon MSK, and self-managed Apache Kafka."
+#[must_use]
+pub fn supports_at_timestamp(vendor: Option<&str>, self_managed: bool) -> bool {
+    self_managed
+        || matches!(
+            vendor,
+            Some(
+                EVENT_SOURCE_VENDOR_KINESIS
+                    | EVENT_SOURCE_VENDOR_KAFKA
+                    | EVENT_SOURCE_VENDOR_DOCUMENT_DB
+            )
+        )
+}
+
+/// `BatchSize` when the request states none: see [`DEFAULT_BATCH_SIZE_QUEUE`].
+#[must_use]
+pub fn default_batch_size(vendor: Option<&str>) -> i32 {
+    if vendor == Some(EVENT_SOURCE_VENDOR_QUEUE) {
+        DEFAULT_BATCH_SIZE_QUEUE
+    } else {
+        DEFAULT_BATCH_SIZE_STREAM
+    }
+}
+
+/// `MaximumBatchingWindowInSeconds` when the request states none: 0 seconds for the
+/// three sources documented with that default, and none at all for the sources whose
+/// documented default — 500 ms — this member's unit cannot carry. See
+/// [`DEFAULT_BATCHING_WINDOW_SECONDS`].
+#[must_use]
+pub fn default_batching_window_seconds(vendor: Option<&str>) -> Option<i32> {
+    (is_shard_source(vendor) || vendor == Some(EVENT_SOURCE_VENDOR_QUEUE))
+        .then_some(DEFAULT_BATCHING_WINDOW_SECONDS)
+}
+
+/// One event source mapping this emulator holds.
+///
+/// `CreateEventSourceMapping` "creates a mapping between an event source and an Lambda
+/// Event Function", so what it persists is the mapping the request described: which
+/// event source, which function, and every polling, filtering, destination and logging
+/// setting it stated, beside the lifecycle this emulator owns. Every member
+/// `GetEventSourceMapping` and `ListEventSourceMappings` report comes back out of this
+/// record (see [`EventSourceMappingRecord::reported`]), so nothing of a request is
+/// echoed straight back to its caller.
+///
+/// No poller runs in this emulator, so the record carries no `LastProcessingResult`:
+/// that member is "The result of the event source mapping's last processing attempt",
+/// and no attempt has been made.
+#[derive(Debug, Clone)]
+pub struct EventSourceMappingRecord {
+    /// `UUID`: "The identifier of the event source mapping", which is also the key it is
+    /// stored under.
+    pub uuid: String,
+    /// `EventSourceMappingArn`, minted once at creation; see
+    /// [`event_source_mapping_arn`].
+    pub arn: String,
+    /// `FunctionArn`: "The ARN of the Lambda function", qualified when the request named
+    /// a version or an alias.
+    pub function_arn: String,
+    /// The bare name of the function the mapping invokes, which is what a
+    /// `ListEventSourceMappings` `FunctionName` filter resolves to.
+    pub function_name: String,
+    /// The qualifier the request named the function by, when it named one.
+    pub function_qualifier: Option<String>,
+    /// `EventSourceArn`: "The Amazon Resource Name (ARN) of the event source", absent
+    /// for a self-managed Apache Kafka cluster, which is named by
+    /// [`Self::self_managed_event_source`] instead.
+    pub event_source_arn: Option<String>,
+    /// `Enabled`: "When true, the event source mapping is active. When false, Lambda
+    /// pauses polling and invocation." Not reported as such — it is the state the
+    /// mapping settles into; see [`EventSourceMappingRecord::materialize`].
+    pub enabled: bool,
+    /// `BatchSize`: "The maximum number of records in each batch that Lambda pulls from
+    /// your stream or queue".
+    pub batch_size: i32,
+    /// `MaximumBatchingWindowInSeconds`, when the source has a default expressible in
+    /// seconds or the request stated one.
+    pub maximum_batching_window_in_seconds: Option<i32>,
+    /// `ParallelizationFactor`, for the two sources it applies to.
+    pub parallelization_factor: Option<i32>,
+    /// `StartingPosition`: "The position in a stream from which to start reading."
+    pub starting_position: Option<String>,
+    /// `StartingPositionTimestamp`: "With StartingPosition set to AT_TIMESTAMP, the time
+    /// from which to start reading."
+    pub starting_position_timestamp: Option<::aws_smithy_types::DateTime>,
+    /// `FilterCriteria`: "An object that defines the filter criteria that determine
+    /// whether Lambda should process an event."
+    pub filter_criteria: Option<FilterCriteria>,
+    /// `KMSKeyArn`: the customer managed key "that Lambda uses to encrypt your
+    /// function's filter criteria".
+    pub kms_key_arn: Option<String>,
+    /// `MetricsConfig`: "The metrics configuration for your event source."
+    pub metrics_config: Option<EventSourceMappingMetricsConfig>,
+    /// `LoggingConfig`: "(Amazon MSK, and self-managed Apache Kafka only) The logging
+    /// configuration for your event source."
+    pub logging_config: Option<EventSourceMappingLoggingConfig>,
+    /// `ScalingConfig`: "(Amazon SQS only) The scaling configuration for the event
+    /// source."
+    pub scaling_config: Option<ScalingConfig>,
+    /// `DestinationConfig`: where "an event after Lambda processes it" is sent.
+    pub destination_config: Option<DestinationConfig>,
+    /// `MaximumRecordAgeInSeconds`, for the stream sources it applies to.
+    pub maximum_record_age_in_seconds: Option<i32>,
+    /// `BisectBatchOnFunctionError`, for the stream sources it applies to.
+    pub bisect_batch_on_function_error: Option<bool>,
+    /// `MaximumRetryAttempts`, for the stream sources it applies to.
+    pub maximum_retry_attempts: Option<i32>,
+    /// `TumblingWindowInSeconds`: "(Kinesis and DynamoDB Streams only) The duration in
+    /// seconds of a processing window".
+    pub tumbling_window_in_seconds: Option<i32>,
+    /// `Topics`: "The name of the Kafka topic."
+    pub topics: Option<Vec<String>>,
+    /// `Queues`: "(Amazon MQ) The name of the Amazon MQ broker destination queue to
+    /// consume."
+    pub queues: Option<Vec<String>>,
+    /// `SourceAccessConfigurations`: "An array of the authentication protocol, VPC
+    /// components, or virtual host to secure and define your event source."
+    pub source_access_configurations: Option<Vec<SourceAccessConfiguration>>,
+    /// `SelfManagedEventSource`: "The self-managed Apache Kafka cluster for your event
+    /// source."
+    pub self_managed_event_source: Option<SelfManagedEventSource>,
+    /// `FunctionResponseTypes`: "A list of current response type enums applied to the
+    /// event source mapping."
+    pub function_response_types: Option<Vec<String>>,
+    /// `AmazonManagedKafkaEventSourceConfig`, when the request stated one.
+    pub amazon_managed_kafka_event_source_config: Option<AmazonManagedKafkaEventSourceConfig>,
+    /// `SelfManagedKafkaEventSourceConfig`, when the request stated one.
+    pub self_managed_kafka_event_source_config: Option<SelfManagedKafkaEventSourceConfig>,
+    /// `DocumentDBEventSourceConfig`, when the request stated one.
+    pub document_db_event_source_config: Option<DocumentDBEventSourceConfig>,
+    /// `ProvisionedPollerConfig`: "the provisioned mode configuration for the event
+    /// source".
+    pub provisioned_poller_config: Option<ProvisionedPollerConfig>,
+    /// `Tags`: "A list of tags to apply to the event source mapping", kept in key order
+    /// so `ListTags` reports them deterministically.
+    pub tags: BTreeMap<String, String>,
+    /// The mapping's `State`, one of the values
+    /// [`EVENT_SOURCE_MAPPING_STATE_CREATING`] documents.
+    pub state: String,
+    /// `StateTransitionReason`; see [`EVENT_SOURCE_MAPPING_USER_INITIATED`].
+    pub state_transition_reason: String,
+    /// When the move out of `Creating` becomes due; see
+    /// [`EventSourceMappingRecord::materialize`].
+    pub settled_due: SystemTime,
+    /// `LastModified`: "The date that the event source mapping was last updated or that
+    /// its state changed."
+    pub last_modified: SystemTime,
+}
+
+impl EventSourceMappingRecord {
+    /// Bring this record up to whatever the clock has already made due.
+    ///
+    /// The ONLY transition it applies is the one the clock owed at `now`: a mapping whose
+    /// poller has finished being stood up leaves `Creating` for the state its `Enabled`
+    /// setting asks for — "When true, the event source mapping is active. When false,
+    /// Lambda pauses polling and invocation." It would have been owed at the same instant
+    /// even if nobody had called, so applying it on a read reports the truth rather than
+    /// inventing a change.
+    pub fn materialize(&mut self, now: SystemTime) {
+        if self.state == EVENT_SOURCE_MAPPING_STATE_CREATING && now >= self.settled_due {
+            self.state = if self.enabled {
+                EVENT_SOURCE_MAPPING_STATE_ENABLED.to_string()
+            } else {
+                EVENT_SOURCE_MAPPING_STATE_DISABLED.to_string()
+            };
+            // `LastModified` is "The date that the event source mapping was last updated
+            // or that its state changed", and this IS a state change: it changed at the
+            // instant the clock owed it, not at the instant somebody happened to read
+            // the record, so that is what is stored.
+            self.last_modified = self.settled_due;
+        }
+    }
+
+    /// The `EventSourceMappingConfiguration` the wire reports for this record, built
+    /// entirely out of what is stored.
+    ///
+    /// The model declares ONE `EventSourceMappingConfiguration`, generated here as
+    /// [`CreateEventSourceMappingOutput`]; an operation whose output is generated as its
+    /// own struct over that shape carries these members across one for one rather than
+    /// rebuilding them from state a second time.
+    #[must_use]
+    pub fn reported(&self) -> CreateEventSourceMappingOutput {
+        CreateEventSourceMappingOutput {
+            uuid: Some(self.uuid.clone()),
+            event_source_mapping_arn: Some(self.arn.clone()),
+            function_arn: Some(self.function_arn.clone()),
+            event_source_arn: self.event_source_arn.clone(),
+            batch_size: Some(self.batch_size),
+            maximum_batching_window_in_seconds: self.maximum_batching_window_in_seconds,
+            parallelization_factor: self.parallelization_factor,
+            starting_position: self.starting_position.clone(),
+            starting_position_timestamp: self.starting_position_timestamp,
+            filter_criteria: self.filter_criteria.clone(),
+            // "An object that contains details about an error related to filter criteria
+            // encryption": this store decrypts nothing and no such error has occurred.
+            filter_criteria_error: None,
+            kms_key_arn: self.kms_key_arn.clone(),
+            metrics_config: self.metrics_config.clone(),
+            logging_config: self.logging_config.clone(),
+            scaling_config: self.scaling_config.clone(),
+            last_modified: Some(::aws_smithy_types::DateTime::from(self.last_modified)),
+            // "The result of the event source mapping's last processing attempt" — no
+            // poller runs here, so there has been no attempt to report the result of.
+            last_processing_result: None,
+            state: Some(self.state.clone()),
+            state_transition_reason: Some(self.state_transition_reason.clone()),
+            destination_config: self.destination_config.clone(),
+            topics: self.topics.clone(),
+            queues: self.queues.clone(),
+            source_access_configurations: self.source_access_configurations.clone(),
+            self_managed_event_source: self.self_managed_event_source.clone(),
+            maximum_record_age_in_seconds: self.maximum_record_age_in_seconds,
+            bisect_batch_on_function_error: self.bisect_batch_on_function_error,
+            maximum_retry_attempts: self.maximum_retry_attempts,
+            tumbling_window_in_seconds: self.tumbling_window_in_seconds,
+            function_response_types: self.function_response_types.clone(),
+            amazon_managed_kafka_event_source_config: self
+                .amazon_managed_kafka_event_source_config
+                .clone(),
+            self_managed_kafka_event_source_config: self
+                .self_managed_kafka_event_source_config
+                .clone(),
+            document_db_event_source_config: self.document_db_event_source_config.clone(),
+            provisioned_poller_config: self.provisioned_poller_config.clone(),
+        }
+    }
+
+    /// What `ListEventSourceMappings` reports for this record.
+    ///
+    /// The ONE member a listing reports differently is the one the model says so about:
+    /// `FilterCriteria` is "null in the response of ListEventSourceMapping API calls"
+    /// when the criteria are encrypted — "You can view this field in plaintext in the
+    /// response of GetEventSourceMapping and DeleteEventSourceMapping calls if you have
+    /// kms:Decrypt permissions for the correct KMS key" — and a mapping's criteria are
+    /// encrypted exactly when it names a key to encrypt them with ("By default, Lambda
+    /// does not encrypt your filter criteria object. Specify this property to encrypt
+    /// data using your own customer managed key.").
+    #[must_use]
+    pub fn listed(&self) -> CreateEventSourceMappingOutput {
+        let mut reported = self.reported();
+        if self.kms_key_arn.is_some() {
+            reported.filter_criteria = None;
+        }
+        reported
+    }
+
+    /// Whether this mapping is one of the function `name` names, qualified by
+    /// `qualifier` when the caller qualified it.
+    ///
+    /// An unqualified reference names the FUNCTION, so it matches every mapping of it;
+    /// a qualified one names one version or alias of that function, so it matches only
+    /// the mappings created against that qualifier.
+    #[must_use]
+    pub fn is_of_function(&self, name: &str, qualifier: Option<&str>) -> bool {
+        self.function_name == name
+            && qualifier.is_none_or(|qualifier| {
+                self.function_qualifier.as_deref() == Some(qualifier)
+            })
+    }
+}
+
 /// Per-service state for com-amazonaws-lambda-awsgirapiservice. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsLambdaAwsgirapiserviceState {
@@ -1208,6 +2142,12 @@ pub struct ComAmazonawsLambdaAwsgirapiserviceState {
     /// Every layer this emulator holds, keyed by layer name so `ListLayers` pages
     /// through them in a stable order.
     pub layers: BTreeMap<String, LayerRecord>,
+    /// Every capacity provider this emulator holds, keyed by provider name so
+    /// `ListCapacityProviders` pages through them in a stable order.
+    pub capacity_providers: BTreeMap<String, CapacityProviderRecord>,
+    /// Every event source mapping this emulator holds, keyed by its UUID so
+    /// `ListEventSourceMappings` pages through them in a stable order.
+    pub event_source_mappings: BTreeMap<String, EventSourceMappingRecord>,
 }
 
 /// One entry of a `ListFunctions` page: the key it is addressed by in the flattened
@@ -1221,11 +2161,19 @@ pub struct ListedFunction {
 }
 
 impl ComAmazonawsLambdaAwsgirapiserviceState {
-    /// Bring every function up to whatever the clock has already made due; see
-    /// [`FunctionRecord::materialize`].
+    /// Bring every function, every capacity provider and every event source mapping up
+    /// to whatever the clock has already made due; see [`FunctionRecord::materialize`],
+    /// [`CapacityProviderRecord::materialize`] and
+    /// [`EventSourceMappingRecord::materialize`].
     pub fn materialize_all(&mut self, now: SystemTime) {
         for function in self.functions.values_mut() {
             function.materialize(now);
+        }
+        for provider in self.capacity_providers.values_mut() {
+            provider.materialize(now);
+        }
+        for mapping in self.event_source_mappings.values_mut() {
+            mapping.materialize(now);
         }
     }
 
@@ -1370,6 +2318,73 @@ pub fn function_arn(region: &str, name: &str) -> String {
 #[must_use]
 pub fn layer_arn(region: &str, name: &str) -> String {
     ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("layer:{name}"))
+}
+
+/// The ARN of a capacity provider:
+/// `arn:aws:lambda:<region>:<account>:capacity-provider:<name>`, as the model's
+/// `CapacityProviderArn` pattern requires.
+#[must_use]
+pub fn capacity_provider_arn(region: &str, name: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_NAMESPACE,
+        region,
+        &format!("capacity-provider:{name}"),
+    )
+}
+
+/// The bare provider name a `CapacityProviderName` names.
+///
+/// The model's `CapacityProviderName` pattern admits two forms — a capacity-provider ARN
+/// and a bare name — and both name the same record, so an ARN resolves here to the name
+/// it carries. `None` when the value is an `arn:`-prefixed string that is not a
+/// capacity-provider ARN of this service, which names no provider at all.
+#[must_use]
+pub fn parse_capacity_provider_name(value: &str) -> Option<String> {
+    if !value.starts_with("arn:") {
+        return (!value.is_empty()).then(|| value.to_string());
+    }
+    // arn:<partition>:lambda:<region>:<account>:capacity-provider:<name>. The resource
+    // type is required, so an ARN of another Lambda resource is not read as a provider
+    // named after its resource type.
+    let parts: Vec<&str> = value.split(':').collect();
+    if parts.len() != 7 || parts[2] != ARN_NAMESPACE || parts[5] != "capacity-provider" {
+        return None;
+    }
+    (!parts[6].is_empty()).then(|| parts[6].to_string())
+}
+
+/// The message a `CapacityProviderName` that names no provider is refused with.
+#[must_use]
+pub fn capacity_provider_name_message(value: &str) -> String {
+    format!(
+        "1 validation error detected: Value '{value}' at 'capacityProviderName' failed to \
+         satisfy constraint: Member must satisfy one of the documented name formats (name \
+         or capacity provider ARN)"
+    )
+}
+
+/// Resolve a `CapacityProviderName` (in either of its documented forms) to one stored
+/// capacity provider.
+///
+/// The record is brought up to whatever the clock already made due before it is handed
+/// back, so every caller reports the same lifecycle state at the same instant.
+pub fn resolve_capacity_provider<'a>(
+    store: &'a mut ComAmazonawsLambdaAwsgirapiserviceState,
+    capacity_provider_name: &str,
+    region: &str,
+    now: SystemTime,
+) -> Result<&'a mut CapacityProviderRecord, ResolveFailure> {
+    let name = parse_capacity_provider_name(capacity_provider_name).ok_or_else(|| {
+        ResolveFailure::Malformed(capacity_provider_name_message(capacity_provider_name))
+    })?;
+    let Some(record) = store.capacity_providers.get_mut(&name) else {
+        return Err(ResolveFailure::NotFound(format!(
+            "Capacity provider not found: {}",
+            capacity_provider_arn(region, &name)
+        )));
+    };
+    record.materialize(now);
+    Ok(record)
 }
 
 /// The download location a layer version's `Content$Location` reports ("A link to the
@@ -1528,11 +2543,23 @@ pub fn code_location_url(region: &str, name: &str, revision_id: &str) -> String 
 
 /// `at` as the ISO-8601 instant the model's `LastModified` member describes
 /// ("in ISO-8601 format (YYYY-MM-DDThh:mm:ss.sTZD)").
+///
+/// The subsecond field is TRUNCATED to whole milliseconds and rendered at a fixed three
+/// digits, so two instants this service reports always compare the same way as strings
+/// as they do as instants — two instants inside one millisecond render as the same
+/// string, so the order is not strict, but it is never reversed. The `DateTime`
+/// formatter trims trailing zeros instead, which makes one rendering a PREFIX of another
+/// (`…:43.848Z` against `…:43.848766Z`) and so reverses their order under a string
+/// comparison, and a caller reading `LastModified` of one resource twice, or of two
+/// resources, has only the string to order them by.
 #[must_use]
 pub fn iso8601(at: SystemTime) -> String {
-    ::aws_smithy_types::DateTime::from(at)
+    let instant = ::aws_smithy_types::DateTime::from(at);
+    let seconds = ::aws_smithy_types::DateTime::from_secs(instant.secs())
         .fmt(::aws_smithy_types::date_time::Format::DateTime)
-        .unwrap_or_default()
+        .unwrap_or_default();
+    let millis = instant.subsec_nanos() / 1_000_000;
+    format!("{}.{millis:03}Z", seconds.trim_end_matches('Z'))
 }
 
 /// The base64-encoded SHA-256 of `bytes`, which is what the model's `CodeSha256`
@@ -1548,6 +2575,36 @@ pub fn code_sha256(bytes: &[u8]) -> String {
 #[must_use]
 pub fn mint_revision_id() -> String {
     ::uuid::Uuid::new_v4().to_string()
+}
+
+/// AWS's published Lambda quota for environment variables: 4 KB for all of a function's
+/// environment variables combined.
+pub const MAX_ENVIRONMENT_BYTES: usize = 4 * 1024;
+
+/// The environment variables an `Environment` member asks a function to hold, ordered so
+/// a read reports them deterministically.
+///
+/// `Err` carries the message of the refusal: the set is larger than the documented
+/// quota. Every operation that accepts an `Environment` applies the same quota, so the
+/// check lives here rather than once per operation.
+pub fn environment_variables(
+    environment: Option<&Environment>,
+) -> Result<BTreeMap<String, String>, String> {
+    let variables: BTreeMap<String, String> = environment
+        .and_then(|environment| environment.variables.clone())
+        .map(|variables| variables.into_iter().collect())
+        .unwrap_or_default();
+    let size: usize = variables
+        .iter()
+        .map(|(name, value)| name.len() + value.len())
+        .sum();
+    if size > MAX_ENVIRONMENT_BYTES {
+        return Err(format!(
+            "Environment.Variables must be smaller than {MAX_ENVIRONMENT_BYTES} bytes for all \
+             environment variables combined, and this request's are {size} bytes"
+        ));
+    }
+    Ok(variables)
 }
 
 /// A `FunctionName` the wire accepted, split into the parts that identify a record.
@@ -1624,6 +2681,97 @@ pub fn parse_function_reference(value: &str) -> Option<FunctionReference> {
     })
 }
 
+/// What a `TaggableResource` ARN — the `Resource` label of the
+/// `/2017-03-31/tags/{Resource}` operations — names.
+///
+/// The member's own pattern admits exactly five Lambda resource types
+/// (`smithy_query(query="operation", operation="ListTags")`): a function, optionally
+/// qualified by a published version or an alias, a code-signing configuration, an event
+/// source mapping, a capacity provider and a network connector. A function and a capacity
+/// provider are the ones this store holds records of; the rest are reported by their
+/// resource type and answered as what is true of them here — a resource of that type this
+/// account does not have.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaggableResourceRef {
+    /// `…:function:<name>` — one function, whose tag set is
+    /// [`FunctionRecord::tags`].
+    Function(String),
+    /// `…:function:<name>:<qualifier>` — a published version or an alias of a function.
+    /// The `Resource` member's own documentation says "Lambda does not support adding
+    /// tags to function aliases or versions", so a qualified ARN names no tag set.
+    FunctionQualifier {
+        /// The bare function name the ARN carries.
+        name: String,
+        /// The version label or alias name qualifying it.
+        qualifier: String,
+    },
+    /// `…:capacity-provider:<name>` — one capacity provider, whose tag set is
+    /// [`CapacityProviderRecord::tags`].
+    CapacityProvider(String),
+    /// `…:event-source-mapping:<uuid>` — one event source mapping, whose tag set is
+    /// [`EventSourceMappingRecord::tags`].
+    EventSourceMapping(String),
+    /// Another Lambda resource type the pattern admits, by its ARN resource type.
+    Other(String),
+}
+
+/// Split a `TaggableResource` into the parts that identify what it names, or `None`
+/// when the value is not a `lambda` resource ARN at all.
+///
+/// The ARN is read through `service_common::arn` — the one parse this repository states
+/// for a caller-supplied ARN — so the `<type>:<id>` and `<type>/<id>` conventions are
+/// handled in one place, and the function form is then split by
+/// [`parse_function_reference`] so that every tag operation resolves a function exactly
+/// the way every other operation on this service does.
+///
+/// The ARN's region and account fields are read by that parse and deliberately NOT
+/// reported: this store keys a function by its name alone, exactly as
+/// [`resolve_function`] resolves every other `FunctionName`, so reporting them here
+/// would invite a caller to refuse a cross-region or cross-account ARN that every
+/// other operation on this service accepts. A tag operation that needs to refuse one
+/// has to make that rule hold for the whole service, and should call
+/// `service_common::arn::parse_of` for the fields when it does.
+///
+/// [`TaggableResourceRef::Other`] is only a resource TYPE because this store holds no
+/// records of those types yet — whoever implements `CreateCodeSigningConfig` or the
+/// network-connector operations has to carry the type's id through here and turn the tag
+/// handlers' `Other` branch into a real lookup against the new records, the way a
+/// capacity provider and an event source mapping are resolved here.
+#[must_use]
+pub fn parse_taggable_resource(value: &str) -> Option<TaggableResourceRef> {
+    let arn = service_common::arn::parse_of(value, ARN_NAMESPACE)?;
+    let resource_type = arn.resource_type();
+    if resource_type.is_empty() {
+        return None;
+    }
+    // A capacity provider is named by `…:capacity-provider:<name>`, and this store holds
+    // one record per provider, so the ARN resolves to the name that record is keyed by.
+    if resource_type == "capacity-provider" {
+        return Some(TaggableResourceRef::CapacityProvider(
+            parse_capacity_provider_name(value)?,
+        ));
+    }
+    // An event source mapping is named by `…:event-source-mapping:<uuid>`, and this store
+    // holds one record per mapping, so the ARN resolves to the UUID that record is keyed
+    // by.
+    if resource_type == "event-source-mapping" {
+        let uuid = service_common::arn::resource_id_of_type(value, resource_type)?;
+        return (!uuid.is_empty())
+            .then(|| TaggableResourceRef::EventSourceMapping(uuid.to_string()));
+    }
+    if resource_type != "function" {
+        return Some(TaggableResourceRef::Other(resource_type.to_string()));
+    }
+    let reference = parse_function_reference(value)?;
+    Some(match reference.qualifier {
+        Some(qualifier) => TaggableResourceRef::FunctionQualifier {
+            name: reference.name,
+            qualifier,
+        },
+        None => TaggableResourceRef::Function(reference.name),
+    })
+}
+
 /// Why a `FunctionName`/`Qualifier` pair names no record.
 #[derive(Debug, Clone)]
 pub enum ResolveFailure {
@@ -1688,6 +2836,44 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_reported_instant_sorts_as_a_string_exactly_as_it_does_as_an_instant() {
+        // `LastModified` is reported as a string, so a caller ordering two reads of it
+        // has only the string to order them by. The offsets are the subsecond values a
+        // trimming formatter renders at different widths: none at all, one nanosecond,
+        // a value whose trimmed rendering is a PREFIX of the next one, and each end of
+        // the field.
+        let base = SystemTime::UNIX_EPOCH + Duration::from_secs(1_793_000_000);
+        let offsets = [
+            Duration::ZERO,
+            Duration::from_nanos(1),
+            Duration::from_millis(848),
+            Duration::from_nanos(848_766_000),
+            Duration::from_millis(999),
+            Duration::new(0, 999_999_999),
+            Duration::from_secs(1),
+        ];
+        let width = "2026-10-23T17:13:43.848Z".len();
+        let mut earlier: Option<(Duration, String)> = None;
+        for offset in offsets {
+            let rendered = iso8601(base + offset);
+            assert_eq!(
+                rendered.len(),
+                width,
+                "case {offset:?}: a reported instant is rendered at a fixed width, got \
+                 {rendered:?}"
+            );
+            if let Some((before, rendered_before)) = &earlier {
+                assert!(
+                    rendered_before.as_str() <= rendered.as_str(),
+                    "case {offset:?}: {rendered:?} is at or after {rendered_before:?} \
+                     ({before:?}) as an instant, so it must be as a string too"
+                );
+            }
+            earlier = Some((offset, rendered));
+        }
+    }
+
+    #[test]
     fn every_documented_function_name_form_resolves_to_one_record() {
         let cases = [
             ("my-function", "my-function", None),
@@ -1727,6 +2913,74 @@ mod tests {
                 qualifier,
                 "case {input:?}: expected qualifier {qualifier:?}, got {:?}",
                 parsed.qualifier
+            );
+        }
+    }
+
+    #[test]
+    fn a_taggable_resource_arn_names_the_resource_it_carries() {
+        // One row per alternative the `TaggableResource` pattern admits
+        // (`smithy_query(query="operation", operation="ListTags")`), plus a value that
+        // is no `lambda` resource ARN at all.
+        let cases: Vec<(&str, Option<TaggableResourceRef>)> = vec![
+            (
+                "arn:aws:lambda:us-east-1:000000000000:function:my-function",
+                Some(TaggableResourceRef::Function("my-function".to_string())),
+            ),
+            (
+                "arn:aws-us-gov:lambda:us-gov-west-1:000000000000:function:my-function",
+                Some(TaggableResourceRef::Function("my-function".to_string())),
+            ),
+            (
+                "arn:aws:lambda:us-east-1:000000000000:function:my-function:3",
+                Some(TaggableResourceRef::FunctionQualifier {
+                    name: "my-function".to_string(),
+                    qualifier: "3".to_string(),
+                }),
+            ),
+            (
+                "arn:aws:lambda:us-east-1:000000000000:function:my-function:$LATEST",
+                Some(TaggableResourceRef::FunctionQualifier {
+                    name: "my-function".to_string(),
+                    qualifier: "$LATEST".to_string(),
+                }),
+            ),
+            (
+                "arn:aws:lambda:us-east-1:000000000000:function:my-function:blue",
+                Some(TaggableResourceRef::FunctionQualifier {
+                    name: "my-function".to_string(),
+                    qualifier: "blue".to_string(),
+                }),
+            ),
+            (
+                "arn:aws:lambda:us-east-1:000000000000:code-signing-config:csc-0123456789abcdefg",
+                Some(TaggableResourceRef::Other(
+                    "code-signing-config".to_string(),
+                )),
+            ),
+            (
+                "arn:aws:lambda:us-east-1:000000000000:event-source-mapping:\
+                 12345678-1234-1234-1234-123456789012",
+                Some(TaggableResourceRef::EventSourceMapping(
+                    "12345678-1234-1234-1234-123456789012".to_string(),
+                )),
+            ),
+            (
+                "arn:aws:lambda:us-east-1:000000000000:capacity-provider:fleet-1",
+                Some(TaggableResourceRef::CapacityProvider("fleet-1".to_string())),
+            ),
+            (
+                "arn:aws:lambda:us-east-1:000000000000:network-connector:link-1",
+                Some(TaggableResourceRef::Other("network-connector".to_string())),
+            ),
+            ("arn:aws:sqs:us-east-1:000000000000:queue:q", None),
+            ("my-function", None),
+        ];
+        for (input, expected) in cases {
+            let actual = parse_taggable_resource(input);
+            assert_eq!(
+                actual, expected,
+                "case {input:?}: expected {expected:?}, got {actual:?}"
             );
         }
     }

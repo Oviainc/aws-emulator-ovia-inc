@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeHosts
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeHosts`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeHosts::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the Dedicated Hosts [`crate::state`] holds, narrowed by `HostIds`
+//! and the documented filters and paged by `MaxResults`/`NextToken`. This is the ONLY file
+//! to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -82,6 +76,11 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+// The prefix of the tag filter, from the crate's one definition of it. `DescribeHosts`
+// documents `tag-key`, and EC2's `tag:<key>` family applies to every resource a `Tags`
+// member is reported for — "use the tag key in the filter name and the tag value as the
+// filter value" (`DescribeVolumesRequest$Filters`) — which `Host$Tags` is one of.
+use crate::state::TAG_FILTER_PREFIX;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -150,18 +149,318 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeHosts` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeHostsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeHosts"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            CompiledFilter, MAX_FILTER_MATCH_STEPS, MAX_FILTER_VALUE_BYTES, MAX_FILTER_VALUES,
+            MAX_FILTERS, MAX_RESOURCE_IDS, MatchBudget, decode_page_token, encode_page_token,
+            invalid_pagination_token_for, matches_every_filter, require_service_state,
+        };
+
+        // `ctx` carries request metadata only; this operation reads none of it — the host
+        // store is per account, not per Region. The store is reached through the engine
+        // held on `self`.
+        let _ = ctx;
+
+        let requested_ids = input.host_ids.clone().unwrap_or_default();
+        if requested_ids.len() > MAX_RESOURCE_IDS {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "HostIds carries {} ids, above the maximum of {MAX_RESOURCE_IDS}",
+                requested_ids.len()
+            )));
+        }
+
+        // "You cannot specify this parameter and the host IDs parameter in the same
+        // request" (`DescribeHostsRequest$MaxResults`).
+        if input.max_results.is_some() && !requested_ids.is_empty() {
+            return Err(Scaffolded::invalid_parameter_combination(
+                "The parameter maxResults cannot be used with the parameter hostId",
+            ));
+        }
+
+        // "This value can be between 5 and 500. If maxResults is given a larger value than
+        // 500, you receive an error" (`DescribeHostsRequest$MaxResults`) — the model
+        // declares no `@range`, so the handler is the only place that bound is enforced.
+        if let Some(max_results) = input.max_results {
+            if !(MIN_HOSTS_PER_PAGE..=MAX_HOSTS_PER_PAGE).contains(&max_results) {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "Invalid value '{max_results}' for maxResults. It must be between \
+                     {MIN_HOSTS_PER_PAGE} and {MAX_HOSTS_PER_PAGE}"
+                )));
+            }
+        }
+
+        // Matching cost is filters x values x held values x stored hosts and the model
+        // bounds none of them, so the request-controlled factors are capped here, before
+        // any work proportional to them is done — and their PRODUCT is charged to one
+        // [`MatchBudget`] below, which is the bound the per-factor caps cannot give.
+        let supplied_filters = input.filter.as_ref().map_or(0, Vec::len);
+        if supplied_filters > MAX_FILTERS {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "The request carries {supplied_filters} filters, above the maximum \
+                 of {MAX_FILTERS}"
+            )));
+        }
+
+        // A filter name this operation does not document is refused whether or not any
+        // host would have matched it, so an unsupported filter can never read as "no
+        // results".
+        let filters: &[Filter] = input.filter.as_deref().unwrap_or_default();
+        let mut selectors: Vec<CompiledFilter> = Vec::with_capacity(filters.len());
+        for filter in filters {
+            let name = filter.name.as_deref().unwrap_or_default();
+            if !is_documented_filter_name(name) {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "The filter '{name}' is invalid"
+                )));
+            }
+            let values = filter.values.as_deref().unwrap_or_default();
+            if values.len() > MAX_FILTER_VALUES {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "The filter '{name}' carries {} values, above the maximum of \
+                     {MAX_FILTER_VALUES}",
+                    values.len()
+                )));
+            }
+            // A capped NUMBER of comparisons is not capped WORK: the matcher's cost is the
+            // product of the pattern's length and the value's, so each value's size is
+            // bounded too, before any matching runs under the lock.
+            if let Some(oversize) = values
+                .iter()
+                .find(|value| value.len() > MAX_FILTER_VALUE_BYTES)
+            {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "A value of the filter '{name}' carries {} bytes, above the maximum of \
+                     {MAX_FILTER_VALUE_BYTES}",
+                    oversize.len()
+                )));
+            }
+            selectors.push(CompiledFilter::new(name.to_string(), values.to_vec()));
+        }
+
+        // "The token to use to retrieve the next page of results"
+        // (`DescribeHostsRequest$NextToken`) — a token this operation did not issue is
+        // refused rather than read as an id, and it is refused before the store is read, so
+        // a bogus token can never be answered with a page.
+        let start_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(
+                decode_page_token(token).ok_or_else(|| invalid_pagination_token_for(token))?,
+            ),
+        };
+
+        let state = require_service_state(&*self.engine)?;
+        let store = state.lock();
+
+        // "Describes the specified Dedicated Hosts": an id that names no host of the
+        // account is an error, not an absent row — and to EC2 an id it never issued is not
+        // a host id at all, so one refusal names every id this account holds no host for.
+        require_describable_hosts(&store, &requested_ids)?;
+
+        // This is a REPORT: the stored hosts are read and nothing is written, so two calls
+        // with the same request answer the same thing. Every comparison is charged to ONE
+        // budget, so the PRODUCT of stored hosts, filters, values, held values and value
+        // length is bounded however the caller combines them — which is also what bounds
+        // how long this holds the state lock.
+        let mut budget = MatchBudget::new(MAX_FILTER_MATCH_STEPS);
+        let mut selected: Vec<Host> = Vec::new();
+        // The ids the request named, as a set, so narrowing one host costs a lookup rather
+        // than a scan of every id the request carries.
+        let wanted: ::std::collections::BTreeSet<&str> =
+            requested_ids.iter().map(String::as_str).collect();
+        for (host_id, host) in &store.dedicated_hosts {
+            if budget.exhausted() {
+                break;
+            }
+            // The id narrowing is read off the key, so a host the request did not name
+            // costs no comparison at all.
+            if !wanted.is_empty() && !wanted.contains(host_id.as_str()) {
+                continue;
+            }
+            // The AND/OR evaluation and the per-candidate budget charge are the shared
+            // ones; only the lookup of what THIS host holds for a filter name is local.
+            if matches_every_filter(&selectors, &mut budget, &|name| filter_values(host, name)) {
+                selected.push(host.clone());
+            }
+        }
+        // A spent budget means the answer is INCOMPLETE, which is not something to report
+        // as a result: the request asked for more filtering than one call will do, and is
+        // told so rather than given a silently truncated page.
+        if budget.exhausted() {
+            return Err(Scaffolded::request_limit_exceeded(format!(
+                "The request's filters would take more than {MAX_FILTER_MATCH_STEPS} \
+                 comparisons to evaluate; narrow them or page with MaxResults"
+            )));
+        }
+
+        // Page in `HostId` order, which the cursor below names a position in. The store is
+        // an ordered map, so its iteration order already satisfies this sort; doing it here
+        // establishes the invariant the cursor depends on at the point of use.
+        selected.sort_by(|left, right| left.host_id.cmp(&right.host_id));
+
+        let from = match start_at.as_deref() {
+            None => 0,
+            Some(cursor) => selected
+                .partition_point(|host| host.host_id.as_deref().unwrap_or_default() < cursor),
+        };
+        let page = selected.get(from..).unwrap_or_default();
+
+        // A request that names no page size gets the largest page this operation serves, so
+        // the `NextToken` path behaves the same whether or not a page size was asked for.
+        let limit = input
+            .max_results
+            .and_then(|max_results| usize::try_from(max_results).ok())
+            .unwrap_or(DEFAULT_HOSTS_PER_PAGE)
+            .clamp(1, DEFAULT_HOSTS_PER_PAGE);
+
+        // A token only when a host follows this page: "The token to use to retrieve the
+        // next page of results. This value is null when there are no more results to
+        // return" (`DescribeHostsResult$NextToken`).
+        let next_token = page
+            .get(limit)
+            .and_then(|host| host.host_id.as_deref())
+            .map(encode_page_token);
+
+        Ok(DescribeHostsOutput {
+            hosts: Some(page.iter().take(limit).cloned().collect()),
+            next_token,
+        })
+    }
+}
+
+/// Refuse the Dedicated Host ids this request named that the account holds no host for:
+/// HTTP 400 `InvalidHostID.Malformed`, naming every one of them.
+///
+/// To EC2 a host id it never issued is NOT VALID rather than merely absent, whatever its
+/// shape — the recorded contract for this operation (corpus `simparity-behavioral-aws-v1`,
+/// unit `ec2.op-contract-describeHosts`) answers a WELL-FORMED id no host has with
+///
+/// ```text
+/// InvalidHostID.Malformed
+/// "The specified Dedicated host IDs ['h-0123456789abcdef0'] are not valid."
+/// ```
+///
+/// so this describe refuses the request as a whole, naming every id it could not resolve,
+/// instead of reporting the hosts it did find. The message is built from the request, in
+/// that recorded form.
+///
+/// It lives HERE rather than in `crate::state` because the policy is this operation's own:
+/// `DescribeMacHosts` keeps `crate::state::unresolvable_host_id`'s
+/// malformed-before-unknown split, which is the contract recorded for THAT operation, and
+/// a shared module holding two divergent id-refusal policies would invite a later caller
+/// picking the wrong one.
+fn require_describable_hosts(
+    store: &crate::state::ComAmazonawsEc2Amazonec2State,
+    host_ids: &[String],
+) -> Result<(), DescribeHostsError> {
+    let unresolvable: Vec<String> = host_ids
+        .iter()
+        .filter(|host_id| !store.dedicated_hosts.contains_key(*host_id))
+        .map(|host_id| format!("'{host_id}'"))
+        .collect();
+    if unresolvable.is_empty() {
+        return Ok(());
+    }
+    Err(crate::scaffolded::Scaffolded::service_error(
+        crate::state::INVALID_HOST_ID_MALFORMED,
+        400,
+        format!(
+            "The specified Dedicated host IDs [{}] are not valid.",
+            unresolvable.join(", ")
+        ),
+    ))
+}
+
+/// The smallest `MaxResults` this operation accepts: "This value can be between 5 and 500"
+/// (`DescribeHostsRequest$MaxResults`).
+const MIN_HOSTS_PER_PAGE: i32 = 5;
+
+/// The largest `MaxResults` it accepts: "If maxResults is given a larger value than 500,
+/// you receive an error" (the same member). Operation-scoped, and deliberately not the
+/// crate-wide generic [`crate::state::MAX_PAGE_SIZE`], which is a different cap.
+const MAX_HOSTS_PER_PAGE: i32 = 500;
+
+/// The page size a request that names none gets — this operation's own documented
+/// maximum, so one answer is never larger than a page a caller could have asked for.
+const DEFAULT_HOSTS_PER_PAGE: usize = MAX_HOSTS_PER_PAGE as usize;
+
+/// The filter names this operation documents, from `DescribeHostsRequest$Filter`:
+///
+/// ```text
+/// smithy_query(query="doc",shape="DescribeHostsRequest",member="Filter",model_path="services/service-com-amazonaws-ec2-amazonec2/smithy-model/com-amazonaws-ec2-amazonec2.json")
+/// ```
+///
+/// `tag:<key>` is the one name with a variable part, so it is matched by prefix rather than
+/// listed here. Every entry must be answered by [`filter_values`].
+const HOST_FILTERS: [&str; 7] = [
+    "auto-placement",
+    "availability-zone",
+    "client-token",
+    "host-reservation-id",
+    "instance-type",
+    "state",
+    "tag-key",
+];
+
+/// Whether `name` is a filter this operation documents.
+///
+/// "Filter names are case-sensitive" (`Filter$Name`), so every comparison is exact — and a
+/// `tag:` prefix with no key names no tag, so it is as undocumented as any other
+/// misspelling. A name that passes here is the name [`filter_values`] answers for, the
+/// `tag:<key>` family included, the key being part of what it selects on.
+fn is_documented_filter_name(name: &str) -> bool {
+    if name
+        .strip_prefix(TAG_FILTER_PREFIX)
+        .is_some_and(|key| !key.is_empty())
+    {
+        return true;
+    }
+    HOST_FILTERS.contains(&name)
+}
+
+/// The values the EC2 filter `name` compares against this host.
+///
+/// A filter naming an attribute this host does not carry compares against NO values, so it
+/// selects nothing — which is the answer `instance-type` gives for a host allocated for a
+/// whole instance family ("if the host supports multiple instance types, no instanceType is
+/// returned", `HostProperties$InstanceType`) and `host-reservation-id` for a host with no
+/// reservation. `name` is a name [`is_documented_filter_name`] accepted, and the answer is
+/// what
+/// [`crate::state::matches_every_filter`] compares the request's values against.
+fn filter_values<'a>(host: &'a Host, name: &str) -> Vec<::std::borrow::Cow<'a, str>> {
+    use ::std::borrow::Cow;
+
+    if let Some(key) = name.strip_prefix(TAG_FILTER_PREFIX) {
+        return host
+            .tags
+            .iter()
+            .flatten()
+            .filter(|tag| tag.key.as_deref() == Some(key))
+            .filter_map(|tag| tag.value.as_deref().map(Cow::Borrowed))
+            .collect();
+    }
+
+    let properties = || host.host_properties.as_ref();
+    let text = |value: Option<&'a str>| -> Vec<Cow<'a, str>> {
+        value.map(Cow::Borrowed).into_iter().collect()
+    };
+    match name {
+        "auto-placement" => text(host.auto_placement.as_deref()),
+        "availability-zone" => text(host.availability_zone.as_deref()),
+        "client-token" => text(host.client_token.as_deref()),
+        "host-reservation-id" => text(host.host_reservation_id.as_deref()),
+        // "`instance-type` - The instance type size that the Dedicated Host is configured
+        // to support" (`DescribeHostsRequest$Filter`).
+        "instance-type" => text(properties().and_then(|p| p.instance_type.as_deref())),
+        "state" => text(host.state.as_deref()),
+        "tag-key" => host
+            .tags
+            .iter()
+            .flatten()
+            .filter_map(|tag| tag.key.as_deref().map(Cow::Borrowed))
+            .collect(),
+        // Unreachable: `is_documented_filter_name` has already refused every other name. An
+        // undefined name compares against nothing, so it could never widen a result even
+        // if that check were bypassed.
+        _ => Vec::new(),
     }
 }

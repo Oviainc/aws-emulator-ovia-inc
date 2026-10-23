@@ -257,7 +257,7 @@ async fn a_refused_change_is_not_reported_as_pending() {
         (
             "a member removed that is not one",
             json!({ "ACLName": acl_name, "UserNamesToRemove": ["pending-two"] }),
-            404,
+            400,
         ),
         (
             "one name added and removed at once",

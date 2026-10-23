@@ -233,7 +233,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 PROTOCOL_TYPE_VALUES.join(", ")
             )));
         }
-        let is_http = input.protocol_type == HTTP_PROTOCOL_TYPE;
+        let is_http = input.protocol_type == crate::state::HTTP_PROTOCOL_TYPE;
 
         // `RouteSelectionExpression` "is required for WebSocket APIs" and defaults to
         // `$request.method $request.path` for HTTP APIs
@@ -297,7 +297,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let region = crate::state::request_region(ctx.parts());
         let record = crate::state::Api {
-            api_endpoint: crate::state::execute_api_endpoint(&api_id, &region),
+            // The endpoint's scheme follows the api's protocol type, so the value a
+            // caller hands to a client library names the protocol that api speaks.
+            api_endpoint: crate::state::execute_api_endpoint(
+                &api_id,
+                &region,
+                &input.protocol_type,
+            ),
             api_id: api_id.clone(),
             name: input.name,
             protocol_type: input.protocol_type,
@@ -326,8 +332,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             integrations: ::std::collections::BTreeMap::new(),
             integration_id_seed: 0,
             stages: ::std::collections::BTreeMap::new(),
+            models: ::std::collections::BTreeMap::new(),
+            model_id_seed: 0,
             deployments: ::std::collections::BTreeMap::new(),
             deployment_id_seed: 0,
+            authorizers: ::std::collections::BTreeMap::new(),
+            authorizer_id_seed: 0,
         };
 
         // `api_id` comes from the store's own id bijection, so it names no existing
@@ -379,10 +389,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })
     }
 }
-
-/// The `ProtocolType` value that selects an HTTP API, from `PROTOCOL_TYPE_VALUES`
-/// (`HTTP | WEBSOCKET`).
-const HTTP_PROTOCOL_TYPE: &str = "HTTP";
 
 /// The catch-all `RouteKey` quick create uses when the request names none
 /// (`CreateApi$RouteKey`: "If you don't specify a routeKey, a default route of

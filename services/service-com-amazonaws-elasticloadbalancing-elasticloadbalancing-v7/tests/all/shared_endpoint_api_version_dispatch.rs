@@ -281,8 +281,15 @@ async fn a_declared_but_unimplemented_elbv2_action_is_reached_not_refused_as_unk
         ("DescribeSSLPolicies", &[]),
         ("DescribeAccountLimits", &[]),
         (
-            "DescribeTrustStores",
-            &[("Names.member.1", "no-such-trust-store")],
+            // `DescribeTrustStores` was this row until it was implemented (its own stub
+            // issue is closed); `DescribeTrustStoreAssociations`, which reads a named
+            // trust store's associations, is the stub that stands in for the same shape
+            // of answer.
+            "DescribeTrustStoreAssociations",
+            &[(
+                "TrustStoreArn",
+                "arn:aws:elasticloadbalancing:us-west-2:000000000000:truststore/t/0",
+            )],
         ),
         (
             "AddTags",

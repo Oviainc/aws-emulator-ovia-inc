@@ -172,8 +172,8 @@ pub const ROOT_RESOURCE_PATH: &str = "/";
 /// service publishes none, this emulator's own resource guard — see `crate::state`.
 fn bound_input(input: &CreateRestApiInput) -> Result<(), String> {
     use crate::state::{
-        bound_chars, bound_entries, MAX_COLLECTION_ENTRIES, MAX_POLICY_CHARS, MAX_STRING_CHARS,
-        MAX_TAGS, MAX_TAG_KEY_CHARS, MAX_TAG_VALUE_CHARS,
+        bound_chars, bound_entries, bound_tag, MAX_COLLECTION_ENTRIES, MAX_POLICY_CHARS,
+        MAX_STRING_CHARS, MAX_TAGS,
     };
 
     bound_chars("name", &input.name, MAX_STRING_CHARS)?;
@@ -198,11 +198,12 @@ fn bound_input(input: &CreateRestApiInput) -> Result<(), String> {
             bound_chars("binaryMediaTypes", value, MAX_STRING_CHARS)?;
         }
     }
+    // The tags a create carries are checked by the SAME rule `TagResource` applies, so
+    // a tag this service refuses on one path cannot be stored through the other.
     if let Some(tags) = &input.tags {
         bound_entries("tags", tags.len(), MAX_TAGS)?;
         for (key, value) in tags {
-            bound_chars("a tag key", key, MAX_TAG_KEY_CHARS)?;
-            bound_chars("a tag value", value, MAX_TAG_VALUE_CHARS)?;
+            bound_tag(key, value)?;
         }
     }
     if let Some(configuration) = &input.endpoint_configuration {
@@ -503,6 +504,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // source's resource tree only, so a cloned API starts with neither.
             stages: BTreeMap::new(),
             deployments: BTreeMap::new(),
+            // A new API customizes no gateway response: every response type reports the
+            // one API Gateway generates until `PutGatewayResponse` stores a
+            // customization for it. A clone copies the source's resource tree only, so a
+            // cloned API starts with none either.
+            gateway_responses: BTreeMap::new(),
+            // Nor with any documentation part: `CreateDocumentationPart` and
+            // `ImportDocumentationParts` are what write them, and a clone copies the
+            // source's resource tree only.
+            documentation_parts: BTreeMap::new(),
+            // Nor with any documentation version: a snapshot exists only once
+            // `CreateDocumentationVersion` takes one, and a clone copies the source's
+            // resource tree only.
+            documentation_versions: BTreeMap::new(),
             // `CreateAuthorizer` is what adds an authorizer, and a clone copies the
             // source's resource tree only, so a created API starts with none.
             authorizers: BTreeMap::new(),

@@ -33,6 +33,8 @@ mod domain_tag_resource;
 mod domain_tagging;
 #[path = "all/domain_undeprecation.rs"]
 mod domain_undeprecation;
+#[path = "all/list_closed_workflow_executions.rs"]
+mod list_closed_workflow_executions;
 #[path = "all/list_open_workflow_executions.rs"]
 mod list_open_workflow_executions;
 #[path = "all/pending_activity_task_count.rs"]
@@ -41,7 +43,11 @@ mod pending_activity_task_count;
 mod request_cancel_workflow_execution;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/tag_resource_value_fidelity.rs"]
+mod tag_resource_value_fidelity;
 #[path = "all/unknown_resource_messages.rs"]
 mod unknown_resource_messages;
 #[path = "all/workflow_execution_lifecycle.rs"]
 mod workflow_execution_lifecycle;
+#[path = "all/workflow_type_undeprecation.rs"]
+mod workflow_type_undeprecation;

@@ -3,10 +3,14 @@
 //! The stack lifecycle, end to end over the awsQuery wire.
 //!
 //! Every case here drives the real request path — form-encoded body in, XML envelope out
-//! — through a router carrying only this service, so what it asserts is what a client
+//! — through the router, so what it asserts is what a client
 //! sees: `CreateStack` persists a stack, and `DescribeStacks`, `ListStacks`,
 //! `GetTemplate`, `UpdateStack`, `DeleteStack` and `DescribeStackEvents` read and mutate
-//! THAT stack rather than echoing the request back.
+//! THAT stack rather than echoing the request back. That router carries the services that
+//! own the resource types a stack really creates beside this one on one engine — Amazon S3
+//! for an `AWS::S3::Bucket`, Amazon SNS for the `AWS::SNS::Topic` most of these templates
+//! declare — because a stack provisions them by calling those services in process (see
+//! `router_with_engine`).
 //!
 //! The wire harness here (`call`, `member`, the XML readers, `router`) is this crate's
 //! one such harness: `stack_outputs.rs` drives its cases through these same helpers.
@@ -37,9 +41,12 @@ pub(crate) fn router() -> MultiServiceRouter {
 /// The services that OWN the resource types `state::provisioning` creates are mounted
 /// beside CloudFormation on the SAME engine, exactly as `core/router/src/lib.rs` mounts
 /// them: a stack's create calls those services, so a suite that deploys a template
-/// declaring one of those types must have them there. (Amazon Data Firehose is
-/// deliberately NOT one of them — `unprovisioned_resources.rs` is the suite that pins
-/// what a stack does when an owning service cannot be reached.)
+/// declaring one of those types must have them there — Amazon SNS among them, since the
+/// `AWS::SNS::Topic` most cases here declare is really created in SNS by the stack. (Amazon
+/// Data Firehose is deliberately NOT one of them — `unprovisioned_resources.rs` is the
+/// suite that pins what a stack does when an owning service cannot be reached.) No case
+/// here calls SNS itself; what a stack and SNS must agree about is
+/// `core/router/tests/all/cloudformation_provisions_sns_topics.rs`.
 pub(crate) fn router_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
@@ -54,6 +61,11 @@ pub(crate) fn router_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryE
     );
     router.register_service(
         service_com_amazonaws_codepipeline_codepipeline_20150709::EmulatedService::new(
+            Arc::clone(&engine),
+        ),
+    );
+    router.register_service(
+        service_com_amazonaws_sns_amazonsimplenotificationservice::EmulatedService::new(
             Arc::clone(&engine),
         ),
     );
@@ -173,6 +185,27 @@ pub(crate) fn xml_texts(xml: &str, tag: &str) -> Vec<String> {
 /// The first `<tag>` text, or `None` when the response carries none.
 pub(crate) fn xml_text(xml: &str, tag: &str) -> Option<String> {
     xml_texts(xml, tag).into_iter().next()
+}
+
+/// The inner text of every non-nested `<tag>…</tag>` BLOCK, in document order, left exactly
+/// as the serializer wrote it.
+///
+/// [`xml_texts`] is the leaf form of this scan: it unescapes what it finds, which is right
+/// for a value and wrong for a block that carries more elements. A caller reading a nested
+/// list (the `<member>`s inside one `<Details>`) takes the block first and scans INSIDE it,
+/// so a sibling list's members cannot be swept up with it.
+pub(crate) fn xml_blocks(xml: &str, tag: &str) -> Vec<String> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let mut found = Vec::new();
+    let mut rest = xml;
+    while let Some(start) = rest.find(&open) {
+        let after = &rest[start + open.len()..];
+        let Some(end) = after.find(&close) else { break };
+        found.push(after[..end].to_string());
+        rest = &after[end + close.len()..];
+    }
+    found
 }
 
 pub(crate) async fn create_stack(

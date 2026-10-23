@@ -8,6 +8,15 @@ build = "build.rs"
 
 [dependencies]
 engine = { workspace = true }
+# `service-common` carries two readers this crate needs.
+# `arn`: the ONE parse of a caller-supplied resource ARN (the six fields, the vendor and
+# the resource field), which this service reads every ARN a tagging call names through to
+# decide which kind of resource it addresses.
+# `query_error_envelope`: the `<RequestId>` element an awsQuery `<ErrorResponse>` carries
+# beside its `<Error>`, which no model declares and the framework's error renderers do not
+# write. Shared with the Classic Elastic Load Balancing crate, which serves this model on
+# the endpoint the two share, so one endpoint cannot answer two envelopes.
+service-common = { path = "../common" }
 smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }
 aws-smithy-schema-server = { workspace = true }
@@ -28,6 +37,13 @@ emulator-core-build-support = { workspace = true }
 [dev-dependencies]
 sha2 = { workspace = true }
 hex = { workspace = true }
+# The Classic Elastic Load Balancing service, which owns the shared `elasticloadbalancing`
+# routing key both APIs are published on: `tests/all/shared_endpoint_routing.rs` drives
+# this model through that front door, the way an AWS SDK ELBv2 client reaches it.
+# DEV-ONLY and deliberate: that crate takes this one as a normal dependency (it mounts this
+# model behind its front door), so the cycle closes through a dev-dependency, which Cargo
+# allows. Do not "fix" it by moving the front door.
+service-com-amazonaws-elasticloadbalancing-elasticloadbalancing-v7 = { workspace = true }
 
 [lints]
 workspace = true

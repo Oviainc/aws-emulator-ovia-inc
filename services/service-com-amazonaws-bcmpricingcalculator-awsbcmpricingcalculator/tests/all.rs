@@ -15,12 +15,16 @@
 mod account_class_gate;
 #[path = "all/bill_scenario_lifecycle.rs"]
 mod bill_scenario_lifecycle;
+#[path = "all/not_found_message_framing.rs"]
+mod not_found_message_framing;
 #[path = "all/preferences.rs"]
 mod preferences;
 #[path = "all/resource_tagging.rs"]
 mod resource_tagging;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/validation_refusal_detail.rs"]
+mod validation_refusal_detail;
 #[path = "all/validation_refusal_framing.rs"]
 mod validation_refusal_framing;
 #[path = "all/workload_estimate_deletion.rs"]

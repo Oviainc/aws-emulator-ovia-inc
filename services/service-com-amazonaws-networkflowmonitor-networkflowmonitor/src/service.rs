@@ -23,9 +23,10 @@
 //! - `override_operation` — serve a request the model's routing key cannot name
 //!   correctly. The default returns `None`, so every request resolves through the
 //!   generated routing table. Return `Some(op)` to route one yourself.
-//! - `override_refusal` — how this service words a request the framework refused
-//!   before any handler ran. The default returns `None`, keeping the framework's
-//!   wording. See the inline note on that method for how to reword.
+//! - `override_refusal` — EDITED HERE. How this service words a request the
+//!   framework refused before any handler ran: AWS's own envelope and clauses, with
+//!   an enum's admissible value set listed in ascending order of its values. See
+//!   [`sorted_enum_value_sets`] and the inline note on that method.
 //! - `override_routing_error` — how this service words a request that reached it
 //!   but named no modeled operation. The default returns `None`, so the entry
 //!   renders the protocol-correct default (query -> 400 InvalidAction, awsJson ->
@@ -40,10 +41,59 @@
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
 
+use aws_smithy_schema_server::{envelope, Violation, ViolationKind};
 use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service,
 };
 use std::sync::Arc;
+
+/// The error code this service answers a boundary constraint refusal with.
+///
+/// It is the code the framework's own restJson1 default already picks, and the code
+/// every operation of this service declares for a bad request
+/// (`smithy_query(query="operation",operation="ListMonitors")`:
+/// `ValidationException`, HTTP 400). It is named here because a chosen message has
+/// to travel with its matching code — a reworded message under a different code
+/// would change what a client branches on.
+const VALIDATION_EXCEPTION: &str = "ValidationException";
+
+/// `violations` with every enum requirement's value set listed in ASCENDING ORDER of
+/// its values, and every other violation exactly as the framework stated it.
+///
+/// THE RULE: a constraint-validation message states the admissible set of an
+/// enumerated member sorted by value, not in the order the model happens to declare
+/// the enum in. The order is derived from the values themselves, so it holds for
+/// every enum this service declares — the monitor status a listing filters on, the
+/// metric and destination category a query is started with — rather than for the one
+/// member a recording covers. Nothing else about the clause is this service's to
+/// choose: the envelope, the member path, the echoed value and every other
+/// requirement come straight back from [`envelope`], so they cannot drift from the
+/// framework's.
+///
+/// The structurally right home for this rule is the framework's own
+/// `Violation::requirement` (`vendor/smithy-schema-server/src/constraints.rs`), which
+/// a fix may not change from here, or the shared `override_refusal` body in
+/// `services/common/src/validation_message.rs` — whose seam today chooses only how a
+/// `@pattern` is quoted, and whose services' recordings do not all agree that a value
+/// set is sorted. Until one of the two learns the rule, it is stated here, for the
+/// one service whose recordings show it.
+fn sorted_enum_value_sets(violations: &[Violation]) -> Vec<Violation> {
+    violations
+        .iter()
+        .map(|violation| match &violation.kind {
+            ViolationKind::EnumValue(allowed) => {
+                let mut sorted = allowed.clone();
+                sorted.sort_unstable();
+                Violation {
+                    path: violation.path.clone(),
+                    kind: ViolationKind::EnumValue(sorted),
+                    value: violation.value.clone(),
+                }
+            }
+            _ => violation.clone(),
+        })
+        .collect()
+}
 
 /// The `com-amazonaws-networkflowmonitor-networkflowmonitor` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -97,16 +147,26 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // required member, or a value outside a declared bound) to let this service
+        // reword it.
+        //
+        // THE CODE is `ValidationException` — the modelled 400 for a bad request on
+        // every operation of this service, and the code the framework's own default
+        // picks here, so what a client branches on is unchanged.
+        //
+        // THE MESSAGE is the framework's own envelope and clauses, with ONE rule of
+        // this service's applied on top: an enum's admissible value set is listed in
+        // ascending order of its values (`sorted_enum_value_sets`).
+        //
+        // An authentication refusal keeps the framework's wording and its 403: it is
+        // not an input-constraint failure.
+        match refusal {
+            Refusal::Invalid(violations) => Some(Refused {
+                code: VALIDATION_EXCEPTION.to_string(),
+                message: envelope(&sorted_enum_value_sets(violations))?,
+            }),
+            _ => None,
+        }
     }
 
     fn override_routing_error(

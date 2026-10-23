@@ -10,15 +10,29 @@
 //! A log group's subscription filters live on the group they are "associated with"
 //! ([`LogGroupRecord::subscription_filters`]), so deleting the group removes them too.
 //!
+//! A log group's log transformer lives on the group too
+//! ([`LogGroupRecord::transformer`]), because `PutTransformer` creates one "for a single
+//! log group" and nothing else identifies it.
+//!
 //! The account's resource policies live here too: an account-scoped one in
 //! [`ComAmazonawsCloudwatchlogsLogs20140328State::account_resource_policies`], a
 //! resource-scoped one on the log group it is attached to
 //! ([`LogGroupRecord::resource_policy`]).
 //!
+//! The account's import tasks — the CloudTrail Lake imports `CreateImportTask` starts and
+//! `DescribeImportTasks` reports — live in
+//! [`ComAmazonawsCloudwatchlogsLogs20140328State::import_tasks`], each one an
+//! [`ImportTaskRecord`] carrying the instant the clock owes it a terminal status.
+//!
 //! A log group's data protection policy lives on that group as well
 //! ([`LogGroupRecord::data_protection_policy`]), because `PutDataProtectionPolicy`
 //! "applies to only the specified log group": one group holds at most one, and deleting
 //! the group takes its policy with it.
+//!
+//! The account's deliveries — each "a connection between a logical delivery source and a
+//! logical delivery destination", which `CreateDelivery` creates and `DescribeDeliveries`
+//! reports — live in [`ComAmazonawsCloudwatchlogsLogs20140328State::deliveries`], each one
+//! a [`DeliveryRecord`].
 
 use std::collections::BTreeMap;
 
@@ -29,6 +43,14 @@ pub const DEFAULT_REGION: &str = "us-east-1";
 /// The log group class `CreateLogGroup` applies when the request omits
 /// `logGroupClass` ("If you omit this parameter, the default of STANDARD is used").
 pub const DEFAULT_LOG_GROUP_CLASS: &str = "STANDARD";
+
+/// The one log group class a log-group-level transformer may be created on, from
+/// `PutTransformer`: "You can create transformers only for the log groups in the
+/// Standard log class." Spelled as the model's `LogGroupClass` spells it
+/// (`LOG_GROUP_CLASS_VALUES`). Named apart from [`DEFAULT_LOG_GROUP_CLASS`] because the
+/// two state different rules — the class a group gets when the request names none, and
+/// the class this feature requires — even where the model spells them the same.
+pub const TRANSFORMER_LOG_GROUP_CLASS: &str = "STANDARD";
 
 /// Per-event storage overhead CloudWatch Logs charges a log group's `storedBytes`.
 /// From the PutLogEvents quota: a batch's size "is calculated as the sum of all event
@@ -95,6 +117,94 @@ pub const MAX_ACCOUNT_RESOURCE_POLICIES: usize = 10;
 /// The model puts no `@length` on `DataProtectionPolicyDocument`, so nothing refuses an
 /// over-long document before the handler runs.
 pub const MAX_DATA_PROTECTION_POLICY_DOCUMENT_CHARS: usize = 30_720;
+
+/// The account-level policy type that protects sensitive data, from the model's
+/// `PolicyType` enum (`DATA_PROTECTION_POLICY` | `SUBSCRIPTION_FILTER_POLICY` |
+/// `FIELD_INDEX_POLICY` | `TRANSFORMER_POLICY` | `METRIC_EXTRACTION_POLICY`, the same
+/// five listed as [`crate::ops::types::POLICY_TYPE_VALUES`]). `policyType` targets that
+/// enum, so the boundary validator has already held it to those five by the time a
+/// handler runs.
+pub const POLICY_TYPE_DATA_PROTECTION: &str = "DATA_PROTECTION_POLICY";
+
+/// The account-level policy type that feeds log events to another service. See
+/// [`POLICY_TYPE_DATA_PROTECTION`] for where these five values come from.
+pub const POLICY_TYPE_SUBSCRIPTION_FILTER: &str = "SUBSCRIPTION_FILTER_POLICY";
+
+/// The account-level policy type that indexes fields. See
+/// [`POLICY_TYPE_DATA_PROTECTION`].
+pub const POLICY_TYPE_FIELD_INDEX: &str = "FIELD_INDEX_POLICY";
+
+/// The account-level policy type that transforms ingested log events. See
+/// [`POLICY_TYPE_DATA_PROTECTION`].
+pub const POLICY_TYPE_TRANSFORMER: &str = "TRANSFORMER_POLICY";
+
+/// The account-level policy type that controls EMF metric creation. See
+/// [`POLICY_TYPE_DATA_PROTECTION`].
+pub const POLICY_TYPE_METRIC_EXTRACTION: &str = "METRIC_EXTRACTION_POLICY";
+
+/// The scope an account-level policy carries when the put naming it specified none, from
+/// `PutAccountPolicy$scope`: "Currently the only valid value for this parameter is ALL,
+/// which specifies that the data protection policy applies to all log groups in the
+/// account. If you omit this parameter, the default of ALL is used." It is the only value
+/// of the model's `Scope` enum, so every stored account policy reports it.
+pub const DEFAULT_ACCOUNT_POLICY_SCOPE: &str = "ALL";
+
+/// The longest `policyDocument` `PutAccountPolicy` admits, from that member's own
+/// documentation: "The JSON specified in policyDocument can be up to 30,720 characters
+/// long." The model puts no `@length` on `AccountPolicyDocument`, so nothing refuses an
+/// over-long document before the handler runs.
+///
+/// It is the same bound the log-group-level
+/// [`MAX_DATA_PROTECTION_POLICY_DOCUMENT_CHARS`] states, named separately because it is a
+/// different member's sentence; an account-level data protection document is held to both,
+/// which is one bound either way.
+pub const MAX_ACCOUNT_POLICY_DOCUMENT_CHARS: usize = MAX_DATA_PROTECTION_POLICY_DOCUMENT_CHARS;
+
+/// The longest `selectionCriteria` `PutAccountPolicy` admits, from that member's own
+/// documentation: "The selectionCriteria string can be up to 25KB in length. The length is
+/// determined by using its UTF-8 bytes."
+pub const MAX_SELECTION_CRITERIA_BYTES: usize = 25 * 1024;
+
+/// The policy types a `selectionCriteria` may be put with.
+/// `PutAccountPolicy$selectionCriteria` names three — "Specifying selectionCriteria is
+/// valid only when you specify SUBSCRIPTION_FILTER_POLICY, FIELD_INDEX_POLICY or
+/// TRANSFORMER_POLICY for policyType" — and the operation's own documentation adds the
+/// fourth, describing metric extraction policies "that are each scoped to a subset of log
+/// groups with the selectionCriteria parameter", so a put of one is accepted rather than
+/// refused on the member sentence alone. A data protection policy is the one type neither
+/// sentence admits: it "applies to all log groups in the account".
+pub const SELECTION_CRITERIA_POLICY_TYPES: [&str; 4] = [
+    POLICY_TYPE_SUBSCRIPTION_FILTER,
+    POLICY_TYPE_FIELD_INDEX,
+    POLICY_TYPE_TRANSFORMER,
+    POLICY_TYPE_METRIC_EXTRACTION,
+];
+
+/// How many account-level policies of one type the account may hold when the policy being
+/// put is "scoped to a subset of log groups with the selectionCriteria parameter": for a
+/// transformer policy, "you can create as many as 20 account-level transformer policies",
+/// and for a field index policy, "as many as 20 account-level field index policies".
+pub const MAX_SCOPED_ACCOUNT_POLICIES: usize = 20;
+
+/// The same quota for a metric extraction policy, which has its own number: "Each account
+/// can have either one account-level metric extraction policy that applies to all log
+/// groups, or up to 5 policies that are each scoped to a subset of log groups with the
+/// selectionCriteria parameter."
+pub const MAX_SCOPED_METRIC_EXTRACTION_ACCOUNT_POLICIES: usize = 5;
+
+/// How many account-level policies of one type the account may hold when the policy being
+/// put applies to EVERY log group — the "one account-level transformer policy that applies
+/// to all log groups in the account" half of each quota sentence, and the whole quota for
+/// the two types that have no scoped form: "Each account can have only one account-level
+/// data protection policy" and "Each account can have one account-level subscription filter
+/// policy per Region."
+pub const MAX_UNSCOPED_ACCOUNT_POLICIES: usize = 1;
+
+/// The prefix a `policyName` may not start with, from `PutAccountPolicy$policyName`: "A
+/// name for the policy. This must be unique within the account and cannot start with
+/// `aws/`." The model puts no `@pattern` on `PolicyName`, so nothing refuses such a name
+/// before the handler runs.
+pub const RESERVED_POLICY_NAME_PREFIX: &str = "aws/";
 
 /// The `dataProtectionStatus` of a log group that has a data protection policy right
 /// now, from the model's `DataProtectionStatus` enum (`ACTIVATED` | `DELETED` |
@@ -182,6 +292,32 @@ pub const MAX_STREAM_EVENTS: usize = 20_000;
 /// The byte half of the per-stream storage ceiling. See [`MAX_STREAM_EVENTS`].
 pub const MAX_STREAM_BYTES: i64 = 8 * 1024 * 1024;
 
+/// An import task that is still running, from the model's `ImportStatus` enum
+/// (`IN_PROGRESS` | `CANCELLED` | `COMPLETED` | `FAILED`). This is the only
+/// non-terminal one: an import AWS accepts starts here and leaves it on its own.
+pub const IMPORT_STATUS_IN_PROGRESS: &str = "IN_PROGRESS";
+
+/// An import task a caller cancelled, from the model's `ImportStatus` enum.
+pub const IMPORT_STATUS_CANCELLED: &str = "CANCELLED";
+
+/// An import task that finished importing, from the model's `ImportStatus` enum.
+pub const IMPORT_STATUS_COMPLETED: &str = "COMPLETED";
+
+/// An import task that stopped on an error, from the model's `ImportStatus` enum. A task
+/// in this status reports why in `Import$errorMessage` ("Error message related to any
+/// failed imports").
+pub const IMPORT_STATUS_FAILED: &str = "FAILED";
+
+/// How long after it is created an import task becomes `COMPLETED`.
+///
+/// AWS documents no duration for an import ("Starts an import from a data source to
+/// CloudWatch Log"), so this span is THE EMULATOR'S OWN CHOICE: the import runs
+/// asynchronously, so the task is handed back `IN_PROGRESS` and the clock owes it a
+/// terminal status later. The span is deliberately not zero — a caller that reads or
+/// cancels the task straight after creating it still observes `IN_PROGRESS`, and the
+/// state rules that go with it.
+pub const IMPORT_COMPLETION_DELAY_MS: i64 = 500;
+
 /// Per-service state for com-amazonaws-cloudwatchlogs-logs-20140328. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsCloudwatchlogsLogs20140328State {
@@ -207,6 +343,30 @@ pub struct ComAmazonawsCloudwatchlogsLogs20140328State {
     /// operations in the account"). `None` until one is associated, and `None` again
     /// after `DisassociateKmsKey`.
     pub query_results_kms_key_id: Option<String>,
+    /// The account-level policies of `PutAccountPolicy`, keyed by `(policyType,
+    /// policyName)`: the two members `DeleteAccountPolicy` identifies one by, so policies
+    /// of different types may share a name and a put under a pair already stored updates
+    /// that policy in place. A `BTreeMap` so `DescribeAccountPolicies` enumerates one
+    /// type's policies in policy-name order without re-sorting.
+    ///
+    /// Account-level policies are not attached to any log group — they "apply to all log
+    /// groups in the account", including ones created later — so they live here rather
+    /// than on [`LogGroupRecord`].
+    pub account_policies: BTreeMap<(String, String), AccountPolicyRecord>,
+    /// Every import task of this account — the resource `CreateImportTask` starts and
+    /// `DescribeImportTasks` reports — keyed by `importId`. A `BTreeMap` so
+    /// `DescribeImportTasks` enumerates in import-id order without re-sorting, which is
+    /// also what makes its pagination cursor stable.
+    pub import_tasks: BTreeMap<String, ImportTaskRecord>,
+    /// Every delivery of this account — the resource `CreateDelivery` creates and
+    /// `DescribeDeliveries` reports — keyed by `Delivery$id`. A `BTreeMap` so
+    /// `DescribeDeliveries` enumerates in delivery-id order without re-sorting, which is
+    /// also what makes its pagination cursor stable.
+    ///
+    /// A delivery is an account-level resource rather than a log group's: its source and
+    /// its destination are both named by their own resources, so it lives here and not on
+    /// [`LogGroupRecord`].
+    pub deliveries: BTreeMap<String, DeliveryRecord>,
 }
 
 impl ComAmazonawsCloudwatchlogsLogs20140328State {
@@ -222,6 +382,20 @@ impl ComAmazonawsCloudwatchlogsLogs20140328State {
         let seq = self.next_policy_revision;
         self.next_policy_revision = self.next_policy_revision.saturating_add(1);
         seq
+    }
+
+    /// Materialise every import-task status change the clock has ALREADY made due, as of
+    /// `now_ms`.
+    ///
+    /// An import runs asynchronously, so its terminal status is owed by the clock rather
+    /// than by a call: the change was due at [`ImportTaskRecord::completion_due_ms`] even
+    /// if nobody asked. A reporting operation calls this before it reads, so what it
+    /// reports is what the clock already decided — never a status moved on because
+    /// something was polled.
+    pub fn materialize_due_import_transitions(&mut self, now_ms: i64) {
+        for task in self.import_tasks.values_mut() {
+            task.materialize_due_transitions(now_ms);
+        }
     }
 }
 
@@ -252,6 +426,517 @@ impl ResourcePolicyRecord {
             POLICY_SCOPE_ACCOUNT
         }
     }
+}
+
+/// One account-level policy — what `PutAccountPolicy` stores — as it is stored.
+///
+/// The document is kept VERBATIM, exactly the bytes the request carried, for the same
+/// reason as [`DataProtectionPolicyRecord::policy_document`]: AWS reports it back through
+/// `DescribeAccountPolicies` unchanged.
+#[derive(Debug, Clone)]
+pub struct AccountPolicyRecord {
+    /// `AccountPolicy$policyName` — "The name of the account policy."
+    pub policy_name: String,
+    /// `AccountPolicy$policyDocument` — "The policy document for this account policy."
+    pub policy_document: String,
+    /// `AccountPolicy$policyType` — "The type of policy for this account policy."
+    pub policy_type: String,
+    /// `AccountPolicy$scope` — "The scope of the account policy."
+    pub scope: String,
+    /// `AccountPolicy$selectionCriteria` — "The log group selection criteria that is used
+    /// for this policy." `None` for a policy that applies to all log groups.
+    pub selection_criteria: Option<String>,
+    /// `AccountPolicy$lastUpdatedTime` — "The date and time that this policy was most
+    /// recently updated."
+    pub last_updated_time_ms: i64,
+}
+
+impl AccountPolicyRecord {
+    /// This policy as the model's `AccountPolicy` structure, which is what both
+    /// `PutAccountPolicy` and `DescribeAccountPolicies` report, so one record renders the
+    /// same way through either.
+    ///
+    /// `accountId` is "The Amazon Web Services account ID that the policy applies to" —
+    /// this emulator's own account, because an account-level policy applies to the account
+    /// that created it.
+    pub fn reported(&self) -> crate::ops::types::AccountPolicy {
+        crate::ops::types::AccountPolicy {
+            policy_name: Some(self.policy_name.clone()),
+            policy_document: Some(self.policy_document.clone()),
+            last_updated_time: Some(self.last_updated_time_ms),
+            policy_type: Some(self.policy_type.clone()),
+            scope: Some(self.scope.clone()),
+            selection_criteria: self.selection_criteria.clone(),
+            account_id: Some(::engine::emulator_account_id().to_string()),
+        }
+    }
+}
+
+/// One import task — "An import job to move data from CloudTrail Event Data Store to
+/// CloudWatch" — as it is stored. Every member of the model's `Import` shape is reported
+/// from this record, so `DescribeImportTasks` answers from state alone.
+#[derive(Debug, Clone)]
+pub struct ImportTaskRecord {
+    /// `Import$importId` — "The unique identifier of the import task."
+    pub import_id: String,
+    /// `Import$importSourceArn` — "The ARN of the CloudTrail Lake Event Data Store being
+    /// imported from."
+    pub import_source_arn: String,
+    /// `CreateImportTask$importRoleArn` — "The ARN of the IAM role that grants CloudWatch
+    /// Logs permission to import". No `Import` member reports it, but the task is the only
+    /// record of the role the import runs under, so it is stored with the task. Written by
+    /// `CreateImportTask` once that operation is implemented (it is still a scaffold stub),
+    /// which is also the only caller [`ImportTaskRecord::new`] is waiting for — neither is
+    /// dead code to prune.
+    pub import_role_arn: String,
+    /// `Import$importDestinationArn` — "The ARN of the managed CloudWatch Logs log group
+    /// where the events are being imported to."
+    pub import_destination_arn: String,
+    /// `Import$importStatus`, one of the [`IMPORT_STATUS_IN_PROGRESS`] family.
+    pub import_status: String,
+    /// `ImportFilter$startEventTime`, when the create named one.
+    pub start_event_time_ms: Option<i64>,
+    /// `ImportFilter$endEventTime`, when the create named one.
+    pub end_event_time_ms: Option<i64>,
+    /// `ImportStatistics$bytesImported` — "The total number of bytes that have been
+    /// imported to the managed log group."
+    pub bytes_imported: i64,
+    /// `Import$creationTime`, in epoch milliseconds.
+    pub creation_time_ms: i64,
+    /// `Import$lastUpdatedTime`, in epoch milliseconds.
+    pub last_updated_time_ms: i64,
+    /// The instant this task's asynchronous import is due to reach `COMPLETED`, stored
+    /// rather than waited for: a reporting operation materialises the transition once the
+    /// clock is past it ([`materialize_due_import_transitions`]). `None` once the task is
+    /// in a terminal status, which owes no further transition.
+    ///
+    /// [`materialize_due_import_transitions`]:
+    ///     ComAmazonawsCloudwatchlogsLogs20140328State::materialize_due_import_transitions
+    pub completion_due_ms: Option<i64>,
+    /// `Import$errorMessage` — "Error message related to any failed imports". Only a
+    /// FAILED task carries one.
+    pub error_message: Option<String>,
+}
+
+impl ImportTaskRecord {
+    /// A brand-new import task: running, nothing imported yet, and due to complete
+    /// [`IMPORT_COMPLETION_DELAY_MS`] after it was created. This is what
+    /// `CreateImportTask` stores once it is implemented.
+    pub fn new(
+        import_id: &str,
+        import_source_arn: &str,
+        import_role_arn: &str,
+        import_destination_arn: &str,
+        import_filter: Option<&crate::ops::types::ImportFilter>,
+        creation_time_ms: i64,
+    ) -> Self {
+        Self {
+            import_id: import_id.to_string(),
+            import_source_arn: import_source_arn.to_string(),
+            import_role_arn: import_role_arn.to_string(),
+            import_destination_arn: import_destination_arn.to_string(),
+            import_status: IMPORT_STATUS_IN_PROGRESS.to_string(),
+            start_event_time_ms: import_filter.and_then(|filter| filter.start_event_time),
+            end_event_time_ms: import_filter.and_then(|filter| filter.end_event_time),
+            bytes_imported: 0,
+            creation_time_ms,
+            last_updated_time_ms: creation_time_ms,
+            completion_due_ms: Some(creation_time_ms.saturating_add(IMPORT_COMPLETION_DELAY_MS)),
+            error_message: None,
+        }
+    }
+
+    /// Whether this task has reached a status it can never leave — anything but
+    /// [`IMPORT_STATUS_IN_PROGRESS`], the one status the model's `ImportStatus` enum
+    /// describes as still running. This is the condition `CancelImportTask` refuses on
+    /// ("Cancels an ACTIVE import task"), and the one that tells this record it owes no
+    /// further clock transition.
+    pub fn is_terminal(&self) -> bool {
+        self.import_status != IMPORT_STATUS_IN_PROGRESS
+    }
+
+    /// This task's `importFilter`, or `None` when the create bounded the event time at
+    /// neither end — `ImportFilter`'s two members are both optional, so a task created
+    /// without either carries no filter to report.
+    pub fn import_filter(&self) -> Option<crate::ops::types::ImportFilter> {
+        let filter = crate::ops::types::ImportFilter {
+            start_event_time: self.start_event_time_ms,
+            end_event_time: self.end_event_time_ms,
+        };
+        (filter.start_event_time.is_some() || filter.end_event_time.is_some()).then_some(filter)
+    }
+
+    /// This task's `importStatistics`: what the import has moved so far, counted in state
+    /// rather than reported as progress nothing made.
+    pub fn import_statistics(&self) -> crate::ops::types::ImportStatistics {
+        crate::ops::types::ImportStatistics {
+            bytes_imported: Some(self.bytes_imported),
+        }
+    }
+
+    /// Materialise the status change the clock owes this task: a running import whose
+    /// completion instant has passed is `COMPLETED`, updated AT that instant and not at
+    /// the time something happened to look.
+    pub fn materialize_due_transitions(&mut self, now_ms: i64) {
+        if self.is_terminal() {
+            return;
+        }
+        let Some(due) = self.completion_due_ms else {
+            return;
+        };
+        if due <= now_ms {
+            self.import_status = IMPORT_STATUS_COMPLETED.to_string();
+            self.last_updated_time_ms = due;
+            self.completion_due_ms = None;
+        }
+    }
+}
+
+/// One delivery — "a connection between a logical delivery source and a logical delivery
+/// destination" — as it is stored. Every member of the model's `Delivery` shape is
+/// reported from this record, so `DescribeDeliveries` answers from state alone.
+#[derive(Debug, Clone)]
+pub struct DeliveryRecord {
+    /// `Delivery$id` — "The unique ID that identifies this delivery in your account."
+    /// Also the key the store enumerates by.
+    pub id: String,
+    /// `Delivery$arn` — "The Amazon Resource Name (ARN) that uniquely identifies this
+    /// delivery", as [`delivery_arn`] builds it.
+    pub arn: String,
+    /// `Delivery$deliverySourceName` — "The name of the delivery source that is associated
+    /// with this delivery."
+    pub delivery_source_name: String,
+    /// `Delivery$deliveryDestinationArn` — "The ARN of the delivery destination that is
+    /// associated with this delivery."
+    pub delivery_destination_arn: String,
+    /// `Delivery$deliveryDestinationType` — the vendor the destination resource belongs to
+    /// ([`delivery_destination_type_for_arn`]); `None` for a destination ARN naming none of
+    /// the four the model's `DeliveryDestinationType` enumerates.
+    pub delivery_destination_type: Option<String>,
+    /// `Delivery$recordFields` — "The record fields used in this delivery". `None` when the
+    /// create named no list at all, which is not the same as the empty list it may name
+    /// (`RecordFields` is `@length(min: 0)`).
+    pub record_fields: Option<Vec<String>>,
+    /// `Delivery$fieldDelimiter` — "The field delimiter that is used between record fields
+    /// when the final output format of a delivery is in Plain, W3C, or Raw format."
+    pub field_delimiter: Option<String>,
+    /// `Delivery$s3DeliveryConfiguration` — the configuration that applies "only when the
+    /// delivery destination resource is an S3 bucket".
+    pub s3_delivery_configuration: Option<crate::ops::types::S3DeliveryConfiguration>,
+    /// `Delivery$tags` — "The tags that have been assigned to this delivery." A `BTreeMap`
+    /// so the stored order is stable; `Tags` is `@length(min: 1)`, so a delivery carrying
+    /// none reports no member at all.
+    pub tags: BTreeMap<String, String>,
+}
+
+impl DeliveryRecord {
+    /// A brand-new delivery between one delivery source and one delivery destination, with
+    /// the ARN and the destination type DERIVED rather than taken from the caller: both are
+    /// facts about the resources being connected. This is what `CreateDelivery` stores once
+    /// it is implemented (it is still a scaffold stub), which is also the only caller this
+    /// constructor is waiting for.
+    ///
+    /// The optional members a create may name — `recordFields`, `fieldDelimiter`,
+    /// `s3DeliveryConfiguration`, `tags` — are left at their "the request named none" value
+    /// and set on the returned record by the caller that has them.
+    pub fn new(
+        id: &str,
+        region: &str,
+        delivery_source_name: &str,
+        delivery_destination_arn: &str,
+    ) -> Self {
+        Self {
+            id: id.to_string(),
+            arn: delivery_arn(region, id),
+            delivery_source_name: delivery_source_name.to_string(),
+            delivery_destination_arn: delivery_destination_arn.to_string(),
+            delivery_destination_type: delivery_destination_type_for_arn(delivery_destination_arn)
+                .map(ToString::to_string),
+            record_fields: None,
+            field_delimiter: None,
+            s3_delivery_configuration: None,
+            tags: BTreeMap::new(),
+        }
+    }
+
+    /// This delivery as the model's `Delivery` structure, which is what `CreateDelivery`,
+    /// `GetDelivery` and `DescribeDeliveries` all report, so one record renders the same way
+    /// through any of them.
+    pub fn reported(&self) -> crate::ops::types::Delivery {
+        crate::ops::types::Delivery {
+            id: Some(self.id.clone()),
+            arn: Some(self.arn.clone()),
+            delivery_source_name: Some(self.delivery_source_name.clone()),
+            delivery_destination_arn: Some(self.delivery_destination_arn.clone()),
+            delivery_destination_type: self.delivery_destination_type.clone(),
+            record_fields: self.record_fields.clone(),
+            field_delimiter: self.field_delimiter.clone(),
+            s3_delivery_configuration: self.s3_delivery_configuration.clone(),
+            tags: (!self.tags.is_empty()).then(|| {
+                self.tags
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect()
+            }),
+        }
+    }
+}
+
+/// A delivery's ARN, the form `Delivery$arn` ("The Amazon Resource Name (ARN) that uniquely
+/// identifies this delivery") carries: a `delivery` resource of this service, identified by
+/// the delivery's own id.
+pub fn delivery_arn(region: &str, id: &str) -> String {
+    ::engine::emulator_arn("logs", region, &format!("delivery:{id}"))
+}
+
+/// The ARN service namespace of each vendor a delivery destination can be, paired with the
+/// `DeliveryDestinationType` the model spells it as.
+///
+/// The four vendors are the ones `DescribeDeliveries` documents — "The destination can be
+/// CloudWatch Logs, Amazon S3, Firehose or X-Ray" — and each spelling is a value of the
+/// model's `DeliveryDestinationType` enum
+/// ([`crate::ops::types::DELIVERY_DESTINATION_TYPE_VALUES`]), never a string typed here.
+pub const DELIVERY_DESTINATION_VENDOR_TYPES: [(&str, &str); 4] = [
+    ("logs", "CWL"),
+    ("firehose", "FH"),
+    ("s3", "S3"),
+    ("xray", "XRAY"),
+];
+
+/// The `DeliveryDestinationType` of the resource an ARN names, or `None` for an ARN naming
+/// none of the four vendors a delivery destination can be.
+///
+/// The type is a property of the destination RESOURCE, not of the request:
+/// `Delivery$deliveryDestinationType` "Displays whether the delivery destination associated
+/// with this delivery is CloudWatch Logs, Amazon S3, Firehose, or X-Ray", so it is read off
+/// the destination's ARN ([`DELIVERY_DESTINATION_VENDOR_TYPES`]).
+pub fn delivery_destination_type_for_arn(arn: &str) -> Option<&'static str> {
+    let (vendor, _resource) = arn_service_and_resource(arn)?;
+    DELIVERY_DESTINATION_VENDOR_TYPES
+        .iter()
+        .find(|(namespace, _)| vendor == *namespace)
+        .map(|(_, destination_type)| *destination_type)
+}
+
+/// How many account-level policies of `policy_type` the account may hold IN TOTAL once a
+/// policy whose scoped-ness is `scoped` is added: each quota sentence is an either/or —
+/// "either one account-level metric extraction policy that applies to all log groups, or up
+/// to 5 policies that are each scoped to a subset of log groups with the selectionCriteria
+/// parameter" — so the number the account is held to is the one for the policy being put,
+/// and every policy of that type counts against it. Every number is one
+/// `PutAccountPolicy`'s own documentation states — see the constants it returns.
+pub fn max_account_policies(policy_type: &str, scoped: bool) -> usize {
+    if !scoped {
+        return MAX_UNSCOPED_ACCOUNT_POLICIES;
+    }
+    match policy_type {
+        POLICY_TYPE_TRANSFORMER | POLICY_TYPE_FIELD_INDEX => MAX_SCOPED_ACCOUNT_POLICIES,
+        POLICY_TYPE_METRIC_EXTRACTION => MAX_SCOPED_METRIC_EXTRACTION_ACCOUNT_POLICIES,
+        // A data protection policy and a subscription filter policy have no scoped half:
+        // the account holds one of each, whatever it is scoped to.
+        _ => MAX_UNSCOPED_ACCOUNT_POLICIES,
+    }
+}
+
+/// What an accepted account-level policy document says: the parts a handler acts on after
+/// [`check_account_policy_document`] accepts it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AccountPolicyShape {
+    /// The log groups a data protection policy's Audit action sends findings to, as
+    /// [`DataProtectionPolicyShape::findings_destination_log_groups`] reports them. Empty
+    /// for every other policy type, none of which names a destination log group.
+    pub findings_destination_log_groups: Vec<String>,
+}
+
+/// Judge a `PutAccountPolicy$policyDocument` against the rules that member's own
+/// documentation states for the `policyType` it is put with, answering the message to
+/// refuse it with, or what the accepted document says.
+///
+/// Every type's document is "the policy, in JSON" and can be "up to 30,720 characters
+/// long". Beyond that each type has its own documented shape, and only the rules the
+/// documentation states are enforced: which data identifiers, processors or fields exist
+/// is a catalogue that lives outside this service, and the grammar of `selectionCriteria`
+/// is judged by the caller of this function rather than here.
+pub fn check_account_policy_document(
+    policy_type: &str,
+    document: &str,
+) -> Result<AccountPolicyShape, String> {
+    if document.chars().count() > MAX_ACCOUNT_POLICY_DOCUMENT_CHARS {
+        return Err(format!(
+            "policyDocument can be up to {MAX_ACCOUNT_POLICY_DOCUMENT_CHARS} characters"
+        ));
+    }
+    match policy_type {
+        // "A data protection policy must include two JSON blocks" — the same document the
+        // log-group-level `PutDataProtectionPolicy` takes, so it is held to the same rule.
+        POLICY_TYPE_DATA_PROTECTION => {
+            let shape = check_data_protection_policy_document(document)?;
+            Ok(AccountPolicyShape {
+                findings_destination_log_groups: shape.findings_destination_log_groups,
+            })
+        }
+        POLICY_TYPE_SUBSCRIPTION_FILTER => {
+            check_subscription_filter_policy_document(document).map(|()| AccountPolicyShape::default())
+        }
+        POLICY_TYPE_FIELD_INDEX => {
+            check_field_index_policy_document(document).map(|()| AccountPolicyShape::default())
+        }
+        POLICY_TYPE_TRANSFORMER => {
+            check_transformer_policy_document(document).map(|()| AccountPolicyShape::default())
+        }
+        // A metric extraction policy "controls whether CloudWatch Metrics can be created
+        // through the Embedded Metrics Format (EMF)"; the documentation states no members
+        // for its document, so the one rule left is that it is a policy in JSON.
+        _ => policy_object(document).map(|_| AccountPolicyShape::default()),
+    }
+}
+
+/// The document as the JSON object every policy type but a transformer policy is
+/// expressed as ("Specify the policy, in JSON").
+fn policy_object(document: &str) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+    serde_json::from_str::<serde_json::Value>(document)
+        .ok()
+        .and_then(|parsed| match parsed {
+            serde_json::Value::Object(members) => Some(members),
+            _ => None,
+        })
+        .filter(|members| !members.is_empty())
+        .ok_or_else(|| "policyDocument must be the policy in JSON (a non-empty JSON object)".to_string())
+}
+
+/// Judge a `SUBSCRIPTION_FILTER_POLICY` document. The attributes are the ones
+/// `PutAccountPolicy$policyDocument` lists for one: "DestinationArn The ARN of the
+/// destination to deliver log events to", "RoleArn The ARN of an IAM role that grants
+/// CloudWatch Logs permissions to deliver ingested log events to the destination stream",
+/// "FilterPattern A filter pattern for subscribing to a filtered stream of log events" and
+/// "Distribution The method used to distribute log data to the destination". Each is held
+/// to the rule the log-group-level `PutSubscriptionFilter` holds the member of the same
+/// name to, so one destination is as acceptable account-wide as it is per group.
+fn check_subscription_filter_policy_document(document: &str) -> Result<(), String> {
+    let members = policy_object(document)?;
+    let string = |name: &str| members.get(name).and_then(serde_json::Value::as_str);
+    let Some(destination_arn) = string("DestinationArn") else {
+        return Err(
+            "policyDocument for a subscription filter policy must include a DestinationArn"
+                .to_string(),
+        );
+    };
+    if let Some(message) = unparsable_arn_message("DestinationArn", destination_arn) {
+        return Err(message);
+    }
+    // The same ordering as `PutSubscriptionFilter`: a destination that needs a role is
+    // refused for the missing role before the kind of resource its ARN names is judged.
+    if string("RoleArn").is_none() {
+        if let Some(vendor) = subscription_role_required_vendor(destination_arn) {
+            return Err(format!(
+                "DestinationArn for vendor {vendor} cannot be used without RoleArn"
+            ));
+        }
+    }
+    if !is_subscription_destination_arn(destination_arn) {
+        return Err(format!(
+            "DestinationArn must be the ARN of a {} resource",
+            SUBSCRIPTION_DESTINATIONS
+                .iter()
+                .map(|(service, _)| *service)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    if let Some(filter_pattern) = string("FilterPattern") {
+        validate_filter_pattern(filter_pattern)?;
+    }
+    // "the grouping can be set to Random for a more even distribution": the two values of
+    // the model's `Distribution` enum, which no boundary validator holds a JSON document
+    // to.
+    if let Some(distribution) = string("Distribution") {
+        if !crate::ops::types::DISTRIBUTION_VALUES.contains(&distribution) {
+            return Err(invalid_value_message(
+                "Distribution",
+                crate::ops::types::DISTRIBUTION_VALUES.iter().copied(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Judge a `FIELD_INDEX_POLICY` document. From `PutAccountPolicy$policyDocument`: the
+/// attributes are "Fields The array of field indexes to create" and "FieldsV2 The object
+/// of field indexes to create along with it's type"; "It must contain at least one field
+/// index"; "Supported types are FIELD_INDEX and FACET" (the model's `IndexType` enum);
+/// and "Field names within Fields and FieldsV2 must be mutually exclusive."
+fn check_field_index_policy_document(document: &str) -> Result<(), String> {
+    let members = policy_object(document)?;
+    let fields = match members.get("Fields") {
+        Some(fields) => fields
+            .as_array()
+            .ok_or_else(|| "Fields in policyDocument must be an array of field names".to_string())?
+            .iter()
+            .map(|field| {
+                field.as_str().map(str::to_string).ok_or_else(|| {
+                    "Fields in policyDocument must be an array of field names".to_string()
+                })
+            })
+            .collect::<Result<Vec<String>, String>>()?,
+        None => Vec::new(),
+    };
+    let fields_v2 = match members.get("FieldsV2") {
+        Some(fields_v2) => fields_v2
+            .as_object()
+            .ok_or_else(|| {
+                "FieldsV2 in policyDocument must be an object of field names and their types"
+                    .to_string()
+            })?
+            .clone(),
+        None => serde_json::Map::new(),
+    };
+    for (name, configuration) in &fields_v2 {
+        let index_type = configuration
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| format!("the FieldsV2 entry '{name}' in policyDocument must carry a type"))?;
+        if !crate::ops::types::INDEX_TYPE_VALUES.contains(&index_type) {
+            return Err(invalid_value_message(
+                &format!("FieldsV2 '{name}' type"),
+                crate::ops::types::INDEX_TYPE_VALUES.iter().copied(),
+            ));
+        }
+    }
+    if fields.is_empty() && fields_v2.is_empty() {
+        return Err(
+            "policyDocument for a field index policy must contain at least one field index"
+                .to_string(),
+        );
+    }
+    if let Some(name) = fields.iter().find(|field| fields_v2.contains_key(*field)) {
+        return Err(format!(
+            "the field '{name}' is listed in both Fields and FieldsV2 in policyDocument; field names within Fields and FieldsV2 must be mutually exclusive"
+        ));
+    }
+    Ok(())
+}
+
+/// Judge a `TRANSFORMER_POLICY` document: "A transformer policy must include one JSON
+/// block with the array of processors and their configurations." Which processors exist,
+/// and how each is configured, is the catalogue `PutTransformer` owns, so what is judged
+/// here is that the document carries a non-empty array of processor blocks — written
+/// either as that array itself or as an object holding it.
+fn check_transformer_policy_document(document: &str) -> Result<(), String> {
+    let expected =
+        "policyDocument for a transformer policy must include an array of processors".to_string();
+    let parsed = serde_json::from_str::<serde_json::Value>(document).map_err(|_| expected.clone())?;
+    let processors = match &parsed {
+        serde_json::Value::Array(processors) => processors.clone(),
+        serde_json::Value::Object(members) => members
+            .values()
+            .find_map(|value| value.as_array().cloned())
+            .ok_or_else(|| expected.clone())?,
+        _ => return Err(expected),
+    };
+    if processors.is_empty() || !processors.iter().all(serde_json::Value::is_object) {
+        return Err(expected);
+    }
+    Ok(())
 }
 
 /// One log group's data protection policy — what `PutDataProtectionPolicy` stores — as
@@ -443,6 +1128,11 @@ pub struct LogGroupRecord {
     /// The resource-scoped policy attached to this group, if one has been put: AWS
     /// allows "one per LogGroup resourceARN", so at most one.
     pub resource_policy: Option<ResourcePolicyRecord>,
+    /// The log-group level transformer `PutTransformer` created for this group, if one
+    /// has been put. A log group has at most one — `PutTransformer` "creates or updates
+    /// a log transformer for a single log group" and names it by nothing but the group —
+    /// and it lives on the group, so deleting the group takes its transformer with it.
+    pub transformer: Option<TransformerRecord>,
     /// The data protection policy attached to this group, if one has been put:
     /// `PutDataProtectionPolicy` "applies to only the specified log group" and a put
     /// replaces the policy the group holds, so at most one. `None` again after
@@ -479,6 +1169,7 @@ impl LogGroupRecord {
             streams: BTreeMap::new(),
             subscription_filters: BTreeMap::new(),
             resource_policy: None,
+            transformer: None,
             data_protection_policy: None,
             had_data_protection_policy: false,
             data_sources: Vec::new(),
@@ -490,8 +1181,9 @@ impl LogGroupRecord {
     /// has never held one — the member "displays whether this log group has a protection
     /// policy, or whether it had one in the past", so a group with neither has nothing to
     /// report. The other two values of the `DataProtectionStatus` enum belong to the
-    /// account-level policies of `PutAccountPolicy`, which no operation of this service
-    /// stores yet.
+    /// account-level policies of `PutAccountPolicy`
+    /// ([`ComAmazonawsCloudwatchlogsLogs20140328State::account_policies`]), which no
+    /// operation of this service moves a per-group status for yet.
     pub fn data_protection_status(&self) -> Option<&'static str> {
         if self.data_protection_policy.is_some() {
             Some(DATA_PROTECTION_STATUS_ACTIVATED)
@@ -669,6 +1361,91 @@ pub fn log_group_name_matches_pattern(name: &str, pattern: &str) -> bool {
                 None => name.contains(alternative),
             }
         })
+}
+
+/// One log-group level transformer — "a series of processors, where each processor
+/// applies one type of transformation to the log events ingested into this log group" —
+/// as it is stored, on the single log group it transforms for.
+#[derive(Debug, Clone)]
+pub struct TransformerRecord {
+    /// The processors, in the order the put listed them: "The processors work one after
+    /// another, in the order that you list them, like a pipeline", so the order is part
+    /// of the configuration and a read reports it back unchanged.
+    pub processors: Vec<crate::ops::types::Processor>,
+    /// When this transformer was first created for the group. An update keeps it: a put
+    /// over an existing transformer is the same transformer, reconfigured.
+    pub creation_time_ms: i64,
+    /// When the transformer was last put, which for a transformer created and never
+    /// updated is its creation time.
+    pub last_modified_time_ms: i64,
+}
+
+/// The transformations one processor names, as the model spells the members that carry
+/// them.
+///
+/// `Processor` is "the information about one processor in a log transformer" and a
+/// `transformerConfig` is "an array of processors, where each processor applies one type
+/// of transformation", so exactly one of the structure's members is populated. Reporting
+/// the populated ones lets a put refuse a processor that names none, and one that names
+/// several, with a message that lists what it named.
+pub fn processor_transformations(processor: &crate::ops::types::Processor) -> Vec<&'static str> {
+    // Destructured EXHAUSTIVELY — no `..` — so a processor kind the model gains is a
+    // COMPILE error here rather than a member this function silently cannot see, which
+    // would make a put naming only that kind look like a processor naming none.
+    let crate::ops::types::Processor {
+        add_keys,
+        copy_value,
+        csv,
+        date_time_converter,
+        delete_keys,
+        grok,
+        list_to_map,
+        lower_case_string,
+        move_keys,
+        parse_cloudfront,
+        parse_json,
+        parse_key_value,
+        parse_route53,
+        parse_to_ocsf,
+        parse_postgres,
+        parse_vpc,
+        parse_waf,
+        rename_keys,
+        split_string,
+        substitute_string,
+        trim_string,
+        type_converter,
+        upper_case_string,
+    } = processor;
+    // The member names are the model's own (`Processor`'s members), in model order.
+    [
+        ("addKeys", add_keys.is_some()),
+        ("copyValue", copy_value.is_some()),
+        ("csv", csv.is_some()),
+        ("dateTimeConverter", date_time_converter.is_some()),
+        ("deleteKeys", delete_keys.is_some()),
+        ("grok", grok.is_some()),
+        ("listToMap", list_to_map.is_some()),
+        ("lowerCaseString", lower_case_string.is_some()),
+        ("moveKeys", move_keys.is_some()),
+        ("parseCloudfront", parse_cloudfront.is_some()),
+        ("parseJSON", parse_json.is_some()),
+        ("parseKeyValue", parse_key_value.is_some()),
+        ("parseRoute53", parse_route53.is_some()),
+        ("parseToOCSF", parse_to_ocsf.is_some()),
+        ("parsePostgres", parse_postgres.is_some()),
+        ("parseVPC", parse_vpc.is_some()),
+        ("parseWAF", parse_waf.is_some()),
+        ("renameKeys", rename_keys.is_some()),
+        ("splitString", split_string.is_some()),
+        ("substituteString", substitute_string.is_some()),
+        ("trimString", trim_string.is_some()),
+        ("typeConverter", type_converter.is_some()),
+        ("upperCaseString", upper_case_string.is_some()),
+    ]
+    .into_iter()
+    .filter_map(|(member, populated)| populated.then_some(member))
+    .collect()
 }
 
 /// One subscription filter — "a real-time stream of log events ingested through

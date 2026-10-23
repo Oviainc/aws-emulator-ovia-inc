@@ -254,22 +254,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let property_definitions = input.property_definitions.clone().unwrap_or_default();
         // `dataType` is optional on `PropertyDefinitionRequest` but REQUIRED on
         // the `PropertyDefinitionResponse` a read reports, so a definition may
-        // omit it only where it refines one it inherits. A component type that
-        // extends nothing inherits nothing, so each of its own definitions must
-        // carry a `dataType`.
-        if extends_from.is_empty() {
-            for (property_name, definition) in &property_definitions {
-                if definition.data_type.is_none() {
-                    return Err(CreateComponentTypeErrorModeled::ValidationException(
-                        ValidationException {
-                            message: Some(format!(
-                                "propertyDefinitions.{property_name}.dataType is required for a \
-                                 component type that extends nothing"
-                            )),
-                        },
-                    )
-                    .into());
-                }
+        // omit it only where it refines one it inherits — the rule
+        // `crate::state::property_definition_needs_data_type` holds for every
+        // writer of a definition.
+        for (property_name, definition) in &property_definitions {
+            if crate::state::property_definition_needs_data_type(&extends_from, definition) {
+                return Err(CreateComponentTypeErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(format!(
+                            "propertyDefinitions.{property_name}.dataType is required for a \
+                             component type that extends nothing"
+                        )),
+                    },
+                )
+                .into());
             }
         }
 
@@ -301,10 +299,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .map(|(group_name, group)| {
                     (
                         group_name,
-                        crate::state::PropertyGroupRecord {
-                            group_type: group.group_type,
-                            property_names: group.property_names.unwrap_or_default(),
-                        },
+                        crate::state::PropertyGroupRecord::from_request(group),
                     )
                 })
                 .collect(),

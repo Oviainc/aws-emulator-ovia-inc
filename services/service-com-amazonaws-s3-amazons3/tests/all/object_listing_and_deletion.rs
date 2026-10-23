@@ -599,15 +599,12 @@ async fn a_bucket_is_deletable_only_once_it_holds_no_objects() {
         );
     }
 
-    // `HeadBucket` stops answering 200 too. Its status is the framework's client-error
-    // default rather than the 404 S3 answers — `NotFound` is the only error it declares
-    // and the model carries no `@httpError` on it — so what this pins is that the bucket
-    // is no longer there, not that status: the `NoSuchBucket` above is where the code is
-    // asserted, and HeadBucket's own status is the bucket-lifecycle suite's to pin.
+    // `HeadBucket` stops answering 200 too: of the three statuses it documents for a HEAD
+    // it cannot answer 200, 404 is the one that means the bucket is not there.
     let headed = head_bucket(&router, bucket_name).await;
-    assert_ne!(
-        headed.status, 200,
-        "HeadBucket must stop answering 200 once the bucket is deleted, got {}",
+    assert_eq!(
+        headed.status, 404,
+        "HeadBucket must answer 404 once the bucket is deleted, got {}",
         headed.status
     );
 }
@@ -619,20 +616,31 @@ async fn a_listing_parameter_this_emulator_cannot_serve_is_refused_not_guessed()
     bucket(&router, bucket_name).await;
     store_keys(&router, bucket_name, &["one", "two"]).await;
 
-    // (case, query, status, error code).
+    // (case, query, status, error code). `encoding-type=url` is NOT here: it is served
+    // (see `listing_encoding_type`), because it decides how this listing's key names are
+    // written rather than which entries it reports. A value the model's enum does not
+    // declare IS refused, because the response would otherwise echo an encoding the keys
+    // do not carry.
     let rows: &[(&str, &str, u16, &str)] = &[
         ("negative max-keys", "&max-keys=-1", 400, "InvalidArgument"),
+        (
+            // The boundary validator refuses a value outside the modelled `EncodingType`
+            // enum before the handler runs, through the framework's own refusal channel
+            // (`ValidationException`, HTTP 400) rather than S3's `InvalidArgument`; what
+            // this row pins is that such a request is REFUSED rather than answered 200
+            // with keys the response then claims an encoding for. The handler carries the
+            // same guard behind it, the way `PutBucketEncryption` guards its own
+            // `SSEAlgorithm`.
+            "an encoding type the model does not declare",
+            "&encoding-type=base64",
+            400,
+            "ValidationException",
+        ),
         (
             "a continuation token this service did not issue",
             "&continuation-token=not-a-token-we-minted",
             400,
             "InvalidArgument",
-        ),
-        (
-            "encoding-type, which changes how keys are written",
-            "&encoding-type=url",
-            501,
-            "NotImplemented",
         ),
         (
             "fetch-owner, which adds an Owner to every entry",
@@ -658,7 +666,7 @@ async fn a_listing_parameter_this_emulator_cannot_serve_is_refused_not_guessed()
         );
     }
 
-    // The third unsupported parameter is a HEADER rather than a query parameter:
+    // The other unsupported parameter is a HEADER rather than a query parameter:
     // `x-amz-optional-object-attributes` asks for an attribute (restore status) no stored
     // object here has, so it keeps the 501 too.
     let with_attributes = send(

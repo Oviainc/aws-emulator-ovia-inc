@@ -17,7 +17,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use smithy_server_runtime::{Violation, ViolationKind};
 
 use crate::ops::types::{
-    Check, ConnectivityInfo, Connector, ConnectorCheck, EipAssociation, Environment,
+    AccountSetting, Check, ConnectivityInfo, Connector, ConnectorCheck, EipAssociation, Environment,
     EnvironmentSummary, Host, LicenseInfo, ResourceNotFoundException,
     ServiceAccessSecurityGroups, ValidationException, VcfHostnames, Vlan, VmEntitlement,
 };
@@ -1066,6 +1066,129 @@ pub const MAX_ENTITLEMENTS_PER_ENVIRONMENT: usize = 1024;
 /// default, adjustable) is far below it.
 pub const MAX_EIP_ASSOCIATIONS_PER_VLAN: usize = 64;
 
+/// The most account-level EVS settings one Region holds.
+///
+/// Not a cap this service enforces as a count: a Region holds at most one value per
+/// setting NAME, and the names are the ones [`ACCOUNT_SETTINGS`] lists, so the reported
+/// list is bounded by that catalog's length — which is what has to stay inside the
+/// `@length(0..100)` of `AccountSettingList`, the shape `GetAccountSettings` reports the
+/// Region's settings as (`smithy_query(query="shape", shape="AccountSettingList")`).
+const _: () = assert!(
+    ACCOUNT_SETTINGS.len() <= 100,
+    "a Region's settings are reported as an AccountSettingList, whose @length is 0..100"
+);
+
+/// The most Regions this service holds account settings for — the cap that bounds
+/// caller-driven growth of [`ComAmazonawsEvsAmazonelasticvmwareserviceState::account_settings`].
+///
+/// The Region a setting is written under comes from the REQUEST (the SigV4 credential
+/// scope), so without a cap a caller could open a fresh per-Region bucket per call even
+/// though each bucket is itself bounded by [`ACCOUNT_SETTINGS`]. Past this many Regions,
+/// a put for a Region the store holds no settings for is refused with
+/// `PutAccountSettings`'s modelled `ValidationException`, never by discarding settings a
+/// caller already set; a put for a Region already in the store is unaffected.
+///
+/// The number is the emulator's own bound, not a contract: it is far above the number of
+/// Regions Amazon EVS is available in.
+pub const MAX_ACCOUNT_SETTING_REGIONS: usize = 64;
+
+/// One account-level EVS setting this service accepts: its name, and the domain its own
+/// documentation gives its value.
+#[derive(Debug, Clone, Copy)]
+pub struct AccountSettingSpec {
+    /// The setting's name, as `AccountSetting$name` spells it.
+    pub name: &'static str,
+    /// The largest value the setting takes.
+    pub maximum: u64,
+}
+
+/// Every account-level EVS setting `PutAccountSettings` accepts.
+///
+/// `AccountSetting$name` states the whole set, and each entry's TYPE and RANGE
+/// (`smithy_query(query="doc", shape="AccountSetting", member="name")`):
+///
+/// > The name of the EVS setting. Valid values are: `vcfPortedCoreCount` (type: numeric
+/// > string) — The total number of VCF license cores ported to Amazon EVS for the
+/// > account in that Region. The maximum value is 1,000,000 cores.
+///
+/// So the modelled `@length(1..128)` and `@pattern ^[a-zA-Z0-9]+$` on the two members are
+/// the SHAPE of a setting, not the domain of one: a name outside this list, a value that
+/// is not a numeric string, and a value past the named setting's maximum are each inside
+/// that shape and outside the documented domain, and are refused with
+/// `PutAccountSettings`'s modelled `ValidationException`
+/// ([`account_setting_failures`]). Add a row here when the model documents another
+/// setting; nothing else needs to change.
+pub const ACCOUNT_SETTINGS: &[AccountSettingSpec] = &[AccountSettingSpec {
+    name: "vcfPortedCoreCount",
+    maximum: 1_000_000,
+}];
+
+/// The setting `name` names, if it is one this service accepts.
+pub fn account_setting_spec(name: &str) -> Option<&'static AccountSettingSpec> {
+    ACCOUNT_SETTINGS.iter().find(|spec| spec.name == name)
+}
+
+/// Whether a run of ASCII digits denotes a number greater than `maximum`.
+///
+/// Compared digit-wise rather than parsed: a setting value may carry up to 128 digits
+/// (its modelled `@length`), which is past every integer type, so a value that is far
+/// too large has to be recognised as too large rather than as unparseable.
+fn exceeds(digits: &str, maximum: u64) -> bool {
+    let value = digits.trim_start_matches('0');
+    let ceiling = maximum.to_string();
+    value.len() > ceiling.len() || (value.len() == ceiling.len() && value > ceiling.as_str())
+}
+
+/// Every way the settings a `PutAccountSettings` request carries fall outside the domain
+/// [`ACCOUNT_SETTINGS`] documents, as `fieldList` entries — empty for a request this
+/// service accepts.
+///
+/// Each entry names the member path the boundary validator names a list element's member
+/// by (`settings.<1-based index>.member.<member>`), so a caller reads one member path
+/// whether the setting was refused for its SHAPE or for its DOMAIN, and states the
+/// requirement without quoting the rejected value back (the rule
+/// [`constraint_violation_message`] keeps for the modelled constraints). Every failure is
+/// reported, not just the first, exactly as [`aggregate_validation_error`] does.
+pub fn account_setting_failures(
+    settings: &[AccountSetting],
+) -> Vec<crate::ops::types::ValidationExceptionField> {
+    let supported = ACCOUNT_SETTINGS
+        .iter()
+        .map(|spec| spec.name)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut failures = Vec::new();
+    for (index, setting) in settings.iter().enumerate() {
+        // The element's path, as the framework builds it: 1-based index, then the step
+        // into the element.
+        let element = format!("settings.{}.{COLLECTION_STEP}", index + 1);
+        let Some(spec) = account_setting_spec(&setting.name) else {
+            // An unrecognised name has no documented domain, so nothing is said about
+            // its value: the name is the failure.
+            failures.push(field_failure(
+                &format!("{element}.name"),
+                &format!("must name a supported EVS account setting: {supported}"),
+            ));
+            continue;
+        };
+        if setting.value.is_empty() || !setting.value.bytes().all(|byte| byte.is_ascii_digit()) {
+            failures.push(field_failure(
+                &format!("{element}.value"),
+                &format!("must be a numeric string, the type of the {} setting", spec.name),
+            ));
+        } else if exceeds(&setting.value, spec.maximum) {
+            failures.push(field_failure(
+                &format!("{element}.value"),
+                &format!(
+                    "must be at most {}, the maximum value of the {} setting",
+                    spec.maximum, spec.name
+                ),
+            ));
+        }
+    }
+    failures
+}
+
 /// Per-service state for com-amazonaws-evs-amazonelasticvmwareservice. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsEvsAmazonelasticvmwareserviceState {
@@ -1073,6 +1196,19 @@ pub struct ComAmazonawsEvsAmazonelasticvmwareserviceState {
     /// so `ListEnvironments` has one stable order to page over. Bounded by
     /// [`MAX_ENVIRONMENTS`], which counts every record, `DELETED` ones included.
     pub environments: BTreeMap<String, StoredEnvironment>,
+    /// The account-level EVS settings that have been EXPLICITLY SET, as `<region> ->
+    /// <setting name> -> value`.
+    ///
+    /// Account settings are regional ("for your Amazon Web Services account in the
+    /// specified Amazon Web Services Region", `Get`/`PutAccountSettings` docs), so the
+    /// outer key is the Region the caller addressed and a setting set at one endpoint is
+    /// not reported at another. A name is absent from the inner map until a
+    /// `PutAccountSettings` names it: "EVS settings that have never been explicitly set
+    /// are omitted from the response" (`GetAccountSettings$settings` doc). A `BTreeMap`
+    /// so the reported list has one stable order; one Region's settings are bounded by
+    /// the names [`ACCOUNT_SETTINGS`] documents, and the number of Regions by
+    /// [`MAX_ACCOUNT_SETTING_REGIONS`].
+    pub account_settings: BTreeMap<String, BTreeMap<String, String>>,
     /// The earliest instant at which any stored environment has a transition due, or
     /// `None` when none has. [`Self::materialise_due_transitions`] returns without
     /// looking at a single record until that instant arrives, so a request pays O(1)
@@ -1274,6 +1410,74 @@ impl ComAmazonawsEvsAmazonelasticvmwareserviceState {
         self.environments.values().any(|environment| {
             environment.state != STATE_DELETED && environment.hosts.contains_key(host_name)
         })
+    }
+
+    /// The account-level settings `region` holds, as the wire list `GetAccountSettings`
+    /// reports: one entry per setting EXPLICITLY SET at that endpoint and nothing else,
+    /// so a Region nobody has written to reports the empty list ("If no settings have
+    /// been set, an empty list is returned", `GetAccountSettings` doc).
+    ///
+    /// Ordered by setting name, the stored order, so two reads of an unchanged store
+    /// report the same list.
+    pub fn account_settings_in_region(&self, region: &str) -> Vec<AccountSetting> {
+        self.account_settings
+            .get(region)
+            .map(|held| {
+                held.iter()
+                    .map(|(name, value)| AccountSetting {
+                        name: name.clone(),
+                        value: value.clone(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Whether this store has room to hold account settings for `region`: a Region it
+    /// already holds settings for always has, and one it does not only while the store
+    /// is below [`MAX_ACCOUNT_SETTING_REGIONS`].
+    pub fn has_room_for_account_settings(&self, region: &str) -> bool {
+        self.account_settings.contains_key(region)
+            || self.account_settings.len() < MAX_ACCOUNT_SETTING_REGIONS
+    }
+
+    /// Create or overwrite exactly the settings `requested` names in `region`, and
+    /// report them as stored.
+    ///
+    /// "EVS settings included in the request are created or overwritten. Settings
+    /// omitted from the request retain their current values." (`PutAccountSettings`
+    /// doc.) The answer is "the settings … that were modified in this request"
+    /// (`PutAccountSettingsResponse$settings` doc): one entry per name the request
+    /// carried, in the order the request first named it, carrying the value now stored —
+    /// which for a name given twice in one request is the LAST value given, since that
+    /// is the one the overwrite left behind.
+    pub fn put_account_settings(
+        &mut self,
+        region: &str,
+        requested: &[AccountSetting],
+    ) -> Vec<AccountSetting> {
+        if requested.is_empty() {
+            // Nothing is modified, so nothing is written: a put that names no setting
+            // does not even bring this Region's map into existence.
+            return Vec::new();
+        }
+        let held = self.account_settings.entry(region.to_string()).or_default();
+        for setting in requested {
+            held.insert(setting.name.clone(), setting.value.clone());
+        }
+        let mut reported: Vec<AccountSetting> = Vec::with_capacity(requested.len());
+        for setting in requested {
+            if reported.iter().any(|already| already.name == setting.name) {
+                continue;
+            }
+            if let Some(value) = held.get(&setting.name) {
+                reported.push(AccountSetting {
+                    name: setting.name.clone(),
+                    value: value.clone(),
+                });
+            }
+        }
+        reported
     }
 }
 

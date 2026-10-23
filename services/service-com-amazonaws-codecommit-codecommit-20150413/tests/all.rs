@@ -11,12 +11,20 @@
 // `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` resolves to a SIBLING
 // (`tests/state_roundtrip.rs`) — which the layout check refuses. The `#[path]` is what
 // points it into `tests/all/`.
+#[path = "all/approval_rule_template_content_canonicalization.rs"]
+mod approval_rule_template_content_canonicalization;
 #[path = "all/approval_rule_template_content_update.rs"]
 mod approval_rule_template_content_update;
+#[path = "all/approval_rule_template_description.rs"]
+mod approval_rule_template_description;
 #[path = "all/approval_rule_templates.rs"]
 mod approval_rule_templates;
 #[path = "all/approval_rules_and_commits.rs"]
 mod approval_rules_and_commits;
+#[path = "all/aws_error_message_text.rs"]
+mod aws_error_message_text;
+#[path = "all/batch_associate_approval_rule_template.rs"]
+mod batch_associate_approval_rule_template;
 #[path = "all/batch_get_repositories.rs"]
 mod batch_get_repositories;
 #[path = "all/blob_content.rs"]
@@ -39,6 +47,8 @@ mod comment_content_deletion;
 mod comment_deleted_refusals;
 #[path = "all/comment_lifecycle.rs"]
 mod comment_lifecycle;
+#[path = "all/comment_thread_traversal.rs"]
+mod comment_thread_traversal;
 #[path = "all/commit_reads.rs"]
 mod commit_reads;
 #[path = "all/compared_commit_comments.rs"]
@@ -51,12 +61,16 @@ mod differences;
 mod file_commit_history;
 #[path = "all/folder_listing.rs"]
 mod folder_listing;
+#[path = "all/git_object_ids.rs"]
+mod git_object_ids;
 #[path = "all/git_transport.rs"]
 mod git_transport;
 #[path = "all/harness.rs"]
 mod harness;
 #[path = "all/object_store_bounds.rs"]
 mod object_store_bounds;
+#[path = "all/path_depth_bound.rs"]
+mod path_depth_bound;
 #[path = "all/repositories_for_approval_rule_template.rs"]
 mod repositories_for_approval_rule_template;
 #[path = "all/repository_description.rs"]

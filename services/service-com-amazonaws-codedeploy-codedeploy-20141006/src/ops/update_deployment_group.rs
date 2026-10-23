@@ -697,10 +697,8 @@ fn check_selector_counts<Filter>(
 }
 
 /// The refusal message for a selector list longer than the service accepts: it
-/// names the member and the limit, which is what a caller has to fix.
+/// names the member and the limit, which is what a caller has to fix. The
+/// wording is shared with every other operation taking a tag filter list.
 fn too_many_filters_message(member: &str) -> String {
-    format!(
-        "The number of tag filters in {member} exceeded the maximum allowed limit of {}",
-        crate::state::MAX_TAG_FILTERS_PER_LIST
-    )
+    crate::state::too_many_tag_filters(member)
 }

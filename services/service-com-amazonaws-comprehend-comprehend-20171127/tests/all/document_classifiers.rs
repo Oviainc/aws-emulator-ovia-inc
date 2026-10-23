@@ -44,15 +44,25 @@ use service_com_amazonaws_comprehend_comprehend_20171127::state::{
     document_classifier_arn, service_state, DocumentClassifier,
 };
 
-use crate::comprehend_client::{error_code, Comprehend, ACCOUNT_ID, REGION};
+use crate::comprehend_client::{error_code, error_message, Comprehend, ACCOUNT_ID, REGION};
+
+/// The message every resource-not-found refusal of this service carries.
+///
+/// Amazon Comprehend's own fixed sentence, carrying its reason code and NOTHING
+/// derived from the request. Written out here rather than imported from the service,
+/// so the suite pins the recorded text instead of whatever the code currently
+/// believes.
+const RESOURCE_NOT_FOUND_MESSAGE: &str = "RESOURCE_NOT_FOUND: Could not find specified resource.";
 
 /// The order a classifier's `ModelStatus` may only move forward along when nobody
 /// stops it.
 ///
-/// The terminal status of a started training is `IN_ERROR`, not `TRAINED`: training
-/// means reading the labelled documents from the Amazon S3 location
-/// `InputDataConfig` names and fitting a model on them, and this emulator serves no
-/// object storage and runs no training, so nothing is read and nothing is fitted.
+/// A started training ends `IN_ERROR` in THIS suite, whose emulator mounts no object
+/// storage: training means reading the labelled documents from the Amazon S3
+/// location `InputDataConfig` names and fitting a model on them, and nothing answers
+/// those calls here, so the training reports what it could not read.
+/// `classifier_training` is the suite that mounts object storage and asserts the
+/// TRAINED model and the metrics it measured.
 const LIFECYCLE: &[&str] = &["SUBMITTED", "TRAINING", "IN_ERROR"];
 
 /// The status a started training reaches, as `MODEL_STATUS_VALUES` spells it.
@@ -260,6 +270,20 @@ async fn the_reads_refuse_an_arn_no_classifier_was_created_under() {
                 "ResourceNotFoundException",
                 "case {operation} with {arn:?}: expected ResourceNotFoundException, got {body}"
             );
+            // The service's own fixed text for a resource that is not there: it
+            // carries the reason code and NOTHING derived from the request, so the
+            // ARN the caller asked for is never echoed back.
+            assert_eq!(
+                error_message(&body),
+                RESOURCE_NOT_FOUND_MESSAGE,
+                "case {operation} with {arn:?}: expected the fixed not-found message, got \
+                 {body}"
+            );
+            assert!(
+                !error_message(&body).contains(&arn),
+                "case {operation} with {arn:?}: the refusal must not echo the requested ARN, \
+                 got {body}"
+            );
         }
     }
 }
@@ -269,8 +293,8 @@ async fn the_reads_refuse_an_arn_no_classifier_was_created_under() {
 // The suites below seed classifier records through the crate's own state API — the
 // SAME store, reached the same way, that the handler reads — rather than through
 // `CreateDocumentClassifier`, because a seeded record can carry a `ModelStatus`,
-// a submission instant and a metrics block that no creation this emulator performs
-// ever reaches (nothing is trained, so no record created here is ever `TRAINED`).
+// a submission instant and a metrics block of its own, without standing up the
+// object storage a real training run reads its documents from.
 
 /// How far apart two seeded submissions are, so each record has its own instant
 /// for the submit-time filters to select on.
@@ -1079,10 +1103,14 @@ async fn the_status_only_moves_forward_and_ends_in_the_modelled_failure() {
                      {properties}"
                 );
             }
-            // The reason the training could not be performed, naming the location it
-            // was pointed at.
+            // The reason the training could not be carried out, naming the location
+            // it was pointed at. No object storage answers this suite's emulator, so
+            // the training's own read is what failed.
             let message = properties["Message"].as_str().unwrap_or_default();
-            for expected in ["s3://other-bucket/corpus/", "no object storage"] {
+            for expected in [
+                "s3://other-bucket/corpus/",
+                "Could not read the training documents",
+            ] {
                 assert!(
                     message.contains(expected),
                     "case \"lifecycle\": expected the failure Message to mention \

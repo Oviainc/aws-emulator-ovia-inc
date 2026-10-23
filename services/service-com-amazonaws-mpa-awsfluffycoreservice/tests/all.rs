@@ -15,9 +15,21 @@
 mod approval_team_lifecycle;
 #[path = "all/authorization_gate.rs"]
 mod authorization_gate;
+#[path = "all/inactive_team_version_deletion.rs"]
+mod inactive_team_version_deletion;
 #[path = "all/policy_catalog.rs"]
 mod policy_catalog;
+#[path = "all/policy_version_detail.rs"]
+mod policy_version_detail;
 #[path = "all/policy_versions.rs"]
 mod policy_versions;
+#[path = "all/rejection_wording.rs"]
+mod rejection_wording;
+#[path = "all/resource_arn_reads.rs"]
+mod resource_arn_reads;
+#[path = "all/resource_policies.rs"]
+mod resource_policies;
+#[path = "all/resource_tags.rs"]
+mod resource_tags;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

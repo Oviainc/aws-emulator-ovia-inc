@@ -13,11 +13,13 @@
 //! 2. an execution reports `IN_PROGRESS`, and no compliance, until the instant the
 //!    clock owes it a terminal status, and a read never changes what a later read
 //!    sees;
-//! 3. the terminal status follows the proactive Config rules the account holds: an
-//!    execution with no rule implementation to run SUCCEEDS with the roll-up of the
-//!    recorded results (none, so `INSUFFICIENT_DATA`), and one that would have to run
-//!    a rule's implementation ends `FAILED` naming that rule, because this emulator
-//!    has no rule engine;
+//! 3. the terminal status and compliance follow the proactive Config rules the
+//!    account holds: an execution the account configured no proactive rule for ends
+//!    `FAILED` (nothing ran), one whose covering rules all already placed the resource
+//!    SUCCEEDS, one that would have to run a rule's implementation ends `FAILED`
+//!    naming that rule (this emulator has no rule engine), and the compliance is
+//!    `NOT_APPLICABLE` where no rule verdict applies to the resource and
+//!    `INSUFFICIENT_DATA` only where one applies but decided nothing;
 //!
 //! plus the modelled refusal for an evaluation id this account does not hold.
 //!
@@ -44,11 +46,14 @@ const SUCCEEDED: &str = "SUCCEEDED";
 /// See [`IN_PROGRESS`].
 const FAILED: &str = "FAILED";
 
-/// The `ComplianceType` an execution reports when no recorded evaluation result
-/// places the resource either way, from
+/// `ComplianceType` values, from
 /// `smithy_query(query="shape", shape="ComplianceType")`: `COMPLIANT`,
-/// `NON_COMPLIANT`, `NOT_APPLICABLE`, `INSUFFICIENT_DATA`.
+/// `NON_COMPLIANT`, `NOT_APPLICABLE`, `INSUFFICIENT_DATA`. An execution reports
+/// `INSUFFICIENT_DATA` when a rule covering the resource decided nothing, and
+/// `NOT_APPLICABLE` when no rule verdict applies to it at all.
 const INSUFFICIENT_DATA: &str = "INSUFFICIENT_DATA";
+/// See [`INSUFFICIENT_DATA`].
+const NOT_APPLICABLE: &str = "NOT_APPLICABLE";
 
 /// The only published `ResourceConfigurationSchemaType` value, from
 /// `smithy_query(query="shape", shape="ResourceConfigurationSchemaType")`.
@@ -277,13 +282,13 @@ async fn an_execution_reports_in_progress_until_the_clock_owes_it_a_terminal_sta
     let settled = summary(&emulator, &id).await;
     assert_eq!(
         settled["EvaluationStatus"]["Status"].as_str(),
-        Some(SUCCEEDED),
-        "case \"settled\": with no proactive rule to run the execution succeeds, got {settled}"
+        Some(FAILED),
+        "case \"settled\": this account has no proactive rule, so nothing ran, got {settled}"
     );
     assert_eq!(
         settled["Compliance"].as_str(),
-        Some(INSUFFICIENT_DATA),
-        "case \"settled\": no recorded result places the resource, got {settled}"
+        Some(NOT_APPLICABLE),
+        "case \"settled\": no rule verdict applies to the resource, got {settled}"
     );
     assert_eq!(
         settled["EvaluationStartTimestamp"], running["EvaluationStartTimestamp"],
@@ -292,12 +297,14 @@ async fn an_execution_reports_in_progress_until_the_clock_owes_it_a_terminal_sta
 }
 
 /// One row of the terminal-outcome table: the rule the account holds when the
-/// execution runs, and the status it ends in.
+/// execution runs, the status it ends in, what its failure reason must name (nothing
+/// when it did not fail) and where it places the resource.
 struct OutcomeCase {
     name: &'static str,
     rule: Option<Value>,
     terminal_status: &'static str,
-    names_the_rule: Option<&'static str>,
+    reason_names: Option<&'static str>,
+    compliance: &'static str,
 }
 
 #[tokio::test]
@@ -316,18 +323,24 @@ async fn the_terminal_status_follows_the_proactive_rules_the_account_holds() {
 
     let cases = [
         OutcomeCase {
+            // Nothing is configured to evaluate in PROACTIVE mode, so there was no
+            // execution to run: the evaluation did not run, and no verdict applies.
             name: "no rules at all",
             rule: None,
-            terminal_status: SUCCEEDED,
-            names_the_rule: None,
+            terminal_status: FAILED,
+            reason_names: Some(PROACTIVE),
+            compliance: NOT_APPLICABLE,
         },
         OutcomeCase {
             name: "a rule in the default detective mode only",
             rule: Some(rule("detective-only", json!({}))),
-            terminal_status: SUCCEEDED,
-            names_the_rule: None,
+            terminal_status: FAILED,
+            reason_names: Some(PROACTIVE),
+            compliance: NOT_APPLICABLE,
         },
         OutcomeCase {
+            // The account DOES evaluate proactively, so the execution ran; no rule
+            // covers this resource, so nothing placed it.
             name: "a proactive rule scoped to another resource type",
             rule: Some(rule(
                 "proactive-elsewhere",
@@ -337,7 +350,8 @@ async fn the_terminal_status_follows_the_proactive_rules_the_account_holds() {
                 }),
             )),
             terminal_status: SUCCEEDED,
-            names_the_rule: None,
+            reason_names: None,
+            compliance: NOT_APPLICABLE,
         },
         OutcomeCase {
             name: "a proactive rule scoped to another resource id",
@@ -352,7 +366,8 @@ async fn the_terminal_status_follows_the_proactive_rules_the_account_holds() {
                 }),
             )),
             terminal_status: SUCCEEDED,
-            names_the_rule: None,
+            reason_names: None,
+            compliance: NOT_APPLICABLE,
         },
         OutcomeCase {
             // A tag scope narrows by the tags of a RECORDED resource, which the
@@ -366,7 +381,8 @@ async fn the_terminal_status_follows_the_proactive_rules_the_account_holds() {
                 }),
             )),
             terminal_status: SUCCEEDED,
-            names_the_rule: None,
+            reason_names: None,
+            compliance: NOT_APPLICABLE,
         },
         OutcomeCase {
             name: "an unscoped proactive rule",
@@ -375,7 +391,8 @@ async fn the_terminal_status_follows_the_proactive_rules_the_account_holds() {
                 json!({ "EvaluationModes": [{ "Mode": PROACTIVE }] }),
             )),
             terminal_status: FAILED,
-            names_the_rule: Some("proactive-everywhere"),
+            reason_names: Some("proactive-everywhere"),
+            compliance: INSUFFICIENT_DATA,
         },
         OutcomeCase {
             name: "a proactive rule scoped to this resource type",
@@ -387,7 +404,8 @@ async fn the_terminal_status_follows_the_proactive_rules_the_account_holds() {
                 }),
             )),
             terminal_status: FAILED,
-            names_the_rule: Some("proactive-buckets"),
+            reason_names: Some("proactive-buckets"),
+            compliance: INSUFFICIENT_DATA,
         },
         OutcomeCase {
             name: "a proactive rule scoped to this resource type and id",
@@ -402,7 +420,8 @@ async fn the_terminal_status_follows_the_proactive_rules_the_account_holds() {
                 }),
             )),
             terminal_status: FAILED,
-            names_the_rule: Some("proactive-this-bucket"),
+            reason_names: Some("proactive-this-bucket"),
+            compliance: INSUFFICIENT_DATA,
         },
     ];
 
@@ -426,15 +445,14 @@ async fn the_terminal_status_follows_the_proactive_rules_the_account_holds() {
             "case {name:?}: expected the execution to end {:?}, got {reported}",
             case.terminal_status
         );
-        match case.names_the_rule {
-            Some(rule_name) => {
+        match case.reason_names {
+            Some(named) => {
                 let reason = status["FailureReason"].as_str().unwrap_or_else(|| {
                     panic!("case {name:?}: a failed execution must say why, got {reported}")
                 });
                 assert!(
-                    reason.contains(rule_name),
-                    "case {name:?}: the failure reason must name the rule whose verdict \
-                     is missing, got {reason:?}"
+                    reason.contains(named),
+                    "case {name:?}: the failure reason must name {named:?}, got {reason:?}"
                 );
             }
             None => assert!(
@@ -445,9 +463,9 @@ async fn the_terminal_status_follows_the_proactive_rules_the_account_holds() {
         }
         assert_eq!(
             reported["Compliance"].as_str(),
-            Some(INSUFFICIENT_DATA),
-            "case {name:?}: with no evaluation result recorded the resource is placed \
-             nowhere, got {reported}"
+            Some(case.compliance),
+            "case {name:?}: expected Compliance {:?}, got {reported}",
+            case.compliance
         );
     }
 }

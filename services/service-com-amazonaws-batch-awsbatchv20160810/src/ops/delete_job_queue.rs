@@ -148,50 +148,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::state as batch;
 
-        let _ = ctx;
         let Some(state) = batch::service_state(&*self.engine) else {
             return Err(
                 DeleteJobQueueErrorModeled::ServerException(batch::unreachable_state()).into(),
             );
         };
         let now = batch::now_millis();
-        let mut state = state.lock();
-        state.materialize_due(now);
+        // The store's lock lives in THIS block and no longer, so nothing holds it while
+        // what `materialize_due` moved — the jobs a queue deleted earlier ended — is
+        // published (that call reaches another service in-process).
+        {
+            let mut state = state.lock();
+            state.materialize_due(now);
 
-        let Some(name) = state.job_queue_name(&input.job_queue) else {
-            // A removal of something that is not there is ALREADY DONE: the post-state
-            // this call asks for already holds, so it answers its empty success body and
-            // changes nothing (see `DeleteComputeEnvironment`).
-            return Ok(DeleteJobQueueOutput {});
-        };
-        let Some(queue) = state.job_queues.get(&name) else {
-            return Err(
-                DeleteJobQueueErrorModeled::ServerException(batch::unreachable_state()).into(),
-            );
-        };
-        // A delete already accepted is in flight: repeating it asks for a removal the
-        // clock already owes, so it is the same success and changes nothing.
-        if queue.status == batch::STATUS_DELETING {
-            return Ok(DeleteJobQueueOutput {});
-        }
-        if queue.state != batch::STATE_DISABLED {
-            return Err(DeleteJobQueueErrorModeled::ClientException(batch::client_exception(
-                format!(
-                    "Cannot delete job queue {name} while its state is {}: disable submissions \
-                     with UpdateJobQueue first",
-                    queue.state
-                ),
-            ))
-            .into());
-        }
+            let Some(name) = state.job_queue_name(&input.job_queue) else {
+                // A removal of something that is not there is ALREADY DONE: the
+                // post-state this call asks for already holds, so it answers its empty
+                // success body and changes nothing (see `DeleteComputeEnvironment`).
+                return Ok(DeleteJobQueueOutput {});
+            };
+            let Some(queue) = state.job_queues.get(&name) else {
+                return Err(
+                    DeleteJobQueueErrorModeled::ServerException(batch::unreachable_state()).into(),
+                );
+            };
+            // A delete already accepted is in flight: repeating it asks for a removal the
+            // clock already owes, so it is the same success and changes nothing.
+            if queue.status == batch::STATUS_DELETING {
+                return Ok(DeleteJobQueueOutput {});
+            }
+            if queue.state != batch::STATE_DISABLED {
+                return Err(DeleteJobQueueErrorModeled::ClientException(
+                    batch::client_exception(format!(
+                        "Cannot delete job queue {name} while its state is {}: disable \
+                         submissions with UpdateJobQueue first",
+                        queue.state
+                    )),
+                )
+                .into());
+            }
 
-        // Accepted: the queue enters DELETING now and stops existing when that move
-        // falls due (`state::materialize_due`).
-        if let Some(queue) = state.job_queues.get_mut(&name) {
-            queue.status = batch::STATUS_DELETING.to_string();
-            queue.status_reason = None;
-            queue.status_due_at = Some(now + batch::JOB_PHASE_MILLIS);
+            // Accepted: the queue enters DELETING now and stops existing when that move
+            // falls due (`state::materialize_due`).
+            if let Some(queue) = state.job_queues.get_mut(&name) {
+                queue.status = batch::STATUS_DELETING.to_string();
+                queue.status_reason = None;
+                queue.status_due_at = Some(now + batch::JOB_PHASE_MILLIS);
+            }
         }
+        batch::publish_job_state_changes(ctx, &*self.engine, &batch::request_region(ctx)).await;
 
         Ok(DeleteJobQueueOutput {})
     }

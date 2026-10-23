@@ -27,9 +27,27 @@
 //! reports is derived from the record and the clock
 //! ([`StoredHypervisor::state_as_of`]) so a read never moves it.
 //!
-//! Both listings page through one helper ([`page_of`], handing back a [`Page`]), so a
-//! page boundary and the token that encodes it mean the same thing whichever resource
-//! is being listed.
+//! The third resource this store owns is the **virtual machine**
+//! ([`StoredVirtualMachine`]), keyed by its own ARN. A virtual machine is not minted by
+//! this API — no operation of this model creates one; it is part of the INVENTORY of the
+//! hypervisor it runs on, which reaches the service out of band when the hypervisor's
+//! metadata is synced (the same out-of-band channel `activation_keys` describes). So
+//! [`ComAmazonawsBackupgatewayBackuponpremisesV20210101State::record_virtual_machine`] is
+//! the one way a record gets here, it records a machine only on a hypervisor this store
+//! holds, and `ListVirtualMachines` reports exactly those records — a hypervisor whose
+//! inventory has never been synced has none.
+//!
+//! Every listing pages through one helper ([`page_of_where`], handing back a [`Page`]),
+//! so a page boundary and the token that encodes it mean the same thing whichever
+//! resource is being listed, filtered ([`ComAmazonawsBackupgatewayBackuponpremisesV20210101State::page_of_virtual_machines`])
+//! or not.
+//!
+//! A hypervisor also carries its PROPERTY MAPPINGS ([`StoredPropertyMappings`]) — the
+//! VMware-to-Amazon tag mappings and the IAM role they are applied with. They live on
+//! the hypervisor record rather than in a map beside it, because that is the resource
+//! they belong to: `GetHypervisorPropertyMappings` reports the mappings of the record its
+//! `ServerArn` resolves to, and a hypervisor that carries none has no mappings resource
+//! to report ([`MissingResource::PropertyMappings`]).
 
 use std::collections::BTreeMap;
 use std::ops::Bound;
@@ -37,8 +55,14 @@ use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     BandwidthRateLimitInterval, Gateway, GatewayDetails, Hypervisor, HypervisorDetails,
-    MaintenanceStartTime, Tag,
+    MaintenanceStartTime, Tag, VirtualMachine,
 };
+
+/// The modelled mapping shape a stored property mapping is kept as, re-exported so the
+/// record, the handlers and a test all name ONE type
+/// (`smithy_query(query="shape",shape="VmwareToAwsTagMapping")`: `VmwareCategory`,
+/// `VmwareTagName`, `AwsTagKey`, `AwsTagValue`, all required) instead of mirroring it.
+pub use crate::ops::types::VmwareToAwsTagMapping;
 
 /// This service's ARN namespace (`smithy_query(query="service_info")`:
 /// `awsService.arnNamespace`), and the second-to-last ARN segment every gateway ARN
@@ -55,6 +79,14 @@ pub const GATEWAY_RESOURCE_TYPE: &str = "gateway";
 /// `ServerArn`), and the tagging operations take either kind in the one `ResourceARN`
 /// member — so they have to tell them apart. See [`MissingResource`].
 pub const HYPERVISOR_RESOURCE_TYPE: &str = "hypervisor";
+
+/// The ARN resource type of a virtual machine: `vm/<id>`.
+///
+/// The third resource this service's ARNs name, spelled as the modelled
+/// `VirtualMachine$ResourceArn` doc spells it
+/// (`smithy_query(query="shape",shape="VirtualMachine")`: "For example,
+/// `arn:aws:backup-gateway:us-west-1:0000000000000:vm/vm-0000ABCDEFGIJKL`").
+pub const VIRTUAL_MACHINE_RESOURCE_TYPE: &str = "vm";
 
 /// `ValidationException$ErrorCode` for a `CreateGateway` whose activation key this
 /// service never issued, and the sentence that states it.
@@ -74,6 +106,21 @@ pub const HYPERVISOR_NOT_FOUND: &str = "HypervisorNotFound";
 
 /// See [`HYPERVISOR_NOT_FOUND`].
 pub const HYPERVISOR_NOT_FOUND_MESSAGE: &str = "The hypervisor is not found.";
+
+/// `ResourceNotFoundException$ErrorCode` for a hypervisor that really exists but carries
+/// no property mappings, so there is no mappings resource to report. See
+/// [`MissingResource::PropertyMappings`].
+///
+/// `ErrorCode` is documented as "A description of which resource wasn't found"
+/// (`smithy_query(query="shape",shape="ResourceNotFoundException")`), and the resource
+/// that is missing here is the MAPPINGS, not the hypervisor — so the code names them,
+/// the way [`HYPERVISOR_NOT_FOUND`] names the hypervisor.
+pub const MAPPINGS_NOT_FOUND: &str = "MappingsNotFound";
+
+/// See [`MAPPINGS_NOT_FOUND`]. Phrased like [`HYPERVISOR_NOT_FOUND_MESSAGE`], the
+/// sentence this service is recorded stating for a resource it holds nothing for; the
+/// requirement is the error shape and the `ErrorCode`, and this wording is an example.
+pub const MAPPINGS_NOT_FOUND_MESSAGE: &str = "The mappings are not found.";
 
 /// The region a minted ARN falls back to when the request carries no SigV4 credential
 /// scope to read one from (an unsigned request on an emulator with authentication off).
@@ -141,6 +188,11 @@ pub const MAX_STORED_GATEWAYS: usize = 1_000;
 /// record per call, so the store is bounded and an import past the ceiling is refused
 /// rather than served.
 pub const MAX_STORED_HYPERVISORS: usize = 1_000;
+
+/// The largest number of virtual machines this emulator keeps, for the same reason as
+/// [`MAX_STORED_GATEWAYS`]: the inventory a hypervisor reports grows resident memory one
+/// record per machine, so the store is bounded and a record past the ceiling is not kept.
+pub const MAX_STORED_VIRTUAL_MACHINES: usize = 10_000;
 
 /// The page size a list operation of this service uses when a request names no
 /// `MaxResults`, and the largest page it will return whatever `MaxResults` asks for.
@@ -295,6 +347,15 @@ pub struct StoredHypervisor {
     /// The resource's tags, by key — the same representation [`StoredGateway::tags`]
     /// uses, so the tagging operations treat both resources alike.
     pub tags: BTreeMap<String, String>,
+    /// The hypervisor's property mappings, absent until they have been SET for it.
+    ///
+    /// An import never mints mappings: `PutHypervisorPropertyMappings` is the operation
+    /// that writes them (still a scaffold answering 501 under its own stub issue), and
+    /// `GetHypervisorPropertyMappings` reports whatever this field holds. Absent is a
+    /// meaningful value and not an empty mapping set: a hypervisor with no mappings has
+    /// no mappings resource to report ([`MissingResource::PropertyMappings`]), where one
+    /// whose mappings are an empty list has.
+    pub property_mappings: Option<StoredPropertyMappings>,
 }
 
 impl StoredHypervisor {
@@ -351,6 +412,93 @@ impl StoredHypervisor {
     pub fn tag_list(&self) -> Vec<Tag> {
         tag_list(&self.tags)
     }
+}
+
+/// One persisted virtual machine.
+///
+/// Keyed in the store by [`StoredVirtualMachine::arn`] — the `ResourceArn` the modelled
+/// `VirtualMachine` reports and `GetVirtualMachine` takes. The members are exactly the
+/// ones `VirtualMachine` reports (`smithy_query(query="shape",shape="VirtualMachine")`)
+/// plus the ARN of the hypervisor the machine runs on: a virtual machine belongs to its
+/// hypervisor (`VirtualMachine$HypervisorId` is "the ID of the virtual machine's
+/// hypervisor"), which is what `ListVirtualMachines` filters on, and the `HypervisorId` a
+/// read reports is that ARN's resource id rather than a second copy of it.
+#[derive(Debug, Clone)]
+pub struct StoredVirtualMachine {
+    /// The machine's ARN — the store's key.
+    pub arn: String,
+    /// `VirtualMachine$Name`.
+    pub name: String,
+    /// `VirtualMachine$HostName`.
+    pub host_name: String,
+    /// `VirtualMachine$Path` — where the machine sits in the hypervisor's inventory, and
+    /// the machine's identity ON that hypervisor: see
+    /// [`ComAmazonawsBackupgatewayBackuponpremisesV20210101State::record_virtual_machine`].
+    pub path: String,
+    /// The ARN of the hypervisor this machine runs on — a key of the `hypervisors` map.
+    pub hypervisor_arn: String,
+    /// `VirtualMachine$LastBackupDate`, absent for a machine that has never been backed
+    /// up.
+    pub last_backup_date: Option<SystemTime>,
+    /// When this record first entered the store — the instant the sync that discovered
+    /// the machine reported it. Kept across a re-sync of the same machine, so
+    /// re-reporting an unchanged inventory is visible as the one record it is. No member
+    /// of the modelled `VirtualMachine` carries it: it is the record's own provenance,
+    /// which `GetVirtualMachine` and a metadata-sync status (both still scaffolds) read
+    /// to tell a machine discovered by the latest sync from one carried over.
+    pub discovered_time: SystemTime,
+}
+
+impl StoredVirtualMachine {
+    /// This record as the `VirtualMachine` shape `ListVirtualMachines` returns.
+    ///
+    /// `HypervisorId` is read off the stored hypervisor ARN
+    /// ([`arn_resource_id`]) — the `hypervisor/<id>` suffix — so the id a listing reports
+    /// and the hypervisor the record belongs to cannot drift apart.
+    pub fn summary(&self) -> VirtualMachine {
+        VirtualMachine {
+            host_name: Some(self.host_name.clone()),
+            hypervisor_id: arn_resource_id(&self.hypervisor_arn).map(str::to_string),
+            name: Some(self.name.clone()),
+            path: Some(self.path.clone()),
+            resource_arn: Some(self.arn.clone()),
+            last_backup_date: self.last_backup_date.map(date_time),
+        }
+    }
+}
+
+/// What a hypervisor's inventory says about one virtual machine: the members a read of a
+/// machine reports, as the sync that discovered it found them.
+///
+/// Not a request shape — no operation of this model carries one. It is the argument of
+/// [`ComAmazonawsBackupgatewayBackuponpremisesV20210101State::record_virtual_machine`],
+/// the out-of-band channel a hypervisor's inventory reaches this service through.
+#[derive(Debug, Clone, Default)]
+pub struct VirtualMachineInventory {
+    /// `VirtualMachine$Name`.
+    pub name: String,
+    /// `VirtualMachine$HostName`.
+    pub host_name: String,
+    /// `VirtualMachine$Path`.
+    pub path: String,
+    /// `VirtualMachine$LastBackupDate`, absent for a machine never backed up.
+    pub last_backup_date: Option<SystemTime>,
+}
+
+/// The property mappings SET for one hypervisor.
+///
+/// The members are exactly the ones `GetHypervisorPropertyMappings` reports beside the
+/// `HypervisorArn` (`smithy_query(query="operation",
+/// operation="GetHypervisorPropertyMappings")`: `IamRoleArn`, `VmwareToAwsTagMappings`),
+/// kept as the MODELLED [`VmwareToAwsTagMapping`] shape so a member cannot drift between
+/// what is stored and what is serialised, and in the order they were set — a list, not a
+/// set, is what the model declares.
+#[derive(Debug, Clone)]
+pub struct StoredPropertyMappings {
+    /// `IamRoleArn` — the role the mappings are applied with.
+    pub iam_role_arn: String,
+    /// `VmwareToAwsTagMappings`, in the order they were set.
+    pub vmware_to_aws_tag_mappings: Vec<VmwareToAwsTagMapping>,
 }
 
 /// What an import asks for a hypervisor to be created with: the members
@@ -411,6 +559,17 @@ pub struct ComAmazonawsBackupgatewayBackuponpremisesV20210101State {
     hypervisors: BTreeMap<String, StoredHypervisor>,
     /// Monotonic counter behind the `hypervisor/<id>` ARN suffix.
     next_hypervisor_id: u64,
+    /// Virtual machines by ARN. A `BTreeMap` for the same reason as `hypervisors`: the
+    /// key order is total and stable, and it is the order `ListVirtualMachines` reports
+    /// them in — "a list of your VirtualMachine objects, ordered by their Amazon Resource
+    /// Names (ARNs)" (`smithy_query(query="operation",operation="ListVirtualMachines")`).
+    ///
+    /// One map for every hypervisor's machines, not one per hypervisor: the listing's
+    /// `HypervisorArn` is a FILTER on an otherwise whole-account listing (the member is
+    /// optional), so both listings page over the same order.
+    virtual_machines: BTreeMap<String, StoredVirtualMachine>,
+    /// Monotonic counter behind the `vm/<id>` ARN suffix.
+    next_virtual_machine_id: u64,
 }
 
 impl ComAmazonawsBackupgatewayBackuponpremisesV20210101State {
@@ -546,6 +705,9 @@ impl ComAmazonawsBackupgatewayBackuponpremisesV20210101State {
             latest_metadata_sync_status_message: None,
             created_time: now,
             tags: configuration.tags,
+            // An import sets no property mappings: they are SET for a hypervisor that
+            // already exists, so a freshly imported record carries none.
+            property_mappings: None,
         };
         // `or_insert` hands back a reference INTO the map, so the record returned is the
         // one the store now holds; the id counter makes the key fresh, so this always
@@ -568,8 +730,16 @@ impl ComAmazonawsBackupgatewayBackuponpremisesV20210101State {
     }
 
     /// Remove the hypervisor stored under `arn`, returning the record that was removed.
+    ///
+    /// The machines of its inventory go with it: a [`StoredVirtualMachine`] is a machine
+    /// ON a hypervisor, so once the hypervisor is gone the service holds no inventory for
+    /// it and `ListVirtualMachines` reports none — rather than machines whose
+    /// `HypervisorId` names nothing.
     pub fn remove_hypervisor(&mut self, arn: &str) -> Option<StoredHypervisor> {
-        self.hypervisors.remove(arn)
+        let removed = self.hypervisors.remove(arn)?;
+        self.virtual_machines
+            .retain(|_, machine| machine.hypervisor_arn != arn);
+        Some(removed)
     }
 
     /// How many hypervisors are stored.
@@ -591,6 +761,98 @@ impl ComAmazonawsBackupgatewayBackuponpremisesV20210101State {
         self.hypervisors
             .values()
             .find(|hypervisor| hypervisor.host == host)
+    }
+
+    /// Record one virtual machine of `hypervisor_arn`'s inventory, and hand back the
+    /// record as it is now STORED — read out of the map after the insert, so the ARN that
+    /// comes back is the key the store holds.
+    ///
+    /// This is the out-of-band channel described on `virtual_machines`: a machine is
+    /// discovered on the hypervisor it runs on, and no operation of this model creates
+    /// one, so nothing a client sends over the wire reaches here.
+    ///
+    /// A machine is identified on its hypervisor by its [`StoredVirtualMachine::path`] —
+    /// where it sits in that hypervisor's inventory — so reporting the same path again
+    /// UPDATES the record under the ARN the machine already has (keeping its
+    /// `discovered_time`) rather than minting a second machine for it, exactly as
+    /// [`Self::hypervisor_by_host`] keeps one hypervisor per host.
+    ///
+    /// `None` — nothing written — when this store holds no hypervisor under
+    /// `hypervisor_arn` (a machine cannot be on a hypervisor the service does not have),
+    /// or when the store already holds [`MAX_STORED_VIRTUAL_MACHINES`] machines.
+    pub fn record_virtual_machine(
+        &mut self,
+        region: &str,
+        hypervisor_arn: &str,
+        inventory: VirtualMachineInventory,
+        now: SystemTime,
+    ) -> Option<StoredVirtualMachine> {
+        if !self.hypervisors.contains_key(hypervisor_arn) {
+            return None;
+        }
+        let known = self
+            .virtual_machines
+            .values()
+            .find(|machine| {
+                machine.hypervisor_arn == hypervisor_arn && machine.path == inventory.path
+            })
+            .map(|machine| (machine.arn.clone(), machine.discovered_time));
+        let (arn, discovered_time) = match known {
+            Some(known) => known,
+            None => {
+                if self.virtual_machines.len() >= MAX_STORED_VIRTUAL_MACHINES {
+                    return None;
+                }
+                let machine_id = format!("vm-{:016x}", self.next_virtual_machine_id);
+                self.next_virtual_machine_id += 1;
+                let arn = ::engine::emulator_arn(
+                    ARN_SERVICE,
+                    &arn_region(region),
+                    &format!("{VIRTUAL_MACHINE_RESOURCE_TYPE}/{machine_id}"),
+                );
+                (arn, now)
+            }
+        };
+        let record = StoredVirtualMachine {
+            arn: arn.clone(),
+            name: inventory.name,
+            host_name: inventory.host_name,
+            path: inventory.path,
+            hypervisor_arn: hypervisor_arn.to_string(),
+            last_backup_date: inventory.last_backup_date,
+            discovered_time,
+        };
+        self.virtual_machines.insert(arn.clone(), record);
+        // Read back out of the map, so what a caller gets is the record the store holds.
+        self.virtual_machines.get(&arn).cloned()
+    }
+
+    /// The virtual machine stored under `arn`, if any.
+    pub fn virtual_machine(&self, arn: &str) -> Option<&StoredVirtualMachine> {
+        self.virtual_machines.get(arn)
+    }
+
+    /// How many virtual machines are stored.
+    pub fn virtual_machine_count(&self) -> usize {
+        self.virtual_machines.len()
+    }
+
+    /// One page of virtual machines in ARN order — the order `ListVirtualMachines`
+    /// reports them in — holding only the machines of `hypervisor_arn` when one is named.
+    ///
+    /// The filter is applied BEFORE the page is cut, so a page holds up to `limit`
+    /// MATCHING machines and carries a token only while a matching machine remains past
+    /// its boundary: a filtered listing pages exactly like an unfiltered one. Same
+    /// boundary contract as [`Self::page_of_gateways`], whose implementation it shares.
+    pub fn page_of_virtual_machines(
+        &self,
+        hypervisor_arn: Option<&str>,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Page<StoredVirtualMachine> {
+        page_of_where(&self.virtual_machines, after, limit, |machine| {
+            hypervisor_arn.is_none_or(|arn| machine.hypervisor_arn == arn)
+        })
     }
 
     /// The ARN `arn` is stored under and the tags the resource it names carries, or
@@ -643,11 +905,28 @@ impl ComAmazonawsBackupgatewayBackuponpremisesV20210101State {
 /// [`MAX_PAGE_SIZE`] by the handler, so no request can make one response carry a whole
 /// store.
 fn page_of<T: Clone>(records: &BTreeMap<String, T>, after: Option<&str>, limit: usize) -> Page<T> {
+    page_of_where(records, after, limit, |_| true)
+}
+
+/// One page of the records of an ARN-keyed map that `keep` accepts, in key order.
+///
+/// The paging [`page_of`] does, with a predicate: the records `keep` rejects are not part
+/// of the listing at all, so they neither fill a page nor make one promise a successor.
+/// `page_of` is this with a predicate that keeps everything, so a filtered listing and an
+/// unfiltered one cut their pages and mint their tokens the same way.
+fn page_of_where<T: Clone>(
+    records: &BTreeMap<String, T>,
+    after: Option<&str>,
+    limit: usize,
+    keep: impl Fn(&T) -> bool,
+) -> Page<T> {
     let lower = match after {
         Some(key) => Bound::Excluded(key.to_string()),
         None => Bound::Unbounded,
     };
-    let mut remaining = records.range((lower, Bound::Unbounded));
+    let mut remaining = records
+        .range((lower, Bound::Unbounded))
+        .filter(|(_, record)| keep(record));
     let page: Vec<(&String, &T)> = remaining.by_ref().take(limit).collect();
     // A token only when a record really remains past this page: the final page must
     // not carry one, or a paginating client never stops.
@@ -727,28 +1006,60 @@ pub fn decode_page_token(token: &str, resource_type: &str) -> Option<String> {
     is_resource_arn(&decoded, resource_type).then_some(decoded)
 }
 
+/// The segments of an ARN of this service: `arn:(aws|aws-cn|aws-us-gov):backup-gateway:
+/// <region>:<account>:<type>/<id>`.
+struct ArnParts<'a> {
+    region: &'a str,
+    account: &'a str,
+    resource_type: &'a str,
+    resource_id: &'a str,
+}
+
+/// Split `arn` into its segments, or `None` for anything that is not an ARN of this
+/// service at all (wrong field count, wrong literal or partition, another service, or no
+/// `<type>/<id>` resource).
+///
+/// The ONE parse of this service's ARN form: [`is_resource_arn`], [`arn_resource_type`]
+/// and [`arn_resource_id`] all read their answer off it, so the accepted form cannot be
+/// changed in one copy only. It says nothing about whether each segment satisfies the
+/// modelled pattern — that is `is_arn_segment`, which only the callers that need it ask.
+fn arn_parts(arn: &str) -> Option<ArnParts<'_>> {
+    let fields: Vec<&str> = arn.split(':').collect();
+    let [literal, partition, service, region, account, resource] = fields.as_slice() else {
+        return None;
+    };
+    if *literal != "arn" || !matches!(*partition, "aws" | "aws-cn" | "aws-us-gov") {
+        return None;
+    }
+    if *service != ARN_SERVICE {
+        return None;
+    }
+    let (resource_type, resource_id) = resource.split_once('/')?;
+    Some(ArnParts {
+        region,
+        account,
+        resource_type,
+        resource_id,
+    })
+}
+
 /// Whether `candidate` is an ARN of this service naming `resource_type`, in the form
 /// the modelled `GatewayArn` and `ServerArn` patterns accept:
 /// `arn:(aws|aws-cn|aws-us-gov):backup-gateway:<region>:<account>:<type>/<id>`, every
 /// segment non-empty and drawn from `[a-zA-Z-0-9]`.
 pub fn is_resource_arn(candidate: &str, resource_type: &str) -> bool {
-    let fields: Vec<&str> = candidate.split(':').collect();
-    let [arn, partition, service, region, account, resource] = fields.as_slice() else {
+    let Some(parts) = arn_parts(candidate) else {
         return false;
     };
-    if *arn != "arn" || !matches!(*partition, "aws" | "aws-cn" | "aws-us-gov") {
-        return false;
-    }
-    if *service != ARN_SERVICE {
-        return false;
-    }
-    let Some((kind, id)) = resource.split_once('/') else {
-        return false;
-    };
-    kind == resource_type
-        && [*region, *account, kind, id]
-            .into_iter()
-            .all(is_arn_segment)
+    parts.resource_type == resource_type
+        && [
+            parts.region,
+            parts.account,
+            parts.resource_type,
+            parts.resource_id,
+        ]
+        .into_iter()
+        .all(is_arn_segment)
 }
 
 /// The resource-type segment of a backup-gateway ARN — the `gateway` of
@@ -760,17 +1071,18 @@ pub fn is_resource_arn(candidate: &str, resource_type: &str) -> bool {
 /// ARN up as is read off the ARN rather than guessed from which store happens to hold
 /// a record.
 pub fn arn_resource_type(arn: &str) -> Option<&str> {
-    let fields: Vec<&str> = arn.split(':').collect();
-    let [literal, partition, service, _region, _account, resource] = fields.as_slice() else {
-        return None;
-    };
-    if *literal != "arn" || !matches!(*partition, "aws" | "aws-cn" | "aws-us-gov") {
-        return None;
-    }
-    if *service != ARN_SERVICE {
-        return None;
-    }
-    resource.split_once('/').map(|(kind, _id)| kind)
+    arn_parts(arn).map(|parts| parts.resource_type)
+}
+
+/// The resource-id segment of a backup-gateway ARN — the `hv-0000…` of
+/// `arn:aws:backup-gateway:<region>:<account>:hypervisor/hv-0000…` — or `None` for
+/// anything that is not an ARN of this service at all.
+///
+/// The counterpart of [`arn_resource_type`]: an operation that reports a resource's bare
+/// ID (`VirtualMachine$HypervisorId`) reads it off the ARN the store holds, so the id and
+/// the record cannot name two different resources.
+pub fn arn_resource_id(arn: &str) -> Option<&str> {
+    arn_parts(arn).map(|parts| parts.resource_id)
 }
 
 /// How this service refuses a well-formed resource ARN that names no resource it holds.
@@ -788,6 +1100,14 @@ pub enum MissingResource {
     /// The store holds hypervisors ([`StoredHypervisor`]), so this arm is reached for a
     /// hypervisor ARN the store has no record under — never for one it does.
     Hypervisor,
+    /// A hypervisor the store DOES hold, which carries no property mappings
+    /// ([`StoredHypervisor::property_mappings`]) — so the resource that is missing is the
+    /// mappings and not the hypervisor.
+    ///
+    /// Chosen by the operation that resolved the mappings, never by [`Self::for_arn`]:
+    /// the ARN names a hypervisor in both cases, and only the record says which of the
+    /// two is missing.
+    PropertyMappings,
     /// Every other resource type, including a `gateway/<id>` ARN with no gateway
     /// behind it.
     Other,
@@ -808,6 +1128,7 @@ impl MissingResource {
     pub fn error_code(self) -> Option<&'static str> {
         match self {
             Self::Hypervisor => Some(HYPERVISOR_NOT_FOUND),
+            Self::PropertyMappings => Some(MAPPINGS_NOT_FOUND),
             Self::Other => None,
         }
     }
@@ -816,6 +1137,7 @@ impl MissingResource {
     pub fn message(self, arn: &str) -> String {
         match self {
             Self::Hypervisor => HYPERVISOR_NOT_FOUND_MESSAGE.to_string(),
+            Self::PropertyMappings => MAPPINGS_NOT_FOUND_MESSAGE.to_string(),
             Self::Other => resource_not_found_message(arn),
         }
     }
@@ -826,7 +1148,10 @@ impl MissingResource {
     pub fn status_override(self) -> Option<u16> {
         match self {
             Self::Hypervisor => Some(400),
-            Self::Other => None,
+            // No recording shows this service answering a missing mappings resource with
+            // anything but the status `ResourceNotFoundException`'s `@httpError` declares,
+            // so that case keeps the model's 404 like every other resource type.
+            Self::PropertyMappings | Self::Other => None,
         }
     }
 }

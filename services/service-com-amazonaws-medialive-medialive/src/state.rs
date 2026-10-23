@@ -172,12 +172,12 @@ pub(crate) use multiplexes::{multiplex_description_output, multiplex_program_des
 pub mod event_bridge_rule_templates;
 
 pub use event_bridge_rule_templates::{
-    is_event_target_arn, is_event_type, EventBridgeRuleTemplateChanges,
-    EventBridgeRuleTemplateRecord, EventBridgeRuleTemplateRefusal,
-    EventBridgeRuleTemplateUpdateRefusal, NewEventBridgeRuleTemplate,
-    EVENT_BRIDGE_RULE_TEMPLATE_EVENT_TYPES, MAX_EVENT_BRIDGE_RULE_TEMPLATES,
-    MAX_EVENT_BRIDGE_RULE_TEMPLATE_TARGETS, MAX_EVENT_BRIDGE_RULE_TEMPLATE_TOKENS,
-    MAX_EVENT_TARGET_ARN_LEN,
+    event_bridge_rule_template_summary, is_event_target_arn, is_event_type,
+    EventBridgeRuleTemplateChanges, EventBridgeRuleTemplateRecord,
+    EventBridgeRuleTemplateRefusal, EventBridgeRuleTemplateUpdateRefusal,
+    NewEventBridgeRuleTemplate, EVENT_BRIDGE_RULE_TEMPLATE_EVENT_TYPES,
+    MAX_EVENT_BRIDGE_RULE_TEMPLATES, MAX_EVENT_BRIDGE_RULE_TEMPLATE_TARGETS,
+    MAX_EVENT_BRIDGE_RULE_TEMPLATE_TOKENS, MAX_EVENT_TARGET_ARN_LEN,
 };
 
 pub(crate) use event_bridge_rule_templates::event_bridge_rule_template_output;
@@ -1557,6 +1557,35 @@ impl ComAmazonawsMedialiveMedialiveState {
             .or_else(|| self.event_bridge_rule_template_group_named(region, identifier))
     }
 
+    /// Apply the members an `UpdateEventBridgeRuleTemplateGroup` request
+    /// supplied onto the group `identifier` names in `region`, and answer that
+    /// group's id — or `None` when this region holds no such group.
+    ///
+    /// "Updates the specified eventbridge rule template group": a member the
+    /// request carries replaces the stored one, a member it omits leaves that
+    /// value as it was, and `ModifiedAt` becomes the instant of the call, which
+    /// is when the record was last written. The identifier resolves through
+    /// [`Self::event_bridge_rule_template_group`], so an update reaches its
+    /// group by either form `Identifier` documents.
+    pub fn update_event_bridge_rule_template_group(
+        &mut self,
+        region: &str,
+        identifier: &str,
+        description: Option<String>,
+        now: SystemTime,
+    ) -> Option<String> {
+        let id = self
+            .event_bridge_rule_template_group(region, identifier)?
+            .id
+            .clone();
+        let group = self.event_bridge_rule_template_groups.get_mut(&id)?;
+        if let Some(description) = description {
+            group.description = Some(description);
+        }
+        group.modified_at = now;
+        Some(id)
+    }
+
     /// Remove the eventbridge rule template group `identifier` names in
     /// `region`, answering the record that was removed — or refuse.
     ///
@@ -1923,21 +1952,19 @@ impl ComAmazonawsMedialiveMedialiveState {
 
     /// The full `Input` description of one stored input, or `None` when no input
     /// has that id.
+    ///
+    /// Every member is DERIVED from the store as it stands at the moment of the
+    /// read rather than echoed from whatever the create request happened to
+    /// carry: `AttachedChannels` and `State` follow the channels that attach it,
+    /// and `Destinations` follows the ingest endpoints the service still holds
+    /// for it ([`described_input_destinations`]), so an input whose delete has
+    /// been accepted stops reporting them.
     pub fn input_description(&self, id: &str) -> Option<Input> {
         let input = self.inputs.get(id)?;
         Some(Input {
             arn: Some(input.arn.clone()),
             attached_channels: Some(self.attached_channels(id)),
-            destinations: Some(
-                input
-                    .destinations
-                    .iter()
-                    .enumerate()
-                    .map(|(index, destination)| {
-                        described_input_destination(input, index, destination)
-                    })
-                    .collect(),
-            ),
+            destinations: Some(described_input_destinations(input)),
             id: Some(input.id.clone()),
             input_class: Some(input.input_class().to_string()),
             input_devices: Some(input.input_devices.clone()),
@@ -1981,6 +2008,34 @@ impl ComAmazonawsMedialiveMedialiveState {
             sdi_sources: Some(input.sdi_sources.clone()),
             router_settings: input.router_settings.as_ref().map(described_router_settings),
         })
+    }
+
+    /// Accept the deletion of the input `id` names and answer with the input it
+    /// deleted, or `None` when no input has that id.
+    ///
+    /// `DeleteInput` answers with the input it just deleted: the representation
+    /// that input HAD when the delete was accepted, carrying the `State` the
+    /// acceptance put it in. Both halves come out of the store — the snapshot is
+    /// taken from the record before the deletion is written and the state is
+    /// read back from the record after it — so nothing is assembled out of the
+    /// request.
+    ///
+    /// That is why the snapshot is taken first: accepting the delete is what
+    /// RELEASES the input's ingest endpoints ([`described_input_destinations`]),
+    /// and a caller is told which endpoints the delete took down. Every later
+    /// read of the input answers from the record itself, so it reports none of
+    /// them.
+    ///
+    /// Idempotent, like [`begin_delete_input`]: a delete already accepted keeps
+    /// the instant the first call set, and its snapshot is the torn-down input's
+    /// own — endpoints already released and all.
+    pub fn delete_input_description(&mut self, id: &str, now: SystemTime) -> Option<Input> {
+        let mut deleted = self.input_description(id)?;
+        let record = self.inputs.get_mut(id)?;
+        begin_delete_input(record, now);
+        let record = self.inputs.get(id)?;
+        deleted.state = Some(self.input_state(record).to_string());
+        Some(deleted)
     }
 
     /// A primary channel's `FollowingChannelArns`: the ARNs of the channels
@@ -3051,6 +3106,10 @@ pub fn new_input(id: String, arn: String) -> InputRecord {
 /// waiter polls for). The record then stays in the account in that terminal
 /// state, so `DescribeInput` keeps reporting it rather than losing it.
 ///
+/// Accepting the delete also RELEASES the ingest endpoints the input held, which
+/// is why no read of it reports a destination afterwards
+/// ([`described_input_destinations`]).
+///
 /// Idempotent: a delete already accepted keeps the instant it was accepted at,
 /// so a repeated call neither restarts the clock nor revives a deleted input.
 pub fn begin_delete_input(input: &mut InputRecord, now: SystemTime) {
@@ -3068,6 +3127,38 @@ fn described_input_source(source: &InputSourceRequest) -> InputSource {
         url: source.url.clone(),
         username: source.username.clone(),
     }
+}
+
+/// An input's `Destinations` — "A list of the destinations of the input
+/// (PUSH-type)" — as they stand at the moment of the read.
+///
+/// A destination is an ingest ENDPOINT the service HOLDS for the input, not
+/// merely configuration the caller handed it: the address behind it is
+/// system-allocated and "remains fixed for the lifetime of the input"
+/// (`InputDestination$Ip`), and something listens on it for the stream an
+/// upstream system pushes. An input whose delete this service has accepted is
+/// being torn down — `DELETING` on its way to the terminal `DELETED` — so those
+/// endpoints are released and no read reports any of them: nothing ingests
+/// through them any more, and a client polling `DescribeInput` to learn the
+/// input has been released must not be handed an endpoint to keep pushing to.
+///
+/// Caller-supplied configuration (`Sources`, `SecurityGroups`, `Tags`, …) is NOT
+/// released this way: it is what the record says the input was, and the deleted
+/// record goes on reporting it.
+///
+/// The one projection that reports a released endpoint is the delete's own
+/// response, which answers with the input it deleted — see
+/// [`ComAmazonawsMedialiveMedialiveState::delete_input_description`].
+fn described_input_destinations(input: &InputRecord) -> Vec<InputDestination> {
+    if input.is_delete_accepted() {
+        return Vec::new();
+    }
+    input
+        .destinations
+        .iter()
+        .enumerate()
+        .map(|(index, destination)| described_input_destination(input, index, destination))
+        .collect()
 }
 
 /// `InputDestinationRequest` -> `InputDestination`, for the destination at
@@ -3540,9 +3631,9 @@ pub(crate) use input_security_group_description_output;
 
 /// Project a stored [`EventBridgeRuleTemplateGroupRecord`] onto one of the
 /// structurally identical per-operation group output shapes
-/// (`CreateEventBridgeRuleTemplateGroupOutput` and
-/// `GetEventBridgeRuleTemplateGroupOutput` today;
-/// `UpdateEventBridgeRuleTemplateGroupOutput` when its own issue lands).
+/// (`CreateEventBridgeRuleTemplateGroupOutput`,
+/// `GetEventBridgeRuleTemplateGroupOutput` and
+/// `UpdateEventBridgeRuleTemplateGroupOutput`).
 ///
 /// One macro rather than a hand-written copy per operation, so the operations
 /// that report a group cannot drift from each other. `Tags` is always reported,

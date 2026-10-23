@@ -1704,6 +1704,18 @@ impl ComAmazonawsOpensearchserverlessOpensearchserverlessState {
         Some(record)
     }
 
+    /// Remove the collection group `id` names, dropping its name index entry and every
+    /// idempotency token that named it with it — so a later `BatchGetCollectionGroup` of
+    /// that id or that name finds no live record and reports the `NOT_FOUND` error detail
+    /// instead of a stale `CollectionGroupDetail`, and the freed name may be created
+    /// again. Mirrors [`Self::remove_collection`].
+    pub fn remove_collection_group(&mut self, id: &str) -> Option<CollectionGroupRecord> {
+        let record = self.collection_groups.remove(id)?;
+        self.collection_group_name_index.remove(&record.name);
+        self.forget_tokens_for(id);
+        Some(record)
+    }
+
     /// Remove the security policy `(kind, name)` identifies, dropping every idempotency
     /// token that named it with it.
     pub fn remove_security_policy(

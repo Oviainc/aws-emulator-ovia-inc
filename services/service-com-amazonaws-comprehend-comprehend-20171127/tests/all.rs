@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/analysis_job_listing.rs"]
 mod analysis_job_listing;
+#[path = "all/analysis_job_runs.rs"]
+mod analysis_job_runs;
 #[path = "all/batch_detect_entities.rs"]
 mod batch_detect_entities;
 #[path = "all/batch_inference.rs"]
@@ -21,8 +23,12 @@ mod batch_inference;
 mod batch_sentiment;
 #[path = "all/batch_syntax.rs"]
 mod batch_syntax;
+#[path = "all/classifier_training.rs"]
+mod classifier_training;
 #[path = "all/comprehend_client.rs"]
 mod comprehend_client;
+#[path = "all/detect_pii_entities.rs"]
+mod detect_pii_entities;
 #[path = "all/document_classifiers.rs"]
 mod document_classifiers;
 #[path = "all/dominant_language_jobs.rs"]
@@ -39,12 +45,16 @@ mod scratch_dump;
 mod key_phrases_jobs;
 #[path = "all/pii_detection.rs"]
 mod pii_detection;
+#[path = "all/pii_entities.rs"]
+mod pii_entities;
 #[path = "all/pii_entities_jobs.rs"]
 mod pii_entities_jobs;
 #[path = "all/realtime_text_quotas.rs"]
 mod realtime_text_quotas;
 #[path = "all/request_validation.rs"]
 mod request_validation;
+#[path = "all/resource_policies.rs"]
+mod resource_policies;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/sentiment_jobs.rs"]

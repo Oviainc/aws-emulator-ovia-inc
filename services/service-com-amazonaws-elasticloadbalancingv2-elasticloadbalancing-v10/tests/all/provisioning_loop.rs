@@ -8,51 +8,140 @@
 //! body in, `<{Operation}Response>` XML out — so these tests exercise the wire
 //! protocol as well as the handlers, and every assertion is made on what a later
 //! read reports rather than on what the create answered.
+//!
+//! This module also carries the harness every suite in this crate shares: the router
+//! over one engine ([`emulator`]), the awsQuery request helpers, the XML readers, and
+//! the seeding of a resource whose create is still a scaffold stub
+//! ([`seed_trust_store`]).
 
+use service_com_amazonaws_elasticloadbalancingv2_elasticloadbalancing_v10::state::{
+    ComAmazonawsElasticloadbalancingv2ElasticloadbalancingV10State as ElbState, TrustStoreRecord,
+    TRUST_STORE_CREATING,
+};
 use smithy_server_runtime::MultiServiceRouter;
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 
 /// The region every request below is signed for; the ARNs and DNS names the service
 /// mints belong to it.
-const REGION: &str = "us-west-2";
+pub(crate) const REGION: &str = "us-west-2";
 
 /// The API version every awsQuery request carries, from the model's service version.
 const VERSION: &str = "2015-12-01";
 
 /// The canonical account id every emulator ARN carries.
-fn account() -> &'static str {
+pub(crate) fn account() -> &'static str {
     emulator_server::emulator_account_id()
 }
 
-/// A router carrying only this service, over one shared engine — what the production
-/// router mounts, minus the other services.
-fn router() -> MultiServiceRouter {
+/// A router carrying this service over one shared engine, plus that engine — what the
+/// production router mounts, minus the other services, with the store reachable so a
+/// suite can seed the record of a resource whose create is still a scaffold stub.
+pub(crate) fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
     router.register_service(
         service_com_amazonaws_elasticloadbalancingv2_elasticloadbalancing_v10::EmulatedService::new(
-            engine,
+            Arc::clone(&engine),
         ),
     );
-    router
+    (router, engine)
+}
+
+/// One trust store to seed: its name, how many CA certificates its bundle held, how
+/// many revoked entries its revocation lists hold, whether the clock still owes it its
+/// move to `ACTIVE`, and the tags it carries.
+#[derive(Default)]
+pub(crate) struct TrustStoreSeed<'a> {
+    pub(crate) name: &'a str,
+    pub(crate) certificates: i32,
+    pub(crate) revoked: i64,
+    pub(crate) settled: bool,
+    pub(crate) tags: &'a [(String, String)],
+}
+
+/// The instant seeded records are ordered from, so creation order is exact rather than
+/// dependent on how fast a suite runs.
+fn seed_epoch() -> SystemTime {
+    SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000)
+}
+
+/// Put one trust store in the store at creation position `index` and answer its ARN.
+///
+/// A suite seeds rather than creates because `CreateTrustStore` is still a scaffold stub
+/// with its own issue: reads and writes go through
+/// `service_..._v10::state::service_state`'s store, exactly as a handler's do, so a
+/// seeded record is the same record the handler serves. Seeding is also what lets the
+/// clock-owed `CREATING -> ACTIVE` move be asserted exactly — by placing the instant it
+/// is owed at either side of now — instead of sleeping for it.
+///
+/// The ARN is minted the way the service mints one — `emulator_arn` over this service's
+/// own namespace, with a 16-hex resource id — so a seeded record carries the same
+/// identifier a create would give it.
+pub(crate) fn seed_trust_store(
+    engine: &Arc<engine::InMemoryEngine>,
+    index: usize,
+    seed: &TrustStoreSeed<'_>,
+) -> String {
+    let id = format!("{:016x}", 0x5100_0000_0000_0000u64 + index as u64);
+    let arn = emulator_server::emulator_arn(
+        "elasticloadbalancing",
+        REGION,
+        &format!("truststore/{}/{id}", seed.name),
+    );
+    let now = SystemTime::now();
+    let record = TrustStoreRecord {
+        arn: arn.clone(),
+        name: seed.name.to_string(),
+        status: TRUST_STORE_CREATING.to_string(),
+        // A settled record is one whose move to `ACTIVE` the clock already owed; an
+        // unsettled one is still inside its settling span.
+        active_at: if seed.settled {
+            now - Duration::from_secs(1)
+        } else {
+            now + Duration::from_secs(3600)
+        },
+        created_at: seed_epoch() + Duration::from_secs(index as u64),
+        number_of_ca_certificates: seed.certificates,
+        total_revoked_entries: seed.revoked,
+        tags: seed
+            .tags
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect::<HashMap<String, String>>(),
+    };
+    let state = engine.state::<ElbState>();
+    let mut store = state.lock();
+    store
+        .name_to_trust_store_arn
+        .insert(record.name.clone(), arn.clone());
+    store.trust_stores.insert(arn.clone(), record);
+    arn
+}
+
+/// A router carrying only this service, over one shared engine — what the production
+/// router mounts, minus the other services.
+fn router() -> MultiServiceRouter {
+    emulator().0
 }
 
 /// One answer from the emulator.
-struct Reply {
-    status: u16,
-    body: String,
+pub(crate) struct Reply {
+    pub(crate) status: u16,
+    pub(crate) body: String,
 }
 
 impl Reply {
     /// The text of the first element named `tag`, or `None` when it is absent or
     /// empty.
-    fn text(&self, tag: &str) -> Option<String> {
+    pub(crate) fn text(&self, tag: &str) -> Option<String> {
         first_text(&self.body, tag)
     }
 
     /// The `<Code>` of an awsQuery error envelope.
-    fn error_code(&self) -> String {
+    pub(crate) fn error_code(&self) -> String {
         self.text("Code").unwrap_or_default()
     }
 }
@@ -65,7 +154,13 @@ impl Reply {
 /// `Cargo.lock` content six times, so the suite reads and writes the wire bytes with
 /// the crates the service already depends on. Escaping every non-alphanumeric byte is
 /// always a valid form encoding.
-fn encode(value: &str) -> String {
+///
+/// `pub(crate)` because the other suites in this one test binary
+/// (`all/shared_endpoint_routing.rs` and `all/query_error_envelope.rs`) write the same
+/// wire bytes and read them with the same helpers below: one encoder and one element
+/// reader for the crate, so the suites cannot drift on encoding or on how an empty
+/// element is reported.
+pub(crate) fn encode(value: &str) -> String {
     let mut out = String::new();
     for byte in value.as_bytes() {
         match byte {
@@ -77,7 +172,7 @@ fn encode(value: &str) -> String {
 }
 
 /// One form field.
-fn p(key: &str, value: &str) -> (String, String) {
+pub(crate) fn p(key: &str, value: &str) -> (String, String) {
     (key.to_string(), value.to_string())
 }
 
@@ -93,12 +188,12 @@ type HealthCheckCase = (&'static str, Form, HealthCheckExpectation);
 type RefusalCase = (&'static str, Form, u16, &'static str);
 
 /// `Action` plus `Version`, the two fields every awsQuery request carries.
-fn action(name: &str) -> Vec<(String, String)> {
+pub(crate) fn action(name: &str) -> Vec<(String, String)> {
     vec![p("Action", name), p("Version", VERSION)]
 }
 
 /// Send one awsQuery request: `pairs` are the form fields, `Action` included.
-async fn call(router: &MultiServiceRouter, pairs: &[(String, String)]) -> Reply {
+pub(crate) async fn call(router: &MultiServiceRouter, pairs: &[(String, String)]) -> Reply {
     let body = pairs
         .iter()
         .map(|(key, value)| format!("{}={}", encode(key), encode(value)))
@@ -132,13 +227,13 @@ async fn call(router: &MultiServiceRouter, pairs: &[(String, String)]) -> Reply 
 
 /// The text of the first element named `tag`, or `None` when it is absent or carries
 /// nothing (an empty list serializes as `<Tag></Tag>`).
-fn first_text(xml: &str, tag: &str) -> Option<String> {
+pub(crate) fn first_text(xml: &str, tag: &str) -> Option<String> {
     let (inner, _) = element_span(xml, tag, 0)?;
     (!inner.is_empty()).then(|| inner.to_string())
 }
 
 /// The XML inside each `<member>` of the first element named `container`.
-fn members(xml: &str, container: &str) -> Vec<String> {
+pub(crate) fn members(xml: &str, container: &str) -> Vec<String> {
     let Some((inner, _)) = element_span(xml, container, 0) else {
         return Vec::new();
     };
@@ -1150,6 +1245,13 @@ async fn a_repeat_with_the_same_settings_is_idempotent_and_a_different_one_is_a_
     form.push(p("LoadBalancerArn", &first));
     form.push(p("Protocol", "HTTPS"));
     form.push(p("Port", "80"));
+    // An HTTPS listener carries the default certificate the model brackets for it, so
+    // this row reaches the duplicate check rather than the certificate refusal pinned
+    // in `listener_tls_certificates.rs`.
+    form.push(p(
+        "Certificates.member.1.CertificateArn",
+        "arn:aws:acm:us-west-2:000000000000:certificate/dup-listener",
+    ));
     form.push(p("DefaultActions.member.1.Type", "forward"));
     form.push(p("DefaultActions.member.1.TargetGroupArn", &tg_first));
     let conflict = call(&router, &form).await;

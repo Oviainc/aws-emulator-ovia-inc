@@ -11,12 +11,15 @@
 //! agree on one implementation instead of carrying copies that can drift.
 //!
 //! The serverless cache is ElastiCache's other cache resource:
-//! `CreateServerlessCache` mints one and `DescribeServerlessCaches` reports it.
-//! Its record and its projection into the modelled `ServerlessCache` shape live
-//! here too, so `ModifyServerlessCache` / `DeleteServerlessCache` and the
-//! serverless snapshot operations — still scaffolded 501s, each with its own gap
-//! issue — write the same copy the reader reads instead of introducing a second
-//! one.
+//! `CreateServerlessCache` mints one, `DescribeServerlessCaches` reports it and
+//! `DeleteServerlessCache` takes it away. Its record and its projection into the
+//! modelled `ServerlessCache` shape live here too, so `ModifyServerlessCache`
+//! and the serverless snapshot operations — still scaffolded 501s, each with its
+//! own gap issue — write the same copy the reader reads instead of introducing a
+//! second one. A deleted cache does not vanish at the call: it answers
+//! `DELETING` and the clock owes its removal
+//! ([`ServerlessCacheRecord::pending_deletion`]), the same way a created one is
+//! owed `AVAILABLE`.
 //!
 //! A snapshot is a copy of a cluster as of the time it was taken:
 //! `CreateSnapshot` mints one from a stored cluster and `DescribeSnapshots`
@@ -50,10 +53,14 @@
 //! A cache parameter group is a supporting resource:
 //! `CreateCacheParameterGroup` mints a custom one and
 //! `DescribeCacheParameterGroups` reports it beside the family defaults the
-//! service publishes. The parameter VALUES inside a group are not held here —
-//! `DescribeCacheParameters`, `ModifyCacheParameterGroup` and
-//! `ResetCacheParameterGroup` are still scaffolded 501s and own their own gap
-//! issues.
+//! service publishes. The parameter VALUES a group has had SET on it live on
+//! that record ([`CacheParameterGroupRecord::parameter_values`]), because a
+//! group reports its family's engine defaults with exactly those values laid
+//! over them — which is what `DescribeCacheParameters` answers with.
+//! `ModifyCacheParameterGroup` and `ResetCacheParameterGroup`, the two
+//! operations that WRITE that map, are still scaffolded 501s and own their own
+//! gap issues; keeping the map on the group record is what will let them write
+//! the copy the reader already reads instead of a second one beside it.
 //!
 //! Beside the cache resources sits the RBAC user: `CreateUser` mints one and
 //! `DescribeUsers` reports it, over the one [`UserRecord`] map below, which also
@@ -73,10 +80,10 @@
 //! operation belongs to one of those resources, the comment beside it says so.
 //!
 //! The serverless cache is another customer-created resource this store holds:
-//! `CreateServerlessCache` mints one and `DescribeServerlessCaches` reports it.
-//! `ModifyServerlessCache` / `DeleteServerlessCache` and the serverless
-//! snapshot operations are still scaffolded 501s with their own gap issues, and
-//! they read and write the SAME record rather than a copy beside it.
+//! `CreateServerlessCache` mints one, `DescribeServerlessCaches` reports it and
+//! `DeleteServerlessCache` removes it. `ModifyServerlessCache` and the
+//! serverless snapshot operations are still scaffolded 501s with their own gap
+//! issues, and they read and write the SAME record rather than a copy beside it.
 //!
 //! A replication group is the other resource this state holds:
 //! `CreateReplicationGroup` mints one together with the member cache clusters it
@@ -201,6 +208,96 @@ pub const DEFAULT_SNAPSHOT_RETENTION_LIMIT: i32 = 0;
 /// this is the format's own example from `PreferredMaintenanceWindow`
 /// ("Example: sun:23:00-mon:01:30").
 pub const DEFAULT_MAINTENANCE_WINDOW: &str = "sun:23:00-mon:01:30";
+
+/// The day abbreviations a maintenance window may name, in week order.
+///
+/// `PreferredMaintenanceWindow` states them: "Valid values for `ddd` are: sun,
+/// mon, tue, wed, thu, fri, sat". The position in this list is the day's offset
+/// from the start of the week, which is what makes the span of a window that
+/// crosses midnight computable ([`maintenance_window_refusal`]).
+pub const MAINTENANCE_WINDOW_DAYS: [&str; 7] =
+    ["sun", "mon", "tue", "wed", "thu", "fri", "sat"];
+
+/// The documented minimum span of a maintenance window, in minutes:
+/// `PreferredMaintenanceWindow` states "The minimum maintenance window is a 60
+/// minute period."
+pub const MAINTENANCE_WINDOW_MIN_MINUTES: i64 = 60;
+
+/// Minutes in a day, and in a week: the arithmetic a `ddd:hh24:mi` point is
+/// placed on.
+const MINUTES_PER_DAY: i64 = 24 * 60;
+/// See [`MINUTES_PER_DAY`].
+const MINUTES_PER_WEEK: i64 = 7 * MINUTES_PER_DAY;
+
+/// How ElastiCache words a `PreferredMaintenanceWindow` it cannot read.
+///
+/// The format is the one the member documents — "a range in the format
+/// ddd:hh24:mi-ddd:hh24:mi (24H Clock UTC)" — and this is the wording AWS was
+/// recorded answering with. The HTTP status (400) and the awsQuery code
+/// (`InvalidParameterValue`) are the contract.
+pub const INVALID_MAINTENANCE_WINDOW_MESSAGE: &str =
+    "Invalid maintenance window format. Should be specified as a range \
+     ddd:hh24:mi-ddd:hh24:mi (24H Clock UTC). Example: Sun:23:15-Mon:03:15";
+
+/// Minutes from the start of the week that the `ddd:hh24:mi` point `value`
+/// names, or `None` when it is not one.
+///
+/// The day is matched case-insensitively against [`MAINTENANCE_WINDOW_DAYS`] and
+/// the clock fields are exactly two digits each on a 24-hour clock, so neither
+/// `notaday:99:99` nor `24:00` is a point.
+fn week_minute(value: &str) -> Option<i64> {
+    let mut fields = value.split(':');
+    let day = fields.next()?;
+    let hour = fields.next()?;
+    let minute = fields.next()?;
+    if fields.next().is_some() {
+        return None;
+    }
+    let day = MAINTENANCE_WINDOW_DAYS
+        .iter()
+        .position(|candidate| candidate.eq_ignore_ascii_case(day))?;
+    let clock_field = |field: &str, max: i64| -> Option<i64> {
+        if field.len() != 2 || !field.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        field.parse::<i64>().ok().filter(|value| *value <= max)
+    };
+    let hour = clock_field(hour, 23)?;
+    let minute = clock_field(minute, 59)?;
+    Some(i64::try_from(day).unwrap_or(0) * MINUTES_PER_DAY + hour * 60 + minute)
+}
+
+/// Why `value` cannot be a `PreferredMaintenanceWindow`, or `None` when it can.
+///
+/// The rule is the member's own: a range `ddd:hh24:mi-ddd:hh24:mi` on the 24-hour
+/// UTC clock whose span is at least [`MAINTENANCE_WINDOW_MIN_MINUTES`]. A window
+/// whose end lies before its start wraps to the next week, which is how
+/// `sun:23:00-mon:01:30` is a 150-minute window; a window whose two ends are the
+/// same point spans nothing and is refused.
+///
+/// Every operation that accepts a maintenance window goes through this one
+/// helper, so a value refused by one is refused by all of them, and the refusal
+/// runs before any state is written.
+pub fn maintenance_window_refusal(value: &str) -> Option<String> {
+    let invalid = || Some(INVALID_MAINTENANCE_WINDOW_MESSAGE.to_string());
+    let Some((start, end)) = value.split_once('-') else {
+        return invalid();
+    };
+    let (Some(start), Some(end)) = (week_minute(start), week_minute(end)) else {
+        return invalid();
+    };
+    let span = match end.cmp(&start) {
+        ::std::cmp::Ordering::Greater => end - start,
+        ::std::cmp::Ordering::Equal => 0,
+        ::std::cmp::Ordering::Less => end + MINUTES_PER_WEEK - start,
+    };
+    if span < MAINTENANCE_WINDOW_MIN_MINUTES {
+        return Some(format!(
+            "The maintenance window must be at least {MAINTENANCE_WINDOW_MIN_MINUTES} minutes."
+        ));
+    }
+    None
+}
 
 /// How long a cluster stays in the status the call that started the work
 /// returned (`creating` after a create, `modifying` after an immediate modify,
@@ -600,6 +697,9 @@ pub fn default_parameter_groups() -> BTreeMap<String, CacheParameterGroupRecord>
                 description: format!("Default parameter group for {family}"),
                 // Nothing tags a group the service itself provides.
                 tags: Vec::new(),
+                // A family default starts out being exactly its family's engine
+                // defaults: nothing has set a value on it.
+                parameter_values: BTreeMap::new(),
             };
             (record.name.clone(), record)
         })
@@ -614,10 +714,6 @@ pub fn default_parameter_groups() -> BTreeMap<String, CacheParameterGroupRecord>
 /// default is provided in every Region, and a custom one is created in the
 /// Region of the create — so the ARN a read reports names the Region of the
 /// request reading it; see [`CacheParameterGroupRecord::to_modeled`].
-///
-/// The parameter VALUES inside a group are not here: `DescribeCacheParameters`,
-/// `ModifyCacheParameterGroup` and `ResetCacheParameterGroup` are scaffolded
-/// 501s with their own issues.
 #[derive(Debug, Clone)]
 pub struct CacheParameterGroupRecord {
     /// The group's identity, which "is stored as a lowercase string"
@@ -630,9 +726,30 @@ pub struct CacheParameterGroupRecord {
     /// The tags `CreateCacheParameterGroup` was given; see
     /// [`CacheClusterRecord::tags`].
     pub tags: Vec<(String, String)>,
+    /// The value SET on this group for a parameter, keyed by
+    /// `Parameter$ParameterName`.
+    ///
+    /// A group holds only the values it DIFFERS from its family's engine
+    /// defaults by, never a copy of the catalog: that is what makes a group's
+    /// effective parameter list "the family defaults with these laid over
+    /// them", and what makes a parameter's `Parameter$Source` derivable — a
+    /// name in this map is the customer's value ([`PARAMETER_SOURCE_USER`]),
+    /// one that is not is the service's ([`PARAMETER_SOURCE_SYSTEM`]).
+    /// `ModifyCacheParameterGroup` sets an entry and
+    /// `ResetCacheParameterGroup` removes one; both are still scaffolded 501s
+    /// with their own issues, so a group answers its family's defaults until
+    /// one of them lands.
+    pub parameter_values: BTreeMap<String, String>,
 }
 
 impl CacheParameterGroupRecord {
+    /// The value set on this group for the parameter `name`, or `None` when
+    /// this group reports the engine's own default for it; see
+    /// [`Self::parameter_values`].
+    pub fn set_value(&self, name: &str) -> Option<&str> {
+        self.parameter_values.get(name).map(String::as_str)
+    }
+
     /// This record as the modelled `CacheParameterGroup`, read from `region`.
     pub fn to_modeled(&self, region: &str) -> CacheParameterGroup {
         CacheParameterGroup {
@@ -658,6 +775,49 @@ impl CacheParameterGroupRecord {
 /// engine-default"); an engine default is the service's own value, so it is
 /// reported as `system`.
 pub const PARAMETER_SOURCE_SYSTEM: &str = "system";
+
+/// The `Parameter$Source` of a value a customer set on the group being read,
+/// from the same `DescribeCacheParameters$Source` vocabulary as
+/// [`PARAMETER_SOURCE_SYSTEM`].
+pub const PARAMETER_SOURCE_USER: &str = "user";
+
+/// The third spelling `DescribeCacheParameters$Source` accepts as a FILTER
+/// ("Valid values: user | system | engine-default").
+///
+/// It selects the same parameters as [`PARAMETER_SOURCE_SYSTEM`] — the ones a
+/// group reports the engine's own default for — because an engine default IS
+/// the service's value and is reported under the `system` spelling; see
+/// [`PARAMETER_SOURCE_SYSTEM`].
+pub const PARAMETER_SOURCE_FILTER_ENGINE_DEFAULT: &str = "engine-default";
+
+/// The `Parameter$Source` the `DescribeCacheParameters$Source` filter `value`
+/// selects, or the reason that value is refused.
+///
+/// `Source` is a plain string with NO modelled enum or pattern, so the
+/// vocabulary its own documentation states ("Valid values: user | system |
+/// engine-default") is enforced here, and it is a SUPERSET of the two spellings
+/// a response reports: `engine-default` and `system` both select the parameters
+/// whose value is the engine's own. Matched ignoring ASCII case, as this
+/// service's other unconstrained filter vocabularies are (see
+/// [`snapshot_source_filter`]): a source is a vocabulary word, not an identity.
+pub fn parameter_source_filter(value: &str) -> Result<&'static str, String> {
+    for (spelling, selected) in [
+        (PARAMETER_SOURCE_USER, PARAMETER_SOURCE_USER),
+        (PARAMETER_SOURCE_SYSTEM, PARAMETER_SOURCE_SYSTEM),
+        (
+            PARAMETER_SOURCE_FILTER_ENGINE_DEFAULT,
+            PARAMETER_SOURCE_SYSTEM,
+        ),
+    ] {
+        if value.eq_ignore_ascii_case(spelling) {
+            return Ok(selected);
+        }
+    }
+    Err(format!(
+        "Invalid value {value} for Source: must be one of {PARAMETER_SOURCE_USER} | \
+         {PARAMETER_SOURCE_SYSTEM} | {PARAMETER_SOURCE_FILTER_ENGINE_DEFAULT}."
+    ))
+}
 
 /// `ChangeType`'s values (`smithy_query(query="shape", shape="ChangeType")`:
 /// `immediate | requires-reboot`): whether a change to the parameter is applied
@@ -1456,6 +1616,33 @@ impl ParameterRecord {
         }
     }
 
+    /// The `Parameter$Source` a group reporting this parameter answers under:
+    /// the customer's when the group holds a value for it, the service's
+    /// otherwise; see [`CacheParameterGroupRecord::parameter_values`].
+    ///
+    /// A parameter whose value is per cache node type is never the customer's:
+    /// its value is the node's own capacity, which is why every such row of the
+    /// published catalog is `IsModifiable: false` and so can hold no set value.
+    pub fn source_in_group(&self, set_value: Option<&str>) -> &'static str {
+        if set_value.is_some() && !self.is_node_type_specific() {
+            PARAMETER_SOURCE_USER
+        } else {
+            PARAMETER_SOURCE_SYSTEM
+        }
+    }
+
+    /// This record as the modelled `Parameter` of a group that holds
+    /// `set_value` for it: the value the group was given, reported as the
+    /// customer's, or the engine's own default reported as the service's.
+    pub fn to_modeled_in_group(&self, set_value: Option<&str>) -> Parameter {
+        let mut parameter = self.to_modeled();
+        parameter.source = Some(self.source_in_group(set_value).to_string());
+        if let Some(value) = set_value {
+            parameter.parameter_value = Some(value.to_string());
+        }
+        parameter
+    }
+
     /// This record as the modelled `CacheNodeTypeSpecificParameter`, for a
     /// parameter whose value is per cache node type.
     pub fn to_node_type_specific(&self) -> CacheNodeTypeSpecificParameter {
@@ -1755,6 +1942,17 @@ pub fn identifier_refusal(
          letter; must contain only ASCII letters, digits, and hyphens; and must not end with a \
          hyphen or contain two consecutive hyphens."
     ))
+}
+
+/// How ElastiCache words a cache cluster this account does not hold:
+/// `CacheCluster not found: <id>`.
+///
+/// One helper, so every surface that reports a missing cache cluster — the
+/// modelled `CacheClusterNotFoundFault` of a describe, modify, delete, reboot or
+/// snapshot call, and the `ErrorMessage` a batch update action reports for a
+/// resource it could not resolve — words it the one way the service does.
+pub fn cache_cluster_not_found_message(cache_cluster_id: &str) -> String {
+    format!("CacheCluster not found: {cache_cluster_id}")
 }
 
 /// The ARN of a cache cluster: `arn:aws:elasticache:<region>:<account>:cluster:<id>`.
@@ -4024,15 +4222,20 @@ impl CacheEngineVersionRecord {
 /// `ServerlessCache$Status`'s values this slice writes and reads: "The current
 /// status of the serverless cache. The allowed values are CREATING, AVAILABLE,
 /// DELETING, CREATE-FAILED and MODIFYING." The member is a plain `String`
-/// rather than an enum, so these are the spellings. `DELETING` / `MODIFYING`
-/// belong to `DeleteServerlessCache` / `ModifyServerlessCache`, which are still
-/// scaffolded 501s, so they are spelled where those land rather than here.
+/// rather than an enum, so these are the spellings. `MODIFYING` belongs to
+/// `ModifyServerlessCache`, which is still a scaffolded 501, so it is spelled
+/// where that lands rather than here.
 pub const SERVERLESS_STATUS_CREATING: &str = "CREATING";
 /// See [`SERVERLESS_STATUS_CREATING`].
 pub const SERVERLESS_STATUS_AVAILABLE: &str = "AVAILABLE";
+/// See [`SERVERLESS_STATUS_CREATING`]. What a cache answers between the
+/// `DeleteServerlessCache` that started its deletion and the removal the clock
+/// owes it ([`ServerlessCacheRecord::pending_deletion`]).
+pub const SERVERLESS_STATUS_DELETING: &str = "DELETING";
 
 /// How long a serverless cache stays `CREATING` before the clock owes it
-/// `AVAILABLE` — the same span a cache cluster's transitions take; see
+/// `AVAILABLE`, and how long one stays `DELETING` before the clock owes its
+/// removal — the same span a cache cluster's transitions take; see
 /// [`CLUSTER_TRANSITION`] for why it is a chosen, non-zero span.
 pub const SERVERLESS_CACHE_TRANSITION: Duration = CLUSTER_TRANSITION;
 
@@ -4298,6 +4501,13 @@ pub struct ServerlessCacheRecord {
     pub status: String,
     /// The status change the clock owes this cache, if any.
     pub pending_status: Option<PendingTransition>,
+    /// The instant the clock owes this cache's REMOVAL from the store, set by
+    /// the `DeleteServerlessCache` that put it in `DELETING`. A deletion is not
+    /// instant at AWS either — the call answers with the cache reporting
+    /// `DELETING` — so the record outlives the call by
+    /// [`SERVERLESS_CACHE_TRANSITION`] and is swept by
+    /// [`ComAmazonawsElasticacheAmazonelasticachev9State::purge_deleted_serverless_caches`].
+    pub pending_deletion: Option<SystemTime>,
     pub created_at: SystemTime,
     /// The usage limits as the request set them, persisted unchanged.
     pub cache_usage_limits: Option<CacheUsageLimits>,
@@ -4354,6 +4564,21 @@ impl ServerlessCacheRecord {
         self.status = pending.status.clone();
         self.pending_status = None;
         Some(settled)
+    }
+
+    /// Put this cache into `DELETING` and record the removal the clock now owes
+    /// it, [`SERVERLESS_CACHE_TRANSITION`] from `now`.
+    ///
+    /// The status change a delete makes is immediate (the call answers with the
+    /// cache reporting `DELETING`), so it is NOT a pending transition; what the
+    /// clock owes is the record's disappearance, which
+    /// [`ComAmazonawsElasticacheAmazonelasticachev9State::purge_deleted_serverless_caches`]
+    /// materialises. Any status change that was still pending is dropped: a
+    /// cache on its way out is not owed `AVAILABLE` any more.
+    pub fn begin_deletion(&mut self, now: SystemTime) {
+        self.status = SERVERLESS_STATUS_DELETING.to_string();
+        self.pending_status = None;
+        self.pending_deletion = Some(now + SERVERLESS_CACHE_TRANSITION);
     }
 
     /// This record as the modelled `ServerlessCache`.
@@ -5136,6 +5361,24 @@ pub fn normalize_user_engine(engine: &str) -> Result<String, String> {
 /// no transition for the clock to owe; only a later modify or delete moves it.
 pub const USER_STATUS_ACTIVE: &str = "active";
 
+/// `User$Status` of a user `DeleteUser` has accepted: "Indicates the user status.
+/// Can be \"active\", \"modifying\" or \"deleting\"". A delete answers with the
+/// user in this status — it is the LAST thing this API reports about it, because
+/// the clock then owes its removal from the store ([`USER_DELETION_TRANSITION`]),
+/// after which the user is gone and every lookup of it answers the modelled
+/// `UserNotFoundFault`.
+pub const USER_STATUS_DELETING: &str = "deleting";
+
+/// How long a user stays `deleting` before the clock owes its removal from the
+/// store.
+///
+/// The same reasoning as [`CLUSTER_TRANSITION`]: ElastiCache takes its own time,
+/// the emulator chooses a span, and it is deliberately NOT zero so a caller
+/// acting straight after `DeleteUser` still observes the transient `deleting`
+/// status and the state error that goes with it. The due instant is stored on the
+/// record and materialised by whichever later call reads it — nothing sleeps.
+pub const USER_DELETION_TRANSITION: Duration = CLUSTER_TRANSITION;
+
 /// How many passwords one user may hold, as `CreateUser$Passwords` documents it:
 /// "Passwords used for this user. You can create up to two passwords for each
 /// user."
@@ -5145,6 +5388,25 @@ pub const MAX_PASSWORDS_PER_USER: usize = 2;
 /// `UserQuotaExceededFault`. The emulator's OWN bound on the store, for the
 /// reason [`CLUSTER_QUOTA`] gives.
 pub const USER_QUOTA: usize = 100;
+
+/// The length a `UserId` must stay UNDER, in the service's own words: a user id
+/// of this length or more is refused with "User id length must be less than
+/// 40." The model constrains `UserId` with `@length(min: 1)` and a pattern only,
+/// so the upper bound is enforced here, by every operation that NAMES a user and
+/// can report the modelled `InvalidParameterValueException` — before the id is
+/// looked up, because an id the service would never have stored names no user to
+/// look up.
+pub const USER_ID_LENGTH_LIMIT: usize = 40;
+
+/// Why `user_id` cannot name a user, or `None` when it can.
+///
+/// Stated once so `CreateUser` and `DeleteUser` cannot drift about which ids the
+/// service accepts: a create that stores an id and a delete that refuses the
+/// same one would leave a user nothing could remove.
+pub fn user_id_rejection(user_id: &str) -> Option<String> {
+    (user_id.chars().count() >= USER_ID_LENGTH_LIMIT)
+        .then(|| format!("User id length must be less than {USER_ID_LENGTH_LIMIT}."))
+}
 
 /// `User$MinimumEngineVersion` of a user that authenticates with a password or
 /// without one: "The minimum engine version required, which is Redis OSS 6.0" —
@@ -5769,14 +6031,79 @@ fn is_selector(group: &str) -> bool {
     rules.peek().is_some() && rules.all(is_access_rule)
 }
 
-/// An access string as the service STORES it: the rules it names, one space
-/// apart.
+/// The ACL rules that state a rule list's COMMAND BASELINE outright: whether the
+/// user starts from every command allowed or every command denied.
 ///
-/// Only the whitespace between rules is normalised — no rule is added, removed
-/// or reordered — so what a later read reports is the permission set the request
-/// asked for.
+/// `allcommands` and `nocommands` are the engine's own aliases for `+@all` and
+/// `-@all` — they are in [`ACCESS_STRING_KEYWORDS`] for that reason — so a rule
+/// list naming any of the four has already said where its command rules start
+/// from. Matched case-insensitively, as the engine reads its rule names.
+const ACCESS_STRING_COMMAND_BASELINE: [&str; 4] = ["+@all", "-@all", "allcommands", "nocommands"];
+
+/// The baseline term the normalised form carries when the request named none: a
+/// new user is created with every command denied, so the expanded rule list
+/// starts by denying them all and the rules that follow are what it grants back.
+pub const ACCESS_STRING_DENY_ALL: &str = "-@all";
+
+/// True when `rule` states the command baseline — see
+/// [`ACCESS_STRING_COMMAND_BASELINE`].
+fn is_command_baseline(rule: &str) -> bool {
+    ACCESS_STRING_COMMAND_BASELINE
+        .iter()
+        .any(|baseline| rule.eq_ignore_ascii_case(baseline))
+}
+
+/// True when `rule` grants or revokes a command or a command category (`+get`,
+/// `-@admin`): the rules whose effect depends on the baseline they start from.
+fn is_command_rule(rule: &str) -> bool {
+    (rule.starts_with('+') || rule.starts_with('-')) && is_access_rule(rule)
+}
+
+/// An access string as the service STORES and REPORTS it: the EXPANDED rule
+/// list, which states its command baseline explicitly.
+///
+/// A Valkey / Redis OSS user is created with no permissions at all — every
+/// command denied — and the rules of an access string are applied on top of that
+/// starting point, so the expanded form of a rule list that grants commands
+/// without saying where it starts from carries the deny-all term
+/// ([`ACCESS_STRING_DENY_ALL`]) before its command rules. A list that already
+/// states its baseline ([`ACCESS_STRING_COMMAND_BASELINE`]) expands to itself.
+/// The term goes in immediately before the FIRST command rule, so the rules it
+/// governs follow it, and at the end of a list that names no command rule, whose
+/// whole command baseline it then is.
+///
+/// Nothing else is changed: no other rule is added, removed or reordered, and a
+/// selector (`(+get ~key1)`) is one rule of the list it sits in, so the baseline
+/// of the list is decided by the rules AROUND it and the selector's own rules are
+/// kept exactly as sent. Beyond that only the whitespace between rules is
+/// normalised.
 pub fn canonical_access_string(access_string: &str) -> String {
-    access_string.split_whitespace().collect::<Vec<_>>().join(" ")
+    let mut rules: Vec<&str> = access_string.split_whitespace().collect();
+    // Where the deny-all term goes, if it is needed at all: before the first
+    // command rule of the list ITSELF, so a command rule inside a selector —
+    // which governs that selector alone — does not decide it.
+    let mut first_command = None;
+    let mut inside_selector = false;
+    for (index, rule) in rules.iter().enumerate() {
+        if inside_selector {
+            inside_selector = !rule.ends_with(')');
+            continue;
+        }
+        if rule.starts_with('(') {
+            inside_selector = !(rule.ends_with(')') && rule.len() > 1);
+            continue;
+        }
+        if is_command_baseline(rule) {
+            // The request said where its command rules start from, so the
+            // expanded form is the list as sent.
+            return rules.join(" ");
+        }
+        if first_command.is_none() && is_command_rule(rule) {
+            first_command = Some(index);
+        }
+    }
+    rules.insert(first_command.unwrap_or(rules.len()), ACCESS_STRING_DENY_ALL);
+    rules.join(" ")
 }
 
 /// Why a request's authentication members cannot make a user's `Authentication`.
@@ -5988,6 +6315,11 @@ pub struct UserRecord {
     /// The tags the create was given, for `ListTagsForResource` (still a
     /// scaffolded 501 with its own issue) to report.
     pub tags: Vec<(String, String)>,
+    /// When the clock owes this user's removal from the store: the instant
+    /// [`USER_DELETION_TRANSITION`] after the `DeleteUser` that moved it to
+    /// [`USER_STATUS_DELETING`], and `None` for a user nothing has deleted.
+    /// Materialised by [`ComAmazonawsElasticacheAmazonelasticachev9State::settle_users`].
+    pub pending_removal: Option<SystemTime>,
 }
 
 impl UserRecord {
@@ -6068,6 +6400,9 @@ pub fn built_in_users() -> BTreeMap<String, UserRecord> {
             status: USER_STATUS_ACTIVE.to_string(),
             arn: user_arn(DEFAULT_REGION, DEFAULT_USER_ID),
             tags: Vec::new(),
+            // No call creates the built-in user and none deletes it, so the
+            // clock never owes its removal.
+            pending_removal: None,
         },
     );
     users
@@ -6281,6 +6616,9 @@ impl ComAmazonawsElasticacheAmazonelasticachev9State {
                 due: new.now + SERVERLESS_CACHE_TRANSITION,
                 status: SERVERLESS_STATUS_AVAILABLE.to_string(),
             }),
+            // Nothing owes a just-created cache its removal; only
+            // `DeleteServerlessCache` sets this.
+            pending_deletion: None,
             created_at: new.now,
             cache_usage_limits: new.cache_usage_limits,
             storage_encryption_type: if new.kms_key_id.is_some() {
@@ -6445,6 +6783,66 @@ impl ComAmazonawsElasticacheAmazonelasticachev9State {
         }
     }
 
+    /// The serverless cache `name` names (the stored, lowercased name), with
+    /// every change the clock owes it already materialised: a removal a delete
+    /// made due, and then any status change — the serverless counterpart of
+    /// [`Self::settled_cluster_mut`], so an operation that branches on a cache's
+    /// status reads the status it is owed at this instant, and a cache whose
+    /// deletion has completed is reported as gone.
+    pub fn settled_serverless_cache_mut(
+        &mut self,
+        name: &str,
+        now: SystemTime,
+    ) -> Option<&mut ServerlessCacheRecord> {
+        self.purge_deleted_serverless_caches(now);
+        // Deliberately two lookups, for the reason
+        // [`Self::settled_cluster_mut`] gives: the first ends the record's
+        // borrow so the transition's event can be written to the log beside it.
+        let settled = {
+            let cache = self.serverless_caches.get_mut(name)?;
+            cache.settle(now).map(|settled| (cache.name.clone(), settled))
+        };
+        if let Some((cache_name, settled)) = settled {
+            self.record_transition(
+                SOURCE_TYPE_SERVERLESS_CACHE,
+                &cache_name,
+                "Serverless cache",
+                &settled,
+            );
+        }
+        self.serverless_caches.get_mut(name)
+    }
+
+    /// Drop every serverless cache whose removal the clock already owes — the
+    /// caches a `DeleteServerlessCache` put into `DELETING` at least
+    /// [`SERVERLESS_CACHE_TRANSITION`] ago.
+    ///
+    /// Owed by the clock alone (due at this instant whether or not anybody
+    /// called), so a reporting operation materialises it too, the same way it
+    /// materialises a status change. A user group reports the caches it serves,
+    /// so a removed cache leaves that list with it rather than outliving itself
+    /// there.
+    pub fn purge_deleted_serverless_caches(&mut self, now: SystemTime) {
+        let due: Vec<String> = self
+            .serverless_caches
+            .values()
+            .filter(|cache| cache.pending_deletion.is_some_and(|at| now >= at))
+            .map(|cache| cache.name.clone())
+            .collect();
+        for name in due {
+            let Some(cache) = self.serverless_caches.remove(&name) else {
+                continue;
+            };
+            if let Some(id) = cache.user_group_id {
+                if let Some(group) = self.user_groups.get_mut(&id) {
+                    group
+                        .serverless_cache_names
+                        .retain(|served| served != &name);
+                }
+            }
+        }
+    }
+
     /// The cluster `id` names, with any status change the clock owes it already
     /// materialised.
     pub fn settled_cluster_mut(
@@ -6489,6 +6887,11 @@ impl ComAmazonawsElasticacheAmazonelasticachev9State {
     /// Materialise every status change the clock owes, for a caller that is
     /// about to report on all of them.
     pub fn settle_all(&mut self, now: SystemTime) {
+        // A user's own clock-owed change: the removal `DeleteUser` started.
+        self.settle_users(now);
+        // A deletion the clock has carried through removes the record before
+        // anything is reported from it.
+        self.purge_deleted_serverless_caches(now);
         let mut settled: Vec<(String, SettledTransition)> = Vec::new();
         for cluster in self.cache_clusters.values_mut() {
             if let Some(transition) = cluster.settle(now) {
@@ -6565,6 +6968,40 @@ impl ComAmazonawsElasticacheAmazonelasticachev9State {
             );
         }
         self.expire_events(now);
+    }
+
+    /// Materialise the removal of every user whose deletion has fallen due by
+    /// `now`.
+    ///
+    /// `DeleteUser` answers with the user in [`USER_STATUS_DELETING`] — a
+    /// non-terminal status — and the clock owes its removal
+    /// [`USER_DELETION_TRANSITION`] later, whether or not anybody calls again;
+    /// this is where that change is made, which is why a reporting operation may
+    /// make it (see [`CacheClusterRecord::settle`]). The event the deletion is
+    /// was recorded by the call that asked for it, so nothing is logged here.
+    ///
+    /// Every path that resolves a user by id materialises it first — the user
+    /// operations and `CreateUserGroup`, which builds a group out of users — so
+    /// none of them can see a user whose removal has fallen due. A user still
+    /// WITHIN the span is a different matter: it exists, in
+    /// [`USER_STATUS_DELETING`], and is reported as such.
+    pub fn settle_users(&mut self, now: SystemTime) {
+        self.users
+            .retain(|_, user| user.pending_removal.is_none_or(|due| now < due));
+    }
+
+    /// Withdraw `user_id` from every user group that lists it.
+    ///
+    /// `DeleteUser` documents it: "The user will be removed from all user groups
+    /// and in turn removed from all replication groups." A group's `user_ids` is
+    /// the ONE copy of a membership (see [`Self::user_group_ids_of`]), so this is
+    /// where a membership ends — at the call that deletes the user, not when the
+    /// record is dropped, so the delete's own answer already reports the user in
+    /// no group.
+    pub fn withdraw_user_from_groups(&mut self, user_id: &str) {
+        for group in self.user_groups.values_mut() {
+            group.user_ids.retain(|member| member != user_id);
+        }
     }
 
     /// Append one event to the log, dated at the instant it happened.
@@ -6848,7 +7285,7 @@ impl ComAmazonawsElasticacheAmazonelasticachev9State {
                     Some(cluster) => Ok((key, cluster.engine.clone())),
                     None => Err((
                         CACHE_CLUSTER_NOT_FOUND_ERROR_TYPE,
-                        format!("Cache cluster {id} not found."),
+                        cache_cluster_not_found_message(id),
                     )),
                 }
             }

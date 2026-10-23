@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateAssetRevision
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateAssetRevision`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateAssetRevision::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Records the NEXT revision of an asset this emulator stores: the metadata the request
+//! carries becomes a new, higher-numbered revision of that asset, the revisions already
+//! recorded are left as they are (`GetAsset` still reads each of them back by number),
+//! and the asset's identity — its id, domain, owning project, type and external
+//! identifier — is untouched, because `CreateAssetRevisionInput` names none of them.
+//!
+//! `createdBy`/`createdAt` on the new revision are the CALLER's principal and this
+//! instant; `firstRevisionCreatedBy`/`firstRevisionCreatedAt` keep pointing at the
+//! revision `CreateAsset` recorded. A revision owes the clock no transition — the output
+//! has no status member — and `listing` reports the catalog record the asset already has
+//! (`CreateListingChangeSet`), since publishing is not part of revising.
+//!
+//! The prerequisites the model documents are checked against the store: the domain must
+//! be available, the asset must exist in it, and "the owning project of the original
+//! asset must still exist and be active". `formsInput` and `typeRevision` are read by
+//! the same rules `CreateAsset` applies ([`crate::state::stored_forms`] and
+//! [`crate::state::asset_type_revision`]), except that a request that pins no
+//! `typeRevision` keeps the one the asset is already bound to.
 //!
 //! ## Shape of an operation
 //!
@@ -130,6 +140,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::ResourceKind;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -204,18 +215,259 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateAssetRevision` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateAssetRevisionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateAssetRevision"))
+        use crate::state::{
+            asset_type_revision, caller_principal, now_ms, stored_forms, AssetRevision,
+            StoredBusinessNameGeneration, StoredPredictionConfiguration, DOMAIN_STATUS_AVAILABLE,
+            MAX_ASSET_REVISIONS, PROJECT_STATUS_ACTIVE,
+        };
+
+        // The forms the new revision carries, read by the rule
+        // `crate::state::stored_forms` states — including the refusal of one `formName`
+        // named twice. A rule about the request's own shape, so it is answered before
+        // anything is looked up in the store.
+        let forms = stored_forms(input.forms_input.unwrap_or_default()).map_err(|message| {
+            CreateAssetRevisionErrorModeled::ValidationException(ValidationException { message })
+        })?;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateAssetRevisionErrorModeled::InternalServerException(InternalServerException {
+                message: "the DataZone store is unavailable".to_string(),
+            })
+        })?;
+        let mut store = state.lock();
+        let now = now_ms();
+        store.settle_clock(now);
+
+        let domain = store.domains.get(&input.domain_identifier).ok_or_else(|| {
+            CreateAssetRevisionErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: ResourceKind::Domain.not_found_message(),
+            })
+        })?;
+        // A domain still being created, or already being deleted, cannot take a
+        // revision: the request conflicts with the domain's current state (the rule
+        // `CreateAsset` applies to a create in that domain).
+        if domain.status != DOMAIN_STATUS_AVAILABLE {
+            return Err(CreateAssetRevisionErrorModeled::ConflictException(ConflictException {
+                message: format!(
+                    "Domain {} is {}, so it cannot accept an asset revision",
+                    input.domain_identifier, domain.status
+                ),
+            })
+            .into());
+        }
+        // "Prerequisites: Asset must already exist in the domain with identifier"
+        // (smithy_query query="doc" shape="CreateAssetRevision"): a revision is a
+        // revision OF a stored asset, so there is nothing to revise otherwise.
+        let asset = domain.assets.get(&input.identifier).ok_or_else(|| {
+            CreateAssetRevisionErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: ResourceKind::Asset.not_found_message(),
+            })
+        })?;
+
+        // The `@idempotencyToken`: a repeat of the SAME request answers with the
+        // revision the first one recorded, so a retry never records two revisions. The
+        // token is remembered on the revision it recorded, so it is released with the
+        // asset that revision belongs to.
+        if let Some(recorded) = input
+            .client_token
+            .as_deref()
+            .and_then(|token| asset.revision_with_token(token))
+        {
+            return Ok(revision_output(domain, asset, recorded));
+        }
+
+        // "The owning project of the original asset must still exist and be active"
+        // (smithy_query query="doc" shape="CreateAssetRevision").
+        let owning_project = domain.projects.get(&asset.owning_project_id).ok_or_else(|| {
+            CreateAssetRevisionErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: ResourceKind::Project.not_found_message(),
+            })
+        })?;
+        if owning_project.project_status != PROJECT_STATUS_ACTIVE {
+            return Err(CreateAssetRevisionErrorModeled::ConflictException(ConflictException {
+                message: format!(
+                    "Project {} is {}, so the assets it owns cannot be revised",
+                    owning_project.id, owning_project.project_status
+                ),
+            })
+            .into());
+        }
+
+        // The revision this one follows: the greatest recorded, whose `typeRevision` the
+        // new revision keeps when the request pins none.
+        let latest = asset.latest_revision().ok_or_else(|| {
+            CreateAssetRevisionErrorModeled::InternalServerException(InternalServerException {
+                message: "the stored asset has no revision".to_string(),
+            })
+        })?;
+        let type_revision = asset_type_revision(
+            domain,
+            &asset.type_identifier,
+            input.type_revision.as_deref(),
+            Some(latest.type_revision.as_str()),
+        )
+        .map_err(|message| {
+            CreateAssetRevisionErrorModeled::ValidationException(ValidationException { message })
+        })?;
+        // The store is bounded, so a revision loop cannot grow the emulator's heap
+        // without limit. `CreateAssetRevision` models no quota error, so the refusal is
+        // one it does model for a request it cannot serve.
+        if asset.revisions.len() >= MAX_ASSET_REVISIONS {
+            return Err(CreateAssetRevisionErrorModeled::ValidationException(ValidationException {
+                message: format!(
+                    "this emulator records at most {MAX_ASSET_REVISIONS} revisions of one asset"
+                ),
+            })
+            .into());
+        }
+
+        // A revision describes the asset's metadata AS OF that revision — the input
+        // carries the whole of it, not a patch — so every member is taken from the
+        // request, and one the request left out is absent at this revision.
+        let revision = AssetRevision {
+            revision: asset.next_revision_number(),
+            name: input.name,
+            description: input.description,
+            type_revision,
+            glossary_terms: input.glossary_terms.unwrap_or_default(),
+            forms,
+            // Mirrored member for member, so a read reports exactly what the request
+            // set — including a `businessNameGeneration` that named no `enabled`.
+            prediction_configuration: input.prediction_configuration.map(|config| {
+                StoredPredictionConfiguration {
+                    business_name_generation: config.business_name_generation.map(|generation| {
+                        StoredBusinessNameGeneration {
+                            enabled: generation.enabled,
+                        }
+                    }),
+                }
+            }),
+            created_by: caller_principal(ctx),
+            created_at_ms: now,
+            client_token: input.client_token,
+        };
+        let number = revision.revision;
+
+        // The asset was proved present above, but the lookup is answered rather than
+        // assumed: the response is built from the record that was actually stored, so a
+        // 200 can never report a revision this call did not persist.
+        let Some(domain) = store.domains.get_mut(&input.domain_identifier) else {
+            return Err(CreateAssetRevisionErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the domain is no longer in the DataZone store".to_string(),
+                },
+            )
+            .into());
+        };
+        let Some(stored_asset) = domain.assets.get_mut(&input.identifier) else {
+            return Err(CreateAssetRevisionErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the asset is no longer in the DataZone store".to_string(),
+                },
+            )
+            .into());
+        };
+        // `next_revision_number` is one past the greatest ever recorded, so this slot is
+        // vacant; were it ever not, inserting would rewrite a revision the store already
+        // holds, so that is refused loudly instead.
+        if stored_asset.revisions.contains_key(&number) {
+            return Err(CreateAssetRevisionErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: format!("revision {number} is already recorded for this asset"),
+                },
+            )
+            .into());
+        }
+        stored_asset.revisions.insert(number, revision);
+
+        // Read back out of the store, so the 200 reports the revision that is now there.
+        let domain = &*domain;
+        let Some(asset) = domain.assets.get(&input.identifier) else {
+            return Err(CreateAssetRevisionErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the asset is no longer in the DataZone store".to_string(),
+                },
+            )
+            .into());
+        };
+        let Some(stored) = asset.revisions.get(&number) else {
+            return Err(CreateAssetRevisionErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: format!("revision {number} was not recorded"),
+                },
+            )
+            .into());
+        };
+        Ok(revision_output(domain, asset, stored))
+    }
+}
+
+/// The stored asset at one of its revisions, as this operation reports it.
+///
+/// Every member is read off the stored records — the asset for its identity, the
+/// revision for the metadata it carries, the asset's first revision for the
+/// `firstRevision*` members and the domain's listings for `listing` — so the response a
+/// retry gets (through the idempotency token) is the response the first call got.
+fn revision_output(
+    domain: &crate::state::Domain,
+    asset: &crate::state::Asset,
+    revision: &crate::state::AssetRevision,
+) -> CreateAssetRevisionOutput {
+    use crate::state::{date_time, ENTITY_TYPE_ASSET};
+
+    let first = asset.first_revision().unwrap_or(revision);
+    CreateAssetRevisionOutput {
+        id: asset.id.clone(),
+        name: revision.name.clone(),
+        type_identifier: asset.type_identifier.clone(),
+        type_revision: revision.type_revision.clone(),
+        external_identifier: asset.external_identifier.clone(),
+        revision: revision.revision_string(),
+        description: revision.description.clone(),
+        created_at: Some(date_time(revision.created_at_ms)),
+        created_by: Some(revision.created_by.clone()),
+        first_revision_created_at: Some(date_time(first.created_at_ms)),
+        first_revision_created_by: Some(first.created_by.clone()),
+        glossary_terms: (!revision.glossary_terms.is_empty())
+            .then(|| revision.glossary_terms.clone()),
+        // Governed glossary terms are attached by `AssociateGovernedTerms`, never by a
+        // revision of the asset.
+        governed_glossary_terms: None,
+        owning_project_id: asset.owning_project_id.clone(),
+        domain_id: asset.domain_id.clone(),
+        // The catalog record the asset already has, if `CreateListingChangeSet`
+        // published it: revising an asset neither publishes it nor withdraws it.
+        listing: domain
+            .listing_for_entity(ENTITY_TYPE_ASSET, &asset.id)
+            .map(|listing| AssetListingDetails {
+                listing_id: listing.id.clone(),
+                listing_status: listing.status.clone(),
+            }),
+        forms_output: revision
+            .forms
+            .iter()
+            .map(|form| FormOutput {
+                form_name: form.form_name.clone(),
+                type_name: form.type_name.clone(),
+                type_revision: form.type_revision.clone(),
+                content: form.content.clone(),
+            })
+            .collect(),
+        // Read-only forms come from the asset type's own definition, and an asset type's
+        // form entry carries no read-only flag (`FormEntryOutput` is
+        // `typeName`/`typeRevision`/`required`), so no stored type marks one.
+        read_only_forms_output: None,
+        // Time series data points are imported by `PostTimeSeriesDataPoints`, which is
+        // still a scaffold, so no stored asset has any.
+        latest_time_series_data_point_forms_output: None,
+        prediction_configuration: revision.prediction_configuration.as_ref().map(|config| {
+            PredictionConfiguration {
+                business_name_generation: config.business_name_generation.as_ref().map(
+                    |generation| BusinessNameGenerationConfiguration {
+                        enabled: generation.enabled,
+                    },
+                ),
+            }
+        }),
     }
 }

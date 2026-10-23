@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdatePrivateDnsNamespace
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdatePrivateDnsNamespace`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdatePrivateDnsNamespace::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: writes the properties the change carries — `Namespace.Description` and
+//! `Namespace.Properties.DnsProperties.SOA.TTL` — onto the one stored `DNS_PRIVATE`
+//! namespace record, and files the `UPDATE_NAMESPACE` operation whose id is this call's
+//! only output, the same asynchronous shape `CreatePrivateDnsNamespace` has. A later
+//! `GetNamespace` reads both back, because both read the one stored record.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +148,98 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdatePrivateDnsNamespace` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdatePrivateDnsNamespaceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdatePrivateDnsNamespace"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                UpdatePrivateDnsNamespaceErrorModeled::InvalidInput(InvalidInput {
+                    message: Some(crate::state::UNREACHABLE_STATE_MESSAGE.to_string()),
+                })
+                .into(),
+            );
+        };
+
+        let now = std::time::SystemTime::now();
+        let mut state = state.lock();
+
+        // `Id` is modelled as an `Arn` and documented as "the ID or Amazon Resource Name
+        // (ARN) of the namespace", so either form resolves to the one stored record.
+        let Some(namespace_id) = state.resolve_namespace_id(&input.id) else {
+            return Err(UpdatePrivateDnsNamespaceErrorModeled::NamespaceNotFound(
+                // `NamespaceNotFound` carries no message: the service reports the class
+                // of failure and echoes no requested id into the body.
+                NamespaceNotFound { message: None },
+            )
+            .into());
+        };
+
+        // The properties this change asks for. Both are optional on
+        // `PrivateDnsNamespaceChange`, so `None` means "leave the stored value alone".
+        let description = input.namespace.description.clone();
+        let soa_ttl = input
+            .namespace
+            .properties
+            .as_ref()
+            .map(|properties| properties.dns_properties.soa.ttl);
+
+        // `UpdaterRequestId` "allows failed UpdatePrivateDnsNamespace requests to be
+        // retried without the risk of running the operation twice": a retry of the SAME
+        // change to the SAME namespace replays the operation the first call filed instead
+        // of filing a second one. The remembered request is the resolved namespace id
+        // plus the change asked of it, so the same token sent with a different change is
+        // not read as a retry of this one.
+        let requested = crate::state::dns_namespace_change_request(
+            &namespace_id,
+            description.as_deref(),
+            soa_ttl,
+        );
+        if let Some(token) = input.updater_request_id.as_deref() {
+            if let Some(operation_id) = state.replayed(
+                crate::state::IdempotencyScope::UpdatePrivateDnsNamespace,
+                token,
+                &requested,
+            ) {
+                return Ok(UpdatePrivateDnsNamespaceOutput {
+                    operation_id: Some(operation_id),
+                });
+            }
+        }
+
+        // This call updates a PRIVATE DNS namespace; the other namespace kinds are
+        // updated through `UpdatePublicDnsNamespace` and `UpdateHttpNamespace`. Asking
+        // the wrong kind of update of a namespace that does exist is a bad request, not a
+        // missing namespace, so it is the modelled `InvalidInput`.
+        let stored_type = state.namespace_type(&namespace_id);
+        if stored_type != "DNS_PRIVATE" {
+            return Err(
+                UpdatePrivateDnsNamespaceErrorModeled::InvalidInput(InvalidInput {
+                    message: Some(crate::state::wrong_namespace_type_message(
+                        &namespace_id,
+                        &stored_type,
+                        Self::NAME,
+                    )),
+                })
+                .into(),
+            );
+        }
+
+        state.apply_dns_namespace_change(&namespace_id, description, soa_ttl);
+
+        let operation_id = state.record_operation(
+            "UPDATE_NAMESPACE",
+            now,
+            [("NAMESPACE".to_string(), namespace_id)],
+        );
+        if let Some(token) = input.updater_request_id.as_deref() {
+            state.remember(
+                crate::state::IdempotencyScope::UpdatePrivateDnsNamespace,
+                token,
+                &requested,
+                &operation_id,
+            );
+        }
+
+        Ok(UpdatePrivateDnsNamespaceOutput {
+            operation_id: Some(operation_id),
+        })
     }
 }

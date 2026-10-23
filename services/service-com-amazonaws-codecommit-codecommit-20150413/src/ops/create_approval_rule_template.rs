@@ -5,9 +5,15 @@
 //! Creates an approval rule template in this account's Region and persists it, so
 //! `GetApprovalRuleTemplate` and `ListApprovalRuleTemplates` report it afterwards.
 //! The content is a JSON approval rule document (see
-//! [`crate::state::validate_approval_rule_template_content`]), and content that is
+//! [`crate::state::is_approval_rule_template_content`]), and content that is
 //! not one is refused with the modelled
 //! `InvalidApprovalRuleTemplateContentException` — no template is created.
+//!
+//! The accepted document is stored CANONICALIZED, not as the caller formatted it
+//! (see [`crate::state::canonical_json_document`]): minified, with member order and
+//! literals preserved. So this response, `GetApprovalRuleTemplate` and
+//! `ruleContentSha256` all report the same bytes for one document however its
+//! submitter indented it.
 //!
 //! ## Shape of an operation
 //!
@@ -221,16 +227,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // The content is an approval rule JSON document, not free text.
-        if let Err(reason) = crate::state::validate_approval_rule_template_content(
-            &input.approval_rule_template_content,
-        ) {
+        // The content is an approval rule JSON document, not free text. The refusal
+        // says only that the document is not valid JSON for a template: no
+        // deserializer diagnostic and no offset reaches the caller.
+        if !crate::state::is_approval_rule_template_content(&input.approval_rule_template_content) {
             return Err(
                 CreateApprovalRuleTemplateErrorModeled::InvalidApprovalRuleTemplateContentException(
                     InvalidApprovalRuleTemplateContentException {
-                        message: Some(format!(
-                            "the content of the approval rule template is not valid: {reason}"
-                        )),
+                        message: Some(
+                            crate::state::INVALID_APPROVAL_RULE_CONTENT_MESSAGE.to_string(),
+                        ),
                     },
                 )
                 .into(),
@@ -252,10 +258,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 CreateApprovalRuleTemplateErrorModeled::ApprovalRuleTemplateNameAlreadyExistsException(
                     ApprovalRuleTemplateNameAlreadyExistsException {
-                        message: Some(format!(
-                            "an approval rule template named {} already exists in this Region",
-                            input.approval_rule_template_name
-                        )),
+                        // A CONSTANT for this class: template names are unique per
+                        // ACCOUNT, and the message names neither the template nor a
+                        // Region.
+                        message: Some(
+                            crate::state::APPROVAL_RULE_TEMPLATE_NAME_ALREADY_EXISTS_MESSAGE
+                                .to_string(),
+                        ),
                     },
                 )
                 .into(),
@@ -280,6 +289,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // The record canonicalizes the document as it takes it: nothing downstream
+        // sees the submitted formatting.
         let template = crate::state::ApprovalRuleTemplateRecord::new(
             &input.approval_rule_template_name,
             input.approval_rule_template_content.clone(),

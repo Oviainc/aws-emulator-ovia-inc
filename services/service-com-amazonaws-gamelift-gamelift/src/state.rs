@@ -2,12 +2,12 @@
 
 //! Engine state for the com-amazonaws-gamelift-gamelift service.
 //!
-//! The hosting resources this emulator persists — fleets, the game sessions placed on
-//! them, and the player slots reserved in those sessions — plus the behaviour every
-//! handler shares over them: resolving a fleet or a game session by id or ARN,
-//! materialising the status changes the clock has already made due, minting ids and
-//! ARNs in the formats the model documents, and the opaque pagination token the
-//! paginated describes share.
+//! The hosting resources this emulator persists — fleets, the aliases that route at
+//! them, the game sessions placed on them, and the player slots reserved in those
+//! sessions — plus the behaviour every handler shares over them: resolving a fleet, an
+//! alias or a game session by id or ARN, materialising the status changes the clock has
+//! already made due, minting ids and ARNs in the formats the model documents, and the
+//! opaque pagination token the paginated describes share.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
@@ -16,16 +16,25 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    AnywhereConfiguration, CertificateConfiguration, FilterConfiguration, FleetAttributes,
-    GameProperty, GameSession, GameSessionQueue, GameSessionQueueDestination, IpPermission,
-    LocationState, PlayerGatewayConfiguration, PlayerLatencyPolicy, PlayerSession,
-    PriorityConfiguration, ResourceCreationLimitPolicy, RuntimeConfiguration, Tag,
+    Alias, AnywhereConfiguration, CertificateConfiguration, DesiredPlayerSession,
+    FilterConfiguration, FleetAttributes, GameProperty, GameSession, GameSessionPlacement,
+    GameSessionQueue, GameSessionQueueDestination, IpPermission, LocationModel, LocationState,
+    MatchmakingConfiguration, MatchmakingRuleSet, MatchmakingTicket, PlacedPlayerSession, Player,
+    PlayerGatewayConfiguration, PlayerLatency, PlayerLatencyPolicy, PlayerSession,
+    PriorityConfiguration, PriorityConfigurationOverride, ResourceCreationLimitPolicy,
+    RoutingStrategy, RuntimeConfiguration, Tag,
 };
 
 /// `ComputeType` values the model declares (`smithy_query shape=ComputeType`).
 pub const COMPUTE_TYPE_EC2: &str = "EC2";
 /// See [`COMPUTE_TYPE_EC2`].
 pub const COMPUTE_TYPE_ANYWHERE: &str = "ANYWHERE";
+
+/// `RoutingStrategyType` values the model declares (`smithy_query
+/// shape=RoutingStrategyType`), i.e. the two routings an alias can carry.
+pub const ROUTING_STRATEGY_TYPE_SIMPLE: &str = "SIMPLE";
+/// See [`ROUTING_STRATEGY_TYPE_SIMPLE`].
+pub const ROUTING_STRATEGY_TYPE_TERMINAL: &str = "TERMINAL";
 
 /// `FleetStatus` values this slice uses (`smithy_query shape=FleetStatus`).
 pub const FLEET_STATUS_NEW: &str = "NEW";
@@ -42,6 +51,45 @@ pub const GAME_SESSION_STATUS_ACTIVE: &str = "ACTIVE";
 /// `PlayerSessionStatus` value a freshly reserved slot carries
 /// (`smithy_query shape=PlayerSessionStatus`).
 pub const PLAYER_SESSION_STATUS_RESERVED: &str = "RESERVED";
+
+/// `MatchmakingConfigurationStatus` value a ticket `StartMatchmaking` has just accepted
+/// carries: that operation's own doc — "If successful, a matchmaking ticket is returned
+/// with status set to `QUEUED`."
+pub const MATCHMAKING_TICKET_STATUS_QUEUED: &str = "QUEUED";
+/// `MatchmakingConfigurationStatus` a ticket moves to once FlexMatch picks it up:
+/// "`SEARCHING` -- The matchmaking request is currently being processed."
+pub const MATCHMAKING_TICKET_STATUS_SEARCHING: &str = "SEARCHING";
+/// `MatchmakingConfigurationStatus` a ticket ends in when no match is formed for it:
+/// "`TIMED_OUT` -- The matchmaking request was not successful within the duration
+/// specified in the matchmaking configuration."
+pub const MATCHMAKING_TICKET_STATUS_TIMED_OUT: &str = "TIMED_OUT";
+
+/// `GameSessionPlacementState` a new placement request carries: `GameSessionPlacement`'s
+/// own doc — "If the game session placement status is `PENDING`, the properties for game
+/// session ID/ARN, region, IP address/DNS, and port aren't final."
+pub const PLACEMENT_STATUS_PENDING: &str = "PENDING";
+/// `GameSessionPlacementState` a placement reaches once a game session has started for
+/// it: "When the request status is `FULFILLED`, a new game session has started and the
+/// placement request is updated with connection information for the game session (IP
+/// address and port)."
+pub const PLACEMENT_STATUS_FULFILLED: &str = "FULFILLED";
+/// `GameSessionPlacementState` a placement ends in when no destination of its queue could
+/// host the session: StartGameSessionPlacement's doc — "Amazon GameLift Servers continues
+/// to retry each placement request until it reaches the queue's timeout setting. If a
+/// request times out, you can resubmit the request to the same queue or try a different
+/// queue."
+pub const PLACEMENT_STATUS_TIMED_OUT: &str = "TIMED_OUT";
+
+/// The prefix every custom location's name carries, from
+/// `CustomInputLocationStringModel`'s pattern (`^custom-[A-Za-z0-9\-]+$`): it is what
+/// tells a custom location apart from an Amazon Web Services one, which `ListLocations`
+/// reports under the `CUSTOM` and `AWS` filters respectively.
+pub const CUSTOM_LOCATION_PREFIX: &str = "custom-";
+
+/// Whether `location` names a custom location rather than an Amazon Web Services one.
+pub fn is_custom_location(location: &str) -> bool {
+    location.starts_with(CUSTOM_LOCATION_PREFIX)
+}
 
 /// `PlayerSessionCreationPolicy` a new game session carries: CreateGameSession's own
 /// doc — "By default, newly created game sessions are open to new players."
@@ -116,6 +164,18 @@ pub const MAX_FLEETS_PER_ACCOUNT: usize = 100;
 /// be repetition, which would otherwise let one request drive an unbounded response.
 pub const MAX_FLEET_IDS_PER_REQUEST: usize = MAX_FLEETS_PER_ACCOUNT;
 
+/// How many aliases this emulator holds before `CreateAlias` answers the modelled
+/// `LimitExceededException` ("The requested operation would cause the resource to exceed
+/// the allowed service limit").
+///
+/// Like [`MAX_FLEETS_PER_ACCOUNT`], Amazon GameLift Servers caps aliases per account per
+/// Region while this emulator keeps ONE store for the account — an alias is reported
+/// whatever Region the request is signed for, and carries the Region of the request that
+/// created it in its ARN — so the cap is account-wide. The model carries no quota, so the
+/// count is CHOSEN: far above any realistic script ("a fleet can have multiple aliases"),
+/// and the bound that keeps the alias store from growing without limit.
+pub const MAX_ALIASES_PER_ACCOUNT: usize = 100;
+
 /// How many game session queues this emulator holds before `CreateGameSessionQueue`
 /// answers the modelled `LimitExceededException` ("The requested operation would cause
 /// the resource to exceed the allowed service limit").
@@ -170,6 +230,58 @@ pub const QUEUE_TIMEOUT_RANGE_SECONDS: (i32, i32) = (10, 600);
 /// ([`QUEUE_TIMEOUT_RANGE_SECONDS`]`.1`), the most permissive setting, which keeps a
 /// placement request queued for as long as the service allows before it times out.
 pub const DEFAULT_QUEUE_TIMEOUT_SECONDS: i32 = QUEUE_TIMEOUT_RANGE_SECONDS.1;
+
+/// How many custom locations this emulator holds before `CreateLocation` answers the
+/// modelled `LimitExceededException`.
+///
+/// Like [`MAX_FLEETS_PER_ACCOUNT`], Amazon GameLift Servers caps custom locations per
+/// account per Region while this emulator keeps ONE store for the account, so the cap is
+/// account-wide. The model carries no quota, so the count is CHOSEN: far above any
+/// realistic script, and the bound that keeps the location store from growing without
+/// limit.
+pub const MAX_CUSTOM_LOCATIONS_PER_ACCOUNT: usize = 100;
+
+/// How many matchmaking rule sets this emulator holds before `CreateMatchmakingRuleSet`
+/// answers the modelled `LimitExceededException`. CHOSEN for the same reason as
+/// [`MAX_CUSTOM_LOCATIONS_PER_ACCOUNT`]: the model carries no quota, and a stored rule set
+/// holds a body of up to the modelled 65535 characters for as long as it exists.
+pub const MAX_MATCHMAKING_RULE_SETS_PER_ACCOUNT: usize = 100;
+
+/// How many matchmaking configurations this emulator holds before
+/// `CreateMatchmakingConfiguration` answers the modelled `LimitExceededException`. CHOSEN
+/// for the same reason as [`MAX_CUSTOM_LOCATIONS_PER_ACCOUNT`].
+pub const MAX_MATCHMAKING_CONFIGURATIONS_PER_ACCOUNT: usize = 100;
+
+/// How many matchmaking tickets this store holds before `StartMatchmaking` refuses the
+/// next one with the modelled `InvalidRequestException` (the operation models no
+/// `LimitExceededException`).
+///
+/// A ticket lives until it is deleted, and nothing in this emulator deletes one, so this
+/// count is CHOSEN: far above any realistic script, and the bound that keeps the ticket
+/// store from growing without limit.
+pub const MAX_MATCHMAKING_TICKETS_PER_ACCOUNT: usize = 200;
+
+/// How many game session placements this store holds before `StartGameSessionPlacement`
+/// refuses the next one with the modelled `InvalidRequestException` (that operation models
+/// no `LimitExceededException` either). CHOSEN for the same reason as
+/// [`MAX_MATCHMAKING_TICKETS_PER_ACCOUNT`].
+pub const MAX_GAME_SESSION_PLACEMENTS_PER_ACCOUNT: usize = 200;
+
+/// How many ticket ids one `DescribeMatchmaking` request may name: that operation's own
+/// doc — "To request matchmaking tickets, provide a list of up to 10 ticket IDs." The
+/// modelled `MatchmakingIdList` carries no length, so the documented maximum is enforced
+/// where the request is served.
+pub const MAX_TICKET_IDS_PER_REQUEST: usize = 10;
+
+/// How many configuration names one `DescribeMatchmakingConfigurations` request may name.
+///
+/// The model bounds `MatchmakingConfigurationNameList` neither above nor below, and each
+/// entry that is an ARN is resolved by a scan of the configuration store, so the work one
+/// request can ask for is the PRODUCT of the list length and the stored configuration
+/// count. This count is CHOSEN exactly as [`MAX_QUEUE_NAMES_PER_REQUEST`] is: it is
+/// [`MAX_MATCHMAKING_CONFIGURATIONS_PER_ACCOUNT`], the most distinct configurations that
+/// can exist, so no legitimate request is refused.
+pub const MAX_CONFIGURATION_NAMES_PER_REQUEST: usize = MAX_MATCHMAKING_CONFIGURATIONS_PER_ACCOUNT;
 
 /// The port range a fleet that opens no inbound permissions draws game-session ports
 /// from, and the range an opened one must lie within. `IpPermission$FromPort`'s doc:
@@ -303,6 +415,12 @@ pub enum PageKind {
     GameSessions,
     /// `DescribeGameSessionQueues`.
     GameSessionQueues,
+    /// `ListLocations`.
+    Locations,
+    /// `DescribeMatchmakingRuleSets`.
+    MatchmakingRuleSets,
+    /// `DescribeMatchmakingConfigurations`.
+    MatchmakingConfigurations,
 }
 
 impl PageKind {
@@ -312,6 +430,9 @@ impl PageKind {
             Self::Fleets => 'f',
             Self::GameSessions => 'g',
             Self::GameSessionQueues => 'q',
+            Self::Locations => 'l',
+            Self::MatchmakingRuleSets => 'r',
+            Self::MatchmakingConfigurations => 'c',
         }
     }
 }
@@ -800,15 +921,506 @@ impl GameSessionQueueRecord {
     }
 }
 
+/// An alias for a fleet, as `CreateAlias` persisted it.
+///
+/// Every member of the modelled `Alias` is either a setting the request supplied or one
+/// the service decided, so the record holds them all and [`AliasRecord::to_modelled`] is
+/// the one projection every read of the alias is served from.
+#[derive(Debug, Clone)]
+pub struct AliasRecord {
+    pub alias_id: String,
+    pub alias_arn: String,
+    pub name: String,
+    pub description: Option<String>,
+    /// The routing configuration as the request configured it: what every read of the
+    /// alias reports, and what [`AliasRecord::routing`] routes a request through.
+    pub routing_strategy: RoutingStrategy,
+    /// The labels assigned to the alias resource. `Alias` has no `Tags` member — tags are
+    /// read back through `ListTagsForResource` — so they are held on the record and
+    /// reported by no projection of it yet.
+    pub tags: Vec<Tag>,
+    pub creation_time: SystemTime,
+    /// When the alias was last modified, which `UpdateAlias` moves forward.
+    pub last_updated_time: SystemTime,
+    /// The Region of the request that created the alias, which its ARN names.
+    pub region: String,
+}
+
+/// Where a request that names an alias is routed, which is what the alias's
+/// `RoutingStrategy$Type` decides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AliasRouting<'a> {
+    /// `SIMPLE` — "The alias resolves to one specific fleet": the `FleetId` it names.
+    Fleet(&'a str),
+    /// `TERMINAL` — "The alias does not resolve to a fleet but instead can be used to
+    /// display a message to the user. A terminal alias throws a
+    /// TerminalRoutingStrategyException with the message embedded": that message.
+    Terminal(Option<&'a str>),
+}
+
+impl AliasRecord {
+    /// This alias as the modelled `Alias`.
+    pub fn to_modelled(&self) -> Alias {
+        Alias {
+            alias_id: Some(self.alias_id.clone()),
+            alias_arn: Some(self.alias_arn.clone()),
+            name: Some(self.name.clone()),
+            description: self.description.clone(),
+            routing_strategy: Some(self.routing_strategy.clone()),
+            creation_time: Some(to_date_time(self.creation_time)),
+            last_updated_time: Some(to_date_time(self.last_updated_time)),
+        }
+    }
+
+    /// Where this alias routes a request that names it.
+    ///
+    /// Only the two forms [`validate_routing_strategy`] accepts are ever stored, so a
+    /// strategy that is not a `SIMPLE` one naming a fleet is the `TERMINAL` one, which
+    /// resolves to no fleet at all.
+    pub fn routing(&self) -> AliasRouting<'_> {
+        match (
+            self.routing_strategy.r#type.as_deref(),
+            self.routing_strategy.fleet_id.as_deref(),
+        ) {
+            (Some(ROUTING_STRATEGY_TYPE_SIMPLE), Some(fleet_id)) => AliasRouting::Fleet(fleet_id),
+            _ => AliasRouting::Terminal(self.routing_strategy.message.as_deref()),
+        }
+    }
+}
+
+/// Whether `strategy` is one of the two routings an alias can carry, or the reason it is
+/// not — which a handler answers with the modelled `InvalidRequestException`.
+///
+/// `RoutingStrategy$Type`'s doc names both forms and what each one needs: "SIMPLE - The
+/// alias resolves to one specific fleet", so a simple strategy names the fleet it points
+/// at; "TERMINAL - The alias does not resolve to a fleet but instead can be used to
+/// display a message to the user. A terminal alias throws a
+/// TerminalRoutingStrategyException with the message embedded", so a terminal strategy
+/// carries that message. The modelled `RoutingStrategyType` enum is refused by the
+/// boundary walk before a handler runs, so an unknown type cannot reach here; which
+/// member each type requires is the service's own rule, enforced here.
+///
+/// Whether the named fleet EXISTS is deliberately not checked: an alias outlives the
+/// fleets it points at ("You can reassign an alias to another fleet by calling
+/// UpdateAlias"), so resolution is what discovers that a target has gone.
+pub fn validate_routing_strategy(strategy: &RoutingStrategy) -> Result<(), String> {
+    match strategy.r#type.as_deref() {
+        Some(ROUTING_STRATEGY_TYPE_SIMPLE) => {
+            if strategy.fleet_id.is_none() {
+                return Err(format!(
+                    "RoutingStrategy of type {ROUTING_STRATEGY_TYPE_SIMPLE} must name the fleet \
+                     it resolves to in RoutingStrategy.FleetId."
+                ));
+            }
+            Ok(())
+        }
+        Some(ROUTING_STRATEGY_TYPE_TERMINAL) => {
+            if strategy.message.is_none() {
+                return Err(format!(
+                    "RoutingStrategy of type {ROUTING_STRATEGY_TYPE_TERMINAL} must carry the \
+                     message to display in RoutingStrategy.Message."
+                ));
+            }
+            Ok(())
+        }
+        _ => Err(format!(
+            "RoutingStrategy.Type is required, and must be {ROUTING_STRATEGY_TYPE_SIMPLE} or \
+             {ROUTING_STRATEGY_TYPE_TERMINAL}."
+        )),
+    }
+}
+
+/// A custom location, as `CreateLocation` persisted it.
+///
+/// `LocationModel` is "properties of a location, which can include its name, ARN (for
+/// custom locations), and ping beacon information", so the record holds the name the
+/// request chose and the ARN the service minted for it, and
+/// [`CustomLocationRecord::to_modelled`] is the one projection every read of the location
+/// is served from.
+#[derive(Debug, Clone)]
+pub struct CustomLocationRecord {
+    pub location_name: String,
+    pub location_arn: String,
+    /// The labels assigned to the location resource. `LocationModel` has no `Tags`
+    /// member — tags are read back through `ListTagsForResource` — so they are held on
+    /// the record and reported by no projection of it yet.
+    pub tags: Vec<Tag>,
+    pub creation_time: SystemTime,
+    /// The Region of the request that created the location, which its ARN names.
+    pub region: String,
+}
+
+impl CustomLocationRecord {
+    /// This custom location as the modelled `LocationModel`.
+    ///
+    /// `PingBeacon` is "information about the UDP ping beacon for this location", a fixed
+    /// UDP endpoint a player device measures latency against. This emulator serves no UDP
+    /// endpoint, so a location reports no beacon rather than an address nothing listens
+    /// on.
+    pub fn to_modelled(&self) -> LocationModel {
+        LocationModel {
+            location_name: Some(self.location_name.clone()),
+            location_arn: Some(self.location_arn.clone()),
+            ping_beacon: None,
+        }
+    }
+}
+
+/// An Amazon Web Services location as `ListLocations` reports it: a Region this store
+/// hosts in, which carries no ARN — an ARN is assigned to "a custom location resource".
+pub fn aws_location_model(location: &str) -> LocationModel {
+    LocationModel {
+        location_name: Some(location.to_string()),
+        location_arn: None,
+        ping_beacon: None,
+    }
+}
+
+/// A FlexMatch rule set, as `CreateMatchmakingRuleSet` persisted it.
+#[derive(Debug, Clone)]
+pub struct MatchmakingRuleSetRecord {
+    pub rule_set_name: String,
+    pub rule_set_arn: String,
+    /// The body exactly as the request supplied it: "a collection of matchmaking rules,
+    /// formatted as a JSON string", reported back verbatim.
+    pub rule_set_body: String,
+    /// The labels assigned to the rule set resource, read back through
+    /// `ListTagsForResource`.
+    pub tags: Vec<Tag>,
+    pub creation_time: SystemTime,
+    /// The Region of the request that created the rule set, which its ARN names.
+    pub region: String,
+}
+
+impl MatchmakingRuleSetRecord {
+    /// This rule set as the modelled `MatchmakingRuleSet`.
+    pub fn to_modelled(&self) -> MatchmakingRuleSet {
+        MatchmakingRuleSet {
+            rule_set_name: Some(self.rule_set_name.clone()),
+            rule_set_arn: Some(self.rule_set_arn.clone()),
+            rule_set_body: self.rule_set_body.clone(),
+            creation_time: Some(to_date_time(self.creation_time)),
+        }
+    }
+}
+
+/// A matchmaker, as `CreateMatchmakingConfiguration` persisted it.
+///
+/// Every member of the modelled `MatchmakingConfiguration` is either a setting the
+/// request supplied or one the service decided, so the record holds them all and
+/// [`MatchmakingConfigurationRecord::to_modelled`] is the one projection every read of
+/// the configuration is served from.
+#[derive(Debug, Clone)]
+pub struct MatchmakingConfigurationRecord {
+    pub name: String,
+    pub configuration_arn: String,
+    pub description: Option<String>,
+    pub game_session_queue_arns: Vec<String>,
+    pub request_timeout_seconds: i32,
+    pub acceptance_timeout_seconds: Option<i32>,
+    pub acceptance_required: bool,
+    /// The `RuleSetName` of the rule set this configuration matches with, resolved from
+    /// whichever of the name and the ARN the request supplied.
+    pub rule_set_name: String,
+    pub rule_set_arn: String,
+    pub notification_target: Option<String>,
+    pub additional_player_count: Option<i32>,
+    pub custom_event_data: Option<String>,
+    pub game_properties: Vec<GameProperty>,
+    pub game_session_data: Option<String>,
+    pub backfill_mode: Option<String>,
+    pub flex_match_mode: Option<String>,
+    /// The labels assigned to the configuration resource, read back through
+    /// `ListTagsForResource`.
+    pub tags: Vec<Tag>,
+    pub creation_time: SystemTime,
+    /// The Region of the request that created the configuration, which its ARN names.
+    pub region: String,
+}
+
+impl MatchmakingConfigurationRecord {
+    /// This matchmaker as the modelled `MatchmakingConfiguration`.
+    pub fn to_modelled(&self) -> MatchmakingConfiguration {
+        MatchmakingConfiguration {
+            name: Some(self.name.clone()),
+            configuration_arn: Some(self.configuration_arn.clone()),
+            description: self.description.clone(),
+            game_session_queue_arns: Some(self.game_session_queue_arns.clone()),
+            request_timeout_seconds: Some(self.request_timeout_seconds),
+            acceptance_timeout_seconds: self.acceptance_timeout_seconds,
+            acceptance_required: Some(self.acceptance_required),
+            rule_set_name: Some(self.rule_set_name.clone()),
+            rule_set_arn: Some(self.rule_set_arn.clone()),
+            notification_target: self.notification_target.clone(),
+            additional_player_count: self.additional_player_count,
+            custom_event_data: self.custom_event_data.clone(),
+            creation_time: Some(to_date_time(self.creation_time)),
+            game_properties: Some(self.game_properties.clone()),
+            game_session_data: self.game_session_data.clone(),
+            backfill_mode: self.backfill_mode.clone(),
+            flex_match_mode: self.flex_match_mode.clone(),
+        }
+    }
+}
+
+/// A matchmaking request, as `StartMatchmaking` persisted it.
+#[derive(Debug, Clone)]
+pub struct MatchmakingTicketRecord {
+    pub ticket_id: String,
+    pub configuration_name: String,
+    pub configuration_arn: String,
+    pub status: String,
+    pub status_reason: Option<String>,
+    pub status_message: Option<String>,
+    pub start_time: SystemTime,
+    /// "Time stamp indicating when the matchmaking request stopped being processed due to
+    /// successful completion, timeout, or cancellation": set once the ticket is in a
+    /// terminal status.
+    pub end_time: Option<SystemTime>,
+    /// The players to find matches for, exactly as the request supplied them.
+    pub players: Vec<Player>,
+    /// When `QUEUED` becomes `SEARCHING`; `None` once FlexMatch has picked the ticket up.
+    pub searching_at: Option<SystemTime>,
+    /// When the request times out: `start_time` plus the configuration's
+    /// `RequestTimeoutSeconds` — "the maximum duration, in seconds, that a matchmaking
+    /// ticket can remain in process before timing out".
+    pub timeout_at: SystemTime,
+}
+
+impl MatchmakingTicketRecord {
+    /// This ticket as the modelled `MatchmakingTicket`.
+    ///
+    /// `GameSessionConnectionInfo` is "connection information for a new game session[,]
+    /// once a match is made", and `EstimatedWaitTime` is reported only when "there is
+    /// enough recent data", so a ticket that has matched nothing reports neither.
+    pub fn to_modelled(&self) -> MatchmakingTicket {
+        MatchmakingTicket {
+            ticket_id: Some(self.ticket_id.clone()),
+            configuration_name: Some(self.configuration_name.clone()),
+            configuration_arn: Some(self.configuration_arn.clone()),
+            status: Some(self.status.clone()),
+            status_reason: self.status_reason.clone(),
+            status_message: self.status_message.clone(),
+            start_time: Some(to_date_time(self.start_time)),
+            end_time: self.end_time.map(to_date_time),
+            players: Some(self.players.clone()),
+            game_session_connection_info: None,
+            estimated_wait_time: None,
+        }
+    }
+}
+
+/// A game session placement request, as `StartGameSessionPlacement` persisted it.
+#[derive(Debug, Clone)]
+pub struct GameSessionPlacementRecord {
+    pub placement_id: String,
+    /// The `Name` of the queue that processes this placement, resolved from whichever of
+    /// the name and the ARN the request supplied.
+    pub queue_name: String,
+    pub status: String,
+    pub game_properties: Vec<GameProperty>,
+    pub maximum_player_session_count: i32,
+    pub game_session_name: Option<String>,
+    pub player_latencies: Vec<PlayerLatency>,
+    /// The players a fulfilled placement reserves a slot for: "you can request new player
+    /// sessions for a group of players[;] include the DesiredPlayerSessions parameter".
+    pub desired_player_sessions: Vec<DesiredPlayerSession>,
+    pub game_session_data: Option<String>,
+    pub priority_configuration_override: Option<PriorityConfigurationOverride>,
+    pub start_time: SystemTime,
+    /// "Time stamp indicating when this request was completed, canceled, or timed out."
+    pub end_time: Option<SystemTime>,
+    /// When the queue next tries to find a destination that can host the session. "Amazon
+    /// GameLift Servers may attempt to place a game session multiple times before
+    /// succeeding", so a failed attempt sets this forward instead of failing the request.
+    pub attempt_at: SystemTime,
+    /// When the request times out: `start_time` plus the queue's `TimeoutInSeconds` —
+    /// "the maximum time, in seconds, that a new game session placement request remains
+    /// in the queue".
+    pub timeout_at: SystemTime,
+    /// The game session the queue started for this placement, once one is running. The
+    /// `GameSessionId`, `GameSessionArn` and connection information a placement reports
+    /// are read from THAT session: "this value isn't final until placement status is
+    /// FULFILLED".
+    pub game_session_id: Option<String>,
+    /// The Region the game session this placement started runs in, which is the Region of
+    /// the fleet hosting it.
+    pub game_session_region: Option<String>,
+    pub placed_player_sessions: Vec<PlacedPlayerSession>,
+}
+
+impl GameSessionPlacementRecord {
+    /// This placement as the modelled `GameSessionPlacement`, with the connection
+    /// information read from the game session it placed — so the placement and that
+    /// session can only agree.
+    pub fn to_modelled(&self, session: Option<&GameSessionRecord>) -> GameSessionPlacement {
+        let fulfilled = self.status == PLACEMENT_STATUS_FULFILLED;
+        let session = session.filter(|_| fulfilled);
+        GameSessionPlacement {
+            placement_id: Some(self.placement_id.clone()),
+            game_session_queue_name: Some(self.queue_name.clone()),
+            status: Some(self.status.clone()),
+            game_properties: Some(self.game_properties.clone()),
+            maximum_player_session_count: Some(self.maximum_player_session_count),
+            game_session_name: self.game_session_name.clone(),
+            game_session_id: session.map(|session| session.game_session_id.clone()),
+            game_session_arn: session.map(|session| session.game_session_id.clone()),
+            game_session_region: session.and_then(|_| self.game_session_region.clone()),
+            player_latencies: Some(self.player_latencies.clone()),
+            start_time: Some(to_date_time(self.start_time)),
+            end_time: self.end_time.map(to_date_time),
+            ip_address: session.and_then(|session| session.ip_address.clone()),
+            dns_name: session.and_then(|session| session.dns_name.clone()),
+            port: session.and_then(|session| session.port),
+            placed_player_sessions: Some(self.placed_player_sessions.clone()),
+            game_session_data: self.game_session_data.clone(),
+            // `MatchmakerData` is "information on the matchmaking process for this game",
+            // which only a placement FlexMatch started carries; nothing here was started
+            // by a match.
+            matchmaker_data: None,
+            priority_configuration_override: self.priority_configuration_override.clone(),
+            // `PlayerGatewayStatus` is reported by the player-gateway slice, which no
+            // fleet in this emulator enables.
+            player_gateway_status: None,
+        }
+    }
+}
+
+/// Whether `body` is a FlexMatch rule set, or the reason it is not — which both
+/// `CreateMatchmakingRuleSet` and `ValidateMatchmakingRuleSet` answer with the modelled
+/// `InvalidRequestException`.
+///
+/// `MatchmakingRuleSet$RuleSetBody`'s doc: "A collection of matchmaking rules, formatted
+/// as a JSON string." `MatchmakingRuleSet`'s own doc names the elements a rule set defines
+/// and which of them the service requires: "A rule set may define the following elements
+/// for a match[:] [...] A rule set must specify teams" — so the two elements a body cannot
+/// omit are the rule language version it is written in and the team definitions the match
+/// is built from, each team naming itself and the player counts it holds. Everything else
+/// the rule language allows (`name`, `playerAttributes`, `algorithm`, `rules`,
+/// `expansions`) is optional, and a body is refused ONLY for what is required: a rule this
+/// emulator does not interpret is still stored and reported verbatim.
+///
+/// The reason names the element and the constraint it missed, in the form the service's
+/// own rule-set errors take (`<what is wrong>; location: <where>`).
+pub fn validate_rule_set_body(body: &str) -> Result<(), String> {
+    let parsed: serde_json::Value = serde_json::from_str(body)
+        .map_err(|error| format!("RuleSetBody is not valid JSON ({error}); location: top level"))?;
+    let Some(object) = parsed.as_object() else {
+        return Err("RuleSetBody must be a JSON object; location: top level".to_string());
+    };
+
+    match object.get("ruleLanguageVersion") {
+        None => {
+            return Err(
+                "Rule set does not define ruleLanguageVersion; location: top level".to_string(),
+            )
+        }
+        Some(version) if !version.is_string() => {
+            return Err(
+                "ruleLanguageVersion must be a string, such as \"1.0\"; location: top level"
+                    .to_string(),
+            )
+        }
+        Some(_) => {}
+    }
+
+    let Some(teams) = object.get("teams") else {
+        return Err("Rule set does not define team definitions; location: top level".to_string());
+    };
+    let Some(teams) = teams.as_array() else {
+        return Err("teams must be a list of team definitions; location: top level".to_string());
+    };
+    if teams.is_empty() {
+        return Err("teams must define at least one team; location: top level".to_string());
+    }
+    let mut names = HashSet::new();
+    for (index, team) in teams.iter().enumerate() {
+        let Some(team) = team.as_object() else {
+            return Err(format!("team must be an object; location: teams[{index}]"));
+        };
+        let name = match team.get("name").and_then(serde_json::Value::as_str) {
+            Some(name) if !name.is_empty() => name,
+            _ => {
+                return Err(format!(
+                    "team does not define a non-empty name; location: teams[{index}]"
+                ))
+            }
+        };
+        if !names.insert(name.to_string()) {
+            return Err(format!(
+                "team name {name} is defined more than once; location: teams[{index}]"
+            ));
+        }
+        let Some(max_players) = team.get("maxPlayers").and_then(serde_json::Value::as_i64) else {
+            return Err(format!(
+                "team {name} does not define maxPlayers as a whole number; location: \
+                 teams[{index}]"
+            ));
+        };
+        if max_players < 1 {
+            return Err(format!(
+                "team {name} defines maxPlayers {max_players}; a team must hold at least one \
+                 player; location: teams[{index}]"
+            ));
+        }
+        if let Some(min_players) = team.get("minPlayers") {
+            let Some(min_players) = min_players.as_i64() else {
+                return Err(format!(
+                    "team {name} defines minPlayers that is not a whole number; location: \
+                     teams[{index}]"
+                ));
+            };
+            if min_players < 0 || min_players > max_players {
+                return Err(format!(
+                    "team {name} defines minPlayers {min_players}, which is not between 0 and \
+                     maxPlayers {max_players}; location: teams[{index}]"
+                ));
+            }
+        }
+    }
+
+    // The remaining elements the rule language lists are optional, but each is a LIST
+    // where it appears, so a body that spells one as something else is not a rule set.
+    for element in ["playerAttributes", "rules", "expansions"] {
+        if let Some(value) = object.get(element) {
+            if !value.is_array() {
+                return Err(format!(
+                    "{element} must be a list; location: top level"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Per-service state for com-amazonaws-gamelift-gamelift. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsGameliftGameliftState {
     /// Fleets by `FleetId`.
     pub fleets: HashMap<String, Fleet>,
+    /// Aliases by `AliasId`: "Alias IDs are unique within a Region", while "alias names
+    /// do not need to be unique", so the id is the alias's key.
+    pub aliases: HashMap<String, AliasRecord>,
     /// Game session queues by `Name`: "Queue names must be unique within each Region",
     /// and this store — like the fleet store — is the account's one store, so the name
     /// is the queue's key.
     pub game_session_queues: HashMap<String, GameSessionQueueRecord>,
+    /// Custom locations by `LocationName`, which `CreateLocation` keeps unique: a second
+    /// create under a name a location already holds answers `ConflictException`.
+    pub custom_locations: HashMap<String, CustomLocationRecord>,
+    /// Matchmaking rule sets by `RuleSetName`, which "a unique identifier for the
+    /// matchmaking rule set" makes the record's key.
+    pub matchmaking_rule_sets: HashMap<String, MatchmakingRuleSetRecord>,
+    /// Matchmaking configurations by `Name`: "a unique identifier for the matchmaking
+    /// configuration[,] used to identify the configuration associated with a matchmaking
+    /// request or ticket".
+    pub matchmaking_configurations: HashMap<String, MatchmakingConfigurationRecord>,
+    /// Matchmaking tickets by `TicketId`, which `StartMatchmaking` calls "a unique ticket
+    /// ID".
+    pub matchmaking_tickets: HashMap<String, MatchmakingTicketRecord>,
+    /// Game session placements by `PlacementId`, "a unique identifier for a game session
+    /// placement".
+    pub game_session_placements: HashMap<String, GameSessionPlacementRecord>,
     /// Game sessions by their full-ARN `GameSessionId`.
     pub game_sessions: HashMap<String, GameSessionRecord>,
     /// Player sessions by `PlayerSessionId`.
@@ -900,6 +1512,258 @@ impl ComAmazonawsGameliftGameliftState {
                 session.port = Some(port);
             }
         }
+
+        self.tick_matchmaking_tickets(now);
+        self.tick_game_session_placements(now);
+    }
+
+    /// Move every matchmaking ticket the clock has carried forward.
+    ///
+    /// A ticket FlexMatch has picked up is `SEARCHING` ("the matchmaking request is
+    /// currently being processed"), and one for which no match is formed within the
+    /// configuration's `RequestTimeoutSeconds` is `TIMED_OUT` ("the matchmaking request
+    /// was not successful within the duration specified in the matchmaking
+    /// configuration").
+    ///
+    /// Forming a match is FlexMatch evaluating a rule set over the tickets of a
+    /// matchmaker, which this emulator does not do — so no ticket here completes, and a
+    /// ticket ends in the modelled `TIMED_OUT` status carrying the reason it did.
+    fn tick_matchmaking_tickets(&mut self, now: SystemTime) {
+        for ticket in self.matchmaking_tickets.values_mut() {
+            if ticket.status == MATCHMAKING_TICKET_STATUS_QUEUED
+                && ticket.searching_at.is_some_and(|due| now >= due)
+            {
+                ticket.status = MATCHMAKING_TICKET_STATUS_SEARCHING.to_string();
+                ticket.searching_at = None;
+            }
+            let in_process = ticket.status == MATCHMAKING_TICKET_STATUS_QUEUED
+                || ticket.status == MATCHMAKING_TICKET_STATUS_SEARCHING;
+            if in_process && now >= ticket.timeout_at {
+                ticket.status = MATCHMAKING_TICKET_STATUS_TIMED_OUT.to_string();
+                ticket.searching_at = None;
+                // The instant the request became due to time out, not the instant
+                // somebody happened to read it.
+                ticket.end_time = Some(ticket.timeout_at);
+                ticket.status_reason = Some("TIMED_OUT".to_string());
+                ticket.status_message = Some(
+                    "No match was formed for this ticket within the matchmaking \
+                     configuration's RequestTimeoutSeconds."
+                        .to_string(),
+                );
+            }
+        }
+    }
+
+    /// Move every game session placement the clock has carried forward.
+    ///
+    /// A `PENDING` placement is one the queue is still working on: at each attempt it
+    /// looks for a destination that can host the session and starts one there ("after
+    /// selecting an available resource, Amazon GameLift Servers prompts the resource to
+    /// start a game session"), and the placement is `FULFILLED` once that session is
+    /// running — "when the request status is FULFILLED, a new game session has started
+    /// and the placement request is updated with connection information for the game
+    /// session", and "if the request included player session data, Amazon GameLift
+    /// Servers creates a player session for each player ID in the request". A placement
+    /// no destination can host keeps being retried "until it reaches the queue's timeout
+    /// setting", and then times out.
+    fn tick_game_session_placements(&mut self, now: SystemTime) {
+        let pending: Vec<String> = self
+            .game_session_placements
+            .iter()
+            .filter(|(_, placement)| placement.status == PLACEMENT_STATUS_PENDING)
+            .map(|(placement_id, _)| placement_id.clone())
+            .collect();
+        for placement_id in pending {
+            let Some(placement) = self.game_session_placements.get(&placement_id) else {
+                continue;
+            };
+            match placement.game_session_id.clone() {
+                // The queue already started a session for this placement: the placement
+                // is fulfilled once that session is running and carries the connection
+                // information the placement reports.
+                Some(game_session_id) => {
+                    let started = self
+                        .game_sessions
+                        .get(&game_session_id)
+                        .is_some_and(|session| session.status == GAME_SESSION_STATUS_ACTIVE);
+                    if started {
+                        self.fulfil_placement(&placement_id, &game_session_id, now);
+                    } else if !self.game_sessions.contains_key(&game_session_id) {
+                        // The session the queue started is gone (its fleet was deleted),
+                        // so this attempt placed nothing: the queue tries again.
+                        if let Some(placement) =
+                            self.game_session_placements.get_mut(&placement_id)
+                        {
+                            placement.game_session_id = None;
+                            placement.game_session_region = None;
+                        }
+                    }
+                }
+                None if now >= placement.timeout_at => {
+                    if let Some(placement) = self.game_session_placements.get_mut(&placement_id) {
+                        placement.status = PLACEMENT_STATUS_TIMED_OUT.to_string();
+                        placement.end_time = Some(placement.timeout_at);
+                    }
+                }
+                None if now >= placement.attempt_at => {
+                    let started = self.start_placed_game_session(&placement_id, now);
+                    if let Some(placement) = self.game_session_placements.get_mut(&placement_id) {
+                        match started {
+                            Some((game_session_id, region)) => {
+                                placement.game_session_id = Some(game_session_id);
+                                placement.game_session_region = Some(region);
+                            }
+                            // "Amazon GameLift Servers may attempt to place a game
+                            // session multiple times before succeeding": the next attempt
+                            // is one span away, until the queue's timeout is reached.
+                            None => placement.attempt_at = now + WORKFLOW_DELAY,
+                        }
+                    }
+                }
+                None => {}
+            }
+        }
+    }
+
+    /// Start a game session for `placement_id` on the first destination of its queue that
+    /// can host one, and return that session's id.
+    ///
+    /// The queue's destinations are "a list of fleets and/or aliases that can be used to
+    /// fulfill game session placement requests in the queue[, in] the order of when to
+    /// place the game session", so they are walked in order; a destination that names no
+    /// stored fleet, a fleet that is not `ACTIVE`, or one whose server processes and
+    /// opened ports are all taken cannot host, exactly as `CreateGameSession` decides.
+    /// `None` means no destination could, which leaves the placement pending.
+    fn start_placed_game_session(
+        &mut self,
+        placement_id: &str,
+        now: SystemTime,
+    ) -> Option<(String, String)> {
+        let placement = self.game_session_placements.get(placement_id)?.clone();
+        let queue = self.game_session_queues.get(&placement.queue_name)?.clone();
+        for destination in &queue.destinations {
+            let reference = destination.destination_arn.as_deref().unwrap_or_default();
+            // "In most situations, you can use an alias ID in place of a fleet ID": a
+            // destination may name either, and a terminal alias resolves to no fleet.
+            let fleet_id = match self.resolve_fleet_id(reference) {
+                Some(fleet_id) => fleet_id,
+                None => match self.resolve_alias(reference).map(AliasRecord::routing) {
+                    Some(AliasRouting::Fleet(fleet_id)) => {
+                        let fleet_id = fleet_id.to_string();
+                        match self.resolve_fleet_id(&fleet_id) {
+                            Some(fleet_id) => fleet_id,
+                            None => continue,
+                        }
+                    }
+                    _ => continue,
+                },
+            };
+            let Some(fleet) = self.fleets.get(&fleet_id) else {
+                continue;
+            };
+            if fleet.status != FLEET_STATUS_ACTIVE {
+                continue;
+            }
+            let location = fleet.home_location.clone();
+            let fleet_arn = fleet.fleet_arn.clone();
+            let region = fleet.region.clone();
+            let capacity = fleet.game_session_capacity(&location);
+            let open_ports = fleet.open_port_count();
+            if self.live_game_sessions_at(&fleet_id, &location) >= capacity
+                || self.live_game_sessions_on(&fleet_id) >= open_ports
+            {
+                continue;
+            }
+
+            let id_string = mint_uuid(&mut self.minted_ids, "game-session");
+            let game_session_id =
+                gamelift_arn(&region, &format!("gamesession/{fleet_id}/{id_string}"));
+            let record = GameSessionRecord {
+                game_session_id: game_session_id.clone(),
+                name: placement.game_session_name.clone(),
+                fleet_id,
+                fleet_arn,
+                status: GAME_SESSION_STATUS_ACTIVATING.to_string(),
+                active_at: Some(now + WORKFLOW_DELAY),
+                creation_time: now,
+                termination_time: None,
+                current_player_session_count: 0,
+                maximum_player_session_count: placement.maximum_player_session_count,
+                game_properties: placement.game_properties.clone(),
+                game_session_data: placement.game_session_data.clone(),
+                // A placed session has no creator: the queue started it.
+                creator_id: None,
+                location,
+                player_session_creation_policy: PLAYER_SESSION_CREATION_POLICY_ACCEPT_ALL
+                    .to_string(),
+                ip_address: None,
+                port: None,
+                dns_name: None,
+            };
+            self.game_sessions.insert(game_session_id.clone(), record);
+            return Some((game_session_id, region));
+        }
+        None
+    }
+
+    /// Mark `placement_id` fulfilled on the game session that is now running for it, and
+    /// reserve a player slot in that session for each player the request asked for.
+    fn fulfil_placement(&mut self, placement_id: &str, game_session_id: &str, now: SystemTime) {
+        let Some(placement) = self.game_session_placements.get(placement_id).cloned() else {
+            return;
+        };
+        let Some(session) = self.game_sessions.get(game_session_id).cloned() else {
+            return;
+        };
+        // "If the request included player session data, Amazon GameLift Servers creates a
+        // player session for each player ID in the request" — never more than the slots
+        // the session was created with, which `StartGameSessionPlacement` refuses up
+        // front.
+        let open_slots = session
+            .maximum_player_session_count
+            .min(MAX_PLAYERS_PER_GAME_SESSION);
+        let mut placed: Vec<PlacedPlayerSession> = Vec::new();
+        let mut reserved = session.current_player_session_count;
+        for desired in &placement.desired_player_sessions {
+            let Some(player_id) = desired.player_id.clone() else {
+                continue;
+            };
+            if reserved >= open_slots {
+                break;
+            }
+            let player_session_id =
+                format!("psess-{}", mint_uuid(&mut self.minted_ids, "player-session"));
+            self.player_sessions.insert(
+                player_session_id.clone(),
+                PlayerSessionRecord {
+                    player_session_id: player_session_id.clone(),
+                    player_id: player_id.clone(),
+                    game_session_id: session.game_session_id.clone(),
+                    fleet_id: session.fleet_id.clone(),
+                    fleet_arn: session.fleet_arn.clone(),
+                    status: PLAYER_SESSION_STATUS_RESERVED.to_string(),
+                    creation_time: now,
+                    termination_time: None,
+                    ip_address: session.ip_address.clone(),
+                    port: session.port,
+                    dns_name: session.dns_name.clone(),
+                    player_data: desired.player_data.clone(),
+                },
+            );
+            reserved += 1;
+            placed.push(PlacedPlayerSession {
+                player_id: Some(player_id),
+                player_session_id: Some(player_session_id),
+            });
+        }
+        if let Some(session) = self.game_sessions.get_mut(game_session_id) {
+            session.current_player_session_count = reserved;
+        }
+        if let Some(placement) = self.game_session_placements.get_mut(placement_id) {
+            placement.status = PLACEMENT_STATUS_FULFILLED.to_string();
+            placement.end_time = Some(now);
+            placement.placed_player_sessions = placed;
+        }
     }
 
     /// Drop a fleet, the game sessions placed on it, the player slots reserved in those
@@ -983,6 +1847,20 @@ impl ComAmazonawsGameliftGameliftState {
         sessions
     }
 
+    /// The alias an `AliasIdOrArn` names, or `None` when no stored alias matches it.
+    ///
+    /// `AliasArn`'s doc: "In a GameLift alias ARN, the resource ID matches the alias ID
+    /// value", so either form selects the same alias.
+    pub fn resolve_alias(&self, id_or_arn: &str) -> Option<&AliasRecord> {
+        if id_or_arn.starts_with("arn:") {
+            self.aliases
+                .values()
+                .find(|alias| alias.alias_arn == id_or_arn)
+        } else {
+            self.aliases.get(id_or_arn)
+        }
+    }
+
     /// The `Name` of the queue a `GameSessionQueueNameOrArn` names, or `None` when no
     /// stored queue matches it.
     ///
@@ -1011,6 +1889,101 @@ impl ComAmazonawsGameliftGameliftState {
                 .then_with(|| left.name.cmp(&right.name))
         });
         queues
+    }
+
+    /// The `RuleSetName` of the rule set a `MatchmakingRuleSetName` names, or `None` when
+    /// no stored rule set matches it.
+    ///
+    /// `MatchmakingRuleSetArn`'s doc: "In a GameLift rule set ARN, the resource ID matches
+    /// the `RuleSetName` value", so either form selects the same rule set — which is why
+    /// the member's pattern accepts both.
+    pub fn resolve_rule_set_name(&self, name_or_arn: &str) -> Option<String> {
+        if name_or_arn.starts_with("arn:") {
+            self.matchmaking_rule_sets
+                .values()
+                .find(|rule_set| rule_set.rule_set_arn == name_or_arn)
+                .map(|rule_set| rule_set.rule_set_name.clone())
+        } else {
+            self.matchmaking_rule_sets
+                .get(name_or_arn)
+                .map(|rule_set| rule_set.rule_set_name.clone())
+        }
+    }
+
+    /// Every stored matchmaking rule set, oldest first, so a paginated walk is stable.
+    pub fn matchmaking_rule_sets_in_order(&self) -> Vec<&MatchmakingRuleSetRecord> {
+        let mut rule_sets: Vec<&MatchmakingRuleSetRecord> =
+            self.matchmaking_rule_sets.values().collect();
+        rule_sets.sort_by(|left, right| {
+            left.creation_time
+                .cmp(&right.creation_time)
+                .then_with(|| left.rule_set_name.cmp(&right.rule_set_name))
+        });
+        rule_sets
+    }
+
+    /// The `Name` of the matchmaking configuration a `MatchmakingConfigurationName` names,
+    /// or `None` when no stored configuration matches it.
+    ///
+    /// `MatchmakingConfigurationArn`'s doc: "In a Amazon GameLift Servers configuration
+    /// ARN, the resource ID matches the `Name` value", so either form selects the same
+    /// configuration.
+    pub fn resolve_matchmaking_configuration_name(&self, name_or_arn: &str) -> Option<String> {
+        if name_or_arn.starts_with("arn:") {
+            self.matchmaking_configurations
+                .values()
+                .find(|configuration| configuration.configuration_arn == name_or_arn)
+                .map(|configuration| configuration.name.clone())
+        } else {
+            self.matchmaking_configurations
+                .get(name_or_arn)
+                .map(|configuration| configuration.name.clone())
+        }
+    }
+
+    /// Every stored matchmaking configuration, oldest first, so a paginated walk is
+    /// stable.
+    pub fn matchmaking_configurations_in_order(&self) -> Vec<&MatchmakingConfigurationRecord> {
+        let mut configurations: Vec<&MatchmakingConfigurationRecord> =
+            self.matchmaking_configurations.values().collect();
+        configurations.sort_by(|left, right| {
+            left.creation_time
+                .cmp(&right.creation_time)
+                .then_with(|| left.name.cmp(&right.name))
+        });
+        configurations
+    }
+
+    /// Every stored custom location, oldest first, so a paginated walk is stable.
+    pub fn custom_locations_in_order(&self) -> Vec<&CustomLocationRecord> {
+        let mut locations: Vec<&CustomLocationRecord> = self.custom_locations.values().collect();
+        locations.sort_by(|left, right| {
+            left.creation_time
+                .cmp(&right.creation_time)
+                .then_with(|| left.location_name.cmp(&right.location_name))
+        });
+        locations
+    }
+
+    /// Every Amazon Web Services location this store hosts in, in name order.
+    ///
+    /// `ListLocations` "lists all custom and Amazon Web Services locations where Amazon
+    /// GameLift Servers can host game servers". The Amazon Web Services ones are not
+    /// resources a caller creates, so they are the Regions this store KNOWS: the Region
+    /// the request is served in, plus every location a stored fleet deploys to that is
+    /// not a custom one.
+    pub fn aws_locations(&self, request_region: &str) -> Vec<String> {
+        let mut locations: HashSet<String> = self
+            .fleets
+            .values()
+            .flat_map(|fleet| fleet.locations.iter())
+            .map(|location| location.location.clone())
+            .filter(|location| !is_custom_location(location))
+            .collect();
+        locations.insert(request_region.to_string());
+        let mut locations: Vec<String> = locations.into_iter().collect();
+        locations.sort();
+        locations
     }
 
     /// An address for a newly provisioned fleet instance, held by no stored fleet.

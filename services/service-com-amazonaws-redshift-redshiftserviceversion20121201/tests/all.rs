@@ -17,6 +17,8 @@ mod cluster_lifecycle;
 mod cluster_parameter_groups;
 #[path = "all/cluster_parameters.rs"]
 mod cluster_parameters;
+#[path = "all/cluster_structure.rs"]
+mod cluster_structure;
 #[path = "all/cluster_versions.rs"]
 mod cluster_versions;
 #[path = "all/error_envelope.rs"]

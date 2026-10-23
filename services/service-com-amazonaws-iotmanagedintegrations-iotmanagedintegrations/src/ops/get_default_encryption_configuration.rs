@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetDefaultEncryptionConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetDefaultEncryptionConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetDefaultEncryptionConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the default encryption configuration `crate::state`'s `default_encryption`
+//! store holds for the region this request was signed for, or the account default
+//! (`crate::state::DefaultEncryptionConfiguration::default`) for a region no
+//! `PutDefaultEncryptionConfiguration` has configured. A reporting operation
+//! (`@readonly`): it never writes, and the `ConfigurationState` it reports is DERIVED
+//! from the clock — the switch a put started is `UPDATE_IN_PROGRESS` until its due
+//! instant and `ENABLED` from it, so there is nothing for a read to materialise.
+//!
+//! IAM authorization is NOT modelled in this emulator — the request pipeline verifies the
+//! signature and no handler evaluates permissions — so this operation's modelled
+//! `AccessDeniedException` / `UnauthorizedException` are deliberately unreachable here.
 //!
 //! ## Shape of an operation
 //!
@@ -149,21 +152,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
     async fn handle(
         &self,
-        input: Self::Input,
+        _input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetDefaultEncryptionConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetDefaultEncryptionConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetDefaultEncryptionConfiguration"))
+        // `GetDefaultEncryptionConfigurationRequest` declares no members
+        // (`smithy_query(query="operation",operation="GetDefaultEncryptionConfiguration")`):
+        // the configuration this reports is identified by the account and the region the
+        // request was signed for, and by nothing in the request body.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetDefaultEncryptionConfigurationErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the encryption-configuration store is unavailable".to_string()),
+                },
+            )
+        })?;
+
+        // The configuration is an account-and-region setting, so the region this request
+        // was signed for is what selects it; a region no put has configured reports the
+        // account default rather than a 404.
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let configuration = state.lock().default_encryption_in(&region);
+
+        Ok(GetDefaultEncryptionConfigurationOutput {
+            configuration_status: configuration.status_at(now),
+            encryption_type: configuration.encryption_type,
+            kms_key_arn: configuration.kms_key_arn,
+        })
     }
 }

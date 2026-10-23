@@ -342,6 +342,18 @@ pub const MAX_RETAINED_MESSAGE_BYTES_PER_QUEUE: usize = 8 * 1024 * 1024;
 /// caps alone would still scale with the number of queues.
 pub const MAX_RETAINED_MESSAGE_BYTES: usize = 32 * 1024 * 1024;
 
+/// How many bytes one attribute VALUE whose form admits text of any length may carry:
+/// the `Json` attributes (`Policy`, `RedrivePolicy`, `RedriveAllowPolicy`) and the
+/// `Text` ones (`KmsMasterKeyId`).
+///
+/// Every other kind is bounded by its own form (an integer, a boolean, one of a list).
+/// These are not, and a queue keeps its attributes for as long as it exists, so without
+/// this a caller looping on `CreateQueue`/`SetQueueAttributes` could grow the store
+/// without end — the one thing the bounds above exist to prevent. The figure is the
+/// ceiling AWS publishes for the largest of them: "The policy size is limited to 8,192
+/// bytes" (the `Policy` attribute's own documentation).
+pub const MAX_ATTRIBUTE_VALUE_BYTES: usize = 8 * 1024;
+
 /// The page size `ListQueues` uses when the caller gives no `MaxResults`, so one
 /// unparameterised request cannot materialise a response that grows with the stored
 /// queue count. A client walks past it with `NextToken`.
@@ -751,6 +763,32 @@ pub fn receipt_handle_is_invalid(receipt_handle: &str) -> ReceiptHandleIsInvalid
     }
 }
 
+/// How many entries one batch request may carry.
+///
+/// "For Amazon SQS, the maximum number of entries you can include in a single
+/// `SendMessageBatch`, `DeleteMessageBatch`, or `ChangeMessageVisibilityBatch` request is
+/// 10" (`TooManyEntriesInBatchRequest`'s own documentation). The model puts no `@length`
+/// on the entry lists, so every batch operation applies this bound itself.
+pub const MAX_BATCH_ENTRIES: usize = 10;
+
+/// How long a batch entry's `Id` may be: "This identifier can have up to 80 characters"
+/// (`DeleteMessageBatchRequestEntry$Id`).
+pub const MAX_BATCH_ENTRY_ID_LEN: usize = 80;
+
+/// Whether `id` is a batch entry id the specification admits.
+///
+/// "The following characters are accepted: alphanumeric characters, hyphens(-), and
+/// underscores (_)" and "this identifier can have up to 80 characters"
+/// (`DeleteMessageBatchRequestEntry$Id`); an empty id names nothing, so it is not one
+/// either. A value outside this is what `InvalidBatchEntryId` refuses.
+pub fn is_valid_batch_entry_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.chars().count() <= MAX_BATCH_ENTRY_ID_LEN
+        && id
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '-' || character == '_')
+}
+
 /// Why an `Attributes` map was refused. Each handler renders it as its own modelled
 /// error variant, so the wire code is the one that operation declares.
 #[derive(Debug)]
@@ -807,6 +845,26 @@ pub fn validate_attributes(
 
 /// Check one attribute value against what its own documentation says it accepts.
 fn check_attribute_value(spec: &AttributeSpec, value: &str) -> Result<(), AttributeRefusal> {
+    // Every attribute value is stored for the queue's lifetime, so the two kinds whose
+    // form admits text of any length are bounded FIRST: a caller looping on
+    // `CreateQueue`/`SetQueueAttributes` must not be able to grow this store without
+    // end (see "Store bounds" above). The ceiling is the one AWS publishes for the
+    // largest of them — "The policy size is limited to 8,192 bytes" (the `Policy`
+    // attribute's own documentation) — applied to each of them.
+    let bounded = match spec.kind {
+        AttributeKind::Json | AttributeKind::Text => value.len() <= MAX_ATTRIBUTE_VALUE_BYTES,
+        _ => true,
+    };
+    if !bounded {
+        return Err(AttributeRefusal::Value(InvalidAttributeValue {
+            message: Some(format!(
+                "Invalid value for the parameter {}: at most {MAX_ATTRIBUTE_VALUE_BYTES} bytes \
+                 were expected, and {} were supplied.",
+                spec.name,
+                value.len()
+            )),
+        }));
+    }
     let accepted = match spec.kind {
         AttributeKind::Integer { min, max } => match value.parse::<i64>() {
             Ok(parsed) => (min..=max).contains(&parsed),

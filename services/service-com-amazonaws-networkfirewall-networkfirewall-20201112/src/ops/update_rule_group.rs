@@ -240,7 +240,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(stored) = state.rule_groups.get(&key) else {
             return Err(
                 UpdateRuleGroupErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                    message: Some(format!("Rule group {key} does not exist.")),
+                    message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
                 })
                 .into(),
             );
@@ -251,11 +251,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if input.update_token != stored.update_token {
             return Err(
                 UpdateRuleGroupErrorModeled::InvalidTokenException(InvalidTokenException {
-                    message: Some(
-                        "The UpdateToken you provided is stale; retrieve the rule group again \
-                         to get a current one."
-                            .to_string(),
-                    ),
+                    message: Some(crate::state::INVALID_TOKEN_MESSAGE.to_string()),
                 })
                 .into(),
             );
@@ -369,7 +365,7 @@ fn invalid_request(message: &str) -> UpdateRuleGroupError {
 
 crate::state::impl_resolve_error!(
     update_lookup_error -> UpdateRuleGroupError, UpdateRuleGroupErrorModeled,
-    resource = "rule group", plural = "rule groups",
+    plural = "rule groups",
     name_member = "RuleGroupName", arn_member = "RuleGroupArn"
 );
 

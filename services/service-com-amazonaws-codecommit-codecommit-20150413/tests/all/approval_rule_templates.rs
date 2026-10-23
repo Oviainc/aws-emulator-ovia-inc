@@ -31,7 +31,10 @@ use crate::repository_lifecycle::{emulator, error, ok, string_at};
 /// structure (`Version`, `Statements` of `Type` `Approvers` with
 /// `NumberOfApprovalsNeeded` and `ApprovalPoolMembers`) is the one the CodeCommit
 /// User Guide documents for approval rule template content.
-fn document(approvals: u32) -> String {
+///
+/// `pub(crate)` so the sibling suite that updates a template's description creates
+/// its templates from this same definition of valid content.
+pub(crate) fn document(approvals: u32) -> String {
     serde_json::to_string(&json!({
         "Version": "2018-11-08",
         "Statements": [{
@@ -190,9 +193,13 @@ async fn each_published_bound_of_the_input_members_is_accepted_and_one_past_it_r
     );
 
     // `ApprovalRuleTemplateContent`, length 1..3000: a document padded to exactly
-    // 3000 characters is accepted and stored verbatim, one more is refused.
+    // 3000 characters is accepted, one more is refused. The padded document is
+    // written minified, so it is already in the canonical form the service stores
+    // (the canonicalization itself is pinned by
+    // `tests/all/approval_rule_template_content_canonicalization.rs`) and the stored
+    // content is the submitted text character for character.
     let padded = |total: usize| -> String {
-        let prefix = "{\"Version\": \"2018-11-08\", \"Statements\": [{\"Type\": \"Approvers\", \"NumberOfApprovalsNeeded\": 1, \"ApprovalPoolMembers\": [\"";
+        let prefix = "{\"Version\":\"2018-11-08\",\"Statements\":[{\"Type\":\"Approvers\",\"NumberOfApprovalsNeeded\":1,\"ApprovalPoolMembers\":[\"";
         let suffix = "\"]}]}";
         let pad = total - prefix.len() - suffix.len();
         format!("{prefix}{}{suffix}", "p".repeat(pad))
@@ -211,7 +218,7 @@ async fn each_published_bound_of_the_input_members_is_accepted_and_one_past_it_r
     assert_eq!(
         string_at(&created, "/approvalRuleTemplate/approvalRuleTemplateContent"),
         at_bound,
-        "a document at the modelled maximum length is stored verbatim"
+        "a minified document at the modelled maximum length is stored as submitted"
     );
     let code = error(
         &router,

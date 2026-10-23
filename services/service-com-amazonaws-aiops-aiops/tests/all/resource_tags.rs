@@ -12,8 +12,9 @@
 //! the resource its identifier names, `TagResource` writes it per key (a key already
 //! present takes the new value, every other key is untouched), `UntagResource` removes
 //! per key and is idempotent, and `ListTagsForResource` reports exactly that stored set
-//! — empty when the resource carries no tags — without changing it. An identifier
-//! naming no resource is a modelled 404 from all three.
+//! — empty when the resource carries no tags — without changing it. A `resourceArn`
+//! naming no resource is the tagging frontend's 404 [`TAGGING_NOT_FOUND`] from all
+//! three (`tests/all/tagging_frontend_errors.rs` is where that rule is pinned).
 //!
 //! An account holds ONE investigation group per Region, so every row below that needs
 //! its own group signs for its own Region ([`region`]).
@@ -53,6 +54,12 @@ fn region(n: usize) -> String {
 
 /// A role ARN that satisfies the modelled `RoleArn` (len 20..2048, `^arn:.*$`).
 const ROLE_ARN: &str = "arn:aws:iam::000000000000:role/AIOpsAssistantRole";
+
+/// The error code the TAGGING operations report an unresolvable `resourceArn` with:
+/// the tagging frontend's own `NotFoundException`, not this service's modelled
+/// `ResourceNotFoundException` (which the resource operations keep). The rule and its
+/// source live on `state::TAGGING_RESOURCE_NOT_FOUND`.
+const TAGGING_NOT_FOUND: &str = "NotFoundException";
 
 /// One emulator with an empty store, mounted exactly as the router mounts it.
 fn emulator() -> MultiServiceRouter {
@@ -489,8 +496,8 @@ async fn tagging_and_untagging_are_per_key_over_the_stored_set() {
 
 /// `resourceArn` resolves the investigation group through its ARN and through nothing
 /// else: the bare forms the modelled identifier pattern also admits — the group's name
-/// and its bare id — name no resource, so all three tagging operations report a
-/// modelled 404 for them while the ARN addresses the stored set.
+/// and its bare id — name no resource, so all three tagging operations report the
+/// tagging frontend's 404 for them while the ARN addresses the stored set.
 #[tokio::test]
 async fn only_the_arn_addresses_the_tag_set() {
     let router = emulator();
@@ -532,8 +539,8 @@ async fn only_the_arn_addresses_the_tag_set() {
             );
             assert_eq!(
                 error_code(&body),
-                "ResourceNotFoundException",
-                "case {via:?} on {operation}: expected ResourceNotFoundException, got {body:?}"
+                TAGGING_NOT_FOUND,
+                "case {via:?} on {operation}: expected {TAGGING_NOT_FOUND}, got {body:?}"
             );
         }
     }
@@ -633,11 +640,11 @@ async fn the_per_resource_tag_maximum_bounds_the_resulting_set() {
     }
 }
 
-/// An identifier naming no investigation group is a modelled 404 from each of the three
-/// tagging operations, whatever form it takes — and the tag set goes with the resource
-/// when it is deleted.
+/// An identifier naming no investigation group is the tagging frontend's 404 from each
+/// of the three tagging operations, whatever form it takes — and the tag set goes with
+/// the resource when it is deleted.
 #[tokio::test]
-async fn an_unknown_resource_is_a_modelled_404() {
+async fn an_unknown_resource_is_a_tagging_frontend_404() {
     let router = emulator();
     let arn = group_with_tags(&router, REGION, "doomed", Some(&[("Team", "ops")])).await;
     let id = arn
@@ -678,8 +685,8 @@ async fn an_unknown_resource_is_a_modelled_404() {
             );
             assert_eq!(
                 error_code(&body),
-                "ResourceNotFoundException",
-                "case {case:?} on {operation}: expected ResourceNotFoundException, got {body:?}"
+                TAGGING_NOT_FOUND,
+                "case {case:?} on {operation}: expected {TAGGING_NOT_FOUND}, got {body:?}"
             );
         }
     }
@@ -716,8 +723,8 @@ async fn an_unknown_resource_is_a_modelled_404() {
     );
     assert_eq!(
         error_code(&body),
-        "ResourceNotFoundException",
-        "case \"after the group is deleted\": expected ResourceNotFoundException, got {body:?}"
+        TAGGING_NOT_FOUND,
+        "case \"after the group is deleted\": expected {TAGGING_NOT_FOUND}, got {body:?}"
     );
 }
 

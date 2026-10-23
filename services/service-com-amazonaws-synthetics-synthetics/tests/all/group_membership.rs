@@ -29,15 +29,18 @@ use serde_json::{json, Value};
 
 use crate::canary_lifecycle::{create_body, Answer, Synthetics};
 
-/// `AssociateResource`'s sentence for a `GroupIdentifier` it cannot resolve, which names
-/// the identifier the request supplied: the recorded service answers
-/// `Group does not exist: <the identifier as supplied>`. The group READERS word the same
-/// miss with the service's fixed, identifier-free sentence instead (pinned by
-/// `group_lifecycle.rs`), so what is asserted per operation is what that operation's
-/// wording is known to be.
-fn associate_group_not_found(identifier: &str) -> String {
-    format!("Group does not exist: {identifier}")
-}
+/// The sentence a group lookup whose wording is RECORDED answers with for a
+/// `GroupIdentifier` it cannot resolve, naming the identifier the request supplied:
+/// `Group does not exist: <the identifier as supplied>`. That is what the recorded service
+/// answers for `AssociateResource`, and — per the recorded unit
+/// `synthetics.delete-group-nonexistent-resource-not-found`, whose later step reads a
+/// just-deleted group back — for `DeleteGroup` and `GetGroup` too. The group operations
+/// with no recorded wording (`ListGroupResources`) word the same miss with the service's
+/// fixed, identifier-free sentence instead, so what is asserted per operation is what that
+/// operation's wording is known to be.
+///
+/// One construction for the whole target, defined beside the group lifecycle suite.
+use crate::group_lifecycle::group_not_found_message as recorded_group_not_found;
 
 /// The fixed sentence a canary lookup that misses answers with.
 const CANARY_NOT_FOUND: &str = "Canary not found.";
@@ -320,7 +323,7 @@ async fn associate_resource_reports_a_missing_group_or_canary_as_not_found() {
             .unwrap_or_else(|| panic!("case {case}: expected a Message, got {:?}", answer.body));
         assert_eq!(
             message,
-            associate_group_not_found(identifier),
+            recorded_group_not_found(identifier),
             "case {case}: expected the missing-group sentence naming the identifier as \
              supplied, got {message:?}"
         );
@@ -338,27 +341,34 @@ async fn associate_resource_reports_a_missing_group_or_canary_as_not_found() {
                 .to_string(),
         );
 
-        // The group READERS answer the same miss with this service's fixed,
-        // identifier-free sentence. What the rule pins for every operation is the status
-        // and the error code; the readers' sentence is pinned as an invariant rather than
-        // as a literal, because nothing documents its text.
-        for (operation, answer) in [
-            ("GetGroup", get_group(&aws, identifier).await),
-            (
-                "ListGroupResources",
-                list_resources(&aws, identifier, json!({})).await,
-            ),
-        ] {
-            let case = format!("{operation}/{row}");
-            let message = error_of(&case, &answer, 404, "ResourceNotFoundException")
-                .unwrap_or_else(|| panic!("case {case}: expected a Message, got {:?}", answer.body));
-            assert!(
-                !message.to_lowercase().contains(&identifier.to_lowercase()),
-                "case {case}: expected a reader's Message that does not name the requested \
-                 group {identifier:?}, got {message:?}"
-            );
-            reader_messages.insert(message);
-        }
+        // `GetGroup` words the same miss the recorded way too: the recorded unit
+        // `synthetics.delete-group-nonexistent-resource-not-found` reads a group back
+        // through `GetGroup` right after deleting it and is answered
+        // `Group does not exist: <identifier>`, so that message echoes the identifier.
+        let case = format!("GetGroup/{row}");
+        let answer = get_group(&aws, identifier).await;
+        let message = error_of(&case, &answer, 404, "ResourceNotFoundException")
+            .unwrap_or_else(|| panic!("case {case}: expected a Message, got {:?}", answer.body));
+        assert_eq!(
+            message,
+            recorded_group_not_found(identifier),
+            "case {case}: expected the recorded missing-group sentence naming the \
+             identifier as supplied, got {message:?}"
+        );
+
+        // `ListGroupResources` has no recorded wording, so it keeps this service's fixed,
+        // identifier-free sentence — pinned as an invariant rather than as a literal,
+        // because nothing documents its text.
+        let case = format!("ListGroupResources/{row}");
+        let answer = list_resources(&aws, identifier, json!({})).await;
+        let message = error_of(&case, &answer, 404, "ResourceNotFoundException")
+            .unwrap_or_else(|| panic!("case {case}: expected a Message, got {:?}", answer.body));
+        assert!(
+            !message.to_lowercase().contains(&identifier.to_lowercase()),
+            "case {case}: expected a Message that does not name the requested group \
+             {identifier:?}, got {message:?}"
+        );
+        reader_messages.insert(message);
     }
     assert_eq!(
         associate_sentences.len(),
@@ -369,8 +379,8 @@ async fn associate_resource_reports_a_missing_group_or_canary_as_not_found() {
     assert_eq!(
         reader_messages.len(),
         1,
-        "case reader-request-independence: expected one fixed message across every group \
-         reader and identifier, got {reader_messages:?}"
+        "case reader-request-independence: expected one fixed message across every \
+         identifier for the reader whose wording is not recorded, got {reader_messages:?}"
     );
 
     // Canary ARNs this store does not hold: another name, another Region (a canary is

@@ -147,40 +147,67 @@
 
 #[allow(unused_imports)]
 use super::types::*;
-use crate::state::StoredResourceChange;
+use crate::state::{StoredChangeDetail, StoredResourceChange};
 
 /// One stored change as the modelled `Change` shape.
 ///
 /// `Type` is the model's only `ChangeType` value: a change set here describes resources.
 /// `PhysicalResourceId` is the id of the resource the change acts on, for a change to one
-/// the stack has already deployed. `Scope` and `Details` are reported, empty where the
-/// change has none: `Scope` is the set of the resource's template attributes the two
-/// templates declare differently — empty for an addition or a removal, which change the
-/// whole resource — and `Details` is the property-level evaluation behind the change, which
-/// needs the resource schemas this emulator does not carry. `Replacement` — whether the
-/// change forces the resource to be recreated — needs those same schemas and is absent
-/// rather than invented.
+/// the stack has already deployed. `Scope`, `Details` and `Replacement` are what the
+/// comparison that computed the change answered (see
+/// [`crate::state::change_plan`]): `Scope` is the resource attributes the two revisions of
+/// the stack state differently, `Details` the property-level change behind each of them, and
+/// `Replacement` — whether the change forces the resource to be recreated — the value those
+/// details imply. `Replacement` is absent for an `Add` and a `Remove`, where the model
+/// declares it does not apply ("For the `Modify` action, indicates whether CloudFormation
+/// will replace the resource").
 fn change_view(stored: &StoredResourceChange) -> Change {
     Change {
         r#type: Some(crate::state::CHANGE_TYPE_RESOURCE.to_string()),
         hook_invocation_count: None,
         resource_change: Some(ResourceChange {
-            policy_action: None,
+            policy_action: stored.policy_action.clone(),
             action: Some(stored.action.clone()),
             logical_resource_id: Some(stored.logical_resource_id.clone()),
             physical_resource_id: stored.physical_resource_id.clone(),
             resource_type: Some(stored.resource_type.clone()),
-            replacement: None,
+            replacement: stored.replacement.clone(),
             scope: Some(stored.scope.clone()),
             resource_drift_status: None,
             resource_drift_ignored_attributes: None,
-            details: Some(Vec::new()),
+            details: Some(stored.details.iter().map(detail_view).collect()),
             change_set_id: None,
             module_info: None,
             before_context: None,
             after_context: None,
             previous_deployment_context: None,
         }),
+    }
+}
+
+/// One stored property-level change as the modelled `ResourceChangeDetail` shape.
+///
+/// The drift-aware members (`BeforeValue`/`AfterValue` and their sources, `Drift`) and
+/// `Path` are left absent: they are reported for a drift-aware change set, which needs the
+/// resource's ACTUAL state read back from the owning service, and an invented before value
+/// is worse than an absent one.
+fn detail_view(stored: &StoredChangeDetail) -> ResourceChangeDetail {
+    ResourceChangeDetail {
+        target: Some(ResourceTargetDefinition {
+            attribute: Some(stored.attribute.clone()),
+            name: stored.name.clone(),
+            requires_recreation: Some(stored.requires_recreation.clone()),
+            path: None,
+            before_value: None,
+            after_value: None,
+            before_value_from: None,
+            after_value_from: None,
+            drift: None,
+            attribute_change_type: None,
+        }),
+        evaluation: Some(stored.evaluation.clone()),
+        change_source: Some(stored.change_source.clone()),
+        causing_entity: stored.causing_entity.clone(),
     }
 }
 

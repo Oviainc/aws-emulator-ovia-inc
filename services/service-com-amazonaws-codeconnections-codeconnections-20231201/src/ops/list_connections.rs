@@ -214,25 +214,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .collect();
 
-        // Server-side page bound. `MaxResults` is modelled with `range 0..100,
-        // default: 0`, so a caller that omits it reaches here with zero; neither zero
-        // nor an over-large value is read as "render the whole store" — the modelled
-        // maximum is the service's own page size either way, and the remainder is
-        // reported through `NextToken`.
-        let page_size = if input.max_results > 0 {
-            (input.max_results as usize).min(crate::state::MAX_PAGE_SIZE)
-        } else {
-            crate::state::MAX_PAGE_SIZE
-        }
-        .min(matching.len());
-        let (page, remaining) = matching.split_at(page_size);
-
-        // A token only when items are actually left: the contract is that the caller
-        // stops when no `NextToken` comes back.
-        let next_token = match (remaining.is_empty(), page.last()) {
-            (false, Some(last)) => Some(crate::state::encode_page_token(&last.connection_arn)),
-            _ => None,
-        };
+        // Server-side page bound and token: the one rule `state::page_of` holds for every
+        // paginated report of this service.
+        let (page, next_token) = crate::state::page_of(&matching, input.max_results, |connection| {
+            connection.connection_arn.as_str()
+        });
 
         Ok(ListConnectionsOutput {
             connections: Some(

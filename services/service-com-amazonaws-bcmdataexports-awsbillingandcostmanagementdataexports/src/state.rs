@@ -300,10 +300,23 @@ pub const EXPORT_NOT_FOUND_MESSAGE: &str = "No matching definition found";
 ///
 /// Recorded AWS behavior: the tagging operations word the same condition as a resource
 /// miss rather than as a missing export definition — the wire recording for a tag
-/// listing of an absent export ARN carries this string where the definition operations
-/// carry [`EXPORT_NOT_FOUND_MESSAGE`]. Like that one it is a fixed, request-independent
-/// constant: which ARN was not found is reported in `ResourceId`.
+/// listing of an absent export ARN, and the one for a `TagResource` of it, both carry this
+/// string where the definition operations carry [`EXPORT_NOT_FOUND_MESSAGE`]. Like that
+/// one it is a fixed, request-independent constant: which ARN was not found is reported in
+/// `ResourceId`.
 pub const RESOURCE_NOT_FOUND_MESSAGE: &str = "Resource not found";
+
+/// The `Message` a `ResourceNotFoundException` of the EXECUTION lookup carries — the
+/// resource `GetExecution` addresses.
+///
+/// Recorded AWS behavior: a `GetExecution` whose pair resolves to no execution reports the
+/// EXECUTION as missing, with this string, and does so whether it was the `ExecutionId`
+/// that named no execution of its export or the `ExportArn` that named no export at all:
+/// the execution is the resource the operation addresses, and the export ARN only scopes
+/// it. Like the two above it is a fixed, request-independent constant naming the KIND of
+/// resource that was missed; WHICH identifier missed is reported in `ResourceId` /
+/// `ResourceType`.
+pub const EXECUTION_NOT_FOUND_MESSAGE: &str = "Execution not found";
 
 /// The modelled `ResourceNotFoundException` for an export ARN that names nothing, worded
 /// with `message`: [`EXPORT_NOT_FOUND_MESSAGE`] on the export-definition operations and
@@ -322,13 +335,22 @@ pub fn export_not_found(arn: &str) -> ResourceNotFoundException {
     resource_not_found(arn, EXPORT_NOT_FOUND_MESSAGE)
 }
 
+/// The modelled `ResourceNotFoundException` `GetExecution` answers an `ExportArn` that
+/// names no export with: the EXECUTION it was asked for is what is missing (see
+/// [`EXECUTION_NOT_FOUND_MESSAGE`]), while the members still name the export ARN that
+/// resolved to nothing, because that is what the caller has to fix.
+pub fn execution_export_not_found(export_arn: &str) -> ResourceNotFoundException {
+    resource_not_found(export_arn, EXECUTION_NOT_FOUND_MESSAGE)
+}
+
 /// The HTTP status this service answers `ResourceNotFoundException` with.
 ///
 /// The error SHAPE carries `@httpError 404`
 /// (`smithy_query(query="shape",shape="ResourceNotFoundException")`), but the SERVICE
-/// answers the export-not-found condition with 400 carrying that same shape, its members
-/// and its `__type`: the wire recordings for a read, an update, a delete and a tag
-/// listing of an export ARN that resolves to nothing all answer HTTP 400. A client
+/// answers the not-found condition with 400 carrying that same shape, its members
+/// and its `__type`: the wire recordings for a read, an update, a delete, a tag listing, a
+/// `TagResource` and an execution lookup of a resource that resolves to nothing all answer
+/// HTTP 400. A client
 /// branches on the status as well as on the code — and an HTTP-level proxy treats a 404
 /// as a routing failure rather than an API error — so the pair it sees has to be the pair
 /// the service sends. The status is stated here once and applied through
@@ -369,12 +391,13 @@ pub fn not_found_error<E>(
 /// The modelled not-found for an `ExecutionId` that names no execution of the export it
 /// was asked about.
 ///
-/// It carries the same fixed [`EXPORT_NOT_FOUND_MESSAGE`] as every other lookup of this
-/// service that resolves to nothing, for the reason stated there: the identity of what
-/// was not found is reported in the modelled `ResourceId`, not in the prose.
+/// It carries [`EXECUTION_NOT_FOUND_MESSAGE`], the sentence of the resource kind this
+/// lookup missed — an execution, not the export definition the `ExportArn` resolved to.
+/// Like every other not-found of this service the sentence is a constant: the identity of
+/// what was not found is reported in the modelled `ResourceId`, not in the prose.
 pub fn execution_not_found(execution_id: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
-        message: EXPORT_NOT_FOUND_MESSAGE.to_string(),
+        message: EXECUTION_NOT_FOUND_MESSAGE.to_string(),
         resource_id: execution_id.to_string(),
         resource_type: EXECUTION_RESOURCE_TYPE.to_string(),
     }

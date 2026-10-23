@@ -178,7 +178,7 @@ async fn deleting_a_user_removes_it_from_state_and_from_every_acl() {
         // not-found fault rather than the user.
         let (status, body) = call(&router, "DescribeUsers", &json!({ "UserName": name })).await;
         assert_eq!(
-            status, 404,
+            status, 400,
             "case {case:?}: a deleted user must not be readable, got {status} with {body}"
         );
         assert_eq!(
@@ -203,7 +203,7 @@ async fn deleting_a_user_removes_it_from_state_and_from_every_acl() {
         // back.
         let (status, body) = call(&router, "DeleteUser", &json!({ "UserName": name })).await;
         assert_eq!(
-            status, 404,
+            status, 400,
             "case {case:?}: a second delete must be refused, got {status} with {body}"
         );
         assert_eq!(
@@ -281,7 +281,7 @@ async fn deleting_a_user_that_is_not_in_state_is_refused_and_changes_nothing() {
     ] {
         let (status, body) = call(&router, "DeleteUser", &json!({ "UserName": name })).await;
         assert_eq!(
-            status, 404,
+            status, 400,
             "case {case:?}: expected the delete of {name:?} to be refused, got {status} \
              with {body}"
         );

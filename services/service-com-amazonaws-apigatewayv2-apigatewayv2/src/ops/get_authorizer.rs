@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetAuthorizer
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetAuthorizer`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetAuthorizer::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -182,18 +173,51 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetAuthorizer` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetAuthorizerErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetAuthorizer"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in the assembled emulator — see the note in `create_api`.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "GetAuthorizer",
+            ));
+        };
+        let store = state.lock();
+
+        // An authorizer is addressed by the api that owns it AND its own id, so an id
+        // that names an authorizer of ANOTHER api is not found here either. A pure
+        // read: nothing in the store moves.
+        let stored = store
+            .apis
+            .get(&input.api_id)
+            .and_then(|api| api.authorizers.get(&input.authorizer_id));
+        let Some(stored) = stored else {
+            return Err(GetAuthorizerErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(format!(
+                        "Invalid Authorizer identifier specified {}:{}",
+                        ::engine::emulator_account_id(),
+                        input.authorizer_id
+                    )),
+                    resource_type: ::std::option::Option::None,
+                },
+            )
+            .into());
+        };
+
+        // Built straight from the state record's own projection, the way every sibling
+        // reader in this crate builds its output.
+        let wire = stored.to_wire();
+        Ok(GetAuthorizerOutput {
+            authorizer_credentials_arn: wire.authorizer_credentials_arn,
+            authorizer_id: wire.authorizer_id,
+            authorizer_payload_format_version: wire.authorizer_payload_format_version,
+            authorizer_result_ttl_in_seconds: wire.authorizer_result_ttl_in_seconds,
+            authorizer_type: wire.authorizer_type,
+            authorizer_uri: wire.authorizer_uri,
+            enable_simple_responses: wire.enable_simple_responses,
+            identity_source: wire.identity_source,
+            identity_validation_expression: wire.identity_validation_expression,
+            jwt_configuration: wire.jwt_configuration,
+            name: Some(wire.name),
+        })
     }
 }

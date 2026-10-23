@@ -21,8 +21,18 @@ mod authorizer_lifecycle;
 mod delete_lifecycle;
 #[path = "all/delete_method_response.rs"]
 mod delete_method_response;
+#[path = "all/documentation_parts.rs"]
+mod documentation_parts;
+#[path = "all/documentation_versions.rs"]
+mod documentation_versions;
 #[path = "all/epoch_second_timestamps.rs"]
 mod epoch_second_timestamps;
+#[path = "all/flush_stage_cache.rs"]
+mod flush_stage_cache;
+#[path = "all/gateway_response.rs"]
+mod gateway_response;
+#[path = "all/integration_response.rs"]
+mod integration_response;
 #[path = "all/method_integration.rs"]
 mod method_integration;
 #[path = "all/method_response.rs"]
@@ -31,6 +41,8 @@ mod method_response;
 mod patch_updates;
 #[path = "all/query_value_coercion.rs"]
 mod query_value_coercion;
+#[path = "all/resource_tagging.rs"]
+mod resource_tagging;
 #[path = "all/rest_api_defaults.rs"]
 mod rest_api_defaults;
 #[path = "all/rest_api_identifier_refusals.rs"]
@@ -39,11 +51,17 @@ mod rest_api_identifier_refusals;
 mod rest_api_import;
 #[path = "all/rest_api_lifecycle.rs"]
 mod rest_api_lifecycle;
+#[path = "all/sdk_types.rs"]
+mod sdk_types;
 #[path = "all/service_claim.rs"]
 mod service_claim;
 #[path = "all/stage_lifecycle.rs"]
 mod stage_lifecycle;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/tag_reads_by_arn.rs"]
+mod tag_reads_by_arn;
+#[path = "all/update_method_response.rs"]
+mod update_method_response;
 #[path = "all/validation_message_rules.rs"]
 mod validation_message_rules;

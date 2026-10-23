@@ -68,7 +68,11 @@ pub const FILE_MODE_SYMLINK: &str = "SYMLINK";
 
 /// Upper bound on the number of segments in a file path. Not an AWS limit: it
 /// bounds the recursion in [`tree_objects`], which walks one level per path
-/// segment, so a pathological path cannot exhaust the stack.
+/// segment, so a pathological path cannot exhaust the stack. Enforced in BOTH
+/// places a path's depth can drive that walk: [`normalize_path`] refuses a deeper
+/// `filePath` at the request boundary, and `build_tree` (under [`tree_objects`])
+/// refuses a deeper snapshot however it was assembled — a pushed packfile reaches
+/// the builder without passing a `filePath` through [`normalize_path`].
 pub const MAX_PATH_SEGMENTS: usize = 256;
 
 /// How many repositories the store holds before `CreateRepository` refuses with
@@ -383,13 +387,68 @@ pub fn repository_does_not_exist_message(name: &str) -> String {
 /// template name — the one place this crate words that code, for the same reason
 /// [`repository_does_not_exist_message`] is the one place it words its own.
 ///
-/// The wording is this emulator's own example text, not a message AWS documents or
-/// the model states: the requirement for this error is its code and its HTTP 400
-/// status, so what matters here is only that every operation raising the code words
-/// it identically and names the template the caller asked for.
+/// CodeCommit words this code with one template whose single slot is the name the
+/// request asked for, and whose second sentence names the likeliest cause (a call
+/// made in another Region than the one the template was created in). The template
+/// is the requirement; the name in the slot comes from the request.
 pub fn approval_rule_template_does_not_exist_message(name: &str) -> String {
-    format!("the approval rule template {name} does not exist")
+    format!(
+        "No approval rule template exists in this AWS Region with the following name: {name}. \
+         Make sure that you are signed in to the AWS Region where you created the rule, and \
+         then try again."
+    )
 }
+
+/// `ApprovalRuleTemplateNameAlreadyExistsException`'s message: a FIXED sentence
+/// carrying no value from the request.
+///
+/// CodeCommit scopes approval-rule-template names per ACCOUNT and words this code
+/// with one constant that names neither the template nor a Region, so the operations
+/// that refuse a name the account already holds — `CreateApprovalRuleTemplate` and
+/// `UpdateApprovalRuleTemplateName` — cannot word it differently or interpolate the
+/// requested name into it.
+pub const APPROVAL_RULE_TEMPLATE_NAME_ALREADY_EXISTS_MESSAGE: &str =
+    "The approval rule template cannot be created because a template with that name already \
+     exists in your AWS account.";
+
+/// `InvalidApprovalRuleTemplateContentException`'s (and
+/// `InvalidApprovalRuleContentException`'s) message: a FIXED sentence pair carrying
+/// nothing from the request and no diagnostic from whichever JSON reader rejected
+/// the document.
+///
+/// A parser's own complaint ("key must be a string at line 1 column 3") is an
+/// implementation detail of the deserializer this emulator links, so it is never
+/// what the caller is told: [`is_approval_rule_template_content`] answers whether
+/// the document is one, and this constant is what the refusal says.
+pub const INVALID_APPROVAL_RULE_CONTENT_MESSAGE: &str =
+    "The JSON in the approval rule template is not valid. Review the JSON and make sure it is \
+     valid, and then try again.";
+
+/// `InvalidResourceArnException`'s message: a FIXED sentence that echoes no ARN.
+///
+/// The tagging operations (`TagResource`, `UntagResource`,
+/// `ListTagsForResource`) all refuse a `resourceArn` that is not an ARN of a
+/// CodeCommit resource with this one constant; the malformed value the caller sent
+/// is NOT interpolated back into it.
+pub const INVALID_RESOURCE_ARN_MESSAGE: &str = "Inputted resource arn is not formatted correctly.";
+
+/// `CommentContentRequiredException`'s message: a FIXED sentence pair that states
+/// the failure and then the rule.
+///
+/// Every operation that saves comment content (`PostCommentForComparedCommit`,
+/// `PostCommentForPullRequest`, `PostCommentReply`, `UpdateComment`) refuses empty
+/// content with this one constant.
+pub const COMMENT_CONTENT_REQUIRED_MESSAGE: &str =
+    "The comment could not be saved because no content was provided. Comments cannot be empty.";
+
+/// The message `InvalidBranchNameException` carries for a `branchName` that is
+/// present but EMPTY — a FIXED sentence, distinct from the wording of a branch name
+/// that is non-empty and still not a valid reference name.
+///
+/// `BranchName` is `@length min 1`, so an empty value is refused at the request
+/// boundary; this is what that refusal says (see `crate::service`), rather than a
+/// generic constraint-violation text.
+pub const EMPTY_BRANCH_NAME_MESSAGE: &str = "Branch name cannot be empty";
 
 /// `RepositoryNameExistsException`'s message: `Repository named <name> already
 /// exists`, built from the requested name.
@@ -450,6 +509,56 @@ pub const MAX_MAX_RESULTS: i32 = 1_000;
 /// `maxResults`: the largest page the service allows, so an unpaginated caller sees
 /// everything in one answer.
 pub const DEFAULT_MAX_RESULTS: i32 = MAX_MAX_RESULTS;
+
+/// `InvalidMaxResultsException`'s message: the range of `maxResults` the operation
+/// accepts, and nothing from the request.
+///
+/// One of the two places this crate words that code (the other is
+/// [`NON_POSITIVE_MAX_RESULTS_MESSAGE`], for an operation that publishes no
+/// maximum). The template is `A valid limit is between <min> and <max>` — the
+/// sentence CodeCommit answers, which states the accepted range and does NOT echo
+/// the rejected value. The bounds are arguments because an operation publishes its
+/// own `maxResults` maximum (the paginated list operations' is
+/// [`MAX_MAX_RESULTS`], and the recorded instance of this message is that
+/// 1..[`MAX_MAX_RESULTS`] one; `GetCommentsForComparedCommit`'s is
+/// [`COMMENTS_PAGE_MAX`]), so the TEMPLATE is what every such operation shares.
+pub fn invalid_max_results_message(min: i32, max: i32) -> String {
+    format!("A valid limit is between {min} and {max}")
+}
+
+/// `InvalidMaxResultsException`'s message where the operation publishes NO maximum
+/// and so refuses only a value that is not a page size at all.
+///
+/// `GetDifferences` and `ListFileCommitHistory` document `maxResults`/`MaxResults`
+/// as "A non-zero, non-negative integer used to limit the number of returned
+/// results" and serve every positive value (shrunk to the page this service
+/// builds), so there is no upper bound to state and this says the rule the member's
+/// own documentation states instead. NOT a recorded message: the recording for this
+/// code is the range form in [`invalid_max_results_message`], which an operation
+/// with a published maximum answers. What is required of this refusal is its code
+/// and its 400 status.
+pub const NON_POSITIVE_MAX_RESULTS_MESSAGE: &str =
+    "A valid limit is a non-zero, non-negative integer";
+
+/// `InvalidContinuationTokenException`'s message: a template whose one slot is the
+/// token the request sent, led by a capital `E`.
+///
+/// The one place this crate words that code, so the paginated listings that page
+/// through [`page_of`] and the operations that carry their own cursor cannot word it
+/// differently.
+pub fn invalid_continuation_token_message(token: &str) -> String {
+    format!("Error parsing next token: {token}")
+}
+
+/// `CommitIdRequiredException`'s message: the sentence the model documents for the
+/// shape, naming nothing from the request. The one place this crate words that code,
+/// for the request boundary (`crate::service`) and for the handlers that check a
+/// commit id the model leaves unconstrained alike.
+pub const COMMIT_ID_REQUIRED_MESSAGE: &str = "A commit ID was not specified.";
+
+/// `InvalidCommitIdException`'s message: likewise the shape's own documented
+/// sentence, worded here once for every operation that raises the code.
+pub const INVALID_COMMIT_ID_MESSAGE: &str = "The specified commit ID is not valid.";
 
 /// The file a commit leaves behind in a folder that its deletions emptied, when the
 /// caller asked to keep the folder. CodeCommit documents `keepEmptyFolders`: "If
@@ -1437,6 +1546,10 @@ pub struct ApprovalRuleTemplateRecord {
     pub template_id: String,
     pub name: String,
     pub description: Option<String>,
+    /// The approval rule document in its canonical form — see
+    /// [`canonical_json_document`]. It is canonicalized once, here, on the way in,
+    /// so every reader of a stored template reports the same bytes and
+    /// `ruleContentSha256` is the digest of those bytes.
     pub content: String,
     pub creation_date: SystemTime,
     pub last_modified_date: SystemTime,
@@ -1458,17 +1571,33 @@ impl ApprovalRuleTemplateRecord {
         Self {
             template_id: approval_rule_template_id(name, created),
             name: name.to_string(),
-            // CodeCommit holds no empty description: a template created with one
-            // simply has none, so `approvalRuleTemplateDescription` is absent on
-            // every later read rather than reported as an empty string (the
-            // recorded behaviour the corpus names
-            // "approval-rule-template-empty-description-normalized-to-absent").
-            description: description.filter(|text| !text.is_empty()),
-            content,
+            description: normalized_template_description(description),
+            // The document is held canonicalized, never as the caller happened to
+            // format it: whatever the submitted whitespace, the stored content,
+            // `ruleContentSha256` and every later read agree.
+            content: canonical_json_document(&content),
             creation_date: created,
             last_modified_date: created,
             last_modified_user,
         }
+    }
+
+    /// Set this template's description to the one a request carried, and record
+    /// who changed it when.
+    ///
+    /// The description is normalized by [`normalized_template_description`], so a
+    /// template never holds an empty one however it was set, and the change moves
+    /// `lastModifiedDate` and `lastModifiedUser` onto this call: both report the
+    /// most recent change to the template, not its creation.
+    pub fn set_description(
+        &mut self,
+        description: Option<String>,
+        modified_by: String,
+        modified: SystemTime,
+    ) {
+        self.description = normalized_template_description(description);
+        self.last_modified_user = modified_by;
+        self.last_modified_date = modified;
     }
 
     /// This template as the modeled `ApprovalRuleTemplate` shape — the one place
@@ -1491,20 +1620,98 @@ impl ApprovalRuleTemplateRecord {
     /// Replace this template's content, recording who changed it and when.
     ///
     /// The one place a stored template's content is overwritten, so every updater
-    /// attributes the change the same way: the content (and with it the
-    /// `ruleContentSha256` derived from it) is what the caller supplied, while the
-    /// template's id, name, description and creation date are untouched.
+    /// attributes the change the same way: the content is canonicalized exactly as a
+    /// created template's is ([`canonical_json_document`]) — an update can therefore
+    /// not leave a template in a serialization a create would never have stored —
+    /// and with it the `ruleContentSha256` derived from it, while the template's id,
+    /// name, description and creation date are untouched.
     pub fn replace_content(&mut self, content: String, by: String, at: SystemTime) {
-        self.content = content;
+        self.content = canonical_json_document(&content);
         self.last_modified_user = by;
         self.last_modified_date = at;
     }
 }
 
+/// An approval rule template's description as CodeCommit HOLDS it, whatever a
+/// request carried.
+///
+/// A template holds no empty description: one set to an empty string simply has
+/// none, so `approvalRuleTemplateDescription` is ABSENT on the answer and on every
+/// later read rather than reported as an empty string (the recorded behaviour the
+/// corpus names
+/// "approval-rule-template-empty-description-normalized-to-absent"). Every write
+/// of a description — the create and every update — goes through here, so they
+/// cannot disagree about what an empty one means.
+pub fn normalized_template_description(description: Option<String>) -> Option<String> {
+    description.filter(|text| !text.is_empty())
+}
+
 /// The SHA-256 hash signature CodeCommit reports for a template's content
-/// (`ruleContentSha256`): the digest of the content bytes, hex encoded.
+/// (`ruleContentSha256`): the digest of the content bytes, hex encoded. Those bytes
+/// are the canonical ones ([`canonical_json_document`]), so the signature of a
+/// document does not depend on how its submitter formatted it.
 pub fn content_sha256(content: &str) -> String {
     ::hex::encode(Sha256::digest(content.as_bytes()))
+}
+
+/// A JSON document CodeCommit stores and hands back, in its canonical form:
+/// minified — every byte of RFC 8259 insignificant whitespace (space, tab, CR, LF
+/// between tokens) removed — with the member order, the string literals and the
+/// number literals exactly as submitted. A service that accepts a JSON document and
+/// reports it back does not echo the submitted formatting: a caller that stores the
+/// returned text, diffs it against a later read, or hashes it to detect drift sees a
+/// change only when the document itself changed.
+///
+/// Whitespace is dropped by scanning the text rather than by re-serializing the
+/// parsed value, because a re-serialization would sort the members (`serde_json`'s
+/// `Map` is a `BTreeMap` unless its `preserve_order` feature is on) and renormalise
+/// number literals (`1e3` to `1000.0`), both of which this canonical form preserves.
+/// Whitespace inside a string literal is part of the value, so it survives, escapes
+/// included.
+///
+/// Callers hand this a document `serde_json` has already accepted (for approval rule
+/// template content, [`is_approval_rule_template_content`]); given text that
+/// is not JSON it is still total, simply stripping whitespace outside quotes.
+///
+/// Two sibling services canonicalize a document of their own:
+/// `service-com-amazonaws-rum-rum`'s `canonical_policy_document` scans the text the
+/// same way, and `service-com-amazonaws-schemas-schemas`'s `canonical_json`
+/// re-encodes through `serde_transcode`. The re-encode route is not used here
+/// because, as that function's own doc comment records, it keeps a number's VALUE
+/// but not its literal (`1e3` comes back `1000.0`), and this canonical form keeps
+/// the literal a caller submitted.
+pub fn canonical_json_document(document: &str) -> String {
+    let mut canonical = String::with_capacity(document.len());
+    // Where the scan is: inside a string literal, and whether the previous
+    // character was the backslash of an escape (so an escaped quote does not close
+    // the literal).
+    let mut in_string = false;
+    let mut escaped = false;
+    for character in document.chars() {
+        if in_string {
+            canonical.push(character);
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match character {
+            '"' => {
+                in_string = true;
+                canonical.push(character);
+            }
+            // The four insignificant whitespace characters JSON defines. Everything
+            // else outside a string literal is structure or a bare literal, and is
+            // kept exactly as it came in.
+            ' ' | '\t' | '\r' | '\n' => {}
+            _ => canonical.push(character),
+        }
+    }
+    canonical
 }
 
 /// Could `value` be a `RuleContentSha256` at all — the hex form [`content_sha256`]
@@ -1592,10 +1799,17 @@ pub fn normalize_comment_id(raw: &str) -> Result<&str, CommentIdProblem> {
 /// `DeleteCommentContent`); an operation with no such recording passes `None`
 /// rather than synthesising a lead clause of its own.
 pub fn comment_deleted_message(refused_action: Option<&str>) -> String {
-    let already_deleted = "The specified comment has already been marked as deleted. Verify that \
-                           you specified a valid comment ID, and then try again.";
+    // The sentences of this constant are separated by TWO spaces, which is part of
+    // the recorded text rather than formatting latitude — hence the explicit
+    // `concat!` rather than a line-continued literal, whose continuation would
+    // swallow them.
+    let already_deleted = concat!(
+        "The specified comment has already been marked as deleted.",
+        "  ",
+        "Verify that you specified a valid comment ID, and then try again.",
+    );
     match refused_action {
-        Some(action) => format!("You cannot {action} this comment. {already_deleted}"),
+        Some(action) => format!("You cannot {action} this comment.  {already_deleted}"),
         None => already_deleted.to_string(),
     }
 }
@@ -1890,7 +2104,7 @@ pub fn file_mode_of(mode: &str) -> &'static str {
 /// [`Repository::insert_blob`] reported.
 pub fn tree_objects(files: &BTreeMap<String, FileEntry>) -> Option<(String, Vec<Object>)> {
     let mut objects: Vec<Object> = Vec::new();
-    let root = build_tree(files, &mut objects)?;
+    let root = build_tree(files, &mut objects, 0)?;
     Some((root, objects))
 }
 
@@ -1900,7 +2114,22 @@ pub fn tree_id(files: &BTreeMap<String, FileEntry>) -> Option<String> {
     tree_objects(files).map(|(root, _)| root)
 }
 
-fn build_tree(files: &BTreeMap<String, FileEntry>, objects: &mut Vec<Object>) -> Option<String> {
+fn build_tree(
+    files: &BTreeMap<String, FileEntry>,
+    objects: &mut Vec<Object>,
+    depth: usize,
+) -> Option<String> {
+    // One level of recursion per path segment, so the depth of this walk is bounded
+    // where it happens — exactly as the opposite walk, [`Repository::flatten_tree_into`],
+    // bounds itself. Every `filePath` a request supplies is already held to
+    // [`MAX_PATH_SEGMENTS`] by [`normalize_path`], but this function is public and a
+    // snapshot can also be assembled from a pushed packfile, so a snapshot whose keys
+    // nest deeper than that is refused here rather than recursed into: a pathological
+    // path cannot exhaust the stack (which in Rust aborts the process), it only fails
+    // its own request.
+    if depth >= MAX_PATH_SEGMENTS {
+        return None;
+    }
     let mut blobs: BTreeMap<&str, &FileEntry> = BTreeMap::new();
     let mut dirs: BTreeMap<&str, BTreeMap<String, FileEntry>> = BTreeMap::new();
     for (path, entry) in files {
@@ -1928,7 +2157,7 @@ fn build_tree(files: &BTreeMap<String, FileEntry>, objects: &mut Vec<Object>) ->
         entries.push(TreeEntry {
             mode: git_object::MODE_TREE.to_string(),
             name: (*name).to_string(),
-            id: build_tree(subtree, objects)?,
+            id: build_tree(subtree, objects, depth + 1)?,
         });
     }
     let tree = git_object::encode_tree(entries)?;
@@ -2029,10 +2258,12 @@ pub fn page_of(
     let limit = match max_results {
         None => DEFAULT_MAX_RESULTS,
         Some(requested) if (MIN_MAX_RESULTS..=MAX_MAX_RESULTS).contains(&requested) => requested,
-        Some(requested) => {
-            return Err(PageProblem::InvalidMaxResults(format!(
-                "the maxResults value {requested} is not valid: a valid limit is between \
-                 {MIN_MAX_RESULTS} and {MAX_MAX_RESULTS}"
+        // `InvalidMaxResultsException`'s message comes from the one place this crate
+        // words that code: the accepted range, with nothing from the request.
+        Some(_) => {
+            return Err(PageProblem::InvalidMaxResults(invalid_max_results_message(
+                MIN_MAX_RESULTS,
+                MAX_MAX_RESULTS,
             )));
         }
     };
@@ -2043,9 +2274,10 @@ pub fn page_of(
             // still holds: one is only ever issued while a further page exists.
             .filter(|offset| *offset < ordered.len())
             .ok_or_else(|| {
-                PageProblem::InvalidContinuationToken(format!(
-                    "error parsing next token: {token}"
-                ))
+                // `InvalidContinuationTokenException`'s message comes from the one
+                // place this crate words that code: the template whose slot is the
+                // token the request sent.
+                PageProblem::InvalidContinuationToken(invalid_continuation_token_message(token))
             })?,
     };
     let end = ordered
@@ -2097,83 +2329,67 @@ pub const APPROVAL_RULE_STATEMENT_TYPE: &str = "Approvers";
 /// `Approvers` statement carrying a positive `NumberOfApprovalsNeeded` and, where
 /// present, an `ApprovalPoolMembers` array of strings, plus an optional
 /// `DestinationReferences` array of strings (the structure the CodeCommit User
-/// Guide documents for an approval rule template). `Err` carries the reason, which
-/// the operations report as `InvalidApprovalRuleTemplateContentException`.
-pub fn validate_approval_rule_template_content(content: &str) -> Result<(), String> {
-    let document: ::serde_json::Value = ::serde_json::from_str(content)
-        .map_err(|error| format!("the content is not a valid JSON document: {error}"))?;
-    let object = document
-        .as_object()
-        .ok_or_else(|| "the content must be a JSON object".to_string())?;
+/// Guide documents for an approval rule template).
+///
+/// The answer is a BOOLEAN, not a reason: the operations that report a rejected
+/// document answer [`INVALID_APPROVAL_RULE_CONTENT_MESSAGE`], and the one diagnostic
+/// a caller must never be handed is the JSON reader's own ("key must be a string at
+/// line 1 column 3"), whose offsets belong to whichever deserializer this emulator
+/// links. Returning nothing to interpolate is what keeps it out of the wire.
+pub fn is_approval_rule_template_content(content: &str) -> bool {
+    let Ok(document) = ::serde_json::from_str::<::serde_json::Value>(content) else {
+        return false;
+    };
+    let Some(object) = document.as_object() else {
+        return false;
+    };
 
-    match object.get("Version").and_then(::serde_json::Value::as_str) {
-        Some(version) if version == APPROVAL_RULE_TEMPLATE_VERSION => {}
-        Some(version) => {
-            return Err(format!(
-                "the content Version {version} is not valid: the supported version is \
-                 {APPROVAL_RULE_TEMPLATE_VERSION}"
-            ))
-        }
-        None => return Err("the content must carry a Version string".to_string()),
+    if object.get("Version").and_then(::serde_json::Value::as_str)
+        != Some(APPROVAL_RULE_TEMPLATE_VERSION)
+    {
+        return false;
     }
 
-    let statements = object
+    let Some(statements) = object
         .get("Statements")
         .and_then(::serde_json::Value::as_array)
-        .ok_or_else(|| "the content must carry a Statements array".to_string())?;
+    else {
+        return false;
+    };
     if statements.is_empty() {
-        return Err("the content Statements array must carry at least one statement".to_string());
+        return false;
     }
     for statement in statements {
-        let statement = statement
-            .as_object()
-            .ok_or_else(|| "every Statements entry must be a JSON object".to_string())?;
-        match statement.get("Type").and_then(::serde_json::Value::as_str) {
-            Some(kind) if kind == APPROVAL_RULE_STATEMENT_TYPE => {}
-            Some(kind) => {
-                return Err(format!(
-                    "the statement Type {kind} is not valid: the supported type is \
-                     {APPROVAL_RULE_STATEMENT_TYPE}"
-                ))
-            }
-            None => return Err("every statement must carry a Type string".to_string()),
+        let Some(statement) = statement.as_object() else {
+            return false;
+        };
+        if statement.get("Type").and_then(::serde_json::Value::as_str)
+            != Some(APPROVAL_RULE_STATEMENT_TYPE)
+        {
+            return false;
         }
         match statement
             .get("NumberOfApprovalsNeeded")
             .and_then(::serde_json::Value::as_i64)
         {
             Some(needed) if needed >= 1 => {}
-            Some(needed) => {
-                return Err(format!(
-                    "the statement NumberOfApprovalsNeeded {needed} is not valid: it must be \
-                     at least 1"
-                ))
-            }
-            None => {
-                return Err(
-                    "every statement must carry a NumberOfApprovalsNeeded number".to_string()
-                )
-            }
+            _ => return false,
         }
         if let Some(members) = statement.get("ApprovalPoolMembers") {
-            let members = members
-                .as_array()
-                .ok_or_else(|| "ApprovalPoolMembers must be an array".to_string())?;
-            if members.iter().any(|member| !member.is_string()) {
-                return Err("every ApprovalPoolMembers entry must be a string".to_string());
+            match members.as_array() {
+                Some(members) if members.iter().all(::serde_json::Value::is_string) => {}
+                _ => return false,
             }
         }
     }
 
     if let Some(references) = object.get("DestinationReferences") {
-        let references = references
-            .as_array()
-            .ok_or_else(|| "DestinationReferences must be an array".to_string())?;
-        if references.iter().any(|reference| !reference.is_string()) {
-            return Err("every DestinationReferences entry must be a string".to_string());
+        match references.as_array() {
+            Some(references) if references.iter().all(::serde_json::Value::is_string) => {}
+            _ => return false,
         }
     }
-    Ok(())
+    true
 }
 
 /// The canonical form of a `folderPath`: leading and trailing separators removed,

@@ -6,11 +6,14 @@
 //! Four rules, each asserted over a table whose rows differ along what the rule
 //! generalises over — never over one recorded request:
 //!
-//! 1. Every operation addressed by `Name` resolves the name in the stored environments
-//!    first and refuses one that resolves to nothing with its modelled
+//! 1. Every CONTROL-PLANE operation addressed by `Name` resolves the name in the stored
+//!    environments first and refuses one that resolves to nothing with its modelled
 //!    `ResourceNotFoundException` (HTTP 404), whose message names the environment the
 //!    request asked for: `Environment <Name> not found.` Rows vary the name (length, case,
 //!    the `-`/`_` characters `EnvironmentName`'s pattern allows) and the operation.
+//!    `InvokeRestApi` is NOT one of them: it is refused by the environment data endpoint it
+//!    proxies through, which carries the refusal as its own document payload — that rule
+//!    has its own suite (`tests/all/env_endpoint_payload.rs`).
 //! 2. The `/tags/{ResourceArn}` operations refuse a well-formed ARN that resolves to no
 //!    environment with HTTP 404 and the WIRE error code the service publishes for them,
 //!    `NotFoundException` — the code a client's error dispatch branches on. Rows vary the
@@ -193,8 +196,13 @@ fn unknown_names() -> Vec<String> {
     ]
 }
 
-/// Every operation addressed by `Name`, as `(label, method, uri template, body)`. The
-/// template's `{}` takes the name.
+/// Every CONTROL-PLANE operation addressed by `Name`, as `(label, method, uri template,
+/// body)`. The template's `{}` takes the name.
+///
+/// `InvokeRestApi` is absent deliberately: it is served through the environment data
+/// endpoint's proxy, whose not-found refusal is that endpoint's document payload rather
+/// than a serialized modelled exception, and is asserted in
+/// `tests/all/env_endpoint_payload.rs`.
 type NamedCall = (&'static str, &'static str, &'static str, Option<Value>);
 
 fn name_addressed_calls() -> Vec<NamedCall> {
@@ -209,17 +217,11 @@ fn name_addressed_calls() -> Vec<NamedCall> {
         ("DeleteEnvironment", "DELETE", "/environments/{}", None),
         ("CreateCliToken", "POST", "/clitoken/{}", None),
         ("CreateWebLoginToken", "POST", "/webtoken/{}", None),
-        (
-            "InvokeRestApi",
-            "POST",
-            "/restapi/{}",
-            Some(json!({"Path": "/dags", "Method": "GET"})),
-        ),
     ]
 }
 
 #[tokio::test]
-async fn every_name_addressed_operation_refuses_an_unknown_environment_with_the_same_404() {
+async fn every_control_plane_operation_refuses_an_unknown_environment_with_the_same_404() {
     let harness = Harness::new();
     // One environment exists, so a refusal below is the lookup failing and not an empty
     // store answering.

@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteServiceLinkedConfigurationRecorder
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteServiceLinkedConfigurationRecorder`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Deletes the ONE service-linked configuration recorder a request names — by its ARN
+//! or by the service principal it is linked to, exactly one of the two — dropping it
+//! and its status record from [`crate::state`] so the operations that report
+//! configuration recorders no longer report it, while the configuration information
+//! previously recorded, and the connector a third-party service-linked recorder
+//! records through, are left where they are.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteServiceLinkedConfigurationRecorder::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Only a service-linked recorder is deleted here: the account's customer managed
+//! recorder is `DeleteConfigurationRecorder`'s, so an ARN naming it names no recorder
+//! of this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -174,18 +175,118 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteServiceLinkedConfigurationRecorder` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteServiceLinkedConfigurationRecorderErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteServiceLinkedConfigurationRecorder"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE)
+        })?;
+
+        // "You must specify exactly one of Arn or ServicePrincipal"
+        // (`DeleteServiceLinkedConfigurationRecorderRequest$Arn`), which the model
+        // cannot state as a constraint because neither member is required on its own:
+        // a request carrying both, and one carrying neither, each name no single
+        // recorder and are refused rather than guessed at (`ValidationException`: "You
+        // have provided both Arn and ServicePrincipal. Only one of Arn or
+        // ServicePrincipal can be specified").
+        let selector = match (input.arn, input.service_principal) {
+            (Some(arn), None) => Selector::Arn(arn),
+            (None, Some(service_principal)) => {
+                // Config names a service-linked recorder after the service it is
+                // linked to, so a value that names no Amazon Web Services service
+                // names no recorder either, and is a bad request rather than a missing
+                // resource (`ValidationException`: "You have provided a service
+                // principal for service-linked configuration recorder that is not
+                // valid").
+                if crate::state::service_linked_recorder_name(&service_principal).is_none() {
+                    return Err(validation(crate::state::invalid_service_principal_message(
+                        &service_principal,
+                    )));
+                }
+                Selector::ServicePrincipal(service_principal)
+            }
+            (Some(_), Some(_)) => return Err(validation(BOTH_SELECTORS.to_string())),
+            (None, None) => return Err(validation(NO_SELECTOR.to_string())),
+        };
+
+        let mut store = state.lock();
+
+        // The recorder this request names, among the SERVICE-LINKED ones: the
+        // account's customer managed recorder is deleted by
+        // `DeleteConfigurationRecorder`, so its ARN names nothing here — and neither
+        // does a second delete of a recorder this operation already deleted.
+        let named = store
+            .recorders
+            .values()
+            .filter(|recorder| recorder.is_service_linked())
+            .find(|recorder| match &selector {
+                Selector::Arn(arn) => recorder.arn == *arn,
+                Selector::ServicePrincipal(service_principal) => {
+                    recorder.service_principal.as_deref() == Some(service_principal.as_str())
+                }
+            })
+            .map(|recorder| recorder.name.clone());
+        let Some(name) = named else {
+            return Err(
+                DeleteServiceLinkedConfigurationRecorderErrorModeled::NoSuchConfigurationRecorderException(
+                    NoSuchConfigurationRecorderException {
+                        message: Some(crate::state::NO_SUCH_CONFIGURATION_RECORDER.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The recorder and the recording status that belongs to it go together: a
+        // recorder that no longer exists has no recording status to report. "This
+        // operation does not delete the configuration information that was previously
+        // recorded", so the resources it discovered stay in the inventory, and so does
+        // the connector a third-party service-linked recorder recorded through — that
+        // one is `DeleteConnector`'s resource.
+        let deleted = store.recorders.remove(&name);
+        store.recorder_status.remove(&name);
+
+        // `name` came out of this very map under this very lock, so the entry is
+        // there; reading the response out of what was removed is what keeps it
+        // computed from state rather than rebuilt from the request.
+        let deleted = deleted.ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE)
+        })?;
+
+        Ok(DeleteServiceLinkedConfigurationRecorderOutput {
+            arn: deleted.arn,
+            name: deleted.name,
+        })
     }
+}
+
+/// Which service-linked configuration recorder a request names: the two ways this
+/// operation accepts, of which a request carries exactly one.
+enum Selector {
+    /// The recorder carrying this ARN.
+    Arn(String),
+    /// The recorder linked to this service.
+    ServicePrincipal(String),
+}
+
+/// How Config words `ValidationException` for a request carrying BOTH selectors
+/// (`ValidationException`: "You have provided both Arn and ServicePrincipal. Only one
+/// of Arn or ServicePrincipal can be specified").
+///
+/// A FIXED message for the class — it quotes nothing from the request, because what is
+/// wrong is which members are present rather than either value.
+const BOTH_SELECTORS: &str = "You have provided both Arn and ServicePrincipal. Only one of Arn \
+                              or ServicePrincipal can be specified.";
+
+/// How Config words `ValidationException` for a request carrying NEITHER selector
+/// (`DeleteServiceLinkedConfigurationRecorderRequest$Arn`: "You must specify exactly
+/// one of Arn or ServicePrincipal"), the other half of the same rule as
+/// [`BOTH_SELECTORS`].
+const NO_SELECTOR: &str = "You must specify exactly one of Arn or ServicePrincipal in the request.";
+
+/// A request this operation refuses as not valid, as the modelled `ValidationException`
+/// it declares.
+fn validation(message: String) -> DeleteServiceLinkedConfigurationRecorderError {
+    DeleteServiceLinkedConfigurationRecorderErrorModeled::ValidationException(ValidationException {
+        message: Some(message),
+    })
+    .into()
 }

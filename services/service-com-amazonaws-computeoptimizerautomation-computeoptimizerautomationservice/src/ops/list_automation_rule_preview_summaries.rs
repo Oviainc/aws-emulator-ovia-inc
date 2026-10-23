@@ -1,41 +1,55 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListAutomationRulePreviewSummaries
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListAutomationRulePreviewSummaries`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Summarises the recommended actions an Automation rule's preview selects: the
+//! SAME set `ListAutomationRulePreview` reports one by one (the actions this service
+//! holds for the accounts the rule type and `organizationScope` cover, restricted to
+//! the requested `recommendedActionTypes` and to the `criteria` conditions), reduced
+//! to one summary per distinct `recommendedActionType` among them, each carrying how
+//! many of those actions it groups and the sum of their estimated monthly savings.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListAutomationRulePreviewSummaries::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The grouping dimension is the EMULATOR's reading: `PreviewResultSummary.key` is
+//! documented only as "The key identifier for this preview result summary" and this
+//! shape, unlike `AutomationEventSummary`, carries no `dimensions` member naming it
+//! (`smithy_query(query="shape",shape="PreviewResultSummary,AutomationEventSummary,SummaryDimension")`).
+//! `recommendedActionType` is the one dimension a preview request itself selects on —
+//! it is required, and `RecommendedActionType` enumerates its values — so a summary
+//! key is the action type of the actions it totals, and a summary appears only for an
+//! action type the selection actually holds (the summary reports what matched, so an
+//! action type nothing matched contributes no group). Groups come back in the order
+//! the store first holds an action of each type, the same record order the
+//! unsummarised preview pages over, cut into `maxResults`-sized pages.
 //!
-//! ## Shape of an operation
+//! `@readonly`, so this handler writes NOTHING: the inventory it reports over is the
+//! analysis output Compute Optimizer derives from observed resources
+//! (`crate::state::RecommendedActionStore`), and a page token carries its own cursor.
 //!
-//! Each operation is a struct that owns the shared engine and implements
-//! [`smithy_server_runtime::Operation`]. The framework constructs one per service via
-//! `ListAutomationRulePreviewSummaries::new(engine)` and drives it through the centralized request walk:
-//! deserialize → validate → `handle` → serialize. You write ONLY the `handle` body.
+//! The refusals below are the EMULATOR's choice rather than modelled constraints, each
+//! reported with the only client-input error this operation declares
+//! (`InvalidParameterValueException`), and each the same reading its unsummarised
+//! sibling takes — one request cannot be valid for a preview and invalid for that
+//! preview's totals:
 //!
-//! ## Reaching this service's state
+//! * an `organizationScope` sent with a rule type other than `OrganizationRule`;
+//! * an EMPTY `recommendedActionTypes`, which selects no action type at all;
+//! * a `criteria` this service cannot evaluate (a condition with no `comparison`, no
+//!   `values`, an operator from the wrong family, or a `resourceTag` condition with no
+//!   `key`);
+//! * a `nextToken` that does not decode, or that was taken with a different rule type,
+//!   scope, action-type list or criteria — or from another operation, including
+//!   `ListAutomationRulePreview`, whose pages are single actions rather than groups.
 //!
-//! The engine is held on `self` (constructor-injected), NOT passed per request — so
-//! engine access is guaranteed by the time any request runs. Reach the store through
-//! [`crate::state::service_state`] and read and write it through the guard it hands back:
+//! NOT enforced here, deliberately: `ruleType`'s prose says only the management account
+//! or a delegated administrator may ask for `OrganizationRule`. This emulator has one
+//! caller account and models no organization membership or delegated administrator, so
+//! there is no entitlement to check and the modelled `AccessDeniedException` /
+//! `ForbiddenException` are unreachable from this handler, exactly as in
+//! `ListAutomationRulePreview`.
 //!
-//! ```ignore
-//!     let state = crate::state::service_state(&*self.engine)
-//!         .ok_or(/* a modelled server error */)?;
-//!     state.lock().your_field = /* ... */;
-//! ```
-//!
-//! `ctx` ([`smithy_server_runtime::OperationContext`]) carries request metadata only —
-//! headers, URI, method, and anything middleware placed in `ctx.parts().extensions`.
-//! The engine is NOT reached through `ctx`.
-//!
-//! @generated by the emulator core scaffold op-stub generator.
-//! Shared types live in `super::types`; the error channel in `crate::scaffolded`.
+//! `maxResults` is an emulator reading, not a refusal: the model bounds it at
+//! `range(min: 1, max: 100)` while the clipped prose transcribed below says 1-1000, so
+//! this handler follows the MODEL, which is the constraint the protocol boundary
+//! enforces.
 //!
 //! ---
 //!
@@ -167,18 +181,204 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListAutomationRulePreviewSummaries` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListAutomationRulePreviewSummariesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                ListAutomationRulePreviewSummariesErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(
+                            "the service is not mounted on a state-bearing engine".into(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // Rules the model cannot express, so the protocol boundary let them
+        // through. Each is refused with the only client-input error this
+        // operation declares, worded by the service's one validation reporter
+        // (`crate::state::constraint_report`), which echoes no request value.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListAutomationRulePreviewSummaries"))
+        // `recommendedActionTypes` is required and names the action types to
+        // include, so an empty list selects nothing at all — and a summary of
+        // nothing would read as "your rule matches no resource".
+        if input.recommended_action_types.is_empty() {
+            return Err(invalid_parameter(crate::state::constraint_report(
+                "recommendedActionTypes",
+                "Member must have length greater than or equal to 1",
+            )));
+        }
+        // `organizationScope` names the accounts of an ORGANIZATION preview; an
+        // account-scoped rule previews only the account it lives in, so a scope
+        // sent with it is refused rather than ignored.
+        if input.rule_type != "OrganizationRule" && input.organization_scope.is_some() {
+            return Err(invalid_parameter(crate::state::constraint_report(
+                "organizationScope",
+                "Member is valid only for the OrganizationRule rule type",
+            )));
+        }
+        if let Some(report) = input
+            .criteria
+            .as_ref()
+            .and_then(crate::state::criteria_violation)
+        {
+            return Err(invalid_parameter(report));
+        }
+
+        // The page token carries the operation and the selection it was taken
+        // with, so resuming a walk with a different scope, action-type list or
+        // criteria — or with another operation's token — is refused instead of
+        // answered with a page of a different result set.
+        let selection_fingerprint = crate::state::fingerprint(&(
+            Self::NAME,
+            &input.rule_type,
+            &input.organization_scope,
+            &input.recommended_action_types,
+            &input.criteria,
+        ));
+        let offset = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => {
+                let Some(cursor) = crate::state::decode_page_token(token) else {
+                    return Err(invalid_parameter(crate::state::constraint_report(
+                        "nextToken",
+                        "Member must be a token returned by a previous \
+                         ListAutomationRulePreviewSummaries call",
+                    )));
+                };
+                if cursor.filter_fingerprint != selection_fingerprint {
+                    return Err(invalid_parameter(crate::state::constraint_report(
+                        "nextToken",
+                        "Member must be a token returned for the same rule type, action types and \
+                         criteria",
+                    )));
+                }
+                cursor.offset
+            }
+        };
+
+        // The model bounds `maxResults` at 1..=100, so a caller that sends none
+        // gets the largest page it could have asked for, and the protocol
+        // boundary has already refused anything outside that range. Clamped into
+        // the range here as well: a zero page would return nothing while still
+        // carrying a token whose offset never advances, so a walk would never
+        // terminate.
+        let max_page_size = usize::try_from(crate::state::DEFAULT_MAX_RESULTS).unwrap_or(1);
+        let page_size = usize::try_from(
+            input
+                .max_results
+                .unwrap_or(crate::state::DEFAULT_MAX_RESULTS),
+        )
+        .unwrap_or(1)
+        .clamp(1, max_page_size);
+
+        let scope = crate::state::preview_account_scope(
+            &input.rule_type,
+            input.organization_scope.as_ref(),
+        );
+        // A caller that sends no criteria constrains nothing, so every action in
+        // scope carrying a requested action type is summarised.
+        let criteria = input.criteria.unwrap_or_default();
+
+        let guard = state.lock();
+        // The service-wide enrollment gate, AHEAD of the inventory walk: an
+        // account that is not opted in is refused the whole call rather than
+        // handed an (empty) summary that tooling would then build on. See
+        // `crate::state::…::opt_in_required`.
+        if let Some(refusal) = guard.opt_in_required() {
+            return Err(
+                ListAutomationRulePreviewSummariesErrorModeled::OptInRequiredException(refusal)
+                    .into(),
+            );
+        }
+
+        // One group per `recommendedActionType` the selection holds, in the
+        // order the store first holds an action of that type: the selected
+        // actions are what gets summarised, never the request's action-type
+        // list, so a type nothing matched is no group.
+        //
+        // The groups are kept as a SEQUENCE keyed by the action type, so a
+        // group's key and its tally are one value: there is no second lookup
+        // that could miss and report a plausible zero total. The number of
+        // groups is bounded by the `RecommendedActionType` value set, so finding
+        // one by key is a walk over a handful of entries.
+        let mut grouped: Vec<(String, Group)> = Vec::new();
+        for action in crate::state::previewed_actions(
+            &guard.recommended_actions,
+            scope.as_deref(),
+            &input.recommended_action_types,
+            &criteria,
+        ) {
+            // `previewed_actions` keeps only an action whose type is one of the
+            // requested ones, so every action reaching here carries one.
+            let Some(action_type) = action.recommended_action_type.as_deref() else {
+                continue;
+            };
+            let index = match grouped.iter().position(|(key, _)| key == action_type) {
+                Some(index) => index,
+                None => {
+                    grouped.push((action_type.to_string(), Group::default()));
+                    grouped.len().saturating_sub(1)
+                }
+            };
+            if let Some((_, group)) = grouped.get_mut(index) {
+                group.count = group.count.saturating_add(1);
+                if let Some(savings) = action.estimated_monthly_savings.as_ref() {
+                    group.estimates.push(savings.clone());
+                }
+            }
+        }
+
+        // One extra group is taken: its presence is what says another page
+        // exists, and the token resumes exactly where this page stopped.
+        let taken: Vec<(String, Group)> = grouped
+            .into_iter()
+            .skip(offset)
+            .take(page_size.saturating_add(1))
+            .collect();
+        let has_more = taken.len() > page_size;
+        let page: Vec<PreviewResultSummary> = taken
+            .into_iter()
+            .take(page_size)
+            .map(|(key, group)| PreviewResultSummary {
+                key,
+                total: RulePreviewTotal {
+                    recommended_action_count: group.count,
+                    estimated_monthly_savings: crate::state::total_savings(group.estimates.iter()),
+                },
+            })
+            .collect();
+        let next_token = has_more.then(|| {
+            crate::state::encode_page_token(&crate::state::PageCursor {
+                offset: offset + page.len(),
+                filter_fingerprint: selection_fingerprint,
+            })
+        });
+
+        Ok(ListAutomationRulePreviewSummariesOutput {
+            preview_result_summaries: Some(page),
+            next_token,
+        })
     }
+}
+
+/// What one group of selected actions accumulates while the inventory is walked:
+/// how many actions it holds and the estimates among them, which
+/// [`crate::state::total_savings`] reduces to the group's
+/// `estimatedMonthlySavings`. An action Compute Optimizer has not estimated
+/// savings for is still one action of the group.
+#[derive(Debug, Default)]
+struct Group {
+    count: i32,
+    estimates: Vec<EstimatedMonthlySavings>,
+}
+
+fn invalid_parameter(message: String) -> ListAutomationRulePreviewSummariesError {
+    ListAutomationRulePreviewSummariesErrorModeled::InvalidParameterValueException(
+        InvalidParameterValueException {
+            message: Some(message),
+        },
+    )
+    .into()
 }

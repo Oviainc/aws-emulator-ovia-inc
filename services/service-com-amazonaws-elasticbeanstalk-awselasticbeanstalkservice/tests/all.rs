@@ -53,6 +53,8 @@ mod request_refusals;
 mod resource_tags;
 #[path = "all/solution_stacks.rs"]
 mod solution_stacks;
+#[path = "all/source_bundle_download.rs"]
+mod source_bundle_download;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/swap_environment_cnames.rs"]

@@ -166,6 +166,31 @@ impl ComAmazonawsNeptunegraphAmazonneptunegraphState {
             graph.settle(now);
         }
     }
+
+    /// The tag map of the resource `arn` names, or `None` when this store holds no
+    /// resource by that ARN.
+    ///
+    /// The lookup is on the ARN the service MINTED for the resource, so a request
+    /// naming the right resource id in the wrong region, account or partition names
+    /// no resource here — an ARN identifies one resource in one region of one
+    /// account.
+    ///
+    /// Tags live on the resource record itself, which is what makes a tag supplied at
+    /// create time and one written later by `TagResource` the same bytes, read back by
+    /// this one lookup. A graph is the only taggable resource this slice stores;
+    /// snapshots, private endpoints and tasks join this lookup with the operations that
+    /// mint them.
+    pub fn tags_of(&self, arn: &str) -> Option<&BTreeMap<String, String>> {
+        self.graphs.values().find(|graph| graph.arn == arn).map(|graph| &graph.tags)
+    }
+
+    /// [`Self::tags_of`], mutably: the one place `TagResource`/`UntagResource` write.
+    pub fn tags_of_mut(&mut self, arn: &str) -> Option<&mut BTreeMap<String, String>> {
+        self.graphs
+            .values_mut()
+            .find(|graph| graph.arn == arn)
+            .map(|graph| &mut graph.tags)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -246,6 +271,68 @@ pub fn graph_not_found(graph_identifier: &str) -> ResourceNotFoundException {
             caller_account_id()
         ),
     }
+}
+
+/// The modelled `ResourceNotFoundException` for a `resourceArn` that names no stored
+/// resource.
+///
+/// The tagging operations identify their subject by ARN rather than by graph id, so the
+/// failure names the ARN the request asked for, beside the account the lookup was
+/// resolved in — the same two facts [`graph_not_found`] reports, which is what lets a
+/// caller tell a deleted resource apart from a call that reached the wrong account or
+/// partition. The modelled shape carries only `message`
+/// (`smithy_query(query="shape",shape="ResourceNotFoundException")`), so the message is
+/// the only place either fact can go.
+pub fn resource_not_found(resource_arn: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: format!(
+            "No resource found for customer [{}] with resource arn [{resource_arn}]",
+            caller_account_id()
+        ),
+    }
+}
+
+/// Refuse more tag entries on one resource than it may hold ([`MAX_TAGS`]).
+///
+/// `total` is the number of entries the record would hold AFTER the call, so
+/// `TagResource` checks the merge of what is stored with what it was sent rather than
+/// the request alone. `Err` carries the message, naming the bound it broke, for the
+/// caller to fix the request from.
+pub fn bound_tag_count(total: usize) -> Result<(), String> {
+    if total > MAX_TAGS {
+        return Err(format!(
+            "tags may carry at most {MAX_TAGS} entries, got {total}"
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse a `tags` map that would put more into one stored record than it may hold
+/// ([`MAX_TAGS`] entries of at most [`MAX_TAG_KEY_CHARS`] / [`MAX_TAG_VALUE_CHARS`]
+/// characters).
+///
+/// Reached by every operation that accepts a `tags` map (`CreateGraph`, `TagResource`),
+/// so the bound on what one record stores is stated once. The model's own `@length`
+/// traits on `TagMap`/`TagKey`/`TagValue` refuse these at the boundary too; the check is
+/// repeated at the growth site so the bound lives beside the write that stores it.
+pub fn bound_tags(tags: &HashMap<String, String>) -> Result<(), String> {
+    bound_tag_count(tags.len())?;
+    for (key, value) in tags {
+        let key_chars = key.chars().count();
+        if key_chars > MAX_TAG_KEY_CHARS {
+            return Err(format!(
+                "a tag key may be at most {MAX_TAG_KEY_CHARS} characters, got {key_chars}"
+            ));
+        }
+        let value_chars = value.chars().count();
+        if value_chars > MAX_TAG_VALUE_CHARS {
+            return Err(format!(
+                "the value of tag '{key}' may be at most {MAX_TAG_VALUE_CHARS} characters, \
+                 got {value_chars}"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// One clause of a `ValidationException` message: the value that was rejected, the
@@ -527,6 +614,69 @@ mod tests {
         }
     }
 
+    /// The bound on what one stored record's tags may hold, at the limit and one past
+    /// it for the entry count, the key length and the value length.
+    #[test]
+    fn tag_bounds_accept_the_limit_and_refuse_one_past_it() {
+        let map = |pairs: Vec<(String, String)>| -> HashMap<String, String> {
+            pairs.into_iter().collect()
+        };
+        let many = |count: usize| {
+            map((0..count)
+                .map(|index| (format!("key{index}"), "v".to_string()))
+                .collect())
+        };
+
+        // (case, tags, accepted)
+        let cases: Vec<(&str, HashMap<String, String>, bool)> = vec![
+            ("no tags", map(Vec::new()), true),
+            ("at the entry limit", many(MAX_TAGS), true),
+            ("one entry past the limit", many(MAX_TAGS + 1), false),
+            (
+                "a key at the length limit",
+                map(vec![("k".repeat(MAX_TAG_KEY_CHARS), "v".to_string())]),
+                true,
+            ),
+            (
+                "a key one character past the limit",
+                map(vec![("k".repeat(MAX_TAG_KEY_CHARS + 1), "v".to_string())]),
+                false,
+            ),
+            (
+                "a value at the length limit",
+                map(vec![("k".to_string(), "v".repeat(MAX_TAG_VALUE_CHARS))]),
+                true,
+            ),
+            (
+                "a value one character past the limit",
+                map(vec![("k".to_string(), "v".repeat(MAX_TAG_VALUE_CHARS + 1))]),
+                false,
+            ),
+        ];
+        for (case, tags, accepted) in cases {
+            let actual = bound_tags(&tags);
+            assert_eq!(
+                actual.is_ok(),
+                accepted,
+                "case {case:?}: expected accepted={accepted}, got {actual:?}"
+            );
+        }
+    }
+
+    /// The post-call entry count `TagResource` checks, at the limit and one past it.
+    #[test]
+    fn the_tag_entry_bound_accepts_the_limit_and_refuses_one_past_it() {
+        for total in [0, 1, MAX_TAGS - 1, MAX_TAGS, MAX_TAGS + 1, MAX_TAGS * 2] {
+            let actual = bound_tag_count(total);
+            let accepted = total <= MAX_TAGS;
+            assert_eq!(
+                actual.is_ok(),
+                accepted,
+                "case total={total}: expected accepted={accepted}, got {actual:?}"
+            );
+        }
+    }
+
     /// A missing graph is reported scoped to the account the lookup ran in, for every
     /// well-formed identifier.
     #[test]
@@ -541,6 +691,81 @@ mod tests {
                 actual, expected,
                 "case {id:?}: expected {expected:?}, got {actual:?}"
             );
+        }
+    }
+
+    /// The ARN lookup the tagging operations resolve their subject through is EXACT:
+    /// only the ARN the service minted for a resource names it, so the same resource id
+    /// under another region, account or partition names no resource in this store.
+    #[test]
+    fn tags_of_resolves_only_the_minted_arn() {
+        let mut state = ComAmazonawsNeptunegraphAmazonneptunegraphState::default();
+        let id = "g-0123456789";
+        let arn = ::engine::emulator_arn(ARN_NAMESPACE, "us-east-1", &format!("graph/{id}"));
+        let mut graph = sample_graph(id, &arn);
+        graph.tags.insert("env".to_string(), "prod".to_string());
+        state.insert_graph(graph);
+
+        // (case, the ARN a request names, whether it resolves to the stored graph)
+        let cases: Vec<(&str, String, bool)> = vec![
+            ("the minted ARN", arn.clone(), true),
+            (
+                "another region",
+                ::engine::emulator_arn(ARN_NAMESPACE, "eu-west-1", &format!("graph/{id}")),
+                false,
+            ),
+            (
+                "another account",
+                format!("arn:aws:{ARN_NAMESPACE}:us-east-1:999999999999:graph/{id}"),
+                false,
+            ),
+            (
+                "another resource type",
+                ::engine::emulator_arn(ARN_NAMESPACE, "us-east-1", &format!("graph-snapshot/{id}")),
+                false,
+            ),
+            (
+                "another graph id",
+                ::engine::emulator_arn(ARN_NAMESPACE, "us-east-1", "graph/g-9999999999"),
+                false,
+            ),
+            ("not an ARN of this service", "arn:aws:s3:::bucket".to_string(), false),
+        ];
+        for (case, candidate, resolves) in cases {
+            let actual = state.tags_of(&candidate).is_some();
+            assert_eq!(
+                actual, resolves,
+                "case {case:?} ({candidate:?}): expected resolves={resolves}, got {actual}"
+            );
+            let actual_mut = state.tags_of_mut(&candidate).is_some();
+            assert_eq!(
+                actual_mut, resolves,
+                "case {case:?} ({candidate:?}) mutably: expected resolves={resolves}, \
+                 got {actual_mut}"
+            );
+        }
+    }
+
+    /// A stored graph with the members every test here needs and nothing else set.
+    fn sample_graph(id: &str, arn: &str) -> Graph {
+        Graph {
+            id: id.to_string(),
+            name: format!("name-for-{id}"),
+            arn: arn.to_string(),
+            status: GraphStatus::Available,
+            status_reason: None,
+            create_time: SystemTime::UNIX_EPOCH,
+            provisioned_memory: 16,
+            endpoint: "endpoint".to_string(),
+            public_connectivity: false,
+            replica_count: 1,
+            kms_key_identifier: None,
+            vector_search_configuration: None,
+            deletion_protection: false,
+            source_snapshot_id: None,
+            build_number: None,
+            tags: BTreeMap::new(),
+            settles_at: None,
         }
     }
 

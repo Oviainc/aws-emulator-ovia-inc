@@ -210,7 +210,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => {
                 return Err(DeleteFirewallErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(format!("Firewall {key} does not exist.")),
+                        message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
                     },
                 )
                 .into())
@@ -236,6 +236,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         for sync_state in record.sync_states.values_mut() {
             sync_state.attachment_status = crate::state::ATTACHMENT_DELETING.to_string();
         }
+        // The response projects the removed record rather than echoing a
+        // request, so the firewall's tag collection is reported as a list —
+        // empty when it carries no tags (see `state::removed_resource_tags`).
+        record.tags = crate::state::removed_resource_tags(record.tags.take());
 
         Ok(DeleteFirewallOutput {
             firewall: Some(record.to_firewall()),
@@ -246,6 +250,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
 crate::state::impl_resolve_error!(
     delete_lookup_error -> DeleteFirewallError, DeleteFirewallErrorModeled,
-    resource = "firewall", plural = "firewalls",
+    plural = "firewalls",
     name_member = "FirewallName", arn_member = "FirewallArn"
 );

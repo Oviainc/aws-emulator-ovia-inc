@@ -1,15 +1,29 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op InvokeEndpoint
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `InvokeEndpoint`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: resolves the endpoint the request names in the SageMaker CONTROL
+//! PLANE's store (through the one shared engine), refuses a request that names no
+//! endpoint, an endpoint that is not yet `InService`, a `TargetVariant` the endpoint
+//! does not host, `EnableExplanations` on an endpoint with no explainer configuration or
+//! a `SessionId` naming no stateful session — and answers an otherwise valid invocation
+//! with the modelled 424 `ModelError`, because a model container is customer-provided
+//! code in a container image and this emulator runs none, so no inference is performed.
+//! Every call is logged in [`crate::state`]. This is the ONLY file to touch for this
+//! operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`InvokeEndpoint::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## Why the answer to a resolved invocation is `ModelError`
+//!
+//! A SageMaker model is a CONTAINER IMAGE of customer code, which a generated emulator
+//! cannot run (see `service_com_amazonaws_sagemaker_sagemaker::state`'s
+//! `TRANSFORM_NOT_RUN_FAILURE`, where the batch-transform path answers the same
+//! limitation in its own modelled failure state). So nothing computes a prediction, and
+//! the answer is the modelled error for an invocation the model did not serve rather
+//! than a synthesised `Body`. Of the six errors the operation models, `ModelError` (424)
+//! is the one that says exactly that: the model behind the endpoint did not return an
+//! inference. The retryable ones would be false — `ModelNotReadyException` (429) and
+//! `ServiceUnavailable` (503) both promise that waiting and retrying helps, and nothing
+//! here ever becomes ready — and `ValidationError` (400) would blame a request that is
+//! valid.
 //!
 //! ## Shape of an operation
 //!
@@ -170,6 +184,12 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The SageMaker CONTROL PLANE, whose store owns every endpoint this data plane
+/// invokes. It is reached through the one shared engine — the same store
+/// `CreateEndpoint` and `DescribeEndpoint` write and read — so this service keeps no
+/// second copy of an endpoint that could drift from it.
+use ::service_com_amazonaws_sagemaker_sagemaker as sagemaker;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -205,6 +225,63 @@ impl From<InvokeEndpointErrorModeled> for InvokeEndpointError {
     fn from(modeled: InvokeEndpointErrorModeled) -> Self {
         crate::scaffolded::Scaffolded::Modeled(modeled)
     }
+}
+
+/// The `EndpointStatus` members with no deployment behind the endpoint, so an
+/// invocation has nothing to route to.
+///
+/// Taken from the modelled enum (`ENDPOINT_STATUS_VALUES` in the SageMaker crate's
+/// `ops/types/shared_types.rs`): `Creating` is still provisioning, `Deleting` is coming
+/// down, and `Failed`, `OutOfService` and `UpdateRollbackFailed` have no serving
+/// deployment at all. The enum's remaining members — `InService`, `Updating`,
+/// `SystemUpdating` and `RollingBack` — all have the previous or new deployment up, and
+/// the real service keeps serving inference in each of them.
+const NON_SERVING_ENDPOINT_STATUSES: &[&str] = &[
+    "Creating",
+    "Deleting",
+    "Failed",
+    "OutOfService",
+    "UpdateRollbackFailed",
+];
+
+/// `SessionId`'s constant that asks for a stateful session to be created: "Create a
+/// stateful session by specifying the value NEW_SESSION"
+/// (`InvokeEndpointInput$SessionId`'s model doc). The member's own pattern
+/// (`^(NEW_SESSION)$|^[a-zA-Z0-9](-*[a-zA-Z0-9])*$`) carries it as its first alternative,
+/// so every other accepted value is a session ID.
+const NEW_SESSION: &str = "NEW_SESSION";
+
+/// This operation's modelled 400 `ValidationError` ("Inspect your request and try
+/// again.") — the error the real service answers for a request it refuses.
+fn validation(message: impl Into<String>) -> InvokeEndpointError {
+    InvokeEndpointErrorModeled::ValidationError(ValidationError {
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// This operation's modelled 500 `InternalFailure`, for a fault of this process rather
+/// than of the request.
+fn internal_failure(message: impl Into<String>) -> InvokeEndpointError {
+    InvokeEndpointErrorModeled::InternalFailure(InternalFailure {
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// What the control plane records about the endpoint a request names.
+struct EndpointFacts {
+    arn: String,
+    status: String,
+    /// The names of the production variants the endpoint hosts, in the order the
+    /// endpoint configuration listed them.
+    production_variants: Vec<String>,
+    /// Whether the endpoint carries an explainer configuration, which is what
+    /// `EnableExplanations` overrides a parameter of.
+    has_explainer_config: bool,
+    /// Whether this call materialised the `Creating` -> `InService` transition the clock
+    /// already owed.
+    settled: bool,
 }
 
 /// The `InvokeEndpoint` operation.
@@ -243,18 +320,190 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `InvokeEndpoint` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(InvokeEndpointErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("InvokeEndpoint"))
+        let Some(log) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_failure(crate::state::NO_STATE));
+        };
+        let Some(control_plane) = sagemaker::state::service_state(&*self.engine) else {
+            return Err(internal_failure(crate::state::NO_CONTROL_PLANE_STATE));
+        };
+
+        let now = ::std::time::SystemTime::now();
+        // "Endpoints are scoped to an individual account" (this operation's model doc),
+        // and this emulator serves the one account every emulated resource belongs to.
+        let account = ::engine::EMULATOR_ACCOUNT_ID;
+
+        // This call, as the data-plane log replays it once its outcome is known. The
+        // `@sensitive` members (the body, `CustomAttributes`) are deliberately absent:
+        // only the body's SIZE is recorded.
+        let attempt = |outcome: crate::state::InvocationOutcome| crate::state::EndpointInvocation {
+            endpoint_name: input.endpoint_name.clone(),
+            target_variant: input.target_variant.clone(),
+            request_bytes: input.body.len(),
+            content_type: input.content_type.clone(),
+            accept: input.accept.clone(),
+            inference_id: input.inference_id.clone(),
+            target_model: input.target_model.clone(),
+            session_id: input.session_id.clone(),
+            outcome,
+            at: now,
+        };
+        // Record the call: in this service's own log, and as one structured audit event
+        // carrying the operation, the endpoint it named, the access-key id the REQUEST
+        // presented and the outcome. Only request METADATA goes into either — never the
+        // `@sensitive` body or custom attributes, and never a credential's secret.
+        let record = |outcome: crate::state::InvocationOutcome| {
+            let invocation = attempt(outcome);
+            tracing::info!(
+                operation = Self::NAME,
+                endpoint = %invocation.endpoint_name,
+                target_variant = invocation.target_variant.as_deref().unwrap_or_default(),
+                request_bytes = invocation.request_bytes,
+                outcome = outcome.label(),
+                access_key_id = %::emulator_server::extract_akid(&ctx.parts().headers),
+                "sagemaker runtime endpoint invocation"
+            );
+            log.lock().record_invocation(invocation);
+        };
+        // Record the invocation, then refuse it: a refused invocation is still one the
+        // data plane served, the way the real service counts it.
+        let refuse = |outcome: crate::state::InvocationOutcome, message: String| {
+            record(outcome);
+            validation(message)
+        };
+
+        // The endpoint is the control plane's resource, so it is resolved there and
+        // nowhere else.
+        let resolved = {
+            let mut store = control_plane.lock();
+            match store.endpoints.get_mut(&input.endpoint_name) {
+                None => Err((
+                    crate::state::InvocationOutcome::EndpointNotFound,
+                    format!(
+                        "Endpoint {} of account {account} not found.",
+                        input.endpoint_name
+                    ),
+                )),
+                Some(endpoint) => {
+                    // The one write this call makes to the control plane: the deployment
+                    // the clock already owed. It was due at the stored instant whether or
+                    // not anybody invoked the endpoint, so invoking it makes no difference
+                    // to the outcome — the same transition `DescribeEndpoint` materialises.
+                    let settled = endpoint.settle_status(now);
+                    Ok(EndpointFacts {
+                        arn: endpoint.arn.clone(),
+                        status: endpoint.status.clone(),
+                        production_variants: endpoint
+                            .production_variants
+                            .iter()
+                            .map(|variant| variant.variant_name.clone())
+                            .collect(),
+                        has_explainer_config: endpoint.explainer_config.is_some(),
+                        settled,
+                    })
+                }
+            }
+        };
+        let facts = match resolved {
+            Ok(facts) => facts,
+            Err((outcome, message)) => return Err(refuse(outcome, message)),
+        };
+        if facts.settled {
+            // The transition is a state change of the control plane's resource, so it
+            // leaves the same record there as the call that created the endpoint.
+            sagemaker::state::record_state_change(Self::NAME, &facts.arn, ctx);
+        }
+
+        // An endpoint serves inference while a deployment is BEHIND it, which is not the
+        // same as "its status is `InService`": the real service keeps serving an endpoint
+        // through an update (`Updating`, `SystemUpdating`, `RollingBack`), because the
+        // previous deployment stays up until the new one lands. What has nothing to route
+        // to is an endpoint whose deployment has not landed or has gone away, so those
+        // statuses are what is refused, named rather than inferred from the complement of
+        // `InService`. (Today only `Creating` and `InService` are reachable, since
+        // `UpdateEndpoint` is still a stub; the rule is stated for the whole modelled
+        // enum, `ENDPOINT_STATUS_VALUES` in the SageMaker crate's `shared_types`.)
+        if NON_SERVING_ENDPOINT_STATUSES.contains(&facts.status.as_str()) {
+            return Err(refuse(
+                crate::state::InvocationOutcome::EndpointNotInService,
+                format!(
+                    "Endpoint {} of account {account} is not in service: its status is {}.",
+                    input.endpoint_name, facts.status
+                ),
+            ));
+        }
+
+        // `TargetVariant` "[s]pecif[ies] the production variant to send the inference
+        // request to", so it has to name one of the variants this endpoint hosts.
+        if let Some(target) = input.target_variant.as_deref() {
+            if !facts
+                .production_variants
+                .iter()
+                .any(|hosted| hosted == target)
+            {
+                return Err(refuse(
+                    crate::state::InvocationOutcome::VariantNotFound,
+                    format!(
+                        "Variant {target} not found for endpoint {}. The endpoint hosts: {}.",
+                        input.endpoint_name,
+                        facts.production_variants.join(", ")
+                    ),
+                ));
+            }
+        }
+
+        // `EnableExplanations` is "an optional JMESPath expression used to override the
+        // EnableExplanations parameter of the ClarifyExplainerConfig API" (the member's
+        // model doc), so there has to be an explainer configuration for it to override.
+        if input.enable_explanations.is_some() && !facts.has_explainer_config {
+            return Err(refuse(
+                crate::state::InvocationOutcome::ExplanationsNotConfigured,
+                format!(
+                    "EnableExplanations is supported only on an endpoint whose endpoint \
+                     configuration carries an ExplainerConfig; endpoint {} carries none.",
+                    input.endpoint_name
+                ),
+            ));
+        }
+
+        // A stateful session is created BY THE MODEL: "When you create a session with a
+        // stateful model, the model must create the session ID and set the expiration
+        // time" (`SessionId`'s model doc). So a session exists only once a container has
+        // answered a `NEW_SESSION` request, and no container runs here: `NEW_SESSION`
+        // falls through to the inference step below, and every other ID names a session
+        // that does not exist.
+        if let Some(session_id) = input
+            .session_id
+            .as_deref()
+            .filter(|session_id| *session_id != NEW_SESSION)
+        {
+            return Err(refuse(
+                crate::state::InvocationOutcome::SessionNotFound,
+                format!(
+                    "Session {session_id} not found for endpoint {}.",
+                    input.endpoint_name
+                ),
+            ));
+        }
+
+        // Everything the control plane owns resolved; what is left is the inference
+        // itself. A model container is customer-provided code in a container image, and
+        // a generated emulator runs no container, so NOTHING computed a prediction: the
+        // answer is the modelled error for an invocation the model did not serve, never a
+        // synthesised `Body` claiming an inference that never ran, and never a capture
+        // record written to the endpoint's `DataCaptureConfig` destination for it.
+        record(crate::state::InvocationOutcome::NoInferenceContainer);
+        Err(InvokeEndpointErrorModeled::ModelError(ModelError {
+            message: Some(format!(
+                "This emulator runs no model inference container, so endpoint {} returned \
+                 no inference for this request.",
+                input.endpoint_name
+            )),
+            // Nothing answered, so there is no container status code, no container
+            // message and no container log stream to report.
+            original_status_code: None,
+            original_message: None,
+            log_stream_arn: None,
+        })
+        .into())
     }
 }

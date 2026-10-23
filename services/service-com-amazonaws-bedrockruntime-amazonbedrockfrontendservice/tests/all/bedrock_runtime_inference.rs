@@ -58,7 +58,7 @@ const FAMILY_ROWS: &[FamilyRow] = &[
         capped_stop: "max_tokens",
     },
     FamilyRow {
-        model_id: "amazon.titan-text-express-v1",
+        model_id: "amazon.titan-text-premier-v1:0",
         family: state::ModelFamily::TitanText,
         request: r#"{"inputText":"Write a haiku about persistent state.","textGenerationConfig":{"maxTokenCount":512}}"#,
         capped_request: r#"{"inputText":"Write a haiku about persistent state.","textGenerationConfig":{"maxTokenCount":3}}"#,
@@ -317,6 +317,15 @@ async fn count_converse_tokens(
     if system.as_array().is_some_and(|blocks| !blocks.is_empty()) {
         converse["system"] = system.clone();
     }
+    count_converse_input_tokens(router, model_id, &converse).await
+}
+
+/// `CountTokens` over a whole `Converse`-shaped input, `toolConfig` included.
+async fn count_converse_input_tokens(
+    router: &MultiServiceRouter,
+    model_id: &str,
+    converse: &serde_json::Value,
+) -> i64 {
     let call = post_json(
         router,
         &format!("/model/{model_id}/count-tokens"),
@@ -333,6 +342,39 @@ async fn count_converse_tokens(
     call.json()["inputTokens"]
         .as_i64()
         .expect("inputTokens is a modelled integer")
+}
+
+/// `CountTokens` over an `InvokeModel` body.
+async fn count_invoke_body_tokens(
+    router: &MultiServiceRouter,
+    model_id: &str,
+    body: &serde_json::Value,
+) -> i64 {
+    let encoded = base64(&serde_json::to_vec(body).expect("a serializable test body"));
+    let call = post_json(
+        router,
+        &format!("/model/{model_id}/count-tokens"),
+        &serde_json::json!({ "input": { "invokeModel": { "body": encoded } } }),
+    )
+    .await;
+    assert_eq!(
+        call.status,
+        200,
+        "CountTokens must succeed, got {} / {}",
+        call.status,
+        String::from_utf8_lossy(&call.body)
+    );
+    call.json()["inputTokens"]
+        .as_i64()
+        .expect("inputTokens is a modelled integer")
+}
+
+/// The tokens a set of prompt pieces is, by the emulator's one tokenizer.
+fn tokens_of(pieces: &[&str]) -> i64 {
+    pieces
+        .iter()
+        .map(|piece| i64::from(state::count_text_tokens(piece)))
+        .sum()
 }
 
 // ---------------------------------------------------------------------------
@@ -419,6 +461,356 @@ async fn count_tokens_and_converse_report_the_same_input_token_count() {
             body["metrics"]["latencyMs"]
         );
     }
+}
+
+/// A row of the prompt-accounting table: one kind of content a `Converse`
+/// request can carry beyond plain user text, and every piece of text that kind
+/// sends the model.
+struct PromptPieceRow {
+    case: &'static str,
+    /// Content blocks appended to the base user turn.
+    extra_content: serde_json::Value,
+    /// The request's `toolConfig`, or `null` for a row that offers no tool.
+    tool_config: serde_json::Value,
+    /// Every piece of prompt text this row adds. EMPTY for a row whose content
+    /// carries no text at all, which must leave the count unchanged.
+    pieces: &'static [&'static str],
+}
+
+/// The content kinds a `Converse` message and a `toolConfig` can carry, one row
+/// each, with the prompt text each one sends the model.
+///
+/// Shapes and member names from `smithy_query(query="shape",
+/// shape="ContentBlock,SystemContentBlock,Tool,ToolResultContentBlock")` on this
+/// service's model; the pieces are what the rule under test says reaches the
+/// model.
+fn prompt_piece_rows() -> Vec<PromptPieceRow> {
+    vec![
+        PromptPieceRow {
+            case: "a tool definition: name, description and JSON input schema",
+            extra_content: serde_json::json!([]),
+            tool_config: serde_json::json!({
+                "tools": [{"toolSpec": {
+                    "name": "get_weather",
+                    "description": "Look up the weather.",
+                    "inputSchema": {"json": {"type": "object"}},
+                }}],
+            }),
+            pieces: &["get_weather", "Look up the weather.", r#"{"type":"object"}"#],
+        },
+        PromptPieceRow {
+            case: "a tool definition and a tool choice naming it",
+            extra_content: serde_json::json!([]),
+            tool_config: serde_json::json!({
+                "tools": [{"toolSpec": {
+                    "name": "get_weather",
+                    "description": "Look up the weather.",
+                    "inputSchema": {"json": {"type": "object"}},
+                }}],
+                "toolChoice": {"tool": {"name": "get_weather"}},
+            }),
+            pieces: &[
+                "get_weather",
+                "Look up the weather.",
+                r#"{"type":"object"}"#,
+                "get_weather",
+            ],
+        },
+        PromptPieceRow {
+            case: "a document carried as text",
+            extra_content: serde_json::json!([{"document": {
+                "format": "txt",
+                "name": "release notes",
+                "source": {"text": "The emulator persists every record."},
+            }}]),
+            tool_config: serde_json::Value::Null,
+            pieces: &["release notes", "The emulator persists every record."],
+        },
+        PromptPieceRow {
+            case: "a tool use and the tool result text answering it",
+            extra_content: serde_json::json!([
+                {"toolUse": {
+                    "toolUseId": "tooluse-1",
+                    "name": "get_weather",
+                    "input": {"city": "Lisbon"},
+                }},
+                {"toolResult": {
+                    "toolUseId": "tooluse-1",
+                    "content": [{"text": "Twenty three degrees and clear."}],
+                }},
+            ]),
+            tool_config: serde_json::Value::Null,
+            pieces: &[
+                "get_weather",
+                r#"{"city":"Lisbon"}"#,
+                "Twenty three degrees and clear.",
+            ],
+        },
+        PromptPieceRow {
+            case: "a tool result carrying JSON",
+            extra_content: serde_json::json!([{"toolResult": {
+                "toolUseId": "tooluse-2",
+                "content": [{"json": {"celsius": 23}}],
+            }}]),
+            tool_config: serde_json::Value::Null,
+            pieces: &[r#"{"celsius":23}"#],
+        },
+        PromptPieceRow {
+            case: "guarded content",
+            extra_content: serde_json::json!([{"guardContent": {
+                "text": {"text": "Guard this sentence."},
+            }}]),
+            tool_config: serde_json::Value::Null,
+            pieces: &["Guard this sentence."],
+        },
+        PromptPieceRow {
+            case: "reasoning text",
+            extra_content: serde_json::json!([{"reasoningContent": {
+                "reasoningText": {"text": "Weigh both answers first.", "signature": "c2ln"},
+            }}]),
+            tool_config: serde_json::Value::Null,
+            pieces: &["Weigh both answers first."],
+        },
+        PromptPieceRow {
+            case: "a search result",
+            extra_content: serde_json::json!([{"searchResult": {
+                "source": "https://example.invalid/weather",
+                "title": "Lisbon weather",
+                "content": [{"text": "Clear skies all week."}],
+            }}]),
+            tool_config: serde_json::Value::Null,
+            pieces: &[
+                "https://example.invalid/weather",
+                "Lisbon weather",
+                "Clear skies all week.",
+            ],
+        },
+        PromptPieceRow {
+            case: "an image, whose payload is not text",
+            extra_content: serde_json::json!([{"image": {
+                "format": "png",
+                "source": {"bytes": "aGVsbG8gaW1hZ2UgYnl0ZXM="},
+            }}]),
+            tool_config: serde_json::Value::Null,
+            pieces: &[],
+        },
+        PromptPieceRow {
+            case: "a cache point, which is a marker and not prompt text",
+            extra_content: serde_json::json!([{"cachePoint": {"type": "default"}}]),
+            tool_config: serde_json::Value::Null,
+            pieces: &[],
+        },
+    ]
+}
+
+/// RULE: the input-token count an inference call reports covers every piece of
+/// text the request sends the model — each message's content blocks of EVERY
+/// kind and the complete definition of each tool offered, not just the
+/// plain-text blocks — so adding a content kind that carries text raises the
+/// count by exactly the tokens of that text, while content that carries no text
+/// leaves it unchanged. `CountTokens` reports the same count for the same input.
+#[tokio::test]
+async fn an_inference_call_counts_every_piece_of_prompt_text_the_request_carries() {
+    let router = emulator();
+    let model_id = "anthropic.claude-3-sonnet-20240229-v1:0";
+    let base_text = "Summarize the weather for me.";
+
+    let base = serde_json::json!({
+        "messages": [{"role": "user", "content": [{"text": base_text}]}],
+    });
+    let base_tokens = count_converse_input_tokens(&router, model_id, &base).await;
+    assert_eq!(
+        base_tokens,
+        tokens_of(&[base_text]),
+        "case \"base turn\": expected the plain user text to be counted, got {base_tokens}"
+    );
+
+    for row in prompt_piece_rows() {
+        let case = row.case;
+        let mut content = vec![serde_json::json!({"text": base_text})];
+        for block in row.extra_content.as_array().into_iter().flatten() {
+            content.push(block.clone());
+        }
+        let mut request = serde_json::json!({
+            "messages": [{"role": "user", "content": content}],
+        });
+        if !row.tool_config.is_null() {
+            request["toolConfig"] = row.tool_config.clone();
+        }
+
+        let expected = base_tokens + tokens_of(row.pieces);
+        let counted = count_converse_input_tokens(&router, model_id, &request).await;
+        assert_eq!(
+            counted, expected,
+            "case {case:?}: expected CountTokens to report {expected} \
+             ({base_tokens} for the base turn plus {} for this row), got {counted}",
+            tokens_of(row.pieces)
+        );
+
+        let call = post_json(&router, &format!("/model/{model_id}/converse"), &request).await;
+        assert_eq!(
+            call.status,
+            200,
+            "case {case:?}: expected Converse to answer 200, got {} / {}",
+            call.status,
+            String::from_utf8_lossy(&call.body)
+        );
+        let reported = call.json()["usage"]["inputTokens"].as_i64();
+        assert_eq!(
+            reported,
+            Some(expected),
+            "case {case:?}: expected Converse usage.inputTokens {expected}, got {reported:?}"
+        );
+        if row.pieces.is_empty() {
+            assert_eq!(
+                reported,
+                Some(base_tokens),
+                "case {case:?}: content that carries no text must not change the count, \
+                 got {reported:?} against {base_tokens}"
+            );
+        } else {
+            assert!(
+                reported.unwrap_or_default() > base_tokens,
+                "case {case:?}: text added to the prompt must raise the count, got \
+                 {reported:?} against {base_tokens}"
+            );
+        }
+    }
+}
+
+/// A row of the invoke-body tool table: a family's body with and without the
+/// tool definitions it can carry, and the pieces those definitions add.
+struct InvokeToolRow {
+    case: &'static str,
+    model_id: &'static str,
+    base: serde_json::Value,
+    /// The member the family binds its tool definitions to, with its value.
+    tools_member: (&'static str, serde_json::Value),
+    pieces: &'static [&'static str],
+    /// Whether AWS publishes `CountTokens` for this model, so the two
+    /// operations can be compared on the same body.
+    counts_tokens: bool,
+}
+
+/// RULE: an `InvokeModel` body's prompt is every piece of text the body sends
+/// the model — the fields the family binds prompt text to AND the whole of each
+/// tool definition it carries, which reaches the model verbatim — so adding the
+/// family's tool definitions to an otherwise identical body raises the reported
+/// input count by exactly the tokens of their text.
+///
+/// Member names from the per-family request formats in "Inference request
+/// parameters and response fields for foundation models" (Amazon Bedrock User
+/// Guide): Anthropic Claude's `tools`, Nova's `toolConfig`.
+#[tokio::test]
+async fn an_invoke_body_counts_the_tool_definitions_it_carries() {
+    let router = emulator();
+    let rows = vec![
+        InvokeToolRow {
+            case: "anthropic claude messages body with a tools array",
+            model_id: "anthropic.claude-3-sonnet-20240229-v1:0",
+            base: serde_json::json!({
+                "anthropic_version": "bedrock-2023-05-31",
+                "max_tokens": 256,
+                "messages": [{"role": "user", "content": [{"type": "text", "text": "Weather?"}]}],
+            }),
+            tools_member: (
+                "tools",
+                serde_json::json!([{
+                    "name": "get_weather",
+                    "description": "Look up the weather.",
+                    "input_schema": {"type": "object"},
+                }]),
+            ),
+            pieces: &["get_weather", "Look up the weather.", "object"],
+            counts_tokens: true,
+        },
+        InvokeToolRow {
+            case: "nova body with a toolConfig",
+            model_id: "amazon.nova-pro-v1:0",
+            base: serde_json::json!({
+                "messages": [{"role": "user", "content": [{"text": "Weather?"}]}],
+            }),
+            tools_member: (
+                "toolConfig",
+                serde_json::json!({
+                    "tools": [{"toolSpec": {
+                        "name": "get_weather",
+                        "description": "Look up the weather.",
+                        "inputSchema": {"json": {"type": "object"}},
+                    }}],
+                }),
+            ),
+            pieces: &["get_weather", "Look up the weather.", "object"],
+            // AWS publishes `CountTokens` for Anthropic Claude models only, and
+            // the emulator's inventory follows it, so this row compares the two
+            // operations and the Nova row does not.
+            counts_tokens: false,
+        },
+    ];
+
+    for row in rows {
+        let case = row.case;
+        let model_id = row.model_id;
+        let mut with_tools = row.base.clone();
+        with_tools[row.tools_member.0] = row.tools_member.1.clone();
+
+        let plain = invoke_input_tokens(&router, model_id, &row.base).await;
+        assert!(
+            plain > 0,
+            "case {case:?}: expected a positive count for the plain body, got {plain}"
+        );
+        let expected = plain + tokens_of(row.pieces);
+        let reported = invoke_input_tokens(&router, model_id, &with_tools).await;
+        assert_eq!(
+            reported, expected,
+            "case {case:?}: expected the tool definitions to add {} tokens to {plain}, \
+             got {reported}",
+            tokens_of(row.pieces)
+        );
+
+        if row.counts_tokens {
+            // One tokenizer, one rule: `CountTokens` reports what the invoke
+            // path reports for the same body.
+            for (label, body) in [("without tools", &row.base), ("with tools", &with_tools)] {
+                let counted = count_invoke_body_tokens(&router, model_id, body).await;
+                let served = invoke_input_tokens(&router, model_id, body).await;
+                assert_eq!(
+                    counted, served,
+                    "case {case:?} ({label}): expected CountTokens and InvokeModel to report \
+                     one count, got {counted} and {served}"
+                );
+            }
+        }
+    }
+}
+
+/// The input-token count the invoked family's own response envelope reports.
+async fn invoke_input_tokens(
+    router: &MultiServiceRouter,
+    model_id: &str,
+    body: &serde_json::Value,
+) -> i64 {
+    let call = send(
+        router,
+        "POST",
+        &format!("/model/{model_id}/invoke"),
+        &[("content-type", "application/json")],
+        serde_json::to_vec(body).expect("a serializable test body"),
+    )
+    .await;
+    assert_eq!(
+        call.status,
+        200,
+        "InvokeModel must succeed, got {} / {}",
+        call.status,
+        String::from_utf8_lossy(&call.body)
+    );
+    let served = call.json();
+    served
+        .pointer("/usage/input_tokens")
+        .or_else(|| served.pointer("/usage/inputTokens"))
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or_else(|| panic!("the family envelope reports an input count: {served}"))
 }
 
 /// RULE: a `Converse` turn stops on `max_tokens` when the generated text reaches
@@ -531,6 +923,23 @@ async fn invoke_model_answers_in_each_family_response_envelope() {
             row.text_pointer
         );
 
+        assert_eq!(
+            body.pointer(row.stop_pointer)
+                .and_then(serde_json::Value::as_str),
+            Some(row.completed_stop),
+            "case {case:?}: expected the family's completed stop reason at {} in {body}",
+            row.stop_pointer
+        );
+        if !row.input_token_pointer.is_empty() {
+            assert_eq!(
+                body.pointer(row.output_token_pointer)
+                    .and_then(serde_json::Value::as_i64),
+                Some(i64::from(state::count_text_tokens(text))),
+                "case {case:?}: expected {} to be the tokens of the returned text in {body}",
+                row.output_token_pointer
+            );
+        }
+
         let counted = post_json(
             &router,
             &format!("/model/{}/count-tokens", row.model_id),
@@ -539,6 +948,29 @@ async fn invoke_model_answers_in_each_family_response_envelope() {
             }),
         )
         .await;
+        // `CountTokens` counts with the MODEL's own tokenizer, which AWS
+        // publishes for the Anthropic Claude family; a model outside it refuses
+        // the count rather than answering one computed with another tokenizer.
+        if !row.model_id.starts_with("anthropic.") {
+            assert_eq!(
+                counted.status,
+                400,
+                "case {case:?}: a model CountTokens does not serve must refuse the count, \
+                 got {} / {}",
+                counted.status,
+                String::from_utf8_lossy(&counted.body)
+            );
+            assert_eq!(
+                counted.error_code(),
+                "ValidationException",
+                "case {case:?}: expected ValidationException, got {:?}",
+                counted.error_code()
+            );
+            continue;
+        }
+        // For a model it does serve, the count it reports is the one the
+        // family's response envelope reports as the input tokens: one tokenizer,
+        // two operations.
         assert_eq!(
             counted.status,
             200,
@@ -559,21 +991,7 @@ async fn invoke_model_answers_in_each_family_response_envelope() {
                 "case {case:?}: expected {} to be the CountTokens result {counted} in {body}",
                 row.input_token_pointer
             );
-            assert_eq!(
-                body.pointer(row.output_token_pointer)
-                    .and_then(serde_json::Value::as_i64),
-                Some(i64::from(state::count_text_tokens(text))),
-                "case {case:?}: expected {} to be the tokens of the returned text in {body}",
-                row.output_token_pointer
-            );
         }
-        assert_eq!(
-            body.pointer(row.stop_pointer)
-                .and_then(serde_json::Value::as_str),
-            Some(row.completed_stop),
-            "case {case:?}: expected the family's completed stop reason at {} in {body}",
-            row.stop_pointer
-        );
     }
 }
 
@@ -665,10 +1083,12 @@ async fn every_served_inference_call_is_recorded_in_the_inference_log() {
     )
     .await;
     assert_eq!(started.status, 200, "StartAsyncInvoke must be served");
-    // A reporting operation must add nothing to the log.
+    // A reporting operation must add nothing to the log. `CountTokens` counts with
+    // the model's own tokenizer, which AWS publishes for the Anthropic Claude
+    // family, so the read is made against a model it serves.
     let _ = count_converse_tokens(
         &router,
-        model_id,
+        "anthropic.claude-3-haiku-20240307-v1:0",
         &serde_json::json!([]),
         &serde_json::json!([{"role": "user", "content": [{"text": "not an inference call"}]}]),
     )
@@ -922,19 +1342,24 @@ async fn a_model_identifier_is_refused_by_the_class_of_identifier_it_is() {
         let case = row.case;
 
         // Every operation that resolves a modelId must answer the same way.
-        let mut calls = vec![
-            (
-                "InvokeModel",
-                send(
-                    &router,
-                    "POST",
-                    &format!("/model/{encoded}/invoke"),
-                    &[("content-type", "application/json")],
-                    row.body.as_bytes().to_vec(),
-                )
-                .await,
-            ),
-            (
+        let mut calls = vec![(
+            "InvokeModel",
+            send(
+                &router,
+                "POST",
+                &format!("/model/{encoded}/invoke"),
+                &[("content-type", "application/json")],
+                row.body.as_bytes().to_vec(),
+            )
+            .await,
+        )];
+        if row.status != 200 {
+            // A served row is asserted against `InvokeModel` only: `Converse`
+            // and `CountTokens` each have their own rule about which models
+            // they serve, pinned separately. The identifier rule itself is what
+            // every one of them must answer identically, which is what the
+            // refused rows check.
+            calls.push((
                 "CountTokens",
                 post_json(
                     &router,
@@ -944,11 +1369,7 @@ async fn a_model_identifier_is_refused_by_the_class_of_identifier_it_is() {
                     }),
                 )
                 .await,
-            ),
-        ];
-        if row.status != 200 {
-            // A served row is not asserted against Converse: Converse has its
-            // own rule about which models it serves, pinned separately.
+            ));
             calls.push((
                 "Converse",
                 post_json(
@@ -1157,12 +1578,23 @@ async fn a_model_this_emulator_runs_no_inference_for_is_refused_not_invented() {
             }),
         )
         .await;
+        // Counting the input's tokens needs no model output, but the count is
+        // the MODEL's own tokenizer's: a model `CountTokens` is not published
+        // for is refused the count rather than answered with another
+        // tokenizer's, and the identifier is still a recognised one (400, never
+        // the 400 for an unreadable identifier).
         assert_eq!(
             counted.status,
-            200,
-            "case {case:?} {model_id:?}: counting tokens needs no model output, got {} / {}",
+            400,
+            "case {case:?} {model_id:?}: expected the count to be refused, got {} / {}",
             counted.status,
             String::from_utf8_lossy(&counted.body)
+        );
+        assert_eq!(
+            counted.json()["message"].as_str(),
+            Some("The provided model doesn't support counting tokens."),
+            "case {case:?} {model_id:?}: expected the unsupported-count refusal, got {}",
+            counted.json()
         );
     }
 }

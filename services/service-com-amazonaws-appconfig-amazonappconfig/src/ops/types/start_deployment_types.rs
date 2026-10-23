@@ -26,7 +26,10 @@ pub struct StartDeploymentInput {
     pub latest_deployment_number: Option<i32>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.appconfig#Deployment")]
+/// `StartedAt` and `CompletedAt` target `Iso8601DateTime` (`@timestampFormat("date-time")`),
+/// so this shape's schema and serializer come from `ac_deployment_shape!` rather than from
+/// `#[smithy_macros::smithy(shape = ...)]` — see `types/deployment_wire.rs`, which also
+/// states where the `Type` member below comes from.
 #[derive(Debug, Clone, Default)]
 pub struct StartDeploymentOutput {
     pub application_id: Option<String>,
@@ -51,5 +54,8 @@ pub struct StartDeploymentOutput {
     pub kms_key_arn: Option<String>,
     pub kms_key_identifier: Option<String>,
     pub version_label: Option<String>,
+    pub r#type: Option<String>,
 }
+
+ac_deployment_shape!(StartDeploymentOutput, START_DEPLOYMENT_OUTPUT_SCHEMA);
 

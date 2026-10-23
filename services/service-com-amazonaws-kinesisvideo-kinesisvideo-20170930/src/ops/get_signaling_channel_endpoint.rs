@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetSignalingChannelEndpoint
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetSignalingChannelEndpoint`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetSignalingChannelEndpoint::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports one endpoint per `ChannelProtocol` the request asks for, for the stored
+//! signaling channel the `ChannelARN` names. Every endpoint is THIS emulator's own
+//! authority under the scheme that protocol names, because the endpoint has to be
+//! reachable: a client takes it and connects back here. `WEBRTC` is refused with the
+//! modeled `InvalidArgumentException` on a channel that is not configured for ingestion,
+//! as the operation's docs state.
 //!
 //! ## Shape of an operation
 //!
@@ -168,18 +165,135 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetSignalingChannelEndpoint` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetSignalingChannelEndpointErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetSignalingChannelEndpoint"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                GetSignalingChannelEndpointErrorModeled::ClientLimitExceededException(
+                    ClientLimitExceededException {
+                        message: Some(
+                            "The signaling channel store is unavailable. Try again later."
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+        let region = crate::state::request_region(ctx.parts());
+        let authority = crate::state::request_authority(ctx.parts(), &region);
+
+        let mut store = state.lock();
+        store.settle_clock();
+
+        let channel = store
+            .resolve_channel(None, Some(input.channel_arn.as_str()))
+            .map_err(|_| {
+                GetSignalingChannelEndpointError::from(
+                    GetSignalingChannelEndpointErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: Some(crate::state::CHANNEL_NOT_FOUND_MESSAGE.to_string()),
+                        },
+                    ),
+                )
+            })?;
+        let ingestion_enabled =
+            channel.media_storage_status == crate::state::MEDIA_STORAGE_ENABLED;
+
+        // "This API uses the SingleMasterChannelEndpointConfiguration input parameter,
+        // which consists of the Protocols and Role properties. Protocols is used to
+        // determine the communication mechanism … Role determines the messaging
+        // permissions." Neither can be inferred, so a request that leaves the
+        // configuration, its protocols or its role unnamed names no endpoint to resolve
+        // and is a bad argument rather than an empty success.
+        let configuration = input
+            .single_master_channel_endpoint_configuration
+            .unwrap_or_default();
+        let protocols = configuration.protocols.unwrap_or_default();
+        for (member, missing) in [
+            ("Protocols", protocols.is_empty()),
+            ("Role", configuration.role.is_none()),
+        ] {
+            if missing {
+                return Err(
+                    GetSignalingChannelEndpointErrorModeled::InvalidArgumentException(
+                        InvalidArgumentException {
+                            message: Some(format!(
+                                "SingleMasterChannelEndpointConfiguration.{member} must be \
+                                 specified to resolve a signaling channel endpoint."
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // The endpoint list is one entry per protocol the caller asked for, in the order
+        // asked.
+        let mut endpoints = Vec::with_capacity(protocols.len());
+        for protocol in protocols {
+            // `ChannelProtocol` is a modeled enum, so the boundary already refuses a
+            // value outside its set; this re-states the same rule from the one list the
+            // model publishes.
+            if !CHANNEL_PROTOCOL_VALUES.contains(&protocol.as_str()) {
+                return Err(
+                    GetSignalingChannelEndpointErrorModeled::InvalidArgumentException(
+                        InvalidArgumentException {
+                            message: Some(format!(
+                                "Protocols must each be one of {}.",
+                                CHANNEL_PROTOCOL_VALUES.join(", ")
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            // "If you specify WEBRTC as the protocol, but the signaling channel isn't
+            // configured for ingestion, you will receive the error
+            // InvalidArgumentException." Ingestion is configured by
+            // `UpdateMediaStorageConfiguration`, which is what enables the channel's
+            // media storage.
+            if protocol == PROTOCOL_WEBRTC && !ingestion_enabled {
+                return Err(
+                    GetSignalingChannelEndpointErrorModeled::InvalidArgumentException(
+                        InvalidArgumentException {
+                            message: Some(format!(
+                                "The {PROTOCOL_WEBRTC} protocol is available only for a \
+                                 signaling channel configured for ingestion. Use \
+                                 UpdateMediaStorageConfiguration to configure it."
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            endpoints.push(ResourceEndpointListItem {
+                resource_endpoint: Some(format!("{}://{authority}", scheme_of(&protocol))),
+                protocol: Some(protocol),
+            });
+        }
+
+        Ok(GetSignalingChannelEndpointOutput {
+            resource_endpoint_list: Some(endpoints),
+        })
+    }
+}
+
+/// The `ChannelProtocol` value whose endpoint is the media server's, available only on a
+/// channel configured for ingestion. From
+/// [`crate::ops::types::CHANNEL_PROTOCOL_VALUES`].
+const PROTOCOL_WEBRTC: &str = "WEBRTC";
+
+/// The URI scheme a `ChannelProtocol` is addressed over.
+///
+/// From the operation's own docs: "if you specify WSS as the protocol, this API produces
+/// a secure websocket endpoint" (`wss`), "if you specify HTTPS as the protocol, this API
+/// generates an HTTPS endpoint" (`https`), and the media server endpoint the `WEBRTC`
+/// protocol names is an HTTPS one too. An unmodeled value cannot reach here — the
+/// caller checks `CHANNEL_PROTOCOL_VALUES` first — and is given the secure scheme every
+/// endpoint of this service uses rather than a panic.
+fn scheme_of(protocol: &str) -> &'static str {
+    match protocol {
+        "WSS" => "wss",
+        _ => "https",
     }
 }

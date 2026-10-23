@@ -559,11 +559,12 @@ async fn one_kind_of_selector_replaces_the_other() {
 }
 
 /// A selector set outside the rules the model documents is refused with
-/// `InvalidEventSelectorsException` (HTTP 400) — or, where the broken rule is a
-/// modelled constraint, with the boundary's own `ValidationException` (HTTP 400) — and
-/// the trail keeps the selectors it already carried. The rows differ in WHICH rule is
-/// broken: the two kinds together or neither, a count past a published bound, and a
-/// value outside a published catalog.
+/// `InvalidEventSelectorsException` (HTTP 400) — including a value outside a modelled
+/// constraint, which the boundary refuses before the handler runs and which this
+/// service answers with that same modelled error rather than a generic
+/// `ValidationException` — and the trail keeps the selectors it already carried. The
+/// rows differ in WHICH rule is broken: the two kinds together or neither, a count
+/// past a published bound, and a value outside a published catalog.
 #[tokio::test]
 async fn a_selector_set_outside_the_documented_rules_is_refused() {
     let emulator = Emulator::new();
@@ -644,10 +645,14 @@ async fn a_selector_set_outside_the_documented_rules_is_refused() {
         ),
         (
             // `ReadWriteType` is a modelled enum, so the boundary refuses a value
-            // outside `READ_WRITE_TYPE_VALUES` before the handler sees the request.
+            // outside `READ_WRITE_TYPE_VALUES` before the handler sees the request —
+            // as `InvalidEventSelectorsException`, the error the model's own doc for
+            // that shape names this case under ("Specify a valid value for a
+            // parameter. For example, specifying the ReadWriteType parameter with a
+            // value of read-only is not valid").
             "a ReadWriteType outside the model's enum".to_string(),
             json!({"EventSelectors": [{"ReadWriteType": "WriteMostly"}]}),
-            "ValidationException",
+            "InvalidEventSelectorsException",
         ),
         (
             // A real CloudTrail resource type, but one only advanced event selectors

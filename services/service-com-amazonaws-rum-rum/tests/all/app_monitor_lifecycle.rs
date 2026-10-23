@@ -17,6 +17,7 @@
 use std::collections::{BTreeSet, HashSet};
 
 use serde_json::{json, Value};
+use service_com_amazonaws_rum_rum::state::CREATED_STATE;
 use service_com_amazonaws_rum_rum::ComAmazonawsRumRumState;
 use smithy_server_runtime::multi_service_router::MultiServiceRouter;
 
@@ -154,8 +155,8 @@ async fn get_app_monitor_rebuilds_every_member_from_the_created_state() {
         );
         assert_eq!(
             monitor["State"].as_str(),
-            Some("ACTIVE"),
-            "case {case:?}: expected State ACTIVE, got {:?}",
+            Some(CREATED_STATE),
+            "case {case:?}: expected State {CREATED_STATE}, got {:?}",
             monitor["State"]
         );
         assert_eq!(
@@ -199,19 +200,19 @@ async fn get_app_monitor_rebuilds_every_member_from_the_created_state() {
         );
 
         let created = monitor["Created"].as_str().unwrap_or_default();
-        let last_modified = monitor["LastModified"].as_str().unwrap_or_default();
         assert!(
             is_modelled_iso_timestamp(created),
             "case {case:?}: expected Created to be a 19-character ISOTimestampString, got {created:?}"
         );
-        assert!(
-            is_modelled_iso_timestamp(last_modified),
-            "case {case:?}: expected LastModified to be a 19-character ISOTimestampString, got {last_modified:?}"
-        );
+        // `LastModified` is "the date and time of the most recent changes to this app
+        // monitor's configuration", and nothing has changed this one since the create, so
+        // there is no such instant to report and the member must be ABSENT.
         assert_eq!(
-            created, last_modified,
-            "case {case:?}: nothing changed the monitor since it was created, so Created \
-             {created:?} and LastModified {last_modified:?} must be equal"
+            monitor["LastModified"],
+            Value::Null,
+            "case {case:?}: nothing changed the monitor since it was created, so it must \
+             report no LastModified, got {:?}",
+            monitor["LastModified"]
         );
 
         // The ARN no implemented operation reports yet is stored, derived from the
@@ -671,10 +672,12 @@ async fn update_app_monitor_changes_only_the_members_the_request_carries() {
         );
         assert_eq!(
             after["State"].as_str(),
-            Some("ACTIVE"),
-            "case {case:?}: State must stay ACTIVE, got {:?}",
+            Some(CREATED_STATE),
+            "case {case:?}: State must stay {CREATED_STATE}, got {:?}",
             after["State"]
         );
+        // The update DID change the configuration, so now there IS a "most recent
+        // change" to report: the member appears, past `Created`.
         let last_modified = after["LastModified"].as_str().unwrap_or_default();
         assert!(
             is_modelled_iso_timestamp(last_modified),
@@ -903,9 +906,18 @@ async fn page_through(
             );
             assert_eq!(
                 summary["State"].as_str(),
-                Some("ACTIVE"),
+                Some(CREATED_STATE),
                 "case {case:?}: summary {name:?} must report the stored State, got {:?}",
                 summary["State"]
+            );
+            // These monitors were created and never updated, so the summary reports no
+            // LastModified either — the summary and the detail projection agree.
+            assert_eq!(
+                summary["LastModified"],
+                Value::Null,
+                "case {case:?}: summary {name:?} was never updated, so it must report no \
+                 LastModified, got {:?}",
+                summary["LastModified"]
             );
             assert_eq!(
                 summary["Platform"].as_str(),
@@ -1066,10 +1078,12 @@ async fn a_create_or_update_the_model_forbids_in_prose_is_refused() {
     // `UpdateAppMonitorRequest$DomainList` ("The UpdateAppMonitor allows either the
     // domain or the domain list") and `AppMonitorConfiguration$IncludedPages` /
     // `$ExcludedPages` ("You can't include both ExcludedPages and IncludedPages in the
-    // same operation").
+    // same operation"). Which platforms the first row's refusal applies to is the
+    // `platform_domain_authority` suite's table: these rows name no `Platform`, so they
+    // are web-platform requests.
     let rows: [(&str, &str, &str, Value); 5] = [
         (
-            "no Domain and no DomainList",
+            "no Domain and no DomainList on the web platform",
             "POST",
             "/appmonitor",
             json!({"Name": "domainless-monitor"}),

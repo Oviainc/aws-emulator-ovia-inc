@@ -206,7 +206,9 @@ pub(crate) fn tag_map(reported: &Value) -> Value {
 ///
 /// A `ResourceArn` is a non-greedy `@httpLabel`, so an SDK encodes it into ONE path
 /// segment — its `:` and `/` included — and a tag key travels the same way in a
-/// `@httpQuery` value (so a `+` in a key is not read as a space). This is the one copy
+/// `@httpQuery` value (so a `+` in a key is not read as a space). An Evidently experiment
+/// ARN in `?destinationArn=` and an `application/x-www-form-urlencoded` component (a
+/// policy document's braces and quotes) are escaped the same way. This is the one copy
 /// every suite in this crate uses, including the ones that bring their own router and
 /// `call`.
 pub(crate) fn percent_encoded(raw: &str) -> String {

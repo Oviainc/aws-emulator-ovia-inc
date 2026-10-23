@@ -31,6 +31,8 @@ mod project_build_batch_lifecycle;
 mod project_build_lifecycle;
 #[path = "all/project_visibility.rs"]
 mod project_visibility;
+#[path = "all/read_response_shape.rs"]
+mod read_response_shape;
 #[path = "all/report_group_lifecycle.rs"]
 mod report_group_lifecycle;
 #[path = "all/report_group_reads.rs"]

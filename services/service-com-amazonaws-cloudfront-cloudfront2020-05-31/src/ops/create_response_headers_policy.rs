@@ -1,15 +1,41 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateResponseHeadersPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateResponseHeadersPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateResponseHeadersPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates a response headers policy: allocates its id and its first version token,
+//! stores the submitted configuration whole, and reports the record it stored, so a later
+//! read answers from that record rather than from the request being served.
+//!
+//! Three refusals are checked BEFORE anything is minted:
+//!
+//! * a list wrapper whose `Quantity` disagrees with the length of its `Items` —
+//!   `InconsistentQuantities`, the same rule every CloudFront list wrapper obeys
+//!   ([`crate::state::response_headers_policy_quantity_mismatch`]);
+//! * a `Name` another policy already holds — "The name must be unique for response
+//!   headers policies in this Amazon Web Services account", so the second create under a
+//!   name is `ResponseHeadersPolicyAlreadyExists` rather than a second policy;
+//! * more policies than this emulator holds
+//!   ([`crate::state::MAX_RESPONSE_HEADERS_POLICIES`]) —
+//!   `TooManyResponseHeadersPolicies`.
+//!
+//! The model declares three more refusals whose maximum is an account quota CloudFront
+//! can raise and neither the model nor the shape documentation states a number for
+//! (`TooLongCSPInResponseHeadersPolicy`, `TooManyCustomHeadersInResponseHeadersPolicy`,
+//! `TooManyRemoveHeadersInResponseHeadersPolicy`). Nothing here refuses on them: a bound
+//! invented for them would refuse configurations the service accepts, which is a worse
+//! answer than accepting them.
+//!
+//! Two further modelled errors are deliberately unreachable from this handler, so a
+//! reader does not take them for omissions:
+//!
+//! * `AccessDenied` — this emulator authorizes no caller. The request boundary verifies
+//!   the signature, and no operation in this service consults a principal, so there is
+//!   no permission for this one to refuse on.
+//! * `InvalidArgument` — the model constrains no member of `ResponseHeadersPolicyConfig`
+//!   (no `@length`, `@pattern` or `@range` outside `SamplingRate`, which the framework
+//!   refuses before this handler runs), and CloudFront publishes no syntax for a policy
+//!   name or for a custom header name. A rule invented here would, again, refuse what the
+//!   service accepts.
 //!
 //! ## Shape of an operation
 //!
@@ -100,6 +126,10 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::time::SystemTime;
+
+use crate::state::StoredResponseHeadersPolicy;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -175,18 +205,87 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateResponseHeadersPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateResponseHeadersPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateResponseHeadersPolicy"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::store_unavailable());
+        };
+        let _ = ctx;
+
+        let config = input.response_headers_policy_config;
+        let now = SystemTime::now();
+        let mut store = state.lock();
+        store.settle(now);
+
+        // Every CloudFront list travels in a wrapper that states its own length beside
+        // the list itself, and a request whose `Quantity` disagrees with its `Items`
+        // describes no list at all: "The value of Quantity and the size of Items don't
+        // match." Checked over every wrapper this configuration reaches, before anything
+        // is minted.
+        if let Some(message) = crate::state::response_headers_policy_quantity_mismatch(&config) {
+            return Err(
+                CreateResponseHeadersPolicyErrorModeled::InconsistentQuantities(
+                    InconsistentQuantities {
+                        message: Some(message),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "The name must be unique for response headers policies in this Amazon Web
+        // Services account": a name identifies ONE policy, so a name another policy
+        // already holds cannot name a second one — the policy that holds it is left
+        // exactly as it was.
+        if store.response_headers_policy_named(&config.name).is_some() {
+            return Err(
+                CreateResponseHeadersPolicyErrorModeled::ResponseHeadersPolicyAlreadyExists(
+                    crate::state::response_headers_policy_already_exists(&config.name),
+                )
+                .into(),
+            );
+        }
+
+        // The store grows only here and a policy cannot be evicted (a later read has to
+        // answer with what this create returned), so the bound is an entry count refused
+        // before the insert.
+        if store.response_headers_policies.len() >= crate::state::MAX_RESPONSE_HEADERS_POLICIES {
+            return Err(
+                CreateResponseHeadersPolicyErrorModeled::TooManyResponseHeadersPolicies(
+                    TooManyResponseHeadersPolicies {
+                        message: Some(format!(
+                            "This emulator holds at most {} response headers policies; delete one \
+                             before creating another",
+                            crate::state::MAX_RESPONSE_HEADERS_POLICIES
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let id = store.allocate_response_headers_policy_id();
+        let etag = store.next_etag();
+        let stored = StoredResponseHeadersPolicy {
+            id: id.clone(),
+            // Stored whole: a later read reports the configuration that was submitted,
+            // down to the members this create left out.
+            config,
+            last_modified_time: now,
+            etag: etag.clone(),
+        };
+        // Read from the record just built, never from the request.
+        let response_headers_policy = stored.to_response_headers_policy();
+        let location =
+            crate::state::location_uri(&crate::state::response_headers_policy_path(&id));
+        store.response_headers_policies.insert(id, stored);
+
+        Ok(CreateResponseHeadersPolicyOutput {
+            // "Contains a response headers policy."
+            response_headers_policy: Some(response_headers_policy),
+            // "The URL of the response headers policy."
+            location: Some(location),
+            // "The version identifier for the current version of the response headers
+            // policy" — the token an `If-Match` against this policy is checked against.
+            e_tag: Some(etag),
+        })
     }
 }

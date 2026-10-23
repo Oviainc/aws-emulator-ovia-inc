@@ -288,9 +288,9 @@ fn repository_name_of(resource_arn: &str) -> Result<&str, TagResourceError> {
             }
             crate::state::ResourceArnProblem::Invalid => {
                 TagResourceErrorModeled::InvalidResourceArnException(InvalidResourceArnException {
-                    message: Some(format!(
-                        "the value for the resource ARN {resource_arn} is not valid"
-                    )),
+                    // A CONSTANT for this class: the malformed value the caller sent
+                    // is not echoed back into it.
+                    message: Some(crate::state::INVALID_RESOURCE_ARN_MESSAGE.to_string()),
                 })
             }
             crate::state::ResourceArnProblem::RepositoryName => {

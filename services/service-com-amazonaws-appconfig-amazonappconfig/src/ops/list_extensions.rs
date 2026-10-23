@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListExtensions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListExtensions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports the extensions this account holds, newest version of each, in
+//! name order, a page at a time.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListExtensions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The model documents this operation as listing "all custom and Amazon Web Services
+//! authored AppConfig extensions in the account". Only the custom ones are reported: this
+//! emulator stores no record for an AWS-authored extension — nothing here creates one, no
+//! operation invokes one, and the model carries neither their names nor their definitions
+//! — so a catalog of them here would be invented rather than read. Every summary this
+//! operation answers is read out of the state a `CreateExtension` call wrote.
 //!
 //! ## Shape of an operation
 //!
@@ -146,20 +146,77 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListExtensions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListExtensionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListExtensions"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListExtensionsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("AppConfig state is not reachable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+        let store = state.lock();
+
+        // One summary per extension, built from its LATEST version: a summary carries a
+        // single `VersionNumber`, and an extension's current definition is its newest
+        // version. `Name` narrows the listing to the extension that carries that name,
+        // which is unique per account. Every member — the ARN included — is read off the
+        // stored version rather than rebuilt here, so the listing cannot disagree with
+        // what `GetExtension` reports.
+        let mut listed: Vec<(String, ExtensionSummary)> = store
+            .created_extensions()
+            .filter(|extension| {
+                input
+                    .name
+                    .as_ref()
+                    .is_none_or(|wanted| &extension.name == wanted)
+            })
+            .filter_map(|extension| {
+                let latest = extension.latest_version()?;
+                Some((
+                    extension.name.clone(),
+                    ExtensionSummary {
+                        id: Some(extension.id.clone()),
+                        name: Some(extension.name.clone()),
+                        version_number: latest.version_number,
+                        arn: Some(latest.arn.clone()),
+                        description: latest.description.clone(),
+                    },
+                ))
+            })
+            .collect();
+        // Name order, so the listing a caller pages through is the same listing on every
+        // call: an extension name is unique per account, so this order is TOTAL, which is
+        // what `paginate` keys its cursor on.
+        listed.sort_by(|left, right| left.0.cmp(&right.0));
+
+        // The same cursor the other listings of this service hand out. `None` means the
+        // `NextToken` is not one this service minted for THIS listing, which is a bad
+        // request rather than "start from the beginning" — answering the first page again
+        // would silently repeat entries the caller already walked.
+        let Some(page) = crate::state::paginate(
+            listed,
+            crate::state::LISTING_EXTENSIONS,
+            input.next_token.as_deref(),
+            input.max_results,
+        ) else {
+            return Err(ListExtensionsErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(
+                        "NextToken is not a token this service issued for an extension listing."
+                            .to_string(),
+                    ),
+                    reason: None,
+                    details: None,
+                },
+            )
+            .into());
+        };
+
+        Ok(ListExtensionsOutput {
+            items: Some(page.items),
+            next_token: page.next_token,
+        })
     }
 }

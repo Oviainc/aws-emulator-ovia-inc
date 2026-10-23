@@ -197,19 +197,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// State the failure to resolve a `StreamName`/`StreamARN` pair as this service's
 /// own modeled error: absent or contradictory identifiers are a bad argument (400),
 /// a well-formed identifier for no stored stream is a missing resource (404).
-fn lookup_error(error: crate::state::StreamLookupError) -> GetDataEndpointError {
+fn lookup_error(error: crate::state::LookupError) -> GetDataEndpointError {
     match error {
-        crate::state::StreamLookupError::NoIdentifier => {
+        crate::state::LookupError::NoIdentifier => {
             GetDataEndpointErrorModeled::InvalidArgumentException(InvalidArgumentException {
                 message: Some("Either StreamName or StreamARN must be specified.".to_string()),
             })
         }
-        crate::state::StreamLookupError::Mismatch => {
+        crate::state::LookupError::Mismatch => {
             GetDataEndpointErrorModeled::InvalidArgumentException(InvalidArgumentException {
                 message: Some("StreamName and StreamARN refer to different streams.".to_string()),
             })
         }
-        crate::state::StreamLookupError::NotFound => {
+        crate::state::LookupError::NotFound => {
             GetDataEndpointErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
                 message: Some("The specified stream does not exist.".to_string()),
             })

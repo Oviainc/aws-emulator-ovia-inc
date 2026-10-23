@@ -3,9 +3,17 @@
 //! @op StartKeyPhrasesDetectionJob
 //!
 //! IMPLEMENTED. Mints the job's id and ARN, persists the whole submitted record in
-//! [`crate::state`], and answers `SUBMITTED`. A repeated `ClientRequestToken`
-//! carrying the same parameters resolves to the job it already created instead of
-//! creating a second one.
+//! [`crate::state`], RUNS the key-phrase extraction over the input documents and
+//! answers `SUBMITTED`. A repeated `ClientRequestToken` carrying the same parameters
+//! resolves to the job it already created instead of creating a second one.
+//!
+//! The run is real: every input document is read from the Amazon S3 location
+//! `InputDataConfig` names through this emulator's own object storage, its key
+//! phrases are extracted in process by [`key_phrases`] and the `output.tar.gz` goes
+//! back to the location `OutputDataConfig` names — the ONE batch run every family
+//! shares, [`crate::state::run_analysis_job`]. What the run could not do is the job's
+//! modelled `FAILED` state and its `Message`, never a 200 for work nothing
+//! performed.
 //!
 //! ## Shape of an operation
 //!
@@ -117,19 +125,254 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::collections::{HashMap, HashSet};
 use std::time::SystemTime;
 
 use crate::state::{
-    AnalysisJob, JobFamily, JobOutcome, JobSubmission, SubmissionKey, PROCESSING_SPAN, QUEUE_SPAN,
+    run_analysis_job, AnalysisJob, Document, JobFamily, JobSubmission, RunOutcomeRecorder,
+    SubmissionKey, PROCESSING_SPAN, QUEUE_SPAN,
 };
 
 /// The family every job this operation creates belongs to.
 const FAMILY: JobFamily = JobFamily::KeyPhrasesDetection;
 
-/// The analysis a key-phrases-detection job's run would carry out, for the reason a
-/// job of a family this emulator does not run ends `FAILED`
-/// ([`crate::state::unperformed_run_message`]).
-const ANALYSIS: &str = "Key-phrase extraction";
+/// The most key phrases one document's analysis reports.
+///
+/// The EMULATOR's bound on what one document can produce, so a document of many
+/// thousand candidate phrases cannot make one output entry unbounded. A document
+/// holding more keeps its highest-scoring phrases, which is what a key-phrase list
+/// is for.
+const MAX_KEY_PHRASES_PER_DOCUMENT: usize = 500;
+
+/// One word of a document: its zero-based character span, its byte span (to slice
+/// the phrase's own text out) and its lowercased form.
+#[derive(Debug)]
+struct Word {
+    /// Zero-based CHARACTER offset of the word's first character, which is the scale
+    /// `KeyPhrase$BeginOffset` is reported on.
+    begin: usize,
+    /// Zero-based character offset one past the word's last character.
+    end: usize,
+    byte_begin: usize,
+    byte_end: usize,
+    lowercase: String,
+    /// Whether something other than whitespace stood between this word and the one
+    /// before it — a punctuation mark, which ends a candidate phrase.
+    break_before: bool,
+}
+
+/// Whether `character` can be part of a word: a letter or digit in any script, or an
+/// apostrophe or hyphen holding one word together (`don't`, `state-of-the-art`).
+fn is_word_character(character: char) -> bool {
+    character.is_alphanumeric() || character == '\'' || character == '-'
+}
+
+/// Split `text` into its words, in document order.
+fn words(text: &str) -> Vec<Word> {
+    let mut words: Vec<Word> = Vec::new();
+    let mut current: Option<Word> = None;
+    let mut break_before = false;
+    for (characters, (byte, character)) in text.char_indices().enumerate() {
+        if is_word_character(character) {
+            match current.as_mut() {
+                Some(word) => {
+                    word.end = characters + 1;
+                    word.byte_end = byte + character.len_utf8();
+                    word.lowercase.extend(character.to_lowercase());
+                }
+                None => {
+                    current = Some(Word {
+                        begin: characters,
+                        end: characters + 1,
+                        byte_begin: byte,
+                        byte_end: byte + character.len_utf8(),
+                        lowercase: character.to_lowercase().collect(),
+                        break_before,
+                    });
+                    break_before = false;
+                }
+            }
+            continue;
+        }
+        if let Some(word) = current.take() {
+            // A run of apostrophes and hyphens is punctuation rather than a word.
+            if word.lowercase.chars().any(char::is_alphanumeric) {
+                words.push(word);
+            } else {
+                break_before = true;
+            }
+        }
+        break_before |= !character.is_whitespace();
+    }
+    if let Some(word) = current {
+        if word.lowercase.chars().any(char::is_alphanumeric) {
+            words.push(word);
+        }
+    }
+    words
+}
+
+/// One candidate key phrase: a run of words the document holds with no stop word and
+/// no punctuation inside it.
+#[derive(Debug)]
+struct Candidate {
+    /// Indices into the document's word list, in document order.
+    words: Vec<usize>,
+}
+
+/// The candidate key phrases of `words`.
+///
+/// Rose et al.'s candidate rule, which is what a key phrase is: "candidate keywords
+/// are sequences of content words as they occur in the text", delimited by stop words
+/// and by punctuation. A stop word is a delimiter rather than part of a phrase, so
+/// "the price of the new phone" offers `price` and `new phone`.
+fn candidates(words: &[Word], stopwords: &HashSet<String>) -> Vec<Candidate> {
+    let mut candidates: Vec<Candidate> = Vec::new();
+    let mut current: Vec<usize> = Vec::new();
+    for (index, word) in words.iter().enumerate() {
+        let delimits = stopwords.contains(&word.lowercase)
+            // A bare number carries no key phrase of its own.
+            || word.lowercase.chars().all(|c| !c.is_alphabetic());
+        if (word.break_before || delimits) && !current.is_empty() {
+            candidates.push(Candidate {
+                words: std::mem::take(&mut current),
+            });
+        }
+        if !delimits {
+            current.push(index);
+        }
+    }
+    if !current.is_empty() {
+        candidates.push(Candidate { words: current });
+    }
+    candidates
+}
+
+/// The stop words of `language_code`, lowercased.
+///
+/// One list per language the `LanguageCode` enum names, from the `stop-words` crate's
+/// ISO lists rather than a list written out here. A language the crate carries no
+/// list for leaves the set empty, which makes punctuation the only phrase delimiter.
+fn stopwords(language_code: &str) -> HashSet<String> {
+    let language = match language_code {
+        "ar" => ::stop_words::LANGUAGE::Arabic,
+        "de" => ::stop_words::LANGUAGE::German,
+        "es" => ::stop_words::LANGUAGE::Spanish,
+        "fr" => ::stop_words::LANGUAGE::French,
+        "hi" => ::stop_words::LANGUAGE::Hindi,
+        "it" => ::stop_words::LANGUAGE::Italian,
+        "ja" => ::stop_words::LANGUAGE::Japanese,
+        "ko" => ::stop_words::LANGUAGE::Korean,
+        "pt" => ::stop_words::LANGUAGE::Portuguese,
+        "zh" | "zh-TW" => ::stop_words::LANGUAGE::Chinese,
+        // `en`, and the English list for a code the enum does not name — which the
+        // boundary's enum check makes unreachable.
+        _ => ::stop_words::LANGUAGE::English,
+    };
+    ::stop_words::get(language)
+        .into_iter()
+        .map(|word| word.to_lowercase())
+        .collect()
+}
+
+/// The key phrases of `text`, in document order.
+///
+/// Extraction is RAKE (Rose et al., "Automatic keyword extraction from individual
+/// documents"), computed over the document's own spans so each phrase reports the
+/// offsets it really occupies: candidate phrases are the runs of content words
+/// between stop words and punctuation, each word scores its degree over its
+/// frequency across the candidates, and a phrase scores the sum of its words'.
+///
+/// `stopwords` is the language's set, built ONCE per run by [`stopwords`] and handed
+/// in, so a job of many documents does not rebuild it per document.
+///
+/// `Score` is that phrase score relative to the document's highest — a computed,
+/// document-relative weight in `(0, 1]`, so the phrase the document is most about
+/// scores 1.0. Nothing here is invented: a document with no content word produces no
+/// key phrase at all.
+pub fn key_phrases(text: &str, stopwords: &HashSet<String>) -> Vec<KeyPhrase> {
+    let words = words(text);
+    let candidates = candidates(&words, stopwords);
+
+    // RAKE's word weights: how often a word occurs across the candidates, and the
+    // total length of the candidates it occurs in (its degree). A word that keeps
+    // company with others in longer phrases outweighs one that stands alone.
+    let mut frequency: HashMap<&str, f64> = HashMap::new();
+    let mut degree: HashMap<&str, f64> = HashMap::new();
+    for candidate in &candidates {
+        let length = candidate.words.len() as f64;
+        for index in &candidate.words {
+            let word = words[*index].lowercase.as_str();
+            *frequency.entry(word).or_default() += 1.0;
+            *degree.entry(word).or_default() += length;
+        }
+    }
+
+    let mut scored: Vec<(f64, KeyPhrase)> = Vec::new();
+    let mut highest = 0.0f64;
+    for candidate in &candidates {
+        let score: f64 = candidate
+            .words
+            .iter()
+            .map(|index| {
+                let word = words[*index].lowercase.as_str();
+                let occurrences = frequency.get(word).copied().unwrap_or(1.0).max(1.0);
+                degree.get(word).copied().unwrap_or(0.0) / occurrences
+            })
+            .sum();
+        let (Some(first), Some(last)) = (candidate.words.first(), candidate.words.last()) else {
+            continue;
+        };
+        let (first, last) = (&words[*first], &words[*last]);
+        highest = highest.max(score);
+        scored.push((
+            score,
+            KeyPhrase {
+                score: None,
+                text: Some(text[first.byte_begin..last.byte_end].to_string()),
+                begin_offset: Some(first.begin as i32),
+                end_offset: Some(last.end as i32),
+            },
+        ));
+    }
+
+    // The document's highest-scoring phrases, when it holds more than one entry can
+    // report, and then back into document order: a key-phrase list reads with the
+    // document.
+    if scored.len() > MAX_KEY_PHRASES_PER_DOCUMENT {
+        scored.sort_by(|(left, _), (right, _)| right.total_cmp(left));
+        scored.truncate(MAX_KEY_PHRASES_PER_DOCUMENT);
+    }
+    scored.sort_by_key(|(_, phrase)| phrase.begin_offset.unwrap_or_default());
+    scored
+        .into_iter()
+        .map(|(score, mut phrase)| {
+            phrase.score = Some((score / highest.max(f64::MIN_POSITIVE)) as f32);
+            phrase
+        })
+        .collect()
+}
+
+/// The output line for one analysed document: the file it came from, its line for a
+/// `ONE_DOC_PER_LINE` input, and the key phrases the extractor found in it.
+fn output_entry(document: &Document<'_>, stopwords: &HashSet<String>) -> ::serde_json::Value {
+    let phrases: Vec<::serde_json::Value> = key_phrases(document.text, stopwords)
+        .into_iter()
+        .map(|phrase| {
+            ::serde_json::json!({
+                "BeginOffset": phrase.begin_offset,
+                "EndOffset": phrase.end_offset,
+                "Score": phrase.score,
+                "Text": phrase.text,
+            })
+        })
+        .collect();
+    let mut entry = ::serde_json::json!({ "File": document.file, "KeyPhrases": phrases });
+    if let Some(line) = document.line {
+        entry["Line"] = ::serde_json::json!(line);
+    }
+    entry
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -248,7 +491,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             redaction_config: None,
         }
         .digest();
-        let mut store = state.lock();
 
         // `ClientRequestToken` is `@idempotencyToken`: the same token re-submitted
         // with the same parameters names the job it already created. A request that
@@ -258,71 +500,118 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the model declares no error for a token reused with different members,
         // and the same token carrying different parameters is a different
         // submission, which gets a job of its own.
-        if let Some(token) = input.client_request_token.as_ref() {
-            let key = SubmissionKey {
-                family: FAMILY,
-                client_request_token: token.clone(),
-                request_digest: request_digest.clone(),
-            };
-            if let Some(existing) = store.replayed_job_id(&key) {
-                if let Some(job) = store.analysis_jobs.get_mut(&(FAMILY, existing)) {
-                    // Report the status the clock already owed this job, so a
-                    // retried token and a Describe an instant apart cannot disagree.
-                    job.settle(now);
-                    return Ok(StartKeyPhrasesDetectionJobOutput {
-                        job_id: Some(job.job_id.clone()),
-                        job_arn: Some(job.job_arn.clone()),
-                        job_status: Some(job.job_status.clone()),
-                    });
+        //
+        // The guard is scoped so the store lock is released before this handler
+        // awaits the job's own S3 work below.
+        let (job_id, job_arn) = {
+            let mut store = state.lock();
+            if let Some(token) = input.client_request_token.as_ref() {
+                let key = SubmissionKey {
+                    family: FAMILY,
+                    client_request_token: token.clone(),
+                    request_digest: request_digest.clone(),
+                };
+                if let Some(existing) = store.replayed_job_id(&key) {
+                    if let Some(job) = store.analysis_jobs.get_mut(&(FAMILY, existing)) {
+                        // Report the status the clock already owed this job, so a
+                        // retried token and a Describe an instant apart cannot
+                        // disagree.
+                        job.settle(now);
+                        return Ok(StartKeyPhrasesDetectionJobOutput {
+                            job_id: Some(job.job_id.clone()),
+                            job_arn: Some(job.job_arn.clone()),
+                            job_status: Some(job.job_status.clone()),
+                        });
+                    }
                 }
             }
-        }
 
-        let (seq, job_id) = store.mint_job_id(now);
-        let job_arn = ::emulator_server::emulator_arn(
-            "comprehend",
+            let (seq, job_id) = store.mint_job_id(now);
+            let job_arn = ::emulator_server::emulator_arn(
+                "comprehend",
+                &region,
+                &format!("{}/{job_id}", FAMILY.arn_resource_type()),
+            );
+            // The record is persisted BEFORE the run starts, so the job exists (and
+            // its token is claimed) from the instant the submission is accepted. Its
+            // terminal outcome is unknown until the run reports, which is exactly
+            // what a job still being processed has.
+            store.insert_analysis_job(
+                FAMILY,
+                AnalysisJob {
+                    seq,
+                    job_id: job_id.clone(),
+                    job_arn: job_arn.clone(),
+                    job_name: input.job_name.clone(),
+                    job_status: "SUBMITTED".to_string(),
+                    message: None,
+                    submit_time: now,
+                    end_time: None,
+                    in_progress_due_at: now + QUEUE_SPAN,
+                    terminal_due_at: now + QUEUE_SPAN + PROCESSING_SPAN,
+                    stopped_due_at: None,
+                    terminal_outcome: None,
+                    input_data_config: input.input_data_config.clone(),
+                    output_data_config: input.output_data_config.clone(),
+                    language_code: Some(input.language_code.clone()),
+                    data_access_role_arn: input.data_access_role_arn.clone(),
+                    volume_kms_key_id: input.volume_kms_key_id.clone(),
+                    vpc_config: input.vpc_config.clone(),
+                    tags,
+                    client_request_token: input.client_request_token.clone(),
+                    // The key-phrases family's input models neither a mode nor a
+                    // redaction configuration, so this record carries neither.
+                    mode: None,
+                    redaction_config: None,
+                    request_digest,
+                },
+            );
+            (job_id, job_arn)
+        };
+
+        // From here on the job exists, so whatever the run does — including this
+        // handler never getting to report it — is recorded against the record by the
+        // recorder's `Drop`.
+        let mut recorder = RunOutcomeRecorder::new(state.clone(), FAMILY, job_id.clone());
+        // The language's stop-word set, built ONCE for the whole run.
+        let stopwords = stopwords(&input.language_code);
+        let outcome = run_analysis_job(
+            ctx,
             &region,
-            &format!("{}/{job_id}", FAMILY.arn_resource_type()),
-        );
-        let terminal_outcome = JobOutcome::failed(crate::state::unperformed_run_message(
-            ANALYSIS,
+            FAMILY,
+            &job_id,
             &input.input_data_config,
             &input.output_data_config,
-        ));
-        let job = AnalysisJob {
-            seq,
-            job_id: job_id.clone(),
-            job_arn: job_arn.clone(),
-            job_name: input.job_name,
-            job_status: "SUBMITTED".to_string(),
-            message: None,
-            submit_time: now,
-            end_time: None,
-            in_progress_due_at: now + QUEUE_SPAN,
-            terminal_due_at: now + QUEUE_SPAN + PROCESSING_SPAN,
-            stopped_due_at: None,
-            terminal_outcome: Some(terminal_outcome),
-            input_data_config: input.input_data_config,
-            output_data_config: input.output_data_config,
-            language_code: Some(input.language_code),
-            data_access_role_arn: input.data_access_role_arn,
-            volume_kms_key_id: input.volume_kms_key_id,
-            vpc_config: input.vpc_config,
-            tags,
-            client_request_token: input.client_request_token,
-            // The key-phrases family's input models neither a mode nor a redaction
-            // configuration, so this record carries neither.
-            mode: None,
-            redaction_config: None,
-            request_digest,
-        };
-        let job_status = job.job_status.clone();
-        store.insert_analysis_job(FAMILY, job);
+            |document| output_entry(document, &stopwords),
+        )
+        .await;
+        // The outcome is RECORDED, not revealed: the clock owes the terminal status
+        // (and, with it, the archive's location in `OutputDataConfig$S3Uri`) only
+        // once the job's processing span is over, which `AnalysisJob::settle` applies.
+        recorder.report(outcome);
+        drop(recorder);
 
+        let store = state.lock();
+        // The record can only be missing if the store's own bound evicted it while
+        // the run was in flight — a job no later Describe can report, so the
+        // submission cannot be answered as accepted: the store could not keep it.
+        let Some(job) = store.analysis_jobs.get(&(FAMILY, job_id.clone())) else {
+            return Err(
+                StartKeyPhrasesDetectionJobErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(format!(
+                            "The job {job_id} ({job_arn}) could not be retained. Retry your \
+                             request."
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
         Ok(StartKeyPhrasesDetectionJobOutput {
-            job_id: Some(job_id),
-            job_arn: Some(job_arn),
-            job_status: Some(job_status),
+            job_id: Some(job.job_id.clone()),
+            job_arn: Some(job.job_arn.clone()),
+            job_status: Some(job.job_status.clone()),
         })
     }
 }

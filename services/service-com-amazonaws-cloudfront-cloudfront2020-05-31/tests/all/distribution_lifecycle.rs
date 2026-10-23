@@ -257,6 +257,25 @@ pub(crate) async fn call(
     body: Option<&str>,
     if_match: Option<&str>,
 ) -> Answer {
+    let headers: Vec<(&str, &str)> = if_match
+        .map(|version| vec![("if-match", version)])
+        .unwrap_or_default();
+    call_with_headers(router, method, uri, body, &headers).await
+}
+
+/// Send one request through the router, carrying `headers` beyond the ones every call
+/// above carries.
+///
+/// The one request path, so a suite that needs a header this service binds an input
+/// member to (`CopyDistribution`'s `Staging`, say) goes over the same wire path as the
+/// rest rather than standing up a second harness.
+pub(crate) async fn call_with_headers(
+    router: &MultiServiceRouter,
+    method: &str,
+    uri: &str,
+    body: Option<&str>,
+    headers: &[(&str, &str)],
+) -> Answer {
     let mut request = ::http::Request::builder()
         .method(method)
         .uri(uri)
@@ -265,8 +284,8 @@ pub(crate) async fn call(
     if body.is_some() {
         request = request.header("content-type", "application/xml");
     }
-    if let Some(version) = if_match {
-        request = request.header("if-match", version);
+    for (name, value) in headers {
+        request = request.header(*name, *value);
     }
     let request = request
         .body(Bytes::from(body.unwrap_or_default().to_string()))
@@ -354,7 +373,7 @@ pub(crate) async fn list_distributions(router: &MultiServiceRouter, query: &str)
     .await
 }
 
-async fn create_invalidation(
+pub(crate) async fn create_invalidation(
     router: &MultiServiceRouter,
     distribution_id: &str,
     batch: &str,
@@ -369,7 +388,7 @@ async fn create_invalidation(
     .await
 }
 
-async fn get_invalidation(
+pub(crate) async fn get_invalidation(
     router: &MultiServiceRouter,
     distribution_id: &str,
     invalidation_id: &str,
@@ -612,7 +631,7 @@ pub(crate) fn config_table() -> Vec<Config> {
 
 /// An `InvalidationBatch` XML body for `paths` under `reference`, stating the quantity
 /// `paths` really has.
-fn batch_xml(reference: &str, paths: &[&str]) -> String {
+pub(crate) fn batch_xml(reference: &str, paths: &[&str]) -> String {
     batch_xml_with_quantity(reference, paths, paths.len() as i32)
 }
 
@@ -648,7 +667,7 @@ pub(crate) fn is_distribution_id(value: &str) -> bool {
 }
 
 /// An invalidation id's shape: `I` followed by 13 uppercase alphanumerics.
-fn is_invalidation_id(value: &str) -> bool {
+pub(crate) fn is_invalidation_id(value: &str) -> bool {
     match value.strip_prefix('I') {
         Some(body) => {
             body.len() == 13
@@ -664,6 +683,24 @@ fn is_invalidation_id(value: &str) -> bool {
 /// CloudFront's own `ETag` values take.
 pub(crate) fn is_version_token(value: &str) -> bool {
     is_distribution_id(value)
+}
+
+/// The shape of every id CloudFront mints as a UUID — a key value store, a cache,
+/// origin request, response headers or continuous deployment policy: five lowercase-hex
+/// groups of 8-4-4-4-12 characters. One predicate here, so each suite that reads such an
+/// id asserts the SAME shape rather than carrying its own copy.
+pub(crate) fn is_minted_uuid(value: &str) -> bool {
+    let groups: Vec<&str> = value.split('-').collect();
+    groups.len() == 5
+        && groups
+            .iter()
+            .zip([8usize, 4, 4, 4, 12])
+            .all(|(group, width)| {
+                group.len() == width
+                    && group
+                        .bytes()
+                        .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+            })
 }
 
 // ---------------------------------------------------------------------------

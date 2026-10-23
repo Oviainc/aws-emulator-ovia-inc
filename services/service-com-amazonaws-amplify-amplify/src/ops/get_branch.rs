@@ -157,7 +157,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let branch = app
             .branches
             .get(&input.branch_name)
-            .cloned()
+            .map(|stored| stored.branch.clone())
             .ok_or_else(|| {
                 GetBranchErrorModeled::NotFoundException(NotFoundException {
                     message: Some(crate::state::not_found_message(

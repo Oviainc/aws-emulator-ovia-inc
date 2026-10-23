@@ -403,9 +403,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// `GetRecommendationError$code` is "the error code", a free-form string the model names
 /// no vocabulary for, so this is the emulator's own stable code — the same one this
 /// service's other per-identifier error reports
-/// ([`crate::state::IDLE_NO_RECOMMENDATION_CODE`]), so a client sees one spelling of one
+/// ([`crate::state::NO_RECOMMENDATION_CODE`]), so a client sees one spelling of one
 /// condition across the service. The requirement the entry carries is its `identifier`.
-const NO_RECOMMENDATION_CODE: &str = crate::state::IDLE_NO_RECOMMENDATION_CODE;
+const NO_RECOMMENDATION_CODE: &str = crate::state::NO_RECOMMENDATION_CODE;
 
 /// Refuse a request this operation cannot act on: "the value supplied for the input
 /// parameter is out of range or not valid" (HTTP 400).

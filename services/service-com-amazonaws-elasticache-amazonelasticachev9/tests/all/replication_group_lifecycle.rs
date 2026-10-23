@@ -773,10 +773,13 @@ async fn a_create_this_service_cannot_satisfy_is_refused_with_its_modelled_error
             "UserGroupNotFound",
         ),
         (
-            "a cache security group that does not exist",
+            // The whole cache-security-group surface is closed for this
+            // account, so naming one is a bad parameter value rather than a
+            // group that could be created and retried with.
+            "a cache security group",
             &[("CacheSecurityGroupNames.CacheSecurityGroupName.1", "sg-a")],
-            404,
-            "CacheSecurityGroupNotFound",
+            400,
+            "InvalidParameterValue",
         ),
         (
             "a parameter group that does not exist",

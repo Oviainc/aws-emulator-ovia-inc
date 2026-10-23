@@ -852,6 +852,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "aws-sdk-eventbridge"
+version = "1.125.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8007157ab0aa1d5ade3b803bb1c0579304329daee6ff9d8e3f615112203b91bb"
+dependencies = [
+ "arc-swap",
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http",
+ "aws-smithy-json 0.65.0",
+ "aws-smithy-observability",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-schema 1.1.0",
+ "aws-smithy-types",
+ "aws-types",
+ "bytes",
+ "fastrand",
+ "http",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
 name = "aws-sdk-iam"
 version = "1.131.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -937,6 +962,31 @@ dependencies = [
  "sha2 0.11.1",
  "tracing",
  "url",
+]
+
+[[package]]
+name = "aws-sdk-sqs"
+version = "1.117.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5f7ed69616b7c0c1d13c65dababc557b6540299c25f13d8358a3f2baa77a9ccf"
+dependencies = [
+ "arc-swap",
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http",
+ "aws-smithy-json 0.65.0",
+ "aws-smithy-observability",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-schema 1.1.0",
+ "aws-smithy-types",
+ "aws-types",
+ "bytes",
+ "fastrand",
+ "http",
+ "regex-lite",
+ "tracing",
 ]
 
 [[package]]
@@ -1810,6 +1860,27 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ce6e4c961d6cd6c9a86db418387425e8bdeaf05b3c8bc1411e6dca4c252f1453"
 dependencies = [
  "hybrid-array",
+]
+
+[[package]]
+name = "csv"
+version = "1.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "52cd9d68cf7efc6ddfaaee42e7288d3a99d613d4b50f76ce9827ae0c6e14f938"
+dependencies = [
+ "csv-core",
+ "itoa",
+ "ryu",
+ "serde_core",
+]
+
+[[package]]
+name = "csv-core"
+version = "0.1.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "704a3c26996a80471189265814dbc2c257598b96b8a7feae2d31ace646bb9782"
+dependencies = [
+ "memchr",
 ]
 
 [[package]]
@@ -4770,8 +4841,10 @@ dependencies = [
  "bytes",
  "hex",
  "http",
+ "percent-encoding",
  "serde",
  "serde_json",
+ "service-common",
  "sha2 0.10.9",
  "tokio",
  "tracing",
@@ -5428,6 +5501,7 @@ dependencies = [
  "aws-emulator-smithy-macros",
  "aws-emulator-smithy-schema-server",
  "aws-emulator-smithy-server-runtime",
+ "aws-sdk-eventbridge",
  "aws-smithy-runtime-api",
  "aws-smithy-schema 0.2.1",
  "aws-smithy-types",
@@ -5435,6 +5509,8 @@ dependencies = [
  "hex",
  "http",
  "serde_json",
+ "service-com-amazonaws-eventbridge-awsevents",
+ "service-com-amazonaws-sqs-amazonsqs",
  "sha2 0.10.9",
  "tokio",
  "tracing",
@@ -5508,6 +5584,7 @@ dependencies = [
  "hex",
  "http",
  "serde_json",
+ "service-common",
  "sha2 0.10.9",
  "tokio",
  "tracing",
@@ -5718,6 +5795,7 @@ dependencies = [
  "aws-emulator-smithy-macros",
  "aws-emulator-smithy-schema-server",
  "aws-emulator-smithy-server-runtime",
+ "aws-smithy-eventstream 0.60.21",
  "aws-smithy-runtime-api",
  "aws-smithy-schema 0.2.1",
  "aws-smithy-types",
@@ -6123,10 +6201,13 @@ dependencies = [
  "bytes",
  "hex",
  "http",
+ "percent-encoding",
+ "quick-xml",
  "serde_json",
  "service-com-amazonaws-codepipeline-codepipeline-20150709",
  "service-com-amazonaws-iam-awsidentitymanagementv20100508",
  "service-com-amazonaws-s3-amazons3",
+ "service-com-amazonaws-sns-amazonsimplenotificationservice",
  "service-common",
  "sha2 0.10.9",
  "tokio",
@@ -6292,6 +6373,7 @@ dependencies = [
  "serde_json",
  "service-common",
  "sha2 0.10.9",
+ "sqlparser",
  "tokio",
  "tracing",
 ]
@@ -6789,6 +6871,7 @@ dependencies = [
  "aws-smithy-schema 0.2.1",
  "aws-smithy-types",
  "bytes",
+ "csv",
  "flate2",
  "hex",
  "http",
@@ -6798,6 +6881,7 @@ dependencies = [
  "serde_json",
  "service-com-amazonaws-s3-amazons3",
  "sha2 0.10.9",
+ "stop-words",
  "tar",
  "tokio",
  "tracing",
@@ -7952,6 +8036,7 @@ dependencies = [
  "aws-emulator-smithy-macros",
  "aws-emulator-smithy-schema-server",
  "aws-emulator-smithy-server-runtime",
+ "aws-sdk-s3",
  "aws-smithy-runtime-api",
  "aws-smithy-schema 0.2.1",
  "aws-smithy-types",
@@ -7959,6 +8044,7 @@ dependencies = [
  "hex",
  "http",
  "serde_json",
+ "service-com-amazonaws-s3-amazons3",
  "sha2 0.10.9",
  "tokio",
  "tracing",
@@ -7983,6 +8069,7 @@ dependencies = [
  "http",
  "serde_json",
  "service-com-amazonaws-elasticloadbalancingv2-elasticloadbalancing-v10",
+ "service-common",
  "sha2 0.10.9",
  "tokio",
  "tracing",
@@ -8006,6 +8093,8 @@ dependencies = [
  "hex",
  "http",
  "serde_json",
+ "service-com-amazonaws-elasticloadbalancing-elasticloadbalancing-v7",
+ "service-common",
  "sha2 0.10.9",
  "tokio",
  "tracing",
@@ -8183,6 +8272,7 @@ dependencies = [
  "aws-emulator-smithy-macros",
  "aws-emulator-smithy-schema-server",
  "aws-emulator-smithy-server-runtime",
+ "aws-sdk-sqs",
  "aws-smithy-runtime-api",
  "aws-smithy-schema 0.2.1",
  "aws-smithy-types",
@@ -8190,6 +8280,8 @@ dependencies = [
  "hex",
  "http",
  "serde_json",
+ "service-com-amazonaws-sqs-amazonsqs",
+ "service-common",
  "sha2 0.10.9",
  "tokio",
  "tracing",
@@ -12616,6 +12708,7 @@ dependencies = [
  "hex",
  "http",
  "md-5 0.10.6",
+ "percent-encoding",
  "quick-xml",
  "serde_json",
  "sha2 0.10.9",
@@ -12924,6 +13017,7 @@ dependencies = [
  "hex",
  "http",
  "serde_json",
+ "service-com-amazonaws-sagemaker-sagemaker",
  "service-common",
  "sha2 0.10.9",
  "tokio",
@@ -14678,6 +14772,7 @@ dependencies = [
  "http",
  "serde_json",
  "sha2 0.10.9",
+ "uuid",
 ]
 
 [[package]]
@@ -14907,6 +15002,15 @@ dependencies = [
  "libc",
  "psm",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "stop-words"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3c6a86be9f7fa4559b7339669e72026eb437f5e9c5a85c207fe1033079033a17"
+dependencies = [
+ "serde_json",
 ]
 
 [[package]]

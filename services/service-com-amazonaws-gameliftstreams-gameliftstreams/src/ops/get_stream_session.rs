@@ -253,8 +253,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetStreamSessionErrorModeled::InternalServerException(
                 InternalServerException {
-                    message: "the gameliftstreams emulator holds no state on this engine"
-                        .to_string(),
+                    message: crate::state::with_internal_id(
+                        "the gameliftstreams emulator holds no state on this engine",
+                    ),
                 },
             )
             .into());
@@ -269,15 +270,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // two path labels name, so an absent group and an absent session are the SAME
         // miss, reported against the composite stream session ARN rather than
         // short-circuiting on the enclosing group.
-        let session = state
-            .stream_group(&input.identifier)
-            .and_then(|group| {
-                crate::state::identifier_id(
-                    &input.stream_session_identifier,
-                    crate::state::STREAM_SESSION_RESOURCE,
-                )
-                .and_then(|session_id| group.sessions.get(&session_id))
-            });
+        let session = state.stream_group(&input.identifier).and_then(|group| {
+            crate::state::identifier_id(
+                &input.stream_session_identifier,
+                crate::state::STREAM_SESSION_RESOURCE,
+            )
+            .and_then(|session_id| group.sessions.get(&session_id))
+        });
         let Some(session) = session else {
             return Err(GetStreamSessionErrorModeled::ResourceNotFoundException(
                 crate::state::stream_session_not_found(

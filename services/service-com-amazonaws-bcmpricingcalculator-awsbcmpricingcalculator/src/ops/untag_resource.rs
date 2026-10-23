@@ -6,15 +6,19 @@
 //!
 //! Removes the named tag keys from the resource its `arn` addresses, leaving every other
 //! tag that resource carries in place. Removing a key the resource does not carry is a
-//! no-op, so the same request repeated answers the same way — only an ARN naming no live
-//! resource is refused, with the modelled `ResourceNotFoundException` (HTTP 404). It
-//! removes from the same map `TagResource` writes and `ListTagsForResource` reports.
+//! no-op, so the same request repeated answers the same way — only an ARN addressing no
+//! live resource is refused, with the modelled not-found payload under HTTP 400
+//! ([`crate::state::unresolvable_arn_refusal`]). It removes from the same map
+//! `TagResource` writes and `ListTagsForResource` reports.
 //!
-//! WHICH RESOURCE AN ARN ADDRESSES: the ARN is matched in FULL against the one the
-//! resource was minted with (partition, region and the single account this emulator
-//! presents included), so an ARN naming another account's or another region's resource
-//! resolves to nothing and is answered with that 404 — this surface never writes to a
-//! resource the ARN does not name. Caller-identity authorization beyond that (IAM policy
+//! WHICH RESOURCE AN ARN ADDRESSES: the ARN is resolved by the identity it names
+//! ([`crate::state::parse_resource_arn`]) — partition, account, resource type and
+//! resource id, which is everything that selects a resource of this partitional service
+//! — so another account's or another kind's ARN addresses nothing here and earns that
+//! 400 ([`crate::state::unresolvable_arn_refusal`]), while the region field, which names
+//! nothing to choose between for a service whose own ARNs leave it empty, does not keep
+//! an ARN from resolving. This surface never writes to a resource the ARN does not name.
+//! Caller-identity authorization beyond that (IAM policy
 //! evaluation, `AccessDeniedException`) is not modelled by this emulator at all, here or
 //! in any other operation of this service.
 //!
@@ -68,7 +72,10 @@
 //!
 //! ## Errors
 //!
-//! * `ResourceNotFoundException` (HTTP 404) — The specified resource was not found.
+//! * `ResourceNotFoundException` (HTTP 404) — The specified resource was not found. On
+//!   this surface it is what an `arn` resolving to no resource of this account earns, and
+//!   the recorded service answers it under HTTP 400 rather than its modelled 404: see
+//!   [`crate::state::unresolvable_arn_refusal`].
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -165,19 +172,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // after it should have been dropped.
         state.settle(crate::state::now_millis());
 
-        // Resolved before the mutable borrow below, so the refusal can name the kind of
-        // resource the ARN addresses.
-        let resource_type = crate::state::arn_resource_label(&input.arn);
-
         let Some(tags) = state.resource_tags_mut(&input.arn) else {
-            return Err(UntagResourceErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: format!("No resource found with ARN {}", input.arn),
-                    resource_id: input.arn.clone(),
-                    resource_type,
-                },
-            )
-            .into());
+            // An ARN that addresses nothing is bad INPUT on this surface: the modelled
+            // not-found payload under a 400, as `crate::state::unresolvable_arn_refusal`
+            // explains.
+            return Err(crate::scaffolded::Scaffolded::modeled_with_status(
+                UntagResourceErrorModeled::ResourceNotFoundException(
+                    crate::state::unresolvable_arn_refusal(&input.arn),
+                ),
+                crate::state::UNRESOLVABLE_ARN_STATUS,
+            ));
         };
 
         // A key the resource does not carry removes nothing: the request asks for the

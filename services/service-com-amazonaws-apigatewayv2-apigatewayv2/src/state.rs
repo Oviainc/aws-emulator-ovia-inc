@@ -3,9 +3,9 @@
 //! Engine state for the com-amazonaws-apigatewayv2-apigatewayv2 service.
 //!
 //! A single store, [`ComAmazonawsApigatewayv2Apigatewayv2State::apis`], keyed by
-//! `ApiId`. An [`Api`] OWNS its child [`Route`]s and [`Integration`]s (and the
-//! [`Stage`]s a later slice will fill), so deleting an api cascades to its children in
-//! one `remove` and no second map can drift out of step with it.
+//! `ApiId`. An [`Api`] OWNS its child [`Route`]s, [`Integration`]s and [`Stage`]s, so
+//! deleting an api cascades to its children in one `remove` and no second map can
+//! drift out of step with it.
 //!
 //! The records here are the service's own, not the wire shapes: a record keeps a
 //! value the api always has (its id, its name, its creation instant) as a plain
@@ -54,6 +54,12 @@ pub const DEFAULT_API_KEY_SELECTION_EXPRESSION: &str = "$request.header.x-api-ke
 /// default for a new API.
 pub const DEFAULT_IP_ADDRESS_TYPE: &str = "ipv4";
 
+/// The `ProtocolType` value that selects a WebSocket API, from
+/// `PROTOCOL_TYPE_VALUES` (`HTTP | WEBSOCKET`) — the protocol whose two-way
+/// communication the route-response resources belong to, and the one whose
+/// `ApiEndpoint` carries the WebSocket scheme (see [`execute_api_scheme`]).
+pub const WEBSOCKET_PROTOCOL_TYPE: &str = "WEBSOCKET";
+
 /// The `AuthorizationType` a route gets when the request names none. One of
 /// `AUTHORIZATION_TYPE_VALUES`; `NONE` is the value the `Route$AuthorizationType`
 /// doc gives for open access.
@@ -78,6 +84,55 @@ pub const MAX_ROUTES_PER_API: usize = 300;
 /// AWS's published API Gateway quota is 300 integrations per API.
 pub const MAX_INTEGRATIONS_PER_API: usize = 300;
 
+/// The most route responses one route may hold, after which CreateRouteResponse is
+/// refused.
+///
+/// AWS publishes no separate route-responses-per-route quota, so this is a CHOSEN
+/// bound, set to the per-parent quota this service already enforces for routes
+/// ([`MAX_ROUTES_PER_API`]): what it buys is that no loop of CreateRouteResponse calls
+/// can grow this store without end, and that the per-route duplicate-key scan stays
+/// bounded. `TooManyRequestsException` ("A limit has been exceeded") is the modelled
+/// error the operation refuses with.
+pub const MAX_ROUTE_RESPONSES_PER_ROUTE: usize = 300;
+
+/// The most models one api may hold, after which CreateModel is refused.
+///
+/// An EMULATOR growth bound, not a figure AWS publishes: API Gateway publishes per-api
+/// quotas for the other child resources of an api (300 routes, 300 integrations) and
+/// this takes the same bound for models, so no loop of CreateModel calls can grow this
+/// store without end. Cite the routes/integrations quotas for those; do not cite this
+/// as a published models quota.
+pub const MAX_MODELS_PER_API: usize = 300;
+
+/// The most authorizers one api may hold, after which CreateAuthorizer is refused.
+///
+/// API Gateway publishes a quota of 10 authorizers per API, so this is the faithful
+/// bound AND what stops a loop of CreateAuthorizer calls growing this store without
+/// end — every call mints a new authorizer, so nothing else bounds it.
+pub const MAX_AUTHORIZERS_PER_API: usize = 10;
+
+/// The `AuthorizerType` value that selects a JWT authorizer, from the generated
+/// `AUTHORIZER_TYPE_VALUES` catalog (`JWT | REQUEST`); the integration test
+/// `the_authorizer_type_names_are_the_modelled_catalog` pins these two names against
+/// that catalog so the spelling here cannot drift from the model. From
+/// `CreateAuthorizer$AuthorizerType`: "Specify JWT to use JSON Web Tokens (supported
+/// only for HTTP APIs)."
+pub const AUTHORIZER_TYPE_JWT: &str = "JWT";
+
+/// The `AuthorizerType` value that selects a Lambda authorizer taking the incoming
+/// request, from the generated `AUTHORIZER_TYPE_VALUES` catalog (`JWT | REQUEST`). From
+/// `CreateAuthorizer$AuthorizerType`: "Specify REQUEST for a Lambda function using
+/// incoming request parameters."
+pub const AUTHORIZER_TYPE_REQUEST: &str = "REQUEST";
+
+/// The `AuthorizerPayloadFormatVersion` values the service accepts.
+///
+/// `StringWithLengthBetween1And64` carries no pattern, so the catalog is the member's
+/// own documentation rather than a modelled constraint
+/// (`CreateAuthorizer$AuthorizerPayloadFormatVersion`: "Supported values are 1.0 and
+/// 2.0").
+pub const AUTHORIZER_PAYLOAD_FORMAT_VERSIONS: &[&str] = &["1.0", "2.0"];
+
 /// The most deployments one api may hold, after which CreateDeployment is refused.
 ///
 /// API Gateway publishes a quota of 500 deployments per API, so this is the faithful
@@ -91,6 +146,10 @@ pub const MAX_DEPLOYMENTS_PER_API: usize = 500;
 /// integrations, which this store already holds — so a minted deployment is reported
 /// released, the terminal status, and never moves again.
 pub const DEPLOYMENT_STATUS_DEPLOYED: &str = "DEPLOYED";
+
+/// The `ProtocolType` value that selects an HTTP API, from `PROTOCOL_TYPE_VALUES`
+/// (`smithy_query(query="shape", shape="ProtocolType")`: `HTTP | WEBSOCKET`).
+pub const HTTP_PROTOCOL_TYPE: &str = "HTTP";
 
 /// The `ConnectionType` an integration gets when the request names none. From
 /// `Integration$ConnectionType`: "Specify INTERNET for connections through the public
@@ -164,13 +223,23 @@ pub struct Api {
     /// Drives [`Api::mint_integration_id`]. Per-api, for the same reason as
     /// [`Api::route_id_seed`]: an `IntegrationId` is unique within its api.
     pub integration_id_seed: u64,
-    /// This api's stages, keyed by `StageName`. Reserved for the stage slice.
+    /// This api's stages, keyed by `StageName`.
     pub stages: BTreeMap<String, Stage>,
+    /// This api's models, keyed by `ModelId`.
+    pub models: BTreeMap<String, Model>,
+    /// Drives [`Api::mint_model_id`]. Per-api, for the same reason as
+    /// [`Api::route_id_seed`]: a `ModelId` is unique within its api.
+    pub model_id_seed: u64,
     /// This api's deployments, keyed by `DeploymentId`.
     pub deployments: BTreeMap<String, Deployment>,
     /// Drives [`Api::mint_deployment_id`]. Per-api, for the same reason as
     /// [`Api::route_id_seed`]: a `DeploymentId` is unique within its api.
     pub deployment_id_seed: u64,
+    /// This api's authorizers, keyed by `AuthorizerId`.
+    pub authorizers: BTreeMap<String, Authorizer>,
+    /// Drives [`Api::mint_authorizer_id`]. Per-api, for the same reason as
+    /// [`Api::route_id_seed`]: an `AuthorizerId` is unique within its api.
+    pub authorizer_id_seed: u64,
 }
 
 impl Api {
@@ -188,11 +257,25 @@ impl Api {
         mint_id(self.integration_id_seed)
     }
 
+    /// Mint a fresh `ModelId` for this api: ten lowercase alphanumerics, never one
+    /// this api already minted.
+    pub fn mint_model_id(&mut self) -> String {
+        self.model_id_seed = self.model_id_seed.wrapping_add(1);
+        mint_id(self.model_id_seed)
+    }
+
     /// Mint a fresh `DeploymentId` for this api: ten lowercase alphanumerics, never
     /// one this api already minted.
     pub fn mint_deployment_id(&mut self) -> String {
         self.deployment_id_seed = self.deployment_id_seed.wrapping_add(1);
         mint_id(self.deployment_id_seed)
+    }
+
+    /// Mint a fresh `AuthorizerId` for this api: ten lowercase alphanumerics, never
+    /// one this api already minted.
+    pub fn mint_authorizer_id(&mut self) -> String {
+        self.authorizer_id_seed = self.authorizer_id_seed.wrapping_add(1);
+        mint_id(self.authorizer_id_seed)
     }
 }
 
@@ -245,9 +328,23 @@ pub struct Route {
     /// "If you created an API using quick create, the $default route is managed by
     /// API Gateway" (`Route$ApiGatewayManaged`).
     pub api_gateway_managed: bool,
+    /// This route's route responses, keyed by `RouteResponseId`. Owned by the route,
+    /// so deleting the route (or its api) cascades to them in one `remove`.
+    pub route_responses: BTreeMap<String, RouteResponse>,
+    /// Drives [`Route::mint_route_response_id`]. Per-route, because a
+    /// `RouteResponseId` only has to be unique within the route that owns the
+    /// response.
+    pub route_response_id_seed: u64,
 }
 
 impl Route {
+    /// Mint a fresh `RouteResponseId` for this route: ten lowercase alphanumerics,
+    /// never one this route already minted.
+    pub fn mint_route_response_id(&mut self) -> String {
+        self.route_response_id_seed = self.route_response_id_seed.wrapping_add(1);
+        mint_id(self.route_response_id_seed)
+    }
+
     /// Project the record onto the modelled `Route` shape.
     pub fn to_wire(&self) -> wire::Route {
         wire::Route {
@@ -274,6 +371,45 @@ impl Route {
             route_key: self.route_key.clone(),
             route_response_selection_expression: self.route_response_selection_expression.clone(),
             target: self.target.clone(),
+        }
+    }
+}
+
+/// A persisted `RouteResponse` resource, owned by its parent [`Route`].
+///
+/// A route response is WebSocket-only: `RouteResponse$ModelSelectionExpression` is
+/// "Supported only for WebSocket APIs", and the selection keys it is matched against
+/// are the WebSocket API's route response selection expressions.
+#[derive(Debug, Clone, Default)]
+pub struct RouteResponse {
+    pub route_response_id: String,
+    /// Required on the modelled `RouteResponse` shape, so the record always carries
+    /// one. Unique within the owning route.
+    pub route_response_key: String,
+    pub model_selection_expression: Option<String>,
+    pub response_models: BTreeMap<String, String>,
+    pub response_parameters: BTreeMap<String, wire::ParameterConstraints>,
+}
+
+impl RouteResponse {
+    /// Project the record onto the modelled `RouteResponse` shape.
+    pub fn to_wire(&self) -> wire::RouteResponse {
+        wire::RouteResponse {
+            model_selection_expression: self.model_selection_expression.clone(),
+            response_models: Some(
+                self.response_models
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+            ),
+            response_parameters: Some(
+                self.response_parameters
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+            ),
+            route_response_id: Some(self.route_response_id.clone()),
+            route_response_key: self.route_response_key.clone(),
         }
     }
 }
@@ -369,10 +505,235 @@ impl Integration {
     }
 }
 
-/// A persisted `Stage`. Reserved so the stage operations can land without a state
-/// rewrite; nothing creates one yet, but [`Deployment`] already points stages at the
-/// deployment they serve.
+/// A persisted `Model` resource, owned by its parent [`Api`].
+///
+/// The record keeps the schema SOURCE the create accepted, verbatim: every reader of
+/// the model reports the document the caller supplied, and [`Model::to_wire`] projects
+/// the record onto the modelled shape the handlers serialize.
 #[derive(Debug, Clone, Default)]
+pub struct Model {
+    pub model_id: String,
+    pub name: String,
+    pub content_type: Option<String>,
+    pub description: Option<String>,
+    pub schema: String,
+}
+
+impl Model {
+    /// Project the record onto the modelled `Model` shape.
+    pub fn to_wire(&self) -> wire::Model {
+        wire::Model {
+            content_type: self.content_type.clone(),
+            description: self.description.clone(),
+            model_id: Some(self.model_id.clone()),
+            name: self.name.clone(),
+            schema: Some(self.schema.clone()),
+        }
+    }
+}
+
+/// A persisted `Authorizer` resource, owned by its parent [`Api`].
+///
+/// The record keeps the configuration the create accepted, so every reader of the
+/// authorizer reports one record rather than its own reconstruction of it, and
+/// [`Authorizer::to_wire`] projects it onto the modelled shape the handlers serialize.
+#[derive(Debug, Clone, Default)]
+pub struct Authorizer {
+    pub authorizer_id: String,
+    /// Required on the modelled `Authorizer` shape, so the record always carries one.
+    pub name: String,
+    /// One of `AUTHORIZER_TYPE_VALUES` (`JWT | REQUEST`).
+    pub authorizer_type: String,
+    pub authorizer_uri: Option<String>,
+    pub authorizer_credentials_arn: Option<String>,
+    pub authorizer_payload_format_version: Option<String>,
+    pub authorizer_result_ttl_in_seconds: Option<i32>,
+    pub enable_simple_responses: Option<bool>,
+    /// `IdentitySource` is a REQUIRED member of `CreateAuthorizerRequest`, so the
+    /// record always carries the list — possibly empty, which a REQUEST authorizer
+    /// with caching disabled is allowed to be.
+    pub identity_source: Vec<String>,
+    pub identity_validation_expression: Option<String>,
+    pub jwt_configuration: Option<wire::JWTConfiguration>,
+}
+
+impl Authorizer {
+    /// Project the record onto the modelled `Authorizer` shape.
+    pub fn to_wire(&self) -> wire::Authorizer {
+        wire::Authorizer {
+            authorizer_credentials_arn: self.authorizer_credentials_arn.clone(),
+            authorizer_id: Some(self.authorizer_id.clone()),
+            authorizer_payload_format_version: self.authorizer_payload_format_version.clone(),
+            authorizer_result_ttl_in_seconds: self.authorizer_result_ttl_in_seconds,
+            authorizer_type: Some(self.authorizer_type.clone()),
+            authorizer_uri: self.authorizer_uri.clone(),
+            enable_simple_responses: self.enable_simple_responses,
+            // The list the record holds, reported whether or not it is empty: the
+            // member is required on the request, so the resource always has one.
+            identity_source: Some(self.identity_source.clone()),
+            identity_validation_expression: self.identity_validation_expression.clone(),
+            jwt_configuration: self.jwt_configuration.clone(),
+            name: self.name.clone(),
+        }
+    }
+}
+
+/// `Ok(())`, or the reason this configuration is not one its own `AuthorizerType`
+/// admits — the message for the caller's `BadRequestException`.
+///
+/// Every clause is a member's own documentation, which makes a member required for one
+/// authorizer type, or one api protocol, and undefined for another:
+///
+/// * `AuthorizerType` — "Specify JWT to use JSON Web Tokens (supported only for HTTP
+///   APIs)", so a WebSocket api takes only `REQUEST` authorizers.
+/// * `JwtConfiguration` — "Required for the JWT authorizer type", and its `Issuer` is
+///   "the base domain of the identity provider that issues JSON Web Tokens", so a JWT
+///   authorizer cannot validate a token without one.
+/// * `AuthorizerUri` — "For REQUEST authorizers, this must be a well-formed Lambda
+///   function URI": the Lambda to invoke, so that type cannot authorize without it.
+/// * `AuthorizerPayloadFormatVersion` — "Specifies the format of the payload sent to an
+///   HTTP API Lambda authorizer. Required for HTTP API Lambda authorizers. Supported
+///   values are 1.0 and 2.0."
+///
+/// `EnableSimpleResponses` is deliberately NOT cross-checked against the payload format
+/// version: a simple-response authorizer under payload format 1.0 is a configuration the
+/// service accepts and that fails when the authorizer is INVOKED, not when it is created.
+///
+/// Shared by every writer of an authorizer, so the requirement cannot differ between
+/// the create and a later update.
+pub fn validate_authorizer_config(
+    protocol_type: &str,
+    authorizer_type: &str,
+    authorizer_uri: Option<&str>,
+    payload_format_version: Option<&str>,
+    jwt_configuration: Option<&wire::JWTConfiguration>,
+) -> Result<(), String> {
+    let is_websocket = protocol_type == WEBSOCKET_PROTOCOL_TYPE;
+    if authorizer_type == AUTHORIZER_TYPE_JWT {
+        if is_websocket {
+            return Err(format!(
+                "AuthorizerType {AUTHORIZER_TYPE_JWT} is supported only for HTTP APIs, \
+                 and this API's ProtocolType is {protocol_type}"
+            ));
+        }
+        let issuer = jwt_configuration.and_then(|configuration| configuration.issuer.as_deref());
+        if issuer.is_none_or(str::is_empty) {
+            return Err(format!(
+                "JwtConfiguration with an Issuer is required for an authorizer of type \
+                 {AUTHORIZER_TYPE_JWT}"
+            ));
+        }
+    }
+    if authorizer_type == AUTHORIZER_TYPE_REQUEST {
+        if authorizer_uri.is_none_or(str::is_empty) {
+            return Err(format!(
+                "AuthorizerUri is required for an authorizer of type {AUTHORIZER_TYPE_REQUEST}"
+            ));
+        }
+        if !is_websocket && payload_format_version.is_none_or(str::is_empty) {
+            return Err(format!(
+                "AuthorizerPayloadFormatVersion is required for an authorizer of type \
+                 {AUTHORIZER_TYPE_REQUEST} on an API whose ProtocolType is {protocol_type}"
+            ));
+        }
+    }
+    if let Some(version) = payload_format_version {
+        if !AUTHORIZER_PAYLOAD_FORMAT_VERSIONS.contains(&version) {
+            return Err(format!(
+                "AuthorizerPayloadFormatVersion must be one of {}, got {version}",
+                AUTHORIZER_PAYLOAD_FORMAT_VERSIONS.join(", ")
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Is `name` a `Model$Name` the service accepts?
+///
+/// "The name of the model. Must be alphanumeric" (`CreateModel$Name`), so a name
+/// carrying anything but letters and digits is refused. The length bounds (1..128) are
+/// the modelled constraint and are already refused before a handler runs, so this is
+/// only the alphabet.
+///
+/// `CreateModel` and `UpdateModel` both route through here: the requirement is a
+/// property of the request, so it cannot differ between the two.
+pub fn model_name_is_alphanumeric(name: &str) -> bool {
+    !name.is_empty() && name.chars().all(|character| character.is_ascii_alphanumeric())
+}
+
+/// Does `content_type` name a media type whose schema language is JSON Schema?
+///
+/// A JSON media type is one whose subtype is `json` or ends in `+json`
+/// (RFC 6839's `+json` structured syntax suffix), with any parameters
+/// (`; charset=utf-8`) ignored. A model that names NO content type is a JSON model
+/// too: `application/json` is the content type the service's own documentation gives
+/// for a model (`Model$ContentType`: "for example, \"application/json\"").
+pub fn is_json_media_type(content_type: Option<&str>) -> bool {
+    let Some(content_type) = content_type else {
+        return true;
+    };
+    let media_type = content_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    let subtype = media_type.split('/').nth(1).unwrap_or_default();
+    subtype == "json" || subtype.ends_with("+json")
+}
+
+/// Refuse a `Schema` that is not a schema document of the model's content type.
+///
+/// For a JSON model (see [`is_json_media_type`]) the schema is a JSON Schema document:
+/// "For application/json models, this should be JSON schema draft 4 model"
+/// (`CreateModel$Schema`), and "A JSON Schema is a JSON document, and that document
+/// MUST be an object" (JSON Schema draft-04, section 3.2). A schema that does not
+/// parse as JSON, or parses as a value that is not an object, is therefore no JSON
+/// Schema at all and nothing reading the model could treat it as one.
+///
+/// A model of any OTHER content type carries a schema in that content type's own
+/// language, which this service has no reader for, so its schema is stored verbatim
+/// rather than refused for not being JSON.
+///
+/// What this does NOT do is check a document against the whole of draft-04 — that
+/// every keyword is one draft-04 defines and carries a value of the type draft-04
+/// gives it. A partial schema is legitimate input (`{}` matches everything), and the
+/// document is handed back verbatim by every reader of the model.
+///
+/// `Ok(())` or the message for the operation's `BadRequestException`: it names the
+/// member and what was wrong with it, and echoes no schema back.
+pub fn validate_model_schema(content_type: Option<&str>, schema: &str) -> Result<(), String> {
+    if !is_json_media_type(content_type) {
+        return Ok(());
+    }
+    let document: ::serde_json::Value = ::serde_json::from_str(schema)
+        .map_err(|error| format!("Invalid model specified: Schema is not valid JSON: {error}"))?;
+    if document.is_object() {
+        return Ok(());
+    }
+    // The JSON type the schema turned out to be, so the caller can see what it sent
+    // without the document being echoed back.
+    let kind = match document {
+        ::serde_json::Value::Null => "null",
+        ::serde_json::Value::Bool(_) => "a boolean",
+        ::serde_json::Value::Number(_) => "a number",
+        ::serde_json::Value::String(_) => "a string",
+        ::serde_json::Value::Array(_) => "an array",
+        ::serde_json::Value::Object(_) => "an object",
+    };
+    Err(format!(
+        "Invalid model specified: Schema is not a valid JSON schema document: a JSON schema \
+         is a JSON object, but this Schema is {kind}."
+    ))
+}
+
+/// A persisted `Stage` resource, owned by its parent [`Api`].
+///
+/// The record keeps what the create resolved — the name it is keyed by, the instants
+/// it was created and last changed at, and the settings maps the request supplied — so
+/// every reader of the stage reports one value, and [`Stage::to_wire`] projects it onto
+/// the modelled shape the handlers serialize.
+#[derive(Debug, Clone)]
 pub struct Stage {
     pub stage_name: String,
     pub description: Option<String>,
@@ -382,6 +743,193 @@ pub struct Stage {
     /// "A Deployment must be associated with a Stage for it to be callable over the
     /// internet" (the `Deployment` shape's own doc).
     pub deployment_id: Option<String>,
+    pub access_log_settings: Option<wire::AccessLogSettings>,
+    /// "Supported only for WebSocket APIs" (`Stage$ClientCertificateId`).
+    pub client_certificate_id: Option<String>,
+    pub default_route_settings: Option<wire::RouteSettings>,
+    /// Route settings by `routeKey`. `BTreeMap`, so the stage reports them in one
+    /// stable order however the request ordered them.
+    pub route_settings: BTreeMap<String, wire::RouteSettings>,
+    /// The stage variable map, by variable name.
+    pub stage_variables: BTreeMap<String, String>,
+    /// "Describes the status of the last deployment of a stage. Supported only for
+    /// stages with autoDeploy enabled" (`Stage$LastDeploymentStatusMessage`), so a
+    /// stage that never auto-released one has none.
+    pub last_deployment_status_message: Option<String>,
+    pub created_date: SystemTime,
+    /// "The timestamp when the stage was last updated" (`Stage$LastUpdatedDate`): the
+    /// creation instant until something rewrites the record.
+    pub last_updated_date: SystemTime,
+    /// True only for a stage another operation created on the caller's behalf: "If you
+    /// created an API using quick create, the $default stage is managed by API Gateway"
+    /// (`Stage$ApiGatewayManaged`). A stage the caller asked for is its own.
+    pub api_gateway_managed: bool,
+}
+
+impl Stage {
+    /// Project the record onto the modelled `Stage` shape.
+    pub fn to_wire(&self) -> wire::Stage {
+        wire::Stage {
+            access_log_settings: self.access_log_settings.clone(),
+            api_gateway_managed: Some(self.api_gateway_managed),
+            auto_deploy: Some(self.auto_deploy),
+            client_certificate_id: self.client_certificate_id.clone(),
+            created_date: Some(to_timestamp(self.created_date)),
+            default_route_settings: self.default_route_settings.clone(),
+            deployment_id: self.deployment_id.clone(),
+            description: self.description.clone(),
+            last_deployment_status_message: self.last_deployment_status_message.clone(),
+            last_updated_date: Some(to_timestamp(self.last_updated_date)),
+            route_settings: Some(
+                self.route_settings
+                    .iter()
+                    .map(|(key, settings)| (key.clone(), settings.clone()))
+                    .collect(),
+            ),
+            stage_name: self.stage_name.clone(),
+            stage_variables: Some(
+                self.stage_variables
+                    .iter()
+                    .map(|(name, value)| (name.clone(), value.clone()))
+                    .collect(),
+            ),
+            tags: Some(self.tags.iter().map(|(k, v)| (k.clone(), v.clone())).collect()),
+        }
+    }
+}
+
+/// The most stages one api may hold, after which CreateStage is refused. AWS's
+/// published API Gateway quota is 10 stages per API.
+pub const MAX_STAGES_PER_API: usize = 10;
+
+/// The `StageName` of the stage that serves an api's root: "the $default stage"
+/// (`Stage$ApiGatewayManaged`), the one name that is not a plain stage name.
+pub const DEFAULT_STAGE_NAME: &str = "$default";
+
+/// The longest `StageName` the service accepts: the upper bound of
+/// `StringWithLengthBetween1And128`, the shape `CreateStage$StageName` targets.
+pub const MAX_STAGE_NAME_LEN: usize = 128;
+
+/// The longest stage variable VALUE the service accepts: the upper bound of
+/// `StringWithLengthBetween0And2048`, the value shape of `StageVariablesMap`
+/// (`smithy_query(query="shape", shape="StageVariablesMap")`).
+pub const MAX_STAGE_VARIABLE_VALUE_LEN: usize = 2048;
+
+/// Refuse a `StageName` the service does not accept.
+///
+/// "Stage names can only contain alphanumeric characters, hyphens, and underscores.
+/// Maximum length is 128 characters" (the `CreateStage$StageName` API reference), plus
+/// [`DEFAULT_STAGE_NAME`], the reserved name of the stage that serves an api's root.
+/// The length bound of `StringWithLengthBetween1And128` carries no `@length` trait in
+/// the model, so the request walk does not enforce it and this does.
+///
+/// `Ok(())` or the message for the operation's `BadRequestException`: it names the
+/// member and the rule it broke.
+pub fn validate_stage_name(stage_name: &str) -> Result<(), String> {
+    if stage_name == DEFAULT_STAGE_NAME {
+        return Ok(());
+    }
+    let length = stage_name.chars().count();
+    if length == 0 || length > MAX_STAGE_NAME_LEN {
+        return Err(format!(
+            "Invalid value for StageName: must have length between 1 and \
+             {MAX_STAGE_NAME_LEN}, got {length}."
+        ));
+    }
+    if !stage_name
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || character == '-' || character == '_')
+    {
+        return Err(format!(
+            "Invalid value for StageName: stage names can only contain alphanumeric \
+             characters, hyphens and underscores, or be the reserved name \
+             {DEFAULT_STAGE_NAME}, got '{stage_name}'."
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse a stage variable whose name or value is not one the service accepts.
+///
+/// "Variable names can have alphanumeric and underscore characters, and the values
+/// must match [A-Za-z0-9-._~:/?#&=,]+" (`Stage$StageVariables`), and a value is bounded
+/// by [`MAX_STAGE_VARIABLE_VALUE_LEN`], the upper bound of the map's value shape.
+/// Neither is a modelled trait, so the request walk does not enforce them and this
+/// does.
+///
+/// `Ok(())` or the message for the operation's `BadRequestException`: it names the
+/// variable and the rule it broke.
+pub fn validate_stage_variables<'a, I>(variables: I) -> Result<(), String>
+where
+    I: IntoIterator<Item = (&'a String, &'a String)>,
+{
+    for (name, value) in variables {
+        if name.is_empty()
+            || !name
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || character == '_')
+        {
+            return Err(format!(
+                "Invalid value for StageVariables: variable names can have alphanumeric \
+                 and underscore characters, got '{name}'."
+            ));
+        }
+        let length = value.chars().count();
+        if length > MAX_STAGE_VARIABLE_VALUE_LEN {
+            return Err(format!(
+                "Invalid value for StageVariables: the value of '{name}' must have length \
+                 less than or equal to {MAX_STAGE_VARIABLE_VALUE_LEN}, got {length}."
+            ));
+        }
+        if value.is_empty() || !value.chars().all(is_stage_variable_value_character) {
+            return Err(format!(
+                "Invalid value for StageVariables: the value of '{name}' must match \
+                 [A-Za-z0-9-._~:/?#&=,]+."
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Is `character` one the stage variable value pattern `[A-Za-z0-9-._~:/?#&=,]`
+/// admits (`Stage$StageVariables`)?
+fn is_stage_variable_value_character(character: char) -> bool {
+    character.is_ascii_alphanumeric()
+        || matches!(
+            character,
+            '-' | '.' | '_' | '~' | ':' | '/' | '?' | '#' | '&' | '=' | ','
+        )
+}
+
+/// The `$context` variable an access log format must select, so an access log entry can
+/// be tied to the request that produced it: "The format must include at least
+/// $context.requestId" (`AccessLogSettings$Format`).
+pub const REQUIRED_ACCESS_LOG_CONTEXT_VARIABLE: &str = "$context.requestId";
+
+/// Refuse `AccessLogSettings` whose `Format` could not identify the request it logged.
+///
+/// "The format must include at least $context.requestId"
+/// (`AccessLogSettings$Format`), so a format selecting no request id is one no access
+/// log entry could be traced back to a request with. A settings block that names no
+/// format at all configures no access logging, so there is no format to require
+/// anything of.
+///
+/// Every operation that stores access log settings routes through here: the requirement
+/// is a property of the settings, so it cannot differ between them.
+///
+/// `Ok(())` or the message for the operation's `BadRequestException`: it names the
+/// member and the rule it broke.
+pub fn validate_access_log_settings(settings: &wire::AccessLogSettings) -> Result<(), String> {
+    let Some(format) = settings.format.as_ref() else {
+        return Ok(());
+    };
+    if format.contains(REQUIRED_ACCESS_LOG_CONTEXT_VARIABLE) {
+        return Ok(());
+    }
+    Err(format!(
+        "Invalid value for AccessLogSettings: the Format must include at least \
+         {REQUIRED_ACCESS_LOG_CONTEXT_VARIABLE}, got '{format}'."
+    ))
 }
 
 /// A persisted `Deployment` resource, owned by its parent [`Api`].
@@ -452,13 +1000,40 @@ pub fn request_region(parts: &::http::request::Parts) -> String {
         .unwrap_or_else(|| DEFAULT_REGION.to_string())
 }
 
-/// The default execute-api endpoint of an api: the host clients invoke it on when
+/// The URI scheme of an api's default endpoint, chosen by its `ProtocolType`.
+///
+/// `ApiEndpoint` is the value a caller hands to a client library to reach the api, so
+/// its scheme has to name the protocol that api speaks: a WebSocket API is opened with
+/// an RFC 6455 handshake, whose URI scheme is `wss` (secure) — `ws` is the cleartext
+/// form, and nothing this emulator serves is cleartext — while an HTTP API is invoked
+/// over `https` ("clients can invoke your API with the default
+/// https://{api_id}.execute-api.{region}.amazonaws.com endpoint",
+/// `Api$DisableExecuteApiEndpoint`).
+///
+/// `ProtocolType` is an enum of exactly `HTTP | WEBSOCKET`
+/// (`smithy_query(query="shape", shape="ProtocolType")`) and the boundary validator
+/// refuses anything else, so `WEBSOCKET` and the `HTTP` arm cover every api a record
+/// can hold; that arm doubles as the fallback a future enum value would take, which
+/// gives it the scheme an api is invoked over rather than one no client could open.
+pub fn execute_api_scheme(protocol_type: &str) -> &'static str {
+    match protocol_type {
+        WEBSOCKET_PROTOCOL_TYPE => "wss",
+        // HTTP_PROTOCOL_TYPE, and anything the enum gains later.
+        _ => "https",
+    }
+}
+
+/// The default execute-api endpoint of an api: the URI clients reach it on when
 /// no custom domain name is configured.
 ///
-/// From `Api$DisableExecuteApiEndpoint`: "clients can invoke your API with the
-/// default https://{api_id}.execute-api.{region}.amazonaws.com endpoint".
-pub fn execute_api_endpoint(api_id: &str, region: &str) -> String {
-    format!("https://{api_id}.execute-api.{region}.amazonaws.com")
+/// The host is the one `CreateApiResponse$ApiEndpoint` documents —
+/// `{api-id}.execute-api.{region}.amazonaws.com` — and the scheme comes from the
+/// api's `ProtocolType` (see [`execute_api_scheme`]).
+pub fn execute_api_endpoint(api_id: &str, region: &str, protocol_type: &str) -> String {
+    format!(
+        "{}://{api_id}.execute-api.{region}.amazonaws.com",
+        execute_api_scheme(protocol_type)
+    )
 }
 
 /// Resolve a `MaxResults` query value into the page size to serve.

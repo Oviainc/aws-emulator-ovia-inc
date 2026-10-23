@@ -184,12 +184,150 @@ pub struct EventTrigger {
     pub customer_profiles_domain_arn: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.connectcampaignsv2#Schedule")]
+/// `Schedule$refreshFrequency`'s constraint traits, as the codegen captures them from
+/// its target shape `Iso8601Duration`: `@length(min: 0, max: 50)` and the ISO-8601
+/// duration `@pattern`.
+#[allow(non_upper_case_globals)]
+static M_REFRESH_FREQUENCY_TRAITS: ::std::sync::LazyLock<::aws_smithy_schema::TraitMap> =
+    ::std::sync::LazyLock::new(|| {
+        let mut m = ::aws_smithy_schema::TraitMap::new();
+        m.insert(::std::boxed::Box::new(
+            ::aws_smithy_schema_server::constraints::LengthTrait::new(
+                ::std::option::Option::Some(0),
+                ::std::option::Option::Some(50),
+            ),
+        ));
+        m.insert(::std::boxed::Box::new(
+            ::aws_smithy_schema_server::constraints::PatternTrait::new(
+                r"^P(?:([-+]?[0-9]+)D)?(T(?:([-+]?[0-9]+)H)?(?:([-+]?[0-9]+)M)?(?:([-+]?[0-9]+)(?:[.,]([0-9]{0,9}))?S)?)?$",
+            ),
+        ));
+        m
+    });
+
+/// `Schedule`, with its schema written out instead of derived.
+///
+/// WHY it is not `#[smithy_macros::smithy(shape = ...)]` like the shapes beside it:
+/// `startTime` and `endTime` target `TimeStamp`, which the model marks
+/// `@timestampFormat("date-time")` (`smithy_query(query="shape", shape="Schedule",
+/// model_path="services/service-com-amazonaws-connectcampaignsv2-amazonconnectcampaignservicev2/\
+/// smithy-model/com-amazonaws-connectcampaignsv2-amazonconnectcampaignservicev2.json")`
+/// reports `"timestampFormat": "date-time"` on both), and `vendor/smithy-macros` never
+/// chains `.with_timestamp_format(..)` onto a member schema, so the restJson1 codec falls
+/// back to its protocol default — epoch seconds, a NUMBER where the model and every AWS
+/// SDK require an RFC 3339 string, in a response AND in the request that sets a campaign's
+/// schedule. The schema below is the model's, member for member — same shape ids, same
+/// order, same constraint traits — plus the `date-time` format the model declares.
+///
+/// The gap is filed as
+/// `issues/things-that-do-not-work/20261022T000000Z-smithy-macros-drops-timestampformat-from-member-schemas.md`;
+/// the fix belongs in `vendor/smithy-macros`, which a service crate may not change. Put
+/// the attribute back once the codegen learns the trait.
 #[derive(Debug, Clone)]
 pub struct Schedule {
     pub start_time: ::aws_smithy_types::DateTime,
     pub end_time: ::aws_smithy_types::DateTime,
     pub refresh_frequency: Option<String>,
+}
+
+#[allow(non_upper_case_globals)]
+impl Schedule {
+    pub const M_START_TIME: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.connectcampaignsv2#Schedule$startTime",
+            "com.amazonaws.connectcampaignsv2",
+            "startTime",
+        ),
+        ::aws_smithy_schema::ShapeType::Timestamp,
+        "startTime",
+        0,
+    )
+    // The one call the vendored codegen omits; see the type's docs.
+    .with_timestamp_format(::aws_smithy_schema::traits::TimestampFormat::DateTime);
+
+    pub const M_END_TIME: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.connectcampaignsv2#Schedule$endTime",
+            "com.amazonaws.connectcampaignsv2",
+            "endTime",
+        ),
+        ::aws_smithy_schema::ShapeType::Timestamp,
+        "endTime",
+        1,
+    )
+    .with_timestamp_format(::aws_smithy_schema::traits::TimestampFormat::DateTime);
+
+    pub const M_REFRESH_FREQUENCY: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.connectcampaignsv2#Schedule$refreshFrequency",
+                "com.amazonaws.connectcampaignsv2",
+                "refreshFrequency",
+            ),
+            ::aws_smithy_schema::ShapeType::String,
+            "refreshFrequency",
+            2,
+        )
+        .with_traits(&M_REFRESH_FREQUENCY_TRAITS);
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.connectcampaignsv2#Schedule",
+            "com.amazonaws.connectcampaignsv2",
+            "Schedule",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[
+            &Self::M_START_TIME,
+            &Self::M_END_TIME,
+            &Self::M_REFRESH_FREQUENCY,
+        ],
+    );
+}
+
+pub static SCHEDULE_SCHEMA: &::aws_smithy_schema::Schema = &Schedule::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for Schedule {
+    fn serialize_members(
+        &self,
+        serializer: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        serializer.write_timestamp(&Self::M_START_TIME, &self.start_time)?;
+        serializer.write_timestamp(&Self::M_END_TIME, &self.end_time)?;
+        if let Some(value) = self.refresh_frequency.as_ref() {
+            serializer.write_string(&Self::M_REFRESH_FREQUENCY, value.as_str())?;
+        }
+        Ok(())
+    }
+}
+
+impl ::aws_smithy_schema_server::DeserializableStruct for Schedule {
+    fn deserialize(
+        deserializer: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+    ) -> ::std::result::Result<Self, ::aws_smithy_schema::serde::SerdeError> {
+        let mut start_time: Option<::aws_smithy_types::DateTime> = None;
+        let mut end_time: Option<::aws_smithy_types::DateTime> = None;
+        let mut refresh_frequency: Option<String> = None;
+        deserializer.read_struct(&Self::SCHEMA, &mut |member, d| {
+            match member.member_index() {
+                Some(0) => start_time = Some(d.read_timestamp(&Self::M_START_TIME)?),
+                Some(1) => end_time = Some(d.read_timestamp(&Self::M_END_TIME)?),
+                Some(2) => {
+                    refresh_frequency = Some(d.read_string(&Self::M_REFRESH_FREQUENCY)?);
+                }
+                _ => {}
+            }
+            Ok(())
+        })?;
+        Ok(Self {
+            // `@required`: absent is a refusal, not a default.
+            start_time: start_time
+                .ok_or_else(|| ::aws_smithy_schema_server::missing_member("startTime"))?,
+            end_time: end_time
+                .ok_or_else(|| ::aws_smithy_schema_server::missing_member("endTime"))?,
+            refresh_frequency,
+        })
+    }
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.connectcampaignsv2#EntryLimitsConfig")]

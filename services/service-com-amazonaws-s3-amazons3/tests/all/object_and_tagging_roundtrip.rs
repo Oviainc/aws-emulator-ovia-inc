@@ -37,7 +37,7 @@ use std::time::SystemTime;
 
 use md5::{Digest, Md5};
 use service_com_amazonaws_s3_amazons3::state::{
-    ComAmazonawsS3Amazons3State, Object, ObjectWrite, DEFAULT_STORAGE_CLASS,
+    ComAmazonawsS3Amazons3State, Object, ObjectEncryption, ObjectWrite, DEFAULT_STORAGE_CLASS,
     MAX_OBJECTS_PER_BUCKET, MAX_OBJECTS_TOTAL, MAX_OBJECT_BYTES_PER_BUCKET,
     MAX_OBJECT_BYTES_TOTAL, MAX_OBJECT_KEY_BYTES, MAX_OBJECT_METADATA_BYTES,
 };
@@ -64,6 +64,9 @@ fn sized_object(length: usize) -> Object {
         website_redirect_location: None,
         metadata: std::collections::BTreeMap::new(),
         tags: Vec::new(),
+        // A write that names no server-side encryption records none, so a stored object
+        // seeded through the store carries none either.
+        encryption: ObjectEncryption::default(),
         // The store mints an object's version id; one handed to `put_object` carries none.
         version_id: None,
         body,
@@ -641,13 +644,18 @@ async fn object_writes_and_reads_are_refused_outside_what_is_stored() {
 
     // Members whose semantics this emulator cannot carry out keep the scaffold's 501
     // rather than being stripped and answered as a plain success — and the request they
-    // were refused on changes nothing. `x-amz-tagging` is NOT one of them any more: the
-    // header's tag set is parsed and stored, which `object_tagging_on_put.rs` covers.
+    // were refused on changes nothing. Two members are NOT among them any more: the
+    // server-side-encryption pair is recorded with the object and reported back (the
+    // `object_encryption` suite covers it), and `x-amz-tagging`'s tag set is parsed and
+    // stored (`object_tagging_on_put.rs`). SSE-C stays, because S3 stores no customer key.
     for (case, headers) in [
         ("a conditional write", &[("if-none-match", "*")][..]),
         (
-            "a server-side-encryption request",
-            &[("x-amz-server-side-encryption", "aws:kms")][..],
+            "a customer-provided encryption key",
+            &[(
+                "x-amz-server-side-encryption-customer-algorithm",
+                "AES256",
+            )][..],
         ),
         (
             "an object lock mode",

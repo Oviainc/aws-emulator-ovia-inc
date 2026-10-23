@@ -206,6 +206,13 @@ fn every_operation(
             "UntagResource",
             json!({ "resourceArn": environment_arn, "tagKeys": ["owner"] }),
         ),
+        // Account-level, so these two name no resource of their own: only a statement
+        // covering every resource decides them.
+        ("GetAccountSettings", json!({})),
+        (
+            "PutAccountSettings",
+            json!({ "settings": [{ "name": "vcfPortedCoreCount", "value": "100" }] }),
+        ),
     ]
 }
 

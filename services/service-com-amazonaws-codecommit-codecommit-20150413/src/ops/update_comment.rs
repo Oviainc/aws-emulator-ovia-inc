@@ -186,10 +186,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if input.content.trim().is_empty() {
             return Err(UpdateCommentErrorModeled::CommentContentRequiredException(
                 CommentContentRequiredException {
-                    message: Some(
-                        "The comment is empty. You must provide some content for a comment."
-                            .to_string(),
-                    ),
+                    message: Some(crate::state::COMMENT_CONTENT_REQUIRED_MESSAGE.to_string()),
                 },
             )
             .into());

@@ -80,23 +80,34 @@ impl Synthetics {
     }
 
     pub(crate) async fn call(&self, method: &str, path: &str, body: Option<Value>) -> Answer {
+        self.call_in_region(&self.region, method, path, body).await
+    }
+
+    /// [`Synthetics::call`], but signed for `region` rather than this endpoint's own, so
+    /// one store can be addressed from two Regions — which is what the global-resource
+    /// and home-Region rules of the group operations are asserted over.
+    pub(crate) async fn call_in_region(
+        &self,
+        region: &str,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+    ) -> Answer {
         let payload = body
             .map(|value| serde_json::to_vec(&value).expect("the test body serialises"))
             .unwrap_or_default();
         let request = http::Request::builder()
             .method(method)
             .uri(format!(
-                "https://synthetics.{}.amazonaws.com{path}",
-                self.region
+                "https://synthetics.{region}.amazonaws.com{path}"
             ))
             // The SigV4 credential scope is what routes the request to this service and
             // names the Region its resources live in.
             .header(
                 "authorization",
                 format!(
-                    "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{}/synthetics/aws4_request, \
+                    "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{region}/synthetics/aws4_request, \
                      SignedHeaders=host, Signature=0",
-                    self.region
                 ),
             )
             .header("content-type", "application/json")

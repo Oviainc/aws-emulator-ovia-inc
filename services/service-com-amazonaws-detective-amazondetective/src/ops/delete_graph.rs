@@ -175,9 +175,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // dropping the record drops all three together.
         if state.lock().remove_graph(&input.graph_arn).is_none() {
             return Err(DeleteGraphErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!("behavior graph {} does not exist", input.graph_arn)),
-                },
+                crate::state::graph_not_found(),
             )
             .into());
         }

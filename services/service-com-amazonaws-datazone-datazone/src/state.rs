@@ -106,6 +106,31 @@ pub fn is_form_type_name(name: &str) -> bool {
         && matches_form_type_name_pattern(name)
 }
 
+/// The form type NAME a `FormTypeIdentifier` resolves to.
+///
+/// A DataZone form type is addressed by its name: `FormTypeIdentifier` (len 1..385,
+/// pattern `^(?!\.)[\w\.]*\w$`) carries that name, while `FormEntryOutput`'s `typeName`
+/// is a `FormTypeName` (len 1..128, pattern
+/// `^(amazon.datazone.)?(?![0-9_])\w+$|^_\w*[a-zA-Z0-9]\w*$`) — both from
+/// `smithy_query(query="shape",shape="FormEntryInput,FormEntryOutput")`. So an
+/// identifier that is already a well-formed name (including one in the service's own
+/// `amazon.datazone.` namespace) resolves to itself, and a qualified identifier in any
+/// other namespace resolves to its unqualified last segment, which is the form type's
+/// own name.
+///
+/// Shared by every handler that has to decide whether two form type references name the
+/// same form type: `CreateAssetType` stores a form entry's resolved name, and
+/// `DeleteFormType` compares a stored reference against the form type being deleted — so
+/// the two cannot drift. Whether a form type of that name EXISTS is a separate question:
+/// the built-in `amazon.datazone.*` types are not stored at all, and an asset type or an
+/// asset may name a form type in any namespace.
+pub fn form_type_reference_name(identifier: &str) -> &str {
+    if is_form_type_name(identifier) {
+        return identifier;
+    }
+    identifier.split('.').next_back().unwrap_or(identifier)
+}
+
 /// The `GlossaryStatus` members (model enum `com.amazonaws.datazone#GlossaryStatus`:
 /// DISABLED | ENABLED).
 pub const GLOSSARY_STATUS_ENABLED: &str = "ENABLED";
@@ -114,6 +139,23 @@ pub const GLOSSARY_STATUS_DISABLED: &str = "DISABLED";
 /// The `Revision` (`com.amazonaws.datazone#Revision`, len 1..64) a freshly created
 /// revisioned resource carries: DataZone numbers revisions from 1, as a decimal string.
 pub const FIRST_REVISION: &str = "1";
+
+/// [`FIRST_REVISION`] as the number a revision map is keyed by: revisions are numbered
+/// from 1 and [`FIRST_REVISION`] is that number rendered, so the two are defined
+/// together here rather than one being parsed out of the other.
+pub const FIRST_REVISION_NUMBER: u32 = 1;
+
+/// The revision number a modelled `Revision` string addresses, when it addresses one.
+///
+/// Addressing is EXACT: a revision is addressed by the decimal number the call that
+/// recorded it returned, so only the canonical decimal resolves and `"01"` or `"+1"`
+/// name no revision. The one rule every revisioned resource in this store applies
+/// ([`Asset::revision`], [`FormType::revision`], [`Listing::revision`]), so they cannot
+/// read one revision string differently.
+pub fn revision_number(revision: &str) -> Option<u32> {
+    let number = revision.parse::<u32>().ok()?;
+    (number.to_string() == revision).then_some(number)
+}
 
 /// The `ListingStatus` members (model enum `com.amazonaws.datazone#ListingStatus`:
 /// CREATING | ACTIVE | INACTIVE).
@@ -130,6 +172,12 @@ pub const CHANGE_ACTION_UNPUBLISH: &str = "UNPUBLISH";
 /// ASSET | DATA_PRODUCT) — what a listing can be a record OF.
 pub const ENTITY_TYPE_ASSET: &str = "ASSET";
 pub const ENTITY_TYPE_DATA_PRODUCT: &str = "DATA_PRODUCT";
+
+/// The only `DataZoneEntityType` member (model enum
+/// `com.amazonaws.datazone#DataZoneEntityType`: DOMAIN_UNIT) — the kind of entity
+/// `AddEntityOwner`, `ListEntityOwners` and `RemoveEntityOwner` work on, so an owner is
+/// kept on a stored domain unit.
+pub const DATA_ZONE_ENTITY_TYPE_DOMAIN_UNIT: &str = "DOMAIN_UNIT";
 
 /// The `listingRevision` that names a listing's newest revision: the `@default` the
 /// model puts on `GetListingInput::listingRevision` (smithy_query operation="GetListing").
@@ -234,6 +282,98 @@ impl Domain {
             .values_mut()
             .find(|listing| listing.entity_type == entity_type && listing.entity_id == entity_id)
     }
+
+    /// The object stored in this domain that binds a metadata form to the form type
+    /// `form_type_name` and so prevents its deletion, when one does.
+    ///
+    /// An asset type's forms carry the form type a form of that type must satisfy, and
+    /// an asset's forms carry the form type the form's content is an instance of. Both
+    /// name it by `FormTypeIdentifier`, so each reference is resolved to a form type
+    /// name with [`form_type_reference_name`] before it is compared. Asset types are
+    /// looked at first — in name order, then assets in id order — so the dependency
+    /// reported is the same one on every call: the asset type that links the form type
+    /// where one does, and otherwise the asset that uses it. `None` exactly when nothing
+    /// in this domain depends on that form type, which is what lets `DeleteFormType`
+    /// remove it. A linear scan over maps bounded by [`MAX_ASSET_TYPES_PER_DOMAIN`] and
+    /// [`MAX_ASSETS_PER_DOMAIN`], the same trade [`Self::listing_for_entity`] makes.
+    pub fn form_type_blocker(&self, form_type_name: &str) -> Option<DeletionBlocker> {
+        let binds_it = |reference: &str| form_type_reference_name(reference) == form_type_name;
+        let blocking_type = self
+            .asset_types
+            .values()
+            .find(|asset_type| {
+                asset_type
+                    .forms
+                    .values()
+                    .any(|form| binds_it(&form.type_name))
+            })
+            .map(|asset_type| DeletionBlocker {
+                tag: GRAPH_TAG_ASSET,
+                identifier: asset_type.name.clone(),
+            });
+        blocking_type.or_else(|| {
+            self.assets
+                .values()
+                .find(|asset| {
+                    // EVERY recorded revision counts: a revision is a record this store
+                    // still serves (`GetAsset` reads one by number), so a form type one
+                    // of them binds is still in use even when the newest revision
+                    // dropped the form.
+                    asset
+                        .revisions
+                        .values()
+                        .flat_map(|revision| revision.forms.iter())
+                        .any(|form| form.type_name.as_deref().is_some_and(binds_it))
+                })
+                .map(|asset| DeletionBlocker {
+                    tag: GRAPH_TAG_ASSET,
+                    identifier: asset.id.clone(),
+                })
+        })
+    }
+}
+
+/// One stored object whose dependency on another object prevents that object's deletion
+/// — what [`Domain::form_type_blocker`] reports and [`deletion_prevented_message`] names
+/// in the refusal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeletionBlocker {
+    /// The tag naming this object's kind in the dependency graph: one of the
+    /// `GRAPH_TAG_*` constants.
+    pub tag: &'static str,
+    /// The object's own identifier within its domain.
+    pub identifier: String,
+}
+
+/// The dependency-graph tag a metadata form type is named by in a deletion refusal.
+///
+/// SOURCE: the recorded `ConflictException` wording, which names the form type being
+/// deleted `type Form#<domainId>#<formTypeName>`.
+pub const GRAPH_TAG_FORM_TYPE: &str = "Form";
+
+/// The dependency-graph tag an asset-domain object — an asset type, or an asset of one —
+/// is named by in a deletion refusal.
+///
+/// SOURCE: the same recorded wording, which names the asset type that prevented a form
+/// type's deletion `type asset#<domainId>#<assetTypeName>`. The third field is the
+/// object's own identifier, which is what tells one asset-domain object from another.
+pub const GRAPH_TAG_ASSET: &str = "asset";
+
+/// One object as a deletion refusal names it: `type <tag>#<domainId>#<identifier>`.
+pub fn graph_object(tag: &str, domain_id: &str, identifier: &str) -> String {
+    format!("type {tag}#{domain_id}#{identifier}")
+}
+
+/// The `ConflictException` message DataZone answers a delete a stored dependency
+/// prevents: the object that could not be deleted, and the object that prevented it.
+///
+/// Built from the request and the store, never from a recorded value: the wording is
+/// recorded behaviour ("The following objects could not be deleted: `<object>` deletion
+/// prevented by `<blocker>`. ", ending in a period and a space), while both objects in it
+/// are named by [`graph_object`] from the domain, kind and identifier the call actually
+/// found.
+pub fn deletion_prevented_message(object: &str, blocker: &str) -> String {
+    format!("The following objects could not be deleted: {object} deletion prevented by {blocker}. ")
 }
 
 /// One stored catalog listing: an entity published in the domain's catalog.
@@ -281,16 +421,10 @@ impl Listing {
         self.revisions.values().next_back()
     }
 
-    /// The revision addressed by a `listingRevision` string, which is the decimal
-    /// number the change set that recorded it returned. Addressing is exact: only the
-    /// canonical decimal resolves, so `"01"` and `"+1"` name no revision — the same
-    /// rule [`FormType::revision`] applies.
+    /// The revision addressed by a `listingRevision` string, by the rule
+    /// [`revision_number`] states.
     pub fn revision(&self, revision: &str) -> Option<&ListingRevision> {
-        let number = revision.parse::<u32>().ok()?;
-        if number.to_string() != revision {
-            return None;
-        }
-        self.revisions.get(&number)
+        self.revisions.get(&revision_number(revision)?)
     }
 
     /// The number the NEXT recorded revision gets: one past the greatest ever recorded,
@@ -460,6 +594,62 @@ pub enum DomainUnitOwner {
     Group(String),
 }
 
+impl DomainUnitOwner {
+    /// The principal this owner names, and the tag that tells a user from a group —
+    /// the two members both owner unions declare (smithy_query
+    /// shape="OwnerProperties,DomainUnitOwnerProperties").
+    pub fn parts(&self) -> (&str, &'static str) {
+        match self {
+            Self::User(user_id) => (user_id.as_str(), "user"),
+            Self::Group(group_id) => (group_id.as_str(), "group"),
+        }
+    }
+}
+
+/// The key one owner is identified and ordered by.
+///
+/// Injective in `(identifier, kind)` for the reason [`membership_key`] is: the kind tag
+/// is always last and the two tags are distinct, so no two different principals key to
+/// the same string. It is what makes an entity's owners a SET — `AddEntityOwner`
+/// compares owners by it — and gives `ListEntityOwners` one stable total order to
+/// paginate over, independent of the order the owners were added in.
+pub fn owner_key(owner: &DomainUnitOwner) -> String {
+    let (identifier, tag) = owner.parts();
+    format!("{identifier}{PRINCIPAL_KEY_SEPARATOR}{tag}")
+}
+
+/// The owner a request's `OwnerProperties` union names, in stored form (smithy_query
+/// shape="OwnerProperties": `user` carries `userIdentifier`, `group` carries
+/// `groupIdentifier`). Shared by `AddEntityOwner` and `RemoveEntityOwner`, so the two
+/// cannot read the same request differently.
+pub fn owner_from_properties(owner: &crate::ops::types::OwnerProperties) -> DomainUnitOwner {
+    use crate::ops::types::OwnerProperties;
+    match owner {
+        OwnerProperties::User(user) => DomainUnitOwner::User(user.user_identifier.clone()),
+        OwnerProperties::Group(group) => DomainUnitOwner::Group(group.group_identifier.clone()),
+    }
+}
+
+/// A stored owner as the modelled `OwnerPropertiesOutput` union (smithy_query
+/// shape="OwnerPropertiesOutput": `user` carries `userId`, `group` carries `groupId`),
+/// the form `ListEntityOwners` reports. The companion of [`owner_properties`], which
+/// renders the same stored owner in the union `GetDomainUnit` reports.
+pub fn entity_owner_output(owner: &DomainUnitOwner) -> crate::ops::types::OwnerPropertiesOutput {
+    use crate::ops::types::{
+        OwnerGroupPropertiesOutput, OwnerPropertiesOutput, OwnerUserPropertiesOutput,
+    };
+    match owner {
+        DomainUnitOwner::User(user_id) => OwnerPropertiesOutput::User(OwnerUserPropertiesOutput {
+            user_id: Some(user_id.clone()),
+        }),
+        DomainUnitOwner::Group(group_id) => {
+            OwnerPropertiesOutput::Group(OwnerGroupPropertiesOutput {
+                group_id: Some(group_id.clone()),
+            })
+        }
+    }
+}
+
 /// One stored metadata form type: a name, the project that owns it, and every
 /// revision created under that name.
 ///
@@ -487,16 +677,10 @@ impl FormType {
         self.revisions.values().next_back()
     }
 
-    /// The revision addressed by a `revision` string, which is the decimal number the
-    /// create that minted it returned. Addressing is exact: only the canonical decimal
-    /// resolves, so `"01"` and `"+1"` name no revision. `None` when this form type has
-    /// no such revision.
+    /// The revision addressed by a `revision` string, by the rule [`revision_number`]
+    /// states. `None` when this form type has no such revision.
     pub fn revision(&self, revision: &str) -> Option<&FormTypeRevision> {
-        let number = revision.parse::<u32>().ok()?;
-        if number.to_string() != revision {
-            return None;
-        }
-        self.revisions.get(&number)
+        self.revisions.get(&revision_number(revision)?)
     }
 }
 
@@ -619,19 +803,21 @@ pub struct Membership {
     pub designation: String,
 }
 
-/// The separator between a member's identifier and its kind inside a membership key.
+/// The separator between a principal's identifier and its kind inside a key this state
+/// builds for it — a membership key ([`membership_key`]) or an owner key
+/// ([`owner_key`]).
 ///
 /// A control character, so the key orders by the identifier FIRST — the only name this
-/// emulator holds for a member, and so the order `sortBy=NAME` asks for — while still
-/// telling a user apart from a group that happens to share its identifier.
-const MEMBERSHIP_KEY_SEPARATOR: char = '\u{1}';
+/// emulator holds for a principal, and so the order `sortBy=NAME` asks for — while
+/// still telling a user apart from a group that happens to share its identifier.
+const PRINCIPAL_KEY_SEPARATOR: char = '\u{1}';
 
 /// The key one membership is stored under.
 ///
 /// Injective in `(identifier, kind)`: the kind tag is always last and the two tags are
 /// distinct, so no two different members can key to the same string.
 pub fn membership_key(kind: MemberKind, identifier: &str) -> String {
-    format!("{identifier}{MEMBERSHIP_KEY_SEPARATOR}{}", kind.tag())
+    format!("{identifier}{PRINCIPAL_KEY_SEPARATOR}{}", kind.tag())
 }
 
 /// The principal a `Member` union value names.
@@ -744,34 +930,170 @@ pub fn membership_from_request(
     ))
 }
 
-/// One stored DataZone catalog asset.
+/// One stored DataZone catalog asset: the identity the catalog addresses it by, plus
+/// every recorded revision of its metadata.
 ///
-/// An asset is versioned: `revision` is the newest revision's number and the
-/// `first_revision_*` fields remember who made revision one. This slice stores the
-/// latest revision only — `CreateAssetRevision` and `ListAssetRevisions` are still
-/// scaffolds — so the two agree until a revision is added.
+/// An asset is versioned. `CreateAsset` records revision [`FIRST_REVISION`] and each
+/// `CreateAssetRevision` records the next number, so what a revision CHANGES lives on
+/// the [`AssetRevision`] and what identifies the asset — its id, the domain and project
+/// it belongs to, its type, the identifier of the system it was imported from — stays
+/// here, unchanged by any revision (`CreateAssetRevisionInput` names none of them,
+/// smithy_query operation="CreateAssetRevision"). A revision already recorded is never
+/// rewritten, so an earlier one stays readable by number after a later one is added.
 #[derive(Debug, Clone)]
 pub struct Asset {
     pub id: String,
     pub domain_id: String,
     pub owning_project_id: String,
-    pub name: String,
-    pub description: Option<String>,
     pub external_identifier: Option<String>,
     pub type_identifier: String,
+    /// Every recorded revision, keyed by its number so the greatest key is the latest
+    /// and the least is the first. NEVER empty: a created asset is its own first
+    /// revision. Bounded by [`MAX_ASSET_REVISIONS`].
+    pub revisions: BTreeMap<u32, AssetRevision>,
+}
+
+impl Asset {
+    /// The greatest revision number recorded: the revision a call that names none
+    /// reads, and the one a new revision supersedes.
+    pub fn latest_revision(&self) -> Option<&AssetRevision> {
+        self.revisions.values().next_back()
+    }
+
+    /// The least revision number recorded — the one `CreateAsset` minted — which is
+    /// what the `firstRevisionCreatedBy`/`firstRevisionCreatedAt` members report.
+    pub fn first_revision(&self) -> Option<&AssetRevision> {
+        self.revisions.values().next()
+    }
+
+    /// The revision addressed by a `Revision` string, by the rule [`revision_number`]
+    /// states. `None` when this asset has no such revision.
+    pub fn revision(&self, revision: &str) -> Option<&AssetRevision> {
+        self.revisions.get(&revision_number(revision)?)
+    }
+
+    /// The number the NEXT recorded revision gets: one past the greatest ever recorded,
+    /// so revision numbers never go backwards.
+    pub fn next_revision_number(&self) -> u32 {
+        self.revisions.keys().next_back().copied().unwrap_or(0) + 1
+    }
+
+    /// The revision carrying `token`, if a `CreateAssetRevision` with that
+    /// `clientToken` already recorded one of this asset's revisions.
+    pub fn revision_with_token(&self, token: &str) -> Option<&AssetRevision> {
+        self.revisions
+            .values()
+            .find(|revision| revision.client_token.as_deref() == Some(token))
+    }
+}
+
+/// One recorded revision of an asset: the asset's metadata as the call that recorded
+/// that revision set it.
+#[derive(Debug, Clone)]
+pub struct AssetRevision {
+    /// The revision number, rendered as the modelled `Revision` string: the revision
+    /// `CreateAsset` records renders as [`FIRST_REVISION`].
+    pub revision: u32,
+    pub name: String,
+    pub description: Option<String>,
+    /// The revision of the asset TYPE this revision of the asset is bound to.
     pub type_revision: String,
-    pub revision: String,
-    pub created_by: String,
-    pub created_at_ms: i64,
-    pub first_revision_created_by: String,
-    pub first_revision_created_at_ms: i64,
     pub glossary_terms: Vec<String>,
-    /// The metadata forms attached to the asset, in the order the request listed them
-    /// and keyed by form name (a name appears at most once).
+    /// The metadata forms attached at this revision, in the order the request listed
+    /// them and keyed by form name (a name appears at most once).
     pub forms: Vec<StoredForm>,
     /// The `predictionConfiguration` the request set, mirrored member for member so a
     /// read reports exactly what was written.
     pub prediction_configuration: Option<StoredPredictionConfiguration>,
+    /// The caller that recorded this revision, and when — the `createdBy`/`createdAt`
+    /// an asset read at this revision reports.
+    pub created_by: String,
+    pub created_at_ms: i64,
+    /// The `clientToken` of the `CreateAssetRevision` that recorded this revision, so a
+    /// replay of that request answers with it instead of recording a second one.
+    /// `None` on the revision `CreateAsset` records: that token created the ASSET, so it
+    /// is remembered in the store's own idempotency map ([`IdempotencyKey::asset`]).
+    pub client_token: Option<String>,
+}
+
+impl AssetRevision {
+    /// This revision as the modelled `Revision` string.
+    pub fn revision_string(&self) -> String {
+        self.revision.to_string()
+    }
+}
+
+/// The metadata forms a request's `formsInput` attaches to a revision of an asset, in
+/// stored form, or the message a bad `formsInput` is refused with.
+///
+/// A form is identified on the asset by its `formName` — that is the only way
+/// `formsOutput` names one — so two forms in one request cannot share a name. A form
+/// bound to a type whose revision the request did not name is bound to that type's
+/// first revision, and a form that names no type has no type revision either. Shared by
+/// `CreateAsset` and `CreateAssetRevision` so the two cannot read one `formsInput`
+/// differently.
+pub fn stored_forms(
+    forms_input: Vec<crate::ops::types::FormInput>,
+) -> Result<Vec<StoredForm>, String> {
+    let mut seen_form_names = std::collections::BTreeSet::new();
+    for form in &forms_input {
+        if !seen_form_names.insert(form.form_name.as_str()) {
+            return Err(format!(
+                "formsInput names the form {} more than once; a form name is unique within an asset",
+                form.form_name
+            ));
+        }
+    }
+    Ok(forms_input
+        .into_iter()
+        .map(|form| StoredForm {
+            type_name: form.type_identifier.clone(),
+            type_revision: form.type_revision.or_else(|| {
+                form.type_identifier
+                    .as_ref()
+                    .map(|_| FIRST_REVISION.to_string())
+            }),
+            form_name: form.form_name,
+            content: form.content,
+        })
+        .collect())
+}
+
+/// The asset-type revision an asset (or a new revision of one) is bound to, or the
+/// message a `typeRevision` that names no revision of that type is refused with.
+///
+/// "--type-revision (if used) must match a valid revision of the asset type"
+/// (smithy_query query="doc" shape="CreateAsset"): a pinned revision is checked against
+/// the revision the STORED type is at, and a type no store holds — one the SERVICE
+/// defines, such as `amazon.datazone.RelationalTable` — carries no revision to check
+/// against, so a pin on it is taken as given. A request that pins none keeps `fallback`
+/// (the revision the asset is already bound to, for a new revision of an existing
+/// asset), else takes the revision the stored type is at, else the first revision.
+///
+/// Shared by `CreateAsset` and `CreateAssetRevision` so the two cannot read one
+/// `typeRevision` differently.
+pub fn asset_type_revision(
+    domain: &Domain,
+    type_identifier: &str,
+    pinned: Option<&str>,
+    fallback: Option<&str>,
+) -> Result<String, String> {
+    let stored = domain
+        .asset_types
+        .get(type_identifier)
+        .map(|asset_type| asset_type.revision.as_str());
+    if let (Some(pinned), Some(stored)) = (pinned, stored) {
+        if pinned != stored {
+            return Err(format!(
+                "typeRevision {pinned} is not a revision of asset type {type_identifier}, which is at revision {stored}"
+            ));
+        }
+    }
+    Ok(pinned
+        .or(fallback)
+        .or(stored)
+        .unwrap_or(FIRST_REVISION)
+        .to_string())
 }
 
 /// One metadata form attached to an asset: the stored form of the modelled
@@ -967,9 +1289,21 @@ pub const MAX_FORM_TYPE_REVISIONS: usize = 100;
 /// under a parent that is itself stored.
 pub const MAX_DOMAIN_UNITS_PER_DOMAIN: usize = 100;
 
+/// The most owners this emulator keeps on one entity, for the same reason and with the
+/// same refusal (`AddEntityOwner` models `ServiceQuotaExceededException` too): adding
+/// owners is caller-driven growth of a stored entity.
+pub const MAX_OWNERS_PER_ENTITY: usize = 100;
+
 /// The most assets this emulator stores in one domain, for the same reason and with the
 /// same refusal (`CreateAsset` models `ServiceQuotaExceededException` too).
 pub const MAX_ASSETS_PER_DOMAIN: usize = 500;
+
+/// The most revisions this emulator records for one asset. Each `CreateAssetRevision`
+/// appends one, so this is the bound on that caller-driven growth; `CreateAssetRevision`
+/// models no `ServiceQuotaExceededException` (smithy_query
+/// operation="CreateAssetRevision"), so the refusal past it is its `ValidationException`
+/// — the rule `CreateProjectMembership` follows for a bound its own model does not name.
+pub const MAX_ASSET_REVISIONS: usize = 100;
 
 /// The most policy grants this emulator stores in one domain, for the same reason and
 /// with the same refusal (`AddPolicyGrant` models `ServiceQuotaExceededException` too).
@@ -1355,6 +1689,41 @@ impl ComAmazonawsDatazoneDatazoneState {
         self.domains.get(domain_id)?.domain_units.get(unit_id)
     }
 
+    /// The entity an entity-owner call names, when it is stored.
+    ///
+    /// `DataZoneEntityType` has exactly one member, `DOMAIN_UNIT` (smithy_query
+    /// shape="DataZoneEntityType"), so the entity owners are kept on is the domain unit
+    /// `entity_id` of domain `domain_id`. `None` when `entity_type` is not that member
+    /// or either resource is not stored, so `AddEntityOwner`, `ListEntityOwners` and
+    /// `RemoveEntityOwner` all resolve the pair by one rule.
+    pub fn owned_entity(
+        &self,
+        domain_id: &str,
+        entity_type: &str,
+        entity_id: &str,
+    ) -> Option<&DomainUnit> {
+        if entity_type != DATA_ZONE_ENTITY_TYPE_DOMAIN_UNIT {
+            return None;
+        }
+        self.domain_unit(domain_id, entity_id)
+    }
+
+    /// [`Self::owned_entity`], for a call that writes the entity's owners.
+    pub fn owned_entity_mut(
+        &mut self,
+        domain_id: &str,
+        entity_type: &str,
+        entity_id: &str,
+    ) -> Option<&mut DomainUnit> {
+        if entity_type != DATA_ZONE_ENTITY_TYPE_DOMAIN_UNIT {
+            return None;
+        }
+        self.domains
+            .get_mut(domain_id)?
+            .domain_units
+            .get_mut(entity_id)
+    }
+
     /// The live domain that already carries `name`, if the account has one.
     ///
     /// A domain name is unique within the account, so this is what `CreateDomain`
@@ -1517,6 +1886,7 @@ pub enum ResourceKind {
     DomainUnit,
     Project,
     AssetType,
+    FormType,
     Glossary,
     Asset,
     DataProduct,
@@ -1531,6 +1901,7 @@ impl ResourceKind {
             Self::DomainUnit => "Domain unit",
             Self::Project => "Project",
             Self::AssetType => "Asset type",
+            Self::FormType => "Form type",
             Self::Glossary => "Glossary",
             Self::Asset => "Asset",
             Self::DataProduct => "Data product",
@@ -1544,9 +1915,22 @@ impl ResourceKind {
     /// not-found message in this service's handlers through this, so none of them can
     /// echo the request back.
     pub fn not_found_message(self) -> String {
-        format!("{} not found", self.as_str())
+        match self {
+            // Recorded behaviour: a metadata form type DataZone cannot find is reported
+            // with its own sentence rather than the "<Kind> not found" form. Still a
+            // fixed text naming only the kind, so it echoes nothing back either.
+            Self::FormType => FORM_TYPE_NOT_FOUND_MESSAGE.to_string(),
+            _ => format!("{} not found", self.as_str()),
+        }
     }
 }
+
+/// The `ResourceNotFoundException` message DataZone answers for a metadata form type it
+/// cannot find — [`ResourceKind::FormType`]'s not-found text, recorded from the service.
+/// Every handler that addresses a form type (`GetFormType`, `DeleteFormType`) answers
+/// the same text, so the two cannot drift.
+pub const FORM_TYPE_NOT_FOUND_MESSAGE: &str =
+    "The given FormType doesn't exist. Try creating FormType before accessing it.";
 
 impl std::fmt::Display for ResourceKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

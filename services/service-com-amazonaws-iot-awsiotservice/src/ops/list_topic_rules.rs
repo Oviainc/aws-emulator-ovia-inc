@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTopicRules
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTopicRules`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTopicRules::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! One page of the account's TOPIC RULES
+//! (`crate::state::ComAmazonawsIotAwsiotserviceState::topic_rules`), in `ruleName`
+//! order, narrowed by the request's filters: every entry is built from the record
+//! `CreateTopicRule` persisted, so what this reports and what `GetTopicRule` reads are
+//! one value.
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +145,239 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTopicRules` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTopicRulesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTopicRules"))
+        let _ = ctx;
+
+        // The filters are resolved BEFORE the store is reached: a request whose
+        // `nextToken` is not one THIS listing issued is refused whatever the store
+        // holds.
+        let scope = listing_scope(input.topic.as_deref(), input.rule_disabled);
+        let resume_after = match input.next_token.as_deref() {
+            Some(token) => Some(decode_next_token(token, &scope)?),
+            None => None,
+        };
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListTopicRulesErrorModeled::InternalException(InternalException {
+                message: Some("the IoT emulator has no state store attached".to_string()),
+            })
+        })?;
+
+        // `maxResults` is `range 1..10000`, refused outside that before this handler
+        // runs, so a request that names it asks for at least one rule; one that does
+        // not asks for every rule that matches. The clamp is defensive rather than
+        // load-bearing: it keeps the page size inside the modelled range without
+        // depending on a validation performed outside this module.
+        let page_size = input
+            .max_results
+            .map_or(usize::MAX, |max| max.clamp(1, MAX_PAGE_SIZE) as usize);
+
+        // A pure read of the rules store: nothing here writes, so a later caller sees
+        // exactly what this one did.
+        let store = state.lock();
+        let mut page: Vec<TopicRuleListItem> = store
+            .topic_rules
+            .values()
+            // The store is keyed by name, so iteration is already `ruleName` order and
+            // "the rules whose name sorts after the last one emitted" is a well-defined
+            // resume point even if that rule has since been deleted.
+            .filter(|rule| {
+                resume_after
+                    .as_deref()
+                    .is_none_or(|cursor| rule.rule_name.as_str() > cursor)
+            })
+            // `ruleDisabled` is "Specifies whether the rule is disabled": a request
+            // that names it asks for the rules in that state only.
+            .filter(|rule| {
+                input
+                    .rule_disabled
+                    .is_none_or(|wanted| rule.rule_disabled == wanted)
+            })
+            // The operation "Lists the rules for the specific topic": a rule is one of
+            // that topic's rules when the topic filter its SQL selects from matches the
+            // topic. A rule whose statement names no topic filter matches no topic.
+            .filter(|rule| {
+                input.topic.as_deref().is_none_or(|topic| {
+                    rule.topic_pattern
+                        .as_deref()
+                        .is_some_and(|pattern| topic_filter_matches(pattern, topic))
+                })
+            })
+            // One rule beyond the page: its presence is what says the listing is
+            // truncated, and nothing more than that is read.
+            .take(page_size.saturating_add(1))
+            .map(topic_rule_list_item)
+            .collect();
+        let truncated = page.len() > page_size;
+        page.truncate(page_size);
+
+        // `nextToken` is "The token to use to get the next set of results, or null if
+        // there are no additional results."
+        let next_token = if truncated {
+            page.last()
+                .and_then(|last| last.rule_name.as_deref())
+                .map(|last_name| encode_next_token(&scope, last_name))
+        } else {
+            None
+        };
+
+        Ok(ListTopicRulesOutput {
+            // `TopicRuleList` carries no length constraint, so a store with no matching
+            // rule answers with an EMPTY list rather than an absent member: "nothing
+            // matches" is an answer, not a missing one.
+            rules: Some(page),
+            next_token,
+        })
     }
+}
+
+/// `TopicRuleMaxResults`'s modelled maximum (`range 1..10000`), which is also the most
+/// rules one page may carry.
+const MAX_PAGE_SIZE: i32 = 10_000;
+
+/// One stored rule as the modelled `TopicRuleListItem` a page carries.
+///
+/// Every member is read off the record `CreateTopicRule` persisted — the ARN it was
+/// minted with, the name it is keyed by, the instant it was created and whether it is
+/// disabled — and `topicPattern` is the topic filter resolved from its SQL statement on
+/// that write (`crate::state::topic_pattern_of_sql`), so a listing and a `GetTopicRule`
+/// of the same rule cannot disagree.
+fn topic_rule_list_item(rule: &crate::state::RegisteredTopicRule) -> TopicRuleListItem {
+    TopicRuleListItem {
+        rule_arn: Some(rule.rule_arn.clone()),
+        rule_name: Some(rule.rule_name.clone()),
+        topic_pattern: rule.topic_pattern.clone(),
+        created_at: Some(::aws_smithy_types::DateTime::from(rule.created_at)),
+        rule_disabled: Some(rule.rule_disabled),
+    }
+}
+
+/// Whether the MQTT topic filter `pattern` covers the topic name `topic`.
+///
+/// A rule's `FROM` clause names an MQTT topic filter, whose matching rules are the MQTT
+/// 3.1.1 specification's (§4.7, the rules AWS IoT Core's "Topics" documentation
+/// restates): levels are separated by `/`; `+` matches exactly one level; `#` is legal
+/// only as the LAST level, and there it matches the remaining levels and the parent
+/// level too (`sport/#` covers `sport`); and a filter starting with a wildcard never
+/// matches a topic beginning with `$`, the prefix AWS IoT reserves for its own topics.
+/// A filter with no wildcard therefore covers exactly the topic equal to it, and a
+/// filter that puts `#` anywhere but last is not a topic filter at all, so it covers
+/// nothing.
+fn topic_filter_matches(pattern: &str, topic: &str) -> bool {
+    let filter: Vec<&str> = pattern.split(TOPIC_LEVEL_SEPARATOR).collect();
+    let levels: Vec<&str> = topic.split(TOPIC_LEVEL_SEPARATOR).collect();
+
+    if topic.starts_with(RESERVED_TOPIC_PREFIX)
+        && matches!(
+            filter.first(),
+            Some(&MULTI_LEVEL_WILDCARD) | Some(&SINGLE_LEVEL_WILDCARD)
+        )
+    {
+        return false;
+    }
+
+    let mut index = 0;
+    while index < filter.len() {
+        match filter[index] {
+            // The multi-level wildcard ends the walk either way: as the last level it
+            // covers every level that is left and the parent level as well, and
+            // anywhere else it makes the filter malformed, which covers nothing. Every
+            // level before it has already matched, so nothing more is read.
+            MULTI_LEVEL_WILDCARD => return index + 1 == filter.len(),
+            SINGLE_LEVEL_WILDCARD if index < levels.len() => {}
+            level if index < levels.len() && level == levels[index] => {}
+            _ => return false,
+        }
+        index += 1;
+    }
+    // No wildcard ended the walk, so the filter covers the topic only when the two have
+    // the same number of levels.
+    index == levels.len()
+}
+
+/// The character that separates the levels of an MQTT topic name or filter.
+const TOPIC_LEVEL_SEPARATOR: char = '/';
+
+/// The MQTT single-level wildcard: one topic level, whatever it is.
+const SINGLE_LEVEL_WILDCARD: &str = "+";
+
+/// The MQTT multi-level wildcard: the rest of the topic.
+const MULTI_LEVEL_WILDCARD: &str = "#";
+
+/// The prefix AWS IoT reserves for its own topics, which a wildcard does not reach.
+const RESERVED_TOPIC_PREFIX: char = '$';
+
+/// The character that separates the fields of a token's SCOPE. A control character, so
+/// it cannot occur in either field it joins: both are built here out of hex digits and
+/// single ASCII letters.
+const SCOPE_SEPARATOR: char = '\u{1e}';
+
+/// The character that separates a token's scope from the rule name it resumes after.
+/// Outside `RuleName`'s pattern (`^[a-zA-Z0-9_]+$`) and outside the scope's alphabet,
+/// so the split is unambiguous.
+const TOKEN_SEPARATOR: char = '\u{1f}';
+
+/// The LISTING a continuation token belongs to: its filters, which decide which rules it
+/// walks and therefore what "the next set of results" means.
+///
+/// `Topic` carries no modelled pattern, so a topic could contain any character a token
+/// uses as a separator; it is hex-encoded here so a scope field can never be forged out
+/// of a topic, and tagged so an ABSENT topic and a supplied empty one stay distinct.
+fn listing_scope(topic: Option<&str>, rule_disabled: Option<bool>) -> String {
+    let topic_scope = match topic {
+        None => "n".to_string(),
+        Some(topic) => format!("t{}", ::hex::encode(topic)),
+    };
+    let disabled_scope = match rule_disabled {
+        None => "a",
+        Some(true) => "d",
+        Some(false) => "e",
+    };
+    format!("{disabled_scope}{SCOPE_SEPARATOR}{topic_scope}")
+}
+
+/// The opaque `nextToken` that resumes `scope`'s listing after the rule named
+/// `last_name`.
+///
+/// Hex-encoded so the token is opaque to the caller whatever the filters contain. The
+/// encoding carries no integrity protection and claims none: a caller that reverses it
+/// can name any resume point of the listing it is already reading, which selects a page
+/// of that same listing and nothing else.
+fn encode_next_token(scope: &str, last_name: &str) -> String {
+    ::hex::encode(format!("{scope}{TOKEN_SEPARATOR}{last_name}"))
+}
+
+/// The rule name a `nextToken` resumes after, or `InvalidRequestException` (HTTP 400,
+/// "The request is not valid") when the token is not one [`encode_next_token`] issued
+/// for THIS listing.
+///
+/// Every step is fallible on purpose: the token is caller-supplied, so nothing read out
+/// of it may panic the handler. A token issued for another filter set is refused rather
+/// than silently restarting a different listing from the middle.
+fn decode_next_token(token: &str, scope: &str) -> Result<String, ListTopicRulesError> {
+    let invalid = || -> ListTopicRulesError {
+        ListTopicRulesErrorModeled::InvalidRequestException(InvalidRequestException {
+            message: Some("nextToken is not a continuation token of this listing".to_string()),
+        })
+        .into()
+    };
+    let bytes = ::hex::decode(token).map_err(|_| invalid())?;
+    let decoded = String::from_utf8(bytes).map_err(|_| invalid())?;
+    let (token_scope, resume_after) = decoded.split_once(TOKEN_SEPARATOR).ok_or_else(invalid)?;
+    // A resume point outside `RuleName` could name no rule in the store, so a token
+    // carrying one was not issued by this listing.
+    if token_scope != scope || !is_modeled_rule_name(resume_after) {
+        return Err(invalid());
+    }
+    Ok(resume_after.to_string())
+}
+
+/// Whether `name` satisfies the model's `RuleName`: 1..128 characters matching
+/// `^[a-zA-Z0-9_]+$` (`smithy_query(query="shape",shape="RuleName")`). Smithy `length`
+/// counts CHARACTERS, so this does too.
+fn is_modeled_rule_name(name: &str) -> bool {
+    let length = name.chars().count();
+    (1..=128).contains(&length)
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
 }

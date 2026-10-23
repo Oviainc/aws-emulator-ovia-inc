@@ -208,35 +208,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: format!("Asset {} was not found", input.identifier),
             })
         })?;
-        // A revision the asset does not have names no stored resource.
-        if let Some(wanted) = input.revision.as_deref() {
-            if wanted != asset.revision {
-                return Err(GetAssetErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: format!(
-                            "Asset {} has no revision {wanted}",
-                            input.identifier
-                        ),
-                    },
-                )
-                .into());
-            }
-        }
+        // The revision read: the one the request addresses, or the asset's latest when
+        // it addresses none. A revision the asset has no record of names no stored
+        // resource — and a revision superseded by a later one is still a record this
+        // store holds, so it reads back as it was recorded.
+        let revision = match input.revision.as_deref() {
+            Some(wanted) => asset.revision(wanted).ok_or_else(|| {
+                GetAssetErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message: format!("Asset {} has no revision {wanted}", input.identifier),
+                })
+            })?,
+            None => asset.latest_revision().ok_or_else(|| {
+                GetAssetErrorModeled::InternalServerException(InternalServerException {
+                    message: "the stored asset has no revision".to_string(),
+                })
+            })?,
+        };
+        // `firstRevisionCreatedBy`/`firstRevisionCreatedAt` report the asset's OWN
+        // first revision, whichever revision is being read.
+        let first = asset.first_revision().unwrap_or(revision);
 
         Ok(GetAssetOutput {
             id: asset.id.clone(),
-            name: asset.name.clone(),
+            name: revision.name.clone(),
             type_identifier: asset.type_identifier.clone(),
-            type_revision: asset.type_revision.clone(),
+            type_revision: revision.type_revision.clone(),
             external_identifier: asset.external_identifier.clone(),
-            revision: asset.revision.clone(),
-            description: asset.description.clone(),
-            created_at: Some(date_time(asset.created_at_ms)),
-            created_by: Some(asset.created_by.clone()),
-            first_revision_created_at: Some(date_time(asset.first_revision_created_at_ms)),
-            first_revision_created_by: Some(asset.first_revision_created_by.clone()),
-            glossary_terms: (!asset.glossary_terms.is_empty())
-                .then(|| asset.glossary_terms.clone()),
+            revision: revision.revision_string(),
+            description: revision.description.clone(),
+            created_at: Some(date_time(revision.created_at_ms)),
+            created_by: Some(revision.created_by.clone()),
+            first_revision_created_at: Some(date_time(first.created_at_ms)),
+            first_revision_created_by: Some(first.created_by.clone()),
+            glossary_terms: (!revision.glossary_terms.is_empty())
+                .then(|| revision.glossary_terms.clone()),
             // Governed glossary terms are attached by `AssociateGovernedTerms`, which
             // this emulator does not serve yet, so no asset carries any.
             governed_glossary_terms: None,
@@ -251,7 +256,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     listing_id: listing.id.clone(),
                     listing_status: listing.status.clone(),
                 }),
-            forms_output: asset
+            forms_output: revision
                 .forms
                 .iter()
                 .map(|form| FormOutput {

@@ -44,10 +44,26 @@ pub const MONITOR_STATE_ACTIVE: &str = "ACTIVE";
 pub const MONITOR_STATE_INACTIVE: &str = "INACTIVE";
 
 /// `ProbeState` of a probe that is not sending packets yet (model enum
-/// `ProbeState`).
+/// `ProbeState`). SERVICE-ASSIGNED: the service puts a probe here while it
+/// provisions, so a caller cannot ask for it ([`SETTABLE_PROBE_STATES`]).
 pub const PROBE_STATE_PENDING: &str = "PENDING";
 /// `ProbeState` of a live probe.
 pub const PROBE_STATE_ACTIVE: &str = "ACTIVE";
+/// `ProbeState` of a probe a caller has switched off: it keeps its
+/// configuration but sends no packets.
+pub const PROBE_STATE_INACTIVE: &str = "INACTIVE";
+
+/// The `ProbeState` values a CALLER may ask a probe to be put into.
+///
+/// The model's `ProbeState` enum is the catalog of states a probe can be
+/// REPORTED in (`PENDING | ACTIVE | INACTIVE | ERROR | DELETING | DELETED`),
+/// and most of those the service assigns itself over a probe's lifecycle: it
+/// provisions through `PENDING`, records its own failure as `ERROR` and tears a
+/// probe down through `DELETING` / `DELETED`. The only states a request names
+/// are the two halves of the documented activate/deactivate toggle, so
+/// `UpdateProbeInput$state` ("The state of the probe update") admits exactly
+/// these; see [`validate_settable_probe_state`].
+pub const SETTABLE_PROBE_STATES: &[&str] = &[PROBE_STATE_ACTIVE, PROBE_STATE_INACTIVE];
 
 /// `AddressFamily` of an IPv4 destination (model enum `AddressFamily`).
 pub const ADDRESS_FAMILY_IPV4: &str = "IPV4";
@@ -68,6 +84,17 @@ pub const AGGREGATION_PERIODS: &[i64] = &[30, 60];
 /// The `aggregationPeriod` a monitor gets when the create request named none —
 /// the documented default (same doc sentence as [`AGGREGATION_PERIODS`]).
 pub const DEFAULT_AGGREGATION_PERIOD: i64 = 60;
+
+/// The refusal message for the cross-member rule the model states for both the
+/// create and the update path: `ProbeInput$destinationPort` is "required only if
+/// the `protocol` is `TCP`", and `UpdateProbeInput$protocol` — "If the protocol
+/// is `TCP`, then `port` is also required".
+///
+/// A FIXED sentence determined by that rule rather than by the request: it names
+/// no value the caller sent, so every operation that applies the rule
+/// ([`validate_probe_spec`], reached by `CreateMonitor`, `CreateProbe` and
+/// `UpdateProbe`) emits this one sentence.
+pub const TCP_PORT_REQUIRED_MESSAGE: &str = "Destination port must be provided for TCP protocol.";
 
 /// The smallest `destinationPort` the service accepts, from the model doc for
 /// `ProbeInput$destinationPort` ("must be a number between `1` and `65536`").
@@ -379,9 +406,7 @@ pub fn validate_probe_spec(spec: &ProbeSpec) -> Result<&'static str, String> {
         ));
     };
     if spec.protocol == PROTOCOL_TCP && spec.destination_port.is_none() {
-        return Err(format!(
-            "destinationPort is required when protocol is {PROTOCOL_TCP}"
-        ));
+        return Err(TCP_PORT_REQUIRED_MESSAGE.to_string());
     }
     if let Some(port) = spec.destination_port {
         if port < MIN_DESTINATION_PORT {
@@ -391,6 +416,20 @@ pub fn validate_probe_spec(spec: &ProbeSpec) -> Result<&'static str, String> {
         }
     }
     Ok(address_family)
+}
+
+/// Check that `requested` is a state a CALLER may put a probe into.
+///
+/// The modelled `ProbeState` enum carries the service's own lifecycle values
+/// beside the settable ones, so the enum alone cannot express this: the
+/// allow-list ([`SETTABLE_PROBE_STATES`]) is enforced by the operation that
+/// takes the member. `Err` carries the message that names the rejected status,
+/// which is what the caller has to fix in its request.
+pub fn validate_settable_probe_state(requested: &str) -> Result<(), String> {
+    if SETTABLE_PROBE_STATES.contains(&requested) {
+        return Ok(());
+    }
+    Err(format!("{requested} is not a valid probe status."))
 }
 
 /// A probe: one source-subnet-to-destination path inside a monitor.
@@ -434,18 +473,6 @@ impl Probe {
         }
     }
 
-    /// Record that this probe is provisioning again: it is `PENDING` now and the
-    /// clock owes it [`PROBE_STATE_ACTIVE`] [`ACTIVATION_AFTER`] from `now`.
-    ///
-    /// Called by the mutating operation that puts a probe back into
-    /// [`PROBE_STATE_PENDING`], so the due instant moves with it rather than
-    /// staying in the past, where `settle_monitor` would settle the probe
-    /// straight back to `ACTIVE` and the caller would never observe the state it
-    /// asked for.
-    pub fn schedule_activation(&mut self, now: SystemTime) {
-        self.state = PROBE_STATE_PENDING.to_string();
-        self.activates_at = now.checked_add(ACTIVATION_AFTER).unwrap_or(now);
-    }
 }
 
 /// A monitor: the container `CreateMonitor` inserts, holding its own probes.

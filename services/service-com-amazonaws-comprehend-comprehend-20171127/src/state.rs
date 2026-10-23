@@ -24,6 +24,14 @@
 //! reveals it once the clock owes the transition. A job whose run has not reported yet
 //! stays `IN_PROGRESS`, because it is still running.
 //!
+//! [`run_analysis_job`] is the ONE batch run every family's `Start*DetectionJob`
+//! performs — list the input objects, read each one, split it into documents, analyse
+//! each document and write the `output.tar.gz` — parametrised by the per-document
+//! analysis the family models, so no two families can disagree about how an input is
+//! read, bounded or reported. [`AnalysisJob::record_run_outcome`] is the ONE place a
+//! finished run is recorded, and it is what keeps the `SUBMITTED` -> `IN_PROGRESS`
+//! -> terminal walk observable however long the run itself took.
+//!
 //! ## Bounds
 //!
 //! Every collection here is bounded, so no sequence of requests can grow this store
@@ -108,7 +116,8 @@
 //! service-wide helpers that live here rather than in one operation's file.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::io::Write;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 
@@ -236,14 +245,19 @@ pub fn remove_tags(held: &mut Vec<Tag>, tag_keys: &[String]) {
     held.retain(|tag| !tag_keys.contains(&tag.key));
 }
 
-/// What a tagging operation tells a caller whose `ResourceArn` names no resource
-/// this service holds.
+/// The message a `ResourceNotFoundException` carries, whichever operation raised it
+/// and whatever `ResourceArn` was asked for.
 ///
-/// ONE fixed sentence, naming no ARN: that is what Comprehend answers for an unknown
-/// resource ARN, exactly as `JOB_NOT_FOUND_MESSAGE` is the one sentence an unknown
-/// `JobId` gets. Shared by `TagResource`, `UntagResource` and `ListTagsForResource`,
-/// so an unknown ARN gets one answer whichever of them is called with it.
-pub const RESOURCE_NOT_FOUND_MESSAGE: &str = "RESOURCE_NOT_FOUND: Could not find specified resource.";
+/// Amazon Comprehend answers a well-formed ARN that names no resource with ONE fixed
+/// sentence, carrying the service's own reason code and NOTHING derived from the
+/// request: the refusal states that the service holds no such resource and never
+/// echoes the ARN back. Fixed for the same reason as [`JOB_NOT_FOUND_MESSAGE`], and
+/// shared by every operation that resolves a resource by ARN — the tagging
+/// operations (`TagResource`, `UntagResource`, `ListTagsForResource`), the
+/// custom-model Describe/Delete/StopTraining operations and the resource-policy
+/// operations — so no two of them can disclose a different amount about the request.
+pub const RESOURCE_NOT_FOUND_MESSAGE: &str =
+    "RESOURCE_NOT_FOUND: Could not find specified resource.";
 
 /// Why a job whose batch run this emulator does not perform ends in the modelled
 /// `FAILED` state, naming the analysis that was not carried out and both S3
@@ -251,11 +265,12 @@ pub const RESOURCE_NOT_FOUND_MESSAGE: &str = "RESOURCE_NOT_FOUND: Could not find
 ///
 /// Running one of these jobs means reading the documents from the Amazon S3 location
 /// `InputDataConfig` names, analysing each one and writing the analysed output back
-/// to `OutputDataConfig`. The family whose run this emulator DOES perform —
-/// dominant-language detection — records what its run actually did; every other
-/// family's job ends with this reason instead of reporting a `COMPLETED` run that
-/// nothing performed. `analysis` names the family's work ("Sentiment analysis",
-/// "Key-phrase extraction", …).
+/// to `OutputDataConfig`. The families whose run this emulator DOES perform —
+/// dominant-language detection, key-phrase extraction and sentiment analysis — record
+/// what their run actually did ([`run_analysis_job`]); a family whose per-document
+/// analysis this emulator cannot carry out ends with this reason instead of reporting
+/// a `COMPLETED` run that nothing performed. `analysis` names the family's work
+/// ("PII entity detection", …).
 pub fn unperformed_run_message(
     analysis: &str,
     input: &InputDataConfig,
@@ -275,11 +290,6 @@ pub fn unperformed_run_message(
 /// `COMPLETED` and `FAILED` end a run, and `STOPPED` ends a cancellation. The
 /// remaining three (`SUBMITTED`, `IN_PROGRESS`, `STOP_REQUESTED`) all still owe
 /// the clock a transition, so each of them is still stoppable.
-///
-/// `COMPLETED` is listed because the modelled vocabulary has it and this record
-/// serves every job family, not because a job this emulator persists can reach
-/// it: [`AnalysisJob::settle`] ends a started job in `FAILED`, so `COMPLETED` is
-/// reserved for a family whose work this emulator can genuinely perform.
 pub const TERMINAL_JOB_STATUSES: &[&str] = &["COMPLETED", "FAILED", "STOPPED"];
 
 /// The message a `JobNotFoundException` carries, whichever job operation raised
@@ -673,6 +683,30 @@ impl AnalysisJob {
         }
     }
 
+    /// Record what this job's run reported, as of the instant `now` it reported it.
+    ///
+    /// The clock cannot have owed a status change for a phase that had not elapsed
+    /// yet: a run that took longer than [`QUEUE_SPAN`] (reading object storage,
+    /// analysing a large input) was still queued-or-running the whole time it ran, so
+    /// the instants the remaining transitions are owed at are carried forward from
+    /// the report rather than left in the past. That is what keeps every phase
+    /// OBSERVABLE — a caller polling after the submission returns sees `IN_PROGRESS`
+    /// before the terminal status however long the run took — while a transition
+    /// whose span really has not elapsed yet keeps the instant it was submitted with.
+    ///
+    /// Only the outcome is recorded here; [`Self::settle`] is still the one place a
+    /// status is moved.
+    pub fn record_run_outcome(&mut self, outcome: JobOutcome, now: SystemTime) {
+        self.terminal_outcome = Some(outcome);
+        if now >= self.in_progress_due_at {
+            self.in_progress_due_at = now + QUEUE_SPAN;
+        }
+        let earliest_terminal = self.in_progress_due_at + PROCESSING_SPAN;
+        if self.terminal_due_at < earliest_terminal {
+            self.terminal_due_at = earliest_terminal;
+        }
+    }
+
     /// Record that a caller asked for this job to stop, naming the reason in
     /// `Message`.
     ///
@@ -825,6 +859,546 @@ impl AnalysisJob {
     }
 }
 
+// --- Reading and writing an analysis job's object storage -----------------------
+//
+// Every `Start*DetectionJob` run, and the training run behind
+// `CreateDocumentClassifier`, reaches the SAME object storage the same way, so the
+// client, the URI split, the listing, the bounds and the archive writer live here
+// once rather than once per operation.
+
+/// The most input objects one run reads, and the most bytes it reads from one object
+/// and in total.
+///
+/// AWS publishes its own per-job document and size quotas; these are the EMULATOR's
+/// bounds on work done inside one request, so no submission can make this process
+/// read an unbounded amount of object storage or hold the service for an unbounded
+/// time. A submission that points past them is not silently truncated: the run ends
+/// in the modelled failure state naming the bound it hit.
+pub const MAX_INPUT_OBJECTS: usize = 200;
+/// The most bytes read from one input object (see [`MAX_INPUT_OBJECTS`]).
+pub const MAX_INPUT_OBJECT_BYTES: usize = 1024 * 1024;
+/// The most bytes read across a run's whole input (see [`MAX_INPUT_OBJECTS`]).
+pub const MAX_TOTAL_INPUT_BYTES: usize = 8 * 1024 * 1024;
+
+/// The most documents one job analyses, and the most output bytes it accumulates.
+///
+/// The input bounds above do NOT bound these: `ONE_DOC_PER_LINE` makes every line of
+/// an input object its own document, and every document costs an output entry that
+/// repeats the object's key, so a bounded input can ask for an unbounded multiple of
+/// itself in output. These bounds are on what the run PRODUCES, checked as each
+/// entry is appended, so the archive one request builds can never outgrow them; a
+/// run that reaches one ends in the modelled `FAILED` state naming it.
+pub const MAX_OUTPUT_DOCUMENTS: usize = 100_000;
+/// The most output bytes one job accumulates (see [`MAX_OUTPUT_DOCUMENTS`]).
+pub const MAX_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
+/// How many documents an analysis pass handles between yields.
+///
+/// Analysing a document is CPU work with no await of its own, so the pass hands the
+/// runtime a yield point this often: a cancelled request or a shutdown has somewhere
+/// to land even while one object of many documents is being analysed.
+pub const DOCUMENTS_PER_YIELD: usize = 256;
+
+/// How each input file is split into documents when a submission sets no
+/// `InputFormat`.
+///
+/// The model declares no default for `InputDataConfig$InputFormat`, so this is the
+/// emulator's choice, and it is the coarser of the two: each file is one document
+/// (`ONE_DOC_PER_FILE`), so an output entry names the file it came from and carries
+/// no line number.
+pub const DEFAULT_INPUT_FORMAT: &str = "ONE_DOC_PER_FILE";
+
+/// The single file an analysis job's output archive holds, one JSON document per
+/// line — the form Comprehend's asynchronous analysis output takes inside the
+/// `output.tar.gz` that `OutputDataConfig$S3Uri` documents.
+pub const OUTPUT_ARCHIVE_ENTRY: &str = "output";
+
+/// An `s3://bucket/key` URI split into its parts.
+///
+/// The modelled `S3Uri` pattern (`^s3://[a-z0-9][\.\-a-z0-9]{1,61}[a-z0-9](/.*)?$`)
+/// is enforced before a handler runs, so a URI reaching here always has a bucket and
+/// may have a key.
+#[derive(Debug, Clone)]
+pub struct S3Location {
+    pub bucket: String,
+    pub key: String,
+}
+
+/// Split a modelled `S3Uri` into bucket and key; `None` for a string the pattern
+/// would not have admitted.
+pub fn parse_s3_uri(uri: &str) -> Option<S3Location> {
+    let rest = uri.strip_prefix("s3://")?;
+    let (bucket, key) = match rest.split_once('/') {
+        Some((bucket, key)) => (bucket, key),
+        None => (rest, ""),
+    };
+    (!bucket.is_empty()).then(|| S3Location {
+        bucket: bucket.to_string(),
+        key: key.to_string(),
+    })
+}
+
+/// An Amazon S3 client over the in-process callback into this same emulator.
+///
+/// The callback is the framework's documented seam for calling another emulated
+/// service: it routes in process, so no network client is configured here and this
+/// crate names no other service's crate. `region` is the request's own signing
+/// region, so a run reads and writes where the caller's own S3 requests go.
+pub fn s3_client(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+) -> ::aws_sdk_s3::Client {
+    let config = ::aws_sdk_s3::Config::builder()
+        .behavior_version(::aws_sdk_s3::config::BehaviorVersion::latest())
+        .region(::aws_sdk_s3::config::Region::new(region.to_string()))
+        .endpoint_url(format!("https://s3.{region}.amazonaws.com"))
+        // The in-process transport routes on the request's own path, and a
+        // virtual-host bucket name is not a host this emulator resolves, so every
+        // request addresses its bucket in the path.
+        .force_path_style(true)
+        .credentials_provider(ctx.callback().aws_credentials_provider())
+        .http_client(ctx.callback().http_client())
+        // The transport is in-process: there is nothing to retry, time out or watch
+        // for a stalled stream, and each of those would need a sleep implementation
+        // this client is not given. The same goes for caching the identity: the
+        // credentials are handed over directly.
+        .retry_config(::aws_sdk_s3::config::retry::RetryConfig::disabled())
+        .timeout_config(::aws_sdk_s3::config::timeout::TimeoutConfig::disabled())
+        .identity_cache(::aws_sdk_s3::config::IdentityCache::no_cache())
+        .stalled_stream_protection(::aws_sdk_s3::config::StalledStreamProtectionConfig::disabled())
+        .build();
+    ::aws_sdk_s3::Client::from_conf(config)
+}
+
+/// The input objects under `input` with their listed sizes, in listing order, or the
+/// reason the listing could not be used.
+///
+/// The SIZE is carried so a run can refuse an object, or a whole input, that is past
+/// its byte bounds BEFORE fetching and buffering any of it.
+pub async fn input_objects(
+    client: &::aws_sdk_s3::Client,
+    input: &S3Location,
+) -> Result<Vec<(String, usize)>, String> {
+    let mut objects: Vec<(String, usize)> = Vec::new();
+    let mut continuation: Option<String> = None;
+    loop {
+        let page = client
+            .list_objects_v2()
+            .bucket(&input.bucket)
+            .prefix(&input.key)
+            .set_continuation_token(continuation.clone())
+            .send()
+            .await
+            .map_err(|error| {
+                ::aws_smithy_types::error::display::DisplayErrorContext(&error).to_string()
+            })?;
+        for object in page.contents() {
+            let Some(key) = object.key() else { continue };
+            // A key ending in the delimiter is a folder marker rather than a
+            // document. An EMPTY object is a document: an analysis engine's answer
+            // for text it can place nowhere is an empty list, which is the honest
+            // result for an empty file.
+            if key.ends_with('/') {
+                continue;
+            }
+            objects.push((key.to_string(), object.size().unwrap_or_default().max(0) as usize));
+            if objects.len() > MAX_INPUT_OBJECTS {
+                return Err(format!(
+                    "The input at s3://{}/{} holds more than the {MAX_INPUT_OBJECTS} input \
+                     objects this emulator reads in one job.",
+                    input.bucket, input.key,
+                ));
+            }
+        }
+        match page.next_continuation_token() {
+            Some(token) => continuation = Some(token.to_string()),
+            None => break,
+        }
+    }
+    Ok(objects)
+}
+
+/// Read every object under `input`, bounded by [`MAX_INPUT_OBJECTS`] and the byte
+/// bounds beside it, and hand each one's key and UTF-8 text to `visit`.
+///
+/// The ONE input-reading path: a `Start*DetectionJob`'s analysis run and
+/// `CreateDocumentClassifier`'s training run both read their object storage through
+/// it, so neither can read an input the other would have refused. An `Err` is the
+/// reason the run could not be carried out, ready for the caller's own failure
+/// state.
+pub async fn input_objects_within_bounds(
+    client: &::aws_sdk_s3::Client,
+    input: &S3Location,
+    uri: &str,
+) -> Result<Vec<(String, usize)>, String> {
+    let objects = input_objects(client, input)
+        .await
+        .map_err(|reason| format!("Could not list the input documents at {uri}: {reason}"))?;
+    if objects.is_empty() {
+        return Err(format!("No input documents were found at {uri}."));
+    }
+    // The byte bounds are decided from the LISTED sizes, before a single object is
+    // fetched, so an input past them costs no buffering at all.
+    if let Some((key, size)) = objects
+        .iter()
+        .find(|(_, size)| *size > MAX_INPUT_OBJECT_BYTES)
+    {
+        return Err(format!(
+            "The input document s3://{}/{key} is {size} bytes, more than the \
+             {MAX_INPUT_OBJECT_BYTES} bytes this emulator reads from one document.",
+            input.bucket,
+        ));
+    }
+    let listed_bytes: usize = objects.iter().map(|(_, size)| *size).sum();
+    if listed_bytes > MAX_TOTAL_INPUT_BYTES {
+        return Err(format!(
+            "The input at {uri} is {listed_bytes} bytes, more than the \
+             {MAX_TOTAL_INPUT_BYTES} bytes this emulator reads in one job.",
+        ));
+    }
+    Ok(objects)
+}
+
+/// Fetch one input object as UTF-8 text, charged against `remaining_bytes` — the
+/// bytes this run may still read across its whole input.
+///
+/// The second half of the ONE input-reading path (see
+/// [`input_objects_within_bounds`]), so every run fetches, bounds and decodes an
+/// object the same way. An `Err` is the reason the run could not be carried out.
+pub async fn read_input_object(
+    client: &::aws_sdk_s3::Client,
+    input: &S3Location,
+    key: &str,
+    remaining_bytes: &mut usize,
+) -> Result<String, String> {
+    let object = client
+        .get_object()
+        .bucket(&input.bucket)
+        .key(key)
+        .send()
+        .await
+        .map_err(|error| {
+            format!(
+                "Could not read the input document s3://{}/{key}: {}",
+                input.bucket,
+                ::aws_smithy_types::error::display::DisplayErrorContext(&error),
+            )
+        })?;
+    let body = object.body.collect().await.map_err(|error| {
+        format!(
+            "Could not read the input document s3://{}/{key}: {error}",
+            input.bucket,
+        )
+    })?;
+    let body = body.into_bytes();
+    // The listed size is what the bounds in `input_objects_within_bounds` were
+    // decided from; these are the backstop for an object whose fetched bytes
+    // disagree with its listing.
+    if body.len() > MAX_INPUT_OBJECT_BYTES {
+        return Err(format!(
+            "The input document s3://{}/{key} is {} bytes, more than the \
+             {MAX_INPUT_OBJECT_BYTES} bytes this emulator reads from one document.",
+            input.bucket,
+            body.len(),
+        ));
+    }
+    if body.len() > *remaining_bytes {
+        return Err(format!(
+            "The input at s3://{}/{} is larger than the {MAX_TOTAL_INPUT_BYTES} bytes this \
+             emulator reads in one job.",
+            input.bucket, input.key,
+        ));
+    }
+    *remaining_bytes -= body.len();
+    String::from_utf8(body.to_vec()).map_err(|_| {
+        format!(
+            "The input document s3://{}/{key} is not UTF-8 text; this emulator extracts \
+             text from plain-text documents only.",
+            input.bucket,
+        )
+    })
+}
+
+/// One document a run analysed: where it came from, and the line it was on for a
+/// `ONE_DOC_PER_LINE` input.
+///
+/// Borrows the object's key and body rather than copying them, so splitting an
+/// object into documents allocates nothing per document.
+#[derive(Debug)]
+pub struct Document<'a> {
+    /// The input object's key with the submitted prefix removed — the file the
+    /// output entry names.
+    pub file: &'a str,
+    /// The document's line within that file, for `ONE_DOC_PER_LINE` only.
+    pub line: Option<usize>,
+    pub text: &'a str,
+}
+
+/// Split one input object into the documents its `InputFormat` says it holds.
+///
+/// `ONE_DOC_PER_FILE` — "Each file is considered a separate document";
+/// `ONE_DOC_PER_LINE` — "Each line in a file is considered a separate document",
+/// where a blank line holds no document.
+///
+/// Lazy: the documents are yielded one at a time, so a file of a million lines never
+/// exists as a million values at once.
+pub fn documents_in<'a>(
+    file: &'a str,
+    body: &'a str,
+    input_format: &str,
+) -> Box<dyn Iterator<Item = Document<'a>> + Send + 'a> {
+    if input_format == "ONE_DOC_PER_LINE" {
+        return Box::new(
+            body.lines()
+                .enumerate()
+                .filter(|(_, line)| !line.trim().is_empty())
+                .map(move |(index, line)| Document {
+                    file,
+                    line: Some(index),
+                    text: line,
+                }),
+        );
+    }
+    Box::new(::std::iter::once(Document {
+        file,
+        line: None,
+        text: body,
+    }))
+}
+
+/// The file an output entry names for the object `key` read under the prefix
+/// `input`: the key with the submitted prefix removed, so an entry points back at the
+/// document it was produced from.
+///
+/// An input URI that names ONE file — "if the prefix is a single file, Amazon
+/// Comprehend uses that file as input" (`InputDataConfig$S3Uri`) — leaves nothing
+/// under the prefix, so the entry names that object.
+fn output_entry_file<'a>(input: &S3Location, key: &'a str) -> &'a str {
+    let relative = key
+        .strip_prefix(input.key.as_str())
+        .unwrap_or(key)
+        .trim_start_matches('/');
+    if relative.is_empty() {
+        key.split('/').next_back().unwrap_or(key)
+    } else {
+        relative
+    }
+}
+
+/// The `output.tar.gz` bytes for `body`: a gzip-compressed tar holding the single
+/// [`OUTPUT_ARCHIVE_ENTRY`] file, which is what `OutputDataConfig$S3Uri` documents
+/// ("a compressed archive that contains the output of the operation").
+pub fn output_archive(body: &str) -> ::std::io::Result<Vec<u8>> {
+    let encoder = ::flate2::write::GzEncoder::new(Vec::new(), ::flate2::Compression::default());
+    let mut archive = ::tar::Builder::new(encoder);
+    let mut header = ::tar::Header::new_gnu();
+    header.set_path(OUTPUT_ARCHIVE_ENTRY)?;
+    header.set_size(body.len() as u64);
+    header.set_mode(0o644);
+    // The archive is a function of the analysed documents alone: nothing about the
+    // machine or the moment it was built takes part, so the same input produces the
+    // same bytes.
+    header.set_mtime(0);
+    header.set_cksum();
+    archive.append(&header, body.as_bytes())?;
+    let mut encoder = archive.into_inner()?;
+    encoder.flush()?;
+    encoder.finish()
+}
+
+/// Run one asynchronous analysis job: read every input document, analyse it with
+/// `analyse`, and write the output archive under the submitted output prefix.
+///
+/// The ONE batch run every family shares. `analyse` is the only per-family part —
+/// the JSON entry the family's analysis produces for one document — so the way an
+/// input is listed, bounded, split and reported is identical for all of them.
+///
+/// Answers a [`JobOutcome`] rather than an error channel: the run is the job's own
+/// work, so what it could not do is the job's modelled `FAILED` state and its
+/// `Message`, never a failure of the `Start*DetectionJob` request that submitted it.
+pub async fn run_analysis_job<Analyse>(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    family: JobFamily,
+    job_id: &str,
+    input_data_config: &InputDataConfig,
+    output_data_config: &OutputDataConfig,
+    mut analyse: Analyse,
+) -> JobOutcome
+where
+    Analyse: FnMut(&Document<'_>) -> ::serde_json::Value,
+{
+    let Some(input) = parse_s3_uri(&input_data_config.s3_uri) else {
+        return JobOutcome::failed(format!(
+            "The input location {} is not an Amazon S3 URI.",
+            input_data_config.s3_uri
+        ));
+    };
+    let Some(output) = parse_s3_uri(&output_data_config.s3_uri) else {
+        return JobOutcome::failed(format!(
+            "The output location {} is not an Amazon S3 URI.",
+            output_data_config.s3_uri
+        ));
+    };
+    // Extracting text from PDF and image files is Amazon Textract's work, which this
+    // emulator does not perform, so a job configured for it is not reported as
+    // having analysed anything.
+    if input_data_config.document_reader_config.is_some() {
+        return JobOutcome::failed(
+            "DocumentReaderConfig asks for Amazon Textract text extraction, which this \
+             emulator does not perform, so no document was analyzed."
+                .to_string(),
+        );
+    }
+
+    let client = s3_client(ctx, region);
+    let objects =
+        match input_objects_within_bounds(&client, &input, &input_data_config.s3_uri).await {
+            Ok(objects) => objects,
+            Err(reason) => return JobOutcome::failed(reason),
+        };
+    let input_format = input_data_config
+        .input_format
+        .as_deref()
+        .unwrap_or(DEFAULT_INPUT_FORMAT);
+    // The output is accumulated as the single archive member it becomes, entry by
+    // entry, so it is never held twice and never grows past [`MAX_OUTPUT_BYTES`].
+    let mut output_body = String::new();
+    let mut documents = 0usize;
+    let mut remaining_bytes = MAX_TOTAL_INPUT_BYTES;
+    for (key, _) in &objects {
+        let text = match read_input_object(&client, &input, key, &mut remaining_bytes).await {
+            Ok(text) => text,
+            Err(reason) => return JobOutcome::failed(reason),
+        };
+        let file = output_entry_file(&input, key);
+        for document in documents_in(file, &text, input_format) {
+            documents += 1;
+            if documents > MAX_OUTPUT_DOCUMENTS {
+                return JobOutcome::failed(format!(
+                    "The input at {} holds more than the {MAX_OUTPUT_DOCUMENTS} documents this \
+                     emulator analyzes in one job.",
+                    input_data_config.s3_uri,
+                ));
+            }
+            // Analysis is CPU work with no await of its own, so the pass hands the
+            // runtime a yield point every [`DOCUMENTS_PER_YIELD`] documents: a
+            // cancelled request or a shutdown has somewhere to land even while one
+            // object of many documents is being analysed.
+            if documents.is_multiple_of(DOCUMENTS_PER_YIELD) {
+                ::tokio::task::yield_now().await;
+            }
+            let entry = analyse(&document).to_string();
+            if output_body.len() + entry.len() + 1 > MAX_OUTPUT_BYTES {
+                return JobOutcome::failed(format!(
+                    "The output for {} is larger than the {MAX_OUTPUT_BYTES} bytes this \
+                     emulator writes in one job.",
+                    input_data_config.s3_uri,
+                ));
+            }
+            output_body.push_str(&entry);
+            output_body.push('\n');
+        }
+    }
+
+    let archive = match output_archive(&output_body) {
+        Ok(archive) => archive,
+        Err(error) => {
+            return JobOutcome::failed(format!("Could not build the output archive: {error}"))
+        }
+    };
+    let archive_key = output_archive_key(&output.key, family, job_id);
+    if let Err(error) = client
+        .put_object()
+        .bucket(&output.bucket)
+        .key(&archive_key)
+        .body(::aws_sdk_s3::primitives::ByteStream::from(archive))
+        .content_type("application/x-gzip")
+        .send()
+        .await
+    {
+        return JobOutcome::failed(format!(
+            "Analyzed {documents} document(s) but could not write the output to \
+             s3://{}/{archive_key}: {}",
+            output.bucket,
+            ::aws_smithy_types::error::display::DisplayErrorContext(&error),
+        ));
+    }
+
+    JobOutcome::completed(format!("s3://{}/{archive_key}", output.bucket))
+}
+
+/// Records against the stored job what its run reported — and, if it is dropped
+/// without a report, the modelled failure for a run that will never report.
+///
+/// A job's terminal status is only revealed once its outcome is recorded, so a run
+/// whose handler never gets to report (the future dropped because the client went
+/// away, a panic the server contains) would otherwise leave the job in `IN_PROGRESS`
+/// for the life of the process. `Drop` runs on EVERY exit from the handler, which is
+/// what makes that unreachable.
+///
+/// `Drop` takes the state lock, so a recorder must not be dropped while a
+/// [`::engine::ServiceState::lock`] guard is alive in the same scope.
+pub struct RunOutcomeRecorder {
+    store: ::engine::ServiceState<ComAmazonawsComprehendComprehend20171127State>,
+    family: JobFamily,
+    job_id: String,
+    reported: bool,
+}
+
+impl RunOutcomeRecorder {
+    /// Watch the run of the job `job_id` of `family`.
+    pub fn new(
+        store: ::engine::ServiceState<ComAmazonawsComprehendComprehend20171127State>,
+        family: JobFamily,
+        job_id: String,
+    ) -> Self {
+        Self {
+            store,
+            family,
+            job_id,
+            reported: false,
+        }
+    }
+
+    /// Record `outcome` as what this job's run reported. The clock reveals it once
+    /// the job's processing span is over, never before.
+    pub fn report(&mut self, outcome: JobOutcome) {
+        self.reported = true;
+        let now = SystemTime::now();
+        let mut store = self.store.lock();
+        if let Some(job) = store
+            .analysis_jobs
+            .get_mut(&(self.family, self.job_id.clone()))
+        {
+            job.record_run_outcome(outcome, now);
+        }
+    }
+}
+
+impl Drop for RunOutcomeRecorder {
+    fn drop(&mut self) {
+        if self.reported {
+            return;
+        }
+        let now = SystemTime::now();
+        let mut store = self.store.lock();
+        if let Some(job) = store
+            .analysis_jobs
+            .get_mut(&(self.family, self.job_id.clone()))
+        {
+            if job.terminal_outcome.is_none() {
+                job.record_run_outcome(
+                    JobOutcome::failed(
+                        "The analysis run did not complete: the request that started it ended \
+                         before the run reported an outcome.",
+                    ),
+                    now,
+                );
+            }
+        }
+    }
+}
+
 /// How long a freshly created document classifier stays `SUBMITTED` before the
 /// clock owes it `TRAINING`.
 ///
@@ -869,6 +1443,444 @@ pub const DEFAULT_CLASSIFIER_MODE: &str = "MULTI_CLASS";
 /// `DocumentClassifierInputDataConfig$DataFormat`: "If you don't specify a value,
 /// Amazon Comprehend uses `COMPREHEND_CSV` as the default."
 pub const DEFAULT_CLASSIFIER_DATA_FORMAT: &str = "COMPREHEND_CSV";
+
+/// One resource-based policy attached to a custom model.
+///
+/// `PutResourcePolicy` documents the revision contract this record stands for: "Each
+/// time you modify a policy, Amazon Comprehend assigns a new revision ID, and it
+/// deletes the prior version of the policy." So a model holds at most one policy, the
+/// revision id changes on every modification, the creation instant is the one the
+/// FIRST attachment happened at and the modification instant is the latest one's.
+#[derive(Debug, Clone)]
+pub struct ResourcePolicy {
+    /// The JSON policy document the caller attached, byte for byte.
+    pub policy: String,
+    /// The revision id this version of the policy carries, as
+    /// [`ComAmazonawsComprehendComprehend20171127State::mint_policy_revision_id`]
+    /// mints it.
+    pub revision_id: String,
+    pub creation_time: SystemTime,
+    pub last_modified_time: SystemTime,
+}
+
+/// The number of tokens a trained classifier's vocabulary holds at most.
+///
+/// The EMULATOR's bound, so one training request cannot make this process hold an
+/// unbounded model: once the vocabulary is full the fit keeps counting the tokens it
+/// already knows and ignores new ones, which is the standard bounded-vocabulary
+/// treatment and leaves every document's known tokens counted.
+pub const MAX_CLASSIFIER_VOCABULARY: usize = 50_000;
+
+/// The number of labelled documents one training run fits a model on at most.
+///
+/// The EMULATOR's bound, for the same reason as [`MAX_CLASSIFIER_VOCABULARY`]. A
+/// training input holding more rows than this is not silently truncated: the run
+/// ends `IN_ERROR` naming the bound.
+pub const MAX_TRAINING_DOCUMENTS: usize = 20_000;
+
+/// The number of distinct labels one model, or one training row, may carry.
+///
+/// Amazon Comprehend publishes 1,000 as the per-classifier quota for both modes (the
+/// "number of classes" of a multi-class classifier and the "number of labels" of a
+/// multi-label one), so a corpus naming more labels than this is past what a custom
+/// classifier can hold and the run ends `IN_ERROR` naming the bound rather than
+/// fitting a model nobody could train.
+pub const MAX_CLASSIFIER_LABELS: usize = 1_000;
+
+/// The number of (label, token) counts one fitted model holds at most.
+///
+/// The EMULATOR's bound on the PRODUCT the per-label counts form: a model's size is
+/// the sum over labels of the distinct tokens their documents hold, so bounding the
+/// vocabulary ([`MAX_CLASSIFIER_VOCABULARY`]) and the label count
+/// ([`MAX_CLASSIFIER_LABELS`]) separately still leaves their product unbounded. The
+/// pairs are counted as they are inserted, so one training request can never make
+/// this process hold more than this many of them; a fit that reaches the bound ends
+/// the classifier `IN_ERROR` naming it.
+pub const MAX_CLASSIFIER_MODEL_ENTRIES: usize = 500_000;
+
+/// The number of (label, token) counts this store holds across EVERY classifier.
+///
+/// The EMULATOR's bound on the other product a caller could grow: the record set is
+/// bounded ([`MAX_DOCUMENT_CLASSIFIER_RECORDS`]) and each model is bounded
+/// ([`MAX_CLASSIFIER_MODEL_ENTRIES`]), but their product is what this process would
+/// hold, so the TOTAL is bounded too. Enforced where a model would be taken into the
+/// store, [`ComAmazonawsComprehendComprehend20171127State::admit_training_outcome`]:
+/// a training whose model does not fit beside the models already held ends `IN_ERROR`
+/// naming the bound, so a stored model is never silently dropped and no classifier
+/// reports a model it does not have.
+pub const MAX_STORED_MODEL_ENTRIES: usize = 500_000;
+
+/// The number of documents one training run holds back to test the model with at
+/// most.
+///
+/// The EMULATOR's bound on the measuring pass, whose cost is the product of the test
+/// documents, the model's labels and the documents' tokens: at most this many
+/// documents are measured, and the rest of the training data trains the model, while
+/// [`MAX_CLASSIFIER_FIT_OPERATIONS`] bounds that product itself. Reported as
+/// `ClassifierMetadata$NumberOfTestDocuments`, which is therefore the number of
+/// documents HELD BACK; a corpus too small to hold any back reports zero and says in
+/// its `TRAINED_WITH_WARNING` message that the metrics were measured on the training
+/// documents instead, so held-out and resubstitution metrics are never confused.
+pub const MAX_TEST_DOCUMENTS: usize = 200;
+
+/// The share of the training documents held back to test the fitted model, as a
+/// divisor: every `TRAINING_TEST_SPLIT`-th document is a test document.
+///
+/// Amazon Comprehend documents the split for a creation that names no `TestS3Uri`:
+/// "Amazon Comprehend uses 10 percent of your training documents to test the custom
+/// classifier."
+pub const TRAINING_TEST_SPLIT: usize = 10;
+
+/// The number of (label, document) token passes one training run performs at most.
+///
+/// The EMULATOR's bound on the WORK of a training, not on any one factor of it:
+/// fitting charges one operation per token occurrence per label of a row, and
+/// measuring charges the same per label of the model per test document, so the budget
+/// bounds the product of rows, labels and tokens however a caller's CSV distributes
+/// them. A run that exhausts it ends the classifier `IN_ERROR` naming the bound
+/// rather than occupying a core for as long as its input asks.
+pub const MAX_CLASSIFIER_FIT_OPERATIONS: u64 = 20_000_000;
+
+/// How many charges the budget makes between two looks at the clock.
+///
+/// Reading the clock is itself work, so the deadline is checked every so many
+/// charges rather than on each one; a charge covers one document's tokens for one
+/// label, so the interval is far finer than the budget it guards.
+const BUDGET_DEADLINE_CHECK_INTERVAL: u64 = 256;
+
+/// What one training run may spend: a number of token operations, and the instant it
+/// must stop at.
+///
+/// Carried THROUGH the fit and the measuring pass ([`TrainedClassifier::fit`] and
+/// [`TrainedClassifier::predict`]), so the bound binds the work the process does
+/// rather than only the caller's wait: the pass charges as it goes and stops itself
+/// when either the operations or the deadline run out. `Err` is the reason it
+/// stopped, ready for the classifier's `IN_ERROR` message — nothing is reported for
+/// a fit that did not finish.
+#[derive(Debug)]
+pub struct TrainingBudget {
+    limit: u64,
+    remaining: u64,
+    deadline: Instant,
+    wall_clock: Duration,
+    charges: u64,
+}
+
+impl TrainingBudget {
+    /// A budget of `limit` token operations, expiring `wall_clock` from now.
+    pub fn new(limit: u64, wall_clock: Duration) -> Self {
+        Self {
+            limit,
+            remaining: limit,
+            deadline: Instant::now() + wall_clock,
+            wall_clock,
+            charges: 0,
+        }
+    }
+
+    /// Charge `operations` token operations against this budget.
+    pub fn charge(&mut self, operations: u64) -> Result<(), String> {
+        self.remaining = self.remaining.checked_sub(operations).ok_or_else(|| {
+            format!(
+                "the training data asks for more than the {} token operations this emulator \
+                 spends on fitting and measuring one classifier",
+                self.limit
+            )
+        })?;
+        self.charges += 1;
+        if self.charges.is_multiple_of(BUDGET_DEADLINE_CHECK_INTERVAL)
+            && Instant::now() >= self.deadline
+        {
+            return Err(format!(
+                "the training did not finish within the {} seconds this emulator spends on \
+                 fitting and measuring one classifier",
+                self.wall_clock.as_secs()
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// One label's share of a fitted model: how many documents carry it, and how often
+/// each token occurs in them.
+#[derive(Debug, Clone, Default)]
+pub struct LabelCounts {
+    /// How many documents of the training set carry this label.
+    pub documents: usize,
+    /// How many times each token occurs across those documents.
+    pub token_counts: BTreeMap<String, u64>,
+    /// The total token occurrences across those documents, i.e. the sum of
+    /// [`Self::token_counts`].
+    pub total_tokens: u64,
+}
+
+impl LabelCounts {
+    /// Count one document's `tokens` towards this label, and answer how many tokens
+    /// this label had never seen before — the new (label, token) counts the model
+    /// just grew by, which is what [`MAX_CLASSIFIER_MODEL_ENTRIES`] bounds.
+    fn observe(&mut self, tokens: &[String]) -> usize {
+        self.documents += 1;
+        let mut added = 0usize;
+        for token in tokens {
+            match self.token_counts.get_mut(token) {
+                Some(count) => *count += 1,
+                None => {
+                    self.token_counts.insert(token.clone(), 1);
+                    added += 1;
+                }
+            }
+            self.total_tokens += 1;
+        }
+        added
+    }
+
+    /// `ln P(token | this label)` under add-one (Laplace) smoothing over a
+    /// vocabulary of `vocabulary` tokens, so a token this label never saw still has
+    /// a finite probability.
+    fn token_log_probability(&self, token: &str, vocabulary: usize) -> f64 {
+        let count = self.token_counts.get(token).copied().unwrap_or(0);
+        ((count + 1) as f64 / (self.total_tokens as f64 + vocabulary.max(1) as f64)).ln()
+    }
+
+    /// `ln P(token | every label but this one)`, from the corpus totals: the
+    /// one-versus-rest counterpart of [`Self::token_log_probability`], which is what
+    /// a `MULTI_LABEL` model decides each label on.
+    fn complement_log_probability(
+        &self,
+        corpus: &LabelCounts,
+        token: &str,
+        vocabulary: usize,
+    ) -> f64 {
+        let count = corpus
+            .token_counts
+            .get(token)
+            .copied()
+            .unwrap_or(0)
+            .saturating_sub(self.token_counts.get(token).copied().unwrap_or(0));
+        let total = corpus.total_tokens.saturating_sub(self.total_tokens);
+        ((count + 1) as f64 / (total as f64 + vocabulary.max(1) as f64)).ln()
+    }
+}
+
+/// One custom classification model, as `CreateDocumentClassifier`'s training run
+/// fitted it: a multinomial naive-Bayes bag-of-words model over the labelled
+/// documents the training data held.
+///
+/// Persisted on the [`DocumentClassifier`] record so what a training run produced is
+/// the model a later inference call uses, rather than a result invented per request.
+#[derive(Debug, Clone)]
+pub struct TrainedClassifier {
+    /// The `DocumentClassifierMode` the model was fitted for: `MULTI_CLASS` picks the
+    /// single best label, `MULTI_LABEL` decides each label on its own.
+    pub mode: String,
+    /// Each label's counts, keyed by the label as the training data spelled it.
+    pub labels: BTreeMap<String, LabelCounts>,
+    /// The counts over the whole training set, which is what the one-versus-rest
+    /// complement of a label is computed from.
+    pub corpus: LabelCounts,
+    /// How many (label, token) counts this model holds, counted as the fit inserted
+    /// them. Kept on the model so the store can bound the TOTAL it holds across
+    /// records ([`MAX_STORED_MODEL_ENTRIES`]) without walking every label of every
+    /// model.
+    entries: usize,
+}
+
+impl TrainedClassifier {
+    /// Fit a model on `documents`, each a pair of the labels the row carried and the
+    /// document's text.
+    ///
+    /// Bounded in every direction a caller's training data could grow: the vocabulary
+    /// by [`MAX_CLASSIFIER_VOCABULARY`] (once it is full, a token the corpus has not
+    /// seen before takes no part in the fit), the label set by
+    /// [`MAX_CLASSIFIER_LABELS`], the (label, token) counts they form — their PRODUCT
+    /// — by [`MAX_CLASSIFIER_MODEL_ENTRIES`], checked as each count is inserted, and
+    /// the WORK by `budget`, charged per label per document token whether the count it
+    /// lands on is new or not. `Err` is the reason the model could not be fitted,
+    /// ready for the classifier's `IN_ERROR` message: no model is reported for a fit
+    /// that was refused or cut short.
+    pub fn fit(
+        mode: &str,
+        documents: &[(Vec<String>, String)],
+        budget: &mut TrainingBudget,
+    ) -> Result<Self, String> {
+        let mut model = Self {
+            mode: mode.to_string(),
+            labels: BTreeMap::new(),
+            corpus: LabelCounts::default(),
+            entries: 0,
+        };
+        let mut entries = 0usize;
+        for (labels, text) in documents {
+            let tokens: Vec<String> = tokenize(text)
+                .into_iter()
+                .filter(|token| {
+                    model.corpus.token_counts.contains_key(token)
+                        || model.corpus.token_counts.len() < MAX_CLASSIFIER_VOCABULARY
+                })
+                .collect();
+            budget.charge(tokens.len() as u64)?;
+            model.corpus.observe(&tokens);
+            for label in labels {
+                if !model.labels.contains_key(label) && model.labels.len() >= MAX_CLASSIFIER_LABELS
+                {
+                    return Err(format!(
+                        "The training data names more than the {MAX_CLASSIFIER_LABELS} labels a \
+                         custom classifier can carry, so no classifier was trained."
+                    ));
+                }
+                budget.charge(tokens.len() as u64)?;
+                entries += model
+                    .labels
+                    .entry(label.clone())
+                    .or_default()
+                    .observe(&tokens);
+                if entries > MAX_CLASSIFIER_MODEL_ENTRIES {
+                    return Err(format!(
+                        "The training data holds more than the {MAX_CLASSIFIER_MODEL_ENTRIES} \
+                         per-label token counts this emulator fits a model from, so no \
+                         classifier was trained."
+                    ));
+                }
+            }
+        }
+        model.entries = entries;
+        Ok(model)
+    }
+
+    /// How many (label, token) counts this model holds — its size, as
+    /// [`MAX_CLASSIFIER_MODEL_ENTRIES`] and [`MAX_STORED_MODEL_ENTRIES`] count it.
+    pub fn model_entries(&self) -> usize {
+        self.entries
+    }
+
+    /// How many distinct tokens the fitted model knows.
+    pub fn vocabulary(&self) -> usize {
+        self.corpus.token_counts.len()
+    }
+
+    /// The labels this model gives `text`, in label order.
+    ///
+    /// A `MULTI_CLASS` model answers the single likeliest label, as its mode's
+    /// documentation says ("the document is assigned exactly one class"); a
+    /// `MULTI_LABEL` model answers every label whose one-versus-rest comparison comes
+    /// out positive ("an individual class represents a different category").
+    ///
+    /// Charged against `budget` per label per token, like the fit, so a classification
+    /// pass over many documents stops itself rather than running for as long as the
+    /// model's labels and the document's tokens multiply out to. `Err` is the reason
+    /// it stopped: no label is answered for a comparison that was not finished.
+    pub fn predict(
+        &self,
+        text: &str,
+        budget: &mut TrainingBudget,
+    ) -> Result<Vec<String>, String> {
+        let tokens = tokenize(text);
+        let vocabulary = self.vocabulary();
+        let documents = self.corpus.documents.max(1) as f64;
+        let mut given: Vec<String> = Vec::new();
+        if self.mode == "MULTI_LABEL" {
+            for (label, counts) in &self.labels {
+                budget.charge(tokens.len() as u64)?;
+                let positive_prior = (counts.documents as f64 / documents).max(f64::MIN_POSITIVE);
+                let negative_prior =
+                    ((documents - counts.documents as f64) / documents).max(f64::MIN_POSITIVE);
+                let mut positive = positive_prior.ln();
+                let mut negative = negative_prior.ln();
+                for token in &tokens {
+                    positive += counts.token_log_probability(token, vocabulary);
+                    negative += counts.complement_log_probability(&self.corpus, token, vocabulary);
+                }
+                if positive > negative {
+                    given.push(label.clone());
+                }
+            }
+            return Ok(given);
+        }
+        // The highest score wins; ties go to the label that sorts first, so one model
+        // always answers one document the same way.
+        let mut best: Option<(&String, f64)> = None;
+        for (label, counts) in &self.labels {
+            budget.charge(tokens.len() as u64)?;
+            let mut score = (counts.documents as f64 / documents)
+                .max(f64::MIN_POSITIVE)
+                .ln();
+            for token in &tokens {
+                score += counts.token_log_probability(token, vocabulary);
+            }
+            if best.is_none_or(|(_, highest)| score > highest) {
+                best = Some((label, score));
+            }
+        }
+        if let Some((label, _)) = best {
+            given.push(label.clone());
+        }
+        Ok(given)
+    }
+}
+
+/// Split `text` into the bag-of-words tokens a [`TrainedClassifier`] counts:
+/// lowercased runs of alphanumeric characters, with everything else a separator.
+///
+/// Script-agnostic on purpose — a Comprehend classifier is trained per language, and
+/// `char::is_alphanumeric` is Unicode-aware — so a document in any language the
+/// `LanguageCode` enum names tokenises the same way.
+pub fn tokenize(text: &str) -> Vec<String> {
+    text.split(|c: char| !c.is_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .map(str::to_lowercase)
+        .collect()
+}
+
+/// What a classifier's training run reported: the terminal `ModelStatus` the clock
+/// reveals once the training span is over, the `Message` that says why, the metrics
+/// the run measured and the model it fitted.
+///
+/// The classifier's counterpart of [`JobOutcome`], and held for the same reason: a
+/// status is only reported for work that ran.
+#[derive(Debug, Clone)]
+pub struct ClassifierTrainingOutcome {
+    /// One of `super::ops::types::MODEL_STATUS_VALUES`, and terminal: `TRAINED`,
+    /// `TRAINED_WITH_WARNING` or `IN_ERROR`.
+    pub status: String,
+    pub message: Option<String>,
+    /// The metrics of the fitted model, measured on the held-out test documents;
+    /// `None` for a run that fitted nothing.
+    pub metadata: Option<ClassifierMetadata>,
+    /// The model the run fitted; `None` for a run that fitted nothing.
+    pub model: Option<TrainedClassifier>,
+}
+
+impl ClassifierTrainingOutcome {
+    /// The outcome of a run that read the labelled documents and fitted `model` on
+    /// them, measuring `metadata`. `warning` carries what the training data made the
+    /// run report alongside the model, which is what `TRAINED_WITH_WARNING` means.
+    pub fn trained(
+        model: TrainedClassifier,
+        metadata: ClassifierMetadata,
+        warning: Option<String>,
+    ) -> Self {
+        Self {
+            status: match warning {
+                Some(_) => "TRAINED_WITH_WARNING".to_string(),
+                None => "TRAINED".to_string(),
+            },
+            message: warning,
+            metadata: Some(metadata),
+            model: Some(model),
+        }
+    }
+
+    /// The outcome of a training that could not be carried out, naming `reason`.
+    /// Nothing was fitted, so the classifier reports no metrics and holds no model.
+    pub fn failed(reason: impl Into<String>) -> Self {
+        Self {
+            status: "IN_ERROR".to_string(),
+            message: Some(reason.into()),
+            metadata: None,
+            model: None,
+        }
+    }
+}
 
 /// One persisted custom document classifier.
 ///
@@ -922,10 +1934,21 @@ pub struct DocumentClassifier {
     pub mode: String,
     pub source_model_arn: Option<String>,
     pub flywheel_arn: Option<String>,
-    /// The `ModelPolicy` the creation attached, if any. Held on the record so
-    /// `DescribeResourcePolicy` has one place to read it from when it is
-    /// implemented.
-    pub model_policy: Option<String>,
+    /// The resource-based policy attached to this model, if any: what
+    /// `CreateDocumentClassifier`'s `ModelPolicy` attached at creation and what
+    /// `PutResourcePolicy` replaces, `DescribeResourcePolicy` reports and
+    /// `DeleteResourcePolicy` removes. ONE policy per model, as the operations'
+    /// `PolicyRevisionId` says: each modification replaces the prior version.
+    pub resource_policy: Option<ResourcePolicy>,
+    /// What this classifier's training run reported, until the clock reveals it — the
+    /// classifier's counterpart of [`AnalysisJob::terminal_outcome`]. `None` while the
+    /// training is still running, and `None` again once [`Self::settle`] has taken
+    /// the outcome onto the record, so a fitted model is never held twice.
+    pub training_outcome: Option<ClassifierTrainingOutcome>,
+    /// The model this classifier's training actually fitted, revealed with its
+    /// terminal status. `None` for a classifier that has not finished training, and
+    /// for one whose training failed: nothing was fitted, so there is no model.
+    pub model: Option<TrainedClassifier>,
     pub tags: Vec<Tag>,
     /// The `ClientRequestToken` the classifier was created under, if any. Held so
     /// the idempotency-index entry can be dropped with the record it points at.
@@ -939,23 +1962,29 @@ impl DocumentClassifier {
     /// transition was due at `now` whether or not anybody called, so applying it on
     /// read reports the status the classifier already had rather than advancing it.
     ///
-    /// The terminal status of a started training is `IN_ERROR`, never `TRAINED`:
-    /// training means reading the labelled documents from the Amazon S3 location
-    /// `InputDataConfig` names and fitting a model on them, and this emulator serves
-    /// no object storage and runs no training, so no document is ever read and no
-    /// model is ever fitted. The classifier therefore ends in the modelled failure
-    /// state with a `Message` that says exactly that, rather than reporting a
-    /// `TRAINED` model that nothing trained and that no inference could use.
+    /// The terminal status is never assumed: it is whatever the training run
+    /// [`Self::training_outcome`] holds reported — `TRAINED` only when this emulator
+    /// really read the labelled documents and fitted a model on them, `IN_ERROR`
+    /// with a reason when it could not — and a classifier whose run has not reported
+    /// yet stays `TRAINING`, because it is still training. No status is ever reported
+    /// for work nothing performed.
     pub fn settle(&mut self, now: SystemTime) {
         if self.status == "SUBMITTED" && now >= self.training_due_at {
             self.status = "TRAINING".to_string();
             self.training_start_time = Some(self.training_due_at);
         }
         if self.status == "TRAINING" && now >= self.terminal_due_at {
-            self.status = "IN_ERROR".to_string();
-            self.training_end_time = Some(self.terminal_due_at);
-            self.end_time = Some(self.terminal_due_at);
-            self.message = Some(self.untrained_model_message());
+            // TAKEN, not cloned: a fitted model can hold half a million per-label
+            // token counts, so the record moves it over rather than keeping a second
+            // copy of it in the outcome for the life of the classifier.
+            if let Some(outcome) = self.training_outcome.take() {
+                self.status = outcome.status;
+                self.message = outcome.message;
+                self.classifier_metadata = outcome.metadata;
+                self.model = outcome.model;
+                self.training_end_time = Some(self.terminal_due_at);
+                self.end_time = Some(self.terminal_due_at);
+            }
         }
         if self.status == "STOP_REQUESTED" && self.stopped_due_at.is_some_and(|due| now >= due) {
             self.status = "STOPPED".to_string();
@@ -1010,6 +2039,30 @@ impl DocumentClassifier {
         )
     }
 
+    /// Record what this classifier's training run reported, as of the instant `now`
+    /// it reported it.
+    ///
+    /// The classifier's counterpart of [`AnalysisJob::record_run_outcome`], and owed
+    /// for the same reason: a training run that took longer than
+    /// [`CLASSIFIER_SUBMITTED_SPAN`] was submitted-or-training the whole time it ran,
+    /// so the instants the remaining transitions are owed at are carried forward from
+    /// the report rather than left in the past. That is what keeps `TRAINING`
+    /// OBSERVABLE to a caller polling after the creation returns.
+    ///
+    /// A classifier a caller has already stopped keeps the stop: the run's outcome is
+    /// recorded, but no status change is owed to a classifier that has left the
+    /// training path.
+    pub fn record_training_outcome(&mut self, outcome: ClassifierTrainingOutcome, now: SystemTime) {
+        self.training_outcome = Some(outcome);
+        if now >= self.training_due_at {
+            self.training_due_at = now + CLASSIFIER_SUBMITTED_SPAN;
+        }
+        let earliest_terminal = self.training_due_at + CLASSIFIER_TRAINING_SPAN;
+        if self.terminal_due_at < earliest_terminal {
+            self.terminal_due_at = earliest_terminal;
+        }
+    }
+
     /// Whether a model trained from this classifier can serve inference: the two
     /// `ModelStatus` values that mean a model was fitted.
     ///
@@ -1019,30 +2072,6 @@ impl DocumentClassifier {
     /// fitted, so there is nothing to deploy behind an endpoint.
     pub fn is_trained(&self) -> bool {
         matches!(self.status.as_str(), "TRAINED" | "TRAINED_WITH_WARNING")
-    }
-
-    /// Why a started training fails: the labelled documents it was pointed at were
-    /// never read, so no model was ever fitted.
-    fn untrained_model_message(&self) -> String {
-        let input = self.input_data_config.as_ref();
-        let source = input
-            .and_then(|config| config.s3_uri.clone())
-            .or_else(|| {
-                input
-                    .and_then(|config| config.augmented_manifests.as_ref())
-                    .and_then(|manifests| manifests.first().map(|item| item.s3_uri.clone()))
-            })
-            .or_else(|| {
-                input
-                    .and_then(|config| config.documents.as_ref())
-                    .map(|documents| documents.s3_uri.clone())
-            })
-            .unwrap_or_else(|| "the configured input location".to_string());
-        format!(
-            "Could not read the training documents from {source}: this emulator serves no \
-             object storage and runs no model training, so no document was read and no \
-             classifier was trained."
-        )
     }
 
     /// A classifier record as it stands the instant it was submitted: the identity
@@ -1084,7 +2113,9 @@ impl DocumentClassifier {
             mode: DEFAULT_CLASSIFIER_MODE.to_string(),
             source_model_arn: None,
             flywheel_arn: None,
-            model_policy: None,
+            resource_policy: None,
+            training_outcome: None,
+            model: None,
             tags: Vec::new(),
             client_request_token: None,
         }
@@ -1496,6 +2527,9 @@ pub struct ComAmazonawsComprehendComprehend20171127State {
     /// Monotonic creation counter, the source of a classifier's `seq` — the stable
     /// order `ListDocumentClassifiers` pages on.
     pub document_classifier_seq: u64,
+    /// Monotonic policy-modification counter: the source of the uniqueness of a
+    /// minted `PolicyRevisionId`.
+    pub policy_revision_seq: u64,
     /// Every persisted inference endpoint, keyed by its `EndpointArn`. Bounded by
     /// [`MAX_ENDPOINT_RECORDS`]: insert through [`Self::insert_endpoint`], never
     /// directly.
@@ -1563,6 +2597,105 @@ impl ComAmazonawsComprehendComprehend20171127State {
         hasher.update(nanos.to_be_bytes());
         let digest = hasher.finalize();
         (self.job_id_seq, hex::encode(&digest[..16]))
+    }
+
+    /// How many (label, token) counts this store holds across every classifier: the
+    /// models already on their records, and the one a training has reported but the
+    /// clock has not revealed yet.
+    ///
+    /// Bounded by [`MAX_STORED_MODEL_ENTRIES`] through [`Self::admit_training_outcome`],
+    /// and cheap to compute: each model carries its own count, and the record set is
+    /// bounded by [`MAX_DOCUMENT_CLASSIFIER_RECORDS`].
+    pub fn stored_model_entries(&self) -> usize {
+        self.document_classifiers
+            .values()
+            .map(|classifier| {
+                let held = classifier
+                    .model
+                    .as_ref()
+                    .map_or(0, TrainedClassifier::model_entries);
+                let pending = classifier
+                    .training_outcome
+                    .as_ref()
+                    .and_then(|outcome| outcome.model.as_ref())
+                    .map_or(0, TrainedClassifier::model_entries);
+                held + pending
+            })
+            .sum()
+    }
+
+    /// `outcome` as this store can take it: itself when its model fits beside the
+    /// models already held, and the modelled failure naming
+    /// [`MAX_STORED_MODEL_ENTRIES`] when it does not.
+    ///
+    /// The ONE place a fitted model is admitted into the store, so the total this
+    /// process holds is bounded however many classifiers a caller trains. A refused
+    /// model is NOT silently dropped: the classifier ends `IN_ERROR` with the reason,
+    /// because a classifier reporting `TRAINED` has to have the model it was asked
+    /// for.
+    pub fn admit_training_outcome(
+        &self,
+        outcome: ClassifierTrainingOutcome,
+    ) -> ClassifierTrainingOutcome {
+        let Some(entries) = outcome
+            .model
+            .as_ref()
+            .map(TrainedClassifier::model_entries)
+        else {
+            return outcome;
+        };
+        if self.stored_model_entries() + entries > MAX_STORED_MODEL_ENTRIES {
+            return ClassifierTrainingOutcome::failed(format!(
+                "The fitted model does not fit beside the models this emulator already \
+                 holds: it keeps at most {MAX_STORED_MODEL_ENTRIES} per-label token counts \
+                 across every classifier. Delete a classifier and try your request again."
+            ));
+        }
+        outcome
+    }
+
+    /// The custom model `resource_arn` names, for the resource-policy operations to
+    /// read and write the policy on.
+    /// A `ComprehendModelArn` names a document classifier or an entity recognizer
+    /// (the modelled pattern admits exactly those two resource types). This emulator
+    /// persists classifiers; `CreateEntityRecognizer` is still a scaffold stub, so no
+    /// entity-recognizer ARN names a resource that exists here, and the resource-policy
+    /// operations answer it with their `ResourceNotFoundException` exactly as they
+    /// answer a classifier ARN nobody created.
+    pub fn custom_model_mut(&mut self, resource_arn: &str) -> Option<&mut DocumentClassifier> {
+        self.document_classifiers.get_mut(resource_arn)
+    }
+
+    /// [`Self::custom_model_mut`] for a REPORTING operation: the same resolution, with
+    /// no way to write through it, so a read path cannot modify the model it reports.
+    pub fn custom_model(&self, resource_arn: &str) -> Option<&DocumentClassifier> {
+        self.document_classifiers.get(resource_arn)
+    }
+
+    /// Mint the `PolicyRevisionId` a resource-policy modification assigns.
+    ///
+    /// The revision id is the first 16 bytes of a digest over the modification
+    /// counter, the resource the policy is attached to, the policy document and the
+    /// instant, rendered as 32 uppercase hex characters — the form and the modelled
+    /// `^[0-9A-Fa-f]+$` pattern an AWS revision id has. It is unique per
+    /// modification because the counter is, which is what `PutResourcePolicy`
+    /// documents ("Each time you modify a policy, Amazon Comprehend assigns a new
+    /// revision ID"): re-attaching the SAME document still mints a new revision.
+    pub fn mint_policy_revision_id(
+        &mut self,
+        resource_arn: &str,
+        policy: &str,
+        at: SystemTime,
+    ) -> String {
+        self.policy_revision_seq += 1;
+        let nanos = at.duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
+        let mut hasher = Sha256::new();
+        hasher.update(self.policy_revision_seq.to_be_bytes());
+        hasher.update(resource_arn.as_bytes());
+        hasher.update(policy.as_bytes());
+        hasher.update(nanos.to_be_bytes());
+        let digest = hasher.finalize();
+        hex::encode_upper(&digest[..16])
     }
 
     /// Materialise every document-classifier change the clock already owed at `now`:
@@ -1920,16 +3053,22 @@ pub const TOXIC_CONTENT_SEGMENT_QUOTA_BYTES: usize = 1_000;
 
 /// The `LanguageCode` values Comprehend's PII analysis accepts.
 ///
-/// ONE set for the whole PII family — the synchronous analysis operations and the
-/// asynchronous detection job — so they can never drift apart on which languages
-/// PII analysis accepts. The set is the one the member documentation that names a
-/// set states, `StartPiiEntitiesDetectionJobRequest$LanguageCode` and
+/// ONE set for the operations that DOCUMENT a set — `ContainsPiiEntities` and the
+/// asynchronous detection job — so they can never drift apart on which languages PII
+/// analysis accepts. The set is the one the member documentation that names a set
+/// states, `StartPiiEntitiesDetectionJobRequest$LanguageCode` and
 /// `DetectPiiEntitiesRequest$LanguageCode`: "Enter the language code for English
 /// (en) or Spanish (es)." `ContainsPiiEntitiesRequest$LanguageCode` is "The language
 /// of the input documents" — it names no set, so it neither widens nor narrows this
-/// one. Every other value the `LanguageCode` enum names is refused with the error
-/// the calling operation models for it, rather than answered with an empty result
-/// that no analysis produced.
+/// one. Every other value the `LanguageCode` enum names is refused with the error the
+/// calling operation models for it, rather than answered with an empty result that no
+/// analysis produced.
+///
+/// `DetectPiiEntities` is the one member of the family that does NOT check this set:
+/// recorded behaviour
+/// (`comprehend.detect-pii-entities-unsupported-language-still-succeeds`) is that it
+/// answers 200 for a language its own documentation does not name, so the check lives
+/// in each caller rather than in the recognizer.
 pub const PII_LANGUAGES: &[&str] = &["en", "es"];
 
 /// The refusal message for a document past `quota_bytes`: `Some(message)` when

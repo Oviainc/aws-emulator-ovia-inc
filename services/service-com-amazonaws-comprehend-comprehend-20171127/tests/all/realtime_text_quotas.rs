@@ -34,6 +34,7 @@ use crate::comprehend_client::{error_code, Comprehend};
 /// answer HTTP 501), so they have no row here yet.
 const QUOTAS: &[(&str, usize)] = &[
     ("ContainsPiiEntities", 100_000),
+    ("DetectPiiEntities", 100_000),
     ("DetectSentiment", 5_000),
     ("DetectSyntax", 5_000),
     ("DetectDominantLanguage", 100_000),
@@ -44,7 +45,7 @@ fn body(operation: &str, text: String) -> Value {
     match operation {
         // `LanguageCode` is `@required` on these operations, and each accepts
         // English, so the size check is the only thing that can refuse the call.
-        "ContainsPiiEntities" | "DetectSentiment" | "DetectSyntax" => {
+        "ContainsPiiEntities" | "DetectPiiEntities" | "DetectSentiment" | "DetectSyntax" => {
             json!({ "Text": text, "LanguageCode": "en" })
         }
         _ => json!({ "Text": text }),

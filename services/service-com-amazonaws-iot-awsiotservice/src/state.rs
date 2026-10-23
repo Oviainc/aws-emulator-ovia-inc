@@ -14,7 +14,10 @@
 //! `CreateThing` returns the created thing member-for-member: a reader clones what
 //! the writer stored and the two cannot drift.
 //!
-//! Beside the registry it holds the THING GROUP registry, keyed by `thingGroupName`
+//! Beside the registry it holds the POLICY registry, keyed by `policyName` — the
+//! name is the policy's identity and the `@httpLabel` of `/policies/{policyName}` —
+//! where each record carries its numbered document versions and which of them is the
+//! default, the THING GROUP registry, keyed by `thingGroupName`
 //! for the same reason — the name is the group's identity and the `@httpLabel` of
 //! `/thing-groups/{thingGroupName}` — the account's JOBS (`CreateJob` keys them by
 //! the `jobId` it documents as unique for the account), whose per-thing EXECUTIONS
@@ -34,6 +37,12 @@
 //! hands back, so `GetTopicRule` after `CreateTopicRule` returns the created rule
 //! member-for-member.
 //!
+//! It also holds the account's FLEET INDEXING configuration — one record, not a map,
+//! because `GetIndexingConfiguration` / `UpdateIndexingConfiguration` name no
+//! resource: there is one indexing configuration per account. An account that has
+//! never updated it still has one (fleet indexing disabled), which is why the field
+//! has a default and the reader never has to create what it reports.
+//!
 //! Finally it holds the account's COMMANDS, keyed by `commandId` ("A unique
 //! identifier for the command", and the `@httpLabel` of `/commands/{commandId}`),
 //! whose EXISTENCE the IoT Jobs data plane also needs — `StartCommandExecution`
@@ -50,7 +59,8 @@ use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
     Action, CommandParameter, CommandPayload, CommandPreprocessor, GetCommandOutput, JobExecution,
-    JobExecutionStatusDetails, TopicRule, TopicRulePayload,
+    JobExecutionStatusDetails, ThingGroupIndexingConfiguration, ThingIndexingConfiguration,
+    TopicRule, TopicRulePayload,
 };
 
 /// The shared index of which IoT COMMANDS exist, which the IoT Jobs data plane's
@@ -322,6 +332,18 @@ pub struct ComAmazonawsIotAwsiotserviceState {
     /// because `ListThingGroups` is `@paginated` and a page boundary is only
     /// meaningful over a stable order.
     pub thing_groups: BTreeMap<String, RegisteredThingGroup>,
+    /// Every IoT policy that exists, keyed by `policyName`.
+    ///
+    /// The name is the policy's identity — the model binds it as the `@httpLabel` of
+    /// `/policies/{policyName}` on every single-policy operation — so a `BTreeMap`
+    /// keyed by name is the registry itself. `BTreeMap` (not `HashMap`) because
+    /// `ListPolicies` is `@paginated` and a page boundary is only meaningful over a
+    /// stable order.
+    ///
+    /// A caller grows this store, so it is bounded: [`MAX_POLICIES`] is the ceiling
+    /// `CreatePolicy` refuses past, and [`MAX_POLICY_DOCUMENT_BYTES`] /
+    /// [`MAX_POLICY_TAGS`] bound what ONE record may cost.
+    pub policies: BTreeMap<String, RegisteredPolicy>,
     /// The names of the thing types that exist.
     ///
     /// `CreateThing` answers `ResourceNotFoundException` for a `thingTypeName` that
@@ -365,6 +387,14 @@ pub struct ComAmazonawsIotAwsiotserviceState {
     /// this command exist?". Both are bounded by
     /// [`iot_commands::MAX_REGISTERED_COMMANDS`].
     pub commands: BTreeMap<String, RegisteredCommand>,
+    /// The account's FLEET INDEXING configuration — one record, read by
+    /// `GetIndexingConfiguration` and replaced by `UpdateIndexingConfiguration`.
+    ///
+    /// It is a plain field and not an `Option`, because an account that has never
+    /// updated it still HAS a configuration: fleet indexing disabled
+    /// ([`IndexingConfiguration::disabled`]). That is what makes the read a pure
+    /// read — it never has to create the record it reports.
+    pub indexing_configuration: IndexingConfiguration,
 }
 
 impl ComAmazonawsIotAwsiotserviceState {
@@ -619,6 +649,273 @@ pub fn thing_group_arn(region: &str, thing_group_name: &str) -> String {
     ::emulator_server::emulator_arn("iot", region, &format!("thinggroup/{thing_group_name}"))
 }
 
+/// The ARN of an IoT policy: `arn:aws:iot:<region>:<account>:policy/<policyName>`.
+///
+/// `policy` is the resource type AWS IoT's policy ARNs use; the namespace and
+/// account segments are the same ones [`thing_arn`] documents.
+pub fn policy_arn(region: &str, policy_name: &str) -> String {
+    ::emulator_server::emulator_arn("iot", region, &format!("policy/{policy_name}"))
+}
+
+/// The `policyVersionId` a freshly created policy's only version carries.
+///
+/// `CreatePolicy` documents it: "The created policy is the default version for the
+/// policy. This operation creates a policy version with a version identifier of 1
+/// and sets 1 as the policy's default version."
+pub const FIRST_POLICY_VERSION_ID: u32 = 1;
+
+/// The shortest policy document AWS IoT accepts, counted EXCLUDING whitespace.
+///
+/// `CreatePolicy$policyDocument`: "policyDocument must have a minimum length of 1,
+/// with a maximum length of 2048, excluding whitespace."
+pub const MIN_POLICY_DOCUMENT_LENGTH: usize = 1;
+
+/// The longest policy document AWS IoT accepts, counted EXCLUDING whitespace; the
+/// other half of the sentence [`MIN_POLICY_DOCUMENT_LENGTH`] quotes.
+///
+/// It is NOT the modelled `PolicyDocument` length (0..404600): that bound is what the
+/// wire shape admits, while this is the document rule the service itself enforces.
+pub const MAX_POLICY_DOCUMENT_LENGTH: usize = 2048;
+
+/// How many policies this emulator keeps for the account.
+///
+/// AWS publishes a service quota on an account's IoT policies; the exact figure is
+/// not in the model, so this is the emulator's own ceiling on a store a caller can
+/// grow — the same reason [`MAX_JOBS`] and [`MAX_TOPIC_RULES`] exist — and
+/// `CreatePolicy` past it refuses with a modelled error rather than growing without
+/// bound.
+pub const MAX_POLICIES: usize = 1_000;
+
+/// How many BYTES of policy document one policy version may keep.
+///
+/// [`MAX_POLICY_DOCUMENT_LENGTH`] is the documented rule, but it counts only
+/// SIGNIFICANT characters, while a record keeps the document verbatim (a reader hands
+/// back what the writer sent) — so whitespace alone would decide how much memory one
+/// record costs. This is the emulator's own ceiling on that cost: far above any
+/// document whose significant length fits the documented 2048, and well under the
+/// modelled `PolicyDocument` length (0..404600) that the wire shape admits.
+pub const MAX_POLICY_DOCUMENT_BYTES: usize = 32 * 1024;
+
+/// How many tags one policy may carry.
+///
+/// AWS IoT's tagging documentation publishes the limit as "You can add up to 50 tags
+/// to a resource"; `TagList` carries no modelled maximum, so without it one request
+/// would choose how large a single record is.
+pub const MAX_POLICY_TAGS: usize = 50;
+
+/// Why a string is not an IoT policy document.
+///
+/// Each variant is a DIFFERENT refusal, so the caller's message can state the rule
+/// that was violated rather than one fixed template.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PolicyDocumentRejection {
+    /// Its length excluding whitespace is outside
+    /// [`MIN_POLICY_DOCUMENT_LENGTH`]..=[`MAX_POLICY_DOCUMENT_LENGTH`]; carries that
+    /// length, which the request supplied.
+    Length(usize),
+    /// It is longer than [`MAX_POLICY_DOCUMENT_BYTES`]; carries its length in bytes,
+    /// which the request supplied.
+    TooManyBytes(usize),
+    /// It is not JSON at all; carries the parser's own complaint.
+    NotJson(String),
+    /// It is JSON, but not a JSON object, so it cannot be a policy document.
+    NotAnObject,
+    /// It carries no `Statement` at all.
+    MissingStatement,
+    /// Its `Statement` list is empty, so the document grants and denies nothing.
+    EmptyStatement,
+    /// A `Statement` entry is not a JSON object.
+    StatementNotAnObject,
+    /// A statement carries no `Effect`.
+    MissingEffect,
+    /// A statement's `Effect` is neither `Allow` nor `Deny`; carries what it was.
+    InvalidEffect(String),
+    /// A statement names neither `Action` nor `NotAction`.
+    MissingAction,
+}
+
+impl PolicyDocumentRejection {
+    /// What to tell the caller: the rule that was violated, built from the document
+    /// that violated it.
+    pub fn message(&self) -> String {
+        match self {
+            Self::Length(length) => format!(
+                "policyDocument must have a minimum length of {MIN_POLICY_DOCUMENT_LENGTH}, \
+                 with a maximum length of {MAX_POLICY_DOCUMENT_LENGTH}, excluding whitespace; \
+                 this one is {length}"
+            ),
+            Self::TooManyBytes(bytes) => format!(
+                "policyDocument must be at most {MAX_POLICY_DOCUMENT_BYTES} bytes long; \
+                 this one is {bytes}"
+            ),
+            Self::NotJson(complaint) => {
+                format!("policyDocument is not a valid JSON document: {complaint}")
+            }
+            Self::NotAnObject => {
+                "policyDocument must be a JSON object carrying a Statement".to_string()
+            }
+            Self::MissingStatement => "policyDocument must carry a Statement".to_string(),
+            Self::EmptyStatement => {
+                "policyDocument must carry at least one statement in Statement".to_string()
+            }
+            Self::StatementNotAnObject => {
+                "every entry of Statement must be a JSON object".to_string()
+            }
+            Self::MissingEffect => "every statement must carry an Effect".to_string(),
+            Self::InvalidEffect(effect) => format!(
+                "a statement's Effect must be either Allow or Deny, not {effect:?}"
+            ),
+            Self::MissingAction => {
+                "every statement must name an Action or a NotAction".to_string()
+            }
+        }
+    }
+}
+
+/// Check `document` against the IoT policy-document rules, naming the first rule it
+/// violates.
+///
+/// An IoT policy document is an IAM-grammar JSON policy: a JSON object whose
+/// `Statement` is one statement object or a list of them, each carrying an `Effect`
+/// of exactly `Allow` or `Deny` and an `Action` (or `NotAction`). Everything else a
+/// statement may carry — `Resource`, `Condition`, `Sid` — is the caller's to shape,
+/// so nothing here reads or restricts it. The LENGTH rule is the one
+/// `CreatePolicy$policyDocument` documents, counted excluding whitespace; beside it,
+/// [`MAX_POLICY_DOCUMENT_BYTES`] bounds what the verbatim document a record keeps may
+/// cost, which the documented rule does not.
+///
+/// Shared by every operation that accepts a policy document, so `CreatePolicy` and
+/// `CreatePolicyVersion` cannot drift apart on what they accept.
+pub fn validate_policy_document(document: &str) -> Result<(), PolicyDocumentRejection> {
+    if document.len() > MAX_POLICY_DOCUMENT_BYTES {
+        return Err(PolicyDocumentRejection::TooManyBytes(document.len()));
+    }
+    let significant = document.chars().filter(|c| !c.is_whitespace()).count();
+    if !(MIN_POLICY_DOCUMENT_LENGTH..=MAX_POLICY_DOCUMENT_LENGTH).contains(&significant) {
+        return Err(PolicyDocumentRejection::Length(significant));
+    }
+    let parsed: ::serde_json::Value = ::serde_json::from_str(document)
+        .map_err(|error| PolicyDocumentRejection::NotJson(error.to_string()))?;
+    let members = parsed
+        .as_object()
+        .ok_or(PolicyDocumentRejection::NotAnObject)?;
+    let statement = members
+        .get("Statement")
+        .ok_or(PolicyDocumentRejection::MissingStatement)?;
+    // The IAM grammar admits both a single statement object and a list of them.
+    let statements: Vec<&::serde_json::Value> = match statement {
+        ::serde_json::Value::Array(entries) => entries.iter().collect(),
+        single => vec![single],
+    };
+    if statements.is_empty() {
+        return Err(PolicyDocumentRejection::EmptyStatement);
+    }
+    for entry in statements {
+        let statement = entry
+            .as_object()
+            .ok_or(PolicyDocumentRejection::StatementNotAnObject)?;
+        let effect = statement
+            .get("Effect")
+            .ok_or(PolicyDocumentRejection::MissingEffect)?;
+        match effect.as_str() {
+            Some("Allow" | "Deny") => {}
+            _ => {
+                return Err(PolicyDocumentRejection::InvalidEffect(effect.to_string()));
+            }
+        }
+        if !statement.contains_key("Action") && !statement.contains_key("NotAction") {
+            return Err(PolicyDocumentRejection::MissingAction);
+        }
+    }
+    Ok(())
+}
+
+/// One version of a policy's document, as this service persists it.
+#[derive(Debug, Clone)]
+pub struct PolicyVersion {
+    /// The document this version carries, verbatim as the writer supplied it: a
+    /// reader hands back what was written, never a reformatted copy.
+    pub document: String,
+    /// When this version was created.
+    pub created_at: SystemTime,
+}
+
+/// One IoT policy in the registry, as this service persists it.
+///
+/// A policy is a NAME plus a set of numbered document versions and a pointer to the
+/// one that is in effect, which is what the model describes: `GetPolicy` reports
+/// "the policy document of the default version" beside a `defaultVersionId`, and
+/// `CreatePolicyVersion` / `SetDefaultPolicyVersion` add versions and re-point that
+/// pointer.
+#[derive(Debug, Clone)]
+pub struct RegisteredPolicy {
+    /// The name the policy was created under; also its key in the registry.
+    pub policy_name: String,
+    /// `arn:aws:iot:<region>:<account>:policy/<policyName>`, minted on create.
+    pub policy_arn: String,
+    /// Every version that exists, keyed by its numeric `policyVersionId`. Ordered,
+    /// so `ListPolicyVersions` reads them oldest-first without sorting.
+    pub versions: BTreeMap<u32, PolicyVersion>,
+    /// Which version is in effect — the `defaultVersionId` a reader reports and the
+    /// version whose document `GetPolicy` hands back.
+    pub default_version_id: u32,
+    /// When the policy was created — `GetPolicy$creationDate`.
+    pub creation_date: SystemTime,
+    /// When the policy last changed — `GetPolicy$lastModifiedDate`. Equal to
+    /// [`RegisteredPolicy::creation_date`] until a later write moves it.
+    pub last_modified_date: SystemTime,
+    /// `GetPolicy$generationId`, "The generation ID of the policy": an opaque,
+    /// server-minted token identifying the policy's current generation. It is stable
+    /// across reads and re-minted by a write, so a caller can tell one generation
+    /// from another.
+    pub generation_id: String,
+    /// `Tag$Key` -> `Tag$Value` for the tags the create request carried. Tags
+    /// "are used to manage the resource" rather than describe the policy, so they are
+    /// not part of its document or its identity.
+    pub tags: BTreeMap<String, Option<String>>,
+}
+
+impl RegisteredPolicy {
+    /// A newly created policy: the minted identity, `document` as version
+    /// [`FIRST_POLICY_VERSION_ID`] and that version set as the default.
+    pub fn new(
+        policy_name: String,
+        policy_arn: String,
+        document: String,
+        tags: BTreeMap<String, Option<String>>,
+        created_at: SystemTime,
+    ) -> Self {
+        Self {
+            policy_name,
+            policy_arn,
+            versions: BTreeMap::from([(
+                FIRST_POLICY_VERSION_ID,
+                PolicyVersion {
+                    document,
+                    created_at,
+                },
+            )]),
+            default_version_id: FIRST_POLICY_VERSION_ID,
+            creation_date: created_at,
+            last_modified_date: created_at,
+            generation_id: fresh_uuid(),
+            tags,
+        }
+    }
+
+    /// The document of the version that is in effect — what `GetPolicy` reports.
+    pub fn default_document(&self) -> &str {
+        self.versions
+            .get(&self.default_version_id)
+            .map_or("", |version| version.document.as_str())
+    }
+
+    /// The default version's id in the modelled `PolicyVersionId` form (`^[0-9]+$`).
+    pub fn default_version_id(&self) -> String {
+        self.default_version_id.to_string()
+    }
+}
+
 /// The ARN of a topic rule: `arn:aws:iot:<region>:<account>:rule/<ruleName>`.
 ///
 /// `rule/` is the resource type AWS IoT's rule ARNs use — it is what
@@ -678,6 +975,14 @@ pub struct RegisteredTopicRule {
     pub aws_iot_sql_version: String,
     /// The action to run when an action fails, when the rule has one.
     pub error_action: Option<Action>,
+    /// The topic filter the rule's SQL statement selects from — what
+    /// `TopicRuleListItem$topicPattern` reports — resolved ONCE, on the write, by
+    /// [`topic_pattern_of_sql`], so every listing of the rule reports the same
+    /// pattern and none of them re-reads the statement.
+    ///
+    /// `None` for a statement that names no topic filter: the pattern is then
+    /// unknown, and a reader reports the member as absent rather than inventing one.
+    pub topic_pattern: Option<String>,
     /// The `x-amz-tagging` query string the create request carried, verbatim.
     ///
     /// `CreateTopicRule$tags` is a raw `key1=value1&key2=value2` string rather than a
@@ -698,17 +1003,19 @@ impl RegisteredTopicRule {
         payload: TopicRulePayload,
         tags: Option<String>,
     ) -> Self {
+        let payload_sql = payload.sql;
         Self {
             rule_name,
             rule_arn,
             created_at,
-            sql: payload.sql,
             description: payload.description,
             actions: payload.actions,
             rule_disabled: payload.rule_disabled.unwrap_or(false),
             aws_iot_sql_version: payload
                 .aws_iot_sql_version
                 .unwrap_or_else(|| DEFAULT_AWS_IOT_SQL_VERSION.to_string()),
+            topic_pattern: topic_pattern_of_sql(&payload_sql),
+            sql: payload_sql,
             error_action: payload.error_action,
             tags,
         }
@@ -731,6 +1038,132 @@ impl RegisteredTopicRule {
             error_action: self.error_action.clone(),
         }
     }
+}
+
+/// The most characters of a rule's SQL statement [`topic_pattern_of_sql`] reads.
+///
+/// `TopicRulePayload$sql` carries NO modelled length constraint
+/// (`smithy_query(query="shape",shape="TopicRulePayload")`), so the statement a caller
+/// stores is bounded only by the request body, while the topic filter it names is in
+/// the statement's FIRST clause — reading past a generous prefix of it can never find
+/// one. The value is the EMULATOR's choice: the AWS IoT SQL reference's statements are
+/// a few hundred characters, so 64 Ki characters is orders of magnitude above any real
+/// rule and keeps this pass's work and its single allocation finite whatever a caller
+/// stored.
+pub const MAX_SQL_SCAN_CHARACTERS: usize = 64 * 1024;
+
+/// The topic filter a rule's SQL statement selects from — what
+/// `TopicRuleListItem$topicPattern` ("The pattern for the topic names that apply")
+/// reports for that rule.
+///
+/// The AWS IoT SQL reference gives a rule's statement as `SELECT <attributes> FROM
+/// <topic filter> [WHERE <condition>]`, with the topic filter written as a
+/// single-quoted string (`SELECT * FROM 'a/b/+'`), so the pattern is the quoted
+/// literal the statement's first `FROM` names, whatever the clause's casing, spacing
+/// or comments.
+///
+/// The statement is LEXED rather than matched out of its text: this is a single
+/// left-to-right pass that knows where whitespace, a `--` line comment, a `/* */`
+/// block comment, a bare word and a single-quoted literal (with `''` for a quote
+/// inside one) begin and end, and it answers with the first literal the first `FROM`
+/// names. It is written here, and not delegated to a SQL parser crate, because the
+/// clause is AWS IoT's OWN dialect: standard SQL names a RELATION after `FROM`, never
+/// a string literal, so no SQL grammar parses this clause and a parser crate could
+/// only ever lend its lexer to it. The pass is iterative, reads at most
+/// [`MAX_SQL_SCAN_CHARACTERS`] of the statement and allocates only the literal it
+/// returns, so a caller-supplied statement can neither recurse nor grow its work
+/// without bound.
+///
+/// `None` when the statement has no `FROM` followed by a quoted topic filter inside
+/// that prefix (an unquoted relation, an unterminated literal, no `FROM` at all): the
+/// pattern is then unknown, and a reader reports the member as absent rather than
+/// inventing one.
+pub fn topic_pattern_of_sql(sql: &str) -> Option<String> {
+    let characters: Vec<char> = sql.chars().take(MAX_SQL_SCAN_CHARACTERS).collect();
+    let mut index = 0;
+    let mut after_from = false;
+    while index < characters.len() {
+        let character = characters[index];
+        match character {
+            // Whitespace separates the clause's parts and carries nothing.
+            _ if character.is_whitespace() => index += 1,
+            // `-- …` comments out the rest of the line.
+            '-' if characters.get(index + 1) == Some(&'-') => {
+                while index < characters.len() && characters[index] != '\n' {
+                    index += 1;
+                }
+            }
+            // `/* … */` comments out everything up to its close.
+            '/' if characters.get(index + 1) == Some(&'*') => {
+                index += 2;
+                while index < characters.len()
+                    && !(characters[index] == '*' && characters.get(index + 1) == Some(&'/'))
+                {
+                    index += 1;
+                }
+                index = index.saturating_add(2).min(characters.len());
+            }
+            // A single-quoted literal. After `FROM` it IS the topic filter; anywhere
+            // else (a selected constant, a `WHERE` comparand) it is skipped.
+            '\'' => {
+                let mut literal = String::new();
+                index += 1;
+                loop {
+                    match characters.get(index) {
+                        // A doubled quote is one quote inside the literal.
+                        Some('\'') if characters.get(index + 1) == Some(&'\'') => {
+                            literal.push('\'');
+                            index += 2;
+                        }
+                        Some('\'') => {
+                            index += 1;
+                            break;
+                        }
+                        Some(other) => {
+                            literal.push(*other);
+                            index += 1;
+                        }
+                        // An unterminated literal names no topic filter.
+                        None => return None,
+                    }
+                }
+                if after_from {
+                    return Some(literal);
+                }
+            }
+            // A bare word. `FROM` is the one this looks for, whatever its casing; a
+            // word AFTER it is an unquoted relation, which names no topic filter.
+            _ if is_word_character(character) => {
+                let start = index;
+                while index < characters.len() && is_word_character(characters[index]) {
+                    index += 1;
+                }
+                if after_from {
+                    return None;
+                }
+                after_from = characters[start..index]
+                    .iter()
+                    .collect::<String>()
+                    .eq_ignore_ascii_case("FROM");
+            }
+            // Anything else — an operator, a bracket, a comma, a quoted identifier.
+            // Before `FROM` it is part of the select clause; after it, it is not a
+            // quoted topic filter.
+            _ => {
+                if after_from {
+                    return None;
+                }
+                index += 1;
+            }
+        }
+    }
+    None
+}
+
+/// Whether `character` can appear in a bare word of an AWS IoT SQL statement: the
+/// keywords, function names and attribute names a statement writes unquoted.
+fn is_word_character(character: char) -> bool {
+    character.is_alphanumeric() || matches!(character, '_' | '.' | '$')
 }
 
 /// The ARN of a command: `arn:aws:iot:<region>:<account>:command/<commandId>`.
@@ -852,6 +1285,121 @@ impl RegisteredCommand {
             deprecated: Some(self.deprecated),
             pending_deletion: Some(self.pending_deletion),
         }
+    }
+}
+
+/// The wire token every fleet-indexing mode uses for "this kind of indexing is
+/// disabled".
+///
+/// `ThingIndexingMode`, `ThingConnectivityIndexingMode`,
+/// `DeviceDefenderIndexingMode`, `NamedShadowIndexingMode` and
+/// `ThingGroupIndexingMode` each declare it and each document it as "OFF - ...
+/// indexing is disabled"
+/// (`smithy_query(query="doc",shape="ThingIndexingConfiguration",member="thingIndexingMode")`).
+pub const INDEXING_MODE_OFF: &str = "OFF";
+
+/// How many custom fields one indexing configuration may carry, per section.
+///
+/// `Fields` carries no modelled length and the list is one a CALLER supplies, so
+/// this is the emulator's own ceiling on it — the same reason [`MAX_TOPIC_RULES`]
+/// exists — and `UpdateIndexingConfiguration` past it refuses with a modelled error
+/// rather than recording a configuration of unbounded size.
+pub const MAX_CUSTOM_FIELDS: usize = 100;
+
+/// The account's fleet-indexing configuration, as this service persists it.
+///
+/// One record for the account, holding the two configuration sections the model
+/// declares — `GetIndexingConfiguration` reports both, `UpdateIndexingConfiguration`
+/// writes the ones its request supplies — so the reader hands back exactly what the
+/// last writer stored and the two cannot drift.
+///
+/// Like the rest of this store it is NOT partitioned by region (see
+/// [`ComAmazonawsIotAwsiotserviceState`]): one account, one configuration.
+#[derive(Debug, Clone)]
+pub struct IndexingConfiguration {
+    /// `ThingIndexingConfiguration` — "Thing indexing configuration".
+    pub thing: ThingIndexingConfiguration,
+    /// `ThingGroupIndexingConfiguration` — "Thing group indexing configuration".
+    pub thing_group: ThingGroupIndexingConfiguration,
+}
+
+impl IndexingConfiguration {
+    /// The configuration of an account that has never updated it: every kind of
+    /// indexing at its documented [`INDEXING_MODE_OFF`] value, no custom fields and
+    /// no filter.
+    ///
+    /// `thingIndexingMode` and `thingGroupIndexingMode` are `@required` members of
+    /// their sections, so the disabled configuration states them explicitly rather
+    /// than leaving either section's mode unset.
+    pub fn disabled() -> Self {
+        Self {
+            thing: ThingIndexingConfiguration {
+                thing_indexing_mode: INDEXING_MODE_OFF.to_string(),
+                thing_connectivity_indexing_mode: Some(INDEXING_MODE_OFF.to_string()),
+                device_defender_indexing_mode: Some(INDEXING_MODE_OFF.to_string()),
+                named_shadow_indexing_mode: Some(INDEXING_MODE_OFF.to_string()),
+                managed_fields: None,
+                custom_fields: None,
+                filter: None,
+            },
+            thing_group: ThingGroupIndexingConfiguration {
+                thing_group_indexing_mode: INDEXING_MODE_OFF.to_string(),
+                managed_fields: None,
+                custom_fields: None,
+            },
+        }
+    }
+
+    /// Record `supplied` as the account's THING indexing configuration.
+    ///
+    /// A supplied section replaces the stored one in full — the request carries the
+    /// whole `ThingIndexingConfiguration`, not a patch of it — so an optional mode
+    /// the request leaves out is recorded at [`INDEXING_MODE_OFF`] rather than
+    /// keeping the value some earlier call set. `managedFields` is dropped: "You
+    /// can't modify managed fields by updating fleet indexing configuration"
+    /// (`smithy_query(query="doc",shape="ThingIndexingConfiguration",member="managedFields")`),
+    /// so the caller's list is not what the service indexes.
+    pub fn set_thing(&mut self, supplied: ThingIndexingConfiguration) {
+        self.thing = ThingIndexingConfiguration {
+            thing_indexing_mode: supplied.thing_indexing_mode,
+            thing_connectivity_indexing_mode: Some(
+                supplied
+                    .thing_connectivity_indexing_mode
+                    .unwrap_or_else(|| INDEXING_MODE_OFF.to_string()),
+            ),
+            device_defender_indexing_mode: Some(
+                supplied
+                    .device_defender_indexing_mode
+                    .unwrap_or_else(|| INDEXING_MODE_OFF.to_string()),
+            ),
+            named_shadow_indexing_mode: Some(
+                supplied
+                    .named_shadow_indexing_mode
+                    .unwrap_or_else(|| INDEXING_MODE_OFF.to_string()),
+            ),
+            managed_fields: None,
+            custom_fields: supplied.custom_fields,
+            filter: supplied.filter,
+        };
+    }
+
+    /// Record `supplied` as the account's THING GROUP indexing configuration, under
+    /// the same replacement and `managedFields` rules as
+    /// [`IndexingConfiguration::set_thing`].
+    pub fn set_thing_group(&mut self, supplied: ThingGroupIndexingConfiguration) {
+        self.thing_group = ThingGroupIndexingConfiguration {
+            thing_group_indexing_mode: supplied.thing_group_indexing_mode,
+            managed_fields: None,
+            custom_fields: supplied.custom_fields,
+        };
+    }
+}
+
+/// A store with no recorded update reports the disabled configuration, so that is
+/// this record's default.
+impl Default for IndexingConfiguration {
+    fn default() -> Self {
+        Self::disabled()
     }
 }
 

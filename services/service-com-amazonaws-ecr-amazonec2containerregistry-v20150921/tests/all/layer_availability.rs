@@ -3,12 +3,17 @@
 //! `BatchCheckLayerAvailability` over the wire.
 //!
 //! The rule under test: for each layer digest a request names, the answer is the
-//! repository's own record of that blob — `AVAILABLE` with the size and media type the
-//! repository stores for it when the repository holds it, a `MissingLayerDigest`
-//! failure when no blob of that repository answers to the digest, and an
-//! `InvalidLayerDigest` failure when the requested digest is not a content digest at
-//! all. The blobs a repository holds are the ones its stored manifests reference: a
-//! manifest cannot be pushed before its blobs are in the repository.
+//! repository's own record of that layer — a `layers` entry marked `AVAILABLE`, with the
+//! size and media type the repository stores for it, when the repository holds the
+//! layer, and a `layers` entry marked `UNAVAILABLE` when it does not. A `failures` entry
+//! is reserved for a request entry that addresses no layer at all: `Layer$layerDigest`
+//! is constrained to `<algorithm>:<hex>`, so a requested string outside that form can
+//! only be answered as a failure — `InvalidLayerDigest` when it carries something that
+//! is not a content digest, `MissingLayerDigest` when it carries nothing. The blobs a
+//! repository holds are the ones a completed layer upload registered there
+//! (`InitiateLayerUpload`, `UploadLayerPart`, `CompleteLayerUpload`), so the size
+//! reported is the registry's own byte count; the media type is what a stored manifest
+//! referencing the blob declares for it.
 //!
 //! Every case goes through the router, so it exercises routing, deserialization, the
 //! handler, the persisted state and serialization — the same path a client takes.
@@ -47,10 +52,13 @@ enum Expected {
         size: Option<i64>,
         media_type: Option<&'static str>,
     },
-    /// A well-formed digest no blob of the repository answers to.
-    Missing,
+    /// A well-formed digest no layer of the repository answers to: the layer is
+    /// addressed, and it is not here.
+    Unavailable,
     /// A requested digest that is not of the form `<algorithm>:<hex>`.
     Invalid,
+    /// A request entry carrying no digest at all.
+    Missing,
 }
 
 /// One row of the availability table: the case name, the digest asked about, and the
@@ -138,6 +146,60 @@ async fn ok(router: &MultiServiceRouter, case: &str, operation: &str, body: &Val
     answer.body
 }
 
+/// Put `content` into `repository` as a layer, through the documented upload sequence,
+/// and answer the digest the registry registered it under.
+async fn given_layer(
+    router: &MultiServiceRouter,
+    case: &str,
+    repository: &str,
+    content: &str,
+) -> String {
+    let opened = ok(
+        router,
+        case,
+        "InitiateLayerUpload",
+        &json!({"repositoryName": repository}),
+    )
+    .await;
+    let upload_id = opened["uploadId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("case {case:?}: InitiateLayerUpload must hand back an uploadId"))
+        .to_string();
+    let last = i64::try_from(content.len()).expect("a test layer fits in an i64") - 1;
+    ok(
+        router,
+        case,
+        "UploadLayerPart",
+        &json!({
+            "repositoryName": repository,
+            "uploadId": upload_id,
+            "partFirstByte": 0,
+            "partLastByte": last,
+            // A blob travels base64-encoded on the awsJson1_1 wire, with the codec the
+            // wire serializer itself uses.
+            "layerPartBlob": aws_smithy_types::base64::encode(content.as_bytes()),
+        }),
+    )
+    .await;
+    let completed = ok(
+        router,
+        case,
+        "CompleteLayerUpload",
+        &json!({
+            "repositoryName": repository,
+            "uploadId": upload_id,
+            "layerDigests": [blob_digest(content)],
+        }),
+    )
+    .await;
+    completed["layerDigest"]
+        .as_str()
+        .unwrap_or_else(|| {
+            panic!("case {case:?}: CompleteLayerUpload must report the registered layerDigest")
+        })
+        .to_string()
+}
+
 /// Ask about `digests` in `repository`.
 async fn check(router: &MultiServiceRouter, case: &str, repository: &str, digests: &[String]) -> Value {
     ok(
@@ -149,22 +211,36 @@ async fn check(router: &MultiServiceRouter, case: &str, repository: &str, digest
     .await
 }
 
-/// The manifests pushed into [`HOLDER`], and the availability table they imply.
+/// The blobs uploaded into [`HOLDER`], the manifests pushed over them, and the
+/// availability table the two imply.
 ///
-/// The manifest formats are the ones a registry is handed, and each spells its blobs
+/// A blob is in the repository because an upload against it was completed, so each blob
+/// is named here by its CONTENT: the digest it is addressed by is the digest of that
+/// content, and the size the repository reports for it is that content's byte count. The
+/// manifest formats are the ones a registry is handed, and each spells its blobs
 /// differently: the Docker image manifest V2 schema 2 and the OCI image manifest carry
 /// a `config` descriptor plus `layers` descriptors (`digest`, `size`, `mediaType`); the
 /// V2 schema 1 lists `fsLayers[].blobSum`, a digest and nothing else; an OCI image
 /// index lists `manifests`, which are other images rather than this one's blobs.
-fn pushed_manifests() -> (Vec<String>, Vec<Row>) {
-    let shared = blob_digest("shared-layer");
-    let schema2_config = blob_digest("schema2-config");
-    let schema2_layer = blob_digest("schema2-layer");
-    let oci_config = blob_digest("oci-config");
-    let oci_layer = blob_digest("oci-layer");
-    let schema1_only = blob_digest("schema1-only");
+fn pushed_manifests() -> (Vec<&'static str>, Vec<String>, Vec<Row>) {
+    let shared_content = "shared-layer";
+    let schema2_config_content = "schema2-config";
+    let schema2_layer_content = "schema2-layer-content";
+    let oci_config_content = "oci-config";
+    let oci_layer_content = "oci-layer-content";
+    let schema1_only_content = "schema1-only";
+
+    let shared = blob_digest(shared_content);
+    let schema2_config = blob_digest(schema2_config_content);
+    let schema2_layer = blob_digest(schema2_layer_content);
+    let oci_config = blob_digest(oci_config_content);
+    let oci_layer = blob_digest(oci_layer_content);
+    let schema1_only = blob_digest(schema1_only_content);
     let child_manifest = blob_digest("child-manifest");
 
+    // The size a descriptor declares is the uploader's claim about the blob; the size
+    // the repository reports is its own count of the bytes it assembled, which is what
+    // these rows expect. The two are deliberately different here.
     let schema2 = serde_json::to_string(&json!({
         "schemaVersion": 2,
         "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
@@ -220,12 +296,17 @@ fn pushed_manifests() -> (Vec<String>, Vec<Row>) {
     }))
     .expect("the index serialises");
 
+    /// The byte count the repository reports for a blob of this content.
+    fn size_of(content: &str) -> Option<i64> {
+        Some(i64::try_from(content.len()).expect("a test blob fits in an i64"))
+    }
+
     let rows: Vec<Row> = vec![
         (
             "the schema 2 config blob".to_string(),
             schema2_config,
             Expected::Available {
-                size: Some(7023),
+                size: size_of(schema2_config_content),
                 media_type: Some("application/vnd.docker.container.image.v1+json"),
             },
         ),
@@ -233,17 +314,17 @@ fn pushed_manifests() -> (Vec<String>, Vec<Row>) {
             "a schema 2 layer".to_string(),
             schema2_layer,
             Expected::Available {
-                size: Some(1_048_576),
+                size: size_of(schema2_layer_content),
                 media_type: Some("application/vnd.docker.image.rootfs.diff.tar.gzip"),
             },
         ),
         (
-            // Two manifests reference this blob, and only one of them says how big it
-            // is: the record that knows the size is the one reported.
+            // Two manifests reference this blob, and only one of them says what kind of
+            // blob it is: the descriptor that knows the media type is the one reported.
             "a blob a schema 2 and a schema 1 manifest share".to_string(),
             shared,
             Expected::Available {
-                size: Some(1),
+                size: size_of(shared_content),
                 media_type: Some("application/vnd.docker.image.rootfs.diff.tar.gzip"),
             },
         ),
@@ -251,7 +332,7 @@ fn pushed_manifests() -> (Vec<String>, Vec<Row>) {
             "the OCI config blob".to_string(),
             oci_config,
             Expected::Available {
-                size: Some(581),
+                size: size_of(oci_config_content),
                 media_type: Some("application/vnd.oci.image.config.v1+json"),
             },
         ),
@@ -259,40 +340,41 @@ fn pushed_manifests() -> (Vec<String>, Vec<Row>) {
             "an OCI layer".to_string(),
             oci_layer,
             Expected::Available {
-                size: Some(32_768),
+                size: size_of(oci_layer_content),
                 media_type: Some("application/vnd.oci.image.layer.v1.tar+zstd"),
             },
         ),
         (
-            // A `blobSum` names the blob and nothing else, so neither the size nor the
-            // media type is reported for it.
+            // A `blobSum` names the blob and nothing else, so no media type is reported
+            // for it — only the size the registry counted.
             "a schema 1 fsLayers blob".to_string(),
             schema1_only,
             Expected::Available {
-                size: None,
+                size: size_of(schema1_only_content),
                 media_type: None,
             },
         ),
         (
-            // An index entry is another manifest, not a blob of this image.
+            // An index entry is another manifest, not a blob of this image, so pushing
+            // the index uploads nothing for it and the repository holds no such blob.
             "a manifest an index references".to_string(),
             child_manifest,
-            Expected::Missing,
+            Expected::Unavailable,
         ),
         (
-            "a well-formed sha256 digest nothing references".to_string(),
+            "a well-formed sha256 digest nothing uploaded".to_string(),
             blob_digest("never-pushed"),
-            Expected::Missing,
+            Expected::Unavailable,
         ),
         (
-            "a digest of another algorithm, nothing references".to_string(),
+            "a digest of another algorithm, nothing uploaded".to_string(),
             "sha512:0123456789abcdefABCDEF".to_string(),
-            Expected::Missing,
+            Expected::Unavailable,
         ),
         (
             "the digest of a stored manifest, which is not a blob of it".to_string(),
             manifest_digest(&schema2),
-            Expected::Missing,
+            Expected::Unavailable,
         ),
         (
             "a digest with no algorithm separator".to_string(),
@@ -302,7 +384,7 @@ fn pushed_manifests() -> (Vec<String>, Vec<Row>) {
         (
             "an empty digest".to_string(),
             String::new(),
-            Expected::Invalid,
+            Expected::Missing,
         ),
         (
             "an algorithm with no encoded value".to_string(),
@@ -321,19 +403,30 @@ fn pushed_manifests() -> (Vec<String>, Vec<Row>) {
         ),
     ];
 
-    (vec![schema2, oci, schema1, index], rows)
+    (
+        vec![
+            shared_content,
+            schema2_config_content,
+            schema2_layer_content,
+            oci_config_content,
+            oci_layer_content,
+            schema1_only_content,
+        ],
+        vec![schema2, oci, schema1, index],
+        rows,
+    )
 }
 
 /// Every requested digest is answered from the repository's stored blobs, in the order
 /// it was asked about.
 ///
 /// The rows differ along what the rule generalises over: which manifest format declares
-/// the blob, whether that format carries a size and a media type, whether the digest is
-/// referenced at all, which algorithm it names, and the ways a digest can be malformed.
+/// the blob, whether that format carries a media type, whether the blob was uploaded at
+/// all, which algorithm the digest names, and the ways a digest can be malformed.
 #[tokio::test]
 async fn every_requested_digest_is_answered_from_the_repositorys_stored_blobs() {
     let router = emulator();
-    let (manifests, rows) = pushed_manifests();
+    let (blobs, manifests, rows) = pushed_manifests();
     for repository in [HOLDER, EMPTY] {
         ok(
             &router,
@@ -342,6 +435,11 @@ async fn every_requested_digest_is_answered_from_the_repositorys_stored_blobs() 
             &json!({"repositoryName": repository}),
         )
         .await;
+    }
+    // The blobs first: a manifest cannot be pushed before the repository holds every
+    // blob it references.
+    for content in blobs {
+        given_layer(&router, "seed", HOLDER, content).await;
     }
     for (index, manifest) in manifests.iter().enumerate() {
         ok(
@@ -390,6 +488,18 @@ async fn every_requested_digest_is_answered_from_the_repositorys_stored_blobs() 
                     next_layer - 1
                 );
             }
+            Expected::Unavailable => {
+                // The repository knows no size and no media type for a layer it does
+                // not hold, so neither member is reported.
+                let wanted = json!({"layerDigest": digest, "layerAvailability": "UNAVAILABLE"});
+                let got = layers.get(next_layer).cloned().unwrap_or(Value::Null);
+                next_layer += 1;
+                assert_eq!(
+                    got, wanted,
+                    "case {case:?}: expected layers[{}] to be {wanted}, got {got:?}",
+                    next_layer - 1
+                );
+            }
             Expected::Missing | Expected::Invalid => {
                 let code = if *expected == Expected::Missing {
                     MISSING_LAYER_DIGEST
@@ -415,30 +525,51 @@ async fn every_requested_digest_is_answered_from_the_repositorys_stored_blobs() 
     assert_eq!(
         layers.len(),
         next_layer,
-        "every available digest is reported exactly once, got {layers:?}"
+        "every addressed layer is reported exactly once, got {layers:?}"
     );
     assert_eq!(
         failures.len(),
         next_failure,
-        "every unavailable digest is reported exactly once, got {failures:?}"
+        "every entry addressing no layer is reported exactly once, got {failures:?}"
     );
 
-    // Blobs belong to the repository they were pushed to: the very same digests are
-    // missing from a repository that holds no manifest referencing them.
+    // Blobs belong to the repository they were uploaded to: the very same digests are
+    // reported unavailable in a repository no upload was completed against.
     let elsewhere = check(&router, "another repository", EMPTY, &digests).await;
+    let addressed = rows
+        .iter()
+        .filter(|(_, _, expected)| {
+            !matches!(expected, Expected::Invalid | Expected::Missing)
+        })
+        .count();
+    let elsewhere_layers = elsewhere["layers"]
+        .as_array()
+        .cloned()
+        .unwrap_or_else(|| panic!("the answer must carry a layers list, got {elsewhere:?}"));
     assert_eq!(
-        elsewhere["layers"],
-        json!([]),
-        "a repository holding no image holds no blob, got {:?}",
-        elsewhere["layers"]
+        elsewhere_layers.len(),
+        addressed,
+        "every addressed layer is answered there too, got {elsewhere_layers:?}"
     );
+    for layer in &elsewhere_layers {
+        assert_eq!(
+            layer["layerAvailability"],
+            json!("UNAVAILABLE"),
+            "a repository holding no image holds no layer, got {layer:?}"
+        );
+        assert_eq!(
+            layer["layerSize"],
+            Value::Null,
+            "no size is reported for a layer the repository has not got, got {layer:?}"
+        );
+    }
     assert_eq!(
         elsewhere["failures"]
             .as_array()
             .map(Vec::len)
             .unwrap_or_default(),
-        digests.len(),
-        "every digest must be reported as a failure there, got {:?}",
+        digests.len() - addressed,
+        "only the entries addressing no layer are failures there, got {:?}",
         elsewhere["failures"]
     );
 
@@ -480,10 +611,11 @@ async fn a_batch_is_answered_reference_by_reference_within_the_modelled_bounds()
         &json!({"repositoryName": HOLDER}),
     )
     .await;
-    let held = blob_digest("held-layer");
+    let held_content = "held-layer";
+    let held = given_layer(&router, "seed", HOLDER, held_content).await;
     let manifest = serde_json::to_string(&json!({
         "schemaVersion": 2,
-        "layers": [{"size": 12, "digest": held}],
+        "layers": [{"size": held_content.len(), "digest": held}],
     }))
     .expect("the manifest serialises");
     ok(
@@ -511,19 +643,31 @@ async fn a_batch_is_answered_reference_by_reference_within_the_modelled_bounds()
     let mut full = vec![held.clone()];
     full.extend((1..100).map(|n| blob_digest(&format!("absent-{n}"))));
     let answer = check(&router, "a batch of 100", HOLDER, &full).await;
+    let layers = answer["layers"]
+        .as_array()
+        .cloned()
+        .unwrap_or_else(|| panic!("the answer must carry a layers list, got {answer:?}"));
     assert_eq!(
-        answer["layers"].as_array().map(Vec::len).unwrap_or_default(),
-        1,
-        "the one held digest is available, got {:?}",
-        answer["layers"]
+        layers.len(),
+        full.len(),
+        "every reference is answered, got {layers:?}"
     );
     assert_eq!(
-        answer["failures"]
-            .as_array()
-            .map(Vec::len)
-            .unwrap_or_default(),
-        99,
-        "the other 99 are failures, got {:?}",
+        layers[0]["layerAvailability"],
+        json!("AVAILABLE"),
+        "the one held digest is available, got {:?}",
+        layers[0]
+    );
+    assert!(
+        layers[1..]
+            .iter()
+            .all(|layer| layer["layerAvailability"] == json!("UNAVAILABLE")),
+        "the other 99 are unavailable, got {layers:?}"
+    );
+    assert_eq!(
+        answer["failures"],
+        json!([]),
+        "every entry addresses a layer, so none is a failure, got {:?}",
         answer["failures"]
     );
 
@@ -609,8 +753,8 @@ async fn a_check_against_a_repository_this_registry_has_not_got_is_refused() {
     )
     .await;
     assert_eq!(
-        answer["failures"][0]["layerDigest"],
-        json!(digest),
-        "the empty repository holds no blob, got {answer:?}"
+        answer["layers"][0],
+        json!({"layerDigest": digest, "layerAvailability": "UNAVAILABLE"}),
+        "the empty repository holds no layer, got {answer:?}"
     );
 }

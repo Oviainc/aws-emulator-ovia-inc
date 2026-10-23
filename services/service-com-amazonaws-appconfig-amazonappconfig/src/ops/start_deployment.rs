@@ -252,24 +252,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Resolve every resource the deployment names before anything is written.
         let Some(application) = store.applications.get(&input.application_id) else {
             return Err(not_found(
-                format!("No application with id {} exists.", input.application_id),
+                crate::state::application_not_found(&input.application_id),
                 input.application_id,
             ));
         };
         if !application.environments.contains_key(&input.environment_id) {
             return Err(not_found(
-                format!(
-                    "No environment with id {} exists in application {}.",
-                    input.environment_id, input.application_id
+                crate::state::environment_not_found(
+                    &input.application_id,
+                    &input.environment_id,
                 ),
                 input.environment_id,
             ));
         }
         let Some(profile) = application.profiles.get(&input.configuration_profile_id) else {
             return Err(not_found(
-                format!(
-                    "No configuration profile with id {} exists in application {}.",
-                    input.configuration_profile_id, input.application_id
+                crate::state::configuration_profile_not_found(
+                    &input.application_id,
+                    &input.configuration_profile_id,
                 ),
                 input.configuration_profile_id,
             ));
@@ -293,10 +293,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let Some(strategy) = store.resolve_strategy(&input.deployment_strategy_id) else {
             return Err(not_found(
-                format!(
-                    "No deployment strategy with id {} exists.",
-                    input.deployment_strategy_id
-                ),
+                crate::state::deployment_strategy_not_found(&input.deployment_strategy_id),
                 input.deployment_strategy_id,
             ));
         };
@@ -368,12 +365,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         );
         let stored = environment.record_deployment(deployment);
 
-        // Answered from the stored deployment. `KmsKeyArn` and `AppliedExtensions` are
-        // deliberately left unset, not overlooked: the first is the ARN of the key
-        // `KmsKeyIdentifier` resolves to and this emulator resolves no KMS key, and the
-        // second lists the extensions the deployment invoked, which this emulator does
-        // not run (extension associations are still a 501 of their own). Any value here
-        // would be fabricated.
+        // Answered from the stored deployment. `KmsKeyArn` is deliberately left unset, not
+        // overlooked: it is the ARN of the key `KmsKeyIdentifier` resolves to and this
+        // emulator resolves no KMS key, so any value here would be fabricated.
+        // `AppliedExtensions` and `Type` are read off the record like every other member;
+        // see their fields in `crate::state`.
         let output = StartDeploymentOutput {
             application_id: Some(stored.application_id.clone()),
             environment_id: Some(stored.environment_id.clone()),
@@ -393,10 +389,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             percentage_complete: Some(stored.percentage_complete),
             started_at: Some(crate::state::to_date_time(stored.started_at)),
             completed_at: stored.completed_at.map(crate::state::to_date_time),
-            applied_extensions: None,
+            applied_extensions: Some(stored.applied_extensions.clone()),
             kms_key_arn: None,
             kms_key_identifier: stored.kms_key_identifier.clone(),
             version_label: stored.version_label.clone(),
+            r#type: Some(stored.deployment_type.clone()),
         };
 
         // The environment is DEPLOYING for as long as this deployment is in flight.

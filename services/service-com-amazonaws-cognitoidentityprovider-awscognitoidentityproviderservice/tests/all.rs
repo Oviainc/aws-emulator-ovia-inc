@@ -27,3 +27,5 @@ mod state_roundtrip;
 mod token_signing;
 #[path = "all/update_user_pool.rs"]
 mod update_user_pool;
+#[path = "all/update_user_pool_client.rs"]
+mod update_user_pool_client;

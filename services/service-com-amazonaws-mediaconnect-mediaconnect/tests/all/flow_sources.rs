@@ -15,7 +15,7 @@ use crate::flow_lifecycle::{Emulator, REGION};
 
 /// The ARN of a flow in this Region that this service never minted — well formed enough
 /// to pass the modelled `FlowArn` label pattern, so the request reaches the handler.
-fn unknown_flow_arn() -> String {
+pub(crate) fn unknown_flow_arn() -> String {
     format!("arn:aws:mediaconnect:{REGION}:111122223333:flow:1-0000dead:never-minted")
 }
 
@@ -23,13 +23,13 @@ fn unknown_flow_arn() -> String {
 /// modelled `SourceArn` label pattern
 /// (`smithy_query(query="operation",operation="RemoveFlowSource")`:
 /// `^arn:.+:mediaconnect.+:source:.+$`), so the request reaches the handler.
-fn unknown_source_arn() -> String {
+pub(crate) fn unknown_source_arn() -> String {
     format!("arn:aws:mediaconnect:{REGION}:111122223333:source:1-0000dead:never-minted")
 }
 
 /// `POST /v1/flows/{FlowArn}/source` — the AddFlowSources binding
 /// (`smithy_query(query="operation",operation="AddFlowSources")`).
-async fn add_flow_sources(
+pub(crate) async fn add_flow_sources(
     emulator: &Emulator,
     flow_arn: &str,
     sources: Value,
@@ -45,7 +45,7 @@ async fn add_flow_sources(
 
 /// `DELETE /v1/flows/{FlowArn}/source/{SourceArn}` — the RemoveFlowSource binding
 /// (`smithy_query(query="operation",operation="RemoveFlowSource")`).
-async fn remove_flow_source(
+pub(crate) async fn remove_flow_source(
     emulator: &Emulator,
     flow_arn: &str,
     source_arn: &str,
@@ -61,7 +61,7 @@ async fn remove_flow_source(
 
 /// Create the flow a case works on, with `initial` sources already on it, and return its
 /// ARN.
-async fn create_flow_with_sources(
+pub(crate) async fn create_flow_with_sources(
     emulator: &Emulator,
     case: &str,
     name: &str,
@@ -82,7 +82,7 @@ async fn create_flow_with_sources(
 }
 
 /// The flow's stored sources, as DescribeFlow reports them.
-async fn described_sources(emulator: &Emulator, case: &str, flow_arn: &str) -> Vec<Value> {
+pub(crate) async fn described_sources(emulator: &Emulator, case: &str, flow_arn: &str) -> Vec<Value> {
     let (status, code, described) = emulator.describe_flow(flow_arn).await;
     assert_eq!(
         (status, code.as_deref()),

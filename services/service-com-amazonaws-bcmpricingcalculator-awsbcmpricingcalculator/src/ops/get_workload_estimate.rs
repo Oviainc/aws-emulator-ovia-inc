@@ -170,14 +170,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let Some(estimate) = state.workload_estimate(&input.identifier) else {
             return Err(GetWorkloadEstimateErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: format!(
-                        "No workload estimate found with identifier {}",
-                        input.identifier
-                    ),
-                    resource_id: input.identifier.clone(),
-                    resource_type: crate::state::WORKLOAD_ESTIMATE_RESOURCE_TYPE.to_string(),
-                },
+                crate::state::workload_estimate_not_found(&input.identifier),
             )
             .into());
         };

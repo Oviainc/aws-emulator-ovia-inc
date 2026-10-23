@@ -12,6 +12,7 @@ emulator-server = { workspace = true }
 http = { workspace = true }
 # `front_door`: the operation wrapper, the schema it reads a member's HTTP binding
 # off, the constraint walk it runs and the request/response types it serves.
+# `event_stream` is driven through the same traits.
 # `validation`: the same `Schema` / `ShapeSerializer` seam, used to re-walk a built
 # input, and the `Violation` / constraint-path vocabulary the framework's own
 # constraint walk reports in. `shared_path`: `percent_decode`, which it reads a
@@ -34,6 +35,10 @@ sha2 = { workspace = true }
 # `iam_trust_policy`: an IAM trust policy IS a JSON document, so it is read with a
 # maintained JSON parser rather than by hand.
 serde_json = { workspace = true }
+# `query_error_envelope`: the v4 UUID an awsQuery error envelope reports as its
+# `<RequestId>`, from the maintained crate the framework's own request-id minter and the
+# service-local copies of that writer use, rather than derived here.
+uuid = { version = "1", features = ["v4"] }
 
 [lints]
 workspace = true

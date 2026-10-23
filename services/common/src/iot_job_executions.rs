@@ -23,7 +23,7 @@
 //! a thing's oldest FINISHED executions) and
 //! [`JobExecutionStore::remember_client_token`] (oldest token evicted first).
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// A newly enqueued execution's status.
@@ -37,11 +37,96 @@ pub const STATUS_IN_PROGRESS: &str = "IN_PROGRESS";
 /// (`UpdateJobExecution$stepTimeoutInMinutes`). It is a `JobExecutionStatus` value of
 /// both IoT models, and TERMINAL (it is not one of the [`PENDING_STATUSES`]).
 pub const STATUS_TIMED_OUT: &str = "TIMED_OUT";
+/// The status a device reports when it REFUSES the work it was handed. It is a
+/// terminal `JobExecutionStatus` value of both IoT models, and the one terminal
+/// status an execution can only be moved to while it is still `QUEUED` — a device
+/// rejects work it has not started ("Only queued jobs can be rejected").
+pub const STATUS_REJECTED: &str = "REJECTED";
 
 /// The two statuses an execution is PENDING in — the ones
 /// `GetPendingJobExecutions` documents as "not in a terminal status" and
 /// `StartNextPendingJobExecution` as the executions it may start.
 pub const PENDING_STATUSES: [&str; 2] = [STATUS_QUEUED, STATUS_IN_PROGRESS];
+
+/// How far through its lifecycle a status leaves a job execution: enqueued (0),
+/// taken up by its device (1), finished (2). A device update may hold an execution
+/// at its stage or carry it FORWARD; it may never carry it back.
+fn lifecycle_stage(status: &str) -> u8 {
+    match status {
+        STATUS_QUEUED => 0,
+        STATUS_IN_PROGRESS => 1,
+        // Every other modelled `JobExecutionStatus` value ends the execution.
+        _ => 2,
+    }
+}
+
+/// Why a device update of an execution in `current` to `requested` is REFUSED, or
+/// `None` while the move is legal.
+///
+/// A job execution runs forward through enqueued -> taken up -> finished
+/// ([`lifecycle_stage`]), so an update may repeat an execution's own stage (a
+/// progress report) or carry it forward (including straight from `QUEUED` to a
+/// terminal status, which skips no step the service requires), and nothing may carry
+/// it BACK: an execution a device already took up can neither return to the queue
+/// nor be rejected, and a finished one moves no further. The caller reports the
+/// reason as its own modelled state-transition error (HTTP 409); a caller that has
+/// its own wording for a finished execution refuses that case before asking.
+pub fn transition_refusal(current: &str, requested: &str) -> Option<String> {
+    if is_terminal_status(current) {
+        return Some(format!(
+            "The status of job execution cannot be changed to be {requested}"
+        ));
+    }
+    if requested == STATUS_REJECTED && current != STATUS_QUEUED {
+        return Some(format!(
+            "Only queued jobs can be rejected. Job was in status {current}"
+        ));
+    }
+    if lifecycle_stage(requested) < lifecycle_stage(current) {
+        return Some(format!(
+            "The status of job execution cannot be changed to be {requested}"
+        ));
+    }
+    None
+}
+
+/// Check a request's `statusDetails` against the bounds a job execution's details
+/// carry — at most [`MAX_STATUS_DETAIL_PAIRS`] name/value pairs, each name within
+/// [`MAX_STATUS_DETAIL_NAME_LEN`] and each value within
+/// [`MAX_STATUS_DETAIL_VALUE_LEN`] characters — and answer `Err` with the reason the
+/// caller reports as its modelled client error.
+///
+/// NOTHING about the stored record enters the check: a supplied map REPLACES the
+/// stored one ([`JobExecutionRecord::try_replace_status_details`]), so the map the
+/// request carries is the map the record will hold, and repeated updates cannot
+/// accumulate details without bound. An absent member changes nothing and is
+/// therefore always acceptable.
+pub fn check_status_details(details: Option<&HashMap<String, String>>) -> Result<(), String> {
+    let Some(details) = details else {
+        return Ok(());
+    };
+    for (name, value) in details {
+        let name_len = name.chars().count();
+        if name_len > MAX_STATUS_DETAIL_NAME_LEN {
+            return Err(format!(
+                "a statusDetails name of {name_len} characters is over the {MAX_STATUS_DETAIL_NAME_LEN} character maximum"
+            ));
+        }
+        let value_len = value.chars().count();
+        if value_len > MAX_STATUS_DETAIL_VALUE_LEN {
+            return Err(format!(
+                "the statusDetails value for {name} is {value_len} characters, over the {MAX_STATUS_DETAIL_VALUE_LEN} character maximum"
+            ));
+        }
+    }
+    if details.len() > MAX_STATUS_DETAIL_PAIRS {
+        return Err(format!(
+            "the job execution would hold {} statusDetails name/value pairs, over the maximum of {MAX_STATUS_DETAIL_PAIRS}",
+            details.len()
+        ));
+    }
+    Ok(())
+}
 
 /// The `versionNumber` a freshly created execution carries: "Job execution versions
 /// are incremented each time they are updated by a device"
@@ -69,6 +154,18 @@ pub fn is_terminal_status(status: &str) -> bool {
 /// past it is refused with the caller's modelled quota error rather than growing the
 /// store without bound.
 pub const MAX_PENDING_EXECUTIONS_PER_THING: usize = 1_000;
+/// How many COMMAND executions one device may have outstanding (non-terminal) at
+/// once: AWS IoT Device Management publishes a non-adjustable command-execution
+/// concurrency limit of 100 concurrent command executions per target device, so a
+/// start request for a device that already holds that many is REFUSED with the
+/// starting operation's modelled admission error instead of being enqueued.
+///
+/// It is the service's own published quota and is deliberately independent of
+/// [`MAX_PENDING_EXECUTIONS_PER_THING`], which is this emulator's memory bound on
+/// the job executions a thing holds whatever created them: a job execution is not a
+/// command execution and consumes none of the device's command-execution
+/// concurrency.
+pub const MAX_CONCURRENT_COMMAND_EXECUTIONS_PER_THING: usize = 100;
 /// How many FINISHED executions one thing keeps: the newest ones stay resolvable
 /// (so a reader can still tell "finished" from "never existed"), older ones are
 /// evicted as new executions are enqueued, so completed work does not accumulate for
@@ -173,6 +270,16 @@ pub struct JobExecutionRecord {
     /// names an S3 object), which this emulator does not fetch and therefore does
     /// not report.
     pub job_document: Option<String>,
+    /// The ARN of the COMMAND this execution runs, for an execution a command start
+    /// created (`iot-jobs-data`: `StartCommandExecution`); `None` for one a JOB
+    /// created (`iot`: `CreateJob`).
+    ///
+    /// It is what makes an execution countable against the target device's
+    /// published command-execution concurrency limit
+    /// ([`MAX_CONCURRENT_COMMAND_EXECUTIONS_PER_THING`], counted by
+    /// [`JobExecutionStore::concurrent_command_executions`]), which a job execution
+    /// does not consume.
+    pub command_arn: Option<String>,
 }
 
 impl JobExecutionRecord {
@@ -200,7 +307,15 @@ impl JobExecutionRecord {
             execution_timeout_expires_at: None,
             in_progress_timeout_minutes: None,
             job_document,
+            command_arn: None,
         }
+    }
+
+    /// True when this execution runs a COMMAND, i.e. it was created by a command
+    /// start and therefore occupies one of its device's command-execution
+    /// concurrency slots while it is pending.
+    pub fn is_command_execution(&self) -> bool {
+        self.command_arn.is_some()
     }
 
     /// True when the execution has reached a status it never leaves.
@@ -275,50 +390,33 @@ impl JobExecutionRecord {
             .collect()
     }
 
-    /// Apply a request's `statusDetails` WITHIN the bounds a job execution's details
-    /// carry: every supplied pair is set and an absent map leaves the details
-    /// unchanged ("If not specified, the statusDetails are unchanged"), but a map
-    /// that would push the record past [`MAX_STATUS_DETAIL_PAIRS`],
-    /// [`MAX_STATUS_DETAIL_NAME_LEN`] or [`MAX_STATUS_DETAIL_VALUE_LEN`] is refused
-    /// with the reason, for the caller to report as the modelled client error.
-    /// Nothing is written on a refusal: the whole map is checked before the first
-    /// insert, so repeated updates cannot accumulate details without bound.
-    pub fn try_merge_status_details(
+    /// Apply a request's `statusDetails`: a map the request CARRIES replaces the
+    /// stored one wholesale (so a name the device no longer sends is dropped), while
+    /// an ABSENT member leaves the stored map exactly as it was ("If not specified,
+    /// the statusDetails are unchanged").
+    ///
+    /// The map is checked against the record's bounds first
+    /// ([`check_status_details`]) and `Err` names the reason for the caller to report
+    /// as its modelled client error; nothing is written on a refusal, so a map the
+    /// record cannot hold leaves the execution untouched.
+    pub fn try_replace_status_details(
         &mut self,
         details: Option<&HashMap<String, String>>,
     ) -> Result<(), String> {
-        let Some(details) = details else {
-            return Ok(());
-        };
-        for (name, value) in details {
-            let name_len = name.chars().count();
-            if name_len > MAX_STATUS_DETAIL_NAME_LEN {
-                return Err(format!(
-                    "a statusDetails name of {name_len} characters is over the {MAX_STATUS_DETAIL_NAME_LEN} character maximum"
-                ));
-            }
-            let value_len = value.chars().count();
-            if value_len > MAX_STATUS_DETAIL_VALUE_LEN {
-                return Err(format!(
-                    "the statusDetails value for {name} is {value_len} characters, over the {MAX_STATUS_DETAIL_VALUE_LEN} character maximum"
-                ));
-            }
-        }
-        let resulting_pairs = self
-            .status_details
-            .keys()
-            .chain(details.keys())
-            .collect::<BTreeSet<&String>>()
-            .len();
-        if resulting_pairs > MAX_STATUS_DETAIL_PAIRS {
-            return Err(format!(
-                "the job execution would hold {resulting_pairs} statusDetails name/value pairs, over the maximum of {MAX_STATUS_DETAIL_PAIRS}"
-            ));
-        }
-        for (name, value) in details {
-            self.status_details.insert(name.clone(), value.clone());
+        check_status_details(details)?;
+        if let Some(details) = details {
+            self.status_details = details
+                .iter()
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .collect();
         }
         Ok(())
+    }
+
+    /// Why a device update of this execution to `requested` is refused, or `None`
+    /// while the move is legal — [`transition_refusal`] against the stored status.
+    pub fn transition_refusal(&self, requested: &str) -> Option<String> {
+        transition_refusal(&self.status, requested)
     }
 
     /// Apply a request's `stepTimeoutInMinutes`: absent leaves the current step timer
@@ -377,6 +475,11 @@ pub struct StartedCommand {
 /// [`MAX_STATUS_DETAIL_PAIRS`] / [`MAX_STATUS_DETAIL_NAME_LEN`] /
 /// [`MAX_STATUS_DETAIL_VALUE_LEN`]; and the client-token index holds at most
 /// [`MAX_REMEMBERED_CLIENT_TOKENS`] entries (oldest evicted first).
+///
+/// Separately from those memory bounds, the store reports the SERVICE's published
+/// per-device command-execution concurrency limit
+/// ([`Self::try_admit_command_execution`]), which a command start enforces before it
+/// mints anything.
 #[derive(Debug, Default)]
 pub struct JobExecutionStore {
     /// thing name -> that thing's job executions, in the order they were enqueued.
@@ -685,6 +788,46 @@ impl JobExecutionStore {
             .count()
     }
 
+    /// How many COMMAND executions `thing_name` currently holds in a non-terminal
+    /// status — the device's command-execution concurrency, as the published
+    /// per-device limit counts it ([`MAX_CONCURRENT_COMMAND_EXECUTIONS_PER_THING`]).
+    ///
+    /// Only command executions count: an execution a JOB created is not a command
+    /// execution. Only non-terminal ones count: an execution that has finished,
+    /// failed, been rejected or timed out has released its slot.
+    pub fn concurrent_command_executions(&self, thing_name: &str) -> usize {
+        self.executions_for(thing_name)
+            .iter()
+            .filter(|held| held.is_command_execution() && held.is_pending())
+            .count()
+    }
+
+    /// The admission decision for ONE more command execution on `thing_name`:
+    /// `Ok(())` while the device is under the published per-device concurrency
+    /// limit, and `Err` naming the limit it is already at, for the caller to report
+    /// as ITS modelled admission error. Nothing is enqueued either way — this is the
+    /// check a start makes BEFORE it mints a record.
+    ///
+    /// Timers that have already come due are materialised first
+    /// ([`Self::time_out_due_executions`]): an execution whose timeout has passed is
+    /// `TIMED_OUT`, hence terminal, hence no longer holding a slot — the move was
+    /// owed at its own deadline whether or not anybody called, so the device's
+    /// concurrency is read at the current instant rather than at the last call's.
+    pub fn try_admit_command_execution(
+        &mut self,
+        thing_name: &str,
+        now: i64,
+    ) -> Result<(), String> {
+        self.time_out_due_executions(thing_name, now);
+        let outstanding = self.concurrent_command_executions(thing_name);
+        if outstanding >= MAX_CONCURRENT_COMMAND_EXECUTIONS_PER_THING {
+            return Err(format!(
+                "the device already has {outstanding} command executions that have not reached a terminal status, the maximum of {MAX_CONCURRENT_COMMAND_EXECUTIONS_PER_THING} concurrent command executions per device"
+            ));
+        }
+        Ok(())
+    }
+
     /// Materialise the `TIMED_OUT` transition every one of `thing_name`'s executions
     /// has already come due for, and answer how many moved. See
     /// [`JobExecutionRecord::time_out_if_due`] for why a reporting handler may write
@@ -759,6 +902,131 @@ mod tests {
         store
             .try_insert_execution(record)
             .expect("the store accepts an execution below every quota");
+    }
+
+    /// RULE: a device update may hold an execution at its lifecycle stage or carry
+    /// it FORWARD (queued -> taken up -> finished), never back; and `REJECTED` is
+    /// reachable only from `QUEUED`.
+    ///
+    /// The rows span every pair of a pending status with a modelled status, plus the
+    /// moves out of a finished execution.
+    #[test]
+    fn a_status_update_may_never_carry_an_execution_backward() {
+        // (case, stored status, requested status, legal)
+        let rows: &[(&str, &str, &str, bool)] = &[
+            ("queued stays queued", STATUS_QUEUED, STATUS_QUEUED, true),
+            ("queued is taken up", STATUS_QUEUED, STATUS_IN_PROGRESS, true),
+            ("queued succeeds directly", STATUS_QUEUED, "SUCCEEDED", true),
+            ("queued fails directly", STATUS_QUEUED, "FAILED", true),
+            ("queued is rejected", STATUS_QUEUED, STATUS_REJECTED, true),
+            ("queued is canceled", STATUS_QUEUED, "CANCELED", true),
+            ("queued is removed", STATUS_QUEUED, "REMOVED", true),
+            ("queued times out", STATUS_QUEUED, STATUS_TIMED_OUT, true),
+            (
+                "in progress reports progress",
+                STATUS_IN_PROGRESS,
+                STATUS_IN_PROGRESS,
+                true,
+            ),
+            ("in progress succeeds", STATUS_IN_PROGRESS, "SUCCEEDED", true),
+            ("in progress fails", STATUS_IN_PROGRESS, "FAILED", true),
+            (
+                "in progress times out",
+                STATUS_IN_PROGRESS,
+                STATUS_TIMED_OUT,
+                true,
+            ),
+            (
+                "in progress is rewound to the queue",
+                STATUS_IN_PROGRESS,
+                STATUS_QUEUED,
+                false,
+            ),
+            (
+                "in progress is rejected",
+                STATUS_IN_PROGRESS,
+                STATUS_REJECTED,
+                false,
+            ),
+            ("a finished execution restarts", "SUCCEEDED", STATUS_IN_PROGRESS, false),
+            ("a finished execution is requeued", "FAILED", STATUS_QUEUED, false),
+            ("a finished execution finishes again", "SUCCEEDED", "FAILED", false),
+        ];
+
+        for (case, current, requested, legal) in rows {
+            let refusal = transition_refusal(current, requested);
+            assert_eq!(
+                refusal.is_none(),
+                *legal,
+                "case {case:?}: expected legal == {legal} for {current} -> {requested}, got {refusal:?}"
+            );
+        }
+    }
+
+    /// RULE: a supplied `statusDetails` REPLACES the stored map (a name no longer
+    /// sent is dropped), an absent one leaves it unchanged, and a map past the
+    /// bounds is refused with the record left untouched.
+    #[test]
+    fn supplied_status_details_replace_the_stored_map_and_an_absent_one_keeps_it() {
+        let mut record =
+            JobExecutionRecord::queued("job".to_string(), "thing".to_string(), None, 1_000);
+
+        /// One row: the case, the pairs the request carries (`None` when the member
+        /// is omitted) and the pairs the record then holds, in key order.
+        type Row = (&'static str, Option<&'static [(&'static str, &'static str)]>, &'static [(&'static str, &'static str)]);
+
+        let rows: &[Row] = &[
+            (
+                "the first write",
+                Some(&[("stage", "download"), ("attempt", "1")]),
+                &[("attempt", "1"), ("stage", "download")],
+            ),
+            (
+                "a write that no longer sends every name",
+                Some(&[("stage", "verify")]),
+                &[("stage", "verify")],
+            ),
+            ("a write that omits the member", None, &[("stage", "verify")]),
+            ("a write that empties the map", Some(&[]), &[]),
+        ];
+
+        for (case, written, expected) in rows {
+            let details: Option<HashMap<String, String>> = written.map(|pairs| {
+                pairs
+                    .iter()
+                    .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+                    .collect()
+            });
+            record
+                .try_replace_status_details(details.as_ref())
+                .unwrap_or_else(|reason| {
+                    panic!("case {case:?}: expected the map accepted: {reason}")
+                });
+            let held: Vec<(&str, &str)> = record
+                .status_details
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.as_str()))
+                .collect();
+            assert_eq!(
+                held, *expected,
+                "case {case:?}: expected the record to hold {expected:?}, got {held:?}"
+            );
+        }
+
+        // One pair past the bound is refused, and the record keeps what it had.
+        let over_bound: HashMap<String, String> = (0..=MAX_STATUS_DETAIL_PAIRS)
+            .map(|index| (format!("key-{index}"), "v".to_string()))
+            .collect();
+        let refusal = record.try_replace_status_details(Some(&over_bound));
+        assert!(
+            refusal.is_err(),
+            "case one pair too many: expected a refusal, got {refusal:?}"
+        );
+        assert!(
+            record.status_details.is_empty(),
+            "case one pair too many: the refused write must change nothing, got {:?}",
+            record.status_details
+        );
     }
 
     /// A created execution is pending at version 1, execution number 1, and the two
@@ -958,6 +1226,107 @@ mod tests {
                 .sum::<usize>(),
             "case past the bound: the byte count must follow the store, got {}",
             store.stored_document_bytes
+        );
+    }
+
+    /// Enqueue one COMMAND execution for `thing`, the way a command start does:
+    /// admitted against the device's concurrency limit, then stored carrying the
+    /// `commandArn` that makes it a command execution.
+    fn enqueue_command(store: &mut JobExecutionStore, thing: &str, id: &str, now: i64) {
+        store
+            .try_admit_command_execution(thing, now)
+            .unwrap_or_else(|limit| panic!("admitting {id}: {limit}"));
+        let mut record = JobExecutionRecord::queued(
+            id.to_string(),
+            thing.to_string(),
+            Some("{}".to_string()),
+            now,
+        );
+        record.command_arn = Some("arn:aws:iot:us-east-1:111122223333:command/reboot".to_string());
+        store
+            .try_insert_execution(record)
+            .expect("the store accepts an execution below every quota");
+    }
+
+    /// A device's command-execution concurrency counts exactly its NON-TERMINAL
+    /// COMMAND executions: a job execution occupies no slot, the device is admitted
+    /// up to [`MAX_CONCURRENT_COMMAND_EXECUTIONS_PER_THING`] and refused past it,
+    /// another device is unaffected, and a slot is released both by a finished
+    /// execution and by one the clock has timed out.
+    #[test]
+    fn a_device_admits_command_executions_up_to_the_published_concurrency_limit() {
+        const NOW: i64 = 1_700_000_000;
+        let mut store = JobExecutionStore::default();
+
+        // A JOB execution is not a command execution.
+        enqueue(&mut store, "thing", "job-1", NOW);
+        assert_eq!(
+            store.concurrent_command_executions("thing"),
+            0,
+            "case \"a job execution\": expected no command-execution slot consumed, got {}",
+            store.concurrent_command_executions("thing")
+        );
+
+        for index in 0..MAX_CONCURRENT_COMMAND_EXECUTIONS_PER_THING {
+            enqueue_command(&mut store, "thing", &format!("cmd-{index}"), NOW);
+        }
+        assert_eq!(
+            store.concurrent_command_executions("thing"),
+            MAX_CONCURRENT_COMMAND_EXECUTIONS_PER_THING,
+            "case \"at the limit\": expected {MAX_CONCURRENT_COMMAND_EXECUTIONS_PER_THING} outstanding, got {}",
+            store.concurrent_command_executions("thing")
+        );
+        assert!(
+            store.try_admit_command_execution("thing", NOW).is_err(),
+            "case \"past the limit\": expected the device refused, got admitted"
+        );
+        assert!(
+            store.try_admit_command_execution("other-thing", NOW).is_ok(),
+            "case \"another device\": expected its own empty concurrency, got refused"
+        );
+
+        // A finished execution releases its slot.
+        let at = store
+            .execution_index("thing", "cmd-0", None)
+            .expect("the first command execution");
+        store
+            .record_mut("thing", at)
+            .expect("the index came from this store")
+            .status = "SUCCEEDED".to_string();
+        assert_eq!(
+            store.concurrent_command_executions("thing"),
+            MAX_CONCURRENT_COMMAND_EXECUTIONS_PER_THING - 1,
+            "case \"one finished\": expected one slot released, got {}",
+            store.concurrent_command_executions("thing")
+        );
+
+        // Refill the released slot with an execution carrying its own timeout: the
+        // device is at the limit again at that instant...
+        enqueue_command(&mut store, "thing", "cmd-timing-out", NOW);
+        let at = store
+            .execution_index("thing", "cmd-timing-out", None)
+            .expect("the execution just enqueued");
+        store
+            .record_mut("thing", at)
+            .expect("the index came from this store")
+            .execution_timeout_expires_at = Some(NOW + 60);
+        assert!(
+            store.try_admit_command_execution("thing", NOW).is_err(),
+            "case \"at the limit again\": expected the device refused, got admitted"
+        );
+        // ...and under it once that execution's own deadline has passed, which the
+        // clock owed whether or not anybody called.
+        assert!(
+            store.try_admit_command_execution("thing", NOW + 61).is_ok(),
+            "case \"a timed-out execution\": expected its slot released, got refused"
+        );
+        assert_eq!(
+            store
+                .resolve_record("thing", "cmd-timing-out", None)
+                .map(|record| record.status.clone()),
+            Some(STATUS_TIMED_OUT.to_string()),
+            "case \"a timed-out execution\": expected it moved to TIMED_OUT, got {:?}",
+            store.resolve_record("thing", "cmd-timing-out", None)
         );
     }
 

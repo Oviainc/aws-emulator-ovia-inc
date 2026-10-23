@@ -180,6 +180,30 @@ pub fn deployment_not_started(deployment_id: &str) -> String {
     format!("The deployment {deployment_id} has not started")
 }
 
+/// `DeploymentTargetDoesNotExistException` (HTTP 400): the target id the request
+/// asked for and the deployment it does not belong to, which is what the shape's
+/// own sentence says ("The provided target ID does not belong to the attempted
+/// deployment"). The id is bounded by [`echoed`], like every other refusal that
+/// quotes a caller-supplied value back.
+pub fn deployment_target_not_found(deployment_id: &str, target_id: &str) -> String {
+    format!(
+        "The deployment target {} does not belong to the deployment {deployment_id}",
+        echoed(target_id)
+    )
+}
+
+/// `InvalidDeploymentTargetIdException` (HTTP 400): the refusal every operation
+/// taking a `targetId` answers a value outside the FORM a target of that compute
+/// platform is reported under with, so the single-target reader and the batch
+/// reader cannot word it differently. It quotes the id the caller sent, bounded
+/// by [`echoed`].
+pub fn malformed_target_id_message(target_id: &str) -> String {
+    format!(
+        "The deployment target ID {} is not in the valid format",
+        echoed(target_id)
+    )
+}
+
 /// `InvalidTargetFilterNameException` (HTTP 400): the shape's own sentence, with
 /// the filter name the caller sent after the delimiter. The names a target
 /// filter may carry are the members of `TargetFilterName`
@@ -223,6 +247,41 @@ pub fn invalid_instance_label(value: &str) -> String {
 pub const INSTANCE_TYPE_ON_IN_PLACE_DEPLOYMENT: &str =
     "An instance type was specified for an in-place deployment. Instance types are supported \
      for blue/green deployments only";
+
+/// Whether a deployment on `compute_platform` has INSTANCES to report.
+///
+/// The instance-shaped readers of a deployment's targets — the deprecated
+/// `ListDeploymentInstances`, `GetDeploymentInstance` and
+/// `BatchGetDeploymentInstances` — report instances, which only the EC2/
+/// on-premises and Lambda compute platforms have: the model says so on the
+/// operation itself
+/// (`smithy_query(query="doc",shape="ListDeploymentInstances")`:
+/// "ListDeploymentInstances throws an exception if it is used with a compute
+/// platform other than EC2/On-premises or Lambda", and "The newer
+/// BatchGetDeploymentTargets should be used instead because it works with all
+/// compute types"). `ComputePlatform`
+/// (`smithy_query(query="shape",shape="ComputePlatform")`: Server | Lambda |
+/// ECS) is the catalogue, so `ECS` is the member this answers `false` for —
+/// stated POSITIVELY so a platform outside the enum, which this emulator can
+/// target no instance of either, is answered the same way.
+pub fn platform_reports_instances(compute_platform: &str) -> bool {
+    matches!(compute_platform, "Server" | "Lambda")
+}
+
+/// `InvalidComputePlatformException` (HTTP 400): the shape's own sentence, with
+/// the platform of the deployment the request named.
+///
+/// What makes the platform invalid here is the OPERATION, not the deployment: an
+/// Amazon ECS deployment is a perfectly good deployment that simply has no
+/// instances, so the sentence says which platforms the call serves. See
+/// [`platform_reports_instances`].
+pub fn instances_not_reported_for_platform(compute_platform: &str) -> String {
+    format!(
+        "The computePlatform is invalid: instances are reported only for deployments on the \
+         EC2/On-premises or Lambda compute platform, and the specified deployment is on {}",
+        echoed(compute_platform)
+    )
+}
 
 /// `DeploymentConfigDoesNotExistException` (HTTP 400): the configuration name
 /// after the delimiter, in the same form as the other not-found sentences. Only
@@ -497,6 +556,19 @@ pub const MAX_TAG_SET_GROUPS: usize = 3;
 /// of every registered on-premises instance, so an unbounded filter list would
 /// be unbounded work on each `CreateDeployment`.
 pub const MAX_TAG_FILTERS_PER_LIST: usize = 10;
+
+/// The refusal message for a tag filter list longer than this service accepts:
+/// it names the member and the limit, which is what a caller has to fix.
+///
+/// Shared by every operation that takes a caller-chosen tag filter list — the
+/// deployment-group selectors and `ListOnPremisesInstances`'s `tagFilters` — so
+/// one bound is stated once.
+pub fn too_many_tag_filters(member: &str) -> String {
+    format!(
+        "The number of tag filters in {member} exceeded the maximum allowed limit of {}",
+        MAX_TAG_FILTERS_PER_LIST
+    )
+}
 
 /// How many application revisions one application's registry keeps.
 ///
@@ -900,6 +972,15 @@ pub struct DeploymentConfig {
     pub create_time_ms: i64,
 }
 
+/// The `RegistrationStatus` of an on-premises instance that is still
+/// registered, one of the two values the model's `RegistrationStatus` enum
+/// carries (the generated `crate::ops::types::REGISTRATION_STATUS_VALUES`:
+/// Deregistered | Registered).
+pub const REGISTRATION_STATUS_REGISTERED: &str = "Registered";
+/// See [`REGISTRATION_STATUS_REGISTERED`]: the status of an instance whose
+/// registration has ended, whose record CodeDeploy keeps.
+pub const REGISTRATION_STATUS_DEREGISTERED: &str = "Deregistered";
+
 /// A registered on-premises instance.
 ///
 /// The record OUTLIVES its registration: CodeDeploy keeps a deregistered
@@ -1300,6 +1381,41 @@ impl ComAmazonawsCodedeployCodedeploy20141006State {
             .get(iam_arn)
             .and_then(|name| self.on_premises_instances.get(name))
             .filter(|instance| instance.is_registered())
+    }
+
+    /// The names of the on-premises instances a listing answers for one
+    /// `registrationStatus` and one tag filter list, in REGISTRATION order so
+    /// the listing is deterministic and pages stably.
+    ///
+    /// Both members RESTRICT what the full registry would answer, and an absent
+    /// member restricts nothing: "unless otherwise specified, both registered
+    /// and deregistered on-premises instance names are listed"
+    /// (`smithy_query(query="doc",shape="ListOnPremisesInstances")`), and the
+    /// tags "are used to restrict the on-premises instance names returned"
+    /// (`smithy_query(query="doc",shape="ListOnPremisesInstancesInput",member="tagFilters")`).
+    /// A record the registry keeps for a DEREGISTERED instance is as listable
+    /// as a registered one — which is what the `Deregistered` status selects —
+    /// and it is reported with the tags it still carries.
+    pub fn on_premises_instance_names(
+        &self,
+        registration_status: Option<&str>,
+        tag_filters: &[TagFilter],
+    ) -> Vec<String> {
+        self.on_premises_instance_order
+            .iter()
+            .filter_map(|name| self.on_premises_instances.get(name))
+            .filter(|instance| match registration_status {
+                None => true,
+                Some(REGISTRATION_STATUS_REGISTERED) => instance.is_registered(),
+                Some(REGISTRATION_STATUS_DEREGISTERED) => !instance.is_registered(),
+                // A status outside the modelled enum is refused at the request
+                // boundary, so it never reaches here; selecting nothing for it
+                // is the conservative answer if it ever did.
+                Some(_) => false,
+            })
+            .filter(|instance| tag_filters_select(tag_filters, &instance.tags))
+            .map(|instance| instance.instance_name.clone())
+            .collect()
     }
 
     /// Record `instance` as this store's newest registration, keeping the
@@ -1725,6 +1841,206 @@ pub fn target_status(deployment: &Deployment) -> &'static str {
     }
 }
 
+/// Why a value is not an id a target of `compute_platform` could ever be
+/// reported under.
+///
+/// The FORM of a target id is per compute platform, as the model states it
+/// (`smithy_query(query="doc",shape="BatchGetDeploymentTargetsInput",member="targetIds")`):
+/// an EC2/on-premises instance id or a Lambda function name is a resource name,
+/// while an Amazon ECS target is "pairs of Amazon ECS clusters and services
+/// specified using the format `<clustername>:<servicename>`". A value outside
+/// the form names no target of ANY deployment on that platform, which is what
+/// `InvalidDeploymentTargetIdException` describes — so every operation taking a
+/// `targetId` gates the form here before it looks the target up, keeping "that
+/// is not a target id" and "no target of this deployment has that id" two
+/// different answers, exactly as [`deployment_id_is_well_formed`] does for a
+/// deployment id.
+pub fn check_deployment_target_id(
+    compute_platform: &str,
+    target_id: &str,
+) -> Result<(), NameRefusal> {
+    if target_id.trim().is_empty() {
+        return Err(NameRefusal::Missing);
+    }
+    // The platform whose targets are named by a PAIR; the other platforms name
+    // a single resource, so the resource-name form answers for them.
+    if compute_platform == "ECS" {
+        let mut parts = target_id.split(':');
+        let (Some(cluster), Some(service), None) = (parts.next(), parts.next(), parts.next())
+        else {
+            return Err(NameRefusal::Malformed);
+        };
+        return if is_resource_name(cluster) && is_resource_name(service) {
+            Ok(())
+        } else {
+            Err(NameRefusal::Malformed)
+        };
+    }
+    check_instance_name(target_id)
+}
+
+/// Whether `value` has the form of a CodeDeploy resource name: at least one
+/// character, at most [`MAX_NAME_LENGTH`] of them, all from the service's
+/// resource-name character set (see [`is_name_character`]).
+fn is_resource_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.chars().count() <= MAX_NAME_LENGTH
+        && value.chars().all(is_name_character)
+}
+
+/// The target of `deployment` reported under `target_id`, if it holds one.
+///
+/// The deployment's targets are the SNAPSHOT its group resolved when it was
+/// created, so this is the one lookup every reader of a single target goes
+/// through: a target id the snapshot does not hold belongs to no target of this
+/// deployment, whatever the fleet looks like now. A target this emulator
+/// resolved but cannot NAME ([`DeploymentTargetSnapshot::target_id`]) is reached
+/// by no id.
+pub fn find_deployment_target<'a>(
+    deployment: &'a Deployment,
+    target_id: &str,
+) -> Option<&'a DeploymentTargetSnapshot> {
+    deployment
+        .targets
+        .iter()
+        .find(|target| target.target_id.as_deref() == Some(target_id))
+}
+
+/// The instant a target of `deployment` last changed state.
+///
+/// A target's state is its deployment's progress ([`target_status`]), so it last
+/// changed when the deployment last did: when it completed, else when it
+/// started, else when it was created. DERIVED from the deployment's own
+/// timestamps rather than stored a second time, so no reader can see a target
+/// status and a `lastUpdatedAt` that disagree, and two reads of a target nothing
+/// happened to answer the same instant.
+pub fn target_last_updated_at_ms(deployment: &Deployment) -> i64 {
+    deployment
+        .complete_time_ms
+        .or(deployment.start_time_ms)
+        .unwrap_or(deployment.create_time_ms)
+}
+
+/// The lifecycle events of `deployment` this service holds a result for, as the
+/// modelled `LifecycleEvent` list a target carries.
+///
+/// CodeDeploy reports a target's lifecycle events as the hooks its deployment
+/// ran on that target. The only lifecycle event results this emulator HOLDS are
+/// the ones a validation function reported through
+/// `PutLifecycleEventHookExecutionStatus` ([`LifecycleEventHookExecution`]):
+/// nothing here runs the EC2/on-premises hooks the CodeDeploy agent runs, so a
+/// deployment no result was reported for carries no lifecycle event rather than
+/// events nothing ran. A report says what the lifecycle event ended as and
+/// when it was made, which is when that event ENDED; when it started is not
+/// something a report carries, so it is left absent.
+fn target_lifecycle_events(
+    deployment: &Deployment,
+) -> Option<Vec<crate::ops::types::LifecycleEvent>> {
+    let events: Vec<crate::ops::types::LifecycleEvent> = deployment
+        .lifecycle_hook_executions
+        .iter()
+        .map(|execution| crate::ops::types::LifecycleEvent {
+            lifecycle_event_name: Some(execution.lifecycle_event_name.clone()),
+            diagnostics: None,
+            start_time: None,
+            end_time: Some(timestamp(execution.update_time_ms)),
+            status: Some(execution.status.clone()),
+        })
+        .collect();
+    non_empty(&events)
+}
+
+/// One target of `deployment` as the modelled `DeploymentTarget`.
+///
+/// The ONE builder every reader of a deployment target answers from
+/// (`BatchGetDeploymentTargets`, `GetDeploymentTarget`), so the batch reader and
+/// the single-target reader cannot report the same target differently. Which
+/// member of `DeploymentTarget` carries the target is its
+/// `DeploymentTargetType`, and everything in it comes from the stored
+/// deployment: its id and the snapshot its group resolved, the status its
+/// progress gives the target ([`target_status`]), and the instant that status
+/// last changed ([`target_last_updated_at_ms`]).
+///
+/// What this emulator does NOT hold, it does not report: a Lambda target's
+/// `lambdaFunctionInfo` names the function and the versions inside the
+/// revision's AppSpec, which CodeDeploy's state holds no content of, and an ECS
+/// target's `taskSetsInfo` and ARN are Amazon ECS's own records, which this
+/// emulator reads from no other service.
+pub fn deployment_target_view(
+    state: &ComAmazonawsCodedeployCodedeploy20141006State,
+    deployment: &Deployment,
+    target: &DeploymentTargetSnapshot,
+) -> crate::ops::types::DeploymentTarget {
+    let deployment_id = Some(deployment.deployment_id.clone());
+    let target_id = target.target_id.clone();
+    let status = Some(target_status(deployment).to_string());
+    let last_updated_at = Some(timestamp(target_last_updated_at_ms(deployment)));
+    let lifecycle_events = target_lifecycle_events(deployment);
+    let mut view = crate::ops::types::DeploymentTarget {
+        deployment_target_type: Some(target.target_type.clone()),
+        instance_target: None,
+        lambda_target: None,
+        ecs_target: None,
+        cloud_formation_target: None,
+    };
+    match target.target_type.as_str() {
+        DEPLOYMENT_TARGET_TYPE_ECS => {
+            view.ecs_target = Some(crate::ops::types::ECSTarget {
+                deployment_id,
+                target_id,
+                target_arn: None,
+                last_updated_at,
+                lifecycle_events,
+                status,
+                task_sets_info: None,
+            });
+        }
+        DEPLOYMENT_TARGET_TYPE_LAMBDA => {
+            view.lambda_target = Some(crate::ops::types::LambdaTarget {
+                deployment_id,
+                target_id,
+                target_arn: None,
+                status,
+                last_updated_at,
+                lifecycle_events,
+                lambda_function_info: None,
+            });
+        }
+        // An EC2/on-premises instance target, which is what a snapshot of this
+        // service's own fleet resolves to; see `deployment_targets`.
+        _ => {
+            view.instance_target = Some(crate::ops::types::InstanceTarget {
+                deployment_id,
+                target_arn: instance_target_arn(state, target),
+                target_id,
+                status,
+                last_updated_at,
+                lifecycle_events,
+                instance_label: target.instance_label.clone(),
+            });
+        }
+    }
+    view
+}
+
+/// The `targetArn` of an instance target: the ARN of the instance itself.
+///
+/// The instances this emulator holds are the on-premises ones registered with
+/// it, and their ARN is the one the registry MINTED at registration
+/// ([`instance_arn`]) rather than one rebuilt here, so a target's ARN and the
+/// `instanceArn` the on-premises readers answer are the same string. An instance
+/// the registry no longer holds has no ARN to report.
+fn instance_target_arn(
+    state: &ComAmazonawsCodedeployCodedeploy20141006State,
+    target: &DeploymentTargetSnapshot,
+) -> Option<String> {
+    let target_id = target.target_id.as_deref()?;
+    state
+        .on_premises_instances
+        .get(target_id)
+        .map(|instance| instance.instance_arn.clone())
+}
+
 /// Whether a deployment group selects an on-premises instance carrying `tags`.
 ///
 /// The two on-premises selectors a group can carry work as the AWS CodeDeploy
@@ -1781,6 +2097,20 @@ fn tag_filter_matches(filter: &TagFilter, tags: &[Tag]) -> bool {
                 })
         }
     }
+}
+
+/// Whether a list of on-premises instance tag filters selects an instance
+/// carrying `tags`.
+///
+/// An EMPTY list is no restriction at all, so it selects every instance; a
+/// non-empty one selects an instance that matches ANY of its filters — the same
+/// rule a deployment group's `onPremisesInstanceTagFilters` follows (see
+/// [`group_selects_instance`]), which is the one semantics CodeDeploy gives a
+/// flat list of tag filters. Each filter is matched by [`tag_filter_matches`],
+/// so a filter that describes no tag (`KEY_AND_VALUE` naming one member, or a
+/// filter naming neither) selects nothing through it.
+pub fn tag_filters_select(filters: &[TagFilter], tags: &[Tag]) -> bool {
+    filters.is_empty() || filters.iter().any(|filter| tag_filter_matches(filter, tags))
 }
 
 /// The terminal status a deployment with `target_count` targets reaches:

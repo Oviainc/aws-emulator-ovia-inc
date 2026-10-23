@@ -27,8 +27,9 @@ use std::collections::BTreeMap;
 
 use crate::ops::types::{
     Build, BuildArtifacts, BuildBatch, BuildBatchPhase, BuildPhase, CommandExecution,
-    EnvironmentVariable, Fleet, FleetStatus, PhaseContext, Project, ProjectArtifacts, ReportGroup,
-    Sandbox, SandboxSession, SandboxSessionPhase, SourceCredentialsInfo,
+    EnvironmentVariable, Fleet, FleetStatus, PhaseContext, Project, ProjectArtifacts, ProjectCache,
+    ProjectEnvironment, ProjectSource, ReportGroup, Sandbox, SandboxSession, SandboxSessionPhase,
+    SourceCredentialsInfo,
 };
 
 /// The ARN service segment for this service, as `emulator_arn`'s first argument
@@ -2217,6 +2218,84 @@ pub fn build_artifacts_of(artifacts: ProjectArtifacts) -> BuildArtifacts {
         artifact_identifier: artifacts.artifact_identifier,
         bucket_owner_access: artifacts.bucket_owner_access,
     }
+}
+
+/// The `CacheType` a run whose project configures no cache reports.
+///
+/// `ProjectCache$type` documents this value as the one that means no cache is
+/// used at all: "NO_CACHE: The build project does not use any cache." A started
+/// build or batch build reports the configuration it RUNS WITH, so the absence of
+/// a cache is reported as this cache type rather than as an absent member.
+pub const CACHE_TYPE_NO_CACHE: &str = "NO_CACHE";
+
+/// The `ImagePullCredentialsType` a run whose environment names none pulls its
+/// image with.
+///
+/// `ProjectEnvironment$imagePullCredentialsType` documents the choice between its
+/// two values by what the image requires: "When you use a cross-account or private
+/// registry image, you must use SERVICE_ROLE credentials. When you use an CodeBuild
+/// curated image, you must use CODEBUILD credentials." An environment that names
+/// no `registryCredential` is pulling a curated image, which is this value.
+pub const DEFAULT_IMAGE_PULL_CREDENTIALS_TYPE: &str = "CODEBUILD";
+
+/// Whether an unconfigured `ProjectSource$insecureSsl` flag is on.
+///
+/// The member is the opt-in "Enable this flag to ignore SSL warnings while
+/// connecting to the project source code", so a source that does not set it runs
+/// with it off. A run reports its effective value rather than omitting the member.
+pub const DEFAULT_INSECURE_SSL: bool = false;
+
+/// Whether an unconfigured `ProjectEnvironment$privilegedMode` flag is on.
+///
+/// AWS documents the default on that member: "Enables running the Docker daemon
+/// inside a Docker container. ... The default setting is `false`."
+pub const DEFAULT_PRIVILEGED_MODE: bool = false;
+
+/// The KMS key a run encrypts its output artifacts with when nothing named one:
+/// `arn:aws:kms:<region>:<account>:alias/aws/s3`.
+///
+/// AWS documents the default on `Project$encryptionKey`: "If you don't specify a
+/// value, CodeBuild uses the managed CMK for Amazon Simple Storage Service (Amazon
+/// S3)", which is that service's managed alias.
+pub fn default_encryption_key(region: &str) -> String {
+    ::emulator_server::emulator_arn("kms", region, "alias/aws/s3")
+}
+
+/// `cache` as a started run reports it: the configured cache, or the explicit
+/// [`CACHE_TYPE_NO_CACHE`] cache of a project that configures none.
+pub fn effective_cache(cache: Option<ProjectCache>) -> ProjectCache {
+    cache.unwrap_or_else(|| ProjectCache {
+        r#type: CACHE_TYPE_NO_CACHE.to_string(),
+        location: None,
+        modes: None,
+        cache_namespace: None,
+    })
+}
+
+/// `source` as a started run reports it: every flag resolved to the value the run
+/// actually uses.
+///
+/// Shared by `StartBuild` and `StartBuildBatch` (and so by every read of the
+/// records they persist), which resolve the same `ProjectSource` with their own
+/// `*Override` members already applied.
+pub fn effective_source(mut source: ProjectSource) -> ProjectSource {
+    source.insecure_ssl = Some(source.insecure_ssl.unwrap_or(DEFAULT_INSECURE_SSL));
+    source
+}
+
+/// `environment` as a started run reports it: the documented defaults resolved,
+/// and the variable list present even when the project defines none.
+pub fn effective_environment(mut environment: ProjectEnvironment) -> ProjectEnvironment {
+    environment.privileged_mode =
+        Some(environment.privileged_mode.unwrap_or(DEFAULT_PRIVILEGED_MODE));
+    environment.image_pull_credentials_type = Some(
+        environment
+            .image_pull_credentials_type
+            .unwrap_or_else(|| DEFAULT_IMAGE_PULL_CREDENTIALS_TYPE.to_string()),
+    );
+    environment.environment_variables =
+        Some(environment.environment_variables.unwrap_or_default());
+    environment
 }
 
 /// `defined` with `overrides` applied: an override replaces the variable of the same

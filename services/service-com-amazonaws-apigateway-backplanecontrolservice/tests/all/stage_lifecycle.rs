@@ -28,8 +28,14 @@ use crate::rest_api_lifecycle::{
 };
 
 /// `CreateDeployment` for `api` with `request`, asserting the modelled 201 and
-/// answering the deployment id.
-async fn create_deployment(gateway: &Gateway, api: &str, case: &str, request: Value) -> String {
+/// answering the deployment id. Shared with the `flush_stage_cache` suite, which needs a
+/// deployment for every stage it creates.
+pub(crate) async fn create_deployment(
+    gateway: &Gateway,
+    api: &str,
+    case: &str,
+    request: Value,
+) -> String {
     let answer = gateway
         .call(
             "POST",
@@ -62,8 +68,9 @@ pub(crate) async fn create_deployed_stage(
     .await
 }
 
-/// `GetStage` for `stage_name` of `api`.
-async fn get_stage(gateway: &Gateway, api: &str, stage_name: &str) -> Answer {
+/// `GetStage` for `stage_name` of `api`. Shared with the `flush_stage_cache` suite,
+/// which reads a stage back to see what a flush changed.
+pub(crate) async fn get_stage(gateway: &Gateway, api: &str, stage_name: &str) -> Answer {
     gateway
         .call("GET", &format!("/restapis/{api}/stages/{stage_name}"), None)
         .await

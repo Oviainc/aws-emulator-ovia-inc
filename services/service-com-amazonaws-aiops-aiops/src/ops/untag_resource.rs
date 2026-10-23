@@ -3,7 +3,8 @@
 //! @op UntagResource
 //! Removes the tag keys the request names from the investigation group
 //! `{resourceArn}` names, leaving every other stored tag in place;
-//! `ResourceNotFoundException` when nothing matches. Idempotent: a key the resource
+//! the tagging frontend's 404 `NotFoundException` when nothing matches
+//! ([`crate::state::TAGGING_RESOURCE_NOT_FOUND`]). Idempotent: a key the resource
 //! does not carry is nothing to remove, not a failure.
 //!
 //! ## Shape of an operation
@@ -158,9 +159,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // operation's modelled `@references` trait), so it resolves exactly the way
         // every other identifier of this service does.
         let group = store.group_mut(&input.resource_arn).ok_or_else(|| {
-            UntagResourceErrorModeled::ResourceNotFoundException(
-                crate::state::investigation_group_not_found(),
-            )
+            // A tagging call is served by the tagging frontend, whose absent-resource
+            // answer is 404 `NotFoundException` rather than this service's own
+            // modelled `ResourceNotFoundException`; see
+            // `crate::state::TAGGING_RESOURCE_NOT_FOUND`.
+            crate::scaffolded::Scaffolded::not_found(crate::state::TAGGING_RESOURCE_NOT_FOUND)
         })?;
 
         // Removal is per key and idempotent: a key the resource never carried leaves

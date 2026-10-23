@@ -1,15 +1,29 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeletePackageVersions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeletePackageVersions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeletePackageVersions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the versions the caller's `versions` list names from the package its
+//! `(format, namespace, package)` triple names, inside one repository:
+//!
+//! * the addressed domain, repository and package are resolved first; one this caller does
+//!   not hold is `ResourceNotFoundException` (404), so a request that names no package is
+//!   refused rather than reported as a list of per-version failures;
+//! * each named version is decided on its own and reported in ONE of the two modelled
+//!   maps, because this operation answers 200 with a per-version outcome rather than
+//!   failing the call: a version the package does not hold is `NOT_FOUND`, a version whose
+//!   status is not the `expectedStatus` the caller pinned is `MISMATCHED_STATUS`, and every
+//!   other named version is removed and reported in `successfulVersions` with the revision
+//!   it last had and status `Deleted` ("The status of every successful version will be
+//!   Deleted" — the member's own documentation);
+//! * the removal is committed to the store, so neither `DescribePackageVersion` nor
+//!   `ListPackageVersions` can still report a deleted version, and the domain's derived
+//!   `assetSizeBytes` drops by what its assets held;
+//! * a package the delete leaves holding NO versions is removed with them: the record
+//!   exists to hold a package's versions, so once the last one is deleted the package is
+//!   no longer in the repository and `DescribePackage` for it answers 404. A package that
+//!   already held no versions (one `PutPackageOriginConfiguration` created) is untouched —
+//!   this delete removed nothing, and a reporting path may not prune what it did not
+//!   change.
 //!
 //! ## Shape of an operation
 //!
@@ -179,20 +193,157 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeletePackageVersions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeletePackageVersionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeletePackageVersions"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeletePackageVersionsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the CodeArtifact store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+        let Some(domain) = store.domain_mut(&input.domain, input.domain_owner.as_deref()) else {
+            return Err(not_found(
+                crate::state::domain_not_found_message(
+                    &input.domain,
+                    input.domain_owner.as_deref(),
+                ),
+                &input.domain,
+                "domain",
+            ));
+        };
+        let Some(repository) = domain.repositories.get_mut(&input.repository) else {
+            return Err(not_found(
+                crate::state::repository_not_found_message(
+                    &input.domain,
+                    input.domain_owner.as_deref(),
+                    &input.repository,
+                ),
+                &input.repository,
+                "repository",
+            ));
+        };
+
+        // A package is addressed by its whole (format, namespace, name) triple, the same
+        // key `DescribePackage` resolves: a request naming the right package name under a
+        // different format or namespace addresses a DIFFERENT package, and that one is
+        // not found.
+        let key =
+            crate::state::package_key(&input.format, input.namespace.as_deref(), &input.package);
+        let Some(package) = repository.packages.get_mut(&key) else {
+            return Err(not_found(
+                crate::state::package_not_found_message(&input.package, &input.repository),
+                &input.package,
+                "package",
+            ));
+        };
+
+        let mut successful: ::std::collections::HashMap<String, SuccessfulPackageVersionInfo> =
+            ::std::collections::HashMap::new();
+        let mut failed: ::std::collections::HashMap<String, PackageVersionError> =
+            ::std::collections::HashMap::new();
+
+        for version in &input.versions {
+            // Both answers are MAPS keyed by version, so a list that repeats a version
+            // carries one outcome for it: the first decision stands, and the repeat is not
+            // re-decided against the store the first one already changed.
+            if successful.contains_key(version) || failed.contains_key(version) {
+                continue;
+            }
+
+            let Some(stored) = package.versions.get(version) else {
+                failed.insert(
+                    version.clone(),
+                    version_error(
+                        PACKAGE_VERSION_ERROR_NOT_FOUND,
+                        crate::state::package_version_not_found_message(
+                            &input.package,
+                            version,
+                            &input.repository,
+                        ),
+                    ),
+                );
+                continue;
+            };
+
+            // `expectedStatus` is the caller's precondition on the version they are
+            // deleting: a version in another status is left exactly as it was and reported
+            // as the mismatch, not deleted.
+            if let Some(expected) = &input.expected_status {
+                if &stored.status != expected {
+                    failed.insert(
+                        version.clone(),
+                        version_error(
+                            PACKAGE_VERSION_ERROR_MISMATCHED_STATUS,
+                            format!(
+                                "Package version {} {} is {}, not the expected status {}.",
+                                input.package, version, stored.status, expected
+                            ),
+                        ),
+                    );
+                    continue;
+                }
+            }
+
+            // Read off the record BEFORE it goes: the revision the version last had is
+            // what identifies the content this call removed.
+            let revision = stored.revision();
+            package.versions.remove(version);
+            successful.insert(
+                version.clone(),
+                SuccessfulPackageVersionInfo {
+                    revision: Some(revision),
+                    status: Some(crate::state::PACKAGE_VERSION_STATUS_DELETED.to_string()),
+                },
+            );
+        }
+
+        // A package record holds a package's versions; once this delete removed the last
+        // one, the package is no longer in the repository and `DescribePackage` for it
+        // answers 404. Guarded on having actually deleted something, so a call that
+        // removed nothing cannot prune a package that legitimately holds no versions (the
+        // record `PutPackageOriginConfiguration` creates for a package with none).
+        if !successful.is_empty() && package.versions.is_empty() {
+            repository.packages.remove(&key);
+        }
+
+        Ok(DeletePackageVersionsOutput {
+            successful_versions: Some(successful),
+            failed_versions: Some(failed),
+        })
     }
 }
+
+/// `PackageVersionErrorCode$NOT_FOUND`: the package holds no version of that name.
+const PACKAGE_VERSION_ERROR_NOT_FOUND: &str = "NOT_FOUND";
+
+/// `PackageVersionErrorCode$MISMATCHED_STATUS`: the version is not in the status the
+/// caller's `expectedStatus` pinned.
+const PACKAGE_VERSION_ERROR_MISMATCHED_STATUS: &str = "MISMATCHED_STATUS";
+
+/// One entry of the `failedVersions` map: the modelled error code and why.
+fn version_error(error_code: &str, error_message: String) -> PackageVersionError {
+    PackageVersionError {
+        error_code: Some(error_code.to_string()),
+        error_message: Some(error_message),
+    }
+}
+
+/// A `ResourceNotFoundException` (404) naming the resource that was addressed, so a caller
+/// can tell an unknown domain from an unknown repository or package.
+fn not_found(
+    message: String,
+    resource_id: &str,
+    resource_type: &str,
+) -> DeletePackageVersionsError {
+    DeletePackageVersionsErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message,
+        resource_id: Some(resource_id.to_string()),
+        resource_type: Some(resource_type.to_string()),
+    })
+    .into()
+}
+

@@ -23,7 +23,7 @@ use crate::ops::types::{
     OptInRequiredException, OrganizationConfiguration, OrganizationScope, PreviewResult,
     RecommendedAction, RecommendedActionFilter, ResourceDetails, ResourceTagsCriteriaCondition,
     Schedule, StringCriteriaCondition, Tag, AUTOMATION_EVENT_FILTER_NAME_VALUES,
-    RECOMMENDED_ACTION_FILTER_NAME_VALUES,
+    RECOMMENDED_ACTION_FILTER_NAME_VALUES, SAVINGS_ESTIMATION_MODE_VALUES,
 };
 
 /// The ARN namespace this service stamps on a rule ARN, from the model's
@@ -144,6 +144,19 @@ pub const MAX_STORED_EVENTS: usize = 1_000;
 /// capped rather than left to grow with every request. It is the same order as
 /// the largest page the model's `maxResults` allows.
 pub const MAX_RULES_PER_ACCOUNT: usize = 100;
+
+/// How many tags one resource of this service may carry.
+///
+/// DOCUMENTED, not chosen: the `tags` member of a rule create reads "A list of
+/// key-value pairs used to categorize and organize the automation rule. Maximum
+/// of 200 tags allowed."
+/// (`smithy_query(query="doc",shape="CreateAutomationRuleRequest",member="tags")`),
+/// and `TagList` — the shape every tag list of this service is, request and
+/// response alike — carries `@length(max: 200)`
+/// (`smithy_query(query="shape",shape="TagList")`). So the list a resource
+/// HOLDS is bounded exactly as the list a request carries is, and an addition
+/// that would push it past the bound is refused instead of applied.
+pub const MAX_TAGS_PER_RESOURCE: usize = 200;
 
 /// How many client tokens the idempotency ledger remembers. Reached only by
 /// distinct caller-supplied tokens; the oldest entry is evicted to make room, so
@@ -285,6 +298,15 @@ pub const IDEMPOTENT_PARAMETER_MISMATCH_MESSAGE: &str =
 /// ARN.
 pub fn revision_mismatch_message(current_revision: i64) -> String {
     format!("Rule revision does not match the current revision number {current_revision}")
+}
+
+/// The `InvalidParameterValueException` message for a tag addition that would
+/// leave the resource holding more than [`MAX_TAGS_PER_RESOURCE`] tags.
+///
+/// States the BOUND, which is the one fact a caller past it needs, and echoes
+/// neither a key, a value nor the resource.
+pub fn tag_limit_exceeded_message() -> String {
+    format!("The request would exceed the limit of {MAX_TAGS_PER_RESOURCE} tags per resource")
 }
 
 /// The `EnrollmentStatus` values `UpdateEnrollmentConfiguration` accepts from a
@@ -612,6 +634,109 @@ pub fn preview_result_for(action: &RecommendedAction) -> PreviewResult {
     }
 }
 
+/// The recommended actions ONE rule-preview request selects, in the order the
+/// store holds them: every stored action that belongs to an account `scope`
+/// covers, whose `recommendedActionType` is one of `recommended_action_types`,
+/// and that satisfies every condition of `criteria`.
+///
+/// A preview request names its selection the same way whichever preview
+/// operation reads it — `ListAutomationRulePreview` reports the selected actions
+/// one by one and `ListAutomationRulePreviewSummaries` aggregates the very same
+/// set — so the selection lives here once. An action that records no
+/// `accountId` belongs to no account, so no scope covers it.
+pub fn previewed_actions<'store>(
+    actions: &'store RecommendedActionStore,
+    scope: Option<&'store [String]>,
+    recommended_action_types: &'store [String],
+    criteria: &'store Criteria,
+) -> impl Iterator<Item = &'store RecommendedAction> + 'store {
+    actions
+        .iter_in_order()
+        .filter(move |action| {
+            action
+                .account_id
+                .as_deref()
+                .is_some_and(|account_id| account_in_scope(account_id, scope))
+        })
+        .filter(move |action| {
+            action
+                .recommended_action_type
+                .as_ref()
+                .is_some_and(|action_type| recommended_action_types.contains(action_type))
+        })
+        .filter(move |action| action_matches_criteria(action, criteria))
+}
+
+/// The `estimatedMonthlySavings` of a GROUP of recommended actions: the sums of
+/// the before- and after-discount figures of the estimates the group carries.
+///
+/// An action Compute Optimizer has not estimated savings for carries no
+/// estimate, which adds nothing to either sum (and is still one action of the
+/// group, so the group's count is not this function's business).
+///
+/// * `currency` is the currency the group's estimates AGREE on. The model types
+///   it as a free-form `String`, so a group holding no estimate — or estimates
+///   in different currencies, whose amounts are not one currency's total —
+///   names no currency: the empty string.
+/// * `savingsEstimationMode` is typed as the `SavingsEstimationMode` enum
+///   (`BeforeDiscount | AfterDiscount`), so a total must name one of the two
+///   even when the group's estimates disagree or carry none. It reports the mode
+///   the group agrees on, else `BeforeDiscount`, the conservative reading this
+///   module already takes for an estimate whose mode it cannot place (see
+///   `savings_for_criteria`).
+pub fn total_savings<'a>(
+    estimates: impl Iterator<Item = &'a EstimatedMonthlySavings>,
+) -> EstimatedMonthlySavings {
+    let mut total = EstimatedMonthlySavings {
+        currency: String::new(),
+        before_discount_savings: 0.0,
+        after_discount_savings: 0.0,
+        savings_estimation_mode: SAVINGS_MODE_BEFORE_DISCOUNT.to_string(),
+    };
+    let mut currency: Option<&str> = None;
+    let mut mode: Option<&str> = None;
+    let mut agreed_currency = true;
+    let mut agreed_mode = true;
+    for estimate in estimates {
+        total.before_discount_savings += estimate.before_discount_savings;
+        total.after_discount_savings += estimate.after_discount_savings;
+        match currency {
+            None => currency = Some(estimate.currency.as_str()),
+            Some(seen) if seen != estimate.currency => agreed_currency = false,
+            Some(_) => {}
+        }
+        match mode {
+            None => mode = Some(estimate.savings_estimation_mode.as_str()),
+            Some(seen) if seen != estimate.savings_estimation_mode => agreed_mode = false,
+            Some(_) => {}
+        }
+    }
+    if agreed_currency {
+        if let Some(currency) = currency {
+            total.currency = currency.to_string();
+        }
+    }
+    if agreed_mode {
+        // A stored mode outside the model's `SavingsEstimationMode` value set
+        // cannot be put on the wire as that enum, so it reads as the
+        // conservative before-discount mode the default already names.
+        if let Some(mode) = mode.filter(|mode| SAVINGS_ESTIMATION_MODE_VALUES.contains(mode)) {
+            total.savings_estimation_mode = mode.to_string();
+        }
+    }
+    total
+}
+
+/// The `SavingsEstimationMode` a total names when the group's estimates do not
+/// agree on one, carry none, or name one the model does not declare: the
+/// before-discount reading, which is the conservative one (see
+/// [`total_savings`]).
+pub const SAVINGS_MODE_BEFORE_DISCOUNT: &str = "BeforeDiscount";
+
+/// The other `SavingsEstimationMode` the model declares: the figure AFTER any
+/// discounts.
+pub const SAVINGS_MODE_AFTER_DISCOUNT: &str = "AfterDiscount";
+
 /// The EBS volume configuration carried by `details`, which is what the
 /// `ebsVolumeType` and `ebsVolumeSizeInGib` criteria read off the CURRENT
 /// resource: the criteria choose which resources a rule acts on, so they read
@@ -627,7 +752,7 @@ fn ebs_configuration(details: Option<&ResourceDetails>) -> Option<&EbsVolumeConf
 /// estimate is compared before discounts and an `AfterDiscount` one after them.
 fn savings_for_criteria(savings: &EstimatedMonthlySavings) -> f64 {
     match savings.savings_estimation_mode.as_str() {
-        "AfterDiscount" => savings.after_discount_savings,
+        SAVINGS_MODE_AFTER_DISCOUNT => savings.after_discount_savings,
         // `BeforeDiscount` is the enum's only other member, and the
         // before-discount figure is the conservative reading of a mode this
         // model does not yet declare.

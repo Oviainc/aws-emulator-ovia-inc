@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateAuthorizer
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateAuthorizer`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateAuthorizer::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -161,6 +152,25 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The `Authorizer` body a stored authorizer is reported as, projected from the ONE
+/// state record every reader of an authorizer shares.
+fn authorizer_output(record: &crate::state::Authorizer) -> CreateAuthorizerOutput {
+    let wire = record.to_wire();
+    CreateAuthorizerOutput {
+        authorizer_credentials_arn: wire.authorizer_credentials_arn,
+        authorizer_id: wire.authorizer_id,
+        authorizer_payload_format_version: wire.authorizer_payload_format_version,
+        authorizer_result_ttl_in_seconds: wire.authorizer_result_ttl_in_seconds,
+        authorizer_type: wire.authorizer_type,
+        authorizer_uri: wire.authorizer_uri,
+        enable_simple_responses: wire.enable_simple_responses,
+        identity_source: wire.identity_source,
+        identity_validation_expression: wire.identity_validation_expression,
+        jwt_configuration: wire.jwt_configuration,
+        name: Some(wire.name),
+    }
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -232,18 +242,93 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateAuthorizer` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateAuthorizerErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateAuthorizer"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in the assembled emulator — see the note in `create_api`.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "CreateAuthorizer",
+            ));
+        };
+        let mut store = state.lock();
+
+        // An authorizer is a CHILD of an api: it is addressed through the api that owns
+        // it, so an api that does not exist holds no authorizer to create.
+        let Some(api) = store.apis.get_mut(&input.api_id) else {
+            return Err(CreateAuthorizerErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(format!(
+                        "Invalid API identifier specified {}:{}",
+                        ::engine::emulator_account_id(),
+                        input.api_id
+                    )),
+                    resource_type: ::std::option::Option::None,
+                },
+            )
+            .into());
+        };
+
+        // `AuthorizerType` is a modelled enum, `Name` and `IdentitySource` are required
+        // members and `AuthorizerResultTtlInSeconds` carries `range 0..3600`, so the
+        // boundary validator has already refused a value outside any of those. What is
+        // left is what the model cannot state: which members one authorizer type (and
+        // one api protocol) requires and another does not.
+        if let Err(message) = crate::state::validate_authorizer_config(
+            &api.protocol_type,
+            &input.authorizer_type,
+            input.authorizer_uri.as_deref(),
+            input.authorizer_payload_format_version.as_deref(),
+            input.jwt_configuration.as_ref(),
+        ) {
+            return Err(bad_request(&message));
+        }
+
+        // Bound the growth a caller drives, the way CreateRoute and CreateModel bound
+        // theirs: `TooManyRequestsException` is the modelled error for "a limit has been
+        // exceeded" (it carries the limit's name in `LimitType`).
+        if api.authorizers.len() >= crate::state::MAX_AUTHORIZERS_PER_API {
+            return Err(CreateAuthorizerErrorModeled::TooManyRequestsException(
+                TooManyRequestsException {
+                    limit_type: Some("Authorizer".to_string()),
+                    message: Some(format!(
+                        "The maximum number of authorizers ({}) for this API has been reached.",
+                        crate::state::MAX_AUTHORIZERS_PER_API
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let authorizer_id = api.mint_authorizer_id();
+        let record = crate::state::Authorizer {
+            authorizer_id: authorizer_id.clone(),
+            name: input.name,
+            authorizer_type: input.authorizer_type,
+            authorizer_uri: input.authorizer_uri,
+            authorizer_credentials_arn: input.authorizer_credentials_arn,
+            authorizer_payload_format_version: input.authorizer_payload_format_version,
+            // "If it equals 0, authorization caching is disabled"
+            // (`CreateAuthorizer$AuthorizerResultTtlInSeconds`): a request that names no
+            // TTL configures none, so nothing is invented for the absent member.
+            authorizer_result_ttl_in_seconds: input.authorizer_result_ttl_in_seconds,
+            enable_simple_responses: input.enable_simple_responses,
+            identity_source: input.identity_source,
+            identity_validation_expression: input.identity_validation_expression,
+            jwt_configuration: input.jwt_configuration,
+        };
+
+        // Persist, then read the response back out of the STORE, so what the caller gets
+        // is what a later GetAuthorizer will report rather than an echo of the request.
+        api.authorizers.insert(authorizer_id.clone(), record);
+        Ok(authorizer_output(&api.authorizers[&authorizer_id]))
     }
+}
+
+/// This operation's refusal of a request it models no more specific error for: the
+/// modelled `BadRequestException` ("The request is not valid, for example, the input is
+/// incomplete or incorrect"), whose message names the member and the constraint.
+fn bad_request(message: &str) -> CreateAuthorizerError {
+    CreateAuthorizerErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message.to_string()),
+    })
+    .into()
 }

@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeAppVersionResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeAppVersionResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeAppVersionResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reads one physical resource of one app version out of
+//! [`crate::state::ComAmazonawsResiliencehubAwsresiliencehubState::app_versions`],
+//! addressed by exactly one of `resourceName`, `logicalResourceId` or
+//! `physicalResourceId`, so it reads back what `CreateAppVersionResource`
+//! persisted.
 //!
 //! ## Shape of an operation
 //!
@@ -180,18 +177,136 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeAppVersionResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeAppVersionResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeAppVersionResource"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_failure());
+        };
+
+        // "This API accepts only one of the following parameters to describe the
+        // resource: resourceName, logicalResourceId, physicalResourceId (Along with
+        // physicalResourceId, you can also provide awsAccountId, and awsRegion)" —
+        // the model's own documentation for this operation. A request naming none
+        // of them addresses no resource, and one naming two may address two.
+        let selectors = usize::from(input.resource_name.is_some())
+            + usize::from(input.logical_resource_id.is_some())
+            + usize::from(input.physical_resource_id.is_some());
+        if selectors != 1 {
+            return Err(invalid_request(format!(
+                "exactly one of resourceName, logicalResourceId and physicalResourceId \
+                 identifies the resource to describe; this request names {selectors}"
+            )));
+        }
+        if input.physical_resource_id.is_none()
+            && (input.aws_region.is_some() || input.aws_account_id.is_some())
+        {
+            return Err(invalid_request(
+                "awsRegion and awsAccountId narrow a physicalResourceId; this request names \
+                 neither a physicalResourceId nor a resource they could narrow"
+                    .to_string(),
+            ));
+        }
+
+        let store = state.lock();
+
+        // A resource is addressed through its application and app version, so each
+        // link of that path has to resolve before the resource is looked up.
+        if !store.apps.contains_key(&input.app_arn) {
+            return Err(app_not_found(&input.app_arn));
+        }
+        if !store.app_version_exists(&input.app_arn, &input.app_version) {
+            return Err(app_version_not_found(&input.app_arn, &input.app_version));
+        }
+
+        let version = store.app_version(&input.app_arn, &input.app_version);
+        let physical_resource = version.and_then(|version| {
+            if let Some(resource_name) = input.resource_name.as_deref() {
+                return version.resource_by_name(resource_name);
+            }
+            if let Some(logical_resource_id) = input.logical_resource_id.as_ref() {
+                return version.resource_by_logical_id(logical_resource_id);
+            }
+            let identifier = input.physical_resource_id.as_deref()?;
+            version.resource_by_physical_id(
+                identifier,
+                input.aws_region.as_deref(),
+                input.aws_account_id.as_deref(),
+            )
+        });
+        let Some(physical_resource) = physical_resource else {
+            return Err(resource_not_found(&input));
+        };
+
+        Ok(DescribeAppVersionResourceOutput {
+            app_arn: input.app_arn,
+            app_version: input.app_version,
+            physical_resource: Some(physical_resource.clone()),
+        })
     }
+}
+
+/// The 500 for a service mounted on an engine that holds no state for it.
+fn internal_failure() -> DescribeAppVersionResourceError {
+    DescribeAppVersionResourceErrorModeled::InternalServerException(InternalServerException {
+        message: Some("resiliencehub state is unavailable on this engine".to_string()),
+    })
+    .into()
+}
+
+/// A 400 `ValidationException` for a request that does not address exactly one
+/// resource.
+fn invalid_request(message: String) -> DescribeAppVersionResourceError {
+    DescribeAppVersionResourceErrorModeled::ValidationException(ValidationException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// A 404 `ResourceNotFoundException` for an `appArn` that was never created, or was
+/// deleted.
+fn app_not_found(app_arn: &str) -> DescribeAppVersionResourceError {
+    DescribeAppVersionResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("application {app_arn} does not exist")),
+        resource_id: Some(app_arn.to_string()),
+        resource_type: Some("App".to_string()),
+    })
+    .into()
+}
+
+/// A 404 for an `appVersion` the application does not have.
+fn app_version_not_found(app_arn: &str, app_version: &str) -> DescribeAppVersionResourceError {
+    DescribeAppVersionResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!(
+            "application {app_arn} has no version {app_version}"
+        )),
+        resource_id: Some(app_version.to_string()),
+        resource_type: Some("AppVersion".to_string()),
+    })
+    .into()
+}
+
+/// A 404 for a resource that app version does not hold — never a 200 carrying a
+/// synthesised resource.
+///
+/// `resourceId` is the selector the request addressed the resource by, which is
+/// the only identity the service has for a resource it does not hold.
+fn resource_not_found(input: &DescribeAppVersionResourceInput) -> DescribeAppVersionResourceError {
+    let resource_id = input
+        .resource_name
+        .clone()
+        .or_else(|| {
+            input
+                .logical_resource_id
+                .as_ref()
+                .map(|logical| logical.identifier.clone())
+        })
+        .or_else(|| input.physical_resource_id.clone());
+    DescribeAppVersionResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!(
+            "app version {} of application {} holds no such resource",
+            input.app_version, input.app_arn
+        )),
+        resource_id,
+        resource_type: Some("PhysicalResource".to_string()),
+    })
+    .into()
 }

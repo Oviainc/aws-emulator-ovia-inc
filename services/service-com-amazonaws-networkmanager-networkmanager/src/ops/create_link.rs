@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateLink
-//! Creates a new link for a site: refuses an unknown `GlobalNetworkId` or a `SiteId`
-//! that is not stored under it with `ResourceNotFoundException` (404), refuses a `Type`
+//! Creates a new link for a site: refuses a `SiteId` that names no site inside the
+//! `GlobalNetworkId` given as a field-validation failure on that member
+//! (`ValidationException`, 400), refuses a `Type`
 //! or `Provider` outside the constraints the model documents with `ValidationException`
 //! (400), otherwise mints the `LinkId`/`LinkArn`, stamps `CreatedAt`, and stores the
 //! record `GetLinks` answers from. This is the ONLY file to touch for this operation.
@@ -192,26 +193,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // A link hangs off a site inside a global network, so an unknown parent at either
-        // level is a 404 rather than a link with a dangling back-reference.
-        if !store.global_networks.contains_key(&input.global_network_id) {
-            return Err(CreateLinkErrorModeled::ResourceNotFoundException(
-                crate::state::resource_not_found(
-                    crate::state::GLOBAL_NETWORK_KIND,
-                    &input.global_network_id,
-                ),
-            )
-            .into());
-        }
-        // A site is addressed through its global network, so one stored under a different
-        // parent is not a usable parent here either.
-        let site_belongs = store
+        // "Creates a new link for a specified site" (`smithy_query query="doc"
+        // shape="CreateLink"`), so the link's IMMEDIATE parent is the site and the global
+        // network is only how that site is addressed: the one reference this create has to
+        // resolve is the `SiteId` WITHIN the `GlobalNetworkId` the request names. A site
+        // that never existed, one that was deleted, one stored under a different global
+        // network and a global network that holds no site at all all leave that reference
+        // naming nothing, so one lookup answers them all — which is why the refusal names
+        // `siteId` even when the global network is unknown too (a global network cannot be
+        // deleted while it still owns a site, so a site that resolves proves its global
+        // network exists).
+        //
+        // The create validates the references its input carries before anything is minted,
+        // so a reference that names nothing is a FIELD failure on the member that carried
+        // it — `ValidationException` (400) with `Reason=FieldValidationFailed` and a
+        // `Fields` entry naming that member — not the missing-resource answer an operation
+        // acting on an existing resource gives.
+        let site_resolves = store
             .sites
             .get(&input.site_id)
             .is_some_and(|site| site.global_network_id == input.global_network_id);
-        if !site_belongs {
-            return Err(CreateLinkErrorModeled::ResourceNotFoundException(
-                crate::state::resource_not_found(crate::state::SITE_KIND, &input.site_id),
+        if !site_resolves {
+            return Err(CreateLinkErrorModeled::ValidationException(
+                crate::state::unknown_reference(
+                    crate::state::FIELD_SITE_ID,
+                    crate::state::SITE_KIND,
+                ),
             )
             .into());
         }

@@ -254,21 +254,24 @@ fn seed(engine: &engine::InMemoryEngine) -> Seeded {
     let mut guard = store.lock();
     let mut ids = Vec::new();
     for spec in &specs {
-        ids.push(guard.insert_capacity_block(CapacityBlockSpec {
-            ultraserver_type: spec.ultraserver_type.map(str::to_string),
-            availability_zone: spec.availability_zone.to_string(),
-            availability_zone_id: spec.availability_zone_id.to_string(),
-            capacity_reservation_ids: spec
-                .capacity_reservation_ids
-                .iter()
-                .map(|id| (*id).to_string())
-                .collect(),
-            start_date: hours_from(seeded_at, spec.start_hours),
-            end_date: hours_from(seeded_at, spec.end_hours),
-            create_date: hours_from(seeded_at, spec.create_hours),
-            pinned_state: spec.pinned_state,
-            tags: spec.tags.clone(),
-        }));
+        let id = guard
+            .insert_capacity_block(CapacityBlockSpec {
+                ultraserver_type: spec.ultraserver_type.map(str::to_string),
+                availability_zone: spec.availability_zone.to_string(),
+                availability_zone_id: spec.availability_zone_id.to_string(),
+                capacity_reservation_ids: spec
+                    .capacity_reservation_ids
+                    .iter()
+                    .map(|id| (*id).to_string())
+                    .collect(),
+                start_date: hours_from(seeded_at, spec.start_hours),
+                end_date: hours_from(seeded_at, spec.end_hours),
+                create_date: hours_from(seeded_at, spec.create_hours),
+                pinned_state: spec.pinned_state,
+                tags: spec.tags.clone(),
+            })
+            .expect("a fresh store has room for a seeded Capacity Block");
+        ids.push(id);
     }
     drop(guard);
     Seeded {
@@ -396,7 +399,8 @@ async fn every_stored_block_is_reported_with_its_members_and_a_later_write_is_vi
             create_date: seeded.seeded_at,
             pinned_state: None,
             tags: vec![tag("Name", "late")],
-        });
+        })
+        .expect("the store has room for a later Capacity Block");
     let after = described_ids(&router, "after a later write", &[]).await;
     let mut expected = seeded.ids.clone();
     expected.push(late_id.clone());
@@ -488,7 +492,8 @@ async fn the_window_decides_scheduled_active_and_expired() {
                 create_date: hours_from(seeded_at, -336),
                 pinned_state: None,
                 tags: vec![tag("Case", case)],
-            });
+            })
+            .expect("the store has room for this Capacity Block");
             expected.push((id, state));
         }
     }

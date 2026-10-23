@@ -137,6 +137,29 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The HTTP status this operation answers its `ConflictException` with.
+///
+/// The model annotates the shape `@httpError(409)`
+/// (`smithy_query(query="shape",shape="ConflictException")`), but `@httpError` is an
+/// HTTP-BINDING trait and the recorded response to a dashboard name that is already
+/// taken carries HTTP **400** with `__type: ConflictException` — the status a client's
+/// retry classifier sees is the service's, not the model's. The recorded unit is
+/// `cloudtrail-dashboard-error-paths#task#2`, a second create of the name that
+/// fixture's first step took. It is answered through
+/// [`crate::scaffolded::Scaffolded::modeled_with_status`], which keeps the modelled
+/// shape's body and changes only the status line — the same deviation
+/// `crate::state::TRAIL_NOT_FOUND_STATUS` and
+/// `crate::state::IMPORT_NOT_FOUND_HTTP_STATUS` already carry for this service.
+const DASHBOARD_CONFLICT_HTTP_STATUS: u16 = 400;
+
+/// The refusal text a name already taken is answered with.
+///
+/// Like `crate::state::DASHBOARD_NOT_FOUND_MESSAGE` it is a FIXED service sentence —
+/// CloudTrail reports no part of the request in it, and it is the text the recorded
+/// conflict of `cloudtrail-dashboard-error-paths#task#2` carries — so it is stated once
+/// rather than composed from the request per call.
+const DASHBOARD_NAME_CONFLICT_MESSAGE: &str = "Dashboard with the provided name already exists.";
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -263,16 +286,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::HIGHLIGHTS_DASHBOARD_NAME
             )));
         }
-        // "You can add up to 10 widgets to a custom dashboard."
-        if requested_widgets.len() > crate::state::CUSTOM_DASHBOARD_WIDGET_LIMIT {
+        // "You can add up to 10 widgets to a custom dashboard." The bound and its
+        // wording live in `crate::state`, so this path and `UpdateDashboard` refuse
+        // alike.
+        if let Some(message) =
+            crate::state::widget_query::widgets_beyond_dashboard_limit_message(
+                requested_widgets.len(),
+            )
+        {
             return Err(CreateDashboardErrorModeled::ServiceQuotaExceededException(
                 ServiceQuotaExceededException {
-                    message: Some(format!(
-                        "Widgets carries {} widgets; a custom dashboard can have a maximum \
-                         of {} widgets",
-                        requested_widgets.len(),
-                        crate::state::CUSTOM_DASHBOARD_WIDGET_LIMIT
-                    )),
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        // A widget's `QueryStatement` has to be a query CloudTrail Lake can run:
+        // "The query that was submitted has validation errors, or uses incorrect
+        // syntax or unsupported keywords." The statement is parsed rather than
+        // matched; `crate::state::widget_query` states that reading once for both
+        // dashboard operations.
+        if crate::state::widget_query::first_unrunnable_statement(&requested_widgets).is_some() {
+            return Err(CreateDashboardErrorModeled::InvalidQueryStatementException(
+                InvalidQueryStatementException {
+                    message: Some(
+                        crate::state::widget_query::INVALID_QUERY_STATEMENT_MESSAGE.to_string(),
+                    ),
                 },
             )
             .into());
@@ -317,16 +357,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         // "The name must be unique to your account": a name already taken is a
-        // conflict, never an overwrite.
+        // conflict, never an overwrite. CloudTrail answers it with the one fixed
+        // sentence below, at the status it sends on the wire (400, not the shape's
+        // modelled 409).
         let key = (input.name.clone(), region.clone());
         if store.dashboards.contains_key(&key) {
-            return Err(CreateDashboardErrorModeled::ConflictException(ConflictException {
-                message: Some(format!(
-                    "Dashboard {} already exists in {region}",
-                    input.name
-                )),
-            })
-            .into());
+            return Err(crate::scaffolded::Scaffolded::modeled_with_status(
+                CreateDashboardErrorModeled::ConflictException(ConflictException {
+                    message: Some(DASHBOARD_NAME_CONFLICT_MESSAGE.to_string()),
+                }),
+                DASHBOARD_CONFLICT_HTTP_STATUS,
+            ));
         }
 
         // The registry is bounded: it holds state for the life of the process and

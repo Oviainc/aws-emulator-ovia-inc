@@ -1722,8 +1722,12 @@ async fn create_user_enforces_the_published_password_rules() {
         );
         assert_eq!(
             read_back.text("AccessString"),
-            Some("on ~app:* +@read"),
-            "case {case:?}: the access string must be the one given, got {}",
+            // The EXPANDED form of the rule list given: a list that states no command
+            // baseline is stored with the deny-all term before its command rules (see
+            // `state::canonical_access_string` and the normalization table in
+            // `rbac_user_access_string_and_deletion.rs`).
+            Some("on ~app:* -@all +@read"),
+            "case {case:?}: the access string must be the expanded form of the one given, got {}",
             read_back.body
         );
         assert_eq!(

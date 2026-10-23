@@ -20,7 +20,7 @@
 //!   past the per-resource tag quota, a key list longer than that quota — changes
 //!   NOTHING, and the next `ListTags` proves it;
 //! * a tag set belongs to ONE resource: an ARN that resolves to no resource of this
-//!   store is that resource kind's modelled 404, an ARN that is not a MemoryDB resource
+//!   store is that resource kind's modelled not-found fault, an ARN that is not a MemoryDB resource
 //!   ARN at all is the modelled 400 `InvalidARNFault`, and an ARN is resolved whole, so
 //!   another region's or partition's copy of a stored name resolves to nothing;
 //! * tags are a caller's own metadata on a caller's own resource: a tag key under AWS's
@@ -583,21 +583,21 @@ async fn a_refused_mutation_leaves_every_tag_where_it_was() {
             label: "untag a key the resource never carried",
             operation: "UntagResource",
             payload: || json!({ "TagKeys": ["absent"] }),
-            status: 404,
+            status: 400,
             code: "TagNotFoundFault",
         },
         Case {
             label: "untag one present and one absent key",
             operation: "UntagResource",
             payload: || json!({ "TagKeys": ["env", "absent"] }),
-            status: 404,
+            status: 400,
             code: "TagNotFoundFault",
         },
         Case {
             label: "untag a key that is only on another resource",
             operation: "UntagResource",
             payload: || json!({ "TagKeys": ["elsewhere"] }),
-            status: 404,
+            status: 400,
             code: "TagNotFoundFault",
         },
         // `Tag$Key` "may not be null", so a tag with no usable key is refused before
@@ -815,14 +815,14 @@ async fn a_merge_past_the_tag_quota_is_refused_and_stores_nothing() {
     );
 }
 
-/// An ARN that names no resource of this store is that resource kind's modelled 404,
-/// for every one of the three tagging operations — never an empty tag list, and never a
-/// tag write.
+/// An ARN that names no resource of this store is that resource kind's modelled
+/// not-found fault — a 400 on this `awsJson1_1` service — for every one of the three
+/// tagging operations: never an empty tag list, and never a tag write.
 #[tokio::test]
 async fn an_arn_that_names_no_resource_is_that_kinds_not_found_fault() {
     let router = router();
-    // One resource of each creatable kind exists under ANOTHER name, so a row's 404 is
-    // about the name in its ARN rather than about an empty store.
+    // One resource of each creatable kind exists under ANOTHER name, so a row's refusal
+    // is about the name in its ARN rather than about an empty store.
     for kind in creatable_kinds() {
         create(
             &router,
@@ -845,8 +845,8 @@ async fn an_arn_that_names_no_resource_is_that_kinds_not_found_fault() {
             body["ResourceArn"] = json!(resource_arn);
             let (status, answered) = call(&router, operation, &body).await;
             assert_eq!(
-                status, 404,
-                "case {case:?}: expected a 404 for an ARN naming no resource, got {status} \
+                status, 400,
+                "case {case:?}: expected a 400 for an ARN naming no resource, got {status} \
                  with {answered}"
             );
             let code = error_code(&answered);
@@ -860,7 +860,8 @@ async fn an_arn_that_names_no_resource_is_that_kinds_not_found_fault() {
 }
 
 /// An ARN is resolved WHOLE: a stored resource's name in another region, account or
-/// partition names no resource, so it answers that kind's 404 rather than the stored
+/// partition names no resource, so it answers that kind's not-found fault rather than
+/// the stored
 /// resource's tags.
 #[tokio::test]
 async fn an_arn_from_another_scope_does_not_resolve_to_a_stored_resource() {
@@ -896,8 +897,8 @@ async fn an_arn_from_another_scope_does_not_resolve_to_a_stored_resource() {
     for (label, candidate) in rows {
         let (status, answered) = call(&router, "ListTags", &json!({ "ResourceArn": candidate })).await;
         assert_eq!(
-            status, 404,
-            "case {label:?}: expected a 404 for {candidate}, got {status} with {answered}"
+            status, 400,
+            "case {label:?}: expected a 400 for {candidate}, got {status} with {answered}"
         );
     }
 
@@ -1041,8 +1042,8 @@ async fn untagging_absent_keys_names_every_one_of_them() {
         )
         .await;
         assert_eq!(
-            status, 404,
-            "case {label:?}: expected a 404 for keys {keys:?}, got {status} with {answered}"
+            status, 400,
+            "case {label:?}: expected a 400 for keys {keys:?}, got {status} with {answered}"
         );
         let message = answered
             .get("message")
@@ -1070,8 +1071,8 @@ async fn untagging_absent_keys_names_every_one_of_them() {
         )
         .await;
         assert_eq!(
-            status, 404,
-            "case {case:?}: expected a 404, got {status} with {answered}"
+            status, 400,
+            "case {case:?}: expected a 400, got {status} with {answered}"
         );
         let message = answered
             .get("message")
@@ -1126,8 +1127,8 @@ async fn untagging_absent_keys_names_every_one_of_them() {
     )
     .await;
     assert_eq!(
-        status, 404,
-        "case {case:?}: expected a 404 for {} keys, got {status} with {answered}",
+        status, 400,
+        "case {case:?}: expected a 400 for {} keys, got {status} with {answered}",
         keys.len()
     );
     // And the resource still carries what it started with.

@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateSignalingChannel
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateSignalingChannel`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateSignalingChannel::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a signaling-channel record and persists it in [`crate::state`]. The channel is
+//! returned in the non-terminal `CREATING` status — the model calls
+//! `CreateSignalingChannel` "an asynchronous operation" — and the clock owes it `ACTIVE`
+//! after [`crate::state::CHANNEL_ACTIVATION_SPAN`]. A create under a name the store
+//! already holds is the modeled `ResourceInUseException`, and one past
+//! [`crate::state::MAX_SIGNALING_CHANNELS`] the modeled
+//! `AccountChannelLimitExceededException`.
 //!
 //! ## Shape of an operation
 //!
@@ -168,18 +166,101 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateSignalingChannel` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateSignalingChannelErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateSignalingChannel"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                CreateSignalingChannelErrorModeled::ClientLimitExceededException(
+                    ClientLimitExceededException {
+                        message: Some(
+                            "The signaling channel store is unavailable. Try again later."
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+        let region = crate::state::request_region(ctx.parts());
+
+        let mut store = state.lock();
+        store.settle_clock();
+
+        // The channel name "must be unique for each Amazon Web Services account and
+        // Amazon Web Services Region", so a create under a name already in the store is
+        // a conflict, never an update.
+        if store.signaling_channels.contains_key(&input.channel_name) {
+            return Err(CreateSignalingChannelErrorModeled::ResourceInUseException(
+                ResourceInUseException {
+                    message: Some(format!("The channel {} already exists.", input.channel_name)),
+                },
+            )
+            .into());
+        }
+
+        // The index grows by one record per create and shrinks only on an explicit
+        // delete, so it carries the emulator's own ceiling and a create past it is
+        // refused with the error the model declares for exactly this case.
+        if store.signaling_channels.len() >= crate::state::MAX_SIGNALING_CHANNELS {
+            return Err(
+                CreateSignalingChannelErrorModeled::AccountChannelLimitExceededException(
+                    AccountChannelLimitExceededException {
+                        message: Some(format!(
+                            "You have reached the maximum limit of active signaling channels \
+                             for this Amazon Web Services account in this region. This account \
+                             and region already holds {} channels; delete a channel before \
+                             creating another.",
+                            crate::state::MAX_SIGNALING_CHANNELS
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let creation_time_millis = crate::state::now_millis();
+        let channel_arn =
+            crate::state::channel_arn(&region, &input.channel_name, creation_time_millis);
+        let version = store.mint_version();
+        let channel = crate::state::SignalingChannel {
+            channel_name: input.channel_name.clone(),
+            channel_arn: channel_arn.clone(),
+            // "Currently, SINGLE_MASTER is the only supported channel type", so that is
+            // what a create naming none gets; a named type is stored as sent.
+            channel_type: input
+                .channel_type
+                .unwrap_or_else(|| crate::state::CHANNEL_TYPE_SINGLE_MASTER.to_string()),
+            status: crate::state::STATUS_CREATING.to_string(),
+            creation_time_millis,
+            // "The default configuration for the channel message's time to live is 60
+            // seconds (1 minute)."
+            message_ttl_seconds: input
+                .single_master_configuration
+                .and_then(|configuration| configuration.message_ttl_seconds)
+                .unwrap_or(crate::state::DEFAULT_MESSAGE_TTL_SECONDS),
+            version,
+            // A later tag under a key already present replaces that key's value, which is
+            // what collecting the modeled LIST into a map gives.
+            tags: input
+                .tags
+                .unwrap_or_default()
+                .into_iter()
+                .map(|tag| (tag.key, tag.value))
+                .collect(),
+            // A create associates no stream with the channel, so its media storage is
+            // disabled until `UpdateMediaStorageConfiguration` enables it.
+            media_storage_status: crate::state::MEDIA_STORAGE_DISABLED.to_string(),
+            media_storage_stream_arn: None,
+            activates_at: Some(
+                ::std::time::Instant::now() + crate::state::CHANNEL_ACTIVATION_SPAN,
+            ),
+        };
+
+        store
+            .channel_arn_index
+            .insert(channel_arn.clone(), input.channel_name.clone());
+        store.signaling_channels.insert(input.channel_name, channel);
+
+        Ok(CreateSignalingChannelOutput {
+            channel_arn: Some(channel_arn),
+        })
     }
 }

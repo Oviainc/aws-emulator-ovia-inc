@@ -15,18 +15,18 @@ use crate::global_network_lifecycle::{error_code, expected_arn, Emulator};
 
 /// The taggable resource kinds this service's state holds; each is also the ARN resource
 /// type of that kind (`arn:aws:networkmanager::<account>:<kind>/<id>`).
-const GLOBAL_NETWORK: &str = "global-network";
+pub(crate) const GLOBAL_NETWORK: &str = "global-network";
 /// See [`GLOBAL_NETWORK`].
-const SITE: &str = "site";
+pub(crate) const SITE: &str = "site";
 /// See [`GLOBAL_NETWORK`].
-const LINK: &str = "link";
+pub(crate) const LINK: &str = "link";
 
 /// The documented maximum length of a tag key, in characters: "Constraints: Maximum
 /// length of 128 characters" (`smithy_query query="doc" shape="Tag" member="Key"`).
-const MAX_KEY_CHARS: usize = 128;
+pub(crate) const MAX_KEY_CHARS: usize = 128;
 /// The documented maximum length of a tag value: "Constraints: Maximum length of 256
 /// characters" (`smithy_query query="doc" shape="Tag" member="Value"`).
-const MAX_VALUE_CHARS: usize = 256;
+pub(crate) const MAX_VALUE_CHARS: usize = 256;
 
 /// AWS's published tagging limit — 50 tags per resource.
 const MAX_TAGS: usize = 50;
@@ -65,7 +65,7 @@ pub(crate) fn untag_uri(arn: &str, keys: &[&str]) -> String {
 }
 
 /// One modelled `Tag`.
-fn tag(key: &str, value: &str) -> Value {
+pub(crate) fn tag(key: &str, value: &str) -> Value {
     json!({ "Key": key, "Value": value })
 }
 
@@ -88,19 +88,23 @@ fn body_with(mut body: Value, tags: &Value) -> Value {
 }
 
 /// A created resource, with everything a test needs to read its tags back two ways.
-struct Taggable {
-    kind: &'static str,
-    arn: String,
-    id: String,
+pub(crate) struct Taggable {
+    pub(crate) kind: &'static str,
+    pub(crate) arn: String,
+    pub(crate) id: String,
     /// The resource's own reader (`DescribeGlobalNetworks` / `GetSites` / `GetLinks`).
-    read_uri: String,
+    pub(crate) read_uri: String,
     /// The list member that reader answers with, and the id member inside it.
-    list: &'static str,
-    id_member: &'static str,
+    pub(crate) list: &'static str,
+    pub(crate) id_member: &'static str,
 }
 
 /// Create a resource of `kind` carrying `tags` (`Value::Null` for "no `Tags` member").
-async fn create_taggable(emulator: &Emulator, kind: &'static str, tags: &Value) -> Taggable {
+pub(crate) async fn create_taggable(
+    emulator: &Emulator,
+    kind: &'static str,
+    tags: &Value,
+) -> Taggable {
     match kind {
         GLOBAL_NETWORK => {
             let (status, created) = emulator
@@ -176,7 +180,7 @@ async fn create_taggable(emulator: &Emulator, kind: &'static str, tags: &Value) 
 }
 
 /// The `TagList` `ListTagsForResource` answers for `arn`, with the status.
-async fn list_tags(emulator: &Emulator, arn: &str) -> (u16, Value) {
+pub(crate) async fn list_tags(emulator: &Emulator, arn: &str) -> (u16, Value) {
     let (status, body) = emulator.get(&tags_uri(arn)).await;
     if status == 200 {
         (status, body["TagList"].clone())
@@ -186,7 +190,10 @@ async fn list_tags(emulator: &Emulator, arn: &str) -> (u16, Value) {
 }
 
 /// The `Tags` the resource's OWN reader reports for it — the same stored list.
-async fn tags_through_resource_reader(emulator: &Emulator, resource: &Taggable) -> Value {
+pub(crate) async fn tags_through_resource_reader(
+    emulator: &Emulator,
+    resource: &Taggable,
+) -> Value {
     let (status, body) = emulator.get(&resource.read_uri).await;
     assert_eq!(
         status, 200,

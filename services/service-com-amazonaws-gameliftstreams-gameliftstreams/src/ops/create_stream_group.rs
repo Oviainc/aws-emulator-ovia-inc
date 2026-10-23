@@ -275,12 +275,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let region = crate::state::region_of(ctx.parts());
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(CreateStreamGroupErrorModeled::InternalServerException(
                 InternalServerException {
-                    message: "the gameliftstreams emulator holds no state on this engine"
-                        .to_string(),
+                    message: crate::state::with_internal_id(
+                        "the gameliftstreams emulator holds no state on this engine",
+                    ),
                 },
             )
             .into());
@@ -288,9 +288,95 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let mut state = state.lock();
         state.materialize(now);
+        let region = crate::state::region_of(ctx.parts());
 
-        // A replayed `ClientToken` answers with the group the first request created.
-        let replayed = state.replayed(Self::NAME, input.client_token.as_deref());
+        // The stream class must be one the SERVICE accepts, which is narrower than
+        // the model's `StreamClass` enum (see
+        // `crate::state::SERVICE_STREAM_CLASSES`): the model's two extra values pass
+        // the request validation the framework runs before this handler, and are
+        // refused here in the same envelope that validation would have used.
+        if !crate::state::stream_class_accepted(&input.stream_class) {
+            return Err(CreateStreamGroupErrorModeled::ValidationException(
+                ValidationException {
+                    message: crate::state::stream_class_refusal(&input.stream_class),
+                },
+            )
+            .into());
+        }
+
+        // A `LocationConfiguration` whose capacities this service cannot store is
+        // refused before any of it reaches state. Cloned rather than consumed here
+        // because the `ClientToken` fingerprint below covers these members too.
+        let configurations = input.location_configurations.clone().unwrap_or_default();
+        for configuration in &configurations {
+            if let Some(message) = crate::state::unstorable_location_configuration(configuration) {
+                return Err(CreateStreamGroupErrorModeled::ValidationException(
+                    ValidationException {
+                        message: crate::state::with_internal_id(message),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // The parameters this request's `ClientToken` stands for.
+        let mut fingerprint = crate::state::Fingerprint::new();
+        fingerprint.text("Description", &input.description);
+        fingerprint.text("StreamClass", &input.stream_class);
+        fingerprint.optional(
+            "DefaultApplicationIdentifier",
+            input.default_application_identifier.as_deref(),
+        );
+        let rendered_configurations: Vec<String> = configurations
+            .iter()
+            .map(|configuration| {
+                let mut one = crate::state::Fingerprint::new();
+                one.text("LocationName", &configuration.location_name);
+                one.number("AlwaysOnCapacity", configuration.always_on_capacity);
+                one.number("OnDemandCapacity", configuration.on_demand_capacity);
+                one.number("TargetIdleCapacity", configuration.target_idle_capacity);
+                one.number("MaximumCapacity", configuration.maximum_capacity);
+                one.optional(
+                    "VpcTransitConfiguration.VpcId",
+                    configuration
+                        .vpc_transit_configuration
+                        .as_ref()
+                        .map(|transit| transit.vpc_id.as_str()),
+                );
+                one.list(
+                    "VpcTransitConfiguration.Ipv4CidrBlocks",
+                    configuration
+                        .vpc_transit_configuration
+                        .as_ref()
+                        .map(|transit| transit.ipv4_cidr_blocks.as_slice())
+                        .unwrap_or_default(),
+                );
+                one.finish()
+            })
+            .collect();
+        fingerprint.list("LocationConfigurations", &rendered_configurations);
+        fingerprint.map("Tags", &input.tags.clone().unwrap_or_default());
+        let fingerprint = fingerprint.finish();
+
+        // The token is read AFTER the input checks above, deliberately: a request
+        // the service refused created nothing, so there is nothing for a retry of
+        // it to replay — it is refused again on its own merits.
+        let replayed = match state.client_token_use(
+            Self::NAME,
+            input.client_token.as_deref(),
+            &fingerprint,
+        ) {
+            crate::state::TokenUse::Fresh => None,
+            crate::state::TokenUse::Replay(id) => Some(id),
+            crate::state::TokenUse::Conflict => {
+                return Err(CreateStreamGroupErrorModeled::ConflictException(
+                    ConflictException {
+                        message: crate::state::client_token_conflict(),
+                    },
+                )
+                .into());
+            }
+        };
         let replayed = replayed.filter(|id| state.stream_groups.contains_key(id));
 
         let id = match replayed {
@@ -302,11 +388,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     return Err(
                         CreateStreamGroupErrorModeled::ServiceQuotaExceededException(
                             ServiceQuotaExceededException {
-                                message: format!(
+                                message: crate::state::with_internal_id(format!(
                                     "this emulator holds the maximum of {} stream groups; \
                                      delete one before creating another",
                                     crate::state::STREAM_GROUP_QUOTA
-                                ),
+                                )),
                             },
                         )
                         .into(),
@@ -343,19 +429,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     None => None,
                 };
 
-                // A `LocationConfiguration` whose capacities this service cannot
-                // store is refused before any of it reaches state.
-                let configurations = input.location_configurations.unwrap_or_default();
-                for configuration in &configurations {
-                    if let Some(message) =
-                        crate::state::unstorable_location_configuration(configuration)
-                    {
-                        return Err(CreateStreamGroupErrorModeled::ValidationException(
-                            ValidationException { message },
-                        )
-                        .into());
-                    }
-                }
                 let locations: Vec<crate::state::LocationSlot> = configurations
                     .into_iter()
                     .map(|configuration| {
@@ -409,7 +482,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     status_due_at: Some(now + crate::state::TRANSITION),
                 };
                 state.stream_groups.insert(id.clone(), group);
-                state.remember(Self::NAME, input.client_token.as_deref(), &id);
+                state.remember(
+                    Self::NAME,
+                    input.client_token.as_deref(),
+                    &id,
+                    &fingerprint,
+                );
                 id
             }
         };

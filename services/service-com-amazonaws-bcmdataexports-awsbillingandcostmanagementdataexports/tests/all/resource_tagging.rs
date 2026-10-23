@@ -402,7 +402,7 @@ async fn tagging_an_arn_that_names_no_export_is_not_found() {
         assert_eq!(
             body["Message"],
             json!(RESOURCE_NOT_FOUND_MESSAGE),
-            "case {label:?}: expected this service's fixed not-found message, got {body}"
+            "case {label:?}: expected the fixed not-found message of a tagged resource, got {body}"
         );
         assert_eq!(
             body["ResourceId"],

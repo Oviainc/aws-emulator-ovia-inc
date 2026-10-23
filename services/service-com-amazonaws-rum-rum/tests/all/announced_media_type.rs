@@ -6,21 +6,25 @@
 //! restJson1 request — so routing, deserialization, the modelled constraints, the handler
 //! and the response ENVELOPE are all exercised, not just a handler body.
 //!
-//! The rule pinned here is a property of the SERVICE, not of one operation: every
-//! response RUM sends for a JSON body announces `content-type:
-//! application/x-amz-json-1.1` (`crate::state::RESPONSE_CONTENT_TYPE`), whatever the
-//! operation, whatever the status, and whoever produced it — a handler's success, a
-//! handler's modelled error, a refusal the request boundary raised, or a scaffolded
-//! operation's 501. The `restJson1` protocol the model declares announces
-//! `application/json`, so this is recorded behaviour the service applies on top of the
-//! codec; the BODY is the same JSON either way, which is what the second and third tests
-//! check.
+//! The rule pinned here is a property of the SERVICE, not of one operation: the media
+//! type a RUM response announces for a JSON body is the one the REQUEST's payload
+//! declared — `restJson1`'s `application/json`
+//! ([`crate::support`]'s requests and an SDK's send no other) — and a request that carried
+//! NO payload declared none, so its answer falls back to RUM's own JSON type,
+//! `application/x-amz-json-1.1` (`crate::state::RESPONSE_CONTENT_TYPE`). That holds
+//! whatever the operation, whatever the status, and whoever produced the answer — a
+//! handler's success, a handler's modelled error, a refusal the request boundary raised,
+//! or a scaffolded operation's 501. The `restJson1` protocol the model declares announces
+//! `application/json` on every JSON body, so the fallback is recorded behaviour the
+//! service applies on top of the codec; the BODY is the same JSON either way, which is
+//! what the second and third tests check.
 //!
 //! The table spans what the rule generalises over rather than the two recorded steps:
-//! all four HTTP methods RUM binds, every operation group (app monitor, resource policy,
-//! metrics destinations, tagging, the data plane), the 200 / 400 / 404 / 409 / 501 status
-//! classes, outputs that model members and outputs that model none, and both an
-//! implemented operation and a scaffolded one.
+//! both halves of the rule (a request with a payload and one without, on the SAME method
+//! and on the same operation group), all four HTTP methods RUM binds, every operation
+//! group (app monitor, resource policy, metrics destinations, tagging, the data plane),
+//! the 200 / 400 / 404 / 409 / 501 status classes, outputs that model members and outputs
+//! that model none, and both an implemented operation and a scaffolded one.
 
 use serde_json::{json, Value};
 use service_com_amazonaws_rum_rum::state::{JSON_CONTENT_TYPE, RESPONSE_CONTENT_TYPE};
@@ -40,14 +44,19 @@ enum Body {
     Error(&'static str),
 }
 
-/// One row of the table: a request, the status it must answer, and the body it must
-/// carry.
+/// One row of the table: a request, the status it must answer, the media type its answer
+/// must announce, and the body it must carry.
+///
+/// `announces` is written out per row rather than computed from the row, so the table is a
+/// GOLDEN: every row states the recorded media type for that kind of call, and a change in
+/// the service that moved any of them would have to move the literal here too.
 struct Case {
     case: &'static str,
     method: &'static str,
     path: String,
     body: Option<Value>,
     status: u16,
+    announces: &'static str,
     expected: Body,
 }
 
@@ -95,6 +104,8 @@ fn cases(live: &str, live_id: &str) -> Vec<Case> {
             path: "/appmonitor".to_string(),
             body: Some(json!({"Name": "announced.second", "Domain": "example.com"})),
             status: 200,
+            // The request carries a JSON payload, which declares `application/json`.
+            announces: JSON_CONTENT_TYPE,
             expected: Body::Members,
         },
         Case {
@@ -103,6 +114,8 @@ fn cases(live: &str, live_id: &str) -> Vec<Case> {
             path: format!("/appmonitor/{live}"),
             body: None,
             status: 200,
+            // No payload, so nothing declared: RUM's own JSON type.
+            announces: RESPONSE_CONTENT_TYPE,
             expected: Body::Members,
         },
         Case {
@@ -111,6 +124,11 @@ fn cases(live: &str, live_id: &str) -> Vec<Case> {
             path: "/appmonitors".to_string(),
             body: None,
             status: 200,
+            // The SAME method as the create row above, and a different answer: what
+            // settles the media type is the payload, not the method or the operation.
+            // `ListAppMonitors` binds both its members to the query string, so a client
+            // calling it with no arguments sends no body at all.
+            announces: RESPONSE_CONTENT_TYPE,
             expected: Body::Members,
         },
         Case {
@@ -119,6 +137,7 @@ fn cases(live: &str, live_id: &str) -> Vec<Case> {
             path: format!("/appmonitor/{live}"),
             body: Some(json!({"Domain": "other.example.com"})),
             status: 200,
+            announces: JSON_CONTENT_TYPE,
             expected: Body::MemberLess,
         },
         Case {
@@ -127,6 +146,7 @@ fn cases(live: &str, live_id: &str) -> Vec<Case> {
             path: format!("/rummetrics/{live}/metricsdestination"),
             body: Some(json!({"Destination": "CloudWatch"})),
             status: 200,
+            announces: JSON_CONTENT_TYPE,
             expected: Body::MemberLess,
         },
         Case {
@@ -135,6 +155,7 @@ fn cases(live: &str, live_id: &str) -> Vec<Case> {
             path: format!("/rummetrics/{live}/metricsdestination"),
             body: None,
             status: 200,
+            announces: RESPONSE_CONTENT_TYPE,
             expected: Body::Members,
         },
         Case {
@@ -143,6 +164,7 @@ fn cases(live: &str, live_id: &str) -> Vec<Case> {
             path: format!("/appmonitor/{live}/policy"),
             body: Some(json!({"PolicyDocument": policy_document()})),
             status: 200,
+            announces: JSON_CONTENT_TYPE,
             expected: Body::Members,
         },
         Case {
@@ -151,6 +173,7 @@ fn cases(live: &str, live_id: &str) -> Vec<Case> {
             path: format!("/appmonitor/{live}/policy"),
             body: None,
             status: 200,
+            announces: RESPONSE_CONTENT_TYPE,
             expected: Body::Members,
         },
         Case {
@@ -159,6 +182,7 @@ fn cases(live: &str, live_id: &str) -> Vec<Case> {
             path: format!("/appmonitor/{live}/policy"),
             body: None,
             status: 200,
+            announces: RESPONSE_CONTENT_TYPE,
             expected: Body::Members,
         },
         Case {
@@ -167,6 +191,7 @@ fn cases(live: &str, live_id: &str) -> Vec<Case> {
             path: tags_uri(live),
             body: Some(json!({"Tags": {"Team": "observability"}})),
             status: 204,
+            announces: JSON_CONTENT_TYPE,
             expected: Body::MemberLess,
         },
         Case {
@@ -175,6 +200,7 @@ fn cases(live: &str, live_id: &str) -> Vec<Case> {
             path: tags_uri(live),
             body: None,
             status: 200,
+            announces: RESPONSE_CONTENT_TYPE,
             expected: Body::Members,
         },
         Case {
@@ -183,6 +209,7 @@ fn cases(live: &str, live_id: &str) -> Vec<Case> {
             path: format!("{}?tagKeys=Team", tags_uri(live)),
             body: None,
             status: 204,
+            announces: RESPONSE_CONTENT_TYPE,
             expected: Body::MemberLess,
         },
         Case {
@@ -195,6 +222,7 @@ fn cases(live: &str, live_id: &str) -> Vec<Case> {
             path: tags_uri(live),
             body: None,
             status: 204,
+            announces: RESPONSE_CONTENT_TYPE,
             expected: Body::MemberLess,
         },
         Case {
@@ -203,6 +231,7 @@ fn cases(live: &str, live_id: &str) -> Vec<Case> {
             path: format!("/appmonitors/{live_id}/"),
             body: Some(rum_events_body(live_id)),
             status: 200,
+            announces: JSON_CONTENT_TYPE,
             expected: Body::MemberLess,
         },
         Case {
@@ -211,6 +240,8 @@ fn cases(live: &str, live_id: &str) -> Vec<Case> {
             path: "/appmonitor/announced.absent".to_string(),
             body: None,
             status: 404,
+            // An error body is announced by the same rule as a success one.
+            announces: RESPONSE_CONTENT_TYPE,
             expected: Body::Error("ResourceNotFoundException"),
         },
         Case {
@@ -219,6 +250,7 @@ fn cases(live: &str, live_id: &str) -> Vec<Case> {
             path: "/appmonitor".to_string(),
             body: Some(json!({"Name": live, "Domain": "example.com"})),
             status: 409,
+            announces: JSON_CONTENT_TYPE,
             expected: Body::Error("ConflictException"),
         },
         Case {
@@ -229,6 +261,7 @@ fn cases(live: &str, live_id: &str) -> Vec<Case> {
             // refused by the request boundary before any handler runs.
             body: Some(json!({"Name": "x".repeat(256), "Domain": "example.com"})),
             status: 400,
+            announces: JSON_CONTENT_TYPE,
             expected: Body::Error("ValidationException"),
         },
         Case {
@@ -239,6 +272,7 @@ fn cases(live: &str, live_id: &str) -> Vec<Case> {
             path: "/tags/not-an-arn-at-all".to_string(),
             body: None,
             status: 400,
+            announces: RESPONSE_CONTENT_TYPE,
             expected: Body::Error("BadRequestException"),
         },
         Case {
@@ -247,6 +281,7 @@ fn cases(live: &str, live_id: &str) -> Vec<Case> {
             path: format!("/rummetrics/{live}/metrics?destination=CloudWatch"),
             body: None,
             status: 501,
+            announces: RESPONSE_CONTENT_TYPE,
             expected: Body::Error("NotImplemented"),
         },
         Case {
@@ -255,6 +290,7 @@ fn cases(live: &str, live_id: &str) -> Vec<Case> {
             path: format!("/appmonitor/{live}"),
             body: None,
             status: 200,
+            announces: RESPONSE_CONTENT_TYPE,
             expected: Body::MemberLess,
         },
         Case {
@@ -263,6 +299,7 @@ fn cases(live: &str, live_id: &str) -> Vec<Case> {
             path: format!("/appmonitor/{live}"),
             body: None,
             status: 404,
+            announces: RESPONSE_CONTENT_TYPE,
             expected: Body::Error("ResourceNotFoundException"),
         },
     ]
@@ -285,6 +322,7 @@ async fn every_rum_response_announces_the_services_media_type() {
         path,
         body,
         status,
+        announces: want_type,
         expected,
     } in cases(live, &live_id)
     {
@@ -297,8 +335,8 @@ async fn every_rum_response_announces_the_services_media_type() {
         );
         assert_eq!(
             reply.content_type(),
-            Some(RESPONSE_CONTENT_TYPE),
-            "case {case:?}: expected the response to announce {RESPONSE_CONTENT_TYPE:?}, got {:?}",
+            Some(want_type),
+            "case {case:?}: expected the response to announce {want_type:?}, got {:?}",
             reply.content_type()
         );
         // One value, not two: re-announcing the media type must REPLACE what the codec
@@ -340,11 +378,12 @@ async fn every_rum_response_announces_the_services_media_type() {
 }
 
 #[tokio::test]
-async fn the_announced_media_type_does_not_depend_on_what_the_request_sent() {
-    // The media type is a property of the RESPONSE, so it cannot be negotiated: whatever
-    // media type the request declares (or declares none at all), the same JSON body comes
-    // back under the same announced type. The rows span the two types a RUM client
-    // plausibly sends, the awsJson types it does not, and an absent header.
+async fn the_announced_media_type_does_not_depend_on_the_type_the_request_declared() {
+    // What settles the announced type is whether the request carried a PAYLOAD, not the
+    // `content-type` header it happens to send: a payload-less request declares nothing
+    // about its (absent) body, so however it labels it, the same JSON body comes back
+    // under RUM's own JSON type. The rows span the two types a RUM client plausibly
+    // sends, the awsJson types it does not, and an absent header.
     let (router, _engine) = emulator();
     let name = "negotiation.monitor";
     create(
@@ -387,6 +426,30 @@ async fn the_announced_media_type_does_not_depend_on_what_the_request_sent() {
             request_types[index].0
         );
     }
+
+    // The other half, in the same test so the two cannot drift apart: the SAME monitor,
+    // reached by a request that DOES carry a payload, is answered in the type that payload
+    // declared — and the body it answers with is still the same JSON.
+    let patched = call(
+        &router,
+        "PATCH",
+        &format!("/appmonitor/{name}"),
+        Some(json!({"Domain": "other.example.com"})),
+    )
+    .await;
+    assert_eq!(
+        patched.status, 200,
+        "case \"a request carrying a payload\": expected HTTP 200, got {} {:?}",
+        patched.status,
+        String::from_utf8_lossy(&patched.body)
+    );
+    assert_eq!(
+        patched.content_type(),
+        Some(JSON_CONTENT_TYPE),
+        "case \"a request carrying a payload\": expected the response to announce \
+         {JSON_CONTENT_TYPE:?}, got {:?}",
+        patched.content_type()
+    );
 }
 
 /// One answer to `GET <path>` with the request's `content-type` set to `declared`, or
@@ -421,8 +484,9 @@ async fn get_with_content_type(
 
 #[tokio::test]
 async fn a_round_trip_still_reads_through_the_announced_media_type() {
-    // The gate re-announces the header and nothing else, so a create still reads back
-    // through `GetAppMonitor` member for member. Rows differ along what a create can
+    // The gate settles the header and nothing else, so a create still reads back through
+    // `GetAppMonitor` member for member — across the two halves of the rule, since the
+    // create carries a payload and the read does not. Rows differ along what a create can
     // carry, so the check is not tied to one request's shape.
     let (router, _engine) = emulator();
     let rows = [
@@ -458,8 +522,9 @@ async fn a_round_trip_still_reads_through_the_announced_media_type() {
         );
         assert_eq!(
             created.content_type(),
-            Some(RESPONSE_CONTENT_TYPE),
-            "case {case:?}: expected the create to announce {RESPONSE_CONTENT_TYPE:?}, got {:?}",
+            Some(JSON_CONTENT_TYPE),
+            "case {case:?}: the create carried a payload, so it must announce \
+             {JSON_CONTENT_TYPE:?}, got {:?}",
             created.content_type()
         );
 
@@ -467,7 +532,8 @@ async fn a_round_trip_still_reads_through_the_announced_media_type() {
         assert_eq!(
             read.content_type(),
             Some(RESPONSE_CONTENT_TYPE),
-            "case {case:?}: expected the read to announce {RESPONSE_CONTENT_TYPE:?}, got {:?}",
+            "case {case:?}: the read carried no payload, so it must announce \
+             {RESPONSE_CONTENT_TYPE:?}, got {:?}",
             read.content_type()
         );
         let monitor = read.json(case)["AppMonitor"].clone();

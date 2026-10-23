@@ -1226,8 +1226,11 @@ fn creation_order(template: &Template) -> Vec<&DeclaredResource> {
 /// Only names the template declares as RESOURCES count: a `Ref` to a parameter or to a
 /// pseudo parameter is not a dependency on anything that has to be created first.
 fn dependencies_of(resource: &DeclaredResource, template: &Template) -> BTreeSet<String> {
-    let mut referenced = BTreeSet::new();
-    collect_references(&resource.declaration, 0, &mut referenced);
+    let mut referenced: BTreeSet<String> = references(&resource.declaration)
+        .names()
+        .into_iter()
+        .map(ToString::to_string)
+        .collect();
     if let Some(depends_on) = resource.declaration.get("DependsOn") {
         match depends_on {
             Value::String(name) => {
@@ -1255,8 +1258,61 @@ fn dependencies_of(resource: &DeclaredResource, template: &Template) -> BTreeSet
         .collect()
 }
 
-/// Every name the intrinsic functions inside one declaration refer to.
-fn collect_references(value: &Value, depth: usize, into: &mut BTreeSet<String>) {
+/// The names the intrinsic functions inside one template value refer to, split by HOW each
+/// is referred to.
+///
+/// The split is what `ResourceChangeDetail$ChangeSource` names: a `Ref` names a VALUE —
+/// "`ParameterReference` entities are `Ref` intrinsic functions that get template parameter
+/// values", "`ResourceReference` entities are `Ref` intrinsic functions that refer to
+/// resources in the template" — while "`ResourceAttribute` entities are `Fn::GetAtt`
+/// intrinsic functions that get resource attribute values". `Fn::Sub`'s `${Name}` and
+/// `${Name.Attribute}` variables are those same two forms spelled inside a string.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct References {
+    /// The names a `Ref` (or a bare `${Name}`) names: a parameter, a pseudo parameter or a
+    /// resource of the same template.
+    pub by_value: BTreeSet<String>,
+    /// The ATTRIBUTE PATHS an `Fn::GetAtt` (or a `${Name.Attribute}`) reads, each spelled
+    /// as that intrinsic spells it: `<logical id>.<attribute>`, which is the whole entity a
+    /// change caused by one of them names.
+    pub by_attribute: BTreeSet<String>,
+}
+
+impl References {
+    /// Every RESOURCE name referred to, however it is referred to: an attribute path names
+    /// its resource in the segment before the first dot.
+    pub fn names(&self) -> BTreeSet<&str> {
+        self.by_value
+            .iter()
+            .map(String::as_str)
+            .chain(self.by_attribute.iter().map(|path| resource_of(path)))
+            .collect()
+    }
+
+    /// Each attribute path with the resource it reads the attribute off.
+    pub fn attribute_targets(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.by_attribute
+            .iter()
+            .map(|path| (resource_of(path), path.as_str()))
+    }
+}
+
+/// The resource an `Fn::GetAtt` path names: everything before the first dot.
+pub fn resource_of(attribute_path: &str) -> &str {
+    attribute_path
+        .split('.')
+        .next()
+        .unwrap_or(attribute_path)
+}
+
+/// Every name the intrinsic functions inside one template value refer to.
+pub fn references(value: &Value) -> References {
+    let mut found = References::default();
+    collect_references(value, 0, &mut found);
+    found
+}
+
+fn collect_references(value: &Value, depth: usize, into: &mut References) {
     if depth > MAX_TEMPLATE_DEPTH {
         return;
     }
@@ -1265,17 +1321,19 @@ fn collect_references(value: &Value, depth: usize, into: &mut BTreeSet<String>) 
             for (key, member) in members {
                 match (key.as_str(), member) {
                     ("Ref", Value::String(name)) => {
-                        into.insert(name.clone());
+                        into.by_value.insert(name.clone());
                     }
                     // `Fn::GetAtt` takes `[logicalId, attribute]` or the `logicalId.attribute`
-                    // short form.
+                    // short form, and names the same entity either way.
                     ("Fn::GetAtt", Value::Array(arguments)) => {
-                        if let Some(name) = arguments.first().and_then(Value::as_str) {
-                            into.insert(name.to_string());
+                        let path: Vec<&str> =
+                            arguments.iter().filter_map(Value::as_str).collect();
+                        if !path.is_empty() {
+                            into.by_attribute.insert(path.join("."));
                         }
                     }
                     ("Fn::GetAtt", Value::String(path)) => {
-                        into.insert(path.split('.').next().unwrap_or(path).to_string());
+                        into.by_attribute.insert(path.clone());
                     }
                     // `Fn::Sub`'s `${Name}` and `${Name.Attribute}` variables name the
                     // same resources `Ref` and `Fn::GetAtt` do.
@@ -1288,8 +1346,15 @@ fn collect_references(value: &Value, depth: usize, into: &mut BTreeSet<String>) 
                             _ => None,
                         };
                         if let Some(source) = source {
-                            for name in substitution_names(source) {
-                                into.insert(name);
+                            for (name, path) in substitution_names(source) {
+                                match path {
+                                    Some(path) => {
+                                        into.by_attribute.insert(path);
+                                    }
+                                    None => {
+                                        into.by_value.insert(name);
+                                    }
+                                }
                             }
                         }
                         collect_references(member, depth + 1, into);
@@ -1308,8 +1373,9 @@ fn collect_references(value: &Value, depth: usize, into: &mut BTreeSet<String>) 
 }
 
 /// The variable names an `Fn::Sub` source string names, each `${…}` without its
-/// attribute path.
-fn substitution_names(source: &str) -> Vec<String> {
+/// attribute path, and the WHOLE `${…}` where it read an attribute path off the name (the
+/// `${Name.Attribute}` form, which is an `Fn::GetAtt` by another spelling).
+fn substitution_names(source: &str) -> Vec<(String, Option<String>)> {
     let mut names = Vec::new();
     let mut rest = source;
     while let Some(start) = rest.find("${") {
@@ -1317,13 +1383,9 @@ fn substitution_names(source: &str) -> Vec<String> {
         let Some(end) = after.find('}') else { break };
         let variable = after[..end].trim();
         if !variable.is_empty() && !variable.starts_with('!') {
-            names.push(
-                variable
-                    .split('.')
-                    .next()
-                    .unwrap_or(variable)
-                    .to_string(),
-            );
+            let name = variable.split('.').next().unwrap_or(variable);
+            let path = (name.len() < variable.len()).then(|| variable.to_string());
+            names.push((name.to_string(), path));
         }
         rest = &after[end + 1..];
     }
@@ -1438,7 +1500,11 @@ fn declared_metadata(declared: &DeclaredResource) -> Option<String> {
 /// condition evaluates TRUE. A condition this module cannot evaluate is not an answer of
 /// `false`: the resource is created, because dropping a resource the template declares
 /// would be a worse answer than materialising one a false condition would have excluded.
-fn is_created(declared: &DeclaredResource, scope: &Scope<'_>, budget: &mut Budget) -> bool {
+fn is_created(
+    declared: &DeclaredResource,
+    scope: &Scope<'_>,
+    budget: &mut Budget,
+) -> bool {
     declared.condition.as_deref().is_none_or(|condition| {
         condition_holds(condition, scope, 0, budget).unwrap_or(true)
     })
@@ -1533,14 +1599,9 @@ fn conventional_attributes(
     // A resource type is `AWS::<Service>::<Type>`: the service segment is the ARN
     // namespace and the last segment is the resource's own type. Anything else (a
     // malformed `Type`) carries no convention at all.
-    let segments: Vec<&str> = resource_type.split("::").collect();
-    let (Some(service), Some(segment)) = (segments.get(1), segments.last()) else {
+    let Some((service, segment)) = type_segments(resource_type) else {
         return Vec::new();
     };
-    if segments.len() < 3 || service.is_empty() || segment.is_empty() {
-        return Vec::new();
-    }
-    let physical_resource_id = resource.physical_resource_id.clone();
     let arn = known_arn(resource).unwrap_or_else(|| {
         ::emulator_server::emulator_arn(
             &service.to_lowercase(),
@@ -1548,14 +1609,53 @@ fn conventional_attributes(
             &format!("{}/{name}", hyphenated(segment)),
         )
     });
-    vec![
+    let mut conventional = vec![
         ("Arn".to_string(), arn.clone()),
         (format!("{segment}Arn"), arn),
-        ("Id".to_string(), physical_resource_id.clone()),
-        (format!("{segment}Id"), physical_resource_id),
-        ("Name".to_string(), name.to_string()),
-        (format!("{segment}Name"), name.to_string()),
+    ];
+    conventional.extend(identity_attributes(
+        resource_type,
+        &resource.physical_resource_id,
+    ));
+    conventional.push(("Name".to_string(), name.to_string()));
+    conventional.push((format!("{segment}Name"), name.to_string()));
+    conventional
+}
+
+/// The attributes the uniform convention reads off a resource's PHYSICAL ID: its
+/// `Id`/`<Type>Id` names, which are "the physical id `Ref` returns"
+/// ([`conventional_attributes`]).
+///
+/// Public because the physical id is not always CloudFormation's own to compute: where the
+/// OWNING service mints a resource's identity — AWS WAF Classic answers `CreateIPSet` with
+/// the `IPSetId` that type's `Ref` returns — the id is the one that service answered, which
+/// only [`super::provisioning`](crate::state::provisioning) learns. It re-points these
+/// attributes through this one function, so the `Id` a resource reports and the id its
+/// `Ref` resolves to cannot drift apart.
+pub fn identity_attributes(
+    resource_type: &str,
+    physical_resource_id: &str,
+) -> Vec<(String, String)> {
+    let Some((_, segment)) = type_segments(resource_type) else {
+        return Vec::new();
+    };
+    vec![
+        ("Id".to_string(), physical_resource_id.to_string()),
+        (format!("{segment}Id"), physical_resource_id.to_string()),
     ]
+}
+
+/// The `(service, type)` segments of a resource type spelled `AWS::<Service>::<Type>`, or
+/// `None` for anything else — a malformed `Type`, which carries no convention at all.
+fn type_segments(resource_type: &str) -> Option<(&str, &str)> {
+    let segments: Vec<&str> = resource_type.split("::").collect();
+    let (Some(service), Some(segment)) = (segments.get(1), segments.last()) else {
+        return None;
+    };
+    if segments.len() < 3 || service.is_empty() || segment.is_empty() {
+        return None;
+    }
+    Some((service, segment))
 }
 
 /// The ARN a resource ALREADY carries: its physical resource id where that is an ARN
@@ -1626,16 +1726,41 @@ fn physical_name(
     naming: &Scope<'_>,
     budget: &mut Budget,
 ) -> String {
-    let segment = declared
-        .resource_type
-        .rsplit("::")
-        .next()
-        .unwrap_or_default();
-    // The type's OWN name property, where it is neither convention, comes first; then the
-    // two conventions, then the Amazon RDS `Identifier` spelling. The chain is consumed
-    // as it is built — the first property the template declares wins — so no candidate
-    // past it is even formatted.
-    let declared_name = declared_name_property(&declared.resource_type)
+    let declared_name = name_property_candidates(&declared.resource_type)
+        .into_iter()
+        .find_map(|property| {
+            declared
+                .properties
+                .get(&property)
+                .and_then(|value| text(value, naming, 0, budget))
+        });
+    match declared_name {
+        // The name the TEMPLATE supplied, exactly as it supplied it: it is the caller's,
+        // and a name the owning service refuses is reported as the failure that service
+        // answers rather than silently rewritten into a different resource than the one
+        // the template asked for.
+        Some(name) => name,
+        // A GENERATED name is held to the naming rules of the service that owns the type,
+        // because a name that service would refuse could not be provisioned at all.
+        None => naming_rules(
+            &declared.resource_type,
+            generated_name(&declared.logical_id, naming.stack),
+        ),
+    }
+}
+
+/// The properties a resource of `resource_type` can take its physical NAME from, most
+/// specific first: the type's OWN name property where it is neither convention, then the
+/// two conventions ([`physical_name`]), then the Amazon RDS `Identifier` spelling.
+///
+/// The ONE list of those candidates: [`physical_name`] reads the first of them the
+/// declaration carries, and [`name_property`] answers WHICH property that was — which is
+/// what a change set needs, since a resource's physical name is fixed when it is created
+/// (every name property's "Update requires" in the resource and property types reference is
+/// `Replacement`).
+pub fn name_property_candidates(resource_type: &str) -> Vec<String> {
+    let segment = resource_type.rsplit("::").next().unwrap_or_default();
+    declared_name_property(resource_type)
         .map(ToString::to_string)
         .into_iter()
         .chain([
@@ -1643,14 +1768,76 @@ fn physical_name(
             "Name".to_string(),
             format!("{segment}Identifier"),
         ])
-        .find_map(|property| {
-            declared
-                .properties
-                .get(&property)
-                .and_then(|value| text(value, naming, 0, budget))
-        });
-    declared_name.unwrap_or_else(|| generated_name(&declared.logical_id, naming.stack))
+        .collect()
 }
+
+/// The property a declaration of `resource_type` takes its physical name from: the first
+/// of [`name_property_candidates`] the `Properties` object carries, or `None` for a
+/// declaration that names the resource nowhere (CloudFormation generates its name).
+pub fn name_property(resource_type: &str, properties: &Value) -> Option<String> {
+    name_property_candidates(resource_type)
+        .into_iter()
+        .find(|property| properties.get(property).is_some())
+}
+
+/// A GENERATED name held to the naming rules of the service that owns the resource type.
+///
+/// A generated `<stack name>-<logical id>-<unique id>` is built from a logical id and a
+/// stack name, and those admit characters the owning service's own names do not: an
+/// Amazon S3 bucket name "can consist only of lowercase letters, numbers, dots (.), and
+/// hyphens (-)", "must begin and end with a letter or number" and must be "between 3
+/// (min) and 63 (max) characters long" (Amazon S3 bucket naming rules), which is why
+/// CloudFormation's own generated bucket names are lowercase
+/// (`mystack-mybucket-kdwwxmddtr2g`). A name outside those rules is not one the owning
+/// service would accept, so the resource could not be provisioned under it at all.
+///
+/// The 3-character MINIMUM needs nothing here: the unique segment alone is
+/// [`GENERATED_NAME_DIGEST_CHARS`] characters, so every name [`generated_name`] produces
+/// is longer than that, and the truncation below keeps that segment.
+fn naming_rules(resource_type: &str, name: String) -> String {
+    match resource_type {
+        S3_BUCKET => {
+            // Lowercase, and every character outside the set a bucket name may carry
+            // replaced by a hyphen — which is one of them — rather than dropped, so two
+            // names that differ only in such a character cannot become one.
+            let within_the_set: String = name
+                .to_lowercase()
+                .chars()
+                .map(|character| {
+                    if character.is_ascii_lowercase()
+                        || character.is_ascii_digit()
+                        || character == '.'
+                        || character == '-'
+                    {
+                        character
+                    } else {
+                        '-'
+                    }
+                })
+                .collect();
+            let characters = within_the_set.chars().count();
+            // Past the maximum the TAIL is kept: it carries the unique segment, so two
+            // resources of one stack still cannot collide. A bucket name has to begin and
+            // end with a letter or a number, and the tail always ends in one, so what the
+            // truncation leaves in FRONT of the first one goes.
+            let kept: String = if characters > MAX_BUCKET_NAME_LEN {
+                within_the_set
+                    .chars()
+                    .skip(characters - MAX_BUCKET_NAME_LEN)
+                    .collect()
+            } else {
+                within_the_set
+            };
+            kept.trim_start_matches(|character: char| !character.is_ascii_alphanumeric())
+                .to_string()
+        }
+        _ => name,
+    }
+}
+
+/// The longest name an Amazon S3 bucket may carry: "Bucket names must be between 3 (min)
+/// and 63 (max) characters long" (Amazon S3 bucket naming rules).
+const MAX_BUCKET_NAME_LEN: usize = 63;
 
 /// The physical name CloudFormation generates for a resource the template does not name:
 /// `<stack name>-<logical id>-<unique id>`.
@@ -1662,7 +1849,12 @@ fn generated_name(logical_id: &str, scope: StackScope<'_>) -> String {
     format!(
         "{}-{logical_id}-{}",
         scope.stack_name,
-        derived_digits(scope.stack_id, logical_id, 12, Alphabet::Upper)
+        derived_digits(
+            scope.stack_id,
+            logical_id,
+            GENERATED_NAME_DIGEST_CHARS,
+            Alphabet::Upper
+        )
     )
 }
 
@@ -1699,6 +1891,13 @@ fn derived_digits(salt: &str, name: &str, digits: usize, alphabet: Alphabet) -> 
     };
     digest[..digits.min(digest.len())].to_string()
 }
+
+/// How many characters of the digest the unique segment of a [`generated_name`] carries.
+///
+/// Enough that two resources of one stack — and two stacks of one name — cannot collide,
+/// and short enough to leave room for the stack name and the logical id inside a name an
+/// owning service bounds (see [`naming_rules`]).
+const GENERATED_NAME_DIGEST_CHARS: usize = 12;
 
 /// A service-generated identifier of the form `<prefix>-<digits hexadecimal characters>`.
 ///
@@ -1912,6 +2111,7 @@ pub const IMPLEMENTED_RESOURCE_TYPES: &[&str] = &[
     ELB_LISTENER_RULE,
     ELB_LOAD_BALANCER,
     ELB_TARGET_GROUP,
+    FIS_EXPERIMENT_TEMPLATE,
     "AWS::IAM::Role",
     FIREHOSE_DELIVERY_STREAM,
     "AWS::Lambda::Function",
@@ -1919,8 +2119,8 @@ pub const IMPLEMENTED_RESOURCE_TYPES: &[&str] = &[
     "AWS::RDS::DBCluster",
     "AWS::RDS::DBInstance",
     "AWS::RUM::AppMonitor",
-    "AWS::S3::Bucket",
-    "AWS::SNS::Topic",
+    S3_BUCKET,
+    SNS_TOPIC,
     SQS_QUEUE,
     "AWS::SecretsManager::Secret",
     "AWS::Transfer::Server",
@@ -1958,8 +2158,12 @@ fn return_values(
     let properties = &declared.properties;
     let mut attributes = BTreeMap::new();
     match resource_type {
-        // "Ref returns the topic ARN"; Fn::GetAtt: TopicArn, TopicName.
-        "AWS::SNS::Topic" => {
+        // "Ref returns the topic ARN"; Fn::GetAtt: TopicArn, TopicName. This is the type
+        // `super::provisioning` creates in Amazon SNS itself, which then answers with the
+        // topic's own ARN — the same ARN this computes, since both are built from the one
+        // account id this emulator mints and the topic's name, which is how SNS keys a
+        // topic (`topic_arn` in its own state module).
+        SNS_TOPIC => {
             let arn = ::emulator_server::emulator_arn("sns", region, name);
             attributes.insert("TopicArn".to_string(), arn.clone());
             attributes.insert("TopicName".to_string(), name.to_string());
@@ -1984,7 +2188,7 @@ fn return_values(
         }
         // "Ref returns the bucket name"; Fn::GetAtt: Arn, DomainName. An Amazon S3 bucket
         // ARN carries neither a region nor an account id (`arn:aws:s3:::<bucket>`).
-        "AWS::S3::Bucket" => {
+        S3_BUCKET => {
             attributes.insert("Arn".to_string(), format!("arn:{PARTITION}:s3:::{name}"));
             attributes.insert("DomainName".to_string(), format!("{name}.s3.{URL_SUFFIX}"));
             (name.to_string(), attributes)
@@ -2504,8 +2708,116 @@ fn return_values(
             );
             (name.to_string(), attributes)
         }
+        // "Ref returns the experiment template ID"; Fn::GetAtt: Id. FIS ASSIGNS that id —
+        // the type has no name property for a template to set — so a declaration reports an
+        // identifier of FIS's own shape (its `EXT` prefix and its 12-character suffix, each
+        // character one FIS's own minting admits) rather than CloudFormation's
+        // `<stack>-<logical id>-<unique id>` name (the case AWS::Transfer::Server and
+        // AWS::RUM::AppMonitor are in). The characters here are uppercase hexadecimal, a
+        // subset of the base-36 alphabet FIS mints from: a stand-in, since this is also the
+        // type `super::provisioning` creates in FIS itself, which reports the id IT minted
+        // back over the `Id` attribute — and THAT id, not this one, is what the stack
+        // reports for a resource FIS created.
+        FIS_EXPERIMENT_TEMPLATE => {
+            let id = format!(
+                "{FIS_TEMPLATE_ID_PREFIX}{}",
+                derived_digits(
+                    FIS_TEMPLATE_ID_PREFIX,
+                    name,
+                    FIS_TEMPLATE_ID_DIGITS,
+                    Alphabet::Upper,
+                )
+            );
+            attributes.insert("Id".to_string(), id.clone());
+            (id, attributes)
+        }
         _ => (name.to_string(), attributes),
     }
+}
+
+/// The NAMES of the `Fn::GetAtt` attributes a resource of this type publishes — the other
+/// half of the catalogue [`return_values`] above keys, read without a resource.
+///
+/// Source: the very same per-type "Return values" sections. Which attributes a type
+/// publishes is a property of the TYPE, while the values [`return_values`] computes are
+/// properties of one provisioned resource, so the extension registry can report what a
+/// published resource type's schema DEFINES
+/// ([`crate::state::resource_schema`](crate::state::resource_schema)) with no stack having
+/// declared one. A type this emulator carries no return values for publishes no
+/// attributes, and gets the empty list.
+///
+/// This is the same split [`declared_name_property`] is in: an arm added to
+/// [`return_values`] has to be added here too, which
+/// `published_attribute_names_are_the_catalogued_return_values` in this module's tests
+/// enforces — it compares this list, type by type, against the attributes the arm actually
+/// inserts. The order is the sorted order a resource's own attribute map holds them in, so
+/// a document built from them is byte-for-byte the same on every read.
+pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str] {
+    match resource_type {
+        "AWS::SNS::Topic" => &["TopicArn", "TopicName"],
+        SQS_QUEUE => &["Arn", "QueueName", "QueueUrl"],
+        "AWS::S3::Bucket" => &["Arn", "DomainName"],
+        "AWS::DynamoDB::Table" => &["Arn"],
+        "AWS::Lambda::Function" => &["Arn"],
+        "AWS::Logs::LogGroup" => &["Arn"],
+        "AWS::Transfer::Server" => &["Arn", "ServerId"],
+        "AWS::Transfer::Workflow" => &["Arn", "WorkflowId"],
+        "AWS::IAM::Role" => &["Arn"],
+        ECR_PUBLIC_REPOSITORY => &["Arn"],
+        FIREHOSE_DELIVERY_STREAM => &["Arn"],
+        ECR_REPOSITORY => &["Arn", "RepositoryUri"],
+        ECS_CLUSTER => &["Arn"],
+        ECS_TASK_DEFINITION => &["TaskDefinitionArn"],
+        ELB_LOAD_BALANCER => &["DNSName", "LoadBalancerFullName", "LoadBalancerName"],
+        ELB_TARGET_GROUP => &["TargetGroupArn", "TargetGroupFullName", "TargetGroupName"],
+        "AWS::RDS::DBCluster" => &[
+            "DBClusterArn",
+            "DBClusterResourceId",
+            "Endpoint.Address",
+            "Endpoint.Port",
+            "ReadEndpoint.Address",
+        ],
+        "AWS::RDS::DBInstance" => &[
+            "DBInstanceArn",
+            "DbiResourceId",
+            "Endpoint.Address",
+            "Endpoint.Port",
+        ],
+        "AWS::SecretsManager::Secret" => &["Id"],
+        "AWS::EC2::SecurityGroup" => &["GroupId"],
+        ECS_SERVICE => &["Name"],
+        ELB_LISTENER => &["ListenerArn"],
+        ELB_LISTENER_RULE => &["IsDefault", "RuleArn"],
+        "AWS::BedrockAgentCore::Memory" => &["MemoryArn", "MemoryId"],
+        "AWS::BedrockAgentCore::Runtime" => {
+            &["AgentRuntimeArn", "AgentRuntimeId", "AgentRuntimeVersion"]
+        }
+        "AWS::BedrockAgentCore::CodeInterpreter" => &["CodeInterpreterArn", "CodeInterpreterId"],
+        "AWS::BedrockAgentCore::Browser" => &["BrowserArn", "BrowserId"],
+        "AWS::BedrockAgentCore::Gateway" => &["GatewayArn", "GatewayId"],
+        "AWS::BedrockAgentCore::WorkloadIdentity" => &["Name", "WorkloadIdentityArn"],
+        "AWS::RUM::AppMonitor" => &["Id"],
+        "AWS::CloudWatch::Alarm" => &["Arn"],
+        FIS_EXPERIMENT_TEMPLATE => &["Id"],
+        _ => &[],
+    }
+}
+
+/// Whether the PHYSICAL ID of a resource of this type is assigned by the service that owns
+/// it rather than derived from what the template declares.
+///
+/// For such a type the identifier in force is the one that service minted: it cannot be
+/// recomputed from the template, so a later deployment of the same declaration carries the
+/// recorded one forward instead of replacing the resource
+/// ([`super::StoredStack::deploy_template`]). Every other type's physical id is a function
+/// of its declared or generated name, which any deployment recomputes identically.
+///
+/// Two types this emulator provisions are in that position: an experiment template's id is
+/// minted by FIS (`Ref` returns it, and the type has no name property at all), and an AWS
+/// WAF Classic regional IPSet's id is minted by `CreateIPSet` ("Ref returns the IPSet ID"),
+/// where that type's `Name` is only what the create asks for.
+pub fn identity_is_service_assigned(resource_type: &str) -> bool {
+    resource_type == FIS_EXPERIMENT_TEMPLATE || resource_type == WAF_REGIONAL_IP_SET
 }
 
 /// The `AWS::<cloudFormationName>::<Resource>` type of an Amazon Data Firehose stream.
@@ -2513,9 +2825,19 @@ fn return_values(
 /// (`smithy_query(query="service_info")` on that service's model).
 pub const FIREHOSE_DELIVERY_STREAM: &str = "AWS::KinesisFirehose::DeliveryStream";
 
+/// The type of an Amazon S3 bucket, whose middle segment is that model's own
+/// `cloudFormationName` the same way. "Ref returns the bucket name" for this type, so a
+/// bucket's physical resource id is the name its owning service creates it under — which
+/// is why [`naming_rules`] holds a GENERATED one to S3's bucket naming rules.
+pub const S3_BUCKET: &str = "AWS::S3::Bucket";
+
 /// The same for an Amazon SQS queue: the SQS model carries
 /// `awsService.cloudFormationName: SQS`.
 pub const SQS_QUEUE: &str = "AWS::SQS::Queue";
+
+/// The same for an Amazon SNS topic: the SNS model carries
+/// `awsService.cloudFormationName: SNS`.
+pub const SNS_TOPIC: &str = "AWS::SNS::Topic";
 
 /// The `AWS::ECR::PublicRepository` resource type: an Amazon ECR Public repository.
 ///
@@ -2541,6 +2863,25 @@ pub const ELB_LOAD_BALANCER: &str = "AWS::ElasticLoadBalancingV2::LoadBalancer";
 
 /// An Elastic Load Balancing v2 target group's resource type.
 pub const ELB_TARGET_GROUP: &str = "AWS::ElasticLoadBalancingV2::TargetGroup";
+
+/// An AWS Fault Injection Service experiment template's resource type (the FIS model:
+/// `cloudFormationName: FIS`). This is the type `super::provisioning` creates in FIS
+/// itself, so the id a stack's output reports for it is the id FIS minted.
+pub const FIS_EXPERIMENT_TEMPLATE: &str = "AWS::FIS::ExperimentTemplate";
+
+/// An AWS WAF Classic regional IPSet's resource type (the AWS WAF Regional model:
+/// `cloudFormationName: WAFRegional`). This is a type `super::provisioning` creates in that
+/// service itself, and "Ref returns the IPSet ID" — an id only AWS WAF Classic mints — so
+/// the id a stack's output reports for it is the one that service answered with.
+pub const WAF_REGIONAL_IP_SET: &str = "AWS::WAFRegional::IPSet";
+
+/// The prefix of an experiment-template id, as FIS mints one (`EXT` + a base-36 suffix;
+/// FIS's own `TEMPLATE_ID_PREFIX`).
+const FIS_TEMPLATE_ID_PREFIX: &str = "EXT";
+
+/// How many characters follow [`FIS_TEMPLATE_ID_PREFIX`] in an experiment-template id:
+/// FIS's own `ID_SUFFIX_LEN`, the width of the base-36 suffix every id it mints carries.
+const FIS_TEMPLATE_ID_DIGITS: usize = 12;
 
 /// The revision a task definition registered for a family the account does not hold yet
 /// carries: "the first task definition that you registered to a family is given a revision
@@ -2611,6 +2952,17 @@ pub fn resolve_properties(
         resource.properties =
             resolved_value(&declared.properties, scope, 0, budget).unwrap_or(Value::Null);
     }
+}
+
+/// One template value with every intrinsic function it carries evaluated, preserving the
+/// objects and arrays around them; `None` for a value that cannot be evaluated at all.
+///
+/// The one entry point for evaluating a value OUTSIDE a deployment: comparing what two
+/// revisions of a template declare for one property has to compare the values each would
+/// really deploy, since a property that reads `!Ref Size` is a different value under a
+/// different parameter value while the template text is the same.
+pub fn resolve(value: &Value, scope: &Scope<'_>, budget: &mut Budget) -> Option<Value> {
+    resolved_value(value, scope, 0, budget)
 }
 
 /// One template value with every intrinsic function it carries evaluated, preserving the
@@ -3520,14 +3872,15 @@ fn substitute(
 mod tests {
     use super::*;
 
-    /// [`IMPLEMENTED_RESOURCE_TYPES`] is the catalogue of the arms of [`return_values`],
-    /// and the registry reports a published extension for exactly its entries — so an
-    /// entry that `return_values` does not actually know would make the registry report an
-    /// extension for a type this emulator provisions no better than any other. Every
-    /// catalogued type must therefore yield the attributes its "Return values" section
-    /// publishes, which a type outside the `match` has none of.
-    #[test]
-    fn every_implemented_resource_type_has_known_return_values() {
+    /// The attributes [`return_values`] computes for a resource of `resource_type`.
+    ///
+    /// `return_values` reads the whole declaration, because a few published return values
+    /// are functions of the resource's own properties: a DB type's `Endpoint.Port` needs a
+    /// declared engine, and the two NESTED Elastic Load Balancing types (a listener and a
+    /// rule, whose ARNs are built from their parent's) the parent ARN. So the declaration
+    /// here carries what a template declaring one of those types would, which is what
+    /// makes the attribute set it yields the type's WHOLE published set.
+    fn computed_attributes(resource_type: &str) -> BTreeMap<String, String> {
         let stack = StackScope {
             region: "us-east-1",
             stack_name: "a-stack",
@@ -3547,14 +3900,7 @@ mod tests {
             conditions: &conditions,
         };
         let mut budget = Budget::new();
-        // `return_values` reads the whole declaration, because a few published return
-        // values are functions of the resource's own properties: a declaration carrying
-        // only the type is what a template that sets no property spells. A DB type's
-        // `Endpoint.Port` is one of those — it needs a declared engine — so each DB row
-        // declares the engine a template would, and the two NESTED Elastic Load Balancing
-        // types (a listener and a rule, whose ARNs are built from their parent's) the
-        // parent ARN a template would.
-        let declared_as = |resource_type: &str| DeclaredResource {
+        let declared = DeclaredResource {
             logical_id: "ARes".to_string(),
             resource_type: resource_type.to_string(),
             properties: ::serde_json::json!({
@@ -3571,9 +3917,20 @@ mod tests {
             condition: None,
             declaration: Value::Null,
         };
+        let (_, attributes) = return_values(&declared, "a-name", &scope, &mut budget);
+        attributes
+    }
+
+    /// [`IMPLEMENTED_RESOURCE_TYPES`] is the catalogue of the arms of [`return_values`],
+    /// and the registry reports a published extension for exactly its entries — so an
+    /// entry that `return_values` does not actually know would make the registry report an
+    /// extension for a type this emulator provisions no better than any other. Every
+    /// catalogued type must therefore yield the attributes its "Return values" section
+    /// publishes, which a type outside the `match` has none of.
+    #[test]
+    fn every_implemented_resource_type_has_known_return_values() {
         for resource_type in IMPLEMENTED_RESOURCE_TYPES {
-            let (_, attributes) =
-                return_values(&declared_as(resource_type), "a-name", &scope, &mut budget);
+            let attributes = computed_attributes(resource_type);
             assert!(
                 !attributes.is_empty(),
                 "case {resource_type:?}: expected the type's documented Fn::GetAtt \
@@ -3582,15 +3939,36 @@ mod tests {
             );
         }
         // And a type no arm carries is NOT in the catalogue: it has no attributes at all.
-        let (_, unknown) = return_values(
-            &declared_as("AWS::NotAService::NotAType"),
-            "a-name",
-            &scope,
-            &mut budget,
-        );
+        let unknown = computed_attributes("AWS::NotAService::NotAType");
         assert!(
             unknown.is_empty(),
             "case \"a type no arm carries\": expected no attributes, got {unknown:?}"
         );
+    }
+
+    /// [`published_attribute_names`] names exactly the attributes [`return_values`]
+    /// computes, for every type either half carries: the registry's resource schema is
+    /// built from the names, so a name missing from one half or invented in the other
+    /// would make the schema a published type's registry record carries disagree with the
+    /// attributes a resource of that type actually answers.
+    #[test]
+    fn published_attribute_names_are_the_catalogued_return_values() {
+        // Every type the schema side is asked about, plus one no arm carries at all.
+        let types = IMPLEMENTED_RESOURCE_TYPES
+            .iter()
+            .copied()
+            .chain(["AWS::NotAService::NotAType"]);
+        for resource_type in types {
+            let computed: Vec<String> = computed_attributes(resource_type).into_keys().collect();
+            let named: Vec<String> = published_attribute_names(resource_type)
+                .iter()
+                .map(ToString::to_string)
+                .collect();
+            assert_eq!(
+                named, computed,
+                "case {resource_type:?}: expected the names of the attributes \
+                 return_values computes ({computed:?}), got {named:?}"
+            );
+        }
     }
 }

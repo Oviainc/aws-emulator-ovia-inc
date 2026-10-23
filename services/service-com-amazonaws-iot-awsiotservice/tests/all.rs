@@ -15,10 +15,14 @@
 mod command_registry;
 #[path = "all/describe_endpoint.rs"]
 mod describe_endpoint;
+#[path = "all/indexing_configuration.rs"]
+mod indexing_configuration;
 #[path = "all/job_execution_read.rs"]
 mod job_execution_read;
 #[path = "all/job_targeting.rs"]
 mod job_targeting;
+#[path = "all/policy_registry.rs"]
+mod policy_registry;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/thing_group_hierarchy.rs"]
@@ -27,5 +31,7 @@ mod thing_group_hierarchy;
 mod thing_listing;
 #[path = "all/thing_registry_lifecycle.rs"]
 mod thing_registry_lifecycle;
+#[path = "all/topic_rule_listing.rs"]
+mod topic_rule_listing;
 #[path = "all/topic_rule_registry.rs"]
 mod topic_rule_registry;

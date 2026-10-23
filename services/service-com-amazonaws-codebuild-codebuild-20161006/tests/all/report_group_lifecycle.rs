@@ -246,7 +246,9 @@ async fn create_report_group_persists_every_member_it_was_given() {
         );
         assert_eq!(
             created["tags"],
-            tags.clone().unwrap_or(Value::Null),
+            // A resource's tag set is always reported: a request that named no tag
+            // reads back as the empty list, not as a missing member.
+            tags.clone().unwrap_or_else(|| json!([])),
             "{case}: expected tags {tags:?}, got {created}"
         );
         assert_eq!(
@@ -284,7 +286,7 @@ async fn create_report_group_persists_every_member_it_was_given() {
             );
             assert_eq!(
                 fetched["reportGroupsNotFound"],
-                Value::Null,
+                json!([]),
                 "{case}: {read} read of a held ARN must report nothing not found, got {fetched}"
             );
         }
@@ -597,8 +599,8 @@ async fn batch_get_report_groups_splits_held_arns_from_the_rest() {
         );
         assert_eq!(
             body["reportGroups"],
-            Value::Null,
-            "{case}: expected no report groups, got {body}"
+            json!([]),
+            "{case}: expected an empty reportGroups, got {body}"
         );
     }
 

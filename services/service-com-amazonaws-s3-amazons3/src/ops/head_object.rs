@@ -457,14 +457,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // status is `Enabled`. A `null` version carries no id of its own, so none is
             // reported for it.
             version_id: object.version_id.clone(),
+            // The encryption configuration the object was STORED under (`PutObject`
+            // records it), so a HEAD of an SSE/SSE-KMS object reports the same
+            // `x-amz-server-side-encryption` headers the write answered with.
+            server_side_encryption: object.encryption.sse_algorithm.clone(),
+            ssekms_key_id: object.encryption.kms_key_id.clone(),
+            bucket_key_enabled: object.encryption.bucket_key_enabled,
             // Every remaining member is documented as reported only when something this
             // slice does not serve is true of the object: it is a delete marker
             // (`DeleteMarker`, which a delete records none of), a lifecycle rule has it
             // expiring (`Expiration`), it is archived (`Restore`, `ArchiveStatus`), a
             // checksum was uploaded with it (`Checksum*`, `ChecksumType`), metadata could
             // not be decoded (`MissingMeta`), the read was partial (`ContentRange`,
-            // `PartsCount`), something encrypted it (`ServerSideEncryption`, `SSE*`,
-            // `BucketKeyEnabled`), it is replicated (`ReplicationStatus`), it is locked
+            // `PartsCount`), a customer-provided key encrypted it (`SSECustomer*`, which
+            // `PutObject` refuses), it is replicated (`ReplicationStatus`), it is locked
             // (`ObjectLock*`) or the bucket is Requester Pays (`RequestCharged`).
             ..HeadObjectOutput::default()
         })

@@ -53,7 +53,10 @@ pub(crate) async fn create_flow(emulator: &Emulator, name: &str, media_streams: 
 
 /// `POST /v1/flows/{FlowArn}/mediaStreams` — the AddFlowMediaStreams binding
 /// (`smithy_query(query="operation",operation="AddFlowMediaStreams")`).
-async fn add_media_streams(
+///
+/// `pub(crate)` because `tests/all/remove_flow_media_stream.rs` fills its flows the same
+/// way.
+pub(crate) async fn add_media_streams(
     emulator: &Emulator,
     flow_arn: &str,
     media_streams: Value,

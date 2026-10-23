@@ -7,7 +7,11 @@
 //! types that pattern admits, a dashboard and a scheduled report. Nothing is echoed from
 //! the request but the ARN that identified the resource, and this operation writes
 //! nothing (the model marks it `@readonly`). An ARN this service holds no resource under
-//! answers `ResourceNotFoundException` (404); a resource carrying no tags answers 200
+//! answers the service's not-found refusal — HTTP 400 with the error code
+//! `ResourceNotFoundException` and a `resourceId` member carrying the requested ARN, as
+//! `crate::scaffolded::Scaffolded::resource_not_found` renders it (the model's `@httpError`
+//! for that shape is 404, which is not what the recorded service answers); a resource
+//! carrying no tags answers 200
 //! with an empty `resourceTags` list, which `ResourceTagList`'s length (0..200) admits.
 //! An ARN that does not satisfy `ResourceArn`'s pattern is refused as a
 //! `ValidationException` (400) by the boundary validator before this handler runs.
@@ -161,10 +165,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let resource_tags = state
             .resource_tags(&input.resource_arn)
             .ok_or_else(|| {
-                ListTagsForResourceErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: format!("No resource found for arn {}", input.resource_arn),
-                    },
+                // The tagging path's own wording for a resource that does not resolve,
+                // as the recorded answer carries it: a constant, naming nothing from the
+                // request (the ARN travels in `resourceId`).
+                crate::scaffolded::Scaffolded::resource_not_found(
+                    &input.resource_arn,
+                    crate::state::TAGGING_RESOURCE_NOT_FOUND_MESSAGE,
                 )
             })?
             .to_vec();

@@ -7,10 +7,11 @@
 //! resolved for it — and persists it, so `GetPipelineExecution` and
 //! `ListPipelineExecutions` report the execution this call created.
 //!
-//! The execution stays `InProgress`: moving it on would mean running the stages'
-//! actions, which the action-execution plane (`PollForJobs`, `PutJobSuccessResult`,
-//! `GetPipelineState`) does, and those operations are still 501. Nothing here
-//! reports a status for work nothing ran.
+//! The start also CARRIES the execution into its first stage: `record_execution` drives
+//! the execution plane (`crate::state::execution`), which starts that stage's first
+//! actions, publishes the approval token or queues the job whoever reports an action's
+//! outcome needs, and from there moves the execution on by the clock until it reaches a
+//! terminal `PipelineExecutionStatus`.
 //!
 //! ## Shape of an operation
 //!

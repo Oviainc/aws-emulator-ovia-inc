@@ -32,6 +32,10 @@ tracing = { workspace = true }
 # already required to be UTF-8 before the parser sees it — and dropping it keeps
 # SR-MEM-001 true of the whole request path.
 yaml-rust2 = { version = "0.10", default-features = false }
+# `arn`: the ONE parse of a caller-supplied `resourceArn`, so this service agrees with
+# every other on what an ARN's six fields are and which ARNs name its own resources —
+# what `state::parse_tagged_resource` reads a tag operation's `resourceArn` with.
+service-common = { path = "../common" }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -39,6 +43,10 @@ emulator-core-build-support = { workspace = true }
 [dev-dependencies]
 sha2 = { workspace = true }
 hex = { workspace = true }
+# Percent-encoding for the `resourceArn` @httpLabel a tag call puts in its URI path: the
+# encoding itself is the crate's, as the sibling medialive/codeartifact suites do it,
+# rather than a tenth hand-written copy of RFC 3986.
+percent-encoding = "2"
 
 [lints]
 workspace = true

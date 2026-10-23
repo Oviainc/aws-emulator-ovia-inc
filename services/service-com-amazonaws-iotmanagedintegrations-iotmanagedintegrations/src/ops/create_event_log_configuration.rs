@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateEventLogConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateEventLogConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateEventLogConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Inserts the event log configuration into `crate::state`'s `event_log_configurations`
+//! store under a freshly generated `LogConfigurationId`, and answers with that id. A log
+//! TARGET — the `ResourceType` the request names, and the `ResourceId` within it when it
+//! names one — holds at most one configuration, so a create for a target that already has
+//! one is refused with the modelled `ConflictException`. A replayed `ClientToken`
+//! (`@idempotencyToken`) answers with the record the first call created instead of creating
+//! a second one.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +157,147 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateEventLogConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateEventLogConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateEventLogConfiguration"))
+        // The credential scope's access key id is read only to ATTRIBUTE the change
+        // ([`audit`]); the region it names is the region this configuration is created in.
+        let akid = ::emulator_server::extract_akid(&ctx.parts().headers);
+        let region = crate::state::request_region(ctx.parts());
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            audit(&akid, &region, &input.resource_type, "unavailable");
+            CreateEventLogConfigurationErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the event-log-configuration store is unavailable".to_string()),
+                },
+            )
+        })?;
+
+        // `EventLogLevel` is a modelled enum, so a value outside
+        // `crate::state::LOG_LEVEL_VALUES` is a client error rather than a stored record.
+        // The model's own constraint walk refuses one before this handler runs; this second
+        // line states it through the SAME formatter, so the two cannot word one refusal two
+        // ways (`crate::service::enum_value_set_refusal`).
+        if !crate::state::LOG_LEVEL_VALUES.contains(&input.event_log_level.as_str()) {
+            audit(&akid, &region, &input.resource_type, "refused");
+            return Err(CreateEventLogConfigurationErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::service::enum_value_set_refusal(
+                        "EventLogLevel",
+                        crate::state::LOG_LEVEL_VALUES,
+                        &input.event_log_level,
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let created_at = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // Retire the idempotency records the clock already made due, before anything reads
+        // them: a token past its TTL neither replays nor occupies the map.
+        store.retire_expired_idempotency_tokens(created_at);
+
+        // A retry with the same `ClientToken` answers with what the first call created,
+        // performing no further action — so it is answered BEFORE the duplicate-target
+        // conflict below, which the first call's own record would otherwise raise.
+        let replayed = input.client_token.as_deref().and_then(|token| {
+            store.replayed_resource_id(
+                crate::state::EVENT_LOG_CONFIGURATION_RESOURCE_TYPE,
+                token,
+            )
+        });
+        if let Some(created) =
+            replayed.and_then(|id| store.event_log_configuration_in(&region, &id))
+        {
+            let id = created.id.clone();
+            drop(store);
+            audit(&akid, &region, &input.resource_type, "replayed");
+            return Ok(CreateEventLogConfigurationOutput { id: Some(id) });
+        }
+
+        // A log target carries ONE logging level, so a target that already has a
+        // configuration is a conflict rather than a second record: the caller updates or
+        // deletes the existing one. The reason names that configuration's identifier, so
+        // the caller can act on it, and nothing the request sent.
+        if let Some(existing) = store.event_log_configuration_for_target(
+            &region,
+            &input.resource_type,
+            input.resource_id.as_deref(),
+        ) {
+            let existing_id = existing.id.clone();
+            drop(store);
+            audit(&akid, &region, &input.resource_type, "conflict");
+            return Err(CreateEventLogConfigurationErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(format!(
+                        "an event log configuration already exists for this resource type and \
+                         resource, with identifier '{existing_id}'"
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The store is bounded: past its maximum a create is refused rather than grown
+        // into, through the quota error this operation models for exactly that.
+        if store.event_log_configurations.len() >= crate::state::MAX_EVENT_LOG_CONFIGURATIONS {
+            drop(store);
+            audit(&akid, &region, &input.resource_type, "refused");
+            return Err(
+                CreateEventLogConfigurationErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(format!(
+                            "this service holds the maximum of {} event log configurations; \
+                             delete one before creating another",
+                            crate::state::MAX_EVENT_LOG_CONFIGURATIONS
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let sequence = store.take_sequence();
+        let id = crate::state::opaque_id(sequence);
+        let configuration = crate::state::EventLogConfiguration {
+            id: id.clone(),
+            region: region.clone(),
+            resource_type: input.resource_type.clone(),
+            resource_id: input.resource_id,
+            event_log_level: input.event_log_level,
+            sequence,
+        };
+
+        if let Some(token) = input.client_token {
+            store.record_idempotency_token(
+                crate::state::EVENT_LOG_CONFIGURATION_RESOURCE_TYPE,
+                &token,
+                &id,
+                created_at,
+            );
+        }
+        store
+            .event_log_configurations
+            .insert(id.clone(), configuration);
+        drop(store);
+
+        audit(&akid, &region, &input.resource_type, "created");
+        Ok(CreateEventLogConfigurationOutput { id: Some(id) })
     }
+}
+
+/// Record this state-changing call for attribution: the access key id the caller presented
+/// (a public identifier, never a secret), the region the configuration was created in, the
+/// resource type it addresses, and how the call ended. No `ResourceId` and no `ClientToken`:
+/// a log sink needs neither to attribute the change.
+fn audit(akid: &str, region: &str, resource_type: &str, outcome: &str) {
+    ::tracing::info!(
+        target: "emulator::audit",
+        operation = "CreateEventLogConfiguration",
+        akid = %akid,
+        region = %region,
+        resource_type = %resource_type,
+        outcome = %outcome,
+        "state-changing operation"
+    );
 }

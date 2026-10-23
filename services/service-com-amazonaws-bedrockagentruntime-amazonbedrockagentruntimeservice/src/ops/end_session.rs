@@ -180,12 +180,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let key = crate::state::session_id_from_identifier(&input.session_identifier);
         let Some(session) = guard.sessions.get_mut(key) else {
             return Err(EndSessionErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!(
-                        "Session with identifier {} was not found.",
-                        input.session_identifier
-                    )),
-                },
+                crate::state::session_not_found(&input.session_identifier),
             )
             .into());
         };

@@ -36,18 +36,31 @@ pub const SERVICE_SIGNING_NAME: &str = "codeartifact";
 /// generated client config uses.
 pub const DEFAULT_REGION: &str = "us-east-1";
 
-/// The only status a domain this emulator holds can be in: CodeArtifact creates a
+/// The only status a domain this emulator HOLDS can be in: CodeArtifact creates a
 /// domain synchronously and `DescribeDomain` reports it `Active` from the first read, so
 /// there is no transient creating state to move through. (`DomainStatus` models exactly
-/// `Active` and `Deleted`; `Deleted` is never observable, because a deleted domain is
-/// gone from the store.)
+/// `Active` and `Deleted` — `smithy_query(query="shape",shape="DomainStatus")`.)
 pub const DOMAIN_STATUS_ACTIVE: &str = "Active";
 
-/// The only status an external connection this emulator holds can be in.
-/// `ExternalConnectionStatus` models exactly one value, `Available`, and the
-/// `RepositoryExternalConnectionInfo.status` doc says so ("There is one valid value,
-/// `Available`"), so an associated connection is reported available from the first read.
-pub const EXTERNAL_CONNECTION_STATUS_AVAILABLE: &str = "Available";
+/// The terminal status of a domain that has been deleted — the other half of
+/// `DomainStatus`. No domain in the store ever carries it: it belongs to the description
+/// `DeleteDomain` answers with ([`Domain::deleted_description`]), which reports the state
+/// the domain is in AFTER the call, not the record as it was before.
+pub const DOMAIN_STATUS_DELETED: &str = "Deleted";
+
+/// The only status an external connection this emulator holds can be in: there is one
+/// external-connection status, and an associated connection carries it from the first
+/// read (CodeArtifact associates a public registry synchronously, so there is no
+/// transient state to move through).
+///
+/// Spelled as the WIRE spells it. The on-disk model is stale for this member — Smithy
+/// `ExternalConnectionStatus` lists `Available`
+/// (`smithy_query(query="shape",shape="ExternalConnectionStatus")`) and the member doc
+/// repeats it, but the live responses of `AssociateExternalConnection` and
+/// `DescribeRepository` return `AVAILABLE`, and `status` is an enum a client COMPARES
+/// against what it sees from AWS, so the observed wire token is the contract here and the
+/// model entry is not.
+pub const EXTERNAL_CONNECTION_STATUS_AVAILABLE: &str = "AVAILABLE";
 
 /// The public registries CodeArtifact can connect a repository to, each paired with the
 /// `PackageFormat` its packages carry.
@@ -148,6 +161,16 @@ pub const MAX_ASSET_BYTES: usize = 64 * 1024 * 1024;
 /// reason as [`MAX_ASSET_BYTES`]: an unfinished version accepts assets until it closes).
 pub const MAX_ASSETS_PER_PACKAGE_VERSION: usize = 100;
 
+/// Maximum versions one `CopyPackageVersions` request may name.
+///
+/// This is the modelled `PackageVersionList` bound (`@length(0..100)`) that the `versions`
+/// member already carries, applied to the `versionRevisions` member, which names the SAME
+/// set and carries NO modelled length — so the boundary validator caps one form of the
+/// request and nothing but this constant caps the other. A request past it is refused with
+/// the same 400 `ValidationException` the validator answers for an over-long `versions`
+/// list, before the keys are collected.
+pub const MAX_VERSIONS_PER_COPY_REQUEST: usize = 100;
+
 /// Maximum versions one package may hold (the emulator's own bound).
 pub const MAX_PACKAGE_VERSIONS_PER_PACKAGE: usize = 1_000;
 
@@ -179,12 +202,28 @@ pub const MAX_STORED_ASSET_BYTES: i64 = 256 * 1024 * 1024;
 /// be published using this API" (the operation's own documentation).
 pub const PACKAGE_FORMAT_GENERIC: &str = "generic";
 
+/// The `PackageFormat`s whose namespace is a SCOPE, so the scope is part of how a package
+/// of that format is written: "The namespace of an npm or Swift package version is its
+/// scope" (`PackageVersionDescription$namespace`,
+/// `smithy_query(query="doc",shape="PackageVersionDescription",member="namespace")`).
+/// Used by [`package_display_name`]; every other format writes its namespace as a
+/// separate coordinate (a Maven `groupId`, a generic `namespace`) or has none at all.
+pub const SCOPED_PACKAGE_FORMATS: &[&str] = &["npm", "swift"];
+
 /// `PackageVersionStatus` of a version whose assets are all uploaded.
 pub const PACKAGE_VERSION_STATUS_PUBLISHED: &str = "Published";
 
 /// `PackageVersionStatus` of a version that is still accepting assets, which is what the
 /// `unfinished` flag keeps a publish in.
 pub const PACKAGE_VERSION_STATUS_UNFINISHED: &str = "Unfinished";
+
+/// `PackageVersionStatus` of a version a delete removed, which is what
+/// `DeletePackageVersions` reports for every version it deleted ("The status of every
+/// successful version will be `Deleted`" — `DeletePackageVersionsResult$successfulVersions`).
+///
+/// Never STORED: a deleted version is gone from the store, so this status is reported by
+/// the call that removed it and by nothing that reads a stored record.
+pub const PACKAGE_VERSION_STATUS_DELETED: &str = "Deleted";
 
 /// The `AllowPublish`/`AllowUpstream` value that permits the action.
 pub const ORIGIN_RESTRICTION_ALLOW: &str = "ALLOW";
@@ -495,6 +534,43 @@ pub fn reported_resource_type(reference: &ResourceRef) -> Option<String> {
     }
 }
 
+/// The `resourceId` a modelled error reports for a resolved resource: the IDENTIFIER of
+/// the resource, never the ARN the caller addressed it by.
+///
+/// `ResourceNotFoundException$resourceId` is documented as "The ID of the resource", and a
+/// client feeds it back into a name-scoped call (or matches it against a name), so an ARN
+/// there is unusable. Each kind reports what this store keys it by: a domain its name, a
+/// repository its own name inside its domain, a package group its pattern.
+#[must_use]
+pub fn reported_resource_id(reference: &ResourceRef) -> String {
+    match reference {
+        ResourceRef::Domain { name, .. } => name.clone(),
+        ResourceRef::Repository { repository, .. } => repository.clone(),
+        ResourceRef::PackageGroup { pattern, .. } => pattern.clone(),
+    }
+}
+
+/// The `ResourceNotFoundException` message for an ARN-addressed resource this store does
+/// not hold: the sentence the resource's OWN kind is refused with everywhere else in this
+/// service ([`domain_not_found_message`] and friends), so a caller that addressed a domain
+/// by ARN reads the same refusal as one that named it.
+#[must_use]
+pub fn tagged_resource_not_found_message(reference: &ResourceRef) -> String {
+    match reference {
+        ResourceRef::Domain { owner, name } => domain_not_found_message(name, owner.as_deref()),
+        ResourceRef::Repository {
+            owner,
+            domain,
+            repository,
+        } => repository_not_found_message(domain, owner.as_deref(), repository),
+        ResourceRef::PackageGroup {
+            owner,
+            domain,
+            pattern,
+        } => package_group_not_found_message(domain, owner.as_deref(), pattern),
+    }
+}
+
 /// `held` with `incoming` applied, the way CodeArtifact's `TagResource` documents it
 /// ("Adds or updates tags for a resource"): a key the resource already holds keeps its
 /// position and takes the new value, and a key it does not hold is appended.
@@ -573,6 +649,20 @@ impl Domain {
             repository_count: self.repository_count(),
             asset_size_bytes: self.asset_size_bytes(),
             s3_bucket_arn: Some(self.s3_bucket_arn.clone()),
+        }
+    }
+
+    /// The modelled `DomainDescription` of this domain AFTER it has been deleted: the
+    /// projection [`Domain::description`] builds, with `status` moved to the terminal
+    /// [`DOMAIN_STATUS_DELETED`].
+    ///
+    /// A delete answers for the post-delete state of the resource, so the status it
+    /// reports is the one the domain reached by being removed — never the `Active` the
+    /// record carried while it was still held.
+    pub fn deleted_description(&self) -> DomainDescription {
+        DomainDescription {
+            status: Some(DOMAIN_STATUS_DELETED.to_string()),
+            ..self.description()
         }
     }
 
@@ -1063,6 +1153,36 @@ pub fn package_key(format: &str, namespace: Option<&str>, package: &str) -> Stri
     format!("{format}/{}/{package}", namespace.unwrap_or_default())
 }
 
+/// `displayName`: the stored package's name written the way its FORMAT writes it.
+///
+/// The rule and its one documented variation come from the member itself: "The name of
+/// the package that is displayed. The `displayName` varies depending on the package
+/// version's format. For example, if an npm package is named `ui`, is in the namespace
+/// `vue`, and has the format `npm`, then the `displayName` is `@vue/ui`"
+/// (`smithy_query(query="doc",shape="PackageVersionDescription",member="displayName")`).
+///
+/// So the display name folds the namespace into the name exactly for the formats whose
+/// namespace is a SCOPE ([`SCOPED_PACKAGE_FORMATS`]) — written `@<scope>/<name>`, the one
+/// spelling the doc gives. Every other format writes its namespace as a separate
+/// coordinate (a Maven `groupId`, a generic `namespace`) or carries none, so its display
+/// name is the package name.
+///
+/// DERIVED from the coordinate the version is stored under and therefore always
+/// available: nothing here is read out of package metadata, which is also why the
+/// metadata-sourced members beside it (`summary`, `homePage`, `sourceCodeRepository`)
+/// stay absent. A leading `@` already on the scope is not doubled, so a caller that
+/// published `@vue` as the namespace and one that published `vue` get the same rendering.
+pub fn package_display_name(format: &str, namespace: Option<&str>, package: &str) -> String {
+    match namespace {
+        Some(scope)
+            if !scope.is_empty() && SCOPED_PACKAGE_FORMATS.contains(&format) =>
+        {
+            format!("@{}/{package}", scope.strip_prefix('@').unwrap_or(scope))
+        }
+        _ => package.to_string(),
+    }
+}
+
 /// A stored package inside a repository.
 ///
 /// A package is identified by the triple (`format`, `namespace`, `name`) — the same triple
@@ -1177,22 +1297,37 @@ impl PackageVersion {
 
     /// The modelled `PackageVersionDescription` for this record, inside `package`.
     ///
-    /// `displayName`, `summary`, `homePage`, `sourceCodeRepository` and `licenses` are
-    /// read by CodeArtifact out of a package's own metadata file (a `pom.xml`, a
-    /// `package.json`): a generic package has none, so they have no source here and are
-    /// omitted rather than invented.
+    /// `displayName` is DERIVED from the coordinate the version is stored under, by its
+    /// format's own display rule ([`package_display_name`]), so every described version
+    /// reports one.
+    ///
+    /// `licenses` is reported as the list it is, and the list is EMPTY: CodeArtifact reads
+    /// license data out of a package's own metadata file (a `pom.xml`, a `package.json`),
+    /// and the versions this service holds are published through `PublishPackageVersion`,
+    /// which takes generic assets carrying no such metadata. An absent list is not an
+    /// empty one — a client that iterates `licenses` must see "no licenses", not "no
+    /// information" — so the member is present whenever the version is described.
+    ///
+    /// `summary`, `homePage` and `sourceCodeRepository` are the other metadata-sourced
+    /// members, and they stay absent: they are single values with no source here, and
+    /// absent is exactly "this package version has no such value", which inventing a
+    /// string would not be.
     pub fn description(&self, package: &Package) -> PackageVersionDescription {
         PackageVersionDescription {
             format: Some(package.format.clone()),
             namespace: package.namespace.clone(),
             package_name: Some(package.name.clone()),
-            display_name: None,
+            display_name: Some(package_display_name(
+                &package.format,
+                package.namespace.as_deref(),
+                &package.name,
+            )),
             version: Some(self.version.clone()),
             summary: None,
             home_page: None,
             source_code_repository: None,
             published_time: Some(self.published_time.into()),
-            licenses: None,
+            licenses: Some(Vec::new()),
             revision: Some(self.revision()),
             status: Some(self.status.clone()),
             origin: Some(PackageVersionOrigin {
@@ -1433,6 +1568,22 @@ pub fn attached_policy(resource_arn: &str, document: String, attachment: u64) ->
     }
 }
 
+/// The `ResourcePolicy` a policy delete answers with for the resource `resource_arn`
+/// names: `removed` is the record the resource held, or `None` when it held no policy.
+///
+/// Removing a policy that is not there is the delete's goal already met, not a failure, so
+/// the answer is the bare `ResourcePolicy` ENVELOPE — `resourceArn` identifying the
+/// resource the request targeted, with no `revision` and no `document`, both of which the
+/// model leaves optional. Shared by the domain and the repository policy delete so the two
+/// cannot report "there was nothing to delete" differently.
+pub fn deleted_policy(resource_arn: &str, removed: Option<ResourcePolicy>) -> ResourcePolicy {
+    removed.unwrap_or_else(|| ResourcePolicy {
+        resource_arn: Some(resource_arn.to_string()),
+        revision: None,
+        document: None,
+    })
+}
+
 /// The revision a resource policy carries once it is written.
 ///
 /// Derived from the resource the policy hangs off, the document being written and
@@ -1583,6 +1734,68 @@ pub fn package_group_not_found_message(
     )
 }
 
+/// The `ResourceNotFoundException` message `DescribePackageVersion` states for a
+/// COORDINATE the addressed repository holds no version of.
+///
+/// A package version is addressed by its whole `(format, namespace, package, version)`
+/// coordinate and a package exists in a repository only through its versions, so this is
+/// the sentence for "nothing is published at this coordinate": it names the format, the
+/// package, its namespace and the repository the version was looked for in. The namespace
+/// clause appears only where the request carried one, since a format whose versions carry
+/// no namespace component has none to name. Distinct from
+/// [`package_not_found_message`], which is the sentence the PACKAGE-scoped operations
+/// state for a package name the repository does not hold at all.
+pub fn package_coordinate_not_found_message(
+    format: &str,
+    namespace: Option<&str>,
+    package: &str,
+    repository: &str,
+) -> String {
+    match namespace {
+        Some(namespace) => format!(
+            "The {format} package '{package}' with namespace '{namespace}' does not exist in \
+             repository '{repository}'."
+        ),
+        None => format!(
+            "The {format} package '{package}' does not exist in repository '{repository}'."
+        ),
+    }
+}
+
+/// The `resourceId` an error reports for a PACKAGE VERSION: its fully-qualified identity
+/// inside the repository, `<namespace>/<package>/<version>`.
+///
+/// A version string alone does not identify anything — two conflicts on different packages
+/// would report the same `1.0.0` — so the id carries the whole coordinate a client would
+/// have to feed back to address this version. The namespace segment is present exactly
+/// when the request carried one; no component can contain `/` (`PackageNamespace`,
+/// `PackageName` and `PackageVersion` are all modelled `^[^#/\s]+$`), so the identity
+/// parses back unambiguously.
+#[must_use]
+pub fn package_version_resource_id(
+    namespace: Option<&str>,
+    package: &str,
+    version: &str,
+) -> String {
+    match namespace {
+        Some(namespace) => format!("{namespace}/{package}/{version}"),
+        None => format!("{package}/{version}"),
+    }
+}
+
+/// The `ResourceNotFoundException` message for a package the addressed repository does not
+/// hold. A package is addressed by its whole `(format, namespace, name)` triple, so the
+/// sentence quotes the name the request asked for and the repository it asked in.
+pub fn package_not_found_message(package: &str, repository: &str) -> String {
+    format!("Package {package} not found in repository {repository}.")
+}
+
+/// The `ResourceNotFoundException` message for a version the addressed package does not
+/// hold, and the `errorMessage` of a `NOT_FOUND` entry in a per-version answer map.
+pub fn package_version_not_found_message(package: &str, version: &str, repository: &str) -> String {
+    format!("Package version {package} {version} not found in repository {repository}.")
+}
+
 /// The `ConflictException` message for a create whose package-group pattern is already
 /// held in the addressed domain.
 pub fn package_group_already_exists_message(
@@ -1591,6 +1804,58 @@ pub fn package_group_already_exists_message(
     package_group: &str,
 ) -> String {
     format!("Package group '{package_group}' in domain '{domain}' owned by '{owner}' already exists.")
+}
+
+/// The `ValidationExceptionReason` a refused member carries: the request reached the
+/// service and one of its fields failed a rule the model cannot express.
+pub const VALIDATION_REASON_FIELD_FAILED: &str = "FIELD_VALIDATION_FAILED";
+
+/// The `ValidationException` message for ONE input member that failed a constraint this
+/// service enforces itself.
+///
+/// AWS states every member-level constraint failure in one envelope — `N validation
+/// error(s) detected: Value '<value>' at '<member path>' failed to satisfy constraint:
+/// <requirement>` — and does not change envelope because the constraint happens to be one
+/// the Smithy model cannot express: clients and operators parse that form to attribute a
+/// failure to a specific member. The framework renders exactly this envelope for a
+/// MODELLED constraint (`aws_smithy_schema_server::envelope` over its own `Violation`s,
+/// which this service's `override_refusal` delegates to), but its `ViolationKind` is
+/// `#[non_exhaustive]` and spells only the modelled requirements, so a service-enforced
+/// requirement is composed here instead — in the one place every handler reaches for it,
+/// so the two cannot word the same refusal differently.
+pub fn constraint_violation_message(member: &str, value: &str, requirement: &str) -> String {
+    format!(
+        "1 validation error detected: Value '{value}' at '{member}' failed to satisfy \
+         constraint: {requirement}"
+    )
+}
+
+/// The requirement a `PackageGroupPattern` that is not a path from the domain root failed.
+///
+/// `PackageGroupPattern` is modelled with length bounds only (len 2..520), so the boundary
+/// validator admits any string of that length; a package group's identifier is a PATH from
+/// the domain root, which is what makes `/*` the ancestor of `/npm/*`, so the leading `/`
+/// is a constraint this service enforces.
+const PACKAGE_GROUP_PATTERN_REQUIREMENT: &str = "Pattern must start with '/'.";
+
+/// The refusal a caller-supplied `packageGroup` owes when it is not a path from the domain
+/// root, or `None` when it is one.
+///
+/// Decided here rather than per handler: every operation that takes a `packageGroup`
+/// accepts the same identifier, so a value no package group can ever have is the same bad
+/// REQUEST at each of them — never a lookup that happens to miss.
+pub fn package_group_pattern_refusal(pattern: &str) -> Option<ValidationException> {
+    if pattern.starts_with('/') {
+        return None;
+    }
+    Some(ValidationException {
+        message: constraint_violation_message(
+            "packageGroup",
+            pattern,
+            PACKAGE_GROUP_PATTERN_REQUIREMENT,
+        ),
+        reason: Some(VALIDATION_REASON_FIELD_FAILED.to_string()),
+    })
 }
 
 /// The ARN of a package group:

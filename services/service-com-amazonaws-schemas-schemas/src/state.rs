@@ -137,19 +137,487 @@ pub struct ResourcePolicy {
 /// point `tests/all/resource_policy.rs` pins holds for every form a policy actually
 /// carries).
 ///
-/// `Err` carries what made the value unreadable, for a value that is not JSON at all.
+/// `Err` carries what made the value unreadable, for a value that is not JSON at
+/// all — the service's own diagnostic for an unreadable body, as
+/// [`json_parse_detail`] builds it.
 pub fn canonical_json(document: &str) -> Result<String, String> {
     let mut encoded: Vec<u8> = Vec::with_capacity(document.len());
     let mut reader = ::serde_json::Deserializer::from_str(document);
     {
         let mut writer = ::serde_json::Serializer::new(&mut encoded);
         ::serde_transcode::transcode(&mut reader, &mut writer)
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| json_parse_detail(document, &error))?;
     }
     // One document, not a stream of them: anything after the first value makes the
     // value unreadable rather than being silently dropped.
-    reader.end().map_err(|error| error.to_string())?;
+    reader
+        .end()
+        .map_err(|error| json_parse_detail(document, &error))?;
     String::from_utf8(encoded).map_err(|error| error.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Where a JSON body stops being JSON
+//
+// Every refusal this service gives for a body it could not read — `CreateSchema`'s
+// and `UpdateSchema`'s `Content`, `PutResourcePolicy`'s `Policy` — says WHERE the
+// body stopped being JSON, and says it the way the service does: by naming the
+// OFFENDING CHARACTER, what was being read when the parser reached it, and that
+// character's BYTE OFFSET into the body the caller sent
+// (`invalid character 'o' in literal null (expecting 'u') at offset 2`).
+//
+// The OFFSET is the count of bytes the parser had consumed when it reached the
+// offending character — so the 1-based byte position of that character, which is what
+// the recorded refusals report: the instance above names the second byte of its body
+// as `offset 2`.
+//
+// The offset is the only part of such a refusal that tells a client WHERE in its own
+// document the defect is, and a byte position in the submitted bytes stays meaningful
+// whatever shape the document has — one line or a thousand. `serde_json`, the parser
+// this emulator reads JSON with, reports a LINE and COLUMN in its own vocabulary
+// instead (`expected ident at line 1 column 2`): a different coordinate system,
+// naming a different place in any multi-line document, in words no client of this API
+// is written against. So `serde_json` stays what decides whether a body is VALID
+// JSON, and the position and wording a refusal carries are produced here.
+//
+// The scan below walks the bytes with an explicit stack rather than by recursion: a
+// body is bounded (`Content` is modelled at most 100000 bytes) but its NESTING is
+// not, and a hundred thousand open brackets must not be able to exhaust the stack.
+// ---------------------------------------------------------------------------
+
+/// Where a JSON document stops being JSON, as a refusal reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JsonFault {
+    /// The offset the refusal reports: the number of bytes read when the offending
+    /// character was reached, which is that character's 1-based byte position in the
+    /// document. `None` where the document simply ran out: then there is no character
+    /// to point a client at.
+    pub offset: Option<usize>,
+    /// What was wrong there: the offending character and what was being read.
+    pub detail: String,
+}
+
+impl ::std::fmt::Display for JsonFault {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        match self.offset {
+            Some(offset) => write!(f, "{} at offset {offset}", self.detail),
+            None => write!(f, "{}", self.detail),
+        }
+    }
+}
+
+/// What this service says about a body `serde_json` refused: the offending character
+/// and its byte offset, as [`json_fault`] finds them.
+///
+/// `serde_json` decides VALIDITY; this decides the wording. Where the scan finds no
+/// fault at all the document is one well-formed JSON value that `serde_json` still
+/// refused — it holds itself to a nesting limit this scan does not — so the position
+/// `serde_json` names is converted to a byte offset in the same coordinates and
+/// reported without its line/column vocabulary.
+pub fn json_parse_detail(document: &str, error: &::serde_json::Error) -> String {
+    match json_fault(document) {
+        Some(fault) => fault.to_string(),
+        None => format!(
+            "invalid JSON at offset {}",
+            byte_offset_of(document, error.line(), error.column()).saturating_add(1)
+        ),
+    }
+}
+
+/// The 0-based byte index a `serde_json` position names: its `line` is counted from 1
+/// and its `column` is the 1-based position within that line.
+fn byte_offset_of(document: &str, line: usize, column: usize) -> usize {
+    let mut offset = 0usize;
+    for (number, text) in document.split_inclusive('\n').enumerate() {
+        if number + 1 == line {
+            return (offset + column.saturating_sub(1)).min(document.len());
+        }
+        offset += text.len();
+    }
+    document.len()
+}
+
+/// Scan `document` as ONE JSON value and report where it stops being JSON, or `None`
+/// where it is a well-formed JSON document with nothing after it.
+///
+/// The grammar is RFC 8259's: one value, with insignificant whitespace around it and
+/// nothing following it. What this reports about a document it refuses is the
+/// offending character, what was being read, and the character's byte offset.
+pub fn json_fault(document: &str) -> Option<JsonFault> {
+    JsonScan {
+        bytes: document.as_bytes(),
+        at: 0,
+    }
+    .fault()
+}
+
+/// Which container the scan is inside, so the character that may follow a value is
+/// known: a `,` and the container's own closing bracket, and after a `,` in an object
+/// another member.
+#[derive(Debug, Clone, Copy)]
+enum JsonFrame {
+    Array,
+    Object,
+}
+
+/// The scan: a cursor over the document's bytes.
+///
+/// Bytes, not characters: a refusal names the offending BYTE's offset, and a
+/// multi-byte character that cannot start a JSON value is reported by its leading
+/// byte the same way a parser reading octets reports it.
+struct JsonScan<'a> {
+    bytes: &'a [u8],
+    at: usize,
+}
+
+impl JsonScan<'_> {
+    /// The byte at the cursor, without consuming it.
+    fn peek(&self) -> Option<u8> {
+        self.bytes.get(self.at).copied()
+    }
+
+    /// Consume the byte at the cursor.
+    fn bump(&mut self) -> Option<u8> {
+        let byte = self.peek();
+        if byte.is_some() {
+            self.at += 1;
+        }
+        byte
+    }
+
+    /// Skip the whitespace JSON allows between tokens: space, tab, newline, carriage
+    /// return (RFC 8259, section 2).
+    fn skip_whitespace(&mut self) {
+        while matches!(self.peek(), Some(b' ' | b'\t' | b'\n' | b'\r')) {
+            self.at += 1;
+        }
+    }
+
+    /// A document that ran out before its value was complete. There is no offending
+    /// character, so no offset is reported.
+    fn truncated() -> JsonFault {
+        JsonFault {
+            offset: None,
+            detail: "unexpected end of JSON input".to_string(),
+        }
+    }
+
+    /// The character at byte index `index` cannot appear where the scan is: `reading`
+    /// says what was being read there.
+    ///
+    /// The offset the refusal reports is the number of bytes read to reach that
+    /// character — `index + 1` — which is the coordinate the service's refusals are
+    /// recorded in.
+    fn invalid(index: usize, byte: u8, reading: &str) -> JsonFault {
+        JsonFault {
+            offset: Some(index.saturating_add(1)),
+            detail: format!("invalid character {} {reading}", quoted_byte(byte)),
+        }
+    }
+
+    /// Walk the whole document; `None` when it is one well-formed JSON value.
+    fn fault(&mut self) -> Option<JsonFault> {
+        let mut stack: Vec<JsonFrame> = Vec::new();
+        'value: loop {
+            // A value is expected here: the start of the document, an element after a
+            // `,` in an array, or a member's value after a `:` in an object.
+            self.skip_whitespace();
+            let offset = self.at;
+            // Nothing where a value must be: the document ran out (or holds only
+            // whitespace), which is not a JSON document.
+            let Some(byte) = self.peek() else {
+                return Some(Self::truncated());
+            };
+            match byte {
+                b'{' => {
+                    self.at += 1;
+                    self.skip_whitespace();
+                    if self.peek() == Some(b'}') {
+                        // The empty object: complete, with no member to read.
+                        self.at += 1;
+                    } else {
+                        stack.push(JsonFrame::Object);
+                        if let Some(fault) = self.member_name() {
+                            return Some(fault);
+                        }
+                        continue 'value;
+                    }
+                }
+                b'[' => {
+                    self.at += 1;
+                    self.skip_whitespace();
+                    if self.peek() == Some(b']') {
+                        self.at += 1;
+                    } else {
+                        stack.push(JsonFrame::Array);
+                        continue 'value;
+                    }
+                }
+                b'"' => {
+                    if let Some(fault) = self.string() {
+                        return Some(fault);
+                    }
+                }
+                b't' => {
+                    if let Some(fault) = self.literal("true") {
+                        return Some(fault);
+                    }
+                }
+                b'f' => {
+                    if let Some(fault) = self.literal("false") {
+                        return Some(fault);
+                    }
+                }
+                b'n' => {
+                    if let Some(fault) = self.literal("null") {
+                        return Some(fault);
+                    }
+                }
+                b'-' | b'0'..=b'9' => {
+                    if let Some(fault) = self.number() {
+                        return Some(fault);
+                    }
+                }
+                other => {
+                    return Some(Self::invalid(
+                        offset,
+                        other,
+                        "looking for beginning of value",
+                    ))
+                }
+            }
+
+            // One value is complete. What may follow it depends on what encloses it,
+            // and a closing bracket completes the enclosing value in turn.
+            loop {
+                match stack.last().copied() {
+                    None => {
+                        // The document's one value is complete: only whitespace may
+                        // follow it.
+                        self.skip_whitespace();
+                        let offset = self.at;
+                        return self
+                            .peek()
+                            .map(|byte| Self::invalid(offset, byte, "after top-level value"));
+                    }
+                    Some(JsonFrame::Array) => {
+                        self.skip_whitespace();
+                        let offset = self.at;
+                        match self.bump() {
+                            None => return Some(Self::truncated()),
+                            Some(b',') => continue 'value,
+                            Some(b']') => {
+                                stack.pop();
+                            }
+                            Some(byte) => {
+                                return Some(Self::invalid(offset, byte, "after array element"))
+                            }
+                        }
+                    }
+                    Some(JsonFrame::Object) => {
+                        self.skip_whitespace();
+                        let offset = self.at;
+                        match self.bump() {
+                            None => return Some(Self::truncated()),
+                            Some(b',') => {
+                                if let Some(fault) = self.member_name() {
+                                    return Some(fault);
+                                }
+                                continue 'value;
+                            }
+                            Some(b'}') => {
+                                stack.pop();
+                            }
+                            Some(byte) => {
+                                return Some(Self::invalid(
+                                    offset,
+                                    byte,
+                                    "after object key:value pair",
+                                ))
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// An object member's name and the `:` that separates it from its value.
+    fn member_name(&mut self) -> Option<JsonFault> {
+        self.skip_whitespace();
+        let offset = self.at;
+        match self.peek() {
+            None => return Some(Self::truncated()),
+            Some(b'"') => {
+                if let Some(fault) = self.string() {
+                    return Some(fault);
+                }
+            }
+            Some(byte) => {
+                return Some(Self::invalid(
+                    offset,
+                    byte,
+                    "looking for beginning of object key string",
+                ))
+            }
+        }
+        self.skip_whitespace();
+        let offset = self.at;
+        match self.bump() {
+            None => Some(Self::truncated()),
+            Some(b':') => None,
+            Some(byte) => Some(Self::invalid(offset, byte, "after object key")),
+        }
+    }
+
+    /// A string, from the opening quote at the cursor to its closing quote, including
+    /// the escapes RFC 8259 section 7 allows.
+    fn string(&mut self) -> Option<JsonFault> {
+        // The opening quote is what selected this scan.
+        self.at += 1;
+        loop {
+            let offset = self.at;
+            match self.bump() {
+                None => return Some(Self::truncated()),
+                Some(b'"') => return None,
+                Some(b'\\') => {
+                    let offset = self.at;
+                    match self.bump() {
+                        None => return Some(Self::truncated()),
+                        Some(b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't') => {}
+                        Some(b'u') => {
+                            // `\uXXXX`: exactly four hexadecimal digits.
+                            for _ in 0..4 {
+                                let offset = self.at;
+                                match self.bump() {
+                                    None => return Some(Self::truncated()),
+                                    Some(byte) if byte.is_ascii_hexdigit() => {}
+                                    Some(byte) => {
+                                        return Some(Self::invalid(
+                                            offset,
+                                            byte,
+                                            "in \\u hexadecimal character escape",
+                                        ))
+                                    }
+                                }
+                            }
+                        }
+                        Some(byte) => {
+                            return Some(Self::invalid(offset, byte, "in string escape code"))
+                        }
+                    }
+                }
+                // A control character has to be escaped to appear in a string.
+                Some(byte) if byte < 0x20 => {
+                    return Some(Self::invalid(offset, byte, "in string literal"))
+                }
+                Some(_) => {}
+            }
+        }
+    }
+
+    /// One of the three literals, whose first byte the cursor is on: the rest of it
+    /// must follow exactly.
+    fn literal(&mut self, literal: &str) -> Option<JsonFault> {
+        self.at += 1;
+        for expected in &literal.as_bytes()[1..] {
+            let offset = self.at;
+            match self.bump() {
+                None => return Some(Self::truncated()),
+                Some(byte) if byte == *expected => {}
+                Some(byte) => {
+                    return Some(Self::invalid(
+                        offset,
+                        byte,
+                        &format!("in literal {literal} (expecting '{}')", *expected as char),
+                    ))
+                }
+            }
+        }
+        None
+    }
+
+    /// A number: an optional `-`, an integer part, an optional fraction and an
+    /// optional exponent (RFC 8259, section 6).
+    ///
+    /// A number ENDS at the first byte that cannot continue it, which is not an error
+    /// here: whether that byte may follow a value is decided by what encloses the
+    /// number, so `01` at the top level is reported as a character after a complete
+    /// value rather than as a bad number.
+    fn number(&mut self) -> Option<JsonFault> {
+        if self.peek() == Some(b'-') {
+            self.at += 1;
+        }
+        let offset = self.at;
+        match self.bump() {
+            None => return Some(Self::truncated()),
+            // A leading zero is the whole integer part: `01` is not a JSON number.
+            Some(b'0') => {}
+            Some(byte) if byte.is_ascii_digit() => self.skip_digits(),
+            Some(byte) => return Some(Self::invalid(offset, byte, "in numeric literal")),
+        }
+        if self.peek() == Some(b'.') {
+            self.at += 1;
+            let offset = self.at;
+            match self.bump() {
+                None => return Some(Self::truncated()),
+                Some(byte) if byte.is_ascii_digit() => self.skip_digits(),
+                Some(byte) => {
+                    return Some(Self::invalid(
+                        offset,
+                        byte,
+                        "after decimal point in numeric literal",
+                    ))
+                }
+            }
+        }
+        if matches!(self.peek(), Some(b'e' | b'E')) {
+            self.at += 1;
+            if matches!(self.peek(), Some(b'+' | b'-')) {
+                self.at += 1;
+            }
+            let offset = self.at;
+            match self.bump() {
+                None => return Some(Self::truncated()),
+                Some(byte) if byte.is_ascii_digit() => self.skip_digits(),
+                Some(byte) => {
+                    return Some(Self::invalid(
+                        offset,
+                        byte,
+                        "in exponent of numeric literal",
+                    ))
+                }
+            }
+        }
+        None
+    }
+
+    /// Consume the digits that continue a number.
+    fn skip_digits(&mut self) {
+        while self.peek().is_some_and(|byte| byte.is_ascii_digit()) {
+            self.at += 1;
+        }
+    }
+}
+
+/// One byte as a refusal names it: printable ASCII as itself, and anything else by
+/// the escape that stands for it, so a refusal stays one line of text whatever byte
+/// it is about.
+fn quoted_byte(byte: u8) -> String {
+    let escaped = match byte {
+        b'\'' => "\\'",
+        b'\\' => "\\\\",
+        0x07 => "\\a",
+        0x08 => "\\b",
+        0x09 => "\\t",
+        0x0a => "\\n",
+        0x0b => "\\v",
+        0x0c => "\\f",
+        0x0d => "\\r",
+        0x20..=0x7e => return format!("'{}'", byte as char),
+        _ => return format!("'\\x{byte:02x}'"),
+    };
+    format!("'{escaped}'")
 }
 
 impl Registry {
@@ -166,13 +634,33 @@ impl Registry {
         }
     }
 
-    /// The ARN one of this registry's schemas reports, for the same reason as
-    /// [`Registry::arn_in`].
-    pub fn schema_arn_in(&self, region: &str, schema: &Schema) -> String {
+    /// The ARN one of this registry's schemas reports, or `None` for a schema that has
+    /// none.
+    ///
+    /// A schema a caller created IS a customer resource: it was minted by a request, it
+    /// can be tagged and named in a policy, and it reports the ARN that create stored.
+    /// A schema of a service-owned registry is not — AWS publishes it, no account owns
+    /// it, and no `TagResource` or policy call accepts an identifier for it — so it
+    /// carries no ARN at all. Reporting one would hand a client a resource identifier
+    /// the service never issued.
+    ///
+    /// The `region` argument is kept so a future service-owned resource that DOES carry
+    /// a regional ARN can be rendered here beside a caller's; nothing needs it today.
+    pub fn schema_arn_in(&self, _region: &str, schema: &Schema) -> Option<String> {
         match self.scope {
-            RegistryScope::Local => schema.arn.clone(),
-            RegistryScope::Aws => schema_arn(region, &self.name, &schema.name),
+            RegistryScope::Local => Some(schema.arn.clone()),
+            RegistryScope::Aws => None,
         }
+    }
+
+    /// The `SchemaArn` a single-schema response reports: the schema's ARN, or the empty
+    /// string for a schema that has none ([`Registry::schema_arn_in`]).
+    ///
+    /// `DescribeSchema` and `ExportSchema` answer ABOUT one schema and always carry the
+    /// member; a schema with no ARN reports it empty. A listing's SUMMARY leaves the
+    /// member out instead, because a summary carries only the members a schema has.
+    pub fn reported_schema_arn_in(&self, region: &str, schema: &Schema) -> String {
+        self.schema_arn_in(region, schema).unwrap_or_default()
     }
 }
 
@@ -372,8 +860,9 @@ impl Schema {
 }
 
 /// The SERVICE-SPECIFIC event types the service-owned catalogue holds a schema for:
-/// the events an AWS service publishes beyond the API-call event every source
-/// publishes (which [`AWS_EVENT_SOURCES`] carries instead, one per source).
+/// the events an AWS service publishes beyond the CloudTrail-delivered family every
+/// source publishes (which [`CLOUD_TRAIL_EVENT_FAMILY`] carries instead, one entry per
+/// source per kind of CloudTrail record).
 ///
 /// Source: the `detail` of each event as AWS documents it (the EventBridge event
 /// reference for the publishing service); the `detail_type` is the `detail-type`
@@ -446,7 +935,119 @@ pub const AWS_SERVICE_EVENT_TYPES: &[ManagedEventType] = &[
         event_name: "TagChangeonResource",
         components: r##"{"TagChangeonResource":{"type":"object","required":["changed-tag-keys","resource-type","service","version"],"properties":{"changed-tag-keys":{"type":"array","items":{"type":"string"}},"resource-type":{"type":"string"},"service":{"type":"string"},"tags":{"type":"object"},"version":{"type":"integer"}}}}"##,
     },
+    ManagedEventType {
+        source: "aws.acm",
+        detail_type: "ACM Certificate Available",
+        event_name: "ACMCertificateAvailable",
+        components: r##"{"ACMCertificateAvailable":{"type":"object","required":["Action","CertificateType","CommonName"],"properties":{"Action":{"type":"string"},"CertificateType":{"type":"string"},"CommonName":{"type":"string"},"DomainValidationMethod":{"type":"string"}}}}"##,
+    },
+    // The event types below are published by the catalogue with their identity (the
+    // source and the `detail-type` EventBridge delivers them under) but with an
+    // unconstrained `detail`: AWS documents that these events exist, not the members
+    // their `detail` carries. [`UNDOCUMENTED_DETAIL`] says what that means for a
+    // reader.
+    ManagedEventType {
+        source: "aws.a4b",
+        detail_type: "Room State Change",
+        event_name: "RoomStateChange",
+        components: UNDOCUMENTED_DETAIL,
+    },
+    ManagedEventType {
+        source: "aws.a4b",
+        detail_type: "Room Device Calendar Error Status",
+        event_name: "RoomDeviceCalendarErrorStatus",
+        components: UNDOCUMENTED_DETAIL,
+    },
+    ManagedEventType {
+        source: "aws.act",
+        detail_type: "Trust Bundle Association Version Updated",
+        event_name: "TrustBundleAssociationVersionUpdated",
+        components: UNDOCUMENTED_DETAIL,
+    },
+    ManagedEventType {
+        source: "aws.events",
+        detail_type: "API Destination Activated",
+        event_name: "APIDestinationActivated",
+        components: UNDOCUMENTED_DETAIL,
+    },
+    ManagedEventType {
+        source: "aws.events",
+        detail_type: "API Destination Deactivated",
+        event_name: "APIDestinationDeactivated",
+        components: UNDOCUMENTED_DETAIL,
+    },
+    ManagedEventType {
+        source: "aws.events",
+        detail_type: "Connection Activated",
+        event_name: "ConnectionActivated",
+        components: UNDOCUMENTED_DETAIL,
+    },
+    ManagedEventType {
+        source: "aws.events",
+        detail_type: "Connection Authorization Started",
+        event_name: "ConnectionAuthorizationStarted",
+        components: UNDOCUMENTED_DETAIL,
+    },
+    ManagedEventType {
+        source: "aws.events",
+        detail_type: "Connection Deactivated",
+        event_name: "ConnectionDeactivated",
+        components: UNDOCUMENTED_DETAIL,
+    },
+    ManagedEventType {
+        source: "aws.events",
+        detail_type: "Connection Deauthorization Started",
+        event_name: "ConnectionDeauthorizationStarted",
+        components: UNDOCUMENTED_DETAIL,
+    },
 ];
+
+/// The `components.schemas` of an event type whose `detail` AWS publishes no member
+/// list for: one component, named after the event type, constrained only to be an
+/// object.
+///
+/// The catalogue's membership and an event's identity are what a discovery flow reads
+/// (which event types exist, under which names, published by which source and
+/// `detail-type`); the members of a `detail` AWS does not document cannot be invented
+/// here, and a document that named members the real event does not carry would make a
+/// generated model reject real events. So the component says exactly what is known:
+/// the `detail` is a JSON object.
+const UNDOCUMENTED_DETAIL: &str = r##"{"{EventName}":{"type":"object"}}"##;
+
+/// The token a components template carries where the event type's own component name
+/// goes, substituted by [`ManagedEventType::components_json`].
+///
+/// A template rather than a literal name, because one template serves a whole FAMILY
+/// of event types: every CloudTrail-delivered event carries a CloudTrail record as its
+/// `detail`, and each of them is published under its own component name.
+const EVENT_COMPONENT_PLACEHOLDER: &str = "{EventName}";
+
+/// How many versions the AWS-managed catalogue publishes for a schema, where it
+/// publishes more than one.
+///
+/// `VersionCount` is "the number of versions available for the schema" — a property of
+/// the PUBLISHED schema, not of this process: AWS has revised some of its event schemas
+/// and still serves the earlier revisions, so a client that pins a version has one to
+/// pin. The count is therefore catalogue data, seeded like a schema's name and its
+/// document, and [`aws_managed_registries`] seeds exactly this many versions so the
+/// count a listing reports stays what the store actually holds.
+///
+/// Source: the counts AWS reports for these entries. Anything not named here is
+/// published at one version, which is the catalogue's norm.
+const MANAGED_VERSION_COUNTS: &[(&str, u64)] = &[
+    ("aws.a4b@RoomStateChange", 3),
+    ("aws.acm@ACMCertificateAvailable", 3),
+];
+
+/// The number of versions the catalogue publishes for the schema named — see
+/// [`MANAGED_VERSION_COUNTS`]. Never zero: a schema with no version could not be
+/// described at all.
+pub fn managed_version_count(schema_name: &str) -> u64 {
+    MANAGED_VERSION_COUNTS
+        .iter()
+        .find(|(name, _)| *name == schema_name)
+        .map_or(1, |(_, count)| *count)
+}
 
 /// The `Type` every schema of the service-owned catalogue is stored as: AWS stores its
 /// event schemas as OpenAPI 3 documents, and `ExportSchema` is what converts one to
@@ -480,26 +1081,86 @@ pub const CLOUD_TRAIL_EVENT_NAME: &str = "AWSAPICallviaCloudTrail";
 /// The `detail-type` EventBridge delivers a CloudTrail-recorded API call under.
 pub const CLOUD_TRAIL_DETAIL_TYPE: &str = "AWS API Call via CloudTrail";
 
-/// The `components.schemas` of the `AWSAPICallviaCloudTrail` document, excluding the
-/// envelope [`event_schema_document`] renders around them.
+/// The CloudTrail-delivered event family every AWS event source publishes, as
+/// `(detail-type, EventName)` pairs.
+///
+/// CloudTrail records more than API calls, and EventBridge delivers each KIND of record
+/// under its own `detail-type`: a console action, a console sign-in, an Insights event,
+/// a network-activity event and a service event beside the API call itself. The
+/// catalogue holds one schema per kind per source, so a source's entries are this whole
+/// family, not the API call alone.
+///
+/// The `detail` of every one of them IS a CloudTrail record, whose contents are the
+/// same whichever kind it records (CloudTrail User Guide, "CloudTrail record
+/// contents"), so one components template ([`CLOUD_TRAIL_COMPONENTS`]) serves the whole
+/// family — published under each event's own component name.
+///
+/// The `EventName` beside each `detail-type` is that detail-type with its spaces taken
+/// out, which is how the catalogue derives a schema's name; the pairs are written out
+/// rather than computed so the published spelling (AWS's own lower-case `via`) is the
+/// one in the table, and `the_cloud_trail_family_is_named_after_its_detail_types` below
+/// holds the two to that rule.
+pub const CLOUD_TRAIL_EVENT_FAMILY: &[(&str, &str)] = &[
+    (CLOUD_TRAIL_DETAIL_TYPE, CLOUD_TRAIL_EVENT_NAME),
+    (
+        "AWS Console Action via CloudTrail",
+        "AWSConsoleActionviaCloudTrail",
+    ),
+    (
+        "AWS Console Sign In via CloudTrail",
+        "AWSConsoleSignInviaCloudTrail",
+    ),
+    ("AWS Insight via CloudTrail", "AWSInsightviaCloudTrail"),
+    (
+        "AWS Network Activity Event via CloudTrail",
+        "AWSNetworkActivityEventviaCloudTrail",
+    ),
+    (
+        "AWS Service Event via CloudTrail",
+        "AWSServiceEventviaCloudTrail",
+    ),
+];
+
+/// The `components.schemas` of a CloudTrail-delivered event's document, excluding the
+/// envelope [`event_schema_document`] renders around them. The record component is
+/// named by [`EVENT_COMPONENT_PLACEHOLDER`], because the same record is published under
+/// each member of [`CLOUD_TRAIL_EVENT_FAMILY`].
 ///
 /// Source: the CloudTrail record contents AWS documents (CloudTrail User Guide,
-/// "CloudTrail record contents") — the `detail` of an `AWS API Call via CloudTrail`
-/// event IS a CloudTrail record, and the record's shape is the same for every event
-/// source, which is why one template serves all of [`AWS_EVENT_SOURCES`]. The nested
-/// `userIdentity`/`sessionContext`/`resources` structures are components of their own,
-/// as the document's `$ref`s name them.
+/// "CloudTrail record contents") — the `detail` of a CloudTrail-delivered event IS a
+/// CloudTrail record, and the record's contents are the same for every event source and
+/// every record kind, which is why one template serves all of [`AWS_EVENT_SOURCES`].
+/// The nested `userIdentity`/`sessionContext`/`resources` structures are components of
+/// their own, as the document's `$ref`s name them.
+///
+/// The members CloudTrail fills only for some records (the free-form
+/// `requestParameters`/`responseElements`/`additionalEventData` objects, the `addendum`
+/// a late-delivered record carries, the TLS, Insights and edge-device details) are
+/// marked `nullable`, which is OpenAPI 3.0's way of saying the member may be present
+/// and null; `ExportSchema` lowers that to draft-04's type union.
 const CLOUD_TRAIL_COMPONENTS: &str = r##"{
-  "AWSAPICallviaCloudTrail": {
+  "{EventName}": {
     "type": "object",
     "required": [
       "eventID", "eventName", "eventSource", "eventTime", "eventVersion",
       "awsRegion", "recipientAccountId", "requestID", "userIdentity"
     ],
     "properties": {
-      "additionalEventData": {"type": "object"},
+      "addendum": {
+        "type": "object",
+        "nullable": true,
+        "properties": {
+          "originalEventID": {"type": "string"},
+          "originalRequestID": {"type": "string"},
+          "reason": {"type": "string"},
+          "updatedFields": {"type": "array", "items": {"type": "string"}}
+        }
+      },
+      "additionalEventData": {"type": "object", "nullable": true},
+      "annotation": {"type": "string"},
       "apiVersion": {"type": "string"},
       "awsRegion": {"type": "string"},
+      "edgeDeviceDetails": {"type": "object", "nullable": true},
       "errorCode": {"type": "string"},
       "errorMessage": {"type": "string"},
       "eventCategory": {"type": "string"},
@@ -509,21 +1170,33 @@ const CLOUD_TRAIL_COMPONENTS: &str = r##"{
       "eventTime": {"type": "string", "format": "date-time"},
       "eventType": {"type": "string"},
       "eventVersion": {"type": "string"},
+      "insightDetails": {"type": "object", "nullable": true},
       "managementEvent": {"type": "boolean"},
       "readOnly": {"type": "boolean"},
       "recipientAccountId": {"type": "string"},
       "requestID": {"type": "string"},
-      "requestParameters": {"type": "object"},
+      "requestParameters": {"type": "object", "nullable": true},
       "resources": {
         "type": "array",
         "items": {"$ref": "#/components/schemas/CloudTrailResource"}
       },
-      "responseElements": {"type": "object"},
-      "serviceEventDetails": {"type": "object"},
+      "responseElements": {"type": "object", "nullable": true},
+      "serviceEventDetails": {"type": "object", "nullable": true},
+      "sessionCredentialFromConsole": {"type": "string"},
       "sharedEventID": {"type": "string"},
       "sourceIPAddress": {"type": "string"},
+      "tlsDetails": {
+        "type": "object",
+        "nullable": true,
+        "properties": {
+          "cipherSuite": {"type": "string"},
+          "clientProvidedHostHeader": {"type": "string"},
+          "tlsVersion": {"type": "string"}
+        }
+      },
       "userAgent": {"type": "string"},
       "userIdentity": {"$ref": "#/components/schemas/CloudTrailUserIdentity"},
+      "vpcEndpointAccountId": {"type": "string"},
       "vpcEndpointId": {"type": "string"}
     }
   },
@@ -541,7 +1214,16 @@ const CLOUD_TRAIL_COMPONENTS: &str = r##"{
       "accessKeyId": {"type": "string"},
       "accountId": {"type": "string"},
       "arn": {"type": "string"},
+      "credentialId": {"type": "string"},
       "invokedBy": {"type": "string"},
+      "onBehalfOf": {
+        "type": "object",
+        "nullable": true,
+        "properties": {
+          "backTraceId": {"type": "string"},
+          "userId": {"type": "string"}
+        }
+      },
       "principalId": {"type": "string"},
       "sessionContext": {"$ref": "#/components/schemas/CloudTrailSessionContext"},
       "type": {"type": "string"},
@@ -552,8 +1234,10 @@ const CLOUD_TRAIL_COMPONENTS: &str = r##"{
     "type": "object",
     "properties": {
       "attributes": {"$ref": "#/components/schemas/CloudTrailSessionAttributes"},
+      "ec2RoleDelivery": {"type": "string"},
       "sessionIssuer": {"$ref": "#/components/schemas/CloudTrailSessionIssuer"},
-      "webIdFederationData": {"type": "object"}
+      "sourceIdentity": {"type": "string"},
+      "webIdFederationData": {"type": "object", "nullable": true}
     }
   },
   "CloudTrailSessionAttributes": {
@@ -579,9 +1263,9 @@ const CLOUD_TRAIL_COMPONENTS: &str = r##"{
 /// namespaces EventBridge delivers AWS service events under.
 ///
 /// Source: the event-source namespaces AWS publishes events under, one per service
-/// that records API calls in CloudTrail (EventBridge delivers those as the
-/// `AWS API Call via CloudTrail` detail-type, which is why every source below carries
-/// a [`CLOUD_TRAIL_EVENT_NAME`] schema in the catalogue). Kept in alphabetical order
+/// that records API calls in CloudTrail (EventBridge delivers those records under the
+/// detail-types of [`CLOUD_TRAIL_EVENT_FAMILY`], which is why every source below
+/// carries that whole family of schemas in the catalogue). Kept in alphabetical order
 /// for reading; the store sorts by name on its own, and a name repeated here seeds one
 /// schema, not two.
 pub const AWS_EVENT_SOURCES: &[&str] = &[
@@ -591,7 +1275,12 @@ pub const AWS_EVENT_SOURCES: &[&str] = &[
     "aws.account",
     "aws.acm",
     "aws.acm-pca",
+    "aws.act",
+    "aws.aidevops",
     "aws.airflow",
+    "aws.amazon.connect",
+    "aws.amazonmq",
+    "aws.amazonq",
     "aws.amplify",
     "aws.amplifybackend",
     "aws.amplifyuibuilder",
@@ -857,14 +1546,18 @@ pub struct ManagedEventType {
 }
 
 impl ManagedEventType {
-    /// The CloudTrail-delivered API-call event type of `source` — the one event type
+    /// One member of the CloudTrail-delivered event family of `source` — the family
     /// every AWS event source publishes, so it is rendered per source rather than
-    /// written out per source.
-    pub const fn cloud_trail(source: &'static str) -> Self {
+    /// written out per source. See [`CLOUD_TRAIL_EVENT_FAMILY`].
+    pub const fn cloud_trail(
+        source: &'static str,
+        detail_type: &'static str,
+        event_name: &'static str,
+    ) -> Self {
         Self {
             source,
-            detail_type: CLOUD_TRAIL_DETAIL_TYPE,
-            event_name: CLOUD_TRAIL_EVENT_NAME,
+            detail_type,
+            event_name,
             components: CLOUD_TRAIL_COMPONENTS,
         }
     }
@@ -873,6 +1566,14 @@ impl ManagedEventType {
     /// under, which is what `ListSchemas` reports and `DescribeSchema` takes.
     pub fn schema_name(&self) -> String {
         format!("{}@{}", self.source, self.event_name)
+    }
+
+    /// This event type's `components.schemas`, with the event's own component name
+    /// substituted for [`EVENT_COMPONENT_PLACEHOLDER`]: one template serves a whole
+    /// family of event types, each published under its own component name.
+    pub fn components_json(&self) -> String {
+        self.components
+            .replace(EVENT_COMPONENT_PLACEHOLDER, self.event_name)
     }
 
     /// This event type as the catalogue holds it. `None` when its document cannot be
@@ -885,8 +1586,10 @@ impl ManagedEventType {
                 self.source,
                 self.detail_type,
                 self.event_name,
-                self.components,
+                &self.components_json(),
             )?,
+            last_modified: managed_last_modified(&name),
+            version_count: managed_version_count(&name),
             name,
         })
     }
@@ -904,7 +1607,55 @@ pub struct ManagedSchema {
     /// The `OpenApi3` document of the event type, as `DescribeSchema` serves it and
     /// `ExportSchema` converts it.
     pub content: String,
+    /// When the published schema was last modified — see [`managed_last_modified`].
+    pub last_modified: SystemTime,
+    /// How many versions the catalogue publishes for it — see
+    /// [`managed_version_count`].
+    pub version_count: u64,
 }
+
+/// When the AWS-managed catalogue's entry named `schema_name` was last modified.
+///
+/// `LastModified` is "the date and time that schema was modified": a property of the
+/// PUBLISHED schema, which is what a client compares against its cached copy to decide
+/// whether that copy is stale. So what the member has to satisfy is that it is the
+/// SCHEMA's own instant — fixed, at whole-second precision, the same in every process
+/// and across every reset of this store, and distinct between schemas that were
+/// published at different times. A reading of the clock satisfies none of that: it
+/// makes every entry report the same instant, moves that instant on every boot, and so
+/// invalidates every client's cache on every run.
+///
+/// AWS publishes no rule for the instant itself, so it is derived from the one thing
+/// that identifies the schema and never changes — its name — by a stable digest, and
+/// placed in the window the catalogue has been maintained over ([`CATALOGUE_EPOCH`],
+/// [`CATALOGUE_SPAN`]). Derived, not stored: the catalogue is built from constants, so
+/// every process derives the same instant for the same name.
+pub fn managed_last_modified(schema_name: &str) -> SystemTime {
+    let digest = <::sha2::Sha256 as ::sha2::Digest>::digest(schema_name.as_bytes());
+    let mut offset = [0u8; 8];
+    offset.copy_from_slice(&digest[..8]);
+    let seconds = u64::from_be_bytes(offset) % CATALOGUE_SPAN_SECONDS;
+    SystemTime::UNIX_EPOCH + Duration::from_secs(CATALOGUE_EPOCH_SECONDS + seconds)
+}
+
+/// The start of the window the AWS-managed catalogue's publication instants fall in,
+/// in seconds since the Unix epoch: 2019-12-01T00:00:00Z, the month the EventBridge
+/// schema registry became available, so no entry claims to have been published before
+/// the registry existed.
+const CATALOGUE_EPOCH_SECONDS: u64 = 1_575_158_400;
+
+/// How wide that window is: six years of whole seconds, which is long enough that no
+/// two entries of a catalogue this size are forced onto the same instant and short
+/// enough that every instant in it is in the past.
+const CATALOGUE_SPAN_SECONDS: u64 = 6 * 365 * 24 * 60 * 60;
+
+/// How far apart the catalogue's versions of one schema are published.
+///
+/// AWS publishes no interval, so this span is the emulator's own: what the store owes
+/// is that version N of a schema was created before version N+1 and that the newest
+/// version's creation is the schema's `LastModified`, so the versions are laid out
+/// backwards from that instant, one month apart.
+const MANAGED_VERSION_INTERVAL: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
 /// The description a catalogue entry carries, derived from its name.
 ///
@@ -925,13 +1676,24 @@ pub fn managed_schema_description(schema_name: &str) -> Option<String> {
 /// The envelope is the same for every AWS event — the EventBridge event fields
 /// (`detail-type`, `source`, `time`, `region`, `account`, `id`, `resources`,
 /// `version`) with `detail` referencing the event-specific component — so it is
-/// rendered here rather than repeated per entry; `detail_type` and `source` are
-/// stamped on it as the `x-amazon-events-*` extensions AWS's documents carry.
+/// rendered here rather than repeated per entry.
+///
+/// The document's `info.title` is the sentence the catalogue titles a published event
+/// schema with: the event's `detail-type`, then which source publishes it
+/// (`AWS API Call via CloudTrail published by aws.events`). It names the EVENT, not the
+/// schema's component, so a client that renders the title shows the event the document
+/// describes; `ExportSchema` carries the same title onto the draft-04 translation.
+///
+/// The `x-amazon-events-detail-type` and `x-amazon-events-source` extensions AWS's
+/// documents carry are stamped on BOTH the envelope and the event's own component: they
+/// record which event the document is for, and that is what the registry indexes a
+/// schema under (see `SearchSchemas`), so they travel with the component a converted
+/// document keeps.
 ///
 /// `None` when `components` is not a JSON object, or does not define the component the
-/// envelope's `detail` must reference (the one named after the event): that is a
-/// document with nothing to describe, and the catalogue leaves it out rather than
-/// seeding a schema whose `detail` dangles.
+/// envelope's `detail` must reference (the one named after the event) as an object:
+/// that is a document with nothing to describe, and the catalogue leaves it out rather
+/// than seeding a schema whose `detail` dangles.
 fn event_schema_document(
     source: &str,
     detail_type: &str,
@@ -942,9 +1704,15 @@ fn event_schema_document(
         ::serde_json::Value::Object(schemas) => schemas,
         _ => return None,
     };
-    if !schemas.contains_key(event_name) {
-        return None;
-    }
+    let event = schemas.get_mut(event_name)?.as_object_mut()?;
+    event.insert(
+        "x-amazon-events-detail-type".to_string(),
+        ::serde_json::Value::String(detail_type.to_string()),
+    );
+    event.insert(
+        "x-amazon-events-source".to_string(),
+        ::serde_json::Value::String(source.to_string()),
+    );
     schemas.insert(
         EVENT_ENVELOPE_COMPONENT.to_string(),
         ::serde_json::json!({
@@ -970,23 +1738,39 @@ fn event_schema_document(
     );
     ::serde_json::to_string(&::serde_json::json!({
         "openapi": "3.0.0",
-        "info": {"version": "1.0.0", "title": event_name},
+        "info": {"version": "1.0.0", "title": managed_schema_title(source, detail_type)},
         "paths": {},
         "components": {"schemas": schemas}
     }))
     .ok()
 }
 
-/// Every event type the service-owned catalogue holds a schema for: the
-/// CloudTrail API-call event type of every source in [`AWS_EVENT_SOURCES`], followed
-/// by the service-specific event types in [`AWS_SERVICE_EVENT_TYPES`].
+/// The title the catalogue gives the document of one published event type:
+/// `<detail-type> published by <source>`.
+///
+/// Shared with `ExportSchema`, which reports the source document's title on the
+/// draft-04 translation it renders, so the two cannot drift.
+pub fn managed_schema_title(source: &str, detail_type: &str) -> String {
+    format!("{detail_type} published by {source}")
+}
+
+/// Every event type the service-owned catalogue holds a schema for: the whole
+/// CloudTrail-delivered event family ([`CLOUD_TRAIL_EVENT_FAMILY`]) of every source in
+/// [`AWS_EVENT_SOURCES`], followed by the service-specific event types in
+/// [`AWS_SERVICE_EVENT_TYPES`].
 ///
 /// The service-specific entries come last, so one of them wins over a generated entry
 /// of the same name: the store seeds entries in this order and keys them by name.
 pub fn aws_managed_event_types() -> Vec<ManagedEventType> {
     AWS_EVENT_SOURCES
         .iter()
-        .map(|source| ManagedEventType::cloud_trail(source))
+        .flat_map(|source| {
+            CLOUD_TRAIL_EVENT_FAMILY
+                .iter()
+                .map(move |(detail_type, event_name)| {
+                    ManagedEventType::cloud_trail(source, detail_type, event_name)
+                })
+        })
         .chain(AWS_SERVICE_EVENT_TYPES.iter().copied())
         .collect()
 }
@@ -1024,11 +1808,13 @@ pub fn aws_managed_schemas() -> &'static [ManagedSchema] {
 ///
 /// Their ARNs are left empty: a service-owned registry is minted by no request, so no
 /// request's region is stored for it, and [`Registry::arn_in`] derives the ARN from
-/// the region of the request asking.
+/// the region of the request asking. A service-owned SCHEMA carries no ARN at all —
+/// see [`Registry::schema_arn_in`].
+///
+/// Nothing here reads the clock: every instant a catalogue entry reports is the
+/// published schema's own, derived from its name ([`managed_last_modified`]), so two
+/// stores seeded at two different moments report the same catalogue.
 fn aws_managed_registries() -> BTreeMap<String, Registry> {
-    // One clock reading for the whole catalogue: it materialises with the store, in
-    // one instant, rather than one instant per entry.
-    let now = SystemTime::now();
     let mut registries: BTreeMap<String, Registry> = AWS_MANAGED_REGISTRIES
         .iter()
         .map(|name| {
@@ -1052,6 +1838,32 @@ fn aws_managed_registries() -> BTreeMap<String, Registry> {
         return registries;
     };
     for entry in aws_managed_schemas() {
+        // Every version the catalogue publishes is stored, so the `VersionCount` a
+        // listing reports is the count of versions this store actually holds and a
+        // client that pins one of them can read it. They are laid out backwards from
+        // the schema's last-modified instant: the newest version was created then, and
+        // each earlier one a [`MANAGED_VERSION_INTERVAL`] before its successor. The
+        // document is the one AWS publishes for the schema, which is the document of
+        // its newest version — AWS publishes no earlier revision of it, so an earlier
+        // version carries the same document rather than one invented here.
+        let versions: BTreeMap<u64, SchemaVersion> = (1..=entry.version_count.max(1))
+            .map(|version| {
+                let age = MANAGED_VERSION_INTERVAL * u32::try_from(entry.version_count - version)
+                    .unwrap_or(u32::MAX);
+                (
+                    version,
+                    SchemaVersion {
+                        version,
+                        content: entry.content.clone(),
+                        r#type: AWS_MANAGED_SCHEMA_TYPE.to_string(),
+                        created_date: entry
+                            .last_modified
+                            .checked_sub(age)
+                            .unwrap_or(entry.last_modified),
+                    },
+                )
+            })
+            .collect();
         registry.schemas.insert(
             entry.name.clone(),
             Schema {
@@ -1060,18 +1872,9 @@ fn aws_managed_registries() -> BTreeMap<String, Registry> {
                 description: entry.description.clone(),
                 r#type: AWS_MANAGED_SCHEMA_TYPE.to_string(),
                 tags: BTreeMap::new(),
-                latest_version: 1,
-                last_modified: now,
-                versions: ::std::iter::once((
-                    1,
-                    SchemaVersion {
-                        version: 1,
-                        content: entry.content.clone(),
-                        r#type: AWS_MANAGED_SCHEMA_TYPE.to_string(),
-                        created_date: now,
-                    },
-                ))
-                .collect(),
+                latest_version: entry.version_count.max(1),
+                last_modified: entry.last_modified,
+                versions,
                 minted_by_token: BTreeMap::new(),
                 code_bindings: BTreeMap::new(),
             },
@@ -1577,13 +2380,18 @@ pub fn registry_name_required() -> BadRequestException {
 }
 
 /// Refuse a write whose `RevisionId` precondition is not the revision the stored
-/// policy is at. Echoes the revision the CALLER sent, never the stored one: the
-/// caller already holds what it sent, and a refusal is not a read of the resource.
-pub fn stale_policy_revision(requested: &str) -> PreconditionFailedException {
-    precondition_failed(format!(
-        "RevisionId {requested} is not the current revision of this resource-based \
-         policy; read the policy again and retry with the revision it reports."
-    ))
+/// policy is at.
+///
+/// The service's sentence for this refusal is a CONSTANT: it names neither the
+/// revision the caller sent nor the one the store holds. Nothing request-derived or
+/// environment-derived belongs in it — the caller already holds what it sent, a
+/// refusal is not a read of the resource (which is what tells the caller the current
+/// revision), and a message carrying a minted id would differ from run to run for a
+/// client or test that compares one.
+pub fn stale_policy_revision() -> PreconditionFailedException {
+    precondition_failed(
+        "The RevisionId provided does not match the latest RevisionId for the registry policy.",
+    )
 }
 
 /// Refuse a `Policy` larger than the store will retain for one registry. Names the
@@ -1743,10 +2551,15 @@ pub fn json_type_name(value: &::serde_json::Value) -> &'static str {
 pub fn validate_content(content: &str, schema_type: &str) -> Result<(), BadRequestException> {
     let document: ::serde_json::Value = ::serde_json::from_str(content).map_err(|error| {
         // AWS's own template for a body it cannot read as JSON, built from the
-        // request: the member, then what the parser objected to and where. The words
-        // of the objection are whichever parser read the body — the rule is that the
-        // refusal names the member and the failure, not any one parser's phrasing.
-        bad_request(format!("Content is not valid JSON: {error}"))
+        // request: the member, then the character the body stops being JSON at, what
+        // was being read there and that character's byte offset into `Content` — see
+        // [`json_parse_detail`], which is where every refusal of an unreadable body in
+        // this service gets its wording, so no two of them can point a client at two
+        // different coordinate systems.
+        bad_request(format!(
+            "Content is not valid JSON: {}",
+            json_parse_detail(content, &error)
+        ))
     })?;
     if document.is_object() {
         return Ok(());

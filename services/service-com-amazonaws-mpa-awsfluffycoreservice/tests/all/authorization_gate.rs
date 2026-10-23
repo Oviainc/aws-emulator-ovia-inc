@@ -56,7 +56,7 @@ fn valid_create_body(name: &str) -> Value {
 /// The refusal a cross-account ARN earns, as the rule builds it: the caller principal,
 /// the attempted `mpa:` action and the ARN that was asked for — cut to the member's
 /// modelled bound.
-fn expected_denial(action: &str, arn: &str) -> String {
+pub(crate) fn expected_denial(action: &str, arn: &str) -> String {
     let full = format!(
         "User: arn:aws:iam::{}:user/emulator is not authorized to perform: mpa:{action} on \
          resource: {arn} because no resource-based policy allows the mpa:{action} action",

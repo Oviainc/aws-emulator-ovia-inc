@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateApplicationVersion
-//! Implemented: stores the application version (creating its application when
-//! `AutoCreateApplication` asks for it) and answers with the
+//! Implemented: downloads the source bundle the request names (refusing the create when
+//! object storage cannot hand it back), stores the application version (creating its
+//! application when `AutoCreateApplication` asks for it) and answers with the
 //! `ApplicationVersionDescription` built from what was stored. This is the ONLY file to
 //! touch for this operation.
 //!
@@ -193,6 +194,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let region = crate::state::request_region(ctx);
+        // "You can create an application version from a source bundle in Amazon S3":
+        // the version is created FROM that archive, so Elastic Beanstalk downloads it
+        // while serving this call and refuses the request when it cannot — before any
+        // application is auto-created and before any version is recorded. The code is
+        // the one the recorded refusal carries: the bundle cannot be used with the
+        // version this request asks for, which is a combination of parameters rather
+        // than one unusable value. A request that names NO source bundle names no
+        // archive to download: it falls back to the sample application below.
+        if let Some(source_bundle) = input.source_bundle.as_ref() {
+            if let Some(message) =
+                crate::state::archive_download_refusal(ctx, &region, source_bundle).await
+            {
+                return Err(CreateApplicationVersionError::invalid_parameter_combination(
+                    message,
+                ));
+            }
+        }
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             CreateApplicationVersionError::internal_failure(
                 "the Elastic Beanstalk store is unavailable",

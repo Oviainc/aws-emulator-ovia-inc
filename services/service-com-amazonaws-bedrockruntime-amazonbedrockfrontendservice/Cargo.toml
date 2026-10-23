@@ -7,7 +7,8 @@ publish = false
 build = "build.rs"
 
 [dependencies]
-# The shared request-claim rule for a SigV4 signing name several services share.
+# The shared request-claim rule for a SigV4 signing name several services share,
+# and the `vnd.amazon.eventstream` framing seam the two streaming operations use.
 service-common = { path = "../common" }
 engine = { workspace = true }
 smithy-macros = { workspace = true }
@@ -23,6 +24,10 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Encodes and decodes one `application/vnd.amazon.eventstream` frame: the two
+# streaming operations add Bedrock's `p` padding member to each frame's payload,
+# which the protocol's own serializer cannot write (it is not a modelled member).
+aws-smithy-eventstream = "0.60"
 # Mints the 12-character async-invoke id embedded in an `invocationArn`.
 sha2 = { workspace = true }
 # Encodes the opaque `ListAsyncInvokes` page token.

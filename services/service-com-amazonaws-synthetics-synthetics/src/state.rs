@@ -187,7 +187,7 @@ pub const RUN_NOT_EXECUTED_REASON_CODE: &str = "EXECUTION_FAILURE";
 pub const CREATE_IN_PROGRESS_REASON_CODE: &str = "CREATE_IN_PROGRESS";
 
 /// The message every handler answers with when the shared store cannot be reached. One
-/// constant so the six handlers that can hit it word it identically.
+/// constant so the handlers that can hit it word it identically.
 pub const STORE_UNAVAILABLE: &str = "the synthetics canary store is unavailable";
 
 /// `ResourceNotFoundException$Message` for a canary that does not exist.
@@ -205,13 +205,13 @@ pub const CANARY_NOT_FOUND: &str = "Canary not found.";
 /// was not found and never the identifier the request asked for.
 pub const DRY_RUN_NOT_FOUND: &str = "Dry run not found.";
 
-/// `ResourceNotFoundException$Message` for a group that does not exist, as every group
-/// READER words it: the sentence names the resource KIND and never the `GroupIdentifier`
-/// the request asked for.
+/// `ResourceNotFoundException$Message` for a group that does not exist, as the group
+/// operations whose wording is CHOSEN rather than recorded word it: the sentence names the
+/// resource KIND and never the `GroupIdentifier` the request asked for.
 ///
-/// `AssociateResource` is the one group operation whose wording is KNOWN rather than
-/// chosen — see [`group_not_found`] — and it words the same miss differently, which is why
-/// this is a per-operation choice and not one service-wide constant.
+/// The operations whose wording is KNOWN rather than chosen echo the identifier instead —
+/// see [`group_not_found`] — which is why this is a per-operation choice and not one
+/// service-wide constant.
 pub const GROUP_NOT_FOUND: &str = "Group not found.";
 
 /// The most groups this store holds, which is also the real service's quota: "You can have
@@ -238,14 +238,26 @@ pub const MAX_CANARIES: usize = 100;
 /// runs beyond this many are dropped as well.
 pub const MAX_RETAINED_RUNS_PER_CANARY: usize = 100;
 
-/// `AssociateResource`'s `ResourceNotFoundException$Message` for a group that does not
-/// exist.
+/// `ResourceNotFoundException$Message` for a group an operation cannot resolve, where the
+/// recorded service's wording is KNOWN: it echoes the identifier.
 ///
-/// Unlike the group readers' [`GROUP_NOT_FOUND`], this wording is not chosen: the recorded
-/// service answers an `AssociateResource` whose `GroupIdentifier` it cannot resolve with
-/// `Group does not exist: <the identifier as supplied>`, naming the value in whichever of
-/// its three forms (name, ARN or id) the caller used. So for that operation the rule is the
-/// sentence plus the echoed identifier, and nothing else about the group is reported.
+/// Unlike the chosen [`GROUP_NOT_FOUND`], this wording is not invented: the recorded
+/// service answers an `AssociateResource` whose `GroupIdentifier` it cannot resolve — and,
+/// per the recorded unit `synthetics.delete-group-nonexistent-resource-not-found`, a
+/// `DeleteGroup` for a group that does not exist as well as the `GetGroup` reading a group
+/// just deleted — with `Group does not exist: <the identifier as supplied>`, naming the
+/// value in whichever of its three forms (name, ARN or id) the caller used. So for those
+/// operations the rule is the sentence plus the echoed identifier, and nothing else about
+/// the group is reported.
+///
+/// What is a REQUIREMENT here is the construction, not a remembered string: the message is
+/// built from the request's own `GroupIdentifier`, which is why every assertion over it is
+/// a table of identifiers rather than one recorded value
+/// (`tests/all/group_deletion.rs::a_delete_of_a_missing_group_names_the_requested_identifier`).
+/// The operations with NO recorded wording keep the service's fixed, identifier-free
+/// sentence instead ([`GROUP_NOT_FOUND`], used by `ListGroupResources`): a message is a
+/// requirement only where the rule that produces it is known, so the split between the two
+/// is per operation and deliberate.
 pub fn group_not_found(identifier: &str) -> String {
     format!("Group does not exist: {identifier}")
 }
@@ -648,7 +660,8 @@ pub struct StoredGroup {
     pub name: String,
     /// The Region the create was signed for, which is the Region in the group's ARN:
     /// "Although the group ARN format reflects the Region name where it was created, a
-    /// group is not constrained to any Region."
+    /// group is not constrained to any Region." It is also the group's HOME Region, the
+    /// only one `DeleteGroup` accepts a delete from.
     pub region: String,
     pub created: SystemTime,
     pub last_modified: SystemTime,

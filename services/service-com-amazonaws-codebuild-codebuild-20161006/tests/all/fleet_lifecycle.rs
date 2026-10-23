@@ -146,17 +146,18 @@ async fn a_created_fleet_round_trips_through_batch_get_fleets() {
             read["fleets"][0], created,
             "BatchGetFleets {identifier:?}: expected the stored fleet, got {read}"
         );
-        assert!(
-            read["fleetsNotFound"].is_null(),
+        assert_eq!(
+            read["fleetsNotFound"],
+            json!([]),
             "BatchGetFleets {identifier:?}: nothing is missing, got {read}"
         );
     }
 
     // Identifiers the store holds no fleet for, in the order the request named them:
-    // an unknown name, an ARN of another resource type, a fleet ARN with no id, an
-    // ARN of another service, and this fleet's own ARN with the account, the region
-    // and the fleet id each changed in turn — an ARN resolves only to the fleet it
-    // addresses exactly.
+    // an ARN of another resource type, a fleet ARN with no id, an ARN of another
+    // service, and this fleet's own ARN with the account, the region and the fleet id
+    // each changed in turn — an ARN resolves only to the fleet it addresses exactly.
+    // Each is reported back verbatim: an ARN names the fleet it could not find.
     let foreign_account = arn.replace(engine::EMULATOR_ACCOUNT_ID, "000000000001");
     let foreign_region = arn.replace(REGION, "eu-west-1");
     let wrong_id = format!(
@@ -165,7 +166,6 @@ async fn a_created_fleet_round_trips_through_batch_get_fleets() {
         "00000000-0000-8000-8000-000000000000"
     );
     let missing = [
-        "no-such-fleet".to_string(),
         expected_arn("project/round-trip-fleet"),
         expected_arn("fleet/round-trip-fleet"),
         format!("arn:aws:codepipeline:{REGION}:000000000000:fleet/round-trip-fleet:1"),
@@ -175,18 +175,37 @@ async fn a_created_fleet_round_trips_through_batch_get_fleets() {
     ];
     let identifiers: Vec<&str> = missing.iter().map(String::as_str).collect();
     let read = batch_get_fleets(&router, &identifiers).await;
-    assert!(
-        read["fleets"].is_null(),
+    assert_eq!(
+        read["fleets"],
+        json!([]),
         "BatchGetFleets over unknown identifiers reports no fleets, got {read}"
     );
     assert_eq!(
         read["fleetsNotFound"],
         json!(missing),
-        "every unresolvable identifier is reported back, got {read}"
+        "every unresolvable fleet ARN is reported back, got {read}"
+    );
+
+    // A NAME that names no fleet is a plain empty result: a fleet's ARN carries its
+    // id, so the service has no ARN to report an unheld name by, and it reports none.
+    let read = batch_get_fleets(&router, &["no-such-fleet"]).await;
+    assert_eq!(
+        read["fleets"],
+        json!([]),
+        "BatchGetFleets for an unheld NAME reports an empty fleets list, got {read}"
+    );
+    assert_eq!(
+        read["fleetsNotFound"],
+        json!([]),
+        "an unheld fleet NAME is not reported in fleetsNotFound, got {read}"
     );
 
     // A mixed request keeps the requested order across both lists.
-    let read = batch_get_fleets(&router, &["no-such-fleet", "round-trip-fleet"]).await;
+    let read = batch_get_fleets(
+        &router,
+        &[missing[0].as_str(), "round-trip-fleet", missing[1].as_str()],
+    )
+    .await;
     assert_eq!(
         read["fleets"],
         json!([created]),
@@ -194,8 +213,8 @@ async fn a_created_fleet_round_trips_through_batch_get_fleets() {
     );
     assert_eq!(
         read["fleetsNotFound"],
-        json!(["no-such-fleet"]),
-        "a mixed BatchGetFleets reports the name it does not hold, got {read}"
+        json!([missing[0].clone(), missing[1].clone()]),
+        "a mixed BatchGetFleets reports the ARNs it does not hold, in request order, got {read}"
     );
 }
 
@@ -338,8 +357,9 @@ async fn a_capacity_below_one_machine_is_refused_on_every_capacity_member() {
 
         // A refused request persists nothing.
         let read = batch_get_fleets(&router, &[&name]).await;
-        assert!(
-            read["fleets"].is_null(),
+        assert_eq!(
+            read["fleets"],
+            json!([]),
             "case {case:?}: a refused CreateFleet must persist nothing, got {read}"
         );
     }
@@ -536,8 +556,9 @@ async fn creating_a_fleet_past_the_account_quota_is_refused() {
         "CreateFleet at the account quota: expected AccountLimitExceededException, got {body}"
     );
     let read = batch_get_fleets(&router, &["one-past-the-quota"]).await;
-    assert!(
-        read["fleets"].is_null(),
+    assert_eq!(
+        read["fleets"],
+        json!([]),
         "a refused CreateFleet must persist nothing, got {read}"
     );
 }

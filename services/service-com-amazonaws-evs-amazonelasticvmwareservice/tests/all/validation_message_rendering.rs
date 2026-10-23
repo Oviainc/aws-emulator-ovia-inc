@@ -541,10 +541,16 @@ async fn a_value_inside_every_constraint_is_not_refused() {
             json!({ "state": ENVIRONMENT_STATES }),
         ),
         (
-            "a setting value at its length ceiling",
+            // A setting's value is also checked against the DOMAIN
+            // `AccountSetting$name` documents for the named setting (a numeric string,
+            // at most 1,000,000 cores for `vcfPortedCoreCount`) — see
+            // `tests/all/account_settings.rs`, which owns that rule. So the value that
+            // may not be worded as a modelled-constraint refusal is one inside BOTH: the
+            // documented maximum, which no 128-character value could be.
+            "a setting value at the maximum its documentation gives it",
             "PutAccountSettings",
             put_settings(json!([
-                { "name": "vcfPortedCoreCount", "value": "a".repeat(128) },
+                { "name": "vcfPortedCoreCount", "value": "1000000" },
             ])),
         ),
         (

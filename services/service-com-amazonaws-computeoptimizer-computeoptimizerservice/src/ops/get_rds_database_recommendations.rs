@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetRDSDatabaseRecommendations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetRDSDatabaseRecommendations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetRDSDatabaseRecommendations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Returns Amazon Aurora and RDS database recommendations. Compute Optimizer generates
+//! recommendations for Amazon Aurora and RDS databases that meet a specific set of
+//! requirements.
+//!
+//! A REPORTING operation: it selects and pages over the rows this service's findings
+//! catalog ([`crate::state::AnalysedResource`]) holds for the resources analysed as
+//! `RdsDBInstance` — the `RecommendationSourceType` the model's `RDSDBRecommendation`
+//! describes — and writes nothing. Compute Optimizer's own analysis of an observed workload
+//! is what produces such a row, so no request to this API creates one and this handler never
+//! invents one: every member it reports is computed from the stored row (its finding, reason
+//! codes, performance risk, database configuration and monthly costs) and from the
+//! preferences stored for that database, and a member the analysis recorded nothing for is
+//! omitted rather than filled in. A requested resource the catalog holds no database row for
+//! is reported in the response's `errors` list, which is what `GetRecommendationError`
+//! describes ("Describes an error experienced when getting recommendations").
 //!
 //! ## Shape of an operation
 //!
@@ -181,18 +188,372 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetRDSDatabaseRecommendations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetRDSDatabaseRecommendationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetRDSDatabaseRecommendations"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                GetRDSDatabaseRecommendationsErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(
+                            "The Compute Optimizer findings store is unavailable.".to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // A malformed request is refused BEFORE the store is read, so
+        // InvalidParameterValueException takes precedence over the opt-in gate below, as it
+        // does in this service's other readers.
+        let account_ids = input.account_ids.clone().unwrap_or_default();
+        // `accountIds`: "You can only specify one account ID per request."
+        if account_ids.len() > 1 {
+            return Err(invalid_parameter(
+                "The value supplied for parameter accountIds is not valid: you can only specify \
+                 one account ID per request."
+                    .to_string(),
+            ));
+        }
+        if let Some(value) = account_ids
+            .iter()
+            .find(|value| !crate::state::is_account_id(value))
+        {
+            return Err(invalid_parameter(format!(
+                "The value supplied for parameter accountIds is not valid: {value} is not a \
+                 12-digit Amazon Web Services account ID."
+            )));
+        }
+
+        // `resourceArns`: "The ARN that identifies the Amazon Aurora or RDS database" — so
+        // each value is an ARN. WHICH resource an ARN names is not checked here: a
+        // well-formed ARN this service holds no database recommendation for is reported in
+        // `errors` below, not refused.
+        let resource_arns = input.resource_arns.clone().unwrap_or_default();
+        if let Some(value) = resource_arns
+            .iter()
+            .find(|value| crate::state::parse_arn(value).is_none())
+        {
+            return Err(invalid_parameter(format!(
+                "The value supplied for parameter resourceArns is not valid: {value} is not an \
+                 Amazon Resource Name (ARN)."
+            )));
+        }
+
+        // The filter vocabulary is the model's own; a name or value outside it is refused
+        // rather than silently matching nothing. The modelled `@enum` on
+        // `RDSDBRecommendationFilter$name` already refuses an unmodelled name at the request
+        // boundary, so this covers the VALUES a filter carries and a filter with no name.
+        let filters = input.filters.clone().unwrap_or_default();
+        if let Some(reason) = crate::state::rds_filter_rejection(&filters) {
+            return Err(invalid_parameter(reason));
+        }
+
+        // The page token carries this operation's name and the selection it was taken with,
+        // so resuming a walk with a different selection, or with a token another operation
+        // issued, is refused rather than answered with a page of a different result set.
+        let selection_fingerprint = crate::state::fingerprint(&(
+            Self::NAME,
+            &resource_arns,
+            &account_ids,
+            &filters,
+            &input.recommendation_preferences,
+        ));
+        let offset = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => {
+                let cursor = crate::state::decode_offset_page_token(token)
+                    .filter(|cursor| cursor.selection_fingerprint == selection_fingerprint);
+                let Some(cursor) = cursor else {
+                    return Err(invalid_parameter(
+                        "The value supplied for parameter nextToken is not valid: it must be a \
+                         token returned by a previous GetRDSDatabaseRecommendations call for the \
+                         same resourceArns, accountIds, filters and recommendationPreferences."
+                            .to_string(),
+                    ));
+                };
+                cursor.offset
+            }
+        };
+
+        // `maxResults` is modelled 0..1000 (the request boundary refuses anything outside
+        // that). Whatever it asks for, the page is capped at `MAX_PAGE_SIZE` so no number a
+        // request carries can size the response or the allocation that builds it; a request
+        // naming no size — or the range's lower bound `0`, which the service documents no
+        // meaning for — gets `DEFAULT_PAGE_SIZE` plus a `nextToken` to walk the rest, the
+        // same rule this service's other 0..1000-paged readers follow.
+        let page_size = input
+            .max_results
+            .and_then(|requested| usize::try_from(requested).ok())
+            .filter(|requested| *requested > 0)
+            .unwrap_or(crate::state::DEFAULT_PAGE_SIZE)
+            .min(crate::state::MAX_PAGE_SIZE);
+
+        let guard = state.lock();
+        // "The account is not opted in to Compute Optimizer": the service analyses an
+        // account's resources only once it has opted in, so an account that never did — or
+        // that opted back out — reads no recommendations at all.
+        if !guard.enrollment.is_opted_in() {
+            return Err(
+                GetRDSDatabaseRecommendationsErrorModeled::OptInRequiredException(
+                    OptInRequiredException {
+                        message: Some(
+                            "The account is not opted in to Compute Optimizer.".to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+        let store = &*guard;
+        // Compute Optimizer is a regional service, so the request addresses ONE region's
+        // endpoint: the resources it asks about are that region's, and the ARNs its answer
+        // names carry that region.
+        let region = crate::state::request_region(ctx);
+
+        // The databases the request selects: those of the named resources, of the named
+        // account, whose recommendation satisfies every filter. A member the request omits
+        // selects nothing away. The filters read the REPORTED recommendation, so they select
+        // on exactly the values the response carries.
+        let selected: Vec<RDSDBRecommendation> = store
+            .analysed_resources
+            .iter()
+            .filter(|resource| resource.resource_type == crate::state::SOURCE_TYPE_RDS_DB_INSTANCE)
+            .filter(|resource| {
+                resource_arns.is_empty() || resource_arns.contains(&resource.arn_in(&region))
+            })
+            .filter(|resource| account_ids.is_empty() || account_ids.contains(&resource.account_id))
+            .map(|resource| {
+                recommendation_for(
+                    resource,
+                    store,
+                    &region,
+                    input
+                        .recommendation_preferences
+                        .as_ref()
+                        .and_then(|preferences| preferences.cpu_vendor_architectures.as_ref()),
+                )
+            })
+            .filter(|recommendation| {
+                crate::state::rds_recommendation_matches_filters(recommendation, &filters)
+            })
+            .collect();
+
+        // Every ARN the request named that this service holds no database recommendation
+        // for, whatever the filters select. Reported with each page, because it describes
+        // the request rather than the page.
+        let errors: Vec<GetRecommendationError> = resource_arns
+            .iter()
+            .filter(|arn| {
+                !store.analysed_resources.iter().any(|resource| {
+                    resource.resource_type == crate::state::SOURCE_TYPE_RDS_DB_INSTANCE
+                        && resource.arn_in(&region) == **arn
+                })
+            })
+            .map(|arn| GetRecommendationError {
+                identifier: Some(arn.clone()),
+                code: Some(crate::state::NO_RECOMMENDATION_CODE.to_string()),
+                message: Some(
+                    "Compute Optimizer has no Amazon Aurora or RDS database recommendation for \
+                     the resource this identifier names."
+                        .to_string(),
+                ),
+            })
+            .collect();
+
+        // One page of the selected sequence. A next token is handed out only when the
+        // sequence continues past this page, and it resumes exactly where this page stopped.
+        let page: Vec<RDSDBRecommendation> = selected
+            .into_iter()
+            .skip(offset)
+            .take(page_size.saturating_add(1))
+            .collect();
+        let has_more = page.len() > page_size;
+        let page: Vec<RDSDBRecommendation> = page.into_iter().take(page_size).collect();
+        let next_token = has_more.then(|| {
+            crate::state::encode_offset_page_token(&crate::state::PageCursor {
+                offset: offset.saturating_add(page.len()),
+                selection_fingerprint,
+            })
+        });
+
+        Ok(GetRDSDatabaseRecommendationsOutput {
+            next_token,
+            rds_db_recommendations: Some(page),
+            errors: Some(errors),
+        })
     }
+}
+
+/// The rank of the one recommendation option this service reports: "The rank identifier of
+/// the DB instance recommendation option" — the analysis records one configuration it would
+/// move the database to, so that option is the first-ranked one.
+const FIRST_RANK: i32 = 1;
+
+/// One analysed database as `GetRDSDatabaseRecommendations` reports it.
+///
+/// Every member is computed from the stored row or from the preference records in force for
+/// that database; nothing here is stored as a recommendation, and a member the analysis
+/// recorded nothing for is omitted rather than invented.
+fn recommendation_for(
+    resource: &crate::state::AnalysedResource,
+    store: &crate::state::ComAmazonawsComputeoptimizerComputeoptimizerserviceState,
+    region: &str,
+    requested_cpu_vendor_architectures: Option<&Vec<String>>,
+) -> RDSDBRecommendation {
+    let resource_arn = resource.arn_in(region);
+    let detail = resource.rds_database.clone().unwrap_or_default();
+    // The catalog records ONE finding per analysed resource; a database is reported with a
+    // finding for its instance AND one for its storage, the side the analysis recorded
+    // nothing against reading `Optimized`: see `crate::state::rds_finding_members`.
+    let (instance_finding, storage_finding) = crate::state::rds_finding_members(&resource.finding);
+    let instance_finding_reason_codes = crate::state::reason_codes_in(
+        R_D_S_INSTANCE_FINDING_REASON_CODE_VALUES,
+        &resource.finding_reason_codes,
+    );
+    let storage_finding_reason_codes = crate::state::reason_codes_in(
+        R_D_S_STORAGE_FINDING_REASON_CODE_VALUES,
+        &resource.finding_reason_codes,
+    );
+
+    // "Describes the effective recommendation preferences for Amazon Aurora and RDS
+    // databases": the ONE resolution this service has
+    // ([`crate::state::ComAmazonawsComputeoptimizerComputeoptimizerserviceState::effective_preferences`]),
+    // applied to this database, so the preferences a recommendation says it was generated
+    // under are the ones `GetEffectiveRecommendationPreferences` reports.
+    let effective = store.effective_preferences_for(
+        &resource_arn,
+        // `ResourceType` and `RecommendationSourceType` name a database identically, so one
+        // constant addresses both the preference records and the catalog rows.
+        crate::state::SOURCE_TYPE_RDS_DB_INSTANCE,
+        &resource.account_id,
+    );
+
+    // The analysis would move the database only where the configuration it recommends costs
+    // something different from the current one; where it would not, there is no option to
+    // report. The option goes on the side that is not `Optimized`, because that is the side
+    // the analysis found something to change on.
+    let changes_configuration = resource.recommended_monthly_cost != resource.current_monthly_cost;
+    let changes = |finding: Option<&str>| {
+        changes_configuration
+            && finding.is_some_and(|finding| finding != crate::state::FINDING_OPTIMIZED)
+    };
+    let instance_recommendation_options = changes(instance_finding).then(|| {
+        vec![RDSDBInstanceRecommendationOption {
+            db_instance_class: detail.recommended_db_instance_class.clone(),
+            // Nothing is recorded about the utilization the recommended class would run
+            // at, nor about the risk it would carry, so the projected metrics are
+            // omitted and `performanceRisk` reports the member's modelled default.
+            projected_utilization_metrics: None,
+            performance_risk: 0.0,
+            rank: FIRST_RANK,
+            savings_opportunity: Some(savings_opportunity(resource)),
+            // A saving after discounts needs the account's discounts, which this service
+            // holds none of.
+            savings_opportunity_after_discounts: None,
+        }]
+    });
+    let storage_recommendation_options = changes(storage_finding).then(|| {
+        vec![RDSDBStorageRecommendationOption {
+            storage_configuration: detail.recommended_storage_configuration.clone(),
+            rank: FIRST_RANK,
+            savings_opportunity: Some(savings_opportunity(resource)),
+            savings_opportunity_after_discounts: None,
+            // "The estimated monthly volume IOPs cost variation" needs observed IOPs
+            // pricing, which the catalog records none of.
+            estimated_monthly_volume_io_ps_cost_variation: None,
+        }]
+    });
+
+    RDSDBRecommendation {
+        resource_arn: Some(resource_arn.clone()),
+        account_id: Some(resource.account_id.clone()),
+        engine: detail.engine,
+        engine_version: detail.engine_version,
+        promotion_tier: detail.promotion_tier,
+        current_db_instance_class: detail.current_db_instance_class,
+        current_storage_configuration: detail.current_storage_configuration,
+        db_cluster_identifier: detail.db_cluster_identifier,
+        // "Describes if an Amazon Aurora or RDS database is idle": it is exactly when this
+        // service also holds an IDLE recommendation for it, which is the record
+        // `GetIdleRecommendations` reports.
+        idle: Some(
+            if store.idle_recommendations.get(&resource_arn).is_some() {
+                crate::state::IDLE_TRUE
+            } else {
+                crate::state::IDLE_FALSE
+            }
+            .to_string(),
+        ),
+        instance_finding: instance_finding.map(ToString::to_string),
+        storage_finding: storage_finding.map(ToString::to_string),
+        instance_finding_reason_codes: (!instance_finding_reason_codes.is_empty())
+            .then_some(instance_finding_reason_codes),
+        storage_finding_reason_codes: (!storage_finding_reason_codes.is_empty())
+            .then_some(storage_finding_reason_codes),
+        // `RDSCurrentInstancePerformanceRisk` declares the same four ratings as the
+        // `CurrentPerformanceRisk` the catalog stores; a rating outside them is reported on
+        // neither member.
+        current_instance_performance_risk: R_D_S_CURRENT_INSTANCE_PERFORMANCE_RISK_VALUES
+            .contains(&resource.current_performance_risk.as_str())
+            .then(|| resource.current_performance_risk.clone()),
+        current_storage_estimated_monthly_volume_io_ps_cost_variation: None,
+        instance_recommendation_options,
+        storage_recommendation_options,
+        utilization_metrics: (!detail.utilization_metrics.is_empty())
+            .then_some(detail.utilization_metrics),
+        effective_recommendation_preferences: Some(RDSEffectiveRecommendationPreferences {
+            // `recommendationPreferences` "Describes the recommendation preferences to return
+            // in the response of a … GetRDSDatabaseRecommendations … request", so the CPU
+            // vendor architecture the request asks for is the one in force for its answer.
+            cpu_vendor_architectures: requested_cpu_vendor_architectures
+                .filter(|architectures| !architectures.is_empty())
+                .cloned(),
+            enhanced_infrastructure_metrics: effective.enhanced_infrastructure_metrics.clone(),
+            look_back_period: Some(effective.look_back_period.clone()),
+            // Where the money figures came from: every one of them is computed from the
+            // prices stored with this service's own analysis
+            // ([`crate::state::SAVINGS_ESTIMATION_SOURCE`]), as the other recommendation
+            // readers of this service report.
+            savings_estimation_mode: Some(RDSSavingsEstimationMode {
+                source: Some(crate::state::SAVINGS_ESTIMATION_SOURCE.to_string()),
+            }),
+        }),
+        // "The number of days the DB instance utilization metrics were analyzed": the days
+        // the look-back period in force covers.
+        lookback_period_in_days: crate::state::look_back_period_in_days(
+            &effective.look_back_period,
+        ),
+        last_refresh_timestamp: detail.last_refresh_timestamp,
+        tags: (!detail.tags.is_empty()).then_some(detail.tags),
+    }
+}
+
+/// The savings opportunity of adopting the recommendation for one database: what it saves
+/// per month, and that saving "as a percentage of monthly cost"
+/// (`SavingsOpportunity$savingsOpportunityPercentage`) — both computed from the stored
+/// current and recommended monthly costs, so a reported saving and the costs it came from
+/// cannot disagree. A recommendation that costs MORE than the current configuration saves
+/// nothing rather than a negative amount ([`crate::state::AnalysedResource::monthly_savings`]).
+fn savings_opportunity(resource: &crate::state::AnalysedResource) -> SavingsOpportunity {
+    let savings = resource.monthly_savings();
+    SavingsOpportunity {
+        savings_opportunity_percentage: crate::state::percentage_of(
+            savings,
+            resource.current_monthly_cost,
+        ),
+        estimated_monthly_savings: Some(EstimatedMonthlySavings {
+            currency: Some(crate::state::CURRENCY_USD.to_string()),
+            value: crate::state::round_hundredths(savings),
+        }),
+    }
+}
+
+/// The 400 `InvalidParameterValueException` this operation refuses a bad request with: "The
+/// value supplied for the input parameter is out of range or not valid."
+fn invalid_parameter(message: String) -> GetRDSDatabaseRecommendationsError {
+    GetRDSDatabaseRecommendationsErrorModeled::InvalidParameterValueException(
+        InvalidParameterValueException {
+            message: Some(message),
+        },
+    )
+    .into()
 }

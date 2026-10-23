@@ -98,15 +98,26 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
         // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // service reword it.
+        //
+        // SSM GuiConnect does not state a constraint violation in the framework's
+        // aggregated `N validation error(s) detected: …` envelope: it answers ONE
+        // sentence naming the member path and the bound it broke, and it does not echo
+        // the offending value. `crate::state::constraint_message` builds that sentence
+        // (and is `None` for a refusal this service words the framework's way, which
+        // keeps the default wording). The code travels with it: `ValidationException`
+        // is both this service's modeled 400 and what the framework picks on
+        // restJson1, so a client branching on the code is unaffected.
+        match refusal {
+            Refusal::Invalid(violations) => {
+                crate::state::constraint_message(violations).map(|message| Refused {
+                    code: "ValidationException".to_string(),
+                    message,
+                })
+            }
+            // An authentication refusal is not this service's to reword.
+            _ => None,
+        }
     }
 
     fn override_routing_error(

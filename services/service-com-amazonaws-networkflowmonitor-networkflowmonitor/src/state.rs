@@ -1028,10 +1028,51 @@ pub fn state_unavailable() -> InternalServerException {
     }
 }
 
-/// The modelled 404 for an id or a name that names nothing in the store.
+/// The modelled 404 for an id that names nothing in the store and names no
+/// resource this service mints an ARN for.
+///
+/// The ARN-qualified forms below are for the resources this service DOES mint an
+/// ARN for — a monitor ([`monitor_not_found`]) and a scope ([`scope_not_found`]).
+/// This generic form is what is left: a `queryId`, which is an identifier inside a
+/// monitor's or a scope's own lifecycle and has no ARN of its own, and the tagging
+/// operations' `resourceArn`, which the caller already addressed BY its ARN, so the
+/// id this message carries is that ARN.
 pub fn not_found(resource_type: &str, id: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
         message: Some(format!("{resource_type} {id} was not found")),
+    }
+}
+
+/// The modelled 404 for a `monitorName` this store holds no monitor under.
+///
+/// The message is BUILT FROM THE REQUEST and identifies the missing monitor by the
+/// ARN it would carry — [`resource_arn`] over the request's Region, the same
+/// builder `CreateMonitor` mints `monitorArn` with — so the partition, Region,
+/// account and resource type of what is missing are all readable from the refusal
+/// alone, and a caller holding a batch of names learns WHICH resource was absent.
+///
+/// The fixed words around the ARN are this service's own wording for a missing
+/// MONITOR. A missing scope is worded differently ([`scope_not_found`]), which is
+/// why the two are separate renderers rather than one template parameterized by a
+/// resource type.
+pub fn monitor_not_found(region: &str, monitor_name: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(format!(
+            "Monitor [{}] doesn't exist",
+            resource_arn(region, MONITOR_RESOURCE, monitor_name)
+        )),
+    }
+}
+
+/// The modelled 404 for a `scopeId` this store holds no scope under: the scope
+/// counterpart of [`monitor_not_found`], ARN-qualified in the same way and from the
+/// same builder, in this service's own wording for a missing SCOPE.
+pub fn scope_not_found(region: &str, scope_id: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(format!(
+            "There's no scope with ARN: [{}]",
+            resource_arn(region, SCOPE_RESOURCE, scope_id)
+        )),
     }
 }
 

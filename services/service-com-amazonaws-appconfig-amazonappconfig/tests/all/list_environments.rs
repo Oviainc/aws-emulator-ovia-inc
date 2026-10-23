@@ -19,7 +19,8 @@ use crate::appconfig_workflow::{
     create_application, create_environment, create_profile, json_call, router, send, Answer,
 };
 use service_com_amazonaws_appconfig_amazonappconfig::state::{
-    MAX_LIST_PAGE_SIZE, PREDEFINED_DEPLOYMENT_STRATEGIES,
+    ENVIRONMENT_DEPLOYING, ENVIRONMENT_READY_FOR_DEPLOYMENT, MAX_LIST_PAGE_SIZE,
+    PREDEFINED_DEPLOYMENT_STRATEGIES,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -301,8 +302,8 @@ async fn a_page_size_outside_the_modelled_range_is_refused() {
         );
         if expected_status == 400 {
             assert!(
-                answer.error_code().contains("ValidationException"),
-                "case {case:?}: expected ValidationException, got {:?}",
+                answer.error_code().contains("BadRequestException"),
+                "case {case:?}: expected the modelled BadRequestException, got {:?}",
                 answer.error_code()
             );
             assert!(
@@ -570,9 +571,9 @@ async fn each_listed_environment_is_the_record_a_get_of_it_answers() {
             fetched.json()
         );
         let expected_state = if id == &deployed {
-            "DEPLOYING"
+            ENVIRONMENT_DEPLOYING
         } else {
-            "READY_FOR_DEPLOYMENT"
+            ENVIRONMENT_READY_FOR_DEPLOYMENT
         };
         assert_eq!(
             entry.get("State").and_then(serde_json::Value::as_str),

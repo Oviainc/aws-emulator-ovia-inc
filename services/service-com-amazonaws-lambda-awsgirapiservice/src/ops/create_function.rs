@@ -460,7 +460,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             architectures: input.architectures.clone().unwrap_or_else(|| {
                 vec![crate::state::DEFAULT_ARCHITECTURE.to_string()]
             }),
-            environment: environment_variables(&input)?,
+            environment: crate::state::environment_variables(input.environment.as_ref())
+                .map_err(invalid_parameter)?,
             layers,
             ephemeral_storage_mb: input
                 .ephemeral_storage
@@ -478,6 +479,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             code_sha256,
             last_modified: crate::state::iso8601(now),
             revision_id: crate::state::mint_revision_id(),
+            vpc_config: input.vpc_config.clone(),
+            dead_letter_config: input.dead_letter_config.clone(),
+            file_system_configs: input.file_system_configs.clone().unwrap_or_default(),
+            image_config: input.image_config.clone(),
+            snap_start_apply_on: input
+                .snap_start
+                .as_ref()
+                .and_then(|snap_start| snap_start.apply_on.clone()),
+            logging_config: input.logging_config.clone(),
+            capacity_provider_config: input.capacity_provider_config.clone(),
+            durable_config: input.durable_config.clone(),
+            tenancy_config: input.tenancy_config.clone(),
         };
 
         let mut record = crate::state::FunctionRecord {
@@ -493,6 +506,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             state_reason: Some(crate::state::STATE_REASON_CREATING.to_string()),
             state_reason_code: Some(crate::state::STATE_REASON_CODE_CREATING.to_string()),
             last_update_status: None,
+            // Nothing is being updated on a function that is still being created.
+            last_update_due: None,
             active_due: now + crate::state::ACTIVATION_DELAY,
             tags: input
                 .tags
@@ -515,6 +530,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             aliases: ::std::collections::BTreeMap::new(),
             // ... and nothing queued for it until an invocation is accepted.
             async_invocations: ::std::collections::VecDeque::new(),
+            // ... and no stored runtime management configuration until
+            // `PutRuntimeManagementConfig` stores one, so every version reports the
+            // documented `Auto` default until then.
+            runtime_management_configs: ::std::collections::BTreeMap::new(),
         };
 
         // "Use the Publish parameter to create version 1 of your function from its
@@ -567,31 +586,22 @@ fn invalid_parameter(message: String) -> CreateFunctionError {
 /// The code of the function being created, refused when the package type and the
 /// `Code` member do not agree.
 ///
-/// The model's own `CreateFunction` documentation states both rules: "If the deployment
-/// package is a container image, then you set the package type to Image. For a
-/// container image, the code property must include the URI of a container image in the
-/// Amazon ECR registry. You do not need to specify the handler and runtime properties.
-/// If the deployment package is a .zip file archive, then you set the package type to
-/// Zip. For a .zip file archive, the code property specifies the location of the .zip
-/// file. You must also specify the handler and runtime properties."
+/// The package members themselves are resolved by
+/// [`crate::state::resolve_package_code`], which `UpdateFunctionCode` shares, so both
+/// write paths admit exactly the same packages. What is checked here is the part that
+/// belongs to creation alone, which the model's own `CreateFunction` documentation
+/// states: "If the deployment package is a container image, then you set the package
+/// type to Image. For a container image, the code property must include the URI of a
+/// container image in the Amazon ECR registry. You do not need to specify the handler
+/// and runtime properties. If the deployment package is a .zip file archive, then you
+/// set the package type to Zip. For a .zip file archive, the code property specifies the
+/// location of the .zip file. You must also specify the handler and runtime properties."
 fn package_code(
     package_type: &str,
     input: &CreateFunctionInput,
 ) -> Result<crate::state::CodeRecord, CreateFunctionError> {
     let code = &input.code;
     if package_type == crate::state::PACKAGE_TYPE_IMAGE {
-        let Some(image_uri) = code.image_uri.clone() else {
-            return Err(invalid_parameter(
-                "Code.ImageUri is required for a function whose PackageType is Image"
-                    .to_string(),
-            ));
-        };
-        if code.zip_file.is_some() || code.s3_bucket.is_some() || code.s3_key.is_some() {
-            return Err(invalid_parameter(
-                "Code must name only ImageUri for a function whose PackageType is Image"
-                    .to_string(),
-            ));
-        }
         if input.runtime.is_some() {
             return Err(invalid_parameter(
                 "Runtime cannot be set for a function whose PackageType is Image".to_string(),
@@ -602,86 +612,31 @@ fn package_code(
                 "Handler cannot be set for a function whose PackageType is Image".to_string(),
             ));
         }
-        return Ok(crate::state::CodeRecord {
-            image_uri: Some(image_uri),
-            ..crate::state::CodeRecord::default()
-        });
-    }
-
-    if code.image_uri.is_some() {
-        return Err(invalid_parameter(
-            "Code.ImageUri can only be set for a function whose PackageType is Image"
-                .to_string(),
-        ));
-    }
-    if input.runtime.is_none() {
-        return Err(invalid_parameter(
-            "Runtime is required if the deployment package is a .zip file archive".to_string(),
-        ));
-    }
-    if input.handler.is_none() {
-        return Err(invalid_parameter(
-            "Handler is required if the deployment package is a .zip file archive".to_string(),
-        ));
-    }
-    match (&code.zip_file, &code.s3_bucket, &code.s3_key) {
-        (Some(zip_file), None, None) => {
-            // AWS's published Lambda quota for a package uploaded inline: "Deployment
-            // package (.zip file archive) size: 50 MB (zipped, for direct upload)".
-            // The bytes are held in memory here, so the ceiling bounds the store too.
-            if zip_file.len() > MAX_INLINE_ZIP_BYTES {
-                return Err(invalid_parameter(format!(
-                    "Code.ZipFile must be smaller than {MAX_INLINE_ZIP_BYTES} bytes for a \
-                     direct upload; use S3Bucket and S3Key for a larger deployment package"
-                )));
-            }
-            Ok(crate::state::CodeRecord {
-                zip_bytes: Some(zip_file.clone()),
-                ..crate::state::CodeRecord::default()
-            })
+    } else {
+        if input.runtime.is_none() {
+            return Err(invalid_parameter(
+                "Runtime is required if the deployment package is a .zip file archive".to_string(),
+            ));
         }
-        (None, Some(bucket), Some(key)) => Ok(crate::state::CodeRecord {
-            s3_bucket: Some(bucket.clone()),
-            s3_key: Some(key.clone()),
-            s3_object_version: code.s3_object_version.clone(),
-            ..crate::state::CodeRecord::default()
-        }),
-        _ => Err(invalid_parameter(
-            "Code must name either ZipFile or both S3Bucket and S3Key for a function whose \
-             PackageType is Zip"
-                .to_string(),
-        )),
+        if input.handler.is_none() {
+            return Err(invalid_parameter(
+                "Handler is required if the deployment package is a .zip file archive".to_string(),
+            ));
+        }
     }
+
+    crate::state::resolve_package_code(
+        package_type,
+        crate::state::PackageMembers {
+            zip_file: code.zip_file.as_deref(),
+            s3_bucket: code.s3_bucket.as_deref(),
+            s3_key: code.s3_key.as_deref(),
+            s3_object_version: code.s3_object_version.as_deref(),
+            s3_object_storage_mode: code.s3_object_storage_mode.as_deref(),
+            image_uri: code.image_uri.as_deref(),
+            source_kms_key_arn: code.source_kms_key_arn.as_deref(),
+        },
+    )
+    .map_err(invalid_parameter)
 }
 
-/// AWS's published Lambda quota for a deployment package uploaded inline: "Deployment
-/// package (.zip file archive) size: 50 MB (zipped, for direct upload)".
-const MAX_INLINE_ZIP_BYTES: usize = 50 * 1024 * 1024;
-
-/// AWS's published Lambda quota for environment variables: 4 KB for all of a
-/// function's environment variables combined.
-const MAX_ENVIRONMENT_BYTES: usize = 4 * 1024;
-
-/// The environment variables of the function being created, refused when the set is
-/// larger than the documented quota.
-fn environment_variables(
-    input: &CreateFunctionInput,
-) -> Result<::std::collections::BTreeMap<String, String>, CreateFunctionError> {
-    let variables: ::std::collections::BTreeMap<String, String> = input
-        .environment
-        .as_ref()
-        .and_then(|environment| environment.variables.clone())
-        .map(|variables| variables.into_iter().collect())
-        .unwrap_or_default();
-    let size: usize = variables
-        .iter()
-        .map(|(name, value)| name.len() + value.len())
-        .sum();
-    if size > MAX_ENVIRONMENT_BYTES {
-        return Err(invalid_parameter(format!(
-            "Environment.Variables must be smaller than {MAX_ENVIRONMENT_BYTES} bytes for all \
-             environment variables combined, and this request's are {size} bytes"
-        )));
-    }
-    Ok(variables)
-}

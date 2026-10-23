@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateFileSystem
-//! IMPLEMENTED: applies a throughput change to the file system persisted in
-//! [`crate::state`] — the new `ThroughputMode` and/or `ProvisionedThroughputInMibps` —
-//! and answers the stored `FileSystemDescription`, which reports `updating` until the
-//! clock owes the file system `available` again.
+//! IMPLEMENTED: accepts a throughput change for the file system persisted in
+//! [`crate::state`] — the requested `ThroughputMode` and/or
+//! `ProvisionedThroughputInMibps` — records it as PENDING, and answers the stored
+//! `FileSystemDescription`, which reports the file system's CURRENT throughput in the
+//! `updating` phase until the clock owes it `available` again and applies the change.
 //!
 //! ## Shape of an operation
 //!
@@ -341,11 +342,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // The change is accepted: the file system carries the requested throughput from
-        // here on and settles back to `available` once the clock owes it, which is what
-        // the `updating` lifecycle phase reports in the meantime.
-        file_system.throughput_mode = mode;
-        file_system.provisioned_throughput_in_mibps = mibps;
+        // The change is ACCEPTED, not applied: the modelled 202 is an acceptance, so the
+        // file system moves to `updating` and goes on reporting the throughput it
+        // currently has, while the requested values wait on the record until the clock
+        // owes the transition's completion — which is when they become its own. A client
+        // that polls the file system therefore observes the transition and then the new
+        // mode, instead of being told the change landed before any transition existed.
+        file_system.pending_throughput = Some(efs::PendingThroughput {
+            throughput_mode: mode,
+            provisioned_throughput_in_mibps: mibps,
+        });
         file_system.life_cycle_state = efs::LIFE_CYCLE_UPDATING.to_string();
         file_system.available_at = now + efs::CREATING_FOR;
         if restricted {

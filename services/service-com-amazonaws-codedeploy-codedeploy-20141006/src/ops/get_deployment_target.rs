@@ -1,15 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetDeploymentTarget
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetDeploymentTarget`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Answers the one `DeploymentTarget` the deployment holds under the target id
+//! the request names.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetDeploymentTarget::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The target is read from the deployment's own record — the snapshot its
+//! deployment group resolved when it was created
+//! ([`crate::state::deployment_targets`]) — and projected by the crate's single
+//! target builder ([`crate::state::deployment_target_view`]), the same one the
+//! batch reader `BatchGetDeploymentTargets` answers from, so a target reads the
+//! same whichever of the two a client asks. A deployment the clock has not
+//! started yet has no target state to report, which is its
+//! `DeploymentNotStartedException`; an id the deployment holds no target under
+//! is `DeploymentTargetDoesNotExistException`, and one outside the FORM a target
+//! of its compute platform is reported under is
+//! `InvalidDeploymentTargetIdException` (see
+//! [`crate::state::check_deployment_target_id`]) — the refusal BOTH readers
+//! model, so the two cannot disagree about a value neither can look up.
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +167,95 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetDeploymentTarget` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetDeploymentTargetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetDeploymentTarget"))
+        let _ = ctx;
+        let deployment_id = input.deployment_id;
+        let target_id = input.target_id;
+
+        // The id's FORMAT is gated before the deployment is looked up, so "that
+        // is not an id" and "no deployment has that id" stay two different
+        // answers, as they are everywhere else in this service.
+        if deployment_id.trim().is_empty() {
+            return Err(GetDeploymentTargetErrorModeled::DeploymentIdRequiredException(
+                DeploymentIdRequiredException {
+                    message: Some(crate::state::DEPLOYMENT_ID_MISSING.to_string()),
+                },
+            )
+            .into());
+        }
+        if !crate::state::deployment_id_is_well_formed(&deployment_id) {
+            return Err(GetDeploymentTargetErrorModeled::InvalidDeploymentIdException(
+                InvalidDeploymentIdException {
+                    message: Some(crate::state::malformed_deployment_id_message(&deployment_id)),
+                },
+            )
+            .into());
+        }
+        // `targetId` is @required but carries no modelled length, so an empty
+        // one reaches the handler, and that is "you did not give me this target
+        // id": `DeploymentTargetIdRequiredException`. Which FORM it has to take
+        // depends on the deployment it is against, so that is checked below,
+        // once the deployment is resolved.
+        if target_id.trim().is_empty() {
+            return Err(
+                GetDeploymentTargetErrorModeled::DeploymentTargetIdRequiredException(
+                    DeploymentTargetIdRequiredException {
+                        message: Some(crate::state::DEPLOYMENT_TARGET_ID_MISSING.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let outcome = crate::state::with_state(&*self.engine, |state| {
+            let Some(deployment) = state.deployments.get(&deployment_id) else {
+                return Err(
+                    GetDeploymentTargetErrorModeled::DeploymentDoesNotExistException(
+                        DeploymentDoesNotExistException {
+                            message: Some(crate::state::deployment_not_found(&deployment_id)),
+                        },
+                    ),
+                );
+            };
+            // A deployment that has not started has deployed to nothing, so it
+            // has no target state to report.
+            if !deployment.is_started() {
+                return Err(GetDeploymentTargetErrorModeled::DeploymentNotStartedException(
+                    DeploymentNotStartedException {
+                        message: Some(crate::state::deployment_not_started(&deployment_id)),
+                    },
+                ));
+            }
+            if crate::state::check_deployment_target_id(&deployment.compute_platform, &target_id)
+                .is_err()
+            {
+                return Err(
+                    GetDeploymentTargetErrorModeled::InvalidDeploymentTargetIdException(
+                        InvalidDeploymentTargetIdException {
+                            message: Some(crate::state::malformed_target_id_message(&target_id)),
+                        },
+                    ),
+                );
+            }
+            let Some(target) = crate::state::find_deployment_target(deployment, &target_id) else {
+                return Err(
+                    GetDeploymentTargetErrorModeled::DeploymentTargetDoesNotExistException(
+                        DeploymentTargetDoesNotExistException {
+                            message: Some(crate::state::deployment_target_not_found(
+                                &deployment_id,
+                                &target_id,
+                            )),
+                        },
+                    ),
+                );
+            };
+            Ok(crate::state::deployment_target_view(state, deployment, target))
+        })
+        .ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE)
+        })?;
+
+        Ok(GetDeploymentTargetOutput {
+            deployment_target: Some(outcome?),
+        })
     }
 }

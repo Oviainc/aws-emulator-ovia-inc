@@ -151,12 +151,20 @@
 //! RDS, Amazon DocumentDB and Amazon Neptune are three Smithy models of. The data is pure
 //! — no modelled shape appears in it — so each of those crates keeps its own generated
 //! shapes and state while the catalog and the rules over it live here once.
+//!
+//! [`query_error_envelope`] is the third: the `<RequestId>` element an `awsQuery`
+//! `<ErrorResponse>` carries beside its `<Error>`, which no model declares and the
+//! framework's error renderers do not write, for every service of that protocol whose
+//! errors must carry the request id an SDK reports.
 
 pub mod rds_cluster_parameters;
 
 pub mod arn;
 pub mod bedrock;
 pub mod db_data_sources;
+/// The `vnd.amazon.eventstream` framing and routing seam a service with a
+/// `@streaming` output member needs, which the scaffold does not generate.
+pub mod event_stream;
 pub mod front_door;
 pub mod iam_authorization;
 pub mod iam_role;
@@ -165,6 +173,7 @@ pub mod iot_commands;
 pub mod iot_job_executions;
 pub mod lex;
 pub mod network;
+pub mod query_error_envelope;
 pub mod rfc3339;
 pub mod rpc_target;
 pub mod shared_path;
@@ -562,6 +571,45 @@ pub fn uri_path(uri: &str) -> &str {
 /// compare unequal rather than disappear.
 pub fn nth_path_segment(path: &str, index: usize) -> Option<&str> {
     path.trim_start_matches('/').split('/').nth(index)
+}
+
+/// The path of a request URI, without its query string and without the authority an
+/// absolute-form URI carries.
+///
+/// A server usually sees the origin form (`/model/m-1/invoke?x=1`), but an SDK that was
+/// given an endpoint can send the absolute form (`https://host/model/m-1/invoke`), and
+/// `aws_smithy_runtime_api::http::Request::uri` hands over whichever arrived. A service
+/// that routes on the URI — reading the tail of a modelled path in `override_operation`,
+/// say — needs the path alone, so it reads it through this one function rather than
+/// splitting the URI itself.
+///
+/// # Services still carrying their own copy
+///
+/// The same extraction is inlined in several service crates that needed it before there
+/// was anywhere shared to put it. The list is NON-EXHAUSTIVE — `grep -rn 'find("://")'
+/// services/*/src` is the authority — and includes
+/// `services/service-com-amazonaws-transcribestreaming-transcribe/src/service.rs`,
+/// `services/service-com-amazonaws-applicationsignals-applicationsignals/src/service.rs`,
+/// `services/service-com-amazonaws-sagemakerruntimehttp2-amazonsagemakerruntimehttp2/src/ops/invoke_endpoint_with_bidirectional_stream.rs`,
+/// `services/service-com-amazonaws-artifact-artifact/src/service.rs`,
+/// `services/service-com-amazonaws-directoryservicedata-directoryservicedata/src/service.rs`,
+/// `services/service-com-amazonaws-lightsail-lightsail-20161128/src/service.rs`,
+/// `services/service-com-amazonaws-mediapackagev2-mediapackagev2/src/service.rs`,
+/// `services/service-com-amazonaws-sso-swbportalservice/src/service.rs` and
+/// `services/service-com-amazonaws-workspacesweb-awserminecontrolplaneservice/src/service.rs`
+/// (which returns an owned `Option<String>`). Those copies are to be MIGRATED onto this
+/// function; they are left in place because this change does not own those services'
+/// issues and each one's routing is judged by its own suite. Nothing new should inline
+/// the split again — call this.
+pub fn request_path(uri: &str) -> &str {
+    let path = uri.split('?').next().unwrap_or_default();
+    match path.find("://") {
+        Some(scheme_end) => match path[scheme_end + 3..].find('/') {
+            Some(authority_end) => &path[scheme_end + 3 + authority_end..],
+            None => "/",
+        },
+        None => path,
+    }
 }
 
 /// The index, in `/endpoints/{EndpointName}/<operation>`, of the segment the two
@@ -973,6 +1021,43 @@ mod tests {
             assert_eq!(
                 actual, expected,
                 "case {case:?}: segment {index} of {path:?} expected {expected:?}, got {actual:?}"
+            );
+        }
+    }
+
+    /// The path a service routes on is the URI's path alone: the query string and the
+    /// authority of an absolute-form URI are not part of it.
+    #[test]
+    fn request_path_reads_the_path_out_of_either_uri_form() {
+        // (case, uri, expected)
+        let rows: [(&str, &str, &str); 8] = [
+            ("origin form", "/model/m-1/invoke", "/model/m-1/invoke"),
+            (
+                "origin form with a query string",
+                "/async-invoke?maxResults=10",
+                "/async-invoke",
+            ),
+            (
+                "absolute form",
+                "https://bedrock-runtime.us-east-1.amazonaws.com/model/m-1/converse",
+                "/model/m-1/converse",
+            ),
+            (
+                "absolute form with a query string",
+                "https://host.example/async-invoke?nextToken=abc",
+                "/async-invoke",
+            ),
+            ("absolute form with no path", "https://host.example", "/"),
+            ("absolute form, root path", "https://host.example/", "/"),
+            ("the root path", "/", "/"),
+            ("the empty uri", "", ""),
+        ];
+
+        for (case, uri, expected) in rows {
+            let actual = request_path(uri);
+            assert_eq!(
+                actual, expected,
+                "case {case:?}: {uri:?} expected {expected:?}, got {actual:?}"
             );
         }
     }

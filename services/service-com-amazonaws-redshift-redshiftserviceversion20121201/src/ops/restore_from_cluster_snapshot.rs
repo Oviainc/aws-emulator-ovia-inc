@@ -604,9 +604,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "The number of nodes specified when provisioning the restored
         // cluster": absent, the snapshot's own node count. The cluster type the
         // count describes is resolved by the rule `CreateCluster` shares.
+        // Bounded BEFORE the pair is resolved and before anything is derived
+        // from the count, exactly as `CreateCluster` bounds it. The count can
+        // come from the snapshot as well as from the request, so both are
+        // checked.
+        let requested_nodes = input.number_of_nodes.or(snapshot.number_of_nodes);
+        if requested_nodes.is_some_and(st::exceeds_nodes_per_cluster_limit) {
+            return Err(
+                RestoreFromClusterSnapshotErrorModeled::NumberOfNodesPerClusterLimitExceededFault(
+                    NumberOfNodesPerClusterLimitExceededFault {
+                        message: Some(st::nodes_per_cluster_limit_message(
+                            requested_nodes.unwrap_or_default(),
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
         let (cluster_type, number_of_nodes) = match st::resolve_cluster_shape(
             None,
-            input.number_of_nodes.or(snapshot.number_of_nodes),
+            requested_nodes,
             None,
         ) {
             Ok(shape) => shape,
@@ -668,6 +685,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .cluster_subnet_group_name
             .clone()
             .or_else(|| source.and_then(|cluster| cluster.cluster_subnet_group_name.clone()));
+        // The account's DEFAULT group exists before anybody creates one, so a
+        // restore that names none is launched into it and a request naming
+        // `default` finds it.
+        let default_subnet_group = store.ensure_default_subnet_group(&region);
         let subnet_group = match requested_subnet_group.as_deref() {
             Some(requested) => match store.subnet_group(requested) {
                 Some(group) => Some(group.clone()),
@@ -684,10 +705,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     )
                 }
             },
-            None => None,
+            None => Some(default_subnet_group),
         };
 
-        let cluster = Cluster {
+        let mut cluster = Cluster {
             cluster_identifier: Some(identifier.clone()),
             node_type: input
                 .node_type
@@ -752,14 +773,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     })
                     .collect(),
             ),
-            cluster_parameter_groups: Some(vec![ClusterParameterGroupStatus {
-                parameter_group_name: Some(
-                    parameter_group_name
-                        .unwrap_or_else(|| st::default_parameter_group(&cluster_version)),
-                ),
-                parameter_apply_status: Some("in-sync".to_string()),
-                cluster_parameter_status_list: None,
-            }]),
+            cluster_parameter_groups: Some(st::cluster_parameter_group_status(
+                parameter_group_name,
+            )),
             cluster_subnet_group_name: subnet_group
                 .as_ref()
                 .and_then(|group| group.cluster_subnet_group_name.clone()),
@@ -873,13 +889,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             availability_zone_relocation_status: Some(
                 input
                     .availability_zone_relocation
-                    .map(|on| if on { "enabled" } else { "disabled" }.to_string())
+                    .map(|on| st::availability_zone_relocation_status(Some(on)))
                     .or_else(|| {
                         source.and_then(|cluster| {
                             cluster.availability_zone_relocation_status.clone()
                         })
                     })
-                    .unwrap_or_else(|| "disabled".to_string()),
+                    .unwrap_or_else(|| st::availability_zone_relocation_status(None)),
             ),
             // The restored cluster holds its own copy of the data, so it is its
             // own namespace.
@@ -927,6 +943,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // neither member changes the cluster this call creates.
             ..Default::default()
         };
+        // The same shared rule `CreateCluster` applies: every member the service
+        // derives from the cluster's own configuration, so a restored cluster
+        // reports the same member set a created one does.
+        st::populate_derived_members(&mut cluster, &cluster_type, created_at);
 
         store.clusters.push(st::StoredCluster {
             cluster: cluster.clone(),

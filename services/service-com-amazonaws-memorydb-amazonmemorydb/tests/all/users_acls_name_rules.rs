@@ -746,7 +746,7 @@ async fn an_acls_minimum_engine_version_follows_every_membership_change() {
         (
             "an ACL state does not hold",
             json!({ "ACLName": "no-such-acl", "UserNamesToAdd": ["pw-one"] }),
-            404,
+            400,
             "ACLNotFoundFault",
         ),
         (
@@ -792,7 +792,7 @@ async fn an_acls_minimum_engine_version_follows_every_membership_change() {
         (
             "a member removed that is not one",
             json!({ "ACLName": "moving-acl", "UserNamesToRemove": ["pw-two"] }),
-            404,
+            400,
             "UserNotFoundFault",
         ),
         // One past the membership bound, in each list that can reach it: the work a
@@ -970,7 +970,7 @@ async fn a_cluster_takes_only_an_engine_version_its_engine_publishes() {
         )
         .await;
         assert_eq!(
-            status, 404,
+            status, 400,
             "case {case:?}: a refused create must leave no cluster behind, got {status} \
              with {described}"
         );

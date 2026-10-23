@@ -15,6 +15,8 @@
 mod app_authorization_and_ingestion_dependency;
 #[path = "all/app_bundle_ingestion_lifecycle.rs"]
 mod app_bundle_ingestion_lifecycle;
+#[path = "all/create_app_authorization_contract.rs"]
+mod create_app_authorization_contract;
 #[path = "all/ingestion_deletion.rs"]
 mod ingestion_deletion;
 #[path = "all/ingestion_destination_lifecycle.rs"]

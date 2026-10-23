@@ -319,6 +319,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         use crate::state::{
             architecture_for, availability_zones_in_region, private_dns_name, request_region,
             require_service_state, validate_tag_size, InstanceRecord, InstanceStateName,
+            MONITORING_STATE_DISABLED, MONITORING_STATE_ENABLED,
             PendingTransition, ReservationRecord, DEFAULT_INSTANCE_TYPE, MAX_INSTANCES_PER_RUN,
             MAX_SECURITY_GROUPS_PER_INSTANCE, MAX_STORED_BYTES, MAX_STORED_INSTANCES,
             MAX_USER_DATA_BYTES, RUN_INSTANCES_TAGGABLE_RESOURCES,
@@ -506,9 +507,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .as_ref()
             .is_some_and(|monitoring| monitoring.enabled)
         {
-            "enabled"
+            // One spelling of the `MonitoringState` words for every launch path.
+            MONITORING_STATE_ENABLED
         } else {
-            "disabled"
+            MONITORING_STATE_DISABLED
         };
         let security_groups: Vec<(Option<String>, Option<String>)> = input
             .security_group_ids
@@ -534,11 +536,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // Each instance retains a copy of the request's user data, tags and security
-        // groups, so the launch has a byte size as well as a count.
+        // Each instance retains a copy of EVERY caller-chosen string of the launch —
+        // its user data, tags and security groups, and equally the image id, instance
+        // type, subnet, key pair name and zone — so the launch has a byte size as well
+        // as a count, and the size asked for here is the one
+        // `crate::state::instance_payload_bytes` charges per instance below.
         let requested = usize::try_from(input.max_count).unwrap_or(usize::MAX);
         let per_instance_bytes = input.user_data.as_ref().map_or(0, String::len)
             + input.client_token.as_ref().map_or(0, String::len)
+            + image_id.len()
+            + instance_type.len()
+            + input.subnet_id.as_ref().map_or(0, String::len)
+            + input.key_name.as_ref().map_or(0, String::len)
+            + availability_zone.len()
             + crate::state::tag_bytes(&tags)
             + security_groups
                 .iter()
@@ -664,6 +674,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 disable_api_termination: input.disable_api_termination.unwrap_or(false),
                 tags: tags.clone(),
                 client_token: input.client_token.clone(),
+                // An on-demand launch fulfills no Spot Instance request, so the instance
+                // carries neither a request id nor the `spot` lifecycle.
+                spot_instance_request_id: None,
             });
         }
 

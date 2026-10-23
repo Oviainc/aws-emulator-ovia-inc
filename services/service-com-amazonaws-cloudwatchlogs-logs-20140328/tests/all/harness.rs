@@ -19,6 +19,7 @@ pub const REGION: &str = "eu-west-2";
 /// One service mounted on one shared engine, reached over the wire.
 pub struct Logs {
     router: smithy_server_runtime::MultiServiceRouter,
+    engine: Arc<engine::InMemoryEngine>,
 }
 
 impl Logs {
@@ -27,9 +28,21 @@ impl Logs {
         let mut router = smithy_server_runtime::MultiServiceRouter::new();
         router.set_request_authentication(false);
         router.register_service(
-            service_com_amazonaws_cloudwatchlogs_logs_20140328::EmulatedService::new(engine),
+            service_com_amazonaws_cloudwatchlogs_logs_20140328::EmulatedService::new(Arc::clone(
+                &engine,
+            )),
         );
-        Self { router }
+        Self { router, engine }
+    }
+
+    /// The ONE shared engine this service is mounted on — the store every request through
+    /// [`Logs::call`] reads and writes.
+    ///
+    /// A suite reaches for this only to stand up a resource whose CREATING operation is
+    /// still a scaffold stub, so there is no wire call that can put one in the store;
+    /// everything it then asserts goes over the wire like any client's call.
+    pub fn engine(&self) -> &Arc<engine::InMemoryEngine> {
+        &self.engine
     }
 
     /// Call one operation, returning its HTTP status and parsed JSON body.

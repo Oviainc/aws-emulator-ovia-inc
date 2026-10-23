@@ -179,7 +179,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             DescribeFirewallPolicyError::from(
                 DescribeFirewallPolicyErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(format!("Firewall policy {key} does not exist.")),
+                        message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
                     },
                 ),
             )
@@ -196,6 +196,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
 crate::state::impl_resolve_error!(
     describe_lookup_error -> DescribeFirewallPolicyError, DescribeFirewallPolicyErrorModeled,
-    resource = "firewall policy", plural = "firewall policies",
+    plural = "firewall policies",
     name_member = "FirewallPolicyName", arn_member = "FirewallPolicyArn"
 );

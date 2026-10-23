@@ -161,7 +161,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetScopeErrorModeled::InternalServerException(
                 crate::state::state_unavailable(),
@@ -172,9 +171,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = state.lock();
         state.settle(::std::time::SystemTime::now());
 
+        // A scope id the store holds nothing under is the modelled 404, worded the
+        // way this service words a missing SCOPE: the scope ARN the request names,
+        // built from the request's own Region (`state::scope_not_found`).
         let Some(scope) = state.scopes.get(&input.scope_id) else {
             return Err(GetScopeErrorModeled::ResourceNotFoundException(
-                crate::state::not_found(crate::state::SCOPE_RESOURCE, &input.scope_id),
+                crate::state::scope_not_found(
+                    &crate::state::request_region(ctx.parts()),
+                    &input.scope_id,
+                ),
             )
             .into());
         };

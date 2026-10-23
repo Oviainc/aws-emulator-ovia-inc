@@ -10,13 +10,14 @@
 //!
 //! 1. Associating a supported public registry stores it on the repository as its ONE
 //!    external connection, with the `packageFormat` of that registry and status
-//!    `Available`, and answers with the repository record as it now stands — which a
+//!    `AVAILABLE`, and answers with the repository record as it now stands — which a
 //!    later `DescribeRepository` reports byte-identically.
 //! 2. A repository holds at most one external connection: a second, different one is
-//!    `ServiceQuotaExceededException` (402) and re-associating the one already held is
-//!    `ConflictException` (409); neither writes anything.
-//! 3. A connection name that is not a registry CodeArtifact supports is
-//!    `ValidationException` (400) and stores nothing.
+//!    refused on its input as `ValidationException` (400) stating the limit, and
+//!    re-associating the one already held is `ConflictException` (409); neither writes
+//!    anything.
+//! 3. A well-formed connection name that is not a registry CodeArtifact supports names a
+//!    registry that does not exist: `ResourceNotFoundException` (404), storing nothing.
 //! 4. An unresolvable domain or repository (including a `domainOwner` that does not own
 //!    the domain) is `ResourceNotFoundException` (404).
 
@@ -51,8 +52,11 @@ const SUPPORTED_CONNECTIONS: &[(&str, &str)] = &[
     ("public:crates-io", "cargo"),
 ];
 
-/// The only value `ExternalConnectionStatus` models.
-const AVAILABLE: &str = "Available";
+/// The one external-connection status, as the WIRE spells it: the live responses of
+/// `AssociateExternalConnection` and `DescribeRepository` return `AVAILABLE`, where the
+/// on-disk model's `ExternalConnectionStatus` lists `Available` and is stale for this
+/// member.
+const AVAILABLE: &str = "AVAILABLE";
 
 /// One HTTP answer's `repository` member.
 impl Answer {
@@ -62,7 +66,11 @@ impl Answer {
     }
 }
 
-async fn create_repository(router: &MultiServiceRouter, domain: &str, repository: &str) -> Answer {
+pub(crate) async fn create_repository(
+    router: &MultiServiceRouter,
+    domain: &str,
+    repository: &str,
+) -> Answer {
     call(
         router,
         "POST",
@@ -86,7 +94,7 @@ async fn describe_repository(
     .await
 }
 
-async fn associate(
+pub(crate) async fn associate(
     router: &MultiServiceRouter,
     domain: &str,
     repository: &str,
@@ -108,7 +116,7 @@ async fn associate(
 /// Percent-encode the characters a connection name may carry that a query string reads
 /// specially. `ExternalConnectionName`'s pattern allows `:`, `.`, `-` and `_` only, so
 /// `:` is the single character needing it.
-fn urlencode(value: &str) -> String {
+pub(crate) fn urlencode(value: &str) -> String {
     value.replace(':', "%3A")
 }
 
@@ -122,7 +130,7 @@ fn connections(repository: &Value) -> Vec<Value> {
 }
 
 /// Rule 1: every supported registry can be associated, is stored with that registry's
-/// package format and the `Available` status, and is reported by a later read.
+/// package format and the `AVAILABLE` status, and is reported by a later read.
 #[tokio::test]
 async fn each_supported_connection_is_stored_with_its_package_format() {
     let router = emulator();
@@ -189,8 +197,9 @@ async fn each_supported_connection_is_stored_with_its_package_format() {
     }
 }
 
-/// Rule 2: one external connection per repository — a second, different one is refused
-/// as a quota, the one already held is refused as a conflict, and neither writes.
+/// Rule 2: one external connection per repository — a second, different one is refused as
+/// a bad request stating the limit, the one already held is refused as a conflict, and
+/// neither writes.
 #[tokio::test]
 async fn a_repository_holds_at_most_one_external_connection() {
     let router = emulator();
@@ -205,15 +214,15 @@ async fn a_repository_holds_at_most_one_external_connection() {
             "second-other-format",
             "public:npmjs",
             "public:pypi",
-            402,
-            "ServiceQuotaExceededException",
+            400,
+            "ValidationException",
         ),
         (
             "second-same-format",
             "public:maven-central",
             "public:maven-clojars",
-            402,
-            "ServiceQuotaExceededException",
+            400,
+            "ValidationException",
         ),
         (
             "repeat-of-the-held-one",
@@ -260,8 +269,8 @@ async fn a_repository_holds_at_most_one_external_connection() {
     }
 }
 
-/// Rule 3: a name that is not a registry CodeArtifact supports is a `ValidationException`
-/// and stores nothing.
+/// Rule 3: a name that is not a registry CodeArtifact supports names a connection that
+/// does not exist — `ResourceNotFoundException` — and stores nothing.
 #[tokio::test]
 async fn an_unsupported_connection_name_is_refused() {
     let router = emulator();
@@ -290,13 +299,13 @@ async fn an_unsupported_connection_name_is_refused() {
 
         let answer = associate(&router, domain, &repository, connection).await;
         assert_eq!(
-            answer.status, 400,
-            "case {connection:?}: expected HTTP 400, got {answer:?}"
+            answer.status, 404,
+            "case {connection:?}: expected HTTP 404, got {answer:?}"
         );
         assert_eq!(
             answer.code(),
-            "ValidationException",
-            "case {connection:?}: expected ValidationException, got {:?}",
+            "ResourceNotFoundException",
+            "case {connection:?}: expected ResourceNotFoundException, got {:?}",
             answer.code()
         );
 

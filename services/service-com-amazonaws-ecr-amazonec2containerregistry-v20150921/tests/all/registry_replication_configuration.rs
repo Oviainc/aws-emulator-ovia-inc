@@ -25,6 +25,38 @@ const FOREIGN_REGISTRY_ID: &str = "111122223333";
 /// (`smithy_query(query="shape",shape="ReplicationRuleList")`).
 const MAX_REPLICATION_RULES: usize = 25;
 
+/// Region codes this suite replicates to, from `emulator_telemetry::policy::KNOWN_REGIONS`
+/// ("every AWS region the wire may carry"), the catalog a replication destination's
+/// Region must appear in. Enough of them to fill the modelled maximum rule count, one
+/// Region per rule.
+const DESTINATION_REGIONS: [&str; MAX_REPLICATION_RULES] = [
+    "af-south-1",
+    "ap-east-1",
+    "ap-east-2",
+    "ap-northeast-1",
+    "ap-northeast-2",
+    "ap-northeast-3",
+    "ap-south-1",
+    "ap-south-2",
+    "ap-southeast-1",
+    "ap-southeast-2",
+    "ap-southeast-3",
+    "ap-southeast-4",
+    "ap-southeast-5",
+    "ap-southeast-6",
+    "ap-southeast-7",
+    "ca-central-1",
+    "ca-west-1",
+    "eu-central-1",
+    "eu-central-2",
+    "eu-north-1",
+    "eu-south-1",
+    "eu-south-2",
+    "eu-west-2",
+    "eu-west-3",
+    "il-central-1",
+];
+
 /// The `replicationConfiguration` `DescribeRegistry` reports, having checked that the
 /// registry it reports is this one.
 async fn described_configuration(router: &MultiServiceRouter, case: &str, region: &str) -> Value {
@@ -66,12 +98,9 @@ async fn describe_registry_reports_the_configuration_each_put_persisted() {
     // The rows differ along what the rule generalises over: the number of rules, the
     // number of destinations in a rule, whether a rule carries repository filters, and
     // whether a destination is in this account or another.
-    let many_rules: Vec<Value> = (0..MAX_REPLICATION_RULES)
-        .map(|index| {
-            // A synthetic Region name, valid per `Region`'s `^[0-9a-z-]{2,25}$`, so the
-            // 25 rules differ from one another.
-            rule(json!([destination(REGISTRY_ID, &format!("eu-test-{index}"))]))
-        })
+    let many_rules: Vec<Value> = DESTINATION_REGIONS
+        .iter()
+        .map(|region| rule(json!([destination(REGISTRY_ID, region)])))
         .collect();
 
     let cases: Vec<(&str, Value)> = vec![
@@ -265,7 +294,13 @@ async fn a_rule_list_past_the_modelled_maximum_is_refused() {
     let rules = |count: usize| -> Value {
         Value::Array(
             (0..count)
-                .map(|index| rule(json!([destination(REGISTRY_ID, &format!("eu-test-{index}"))])))
+                .map(|index| {
+                    // Cycling the catalog, so a count past the number of Regions listed
+                    // still produces that many rules: the bound under test is on the
+                    // rule COUNT, and two rules may name one destination.
+                    let region = DESTINATION_REGIONS[index % DESTINATION_REGIONS.len()];
+                    rule(json!([destination(REGISTRY_ID, region)]))
+                })
                 .collect(),
         )
     };

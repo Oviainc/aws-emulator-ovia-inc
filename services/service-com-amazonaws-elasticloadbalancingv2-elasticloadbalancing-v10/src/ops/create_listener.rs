@@ -12,6 +12,12 @@
 //! port the load balancer already listens on returns the stored listener when the
 //! settings match, and is `DuplicateListenerException` when they do not.
 //!
+//! The default certificate is bracketed to the protocols that terminate TLS —
+//! "[HTTPS and TLS listeners] The default certificate for the listener. You must
+//! provide exactly one certificate." — so one of those listeners is refused when it
+//! carries no certificate (or more than one), and any other listener is refused when
+//! it carries one. See [`check_default_certificate`].
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -226,6 +232,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx);
         let now = std::time::SystemTime::now();
 
+        // The default certificate belongs to the listeners the model brackets it for,
+        // and only to those. Checked before anything is looked up, because it reads
+        // the request alone.
+        check_default_certificate(input.protocol.as_deref(), input.certificates.as_deref())?;
+
         let candidate = ListenerRecord {
             arn: String::new(),
             load_balancer_arn: input.load_balancer_arn.clone(),
@@ -347,4 +358,73 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             listeners: Some(vec![stored.to_shape()]),
         })
     }
+}
+
+/// The listener protocols that terminate TLS at the load balancer, and so are the ones
+/// the model brackets the certificate members for.
+///
+/// From this model's own documentation of `CreateListenerInput$Certificates` —
+/// "[HTTPS and TLS listeners] The default certificate for the listener. You must
+/// provide exactly one certificate." — and of `SslPolicy`, bracketed the same way
+/// (`smithy_query(query="operation",operation="CreateListener")`). `ProtocolEnum`'s
+/// other values (GENEVE, HTTP, QUIC, TCP, TCP_QUIC, TCP_UDP, UDP) are outside that
+/// bracket, as is a listener that names no protocol at all — the model: "You can't
+/// specify a protocol for a Gateway Load Balancer".
+const TLS_TERMINATING_PROTOCOLS: &[&str] = &["HTTPS", "TLS"];
+
+/// Enforce that bracket on the listener's default certificate: a TLS-terminating
+/// listener is created with EXACTLY ONE certificate, carrying the ARN that names it,
+/// and a listener that terminates no TLS is created with none.
+///
+/// The model states the rule in the member's documentation and declares no error shape
+/// for breaking it, so the refusal is this service's own input-validation code
+/// (`400` `ValidationError`) with a message naming the member and the protocol it was
+/// judged against — the only thing the caller can act on.
+fn check_default_certificate(
+    protocol: Option<&str>,
+    certificates: Option<&[Certificate]>,
+) -> Result<(), CreateListenerError> {
+    let certificates = certificates.unwrap_or_default();
+    let terminates_tls = protocol.is_some_and(|value| TLS_TERMINATING_PROTOCOLS.contains(&value));
+    // How the refusal names what it judged, for a listener that names no protocol as
+    // well as for one that does.
+    let listener = match protocol {
+        Some(value) => format!("{value} listeners"),
+        None => "a listener with no protocol".to_string(),
+    };
+
+    if !terminates_tls {
+        if certificates.is_empty() {
+            return Ok(());
+        }
+        return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+            "Certificates cannot be specified for {listener}: the default certificate \
+             applies only to {} listeners",
+            TLS_TERMINATING_PROTOCOLS.join(" and ")
+        )));
+    }
+
+    if certificates.is_empty() {
+        // AWS's own wording for this refusal, built from the protocol the request
+        // named: "A certificate must be specified for HTTPS listeners".
+        return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+            "A certificate must be specified for {listener}"
+        )));
+    }
+    if certificates.len() > 1 {
+        return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+            "You must provide exactly one certificate for {listener}, got {}",
+            certificates.len()
+        )));
+    }
+    if certificates[0]
+        .certificate_arn
+        .as_deref()
+        .is_none_or(str::is_empty)
+    {
+        return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+            "CertificateArn must be set on the certificate of {listener}"
+        )));
+    }
+    Ok(())
 }

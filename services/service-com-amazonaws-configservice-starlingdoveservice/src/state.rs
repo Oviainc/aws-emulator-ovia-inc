@@ -32,6 +32,11 @@ use crate::ops::types::{
 // staying out of it keeps this change from colliding with theirs.
 use crate::ops::types::ScopeConfiguration;
 
+// `BaseConfigurationItem` is named separately for the same reason as
+// `ScopeConfiguration` above: it is what the aggregate read paths report a discovered
+// resource's current configuration as.
+use crate::ops::types::BaseConfigurationItem;
+
 /// The ARN namespace of this service (`awsService.arnNamespace` in the model), used
 /// for every ARN this emulator mints.
 pub const ARN_SERVICE: &str = "config";
@@ -85,6 +90,31 @@ pub const RECORDING_STRATEGY_INCLUSION: &str = "INCLUSION_BY_RESOURCE_TYPES";
 /// `RecordingMode`: "Config supports Continuous recording and Daily recording", and
 /// continuous recording is the recorder's default).
 pub const RECORDING_FREQUENCY_CONTINUOUS: &str = "CONTINUOUS";
+
+/// The other `RecordingFrequency` a recorder can record a resource type at
+/// (`com.amazonaws.configservice#RecordingFrequency`, whose values are `CONTINUOUS`
+/// and `DAILY`). A configuration item reports its `recordingFrequency` only under
+/// this one (`BaseConfigurationItem$recordingFrequency`: "This field only appears in
+/// the API response when DAILY recording is enabled for a resource type. If this
+/// field is not present, CONTINUOUS recording is enabled for that resource type").
+pub const RECORDING_FREQUENCY_DAILY: &str = "DAILY";
+
+/// `ConfigurationItemStatus` values
+/// (`com.amazonaws.configservice#ConfigurationItemStatus`): the configuration of the
+/// resource has been recorded (`OK`), the resource has been discovered but its
+/// configuration was not recorded (`ResourceDiscovered`), and the resource has been
+/// deleted (`ResourceDeleted`).
+pub const CONFIGURATION_ITEM_STATUS_OK: &str = "OK";
+/// See [`CONFIGURATION_ITEM_STATUS_OK`].
+pub const CONFIGURATION_ITEM_STATUS_RESOURCE_DISCOVERED: &str = "ResourceDiscovered";
+/// See [`CONFIGURATION_ITEM_STATUS_OK`].
+pub const CONFIGURATION_ITEM_STATUS_RESOURCE_DELETED: &str = "ResourceDeleted";
+
+/// The only published `AggregatorFilterType` value
+/// (`com.amazonaws.configservice#AggregatorFilterType`): an aggregator filter lists
+/// the values it takes IN, so a filter that lists resource types aggregates those
+/// types and no others.
+pub const AGGREGATOR_FILTER_TYPE_INCLUDE: &str = "INCLUDE";
 
 /// The `RecordingScope` of a CUSTOMER MANAGED configuration recorder
 /// (`com.amazonaws.configservice#RecordingScope`: `INTERNAL` when the recorded
@@ -300,6 +330,18 @@ pub fn delivery_frequency_interval(frequency: &str) -> Option<Duration> {
 /// keeps the transient `Pending` status observable to a caller that describes the
 /// status straight after starting the recorder.
 pub const RECORDER_STATUS_SETTLE_AFTER: Duration = Duration::from_millis(500);
+
+/// How long after `DeliverConfigSnapshot` the configuration-snapshot delivery that
+/// call schedules completes.
+///
+/// A snapshot delivery is in flight when the call returns — `DeliverConfigSnapshot`
+/// answers with "the ID of the snapshot that is being created" and Config notifies
+/// the start of the delivery and then its completion — so the completion is a change
+/// the clock owes rather than one the call itself makes. AWS documents no duration
+/// for it, so the span is CHOSEN: it sits inside the 250–750 ms window this project
+/// uses for such a transition, which keeps the in-flight delivery observable to a
+/// caller that describes the channel's status straight after scheduling it.
+pub const SNAPSHOT_DELIVERY_SETTLE_AFTER: Duration = Duration::from_millis(500);
 
 /// The most Config rules this account and Region can hold, after which
 /// `PutConfigRule` refuses a new rule with `MaxNumberOfConfigRulesExceededException`.
@@ -793,6 +835,41 @@ impl RecorderStatusEntry {
     }
 }
 
+/// One configuration-snapshot delivery `DeliverConfigSnapshot` scheduled for a
+/// delivery channel.
+///
+/// The delivery is NOT complete when the call returns (see
+/// [`SNAPSHOT_DELIVERY_SETTLE_AFTER`]), so the entry stores both the instant the
+/// delivery was attempted and the instant it is due to complete; nothing sleeps for
+/// it and no read moves it, because every reported instant is derived from these two.
+#[derive(Debug, Clone)]
+pub struct SnapshotDeliveryEntry {
+    /// The `configSnapshotId` the scheduling call answered with.
+    pub id: String,
+    /// When the delivery was scheduled, which is when it was attempted.
+    pub attempted_at: SystemTime,
+    /// When the delivery completes — [`SNAPSHOT_DELIVERY_SETTLE_AFTER`] after it was
+    /// attempted.
+    pub completes_at: SystemTime,
+}
+
+impl SnapshotDeliveryEntry {
+    /// The delivery `DeliverConfigSnapshot` scheduled at `at`, carrying the snapshot
+    /// id it answered with.
+    pub fn scheduled(id: String, at: SystemTime) -> Self {
+        Self {
+            id,
+            attempted_at: at,
+            completes_at: at + SNAPSHOT_DELIVERY_SETTLE_AFTER,
+        }
+    }
+
+    /// Whether this delivery has completed as of `now`.
+    pub fn completed_by(&self, now: SystemTime) -> bool {
+        now >= self.completes_at
+    }
+}
+
 /// One persisted delivery channel.
 #[derive(Debug, Clone)]
 pub struct DeliveryChannelEntry {
@@ -807,6 +884,13 @@ pub struct DeliveryChannelEntry {
     /// `DescribeDeliveryChannelStatus` derives every reported instant from it. An
     /// update keeps the instant the channel was first created.
     pub created_at: SystemTime,
+    /// The last configuration-snapshot delivery `DeliverConfigSnapshot` scheduled for
+    /// this channel, if any.
+    ///
+    /// ONE entry, not a history: `ConfigExportDeliveryInfo` reports the LAST attempt
+    /// and the last success, so an on-demand delivery supersedes the one before it and
+    /// however many snapshots a caller schedules, this channel grows no further.
+    pub last_snapshot_delivery: Option<SnapshotDeliveryEntry>,
 }
 
 impl DeliveryChannelEntry {
@@ -845,17 +929,24 @@ impl DeliveryChannelEntry {
     }
 
     /// The status of this channel as of `now`, DERIVED from the delivery schedule its
-    /// creation instant anchors: nothing here is stored at write time and reading it
-    /// changes no state, so two callers reading at the same instant see the same thing.
+    /// creation instant anchors and from the snapshot delivery a call last scheduled
+    /// for it: reading it changes no state, so two callers reading at the same instant
+    /// see the same thing.
     pub fn status_at(&self, now: SystemTime) -> DeliveryChannelStatus {
         DeliveryChannelStatus {
             name: Some(self.name.clone()),
-            config_snapshot_delivery_info: Some(
-                self.export_delivery_info(now, self.snapshot_delivery_interval()),
-            ),
-            config_history_delivery_info: Some(
-                self.export_delivery_info(now, CONFIG_HISTORY_DELIVERY_INTERVAL),
-            ),
+            config_snapshot_delivery_info: Some(self.export_delivery_info(
+                now,
+                self.snapshot_delivery_interval(),
+                self.last_snapshot_delivery.as_ref(),
+            )),
+            config_history_delivery_info: Some(self.export_delivery_info(
+                now,
+                CONFIG_HISTORY_DELIVERY_INTERVAL,
+                // The configuration history has a schedule only: no operation of this
+                // API delivers one on demand.
+                None,
+            )),
             config_stream_delivery_info: self.stream_delivery_info(),
         }
     }
@@ -863,11 +954,29 @@ impl DeliveryChannelEntry {
     /// The delivery info of one periodic export (the snapshot or the configuration
     /// history) as of `now`, for a schedule that delivers every `interval`.
     ///
-    /// Exactly `floor((now - created_at) / interval)` deliveries are behind us, so the
-    /// next one falls one interval after the last of them — strictly after `now`, and
-    /// never more than one interval after it. Before the first delivery there is no
-    /// attempt to report, so only `nextDeliveryTime` carries a value.
-    fn export_delivery_info(&self, now: SystemTime, interval: Duration) -> ConfigExportDeliveryInfo {
+    /// Exactly `floor((now - created_at) / interval)` scheduled deliveries are behind
+    /// us. The next delivery falls ONE INTERVAL AFTER THE LAST DELIVERY THAT
+    /// COMPLETED — that is what makes the `deliveryFrequency` the bound on the next
+    /// delivery time — and one interval after the channel's creation while no delivery
+    /// has completed at all. Either way it is strictly after `now` and never more than
+    /// one interval after it, because the instant it is measured from is at or before
+    /// `now` and later than one interval before it. Before the first delivery there is
+    /// no attempt to report, so only `nextDeliveryTime` carries a value.
+    ///
+    /// `on_demand` is the delivery of this kind that was last scheduled by a call
+    /// rather than by the schedule. It is an attempt of its own, so the reported
+    /// attempt is the LATER of it and the last scheduled delivery; it counts as a
+    /// completed delivery only once it has completed, and from then on it is what the
+    /// next delivery is measured from. `lastStatus` is the status of the last delivery
+    /// that COMPLETED: `DeliveryStatus` publishes no in-progress value (`Success`,
+    /// `Failure`, `Not_Applicable`), so a delivery still in flight contributes an
+    /// attempt time and no status.
+    fn export_delivery_info(
+        &self,
+        now: SystemTime,
+        interval: Duration,
+        on_demand: Option<&SnapshotDeliveryEntry>,
+    ) -> ConfigExportDeliveryInfo {
         let interval_secs = interval.as_secs().max(1);
         let elapsed = now
             .duration_since(self.created_at)
@@ -876,14 +985,35 @@ impl DeliveryChannelEntry {
         let delivered = elapsed / interval_secs;
         let last_delivery = (delivered > 0)
             .then(|| self.created_at + Duration::from_secs(delivered * interval_secs));
-        let next_delivery = self.created_at + Duration::from_secs((delivered + 1) * interval_secs);
+
+        let last_attempt = [last_delivery, on_demand.map(|delivery| delivery.attempted_at)]
+            .into_iter()
+            .flatten()
+            .max();
+        let last_success = [
+            last_delivery,
+            on_demand
+                .filter(|delivery| delivery.completed_by(now))
+                .map(|delivery| delivery.completes_at),
+        ]
+        .into_iter()
+        .flatten()
+        .max();
+
+        // ONE form of the interval in both branches, so the periodic and the on-demand
+        // schedules advance by provably the same step.
+        let step = Duration::from_secs(interval_secs);
+        let next_delivery = match last_success {
+            Some(delivered_at) => delivered_at + step,
+            None => self.created_at + step,
+        };
 
         ConfigExportDeliveryInfo {
-            last_status: last_delivery.map(|_| DELIVERY_STATUS_SUCCESS.to_string()),
+            last_status: last_success.map(|_| DELIVERY_STATUS_SUCCESS.to_string()),
             last_error_code: None,
             last_error_message: None,
-            last_attempt_time: last_delivery.map(timestamp),
-            last_successful_time: last_delivery.map(timestamp),
+            last_attempt_time: last_attempt.map(timestamp),
+            last_successful_time: last_success.map(timestamp),
             next_delivery_time: Some(timestamp(next_delivery)),
         }
     }
@@ -1038,6 +1168,20 @@ pub struct RuleEvaluationEntry {
     pub last_successful_invocation_at: Option<SystemTime>,
     /// When the last completed pass finished evaluating the resources in scope.
     pub last_successful_evaluation_at: Option<SystemTime>,
+    /// Whether the pass in flight was asked for ON DEMAND — by a
+    /// `StartConfigRulesEvaluation` call — rather than run by Config itself because
+    /// the rule was written.
+    ///
+    /// The on-demand path states a precondition of its own about the pass IT started:
+    /// "An existing StartConfigRulesEvaluation call for the specified rules must
+    /// complete before you can call the API again" (`StartConfigRulesEvaluation`).
+    /// That sentence is about an existing on-demand call, not about the pass Config
+    /// runs by itself when a rule is created or updated ("When you create a rule,
+    /// Config evaluates your resources against the rule automatically" — which the
+    /// same page says needs no call from the caller), so which kind of pass is in
+    /// flight has to be part of the record for the precondition to be checkable.
+    /// Cleared when the pass completes, like every other in-flight member here.
+    pub on_demand: bool,
 }
 
 impl RuleEvaluationEntry {
@@ -1049,10 +1193,30 @@ impl RuleEvaluationEntry {
         evaluation
     }
 
-    /// Record that Config owes this rule an evaluation pass, invoked at `at`.
+    /// Record that Config owes this rule an evaluation pass, invoked at `at`, because
+    /// the rule was written.
     pub fn invoke(&mut self, at: SystemTime) {
         self.invoked_at = Some(at);
         self.completes_at = Some(at + RULE_EVALUATION_SETTLE_AFTER);
+        self.on_demand = false;
+    }
+
+    /// Record that Config owes this rule an evaluation pass, invoked at `at`, because
+    /// a caller asked for one on demand (`StartConfigRulesEvaluation`: it "re-runs an
+    /// evaluation against the last known state of your resources").
+    ///
+    /// The pass itself is the same pass a write owes — same invocation instant, same
+    /// span before it completes — so the two share [`Self::invoke`]; only
+    /// [`Self::on_demand`] tells them apart.
+    pub fn invoke_on_demand(&mut self, at: SystemTime) {
+        self.invoke(at);
+        self.on_demand = true;
+    }
+
+    /// Whether a pass a `StartConfigRulesEvaluation` call started has still not
+    /// completed as of `now`. See [`Self::on_demand`].
+    pub fn on_demand_in_progress(&self, now: SystemTime) -> bool {
+        self.on_demand && self.in_progress(now)
     }
 
     /// Whether the pass this rule is owed has still not completed as of `now`.
@@ -1082,6 +1246,7 @@ impl RuleEvaluationEntry {
             self.last_successful_evaluation_at = Some(due);
             self.invoked_at = None;
             self.completes_at = None;
+            self.on_demand = false;
         }
     }
 }
@@ -1446,6 +1611,88 @@ impl DiscoveredResourceEntry {
             resource_deletion_time: self.deleted_at.map(timestamp),
         }
     }
+
+    /// The resource's CURRENT configuration item, as the configuration-item read paths
+    /// report it: this account's data in `aws_region`, recorded at
+    /// `recording_frequency` (see [`ComAmazonawsConfigserviceStarlingdoveserviceState::recording_frequency_of`]).
+    ///
+    /// A `BaseConfigurationItem` is the configuration item WITHOUT the resource's tags
+    /// and relationships (`BatchGetAggregateResourceConfig`: "The API does not return
+    /// tags and relationships"), so the tags the inventory holds are deliberately not
+    /// reported here, and `supplementaryConfiguration` — the extra configuration
+    /// blocks a recorder captures beside the configuration itself — carries nothing
+    /// this emulator records.
+    ///
+    /// Three members stay unset because nothing in this emulator knows them: the
+    /// resource's own `arn` and `availabilityZone` belong to the service that owns the
+    /// resource, and `resourceCreationTime` is the instant that service created it,
+    /// none of which a recorded configuration item carries
+    /// (`PutResourceConfig` records the type, the id, the name, the schema version and
+    /// the configuration document, and nothing else).
+    pub fn to_base_configuration_item(
+        &self,
+        aws_region: &str,
+        recording_frequency: &str,
+    ) -> BaseConfigurationItem {
+        // Daily recording delivers a configuration item separately from capturing it,
+        // which is the only frequency that reports either member
+        // (`BaseConfigurationItem$configurationItemDeliveryTime`: "if you are using
+        // daily recording, this field will be populated. However, if you are using
+        // continuous recording, this field will be omitted since the delivery time is
+        // instantaneous as the CI is available right away").
+        let daily = recording_frequency == RECORDING_FREQUENCY_DAILY;
+        BaseConfigurationItem {
+            // "The version number of the resource configuration" — the schema version
+            // the configuration document was recorded under
+            // (`PutResourceConfigRequest$SchemaVersionId`).
+            version: self.schema_version_id.clone(),
+            account_id: Some(::emulator_server::emulator_account_id().to_string()),
+            configuration_item_capture_time: self.last_recorded_at.map(timestamp),
+            configuration_item_status: Some(self.configuration_item_status().to_string()),
+            configuration_state_id: self.configuration_state_id(),
+            arn: None,
+            resource_type: Some(self.resource_type.clone()),
+            resource_id: Some(self.resource_id.clone()),
+            resource_name: self.resource_name.clone(),
+            aws_region: Some(aws_region.to_string()),
+            availability_zone: None,
+            resource_creation_time: None,
+            configuration: self.configuration.clone(),
+            supplementary_configuration: None,
+            recording_frequency: daily.then(|| recording_frequency.to_string()),
+            configuration_item_delivery_time: daily
+                .then(|| self.last_recorded_at.map(timestamp))
+                .flatten(),
+        }
+    }
+
+    /// The `ConfigurationItemStatus` of the resource's current configuration item: the
+    /// resource has been deleted, its configuration has been recorded, or it has been
+    /// discovered without its configuration being recorded.
+    pub fn configuration_item_status(&self) -> &'static str {
+        if self.deleted_at.is_some() {
+            CONFIGURATION_ITEM_STATUS_RESOURCE_DELETED
+        } else if self.configuration.is_some() {
+            CONFIGURATION_ITEM_STATUS_OK
+        } else {
+            CONFIGURATION_ITEM_STATUS_RESOURCE_DISCOVERED
+        }
+    }
+
+    /// The `configurationStateId` of the current configuration item — "an identifier
+    /// that indicates the ordering of the configuration items of a resource" — which
+    /// is therefore DERIVED from the instant the item was captured, in milliseconds,
+    /// so recording the resource again moves it forward and two reads of the same
+    /// recorded state report the same id. A resource no configuration item has been
+    /// recorded for has no state to order, so it carries none.
+    pub fn configuration_state_id(&self) -> Option<String> {
+        self.last_recorded_at.map(|at| {
+            at.duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+                .to_string()
+        })
+    }
 }
 
 /// One persisted retention configuration: the name Config gave the object and the
@@ -1565,6 +1812,61 @@ impl ConfigurationAggregatorEntry {
             aggregator_filters: self.aggregator_filters.clone(),
         }
     }
+
+    /// Whether this aggregator aggregates the Config data of `account_id` in `region`.
+    ///
+    /// An aggregator aggregates either listed source accounts, each naming the Regions
+    /// it takes in — every Region (`AllAwsRegions`) or the listed `AwsRegions` — or an
+    /// organization, which takes in every account of that organization over the same
+    /// choice of Regions. An account or a Region no source names is outside the
+    /// aggregator's scope, so it holds nothing for it.
+    pub fn aggregates_source(&self, account_id: &str, region: &str) -> bool {
+        let takes_region = |all_aws_regions: bool, aws_regions: Option<&[String]>| {
+            all_aws_regions
+                || aws_regions.is_some_and(|regions| regions.iter().any(|named| named == region))
+        };
+        let listed_account = self.account_aggregation_sources.iter().any(|source| {
+            source.account_ids.iter().any(|named| named == account_id)
+                && takes_region(source.all_aws_regions, source.aws_regions.as_deref())
+        });
+        listed_account
+            || self
+                .organization_aggregation_source
+                .as_ref()
+                .is_some_and(|source| {
+                    takes_region(source.all_aws_regions, source.aws_regions.as_deref())
+                })
+    }
+
+    /// Whether this aggregator aggregates resources of `resource_type`: every type it
+    /// discovers, unless its `AggregatorFilters` carry a resource-type filter, and
+    /// then only the types that filter lists.
+    ///
+    /// A filter lists the values it takes IN ([`AGGREGATOR_FILTER_TYPE_INCLUDE`] is
+    /// the only published `AggregatorFilterType`), so a filter that lists no type at
+    /// all narrows nothing. The `ServicePrincipal` filter selects which SERVICE-LINKED
+    /// recorders' data the aggregator takes in, and a resource in this store's
+    /// inventory carries no service principal to match it against, so it narrows
+    /// nothing here.
+    pub fn aggregates_resource_type(&self, resource_type: &str) -> bool {
+        let Some(filter) = self
+            .aggregator_filters
+            .as_ref()
+            .and_then(|filters| filters.resource_type.as_ref())
+        else {
+            return true;
+        };
+        let listed = filter.value.as_deref().unwrap_or_default();
+        if listed.is_empty() {
+            return true;
+        }
+        match filter.r#type.as_deref() {
+            // A filter type this emulator does not know cannot be read as a narrowing,
+            // so it takes in every type rather than silently hiding resources.
+            Some(kind) if kind != AGGREGATOR_FILTER_TYPE_INCLUDE => true,
+            _ => listed.iter().any(|named| named == resource_type),
+        }
+    }
 }
 
 /// The key one resource evaluation is listed at: the instant its execution started,
@@ -1605,10 +1907,20 @@ pub struct ResourceEvaluationEntry {
 
 impl ResourceEvaluationEntry {
     /// The modelled `ResourceEvaluation`, read back out of state.
+    ///
+    /// A LISTED evaluation carries its identity and the instant its execution started.
+    /// `ResourceEvaluation$EvaluationMode` is modelled but NOT populated here: the
+    /// recorded `ListResourceEvaluations` entries carry only `ResourceEvaluationId` and
+    /// `EvaluationStartTimestamp`, with the mode living in the request's
+    /// `ResourceEvaluationFilters` vocabulary rather than in the listed item. The mode
+    /// the execution runs in is persisted all the same
+    /// ([`ResourceEvaluationEntry::evaluation_mode`]) — the list path filters on it,
+    /// and `GetResourceEvaluationSummary` reports it, where the model and the
+    /// recordings agree it is populated.
     pub fn to_shape(&self) -> ResourceEvaluation {
         ResourceEvaluation {
             resource_evaluation_id: Some(self.id.clone()),
-            evaluation_mode: Some(self.evaluation_mode.clone()),
+            evaluation_mode: None,
             evaluation_start_timestamp: Some(timestamp(self.started_at)),
         }
     }
@@ -1747,6 +2059,9 @@ pub struct ComAmazonawsConfigserviceStarlingdoveserviceState {
     /// Source of the next configuration recorder id, so every recorder Config
     /// creates here gets a distinct one.
     pub next_recorder_seq: u64,
+    /// Source of the next `configSnapshotId`, so every configuration-snapshot delivery
+    /// `DeliverConfigSnapshot` schedules gets a distinct one.
+    pub next_config_snapshot_seq: u64,
     /// Stored queries, keyed by `QueryName` — unique per account per Region, which is
     /// what one engine's store stands for. A `BTreeMap` so a list of them pages over a
     /// stable ordering and a page token survives inserts and deletes.
@@ -1885,6 +2200,47 @@ impl ComAmazonawsConfigserviceStarlingdoveserviceState {
             .values()
             .filter(|status| status.recording)
             .find_map(|status| self.recorders.get(&status.name))
+    }
+
+    /// The CUSTOMER MANAGED configuration recorder that is RECORDING right now, if
+    /// any: this account's delivery channel delivers what such a recorder records,
+    /// while a service-linked recorder records for the Amazon Web Services service it
+    /// is linked to.
+    pub fn recording_customer_managed_recorder(&self) -> Option<&RecorderEntry> {
+        self.customer_managed_recorders().find(|recorder| {
+            self.recorder_status
+                .get(&recorder.name)
+                .is_some_and(|status| status.recording)
+        })
+    }
+
+    /// The `RecordingFrequency` Config records `resource_type` at: the frequency the
+    /// recording recorder's recording mode OVERRIDES for that resource type, else that
+    /// mode's own frequency, and continuous recording while no recorder is recording
+    /// (`RecordingMode`: "Config supports Continuous recording and Daily recording",
+    /// with `RecordingModeOverride` setting "a specific recording frequency ... for
+    /// all supported resource types in this override").
+    pub fn recording_frequency_of(&self, resource_type: &str) -> &str {
+        let Some(mode) = self
+            .recording_recorder()
+            .and_then(|recorder| recorder.recording_mode.as_ref())
+        else {
+            return RECORDING_FREQUENCY_CONTINUOUS;
+        };
+        let overridden = mode
+            .recording_mode_overrides
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .find(|rule| {
+                !rule.recording_frequency.is_empty()
+                    && rule.resource_types.iter().any(|named| named == resource_type)
+            })
+            .map(|rule| rule.recording_frequency.as_str());
+        overridden
+            .or(Some(mode.recording_frequency.as_str()))
+            .filter(|frequency| !frequency.is_empty())
+            .unwrap_or(RECORDING_FREQUENCY_CONTINUOUS)
     }
 
     /// How many discovered resources Config holds of each resource type it is
@@ -2078,6 +2434,19 @@ pub fn mint_stored_query_id(seq: u64) -> String {
 /// so every operation that refuses an absent stored query words it the same way.
 pub fn no_such_stored_query_message(name: &str) -> String {
     format!("The stored query '{name}' provided in the request does not exist.")
+}
+
+/// The `configSnapshotId` of the `seq`-th configuration-snapshot delivery scheduled
+/// in this emulator: sixteen base-36 characters, the same opaque shape this service's
+/// other server-assigned ids take (see [`mint_recorder_id`]). The model constrains
+/// `DeliverConfigSnapshotResponse$configSnapshotId` to a plain `String`, so the only
+/// requirement is that it identifies one snapshot.
+///
+/// [`splitmix64`] is a bijection on `u64`, so distinct sequence numbers give distinct
+/// ids; the mixing input differs from the other mints', so the n-th snapshot and the
+/// n-th recorder do not carry the same id.
+pub fn mint_config_snapshot_id(seq: u64) -> String {
+    base36(splitmix64(seq ^ 0x5347_4e41_5053_4e50), 16)
 }
 
 /// The DNS suffix every Amazon Web Services service principal ends with, which is
@@ -2340,6 +2709,20 @@ pub fn aggregation_authorization_arn(
     )
 }
 
+/// The separator between the two halves of the key one aggregation authorization is
+/// held under. `AccountId`'s `^\d{12}$` pattern leaves no room for it in the account
+/// id, so the key splits unambiguously at its FIRST occurrence even when the
+/// authorized Region contains one.
+const AGGREGATION_AUTHORIZATION_KEY_SEPARATOR: char = '/';
+
+/// The exact length of an `AccountId` (`com.amazonaws.configservice#AccountId`,
+/// pattern `^\d{12}$`).
+const ACCOUNT_ID_LENGTH: usize = 12;
+
+/// The longest `AwsRegion` the model allows (`com.amazonaws.configservice#AwsRegion`,
+/// `length 1..64`).
+const AWS_REGION_MAX_LENGTH: usize = 64;
+
 /// The key one aggregation authorization is held under: the authorized account id and
 /// the authorized Region, in that order, so `DescribeAggregationAuthorizations` pages
 /// by account and then by Region. `AccountId`'s `^\d{12}$` pattern leaves no room for
@@ -2348,7 +2731,34 @@ pub fn aggregation_authorization_key(
     authorized_account_id: &str,
     authorized_aws_region: &str,
 ) -> String {
-    format!("{authorized_account_id}/{authorized_aws_region}")
+    format!(
+        "{authorized_account_id}{AGGREGATION_AUTHORIZATION_KEY_SEPARATOR}\
+         {authorized_aws_region}"
+    )
+}
+
+/// Encode the key a `DescribeAggregationAuthorizations` page should resume at as an
+/// opaque `NextToken`.
+pub fn encode_aggregation_authorization_token(key: &str) -> String {
+    encode_page_token(key)
+}
+
+/// The key a `NextToken` resumes at, or `None` when the token is malformed — i.e. not
+/// something [`encode_aggregation_authorization_token`] produced, so it does not decode
+/// to a key of the form [`aggregation_authorization_key`] builds: an authorized account
+/// id of exactly twelve digits (`AccountId`, pattern `^\d{12}$`) and an authorized
+/// Region within `AwsRegion`'s 1..64 length.
+pub fn decode_aggregation_authorization_token(token: &str) -> Option<String> {
+    let key = decode_page_token(token)?;
+    let well_formed = match key.split_once(AGGREGATION_AUTHORIZATION_KEY_SEPARATOR) {
+        Some((account, region)) => {
+            account.len() == ACCOUNT_ID_LENGTH
+                && account.chars().all(|digit| digit.is_ascii_digit())
+                && (1..=AWS_REGION_MAX_LENGTH).contains(&region.chars().count())
+        }
+        None => false,
+    };
+    well_formed.then_some(key)
 }
 
 /// The ARN of a Config rule: `arn:aws:config:<region>:<account>:config-rule/<id>`.
@@ -3257,6 +3667,81 @@ mod tests {
                 ),
                 before,
                 "case {case:?}: a second settle must not move the recorded instants"
+            );
+        }
+    }
+
+    #[test]
+    fn only_an_on_demand_pass_is_recorded_as_one_and_only_while_it_runs() {
+        // Rows differ along WHICH pass is in flight and how far the clock has moved:
+        // the pass a write owes, the pass an on-demand call owes, and an on-demand
+        // pass a later write replaced. Only a pass a `StartConfigRulesEvaluation`
+        // call started counts as on demand, and only until it completes.
+        let invoked_at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        type Invoke = fn(&mut RuleEvaluationEntry, SystemTime);
+        let cases: [(&str, &[Invoke], Duration, bool); 6] = [
+            (
+                "a write's pass, in flight",
+                &[RuleEvaluationEntry::invoke],
+                Duration::ZERO,
+                false,
+            ),
+            (
+                "an on-demand pass, in flight",
+                &[RuleEvaluationEntry::invoke_on_demand],
+                Duration::ZERO,
+                true,
+            ),
+            (
+                "an on-demand pass, one millisecond before it is due",
+                &[RuleEvaluationEntry::invoke_on_demand],
+                RULE_EVALUATION_SETTLE_AFTER - Duration::from_millis(1),
+                true,
+            ),
+            (
+                "an on-demand pass, exactly when it is due",
+                &[RuleEvaluationEntry::invoke_on_demand],
+                RULE_EVALUATION_SETTLE_AFTER,
+                false,
+            ),
+            (
+                "a write's pass over an on-demand one",
+                &[
+                    RuleEvaluationEntry::invoke_on_demand,
+                    RuleEvaluationEntry::invoke,
+                ],
+                Duration::ZERO,
+                false,
+            ),
+            (
+                "an on-demand pass over a write's one",
+                &[
+                    RuleEvaluationEntry::invoke,
+                    RuleEvaluationEntry::invoke_on_demand,
+                ],
+                Duration::ZERO,
+                true,
+            ),
+        ];
+
+        for (case, invocations, elapsed, on_demand_in_progress) in cases {
+            let mut evaluation = RuleEvaluationEntry::default();
+            for invoke in invocations {
+                invoke(&mut evaluation, invoked_at);
+            }
+            let now = invoked_at + elapsed;
+            assert_eq!(
+                evaluation.on_demand_in_progress(now),
+                on_demand_in_progress,
+                "case {case:?}: expected on_demand_in_progress {on_demand_in_progress}, got {}",
+                evaluation.on_demand_in_progress(now)
+            );
+
+            // A completed pass is no longer in flight, whichever kind it was.
+            evaluation.settle(invoked_at + RULE_EVALUATION_SETTLE_AFTER);
+            assert!(
+                !evaluation.on_demand,
+                "case {case:?}: a completed pass must leave no pass in flight, got {evaluation:?}"
             );
         }
     }

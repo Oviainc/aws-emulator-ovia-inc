@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RejectInvitation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RejectInvitation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RejectInvitation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: the calling account's own open invitation into one behavior graph,
+//! resolved from the member records `CreateMembers` stored and dropped when it is
+//! rejected.
 //!
 //! ## Shape of an operation
 //!
@@ -135,6 +130,11 @@ impl From<RejectInvitationErrorModeled> for RejectInvitationError {
     }
 }
 
+/// What this operation answers when the calling account holds no invitation into the
+/// graph it named: the modelled 404, with a fixed sentence that echoes neither the
+/// account nor the ARN.
+const INVITATION_NOT_FOUND_MESSAGE: &str = "The specified invitation does not exist";
+
 /// The `RejectInvitation` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -171,18 +171,60 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RejectInvitation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RejectInvitationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RejectInvitation"))
+        let _ = ctx;
+        // `GraphArn`'s pattern is a modelled constraint the centralized walk has
+        // already refused anything outside of.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            RejectInvitationErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the behavior graph store is unavailable".to_string()),
+            })
+        })?;
+
+        // "This operation must be called by an invited member account that has the
+        // INVITED status": the invitation this call rejects is the one addressed to the
+        // CALLING account, never one named in the request.
+        let caller = crate::state::caller_account_id();
+        let now = crate::state::now_epoch_millis();
+
+        let mut store = state.lock();
+        let graph = store.graph_mut(&input.graph_arn).ok_or_else(|| {
+            RejectInvitationErrorModeled::ResourceNotFoundException(crate::state::graph_not_found())
+        })?;
+        // The verification `CreateMembers` started may have come due since, and the
+        // status it moves to is the one this operation acts on. See
+        // `crate::state::Member::settle`.
+        graph.settle_members(now);
+
+        let status = graph
+            .members
+            .get(&caller)
+            .map(|member| member.status.clone())
+            .ok_or_else(|| {
+                RejectInvitationErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(INVITATION_NOT_FOUND_MESSAGE.to_string()),
+                    },
+                )
+            })?;
+        // Only an open invitation can be rejected. A membership in any other status is
+        // an invalid action on that membership, which is what `ConflictException` (409)
+        // states.
+        if status != crate::state::MEMBER_STATUS_INVITED {
+            return Err(RejectInvitationErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(format!(
+                        "An invitation can only be rejected while its membership status is {}.",
+                        crate::state::MEMBER_STATUS_INVITED
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Rejecting the invitation removes the membership it created: the account
+        // contributes no data and the graph no longer lists it.
+        graph.members.remove(&caller);
+
+        Ok(RejectInvitationOutput)
     }
 }

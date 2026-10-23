@@ -12,8 +12,14 @@
 //!   resource whose STORED state it moved — that resource's `SourceType`, its stored
 //!   (folded) name and the instant of the change — and `DescribeEvents` reports exactly
 //!   those events, so a store nothing has changed reports none;
+//! * each event's `Message` states the operation that was performed and the resource(s)
+//!   the request named for it, in AWS's `<Operation> <kind> <name> operation completed.`
+//!   form, and a change to an ACL's membership records ONE event per member added or
+//!   removed, naming that user AND that ACL;
 //! * `SourceName` / `SourceType` narrow the listing to the events of one resource or
-//!   one kind of resource, for every token the model's `SourceType` publishes;
+//!   one kind of resource, for every token the model's `SourceType` publishes, with
+//!   `SourceName` matched against the identifier each event RECORDED exactly — a
+//!   spelling the log does not hold selects nothing;
 //! * the reported window is `StartTime`..`EndTime`, defaulting to the documented last
 //!   hour or to `Duration` minutes before the end, and a `Duration` outside
 //!   1..=20160 minutes (14 days, the age past which no event is kept) or an interval
@@ -53,28 +59,57 @@ const MAX_MAX_RESULTS: i64 = 50;
 /// One event as the wire reports it, reduced to what the rule fixes.
 type Reported = (String, String, String);
 
-/// How an event message names the kind of resource it is about.
+/// How an event message names the kind of resource it is about: the noun that reads
+/// mid-sentence, which for an acronym is the acronym itself.
 ///
-/// AWS documents no text for `Event$Message` ("The text of the event"), so the WORDING
-/// is the emulator's; what the rule fixes is that the message says what KIND of
-/// resource changed and how, with WHICH resource carried by `SourceName`.
-fn label(source_type: &str) -> &'static str {
+/// Spelled out HERE rather than taken from the crate under test, so each assertion
+/// below is independent of the code that builds the message. The nouns follow the
+/// `SourceType` tokens the model publishes (`crate::ops::types::SOURCE_TYPE_VALUES`).
+fn noun(source_type: &str) -> &'static str {
     match source_type {
-        "cluster" => "Cluster",
+        "cluster" => "cluster",
         "acl" => "ACL",
-        "user" => "User",
-        "parameter-group" => "Parameter group",
+        "user" => "user",
+        "parameter-group" => "parameter group",
         other => panic!("no event is recorded for source type {other:?}"),
     }
 }
 
 /// The event one change must be reported as: its source type, its source name and the
-/// message naming the kind of resource and what happened to it.
-fn expected(source_type: &str, source_name: &str, verb: &str) -> Reported {
+/// message naming the operation that was performed and the resource(s) the request
+/// named for it.
+///
+/// `operation` is the operation phrase's leading verb (`Create`, `Modify`, `Delete`),
+/// and the message AWS records is `<Operation> <kind> <name> operation completed.` —
+/// recorded MemoryDB behaviour, e.g. `Create user bob operation completed.` /
+/// `Create ACL acl-one operation completed.`
+fn expected(source_type: &str, source_name: &str, operation: &str) -> Reported {
     (
         source_type.to_string(),
         source_name.to_string(),
-        format!("{} {verb}", label(source_type)),
+        format!(
+            "{operation} {} {source_name} operation completed.",
+            noun(source_type)
+        ),
+    )
+}
+
+/// The event ONE membership change must be reported as: against the ACL whose stored
+/// `UserNames` moved, with a message naming BOTH the user and the ACL —
+/// `Add user <u> to ACL <a> operation completed.` /
+/// `Remove user <u> from ACL <a> operation completed.` (recorded MemoryDB behaviour).
+fn expected_membership(acl_name: &str, operation: &str, user_name: &str) -> Reported {
+    let joiner = match operation {
+        "Add" => "to",
+        "Remove" => "from",
+        other => panic!("no membership event is recorded for operation {other:?}"),
+    };
+    (
+        "acl".to_string(),
+        acl_name.to_string(),
+        format!(
+            "{operation} user {user_name} {joiner} ACL {acl_name} operation completed."
+        ),
     )
 }
 
@@ -222,20 +257,23 @@ async fn drive_every_kind_of_change(router: &MultiServiceRouter) -> Vec<Reported
 
     // The changes above in the order they were made; the listing reports the reverse.
     let mut recorded = vec![
-        expected("user", "alice", "created"),
-        expected("user", "bob-2", "created"),
-        // An ACL's membership is part of the ACL's own stored state, so `CreateACL`
-        // with a member and `UpdateACL` moving one are each ONE `acl` event.
-        expected("acl", "acl-one", "created"),
-        expected("acl", "acl-one", "modified"),
-        expected("parameter-group", "pg-one", "created"),
-        expected("parameter-group", "pg-one", "modified"),
-        expected("cluster", "cl-one", "created"),
-        expected("cluster", "cl-one", "modified"),
-        expected("cluster", "cl-one", "deleted"),
-        // `DeleteUser`: the user, and the ACL whose membership it left.
-        expected("user", "alice", "deleted"),
-        expected("acl", "acl-one", "modified"),
+        expected("user", "alice", "Create"),
+        expected("user", "bob-2", "Create"),
+        // An ACL's initial membership is part of the resource the create made, so
+        // `CreateACL` with a member is ONE `acl` event for the ACL it created...
+        expected("acl", "acl-one", "Create"),
+        // ...while `UpdateACL` MOVES an existing ACL's membership, so it records one
+        // event per member it added, naming that user and that ACL.
+        expected_membership("acl-one", "Add", "bob-2"),
+        expected("parameter-group", "pg-one", "Create"),
+        expected("parameter-group", "pg-one", "Modify"),
+        expected("cluster", "cl-one", "Create"),
+        expected("cluster", "cl-one", "Modify"),
+        expected("cluster", "cl-one", "Delete"),
+        // `DeleteUser`: the user, and the ACL whose membership it left — a membership
+        // change like any other, so the event names the user and the ACL.
+        expected("user", "alice", "Delete"),
+        expected_membership("acl-one", "Remove", "alice"),
     ];
     recorded.reverse();
     recorded
@@ -292,7 +330,7 @@ async fn a_store_nothing_changed_reports_no_events() {
     let second = whole_log(&router, "second read").await;
     assert_eq!(
         first,
-        vec![expected("user", "solo-user", "created")],
+        vec![expected("user", "solo-user", "Create")],
         "case {case:?}: expected the one recorded event, got {first:?}"
     );
     assert_eq!(
@@ -331,18 +369,25 @@ async fn a_source_filter_narrows_the_listing() {
         );
     }
 
-    // A name, in either spelling (the stored name is folded), a name nothing recorded,
-    // and a name paired with a type that both does and does not hold its events.
+    // A name as the log RECORDED it, the same name in other spellings (upper, mixed —
+    // each names no recorded event, because the filter matches the recorded identifier
+    // exactly rather than folding it), a name nothing recorded, and a name paired with a
+    // type that both does and does not hold its events.
     let name_cases: &[(&str, Option<&str>)] = &[
         ("alice", None),
         ("ALICE", None),
+        ("Alice", None),
         ("acl-one", None),
+        ("ACL-One", None),
         ("bob-2", None),
+        ("Bob-2", None),
         ("cl-one", None),
         ("no-such-resource", None),
         ("alice", Some("user")),
+        ("ALICE", Some("user")),
         ("alice", Some("acl")),
         ("acl-one", Some("acl")),
+        ("ACL-ONE", Some("acl")),
         ("pg-one", Some("parameter-group")),
         ("pg-one", Some("node")),
     ];
@@ -357,11 +402,10 @@ async fn a_source_filter_narrows_the_listing() {
             request["SourceType"] = json!(source_type);
         }
         let body = describe(&router, &request, &case).await;
-        let folded = source_name.to_ascii_lowercase();
         let want: Vec<Reported> = whole
             .iter()
             .filter(|event| {
-                event.1 == folded && source_type.is_none_or(|wanted| event.0 == wanted)
+                event.1 == *source_name && source_type.is_none_or(|wanted| event.0 == wanted)
             })
             .cloned()
             .collect();
@@ -593,6 +637,197 @@ async fn a_request_that_names_no_listing_is_refused() {
             error_code(&body),
             code,
             "case {case:?}: expected {code}, got {body}"
+        );
+    }
+}
+
+/// Every recorded message states the operation that was performed and the resource(s)
+/// the request named for it, and ends with AWS's ` operation completed.`
+///
+/// The invariant over the WHOLE log rather than one row: whatever the kind of resource
+/// or the kind of change, the message opens with an operation phrase this service can
+/// have performed and names the resource the event is recorded against.
+#[tokio::test]
+async fn every_message_names_an_operation_and_the_resource_it_was_performed_on() {
+    let router = router();
+    // The operation phrases a MemoryDB event message can open with, from the recorded
+    // behaviour this suite's `expected` / `expected_membership` spell out: the lifecycle
+    // verbs, and the two a membership change uses.
+    const OPERATIONS: &[&str] = &["Create", "Modify", "Delete", "Add", "Remove"];
+    const TAIL: &str = " operation completed.";
+
+    drive_every_kind_of_change(&router).await;
+    let log = whole_log(&router, "message form").await;
+    assert!(
+        !log.is_empty(),
+        "case \"message form\": expected the driven changes to be recorded, got {log:?}"
+    );
+    for (source_type, source_name, message) in &log {
+        let case = format!("{source_type} event for {source_name}");
+        assert!(
+            message.ends_with(TAIL),
+            "case {case:?}: expected the message to end with {TAIL:?}, got {message:?}"
+        );
+        assert!(
+            OPERATIONS
+                .iter()
+                .any(|operation| message.starts_with(&format!("{operation} "))),
+            "case {case:?}: expected the message to open with one of {OPERATIONS:?}, got \
+             {message:?}"
+        );
+        assert!(
+            message.contains(&format!("{} {source_name} ", noun(source_type))),
+            "case {case:?}: expected the message to name {} {source_name}, got {message:?}",
+            noun(source_type)
+        );
+    }
+}
+
+/// A change to an ACL's membership records ONE event per member added or removed,
+/// against the ACL whose stored `UserNames` moved, and each such message names BOTH the
+/// user and the ACL the request named for it.
+///
+/// The rows differ along what the rule generalises over: the direction of the change
+/// (added, removed, both in one call), the COUNT of members one call moves, the spelling
+/// of the names (an event carries the folded name the store keys by) and the operation
+/// that makes the change — `UpdateACL`, and the `DeleteUser` that takes a member out of
+/// every ACL that listed it.
+#[tokio::test]
+async fn a_membership_change_records_one_event_per_member_naming_both_resources() {
+    let router = router();
+    let acl = "members-acl";
+    for user in ["alpha", "bravo", "Charlie", "delta"] {
+        create_user(&router, user).await;
+    }
+    // A mixed-case ACL name: a MemoryDB resource name is a case-insensitive identifier,
+    // so every event below carries the folded spelling.
+    ok(
+        &router,
+        "CreateACL",
+        &json!({ "ACLName": "Members-Acl" }),
+        "CreateACL",
+    )
+    .await;
+
+    // Each row: the `UpdateACL` request, and the events it must record, oldest first.
+    let rows: Vec<(&str, Value, Vec<Reported>)> = vec![
+        (
+            "one member added",
+            json!({ "ACLName": acl, "UserNamesToAdd": ["alpha"] }),
+            vec![expected_membership(acl, "Add", "alpha")],
+        ),
+        (
+            "two members added by one call, one named in mixed case",
+            json!({ "ACLName": acl, "UserNamesToAdd": ["bravo", "Charlie"] }),
+            vec![
+                expected_membership(acl, "Add", "bravo"),
+                expected_membership(acl, "Add", "charlie"),
+            ],
+        ),
+        (
+            "one member removed, named in mixed case",
+            json!({ "ACLName": "MEMBERS-ACL", "UserNamesToRemove": ["ALPHA"] }),
+            vec![expected_membership(acl, "Remove", "alpha")],
+        ),
+        (
+            "a member added and two removed by one call",
+            json!({
+                "ACLName": acl,
+                "UserNamesToAdd": ["delta"],
+                "UserNamesToRemove": ["bravo", "charlie"],
+            }),
+            vec![
+                expected_membership(acl, "Add", "delta"),
+                expected_membership(acl, "Remove", "bravo"),
+                expected_membership(acl, "Remove", "charlie"),
+            ],
+        ),
+    ];
+
+    let mut oldest_first = vec![expected("acl", acl, "Create")];
+    for (case, request, recorded) in rows {
+        ok(&router, "UpdateACL", &request, case).await;
+        oldest_first.extend(recorded);
+        let mut want = oldest_first.clone();
+        want.reverse();
+        let body = describe(
+            &router,
+            &json!({
+                "StartTime": 0,
+                "MaxResults": MAX_MAX_RESULTS,
+                "SourceType": "acl",
+                "SourceName": acl,
+            }),
+            case,
+        )
+        .await;
+        assert_eq!(
+            reported(&body, case),
+            want,
+            "case {case:?}: expected one event per member changed, newest first, got {body}"
+        );
+    }
+
+    // A member taken out of the ACL by a `DeleteUser` is the same kind of change, so it
+    // is recorded the same way: the user's own delete event, and one membership event
+    // per ACL the user left.
+    let case = "a member removed by deleting the user";
+    ok(
+        &router,
+        "DeleteUser",
+        &json!({ "UserName": "delta" }),
+        case,
+    )
+    .await;
+    oldest_first.push(expected_membership(acl, "Remove", "delta"));
+    let mut want = oldest_first.clone();
+    want.reverse();
+    let body = describe(
+        &router,
+        &json!({
+            "StartTime": 0,
+            "MaxResults": MAX_MAX_RESULTS,
+            "SourceType": "acl",
+            "SourceName": acl,
+        }),
+        case,
+    )
+    .await;
+    assert_eq!(
+        reported(&body, case),
+        want,
+        "case {case:?}: expected the membership the delete ended to be recorded, got {body}"
+    );
+
+    // The membership events belong to the ACL whose stored state moved: a user's own
+    // listing holds only the events of the user resource itself.
+    for (user, mut user_events) in [
+        ("alpha", vec![expected("user", "alpha", "Create")]),
+        (
+            "delta",
+            vec![
+                expected("user", "delta", "Create"),
+                expected("user", "delta", "Delete"),
+            ],
+        ),
+    ] {
+        let case = format!("user listing for {user}");
+        user_events.reverse();
+        let body = describe(
+            &router,
+            &json!({
+                "StartTime": 0,
+                "MaxResults": MAX_MAX_RESULTS,
+                "SourceType": "user",
+                "SourceName": user,
+            }),
+            &case,
+        )
+        .await;
+        assert_eq!(
+            reported(&body, &case),
+            user_events,
+            "case {case:?}: expected only the user's own events, got {body}"
         );
     }
 }

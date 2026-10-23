@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RequestSpotInstances
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RequestSpotInstances`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RequestSpotInstances::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: mints one Spot Instance request per unit of `InstanceCount` from the
+//! request's launch specification, stores each in [`crate::state`] as the modelled
+//! `SpotInstanceRequest` `DescribeSpotInstanceRequests` reports, and answers them back out
+//! of the store. A request is `open` / `pending-evaluation`, and the clock — not a caller —
+//! either fulfills it (launching the Spot Instance it asked for) or expires it when its
+//! `ValidUntil` is reached. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -180,18 +177,459 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RequestSpotInstances` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RequestSpotInstancesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            DEFAULT_SPOT_REQUEST_VALIDITY, INSTANCE_INTERRUPTION_BEHAVIOR_TERMINATE,
+            MAX_CLIENT_TOKEN_CHARS, MAX_SECURITY_GROUPS_PER_INSTANCE,
+            MAX_SPOT_INSTANCES_PER_REQUEST, MAX_STORED_BYTES, MAX_STORED_INSTANCES,
+            MAX_STORED_SPOT_INSTANCE_REQUESTS, MAX_TAGS_PER_RESOURCE, MAX_USER_DATA_BYTES,
+            SPOT_INSTANCE_TYPES, SPOT_REQUEST_STATE_OPEN, SPOT_REQUEST_TAGGABLE_RESOURCE,
+            SPOT_STATUS_MESSAGE_PENDING_EVALUATION, SPOT_STATUS_PENDING_EVALUATION,
+            SPOT_INSTANCE_TYPE_ONE_TIME, SpotTransition, TRANSITION_DELAY,
+            availability_zones_in_region, date_time_to_system_time, due_instant,
+            due_system_time, duration_until, invalid_group_not_found,
+            invalid_subnet_id_not_found, request_region, require_service_state,
+            require_visible_image, resource_count_exceeded,
+            spot_instance_request_payload_bytes, system_time_to_date_time, tag_list,
+            validate_tag_size,
+        };
+
+        // The launch specification IS the request's description of the instance to launch,
+        // so everything below reads off it. A request that carries none has described no
+        // launch at all.
+        let launch = input.launch_specification.clone().unwrap_or_default();
+
+        // Each member below is a resource this slice does not model, and each CONTRADICTS
+        // one it does: a Spot Instance launched for this request must not be reported
+        // sitting somewhere other than where the specification put it. Refused rather than
+        // accepted and discarded — the same answer `RunInstances` gives for them.
+        if launch
+            .network_interfaces
+            .as_ref()
+            .is_some_and(|interfaces| !interfaces.is_empty())
+        {
+            return Err(Scaffolded::not_implemented(
+                "RequestSpotInstances with a network interface specification",
+            ));
+        }
+        if launch
+            .block_device_mappings
+            .as_ref()
+            .is_some_and(|mappings| !mappings.is_empty())
+        {
+            return Err(Scaffolded::not_implemented(
+                "RequestSpotInstances with a block device mapping",
+            ));
+        }
+        if launch.iam_instance_profile.is_some() {
+            return Err(Scaffolded::not_implemented(
+                "RequestSpotInstances with an IAM instance profile",
+            ));
+        }
+
+        // An instance cannot be launched without an AMI to launch it from: "the ID of the
+        // AMI" (`RequestSpotLaunchSpecification$ImageId`). Refused the way `RunInstances`
+        // refuses a launch that names none, because the fulfillment of this request is a
+        // launch.
+        let Some(image_id) = launch.image_id.clone() else {
+            return Err(Scaffolded::missing_parameter(
+                "The request must contain the parameter launchSpecification.imageId",
+            ));
+        };
+
+        // "The maximum number of Spot Instances to launch. Default: 1"
+        // (`RequestSpotInstancesRequest$InstanceCount`). The member arrives as a plain
+        // integer with no modelled `@range`, so this is the only place a floor and a
+        // ceiling can exist — and the ceiling must dominate the minting loop below.
+        let instance_count = input.instance_count.unwrap_or(1);
+        if instance_count < 1 {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "Invalid value '{instance_count}' for instanceCount. It must be at least 1"
+            )));
+        }
+        if instance_count > MAX_SPOT_INSTANCES_PER_REQUEST {
+            return Err(Scaffolded::instance_limit_exceeded(format!(
+                "You requested {instance_count} Spot Instances, above the \
+                 {MAX_SPOT_INSTANCES_PER_REQUEST} this account may request in one call"
+            )));
+        }
+
+        // "The Spot Instance request type. Default: one-time"
+        // (`RequestSpotInstancesRequest$Type`), and "the behavior when a Spot Instance is
+        // interrupted. The default is terminate"
+        // (`RequestSpotInstancesRequest$InstanceInterruptionBehavior`). Both are modelled
+        // enums, so a value outside either catalog is already refused by the boundary
+        // validator; the checks below are the backstop for both at once — one way for the
+        // two of them — and the documented default is applied here.
+        let request_type = input
+            .r#type
+            .clone()
+            .unwrap_or_else(|| SPOT_INSTANCE_TYPE_ONE_TIME.to_string());
+        if !SPOT_INSTANCE_TYPES.contains(&request_type.as_str()) {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "Invalid value '{request_type}' for type. Valid values: {}",
+                SPOT_INSTANCE_TYPES.join(" | ")
+            )));
+        }
+        let interruption_behavior = input
+            .instance_interruption_behavior
+            .clone()
+            .unwrap_or_else(|| INSTANCE_INTERRUPTION_BEHAVIOR_TERMINATE.to_string());
+        if !INSTANCE_INTERRUPTION_BEHAVIOR_VALUES.contains(&interruption_behavior.as_str()) {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "Invalid value '{interruption_behavior}' for instanceInterruptionBehavior. \
+                 Valid values: {}",
+                INSTANCE_INTERRUPTION_BEHAVIOR_VALUES.join(" | ")
+            )));
+        }
+
+        // "The maximum price per unit hour that you are willing to pay for a Spot
+        // Instance" (`RequestSpotInstancesRequest$SpotPrice`): a price, so a value that is
+        // not a non-negative number is not one. The member is a plain String in the model,
+        // so the handler is the only place that can be said.
+        if let Some(spot_price) = input.spot_price.as_deref() {
+            let valid = spot_price
+                .parse::<f64>()
+                .is_ok_and(|price| price.is_finite() && price >= 0.0);
+            if !valid {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "Invalid value '{spot_price}' for spotPrice. \
+                     It must be a non-negative hourly price"
+                )));
+            }
+        }
+
+        // The same byte bounds the on-demand launch path puts on the members a launch
+        // retains, for the same reason: a count ceiling on `InstanceCount` does not bound
+        // the BYTES one call can store, because the specification is copied into every
+        // request it mints.
+        if launch
+            .user_data
+            .as_ref()
+            .is_some_and(|user_data| user_data.len() > MAX_USER_DATA_BYTES)
+        {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "User data accepts at most {MAX_USER_DATA_BYTES} bytes"
+            )));
+        }
+        let named_groups = launch.security_group_ids.as_ref().map_or(0, Vec::len)
+            + launch.security_groups.as_ref().map_or(0, Vec::len);
+        if named_groups > MAX_SECURITY_GROUPS_PER_INSTANCE {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "An instance may be launched with at most \
+                 {MAX_SECURITY_GROUPS_PER_INSTANCE} security groups, not {named_groups}"
+            )));
+        }
+        if input
+            .client_token
+            .as_ref()
+            .is_some_and(|token| token.chars().count() > MAX_CLIENT_TOKEN_CHARS)
+        {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "clientToken accepts at most {MAX_CLIENT_TOKEN_CHARS} characters"
+            )));
+        }
+
+        // "The key-value pair for tagging the Spot Instance request on creation. The value
+        // for ResourceType must be spot-instances-request, otherwise the Spot Instance
+        // request fails" (`RequestSpotInstancesRequest$TagSpecifications`) — so a
+        // specification naming any other resource type is refused rather than accepted and
+        // discarded.
+        let mut tags: ::std::collections::BTreeMap<String, String> =
+            ::std::collections::BTreeMap::new();
+        for specification in input.tag_specifications.iter().flatten() {
+            match specification.resource_type.as_deref() {
+                Some(SPOT_REQUEST_TAGGABLE_RESOURCE) | None => {}
+                Some(resource_type) => {
+                    return Err(Scaffolded::invalid_parameter_value(format!(
+                        "Invalid value '{resource_type}' for resourceType. The value for \
+                         ResourceType must be {SPOT_REQUEST_TAGGABLE_RESOURCE}"
+                    )));
+                }
+            }
+            for tag in specification.tags.iter().flatten() {
+                let key = tag.key.clone().unwrap_or_default();
+                let value = tag.value.clone().unwrap_or_default();
+                validate_tag_size(&key, &value)?;
+                tags.insert(key, value);
+            }
+        }
+        if tags.len() > MAX_TAGS_PER_RESOURCE {
+            return Err(Scaffolded::tag_limit_exceeded(format!(
+                "A Spot Instance request carries at most {MAX_TAGS_PER_RESOURCE} tags, not {}",
+                tags.len()
+            )));
+        }
+
+        // The zone a Spot Instance launches into must be one the Region has, and the naming
+        // rule for those zones lives in one place: `availability_zones_in_region`.
+        let region = request_region(ctx.parts());
+        let zones = availability_zones_in_region(&region);
+        if let Some(requested) = launch
+            .placement
+            .as_ref()
+            .and_then(|placement| placement.availability_zone.as_deref())
+        {
+            if !zones.iter().any(|zone| zone.zone_name == requested) {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "Invalid value '{requested}' for availabilityZone. \
+                     Region '{region}' has no such Availability Zone"
+                )));
+            }
+        }
+
+        // The request's own window. "The request becomes active at this date and time"
+        // (`ValidFrom`), so a start date in the future is when the fulfillment falls due
+        // rather than [`TRANSITION_DELAY`] from now; "by default, the request is valid for
+        // 7 days from the date the request was created" (`ValidUntil`) is where a request
+        // that names no end date stops being valid.
+        let created_at = ::std::time::SystemTime::now();
+        let valid_from = input.valid_from.map(date_time_to_system_time);
+        let valid_until = input
+            .valid_until
+            .map(date_time_to_system_time)
+            .unwrap_or_else(|| due_system_time(created_at, DEFAULT_SPOT_REQUEST_VALIDITY));
+        // The fulfillment is never due sooner than the span this crate gives every
+        // clock-owed move, so a caller reading the request straight back still sees it
+        // `open`.
+        let until_fulfilled = valid_from
+            .map_or(TRANSITION_DELAY, duration_until)
+            .max(TRANSITION_DELAY);
+        let fulfillment = SpotTransition::due_in(until_fulfilled);
+        // Both instants come from a DATE THE CALLER CHOSE, which is unbounded: they are
+        // computed by the capped, checked clock helpers, because `Instant + Duration`
+        // panics on a sum the platform's monotonic clock cannot represent and one request
+        // body must never be able to abort a handler.
+        let valid_until_at = due_instant(duration_until(valid_until));
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+
+        // Every move the clock already owed is applied before anything is read back, for
+        // the same reason the describes apply it: it was owed at this instant whether or
+        // not anybody called. Without it a `ClientToken` replay arriving after a request's
+        // fulfillment would answer the stale `open` view while a describe reported the same
+        // request `active`.
+        store.materialize_due_transitions();
+
+        // A launch specification that names a resource the account cannot resolve describes
+        // a launch that could never happen, so it is refused with that resource's own error
+        // code — before the DryRun gate, because the flag asks whether the request WOULD
+        // have succeeded and this one would not have.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RequestSpotInstances"))
+        // The AMI first: "the ID of the AMI" is what the instance is launched from, so
+        // there is nothing to launch without one the account can see.
+        require_visible_image(&store, &image_id)?;
+        if let Some(subnet_id) = launch.subnet_id.as_deref() {
+            if !store.subnets.contains_key(subnet_id) {
+                return Err(invalid_subnet_id_not_found(subnet_id));
+            }
+        }
+        for group_id in launch.security_group_ids.iter().flatten() {
+            if !store.security_groups.contains_key(group_id) {
+                return Err(invalid_group_not_found(group_id));
+            }
+        }
+        // "The IDs of the security groups" is the supported spelling; a group named by NAME
+        // is resolved against the groups the account holds, which is the only way a name
+        // can be answered for at all.
+        for group_name in launch.security_groups.iter().flatten() {
+            let known = store
+                .security_groups
+                .values()
+                .any(|group| group.group_name.as_deref() == Some(group_name.as_str()));
+            if !known {
+                return Err(invalid_group_not_found(group_name));
+            }
+        }
+
+        // Idempotency: "unique, case-sensitive identifier that you provide to ensure the
+        // idempotency of the request" (`RequestSpotInstancesRequest$ClientToken`) — one
+        // token names the requests it minted, so a replay reports those and asks for no
+        // more capacity. Read before the DryRun check, answered after it, because a replay
+        // stores nothing and so passes the ceilings a fresh request has to clear.
+        let replayed = input
+            .client_token
+            .as_deref()
+            .and_then(|token| store.spot_instance_request_client_tokens.get(token).cloned());
+
+        let wanted = usize::try_from(instance_count).unwrap_or(usize::MAX);
+        if replayed.is_none() {
+            if !store.has_spot_instance_request_capacity(wanted) {
+                return Err(resource_count_exceeded(format!(
+                    "This emulator holds {} of at most \
+                     {MAX_STORED_SPOT_INSTANCE_REQUESTS} Spot Instance requests, so it \
+                     cannot store {wanted} more",
+                    store.spot_instance_requests.len()
+                )));
+            }
+            // Each request this call mints will launch one instance when the clock
+            // fulfills it, so the room for those instances is asked for HERE — a request
+            // this store could never place is refused instead of sitting `open` for ever.
+            if store.instances.len().saturating_add(wanted) > MAX_STORED_INSTANCES {
+                return Err(Scaffolded::instance_limit_exceeded(format!(
+                    "This emulator holds {} of at most {MAX_STORED_INSTANCES} instances, \
+                     so it cannot launch {wanted} more",
+                    store.instances.len()
+                )));
+            }
+        }
+
+        // The request as it will be stored, all but its id: the id is minted by the store's
+        // one writer of a Spot Instance request, below the DryRun and replay gates, so
+        // neither a dry run (which "leaves state untouched") nor a replay (which stores
+        // nothing) consumes one from the counter.
+        let view = SpotInstanceRequest {
+            spot_instance_request_id: None,
+            // A request AWS hands back is waiting to be fulfilled: the instance, the zone
+            // it launched in and the fulfilled status are owed by the clock, not by this
+            // call.
+            state: Some(SPOT_REQUEST_STATE_OPEN.to_string()),
+            status: Some(SpotInstanceStatus {
+                code: Some(SPOT_STATUS_PENDING_EVALUATION.to_string()),
+                message: Some(SPOT_STATUS_MESSAGE_PENDING_EVALUATION.to_string()),
+                update_time: Some(system_time_to_date_time(created_at)),
+            }),
+            create_time: Some(system_time_to_date_time(created_at)),
+            r#type: Some(request_type.clone()),
+            // The behaviour checked and defaulted above.
+            instance_interruption_behavior: Some(interruption_behavior.clone()),
+            // Reported only when the request named one: a request with no start date is
+            // valid from the moment it was created, which `CreateTime` already says.
+            valid_from: input.valid_from,
+            valid_until: Some(system_time_to_date_time(valid_until)),
+            launch_group: input.launch_group.clone(),
+            availability_zone_group: input.availability_zone_group.clone(),
+            // "We do not recommend using this parameter … If you do not specify this
+            // parameter, you will pay the current Spot price" (`SpotPrice`): the current
+            // price is not modelled by this emulator (there is no price history), so a
+            // request that named no maximum reports none rather than an invented number.
+            spot_price: input.spot_price.clone(),
+            product_description: Some(
+                store
+                    .spot_product_description(Some(image_id.as_str()))
+                    .to_string(),
+            ),
+            launch_specification: Some(LaunchSpecification {
+                image_id: Some(image_id.clone()),
+                instance_type: launch.instance_type.clone(),
+                key_name: launch.key_name.clone(),
+                subnet_id: launch.subnet_id.clone(),
+                user_data: launch.user_data.clone(),
+                addressing_type: launch.addressing_type.clone(),
+                kernel_id: launch.kernel_id.clone(),
+                ramdisk_id: launch.ramdisk_id.clone(),
+                ebs_optimized: Some(launch.ebs_optimized.unwrap_or(false)),
+                monitoring: launch.monitoring.clone(),
+                placement: launch.placement.clone(),
+                // "The IDs of the security groups" and the names in the deprecated
+                // `SecurityGroups` are one list of groups on the way out, which the
+                // modelled `LaunchSpecification` reports as `GroupIdentifier`s.
+                security_groups: Some(
+                    launch
+                        .security_group_ids
+                        .iter()
+                        .flatten()
+                        .map(|group_id| GroupIdentifier {
+                            group_id: Some(group_id.clone()),
+                            group_name: None,
+                        })
+                        .chain(launch.security_groups.iter().flatten().map(|group_name| {
+                            GroupIdentifier {
+                                group_id: None,
+                                group_name: Some(group_name.clone()),
+                            }
+                        }))
+                        .collect(),
+                ),
+                block_device_mappings: None,
+                iam_instance_profile: None,
+                network_interfaces: None,
+            }),
+            tags: Some(tag_list(&tags)),
+            // The instance, and the zone it launched in, are known only once the clock has
+            // fulfilled the request.
+            instance_id: None,
+            launched_availability_zone: None,
+            launched_availability_zone_id: None,
+            // "Deprecated" (`SpotInstanceRequest$BlockDurationMinutes` and
+            // `ActualBlockHourlyPrice`): Spot blocks are not offered any more, so no
+            // duration is reserved and no block price is charged for one.
+            block_duration_minutes: None,
+            actual_block_hourly_price: None,
+            // "The fault codes for the Spot Instance request, if any": this request has
+            // none.
+            fault: None,
+        };
+
+        // The caller-chosen bytes ONE request retains for the process's lifetime, by the one
+        // definition of that charge, times the requests this call would mint.
+        //
+        // The instance a fulfillment launches charges its own bytes through the store's one
+        // writer of an instance, and holds no caller-chosen member this request does not
+        // (its user data and its groups), so the total this call can ever retain is bounded
+        // by twice what is asked for here — and the instances themselves are bounded in
+        // COUNT by the check above.
+        let per_request_bytes =
+            spot_instance_request_payload_bytes(&view, input.client_token.as_deref());
+        let payload_bytes = per_request_bytes.saturating_mul(wanted);
+        if replayed.is_none() && store.would_exceed_stored_bytes(payload_bytes) {
+            return Err(resource_count_exceeded(format!(
+                "This emulator holds {} of at most {MAX_STORED_BYTES} bytes of \
+                 caller-supplied data, so it cannot store {payload_bytes} more",
+                store.stored_bytes()
+            )));
+        }
+
+        // DryRun sits AFTER every parameter has been validated and every read-only check
+        // made, and BEFORE the first write: the flag asks whether the request WOULD have
+        // worked, so one that would have been refused is refused with that reason instead,
+        // and one that would have succeeded leaves state untouched.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        if let Some(request_ids) = replayed {
+            return Ok(RequestSpotInstancesOutput {
+                spot_instance_requests: Some(
+                    request_ids
+                        .iter()
+                        .filter_map(|request_id| store.spot_instance_requests.get(request_id))
+                        .map(|record| record.view.clone())
+                        .collect(),
+                ),
+            });
+        }
+
+        // One request per unit of `InstanceCount`: "the maximum number of Spot Instances to
+        // launch", each of which is one Spot Instance request of the account, each
+        // fulfilled on its own.
+        let mut request_ids: Vec<String> = Vec::with_capacity(wanted);
+        for _ in 0..wanted {
+            request_ids.push(store.insert_spot_instance_request(
+                view.clone(),
+                Some(fulfillment.clone()),
+                valid_until_at,
+                &region,
+                input.client_token.as_deref(),
+            ));
+        }
+        if let Some(token) = input.client_token.clone() {
+            store
+                .spot_instance_request_client_tokens
+                .insert(token, request_ids.clone());
+        }
+
+        // Read the response back OUT of the store, so the caller sees what a later
+        // `DescribeSpotInstanceRequests` will see rather than the request object.
+        Ok(RequestSpotInstancesOutput {
+            spot_instance_requests: Some(
+                request_ids
+                    .iter()
+                    .filter_map(|request_id| store.spot_instance_requests.get(request_id))
+                    .map(|record| record.view.clone())
+                    .collect(),
+            ),
+        })
     }
 }

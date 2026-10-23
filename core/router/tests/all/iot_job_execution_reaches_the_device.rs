@@ -85,13 +85,16 @@ const JOB_CASES: &[JobCase] = &[
         terminal_status: "FAILED",
     },
     JobCase {
-        case: "three devices, no document, rejected",
+        case: "three devices, no document, times out",
         job_id: "handoff-from-source",
         things: &["handoff-laser-4", "handoff-laser-5", "handoff-laser-6"],
         document: None,
         in_progress_timeout_minutes: Some(1),
         progress_statuses: &[],
-        terminal_status: "REJECTED",
+        // Not `REJECTED`: a device rejects work it has not taken up, and this row's
+        // device has already started the execution through `$next` — a started
+        // execution cannot be moved back out of its own stage.
+        terminal_status: "TIMED_OUT",
     },
 ];
 

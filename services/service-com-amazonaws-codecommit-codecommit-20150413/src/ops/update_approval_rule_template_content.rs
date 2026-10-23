@@ -6,6 +6,11 @@
 //! SHA-256 signature of the content the caller believes is stored, and reports the
 //! stored template as it now is.
 //!
+//! The replacement is stored CANONICALIZED exactly as a created template's content
+//! is (see [`crate::state::canonical_json_document`]): minified, with member order
+//! and literals preserved, so an update cannot leave a template in a serialization
+//! `CreateApprovalRuleTemplate` would never have stored.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -203,15 +208,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The content is an approval rule JSON document, not free text, and
         // "content statements must be complete": the replacement stands on its own.
-        if let Err(reason) =
-            crate::state::validate_approval_rule_template_content(&input.new_rule_content)
-        {
+        // The refusal carries the class's fixed text, not the JSON reader's
+        // complaint.
+        if !crate::state::is_approval_rule_template_content(&input.new_rule_content) {
             return Err(
                 UpdateApprovalRuleTemplateContentErrorModeled::InvalidApprovalRuleTemplateContentException(
                     InvalidApprovalRuleTemplateContentException {
-                        message: Some(format!(
-                            "the content of the approval rule template is not valid: {reason}"
-                        )),
+                        message: Some(
+                            crate::state::INVALID_APPROVAL_RULE_CONTENT_MESSAGE.to_string(),
+                        ),
                     },
                 )
                 .into(),
@@ -250,10 +255,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| {
                 UpdateApprovalRuleTemplateContentErrorModeled::ApprovalRuleTemplateDoesNotExistException(
                     ApprovalRuleTemplateDoesNotExistException {
-                        message: Some(format!(
-                            "the approval rule template {} does not exist",
-                            input.approval_rule_template_name
-                        )),
+                        // The one place this crate words that code, so this
+                        // operation cannot word it differently from the lookups in
+                        // the other approval-rule-template operations.
+                        message: Some(
+                            crate::state::approval_rule_template_does_not_exist_message(
+                                &input.approval_rule_template_name,
+                            ),
+                        ),
                     },
                 )
             })?;
@@ -279,9 +288,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // The content replaces what was stored; every other field of the template —
-        // its id, name, description and creation date — is untouched, and the change
-        // is attributed to this caller at this instant.
+        // The content replaces what was stored, canonicalized the way a created
+        // template's content is; every other field of the template — its id, name,
+        // description and creation date — is untouched, and the change is attributed
+        // to this caller at this instant.
         template.replace_content(
             input.new_rule_content.clone(),
             crate::state::caller_identity_arn(ctx.parts()),

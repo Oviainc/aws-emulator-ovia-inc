@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListSignalingChannels
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListSignalingChannels`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListSignalingChannels::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Pages over the stored signaling-channel index, filtered by the modeled
+//! `ChannelNameCondition`. A reporting operation: the only write it performs is
+//! [`crate::state::ComAmazonawsKinesisvideoKinesisvideo20170930State::settle_clock`],
+//! which materialises the moves out of `CREATING` the clock already owed.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +148,128 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListSignalingChannels` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListSignalingChannelsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListSignalingChannels"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                ListSignalingChannelsErrorModeled::ClientLimitExceededException(
+                    ClientLimitExceededException {
+                        message: Some(
+                            "The signaling channel store is unavailable. Try again later."
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // `MaxResults` is the page bound; absent, the whole (filtered) index is one
+        // page, which `ListStreamsInputLimit`'s modeled maximum expresses.
+        let page_size = usize::try_from(input.max_results.unwrap_or(MAX_PAGE_SIZE))
+            .unwrap_or(1)
+            .max(1);
+
+        // An empty token is the modeled "start from the beginning" value (`NextToken`
+        // has a minimum length of 0); anything else must decode.
+        let resume_after = match input.next_token.as_deref() {
+            None | Some("") => None,
+            Some(token) => Some(decode_token(token).ok_or_else(|| {
+                ListSignalingChannelsError::from(
+                    ListSignalingChannelsErrorModeled::InvalidArgumentException(
+                        InvalidArgumentException {
+                            message: Some("The NextToken provided is not valid.".to_string()),
+                        },
+                    ),
+                )
+            })?),
+        };
+
+        // `ComparisonOperator` models exactly one value, BEGINS_WITH, so the whole
+        // condition reduces to a name prefix. A condition carrying no value cannot be
+        // evaluated at all.
+        let prefix = match input.channel_name_condition.as_ref() {
+            None => None,
+            Some(condition) => match condition.comparison_value.as_deref() {
+                Some(value) => Some(value.to_string()),
+                None => {
+                    return Err(
+                        ListSignalingChannelsErrorModeled::InvalidArgumentException(
+                            InvalidArgumentException {
+                                message: Some(
+                                    "ChannelNameCondition requires a ComparisonValue."
+                                        .to_string(),
+                                ),
+                            },
+                        )
+                        .into(),
+                    )
+                }
+            },
+        };
+
+        let mut store = state.lock();
+        store.settle_clock();
+
+        // `signaling_channels` is sorted by name, so the token resolves against the live
+        // key set rather than a snapshot: a channel deleted between pages simply is not
+        // there.
+        let mut matching = store
+            .signaling_channels
+            .values()
+            .filter(|channel| {
+                resume_after
+                    .as_deref()
+                    .is_none_or(|after| channel.channel_name.as_str() > after)
+            })
+            .filter(|channel| {
+                prefix
+                    .as_deref()
+                    .is_none_or(|prefix| channel.channel_name.starts_with(prefix))
+            });
+
+        let page: Vec<ChannelInfo> = matching
+            .by_ref()
+            .take(page_size)
+            .map(crate::state::SignalingChannel::to_channel_info)
+            .collect();
+        // The token is emitted only when a channel is actually left over, so the last
+        // page carries none.
+        let next_token = matching.next().and_then(|_| {
+            page.last()
+                .and_then(|last| last.channel_name.as_deref())
+                .map(encode_token)
+        });
+
+        Ok(ListSignalingChannelsOutput {
+            channel_info_list: Some(page),
+            next_token,
+        })
     }
+}
+
+/// `ListStreamsInputLimit`'s modeled maximum — the shape `MaxResults` targets here, from
+/// `smithy_query(query="operation", operation="ListSignalingChannels")`. Used as the page
+/// bound when the caller names none, so an unbounded request still paginates by the same
+/// rule.
+const MAX_PAGE_SIZE: i32 = 10_000;
+
+/// The marker every `NextToken` this listing mints carries, before the resume key.
+/// It is what makes a token verifiable: a string that merely happens to be base64 is
+/// not a resume point. Distinct from the stream listing's marker, so a token minted by
+/// one listing is not a resume point for the other.
+const PAGE_TOKEN_PREFIX: &str = "kinesisvideo/signalingchannels/v1/";
+
+/// Encode the last-returned channel name as an opaque `NextToken`.
+///
+/// Base64 because `NextToken`'s modeled `@pattern` is `^[a-zA-Z0-9+/=]*$` — exactly
+/// the standard base64 alphabet — so an encoded name of any shape satisfies it.
+fn encode_token(channel_name: &str) -> String {
+    ::aws_smithy_types::base64::encode(format!("{PAGE_TOKEN_PREFIX}{channel_name}"))
+}
+
+/// The channel name an opaque `NextToken` carries, or `None` when it is not one this
+/// listing issued.
+fn decode_token(token: &str) -> Option<String> {
+    let decoded = String::from_utf8(::aws_smithy_types::base64::decode(token).ok()?).ok()?;
+    decoded.strip_prefix(PAGE_TOKEN_PREFIX).map(str::to_string)
 }

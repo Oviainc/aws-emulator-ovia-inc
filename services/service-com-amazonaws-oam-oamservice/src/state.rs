@@ -26,11 +26,16 @@
 //! `GetSinkPolicy` reports, held on the sink's own record so the two answer from one
 //! stored copy of it and deleting the sink takes its policy with it.
 //!
-//! A few stored members are not reported by any operation in this slice — a sink's
-//! `created_at`, a link's `sink_id` and `created_at`. They are written where the
-//! resource is created so the slices that read them (the tagging operations and
-//! `ListSinks`, still 501 stubs) read the same record rather than a second copy of
-//! it.
+//! A few stored members are not reported by any operation in this slice — a link's
+//! `sink_id` and `created_at`, and a sink's `created_at`. They are written where the
+//! resource is created so the slices that read them (`UntagResource` and `ListSinks`,
+//! still 501 stubs) read the same record rather than a second copy of it.
+//!
+//! Tags live on the resource record itself, so `TagResource` writes through the very
+//! map `CreateSink`/`CreateLink` seeded and `GetSink`/`GetLink` and
+//! `ListTagsForResource` report
+//! ([`ComAmazonawsOamOamserviceState::resource_tags`]): a resource has ONE tag set
+//! however it is reached.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -81,6 +86,15 @@ pub const MAX_SINKS: usize = 100;
 /// cap is what keeps the store finite. A create that would exceed it is refused with
 /// the modelled `ServiceQuotaExceededException`.
 pub const MAX_LINKS: usize = 10_000;
+
+/// The most tags one resource may carry, sinks and links alike.
+///
+/// From `TooManyTagsException`'s own documentation ("A resource can have no more
+/// than 50 tags.") and `TagResource`'s ("You can associate as many as 50 tags with
+/// a resource."): the bound is on what the RESOURCE holds, not on what one request
+/// carries — the per-request bound is the modelled `TagMapInput` `@length(0..50)`,
+/// which the centralized walk enforces before a handler runs.
+pub const MAX_TAGS_PER_RESOURCE: usize = 50;
 
 /// One stored sink: every member `GetSink` and `CreateSink` report, plus the
 /// resource policy `Put/GetSinkPolicy` will attach to it and the tags the tagging
@@ -152,6 +166,20 @@ impl Link {
     pub fn tags_output(&self, include: bool) -> Option<HashMap<String, String>> {
         tags_output(&self.tags, include)
     }
+}
+
+/// Which of this service's two resources an ARN names, with the id its record is
+/// keyed by.
+///
+/// "Both sinks and links support tagging" (`ListTagsForResource`'s own
+/// documentation), and the two live in two maps, so resolving a tagging request's
+/// `ResourceArn` has to say WHICH map holds the record as well as where in it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaggedResource {
+    /// The sink stored under this id.
+    Sink(String),
+    /// The link stored under this id.
+    Link(String),
 }
 
 /// Per-service state for com-amazonaws-oam-oamservice. A handler reaches it through
@@ -309,6 +337,64 @@ impl ComAmazonawsOamOamserviceState {
             .values()
             .filter(|link| link.source_account == source_account)
             .count()
+    }
+
+    /// Which resource `arn` names in `region`, or `None` when no sink or link of this
+    /// region is stored under that exact ARN.
+    ///
+    /// A tagging operation's `ResourceArn` is an ARN and nothing else (its modelled
+    /// `^arn:(\w|-)+:oam:.+:.+:.+` pattern admits no other form), so resolution is by
+    /// FULL ARN equality against the stored record: an ARN naming another partition,
+    /// account or region resolves to nothing rather than to the resource that happens
+    /// to share its id segment. Scoped to `region` for the same reason every other
+    /// lookup here is — a regional endpoint only ever sees its own region's resources.
+    pub fn tagged_resource(&self, region: &str, arn: &str) -> Option<TaggedResource> {
+        if let Some(id) = id_from_arn(arn, SINK_ARN_RESOURCE_PREFIX) {
+            return self
+                .sinks
+                .get(id)
+                .filter(|sink| sink.arn == arn && sink.region == region)
+                .map(|sink| TaggedResource::Sink(sink.id.clone()));
+        }
+        if let Some(id) = id_from_arn(arn, LINK_ARN_RESOURCE_PREFIX) {
+            return self
+                .links
+                .get(id)
+                .filter(|link| link.arn == arn && link.region == region)
+                .map(|link| TaggedResource::Link(link.id.clone()));
+        }
+        None
+    }
+
+    /// The tags stored on the resource `arn` names in `region`, for a reporting
+    /// operation; `None` when that resource is not stored.
+    ///
+    /// Answers the ONE stored tag map — the same one `CreateSink`/`CreateLink` wrote
+    /// and `GetSink`/`GetLink` report — so there is never a second copy of a
+    /// resource's tags to drift from it.
+    pub fn resource_tags(&self, region: &str, arn: &str) -> Option<&BTreeMap<String, String>> {
+        match self.tagged_resource(region, arn)? {
+            TaggedResource::Sink(id) => self.sinks.get(&id).map(|sink| &sink.tags),
+            TaggedResource::Link(id) => self.links.get(&id).map(|link| &link.tags),
+        }
+    }
+
+    /// The same stored tag map, for a tagging operation to write THROUGH; `None` when
+    /// that resource is not stored — which is the 404, never a tag map conjured for an
+    /// absent resource.
+    ///
+    /// Because it is the resource's own map, a write is visible to every later read of
+    /// that one record (`ListTagsForResource`, and `GetSink`/`GetLink` with
+    /// `IncludeTags`).
+    pub fn resource_tags_mut(
+        &mut self,
+        region: &str,
+        arn: &str,
+    ) -> Option<&mut BTreeMap<String, String>> {
+        match self.tagged_resource(region, arn)? {
+            TaggedResource::Sink(id) => self.sinks.get_mut(&id).map(|sink| &mut sink.tags),
+            TaggedResource::Link(id) => self.links.get_mut(&id).map(|link| &mut link.tags),
+        }
     }
 
     /// A fresh id no stored sink is using, or `None` when one could not be found.

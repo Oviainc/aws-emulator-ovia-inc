@@ -62,7 +62,10 @@
 //! evaluated over them (see [`template`]) — rides on that same clock: the call computes
 //! the deployment ([`StoredStack::deploy_template`]) and `settle` installs it with the
 //! terminal status, so a stack always reports the resources and outputs of the template
-//! that finished deploying.
+//! that finished deploying. An operation that could NOT create a resource it declares
+//! reaches a FAILED terminal status instead ([`StoredStack::fail_transition`]), on the same
+//! clock: a failed create resolves no outputs and reports no identifier for what was never
+//! created, and a failed update leaves the template in force alone.
 //!
 //! CREATING those resources in the services that own them is [`provisioning`], which the
 //! deploying operation drives with no lock held — and which leaves the stack
@@ -100,6 +103,10 @@ pub mod provisioning;
 /// declares.
 pub mod template;
 
+/// Computing a change set: comparing the stack's template and parameters with the ones a
+/// change set submits, and the resource-level change list that comparison answers.
+pub mod change_plan;
+
 /// One entry per resource type this emulator really creates: which service owns it, and
 /// the create and delete calls that make its resources exist.
 mod provisioner;
@@ -115,6 +122,10 @@ pub mod resource_types;
 /// The extension registry: the registered and activated extensions this account and
 /// Region holds, and the versions of each.
 pub mod registry;
+
+/// The resource schema the registry holds for a resource type: the document that defines
+/// which properties the type has.
+pub mod resource_schema;
 
 /// How long after the call that starts it a stack's terminal status becomes due.
 ///
@@ -308,9 +319,11 @@ pub mod status {
 /// `ResourceStatus` values this service leaves a stack's resource in (all from the
 /// model's `ResourceStatus` enum).
 ///
-/// A stack operation of this service deploys a whole template at once and never fails
-/// part-way, so the only statuses a resource reaches here are the completions of the
-/// operation that created, updated or deleted it.
+/// A stack operation of this service deploys a whole template at once, so the statuses a
+/// resource reaches here are the completions of the operation that created, updated or
+/// deleted it; a deployment that could not provision a resource is reported on the STACK
+/// (`StoredStack::fail_transition`), which does not install that template's resources at
+/// all.
 pub mod resource_status {
     pub const CREATE_COMPLETE: &str = "CREATE_COMPLETE";
     pub const UPDATE_COMPLETE: &str = "UPDATE_COMPLETE";
@@ -410,8 +423,11 @@ pub struct StoredParameter {
 /// One resource a stack's template declares, as this emulator records it.
 ///
 /// The physical resource id and the attributes are what CloudFormation's documented
-/// return values for that resource type give it (see [`template::provision`]); they are
-/// what `Ref` and `Fn::GetAtt` resolve to when the stack's outputs are evaluated.
+/// return values for that resource type give it (see [`template::provision`]), unless the
+/// resource was really CREATED in the service that owns it
+/// ([`provisioning`](crate::state::provisioning)) — then they are what that service
+/// answered and `materialised` records it. They are what `Ref` and `Fn::GetAtt` resolve to
+/// when the stack's outputs are evaluated.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredResource {
     pub logical_id: String,
@@ -507,7 +523,6 @@ pub struct StoredOperation {
     pub operation_type: String,
 }
 
-
 /// A stack tag.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredTag {
@@ -557,7 +572,8 @@ pub struct StoredEvent {
 pub struct PendingStatus {
     pub status: String,
     /// The `StackStatusReason` that status carries, for an operation that is headed for a
-    /// FAILED one: a failure has to say what failed, and a success states no reason.
+    /// FAILED one: a failure has to say what failed, and a success states no reason
+    /// (`StoredStack::fail_transition`).
     pub status_reason: Option<String>,
     pub due_at: SystemTime,
     pub operation_id: Option<String>,
@@ -729,24 +745,13 @@ impl StoredStack {
     /// own them is [`provisioning::reconcile`](provisioning::reconcile), which the
     /// deploying operation calls with these records once the store is unlocked.
     pub fn deploy_template(&mut self) {
-        let Some(declared) = self
-            .template_body
-            .as_deref()
-            .and_then(template::parse)
-        else {
+        let Some((declared, parameters)) = self.template_scope() else {
             // No template at all (a stack a CREATE change set created and nothing has
             // executed yet), or one this service will not read: either way the stack is
             // left with no resources and no outputs rather than with invented ones.
             self.pending_deployment = Some(PendingDeployment::default());
             return;
         };
-        // "Default: A value of the appropriate type for the template to use if no value
-        // is specified when a stack is created" — the request's values win over the
-        // template's declared defaults.
-        let mut parameters = declared.parameter_defaults();
-        for parameter in &self.parameters {
-            parameters.insert(parameter.key.clone(), parameter.value.clone());
-        }
         let stack = template::StackScope {
             region: &self.region,
             stack_name: &self.stack_name,
@@ -792,23 +797,136 @@ impl StoredStack {
         // operation calls with these records.
         let already_created = self.current_resources();
         for resource in &mut resources {
-            if let Some(existing) = already_created.iter().find(|existing| {
-                existing.materialised && provisioning::is_same_resource(existing, resource)
-            }) {
+            // The record of the same resource this stack already created. Judged by
+            // identity first; for a type whose id the OWNING SERVICE assigns, a record
+            // under the same logical id and type IS that resource, because nothing here
+            // can recompute the id it was created with.
+            let existing = already_created
+                .iter()
+                .find(|existing| {
+                    existing.materialised && provisioning::is_same_resource(existing, resource)
+                })
+                .or_else(|| {
+                    template::identity_is_service_assigned(&resource.resource_type)
+                        .then(|| {
+                            already_created.iter().find(|existing| {
+                                existing.materialised
+                                    && existing.logical_id == resource.logical_id
+                                    && existing.resource_type == resource.resource_type
+                            })
+                        })
+                        .flatten()
+                });
+            if let Some(existing) = existing {
                 // Deliberately NOT `provisioning::carry_forward`: that one also carries
                 // the properties the resource was created with, and this record's
                 // properties are what `reconcile` compares against them to see whether
                 // the deployment asks for a DIFFERENT configuration of a resource that
-                // already exists. Only the fact that it exists, and what the owning
-                // service reported about it, carry forward here.
+                // already exists. Only the fact that it exists, what the owning service
+                // reported about it, and an identity that service MINTED (which no
+                // deployment recomputes) carry forward here.
                 resource.materialised = true;
+                if template::identity_is_service_assigned(&resource.resource_type) {
+                    // The identifier in force is the one that service minted, so the
+                    // record keeps it: an output naming the resource reports the id a
+                    // client can call that service with, and `reconcile` sees the resource
+                    // the stack already has rather than one to create again.
+                    resource.physical_resource_id = existing.physical_resource_id.clone();
+                }
                 for (name, value) in &existing.attributes {
                     resource.attributes.insert(name.clone(), value.clone());
                 }
             }
         }
-        let outputs = template::evaluate_outputs(&declared, &resolved, &mut budget);
+        // The outputs are evaluated against the identities now in force, which is why this
+        // is after the carry-forward above: a resource whose id the owning service assigned
+        // carries the one it minted, and an output naming that resource must report THAT.
+        let outputs = self.evaluated_outputs(&declared, scope, &resources, &mut budget);
         self.pending_deployment = Some(PendingDeployment { resources, outputs });
+    }
+
+    /// The stack's declared outputs, evaluated against `resources`.
+    ///
+    /// An output's value is a function of the template, the parameters in force and the
+    /// resources' IDENTITIES, so it is evaluated wherever one of those is settled: by
+    /// [`Self::deploy_template`] when the template is deployed, and again by
+    /// [`Self::record_materialised_resources`] once the services that own the resources
+    /// have reported the identifiers they minted.
+    fn evaluated_outputs(
+        &self,
+        declared: &template::Template,
+        scope: template::Scope<'_>,
+        resources: &[StoredResource],
+        budget: &mut template::Budget,
+    ) -> Vec<StoredOutput> {
+        let identities: BTreeMap<String, StoredResource> = resources
+            .iter()
+            .map(|resource| (resource.logical_id.clone(), resource.clone()))
+            .collect();
+        template::evaluate_outputs(
+            declared,
+            &template::Scope {
+                resources: &identities,
+                ..scope
+            },
+            budget,
+        )
+    }
+
+    /// The template this stack carries and the parameter values in force on it.
+    ///
+    /// "Default: A value of the appropriate type for the template to use if no value is
+    /// specified when a stack is created" — the request's values win over the template's
+    /// declared defaults, which is what this merge is.
+    ///
+    /// `None` for a stack with no template, or one this service cannot read: there is
+    /// nothing to evaluate then.
+    fn template_scope(&self) -> Option<(template::Template, BTreeMap<String, String>)> {
+        let declared = self.template_body.as_deref().and_then(template::parse)?;
+        let mut parameters = declared.parameter_defaults();
+        for parameter in &self.parameters {
+            parameters.insert(parameter.key.clone(), parameter.value.clone());
+        }
+        Some((declared, parameters))
+    }
+
+    /// Re-evaluate the stack's outputs over the resource records now in force.
+    ///
+    /// Called where the identities those records carry have CHANGED since the template was
+    /// deployed — which is what provisioning does for a type whose physical id the owning
+    /// service assigns ([`template::identity_is_service_assigned`]): the output of such a
+    /// resource must report the identifier that service minted, since that is the one a
+    /// client calls it with. Nothing else about the evaluation differs, so the stack's
+    /// outputs stay a function of its template, its parameters and its resources.
+    fn reevaluate_outputs(&mut self) {
+        let Some((declared, parameters)) = self.template_scope() else {
+            return;
+        };
+        let resources = self.current_resources();
+        let parameter_types = declared.parameter_types();
+        let no_resources = BTreeMap::new();
+        let mut budget = template::Budget::new();
+        let outputs = self.evaluated_outputs(
+            &declared,
+            template::Scope {
+                stack: template::StackScope {
+                    region: &self.region,
+                    stack_name: &self.stack_name,
+                    stack_id: &self.stack_id,
+                },
+                parameters: &parameters,
+                parameter_types: &parameter_types,
+                resources: &no_resources,
+                mappings: &declared.mappings,
+                conditions: &declared.conditions,
+            },
+            &resources,
+            &mut budget,
+        );
+        match &mut self.pending_deployment {
+            Some(deployment) => deployment.outputs = outputs,
+            None => self.outputs = outputs,
+        }
     }
 
     /// Whether this stack is still part of the live set — the set addressable by stack
@@ -896,7 +1014,8 @@ impl StoredStack {
         } else if let Some(deployed) = self.pending_deployment.take() {
             // The create or update completed: the template it deployed is what the stack
             // reports resources and outputs for from here on.
-            self.resources = installed_resources(&self.resources, deployed.resources, pending.due_at);
+            self.resources =
+                installed_resources(&self.resources, deployed.resources, pending.due_at);
             self.outputs = deployed.outputs;
         }
         let status = self.status.clone();
@@ -943,6 +1062,8 @@ impl StoredStack {
         );
         self.pending = Some(PendingStatus {
             status: settles_to.to_string(),
+            // A completion carries no reason, and nothing has failed yet:
+            // `Self::fail_transition` is what records a failure of this operation.
             status_reason: None,
             due_at: now + STATUS_TRANSITION_DELAY,
             operation_id,
@@ -965,8 +1086,8 @@ impl StoredStack {
     }
 
     /// Replace the resources of [`Self::current_resources`] with what the services that
-    /// own them answered — the attributes they reported, and whether each one was really
-    /// created there.
+    /// own them answered — the identifier each one minted, the attributes they reported,
+    /// and whether each resource was really created there.
     ///
     /// For an operation still in flight that is the pending deployment, which
     /// [`Self::settle`] installs when the operation completes. For one that has already
@@ -974,9 +1095,16 @@ impl StoredStack {
     /// records are rewritten in place, each keeping the resource STATUS and timestamp its
     /// deployment gave it: nothing about a resource's status changed because its
     /// provisioning record did.
+    ///
+    /// The stack's outputs are evaluated again over the recorded set
+    /// ([`Self::reevaluate_outputs`]): for a type whose physical id the owning service
+    /// ASSIGNS, the identity in these records is the one it minted rather than the one the
+    /// naming rules computed, and an output naming that resource reports what a client can
+    /// call that service with.
     pub fn record_materialised_resources(&mut self, resources: Vec<StoredResource>) {
         if let Some(deployment) = &mut self.pending_deployment {
             deployment.resources = resources;
+            self.reevaluate_outputs();
             return;
         }
         for resource in resources {
@@ -995,6 +1123,7 @@ impl StoredStack {
                 )),
             }
         }
+        self.reevaluate_outputs();
     }
 
     /// Record that the operation in flight could not be carried out: the stack takes the
@@ -1051,23 +1180,10 @@ fn installed_resources(
         .collect()
 }
 
-/// One resource-level change a change set would make, computed once when the change set
-/// is created by comparing the submitted template with the stack's current one.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StoredResourceChange {
-    /// The model's `ChangeAction`: `Add`, `Modify` or `Remove`.
-    pub action: String,
-    pub logical_resource_id: String,
-    pub resource_type: String,
-    /// The physical id of the resource the change acts on, for a change to one the stack
-    /// has already deployed (a `Modify` or a `Remove`). `None` for an `Add`: the resource
-    /// does not exist yet, so it has no physical id to report.
-    pub physical_resource_id: Option<String>,
-    /// For a `Modify`, the resource attributes that differ, spelled as the model's
-    /// `ResourceAttribute` enum spells them and in that enum's order. Empty for an `Add`
-    /// or a `Remove`, which change the whole resource rather than an attribute of it.
-    pub scope: Vec<String>,
-}
+/// The change set as this store carries it: the resource-level change list and the
+/// property-level detail behind each entry, which [`change_plan::computed_changes`]
+/// computes once where the change set is created.
+pub use change_plan::{StackRevision, StoredChangeDetail, StoredResourceChange};
 
 /// The change-set statuses a change set's creation is headed for, and the instant they
 /// are due.
@@ -1161,6 +1277,114 @@ impl StoredChangeSet {
         self.status == change_set_status::CREATE_COMPLETE
             && self.execution_status == execution_status::AVAILABLE
     }
+
+    /// The first attribute this stored change set states differently from a request that
+    /// re-creates its name, spelled as the REQUEST member that carries it, or `None` when
+    /// the request submits the very same change set.
+    ///
+    /// What `CreateChangeSet` answers for a name the stack already carries depends on this
+    /// comparison, not on the name alone: re-submitting the same plan under the same name is
+    /// the same change set (which is what makes a retried create idempotent), while one
+    /// whose attributes differ cannot be created, and the refusal names the attribute that
+    /// differs — "cannot be created due to a mismatch with existing attribute `<member>`".
+    ///
+    /// The attributes are the request's own, in the order this function compares them; the
+    /// change set's id, its stack, its creation time and its status are not request
+    /// attributes and are not compared.
+    pub fn mismatching_attribute(
+        &self,
+        submitted: &SubmittedChangeSet<'_>,
+    ) -> Option<&'static str> {
+        let comparisons: [(&'static str, bool); 14] = [
+            ("ChangeSetType", self.change_set_type == submitted.change_set_type),
+            (
+                "Parameters",
+                same_parameters(&self.parameters, submitted.parameters),
+            ),
+            ("TemplateBody", self.template_body == submitted.template_body),
+            ("Capabilities", self.capabilities == submitted.capabilities),
+            ("ResourceTypes", self.resource_types == submitted.resource_types),
+            ("RoleARN", self.role_arn.as_deref() == submitted.role_arn),
+            (
+                "RollbackConfiguration",
+                self.rollback_configuration.as_ref() == submitted.rollback_configuration,
+            ),
+            (
+                "NotificationARNs",
+                self.notification_arns == submitted.notification_arns,
+            ),
+            ("Tags", same_tags(&self.tags, submitted.tags)),
+            ("Description", self.description.as_deref() == submitted.description),
+            (
+                "OnStackFailure",
+                self.on_stack_failure.as_deref() == submitted.on_stack_failure,
+            ),
+            (
+                "IncludeNestedStacks",
+                self.include_nested_stacks == submitted.include_nested_stacks,
+            ),
+            (
+                "ImportExistingResources",
+                self.import_existing_resources == submitted.import_existing_resources,
+            ),
+            (
+                "DeploymentMode",
+                self.deployment_mode.as_deref() == submitted.deployment_mode,
+            ),
+        ];
+        comparisons
+            .into_iter()
+            .find_map(|(attribute, agrees)| (!agrees).then_some(attribute))
+    }
+}
+
+/// Whether two parameter sets state the same values: `Parameters` is a SET keyed by
+/// `ParameterKey`, so two requests that list the same pairs in two orders submit the same
+/// parameters.
+fn same_parameters(stored: &[StoredParameter], submitted: &[StoredParameter]) -> bool {
+    fn by_key(parameters: &[StoredParameter]) -> BTreeMap<&str, &str> {
+        parameters
+            .iter()
+            .map(|parameter| (parameter.key.as_str(), parameter.value.as_str()))
+            .collect()
+    }
+    by_key(stored) == by_key(submitted)
+}
+
+/// Whether two tag sets state the same tags, keyed by `Key` for the same reason
+/// [`same_parameters`] keys by `ParameterKey`.
+fn same_tags(stored: &[StoredTag], submitted: &[StoredTag]) -> bool {
+    fn by_key(tags: &[StoredTag]) -> BTreeMap<&str, &str> {
+        tags.iter()
+            .map(|tag| (tag.key.as_str(), tag.value.as_str()))
+            .collect()
+    }
+    by_key(stored) == by_key(submitted)
+}
+
+/// The attributes one `CreateChangeSet` request submits, resolved the way they would be
+/// STORED: what [`StoredChangeSet::mismatching_attribute`] compares a re-created name
+/// against.
+#[derive(Debug, Clone, Copy)]
+pub struct SubmittedChangeSet<'a> {
+    pub change_set_type: &'a str,
+    pub description: Option<&'a str>,
+    /// The template the change set would put on the stack, which for a request reusing the
+    /// stack's template is that template.
+    pub template_body: &'a str,
+    /// The parameter values the change set would apply, already resolved against the ones
+    /// the stack carries (`UsePreviousValue`).
+    pub parameters: &'a [StoredParameter],
+    pub capabilities: &'a [String],
+    pub resource_types: &'a [String],
+    pub role_arn: Option<&'a str>,
+    pub rollback_configuration: Option<&'a StoredRollbackConfiguration>,
+    pub notification_arns: &'a [String],
+    pub tags: &'a [StoredTag],
+    pub on_stack_failure: Option<&'a str>,
+    pub include_nested_stacks: bool,
+    pub import_existing_resources: bool,
+    pub deployment_mode: Option<&'a str>,
 }
 
 /// One drift-detection operation on one stack: what `DetectStackDrift` started and
@@ -1491,6 +1715,12 @@ impl ComAmazonawsCloudformationCloudformationState {
     /// the id wins, and this emulator derives a generated physical id from the stack id, so
     /// two stacks collide only where their templates NAME the same resource.
     pub fn stack_of_physical_resource(&self, physical_resource_id: &str) -> Option<&StoredStack> {
+        if physical_resource_id.is_empty() {
+            // A resource that was never created carries no physical id, so nothing is
+            // addressable by one: the empty string must not resolve to the first stack
+            // holding such a resource.
+            return None;
+        }
         self.stacks.iter().find(|stack| {
             stack
                 .resources
@@ -1538,6 +1768,16 @@ impl ComAmazonawsCloudformationCloudformationState {
     }
 }
 
+/// A resource's `PhysicalResourceId`, which a resource that was never CREATED does not
+/// have.
+///
+/// A resource whose create the service that owns it refused carries no identifier at all,
+/// and `StackResource$PhysicalResourceId` is optional, so it is reported ABSENT — an id
+/// nothing minted is what a client must never be handed.
+pub fn physical_resource_id(resource: &StoredResource) -> Option<String> {
+    (!resource.physical_resource_id.is_empty()).then(|| resource.physical_resource_id.clone())
+}
+
 /// Stored outputs as the modelled `Outputs` member.
 ///
 /// A declared output whose value this service could not evaluate carries no
@@ -1557,25 +1797,7 @@ pub fn output_views(outputs: &[StoredOutput]) -> Option<Vec<crate::ops::types::O
     )
 }
 
-/// The `ResourceAttribute`s one resource declaration states differently from another, in
-/// the order the model's enum lists them.
-///
-/// Only attributes the model can name are reported, which is what `ResourceChange$Scope`
-/// carries: the whole resource declaration is compared, not just its `Properties`.
-fn differing_attributes(
-    resource: &template::DeclaredResource,
-    other: &template::DeclaredResource,
-) -> Vec<String> {
-    crate::ops::types::RESOURCE_ATTRIBUTE_VALUES
-        .iter()
-        .filter(|attribute| {
-            resource.declaration.get(**attribute) != other.declaration.get(**attribute)
-        })
-        .map(|attribute| (*attribute).to_string())
-        .collect()
-}
-
-/// The resources a template body declares, by logical id, for comparing two templates.
+/// The template a body declares, ready to compare against another revision of it.
 ///
 /// Read by the SAME reader a deployment uses ([`template::parse`], which takes a JSON or a
 /// YAML body under this service's template bounds), then SORTED by logical id — and that
@@ -1587,77 +1809,17 @@ fn differing_attributes(
 ///
 /// `None` for a body this service will not read at all; `Some([])` for one that declares no
 /// resources — which `CreateChangeSet` refuses, since a change set is a plan over resources.
-pub fn template_resources(template_body: &str) -> Option<Vec<template::DeclaredResource>> {
-    let mut declared = template::parse(template_body)?.resources;
-    declared.sort_by(|left, right| left.logical_id.cmp(&right.logical_id));
+pub fn declared_template(template_body: &str) -> Option<template::Template> {
+    let mut declared = template::parse(template_body)?;
+    declared
+        .resources
+        .sort_by(|left, right| left.logical_id.cmp(&right.logical_id));
     Some(declared)
 }
 
-/// The resource-level changes that applying `next` to a stack whose template declares
-/// `previous` would make, against the resources that stack has `deployed`.
-///
-/// A resource only `next` declares is an `Add`, one only `previous` declares is a `Remove`,
-/// and one both declare differently is a `Modify` scoped to the attributes that differ —
-/// except when its `Type` itself changed, which cannot be modified into place and so is
-/// reported as the `Remove` of the old resource and the `Add` of the new one. A change to a
-/// resource the stack has already deployed carries that resource's physical id. The order is
-/// deterministic: the submitted template's resources (in the order
-/// [`template_resources`] yields them, which is by logical id), then the removals in the
-/// stack template's.
-pub fn computed_changes(
-    previous: &[template::DeclaredResource],
-    next: &[template::DeclaredResource],
-    deployed: &[DeployedResource],
-) -> Vec<StoredResourceChange> {
-    let physical_id = |logical_id: &str| {
-        deployed
-            .iter()
-            .find(|deployed| deployed.resource.logical_id == logical_id)
-            .map(|deployed| deployed.resource.physical_resource_id.clone())
-    };
-    let change =
-        |action: &str, resource: &template::DeclaredResource, scope: Vec<String>| {
-            StoredResourceChange {
-                action: action.to_string(),
-                logical_resource_id: resource.logical_id.clone(),
-                resource_type: resource.resource_type.clone(),
-                // Only a change to a resource the stack has deployed has one; an addition
-                // has nothing deployed under that logical id yet.
-                physical_resource_id: (action != change_action::ADD)
-                    .then(|| physical_id(&resource.logical_id))
-                    .flatten(),
-                scope,
-            }
-        };
-    let mut changes = Vec::new();
-    for resource in next {
-        match previous
-            .iter()
-            .find(|candidate| candidate.logical_id == resource.logical_id)
-        {
-            None => changes.push(change(change_action::ADD, resource, Vec::new())),
-            Some(before) if before.declaration == resource.declaration => {}
-            Some(before) if before.resource_type != resource.resource_type => {
-                changes.push(change(change_action::REMOVE, before, Vec::new()));
-                changes.push(change(change_action::ADD, resource, Vec::new()));
-            }
-            Some(before) => changes.push(change(
-                change_action::MODIFY,
-                resource,
-                differing_attributes(resource, before),
-            )),
-        }
-    }
-    for resource in previous {
-        let still_declared = next
-            .iter()
-            .any(|candidate| candidate.logical_id == resource.logical_id);
-        if !still_declared {
-            changes.push(change(change_action::REMOVE, resource, Vec::new()));
-        }
-    }
-    changes
-}
+/// The resource-level change list a change set carries, computed by comparing the stack's
+/// revision with the submitted one — see [`change_plan`].
+pub use change_plan::computed_changes;
 
 /// Resolve the request's `Parameters` against the values the stack already carries.
 ///

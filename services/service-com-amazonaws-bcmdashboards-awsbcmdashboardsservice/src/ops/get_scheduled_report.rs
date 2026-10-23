@@ -5,7 +5,11 @@
 //! Resolves the stored scheduled report the requested ARN is the key of and returns it
 //! projected onto the modelled `ScheduledReport` shape
 //! (`crate::state::ScheduledReportRecord::report`). A read: it writes nothing, and an
-//! ARN no report is stored under is refused with `ResourceNotFoundException` (404).
+//! ARN no report is stored under is refused with the service's not-found answer — HTTP 400
+//! with the error code `ResourceNotFoundException` and a `resourceId` member carrying the
+//! requested ARN, as `crate::scaffolded::Scaffolded::resource_not_found` renders it (the
+//! model's `@httpError` for that shape is 404, which is not what the recorded service
+//! answers).
 //!
 //! Implemented alongside `CreateScheduledReport` so a create can be proved by reading
 //! the resource back; `ListScheduledReports`, `UpdateScheduledReport`,
@@ -161,9 +165,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A read: it resolves the record and projects it, and writes nothing.
         let state = state.lock();
         let report = state.scheduled_reports.get(&input.arn).ok_or_else(|| {
-            GetScheduledReportErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: format!("Resource {} does not exist.", input.arn),
-            })
+            // The request-derived template the recorded service words THIS operation's
+            // refusal with (each operation has its own); the ARN is the request's.
+            crate::scaffolded::Scaffolded::resource_not_found(
+                &input.arn,
+                format!("Scheduled report not found: {}", input.arn),
+            )
         })?;
 
         Ok(GetScheduledReportOutput {

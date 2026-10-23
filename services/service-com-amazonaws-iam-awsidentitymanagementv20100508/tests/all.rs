@@ -37,6 +37,8 @@ mod role_inline_policy_rotation;
 mod role_lifecycle;
 #[path = "all/role_listing.rs"]
 mod role_listing;
+#[path = "all/role_permissions_boundary.rs"]
+mod role_permissions_boundary;
 #[path = "all/role_policy_listing.rs"]
 mod role_policy_listing;
 #[path = "all/role_policy_removal.rs"]

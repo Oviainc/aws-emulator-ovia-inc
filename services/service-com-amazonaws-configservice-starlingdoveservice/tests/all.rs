@@ -64,3 +64,15 @@ mod config_custom_rule_policy;
 mod compliance_details_by_config_rule;
 #[path = "all/proactive_resource_evaluation.rs"]
 mod proactive_resource_evaluation;
+#[path = "all/config_deliver_config_snapshot.rs"]
+mod config_deliver_config_snapshot;
+#[path = "all/aggregate_resource_config.rs"]
+mod aggregate_resource_config;
+#[path = "all/resource_evaluation_surface.rs"]
+mod resource_evaluation_surface;
+#[path = "all/delete_service_linked_recorder.rs"]
+mod delete_service_linked_recorder;
+#[path = "all/config_rules_on_demand_evaluation.rs"]
+mod config_rules_on_demand_evaluation;
+#[path = "all/config_delete_configuration_aggregator.rs"]
+mod config_delete_configuration_aggregator;

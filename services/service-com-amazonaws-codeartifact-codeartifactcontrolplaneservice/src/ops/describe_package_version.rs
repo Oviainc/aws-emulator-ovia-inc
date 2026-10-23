@@ -3,8 +3,11 @@
 //! @op DescribePackageVersion
 //! Reports the stored `PackageVersionDescription` of one package version, addressed by
 //! the `(format, namespace, package, version)` the publish path stored it under. A
-//! REPORTING operation: it writes nothing. An unknown domain, repository, package or
-//! version is a `ResourceNotFoundException` (404) naming the resource that was missing.
+//! REPORTING operation: it writes nothing. An unknown domain or repository is a
+//! `ResourceNotFoundException` (404) naming it; a coordinate the repository holds no
+//! version for names the PACKAGE at that coordinate as the missing resource (a package
+//! exists in a repository only through its versions), with `resourceType` `package` and
+//! `resourceId` the package name.
 //!
 //! ## Shape of an operation
 //!
@@ -200,28 +203,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "repository",
             ));
         };
-        let Some(package) = repository.package(
-            &input.format,
-            input.namespace.as_deref(),
-            &input.package,
-        ) else {
+        // A package version is addressed by the whole (format, namespace, package,
+        // version) coordinate, and a package exists in a repository only through its
+        // versions — the same rule that makes a package whose last version was deleted
+        // unreadable. So a coordinate this repository holds no version for has no package
+        // at it either, and that is the resource the refusal names: `resourceType`
+        // `package`, `resourceId` the package name, and the message naming the format, the
+        // package, its namespace and the repository the version was looked for in.
+        let stored = repository
+            .package(&input.format, input.namespace.as_deref(), &input.package)
+            .and_then(|package| {
+                package
+                    .versions
+                    .get(&input.package_version)
+                    .map(|version| (package, version))
+            });
+        let Some((package, version)) = stored else {
             return Err(not_found(
-                format!(
-                    "Package {} not found in repository {}.",
-                    input.package, input.repository
+                crate::state::package_coordinate_not_found_message(
+                    &input.format,
+                    input.namespace.as_deref(),
+                    &input.package,
+                    &input.repository,
                 ),
                 &input.package,
                 "package",
-            ));
-        };
-        let Some(version) = package.versions.get(&input.package_version) else {
-            return Err(not_found(
-                format!(
-                    "Package version {} {} not found in repository {}.",
-                    input.package, input.package_version, input.repository
-                ),
-                &input.package_version,
-                "package-version",
             ));
         };
 

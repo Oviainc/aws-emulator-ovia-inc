@@ -19,12 +19,18 @@ mod automation_events;
 mod automation_rule_lifecycle;
 #[path = "all/automation_rule_preview.rs"]
 mod automation_rule_preview;
+#[path = "all/automation_rule_preview_summaries.rs"]
+mod automation_rule_preview_summaries;
 #[path = "all/enrollment_gate.rs"]
 mod enrollment_gate;
 #[path = "all/error_payloads.rs"]
 mod error_payloads;
+#[path = "all/recommended_action_summaries.rs"]
+mod recommended_action_summaries;
 #[path = "all/recommended_actions.rs"]
 mod recommended_actions;
+#[path = "all/resource_tagging.rs"]
+mod resource_tagging;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/rule_projection.rs"]

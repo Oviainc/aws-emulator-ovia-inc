@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! The `ResourceNotFoundException` body every ARN-addressed operation of this service
-//! answers an export ARN that resolves to nothing with.
+//! answers an ARN that resolves to nothing with.
 //!
 //! The rule under test: the not-found `Message` is a FIXED, request-independent string
 //! — one per operation family, the export-definition operations wording the condition as
-//! a missing definition and the resource-tagging operations as a missing resource. It
+//! a missing definition and the resource-tagging operations as a missing resource (and
+//! `GetExecution`, whose resource is the EXECUTION, as a missing execution —
+//! `tests/all/execution_lookup.rs` owns that operation). It
 //! does not restate — and does not vary with — the requested ARN, its partition, its
 //! region, its account id or its resource name, so the reply to "this export does not
 //! exist in your account" carries the same message as the reply to "this ARN names a
@@ -28,6 +30,10 @@
 //! `^arn:aws[-a-z0-9]*:(bcm-data-exports):[-a-z0-9]*:[0-9]{12}:[-a-zA-Z0-9/:_]+$` —
 //! smithy_query shape `Arn`), so each refusal comes from the handler's lookup and not
 //! from boundary validation.
+//!
+//! The STATUS those refusals carry is this service's client-error status (HTTP 400) rather
+//! than the 404 the shape's `@httpError` trait declares;
+//! `tests/all/not_found_wire_status.rs` is where that rule is asserted.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -246,7 +252,7 @@ fn check_not_found(
 
 /// Over the whole table, the message an operation answers with is the same fixed string
 /// for every absent ARN — and the whole service words the condition in just the two ways
-/// its two operation families do.
+/// its two ARN-addressed operation families do.
 #[tokio::test]
 async fn not_found_message_is_a_fixed_constant_for_every_absent_arn() {
     let client = Client::new();

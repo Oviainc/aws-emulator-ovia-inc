@@ -137,6 +137,28 @@ pub(crate) async fn json_call(
     send(router, method, uri, "application/json", payload, &[]).await
 }
 
+/// A retrieval role of the shape the model's `RoleArn` pattern demands
+/// (`^((arn):(aws|…):(iam)::\d{12}:role[/].*)$`).
+///
+/// Every `LocationUri` but the hosted store and a CodePipeline pipeline needs one: "A
+/// retrieval role ARN is not required for configurations stored in CodePipeline or the
+/// AppConfig hosted configuration store. It is required for all other sources that store
+/// your configuration" (the model's `RetrievalRoleArn` documentation).
+pub(crate) const RETRIEVAL_ROLE: &str = "arn:aws:iam::000000000000:role/appconfig-retrieval";
+
+/// `body` with a `RetrievalRoleArn` added when its `LocationUri` needs one, so a row can
+/// name a location without restating the rule.
+pub(crate) fn with_required_retrieval_role(mut body: serde_json::Value) -> serde_json::Value {
+    let needs_role = body
+        .get("LocationUri")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(state::location_uri_requires_retrieval_role);
+    if needs_role && body.get("RetrievalRoleArn").is_none() {
+        body["RetrievalRoleArn"] = serde_json::Value::from(RETRIEVAL_ROLE);
+    }
+    body
+}
+
 /// Create an application and return its minted id.
 pub(crate) async fn create_application(router: &MultiServiceRouter, name: &str) -> String {
     let answer = json_call(
@@ -422,7 +444,7 @@ async fn environments_and_profiles_round_trip_with_their_optional_members() {
         );
         assert_eq!(
             created.string("State").as_deref(),
-            Some("READY_FOR_DEPLOYMENT"),
+            Some(state::ENVIRONMENT_READY_FOR_DEPLOYMENT),
             "case {case:?}: a new environment has nothing deploying into it, got {:?}",
             created.string("State")
         );
@@ -492,6 +514,7 @@ async fn environments_and_profiles_round_trip_with_their_optional_members() {
         if !validators.is_null() {
             body["Validators"] = validators.clone();
         }
+        let body = with_required_retrieval_role(body);
         let created = json_call(
             &router,
             "POST",
@@ -904,8 +927,8 @@ async fn predefined_strategies_deploy_and_the_deployment_reads_back() {
         .await;
         assert_eq!(
             environment_state.string("State").as_deref(),
-            Some("DEPLOYING"),
-            "case {case:?}: an environment with a deployment in flight is DEPLOYING, got {:?}",
+            Some(state::ENVIRONMENT_DEPLOYING),
+            "case {case:?}: an environment with a deployment in flight is Deploying, got {:?}",
             environment_state.string("State")
         );
     }
@@ -1027,7 +1050,9 @@ async fn semantic_rules_the_schema_cannot_express_are_refused_with_bad_request()
             &router,
             "POST",
             &format!("/applications/{application}/configurationprofiles"),
-            &serde_json::json!({ "Name": format!("profile-{case}"), "LocationUri": location_uri }),
+            &with_required_retrieval_role(
+                serde_json::json!({ "Name": format!("profile-{case}"), "LocationUri": location_uri }),
+            ),
         )
         .await;
         assert_eq!(
@@ -1283,8 +1308,7 @@ async fn writes_past_a_bound_are_refused_with_the_modelled_quota_error() {
 }
 
 /// Deployment numbers increase by one per environment, independently of other
-/// environments, and a deployment whose rollout and bake time have elapsed stops
-/// blocking the next one — which is the clock's doing, not a caller's.
+/// environments, and a deployment that is already finished does not block the next one.
 #[tokio::test]
 async fn deployment_numbers_increase_per_environment() {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
@@ -1292,12 +1316,11 @@ async fn deployment_numbers_increase_per_environment() {
     let application = create_application(&router, "numbering").await;
     let profile = create_profile(&router, &application, "config").await;
 
-    // A strategy with no deployment duration and no final bake time, so its
-    // deployments reach a terminal state as soon as the clock allows and this suite
-    // can start a second deployment into the same environment without waiting out a
-    // predefined strategy's minutes. Seeded through the same bounded entry point
-    // `CreateDeploymentStrategy` writes through, so this suite exercises the deployment
-    // numbering rather than that operation.
+    // A strategy with no deployment duration and no final bake time, so each of its
+    // deployments is finished the moment it is started and this suite can deploy into the
+    // same environment again without waiting out a predefined strategy's minutes. Seeded
+    // through the same bounded entry point `CreateDeploymentStrategy` writes through, so
+    // this suite exercises the deployment numbering rather than that operation.
     let immediate = "imm0001";
     assert!(
         state::service_state(&*engine)
@@ -1358,31 +1381,17 @@ async fn deployment_numbers_increase_per_environment() {
             started.string("EnvironmentId")
         );
 
-        // The deployment is in flight, so the next one would conflict...
-        let conflicting = json_call(
-            &router,
-            "POST",
-            &format!("/applications/{application}/environments/{first}/deployments"),
-            &serde_json::json!({
-                "DeploymentStrategyId": immediate,
-                "ConfigurationProfileId": profile,
-                "ConfigurationVersion": "1",
-            }),
-        )
-        .await;
+        // A strategy with no rollout window and no bake time has nothing left to wait
+        // for, so the start call itself answers a COMPLETE deployment — and the next
+        // deployment into the same environment is not blocked, with no caller asking for
+        // anything and no test sleeping.
         assert_eq!(
-            conflicting.status, 409,
-            "case {case:?}: a deployment in flight must block the next one, got {} / {}",
-            conflicting.status,
-            String::from_utf8_lossy(&conflicting.body)
+            started.string("State").as_deref(),
+            Some("COMPLETE"),
+            "case {case:?}: a deployment with no duration and no bake time completes at \
+             once, got {}",
+            started.json()
         );
-
-        // ...until the clock makes its completion due, which no caller has to ask for.
-        // This strategy rolls out and bakes for no documented time at all, so the wait
-        // is the emulator's own floor on a transient state. It is the only wall-clock
-        // wait in this suite: the schedule itself is asserted against
-        // `state::Deployment` below, where the whole window is covered without sleeping.
-        tokio::time::sleep(std::time::Duration::from_millis(900)).await;
 
         let finished = json_call(
             &router,
@@ -1424,7 +1433,7 @@ async fn deployment_numbers_increase_per_environment() {
         .await;
         assert_eq!(
             environment_state.string("State").as_deref(),
-            Some("READY_FOR_DEPLOYMENT"),
+            Some(state::ENVIRONMENT_READY_FOR_DEPLOYMENT),
             "case {case:?}: an environment with nothing in flight is ready, got {:?}",
             environment_state.string("State")
         );
@@ -1584,9 +1593,9 @@ fn a_deployment_schedule_terminates_for_any_stored_growth_factor() {
             deployment.materialize(started_at + Duration::from_secs(60 * elapsed_minutes));
             let reached = deployment.percentage_complete;
             assert!(
-                reached.is_finite() && (1.0..=100.0).contains(&reached),
+                reached.is_finite() && (0.0..=100.0).contains(&reached),
                 "case {case:?} at {elapsed_minutes} minutes: expected a percentage inside the \
-                 modelled 1..=100 range, got {reached}"
+                 0..=100 range the modelled Percentage caps, got {reached}"
             );
             assert!(
                 deployment.event_log.len() <= MAX_EVENTS,
@@ -1626,18 +1635,27 @@ fn a_deployments_progress_follows_the_strategys_documented_schedule() {
         let rollout = Duration::from_secs(60 * predefined.deployment_duration_in_minutes as u64);
         let bake = Duration::from_secs(60 * predefined.final_bake_time_in_minutes as u64);
 
-        // At the start instant: rolling out, with the strategy's first growth step
-        // already applied and never 0% of targets.
+        // At the start instant: nothing has rolled out yet, so a strategy with a rollout
+        // window reports 0% of targets and is still DEPLOYING, while one with no window at
+        // all has already reached every target and is baking (every predefined strategy
+        // has a bake time, so none of them completes instantly).
         let at_start = Deployment::start(new.clone(), &strategy, started_at);
+        let expected_at_start = if rollout.is_zero() {
+            state::DEPLOYMENT_BAKING
+        } else {
+            state::DEPLOYMENT_DEPLOYING
+        };
         assert_eq!(
-            at_start.state, state::DEPLOYMENT_DEPLOYING,
-            "case {case:?}: a deployment starts in a non-terminal state, got {:?}",
+            at_start.state, expected_at_start,
+            "case {case:?}: a deployment starts in a non-terminal state, expected \
+             {expected_at_start}, got {:?}",
             at_start.state
         );
-        assert!(
-            at_start.percentage_complete >= predefined.growth_factor,
-            "case {case:?}: the first growth step is due at the start, expected at least {} got {}",
-            predefined.growth_factor,
+        let expected_percentage_at_start = if rollout.is_zero() { 100.0 } else { 0.0 };
+        assert_eq!(
+            at_start.percentage_complete, expected_percentage_at_start,
+            "case {case:?}: expected {expected_percentage_at_start}% of targets at the start \
+             instant, got {}",
             at_start.percentage_complete
         );
         assert!(

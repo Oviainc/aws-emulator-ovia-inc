@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: the tags of one behavior graph, written onto the graph record
+//! `CreateGraph` stored and read back by `ListTagsForResource`.
 //!
 //! ## Shape of an operation
 //!
@@ -143,18 +137,67 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        // `ResourceArn`'s pattern and `Tags`' 1..50 length, and each key's and value's
+        // own length, are modelled constraints the centralized walk already refused
+        // anything outside of.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        // The reserved `aws:` prefix is the one tag-key rule that walk cannot enforce:
+        // `TagKey`'s modelled pattern states it with a negative lookahead, which the
+        // regex engine will not compile, and an uncompilable `@pattern` is treated as
+        // satisfied. Recorded behaviour is that the service refuses such a key with
+        // error code `BadRequestException` at HTTP 400, raised ahead of its normal
+        // validation path — so this runs before the graph is even resolved, and before
+        // any tag in the request is applied.
+        if input
+            .tags
+            .keys()
+            .any(|key| crate::state::is_reserved_tag_key(key))
+        {
+            return Err(crate::scaffolded::Scaffolded::bad_request(
+                crate::state::RESERVED_TAG_KEY_MESSAGE,
+            ));
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            TagResourceErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the behavior graph store is unavailable".to_string()),
+            })
+        })?;
+
+        let mut store = state.lock();
+        // "Applies tag values to a behavior graph": the graph owns its tag map, so a
+        // tag survives exactly as long as the graph does.
+        let graph = store.graph_mut(&input.resource_arn).ok_or_else(|| {
+            TagResourceErrorModeled::ResourceNotFoundException(crate::state::graph_not_found())
+        })?;
+        // The graph's tag map is finite. The modelled `Tags` 1..50 length bounds ONE
+        // request, and this operation MERGES into what is already stored, so the store
+        // needs its own bound: a request that would take the graph past the per-resource
+        // tag quota stores nothing at all, so the caller can retry a smaller one.
+        let added = input
+            .tags
+            .keys()
+            .filter(|key| !graph.tags.contains_key(key.as_str()))
+            .count();
+        if graph.tags.len() + added > crate::state::MAX_TAGS_PER_GRAPH {
+            return Err(TagResourceErrorModeled::ValidationException(ValidationException {
+                message: Some(format!(
+                    "a behavior graph cannot hold more than {} tag keys; this graph already \
+                     holds {}",
+                    crate::state::MAX_TAGS_PER_GRAPH,
+                    graph.tags.len()
+                )),
+                ..Default::default()
+            })
+            .into());
+        }
+        // Applying a tag whose key is already assigned replaces that key's value and
+        // leaves every other key alone.
+        for (key, value) in &input.tags {
+            graph.tags.insert(key.clone(), value.clone());
+        }
+
+        Ok(TagResourceOutput {})
     }
 }

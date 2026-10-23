@@ -1,15 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutAccountPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutAccountPolicy`'s real behaviour. Implement it here — this is
+//! Implemented: creates or updates one account-level policy in the shared store, keyed by
+//! the `(policyType, policyName)` pair that identifies it, and reports it back. This is
 //! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutAccountPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## What this handler judges, and what it does not
+//!
+//! Each policy type's `policyDocument` is held to the rules
+//! `PutAccountPolicy$policyDocument` states for it
+//! ([`crate::state::check_account_policy_document`]), and each type's documented quota is
+//! enforced ([`crate::state::max_account_policies`]).
+//!
+//! The GRAMMAR of `selectionCriteria` — `LogGroupName NOT IN [...]`,
+//! `LogGroupNamePrefix`, `DataSourceName` AND `DataSourceType` — and the "no two of them
+//! can use the same or overlapping log group name prefixes" rule between two policies of
+//! one type are NOT judged here: a criteria string is stored and reported verbatim. They
+//! are the subject of this operation's own issue,
+//! `issues/things-that-do-not-work/20261023T113357Z-logs-putaccountpolicy-stub.md`, whose
+//! recorded units cover them.
 //!
 //! ## Shape of an operation
 //!
@@ -202,18 +211,138 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutAccountPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutAccountPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutAccountPolicy"))
+        // `ctx` carries only request metadata: an account-level policy is not scoped to a
+        // Region in this store, so nothing here is read from the request's credential
+        // scope.
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            PutAccountPolicyError::from(PutAccountPolicyErrorModeled::ServiceUnavailableException(
+                ServiceUnavailableException {
+                    message: Some("the log store is unavailable".to_string()),
+                },
+            ))
+        })?;
+        let mut store = state.lock();
+
+        let invalid = |message: String| {
+            PutAccountPolicyError::from(PutAccountPolicyErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message),
+                },
+            ))
+        };
+
+        // "A name for the policy. This must be unique within the account and cannot start
+        // with aws/." `PolicyName` carries no `@pattern`, so the reserved prefix is
+        // refused here; the uniqueness half is structural, because the store is keyed by
+        // the pair that identifies a policy and a put under a stored pair is an update.
+        if input
+            .policy_name
+            .starts_with(crate::state::RESERVED_POLICY_NAME_PREFIX)
+        {
+            return Err(invalid(format!(
+                "policyName cannot start with {}",
+                crate::state::RESERVED_POLICY_NAME_PREFIX
+            )));
+        }
+
+        // "Specifying selectionCriteria is valid only when you specify
+        // SUBSCRIPTION_FILTER_POLICY, FIELD_INDEX_POLICY or TRANSFORMER_POLICY for
+        // policyType" — plus the metric extraction policies the operation's own
+        // documentation scopes with it. A data protection policy is the one type that
+        // applies to every log group, so a criteria string put with it selects nothing.
+        if let Some(selection_criteria) = input.selection_criteria.as_deref() {
+            if !crate::state::SELECTION_CRITERIA_POLICY_TYPES.contains(&input.policy_type.as_str())
+            {
+                return Err(invalid(format!(
+                    "selectionCriteria is valid only when policyType is one of: [{}]",
+                    crate::state::SELECTION_CRITERIA_POLICY_TYPES.join(", ")
+                )));
+            }
+            // "The selectionCriteria string can be up to 25KB in length. The length is
+            // determined by using its UTF-8 bytes."
+            if selection_criteria.len() > crate::state::MAX_SELECTION_CRITERIA_BYTES {
+                return Err(invalid(format!(
+                    "selectionCriteria can be up to {} bytes in length",
+                    crate::state::MAX_SELECTION_CRITERIA_BYTES
+                )));
+            }
+        }
+
+        // What the document must say is the contract of `policyDocument` for the type it
+        // is put with; the checks, and the sentences they refuse with, live beside the
+        // stored record in `crate::state`.
+        let policy =
+            crate::state::check_account_policy_document(&input.policy_type, &input.policy_document)
+                .map_err(invalid)?;
+
+        // "If you specify destinations such as log groups, Firehose streams, and S3
+        // buckets, they must already exist." A log group destination is the half of that
+        // rule this service can judge, and it is the same rule
+        // `PutDataProtectionPolicy` holds a log-group-level document to.
+        for destination in &policy.findings_destination_log_groups {
+            let destination_name = crate::state::log_group_name_from_identifier(destination);
+            if !store.log_groups.contains_key(destination_name) {
+                return Err(invalid(format!(
+                    "the findings destination log group '{destination_name}' does not exist"
+                )));
+            }
+        }
+
+        // A policy is identified by its type AND its name: "If you are updating an
+        // existing filter, you must specify the correct name in PolicyName", so a put
+        // under a pair already stored is an update of that policy and only a put that
+        // would ADD one can exceed its type's quota. Each quota sentence is an either/or,
+        // so EVERY policy of the type counts against the number the policy being put is
+        // held to.
+        let key = (input.policy_type.clone(), input.policy_name.clone());
+        let scoped = input.selection_criteria.is_some();
+        let limit = crate::state::max_account_policies(&input.policy_type, scoped);
+        if !store.account_policies.contains_key(&key) {
+            let held = store
+                .account_policies
+                .values()
+                .filter(|policy| policy.policy_type == input.policy_type)
+                .count();
+            if held >= limit {
+                return Err(PutAccountPolicyErrorModeled::LimitExceededException(
+                    LimitExceededException {
+                        message: Some(format!(
+                            "an account can have up to {limit} account-level {} policies of this kind",
+                            input.policy_type
+                        )),
+
+                    },
+                )
+                .into());
+            }
+        }
+
+        // "The date and time that this policy was most recently updated": an update
+        // restamps the policy, because the put IS the update.
+        let record = crate::state::AccountPolicyRecord {
+            policy_name: input.policy_name,
+            policy_document: input.policy_document,
+            policy_type: input.policy_type,
+            // "If you omit this parameter, the default of ALL is used."
+            scope: input
+                .scope
+                .unwrap_or_else(|| crate::state::DEFAULT_ACCOUNT_POLICY_SCOPE.to_string()),
+            // Every member is replaced by what this put names, so a criteria string the
+            // request omits is absent afterwards rather than inherited from an earlier put.
+            selection_criteria: input.selection_criteria,
+            last_updated_time_ms: crate::state::now_ms(),
+        };
+        store.account_policies.insert(key.clone(), record);
+
+        Ok(PutAccountPolicyOutput {
+            // "The account policy that you created" — read back out of the store, so what
+            // this call reports is what `DescribeAccountPolicies` reports afterwards.
+            account_policy: store
+                .account_policies
+                .get(&key)
+                .map(crate::state::AccountPolicyRecord::reported),
+        })
     }
 }

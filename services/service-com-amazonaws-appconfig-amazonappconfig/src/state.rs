@@ -21,7 +21,12 @@
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, SystemTime};
 
-use crate::ops::types::{Action, DeploymentEvent, Monitor, Parameter, Validator};
+use crate::ops::types::{
+    Action, AppliedExtension, DeletionProtectionSettings, DeploymentEvent, Monitor, Parameter,
+    Validator, VendedMetricsSettings,
+};
+
+pub mod feature_flags;
 
 /// `DeploymentState` values this service moves a deployment through. Each is a member
 /// of `DEPLOYMENT_STATE_VALUES` in `crate::ops::types` (the model's `DeploymentState`
@@ -32,11 +37,33 @@ pub const DEPLOYMENT_BAKING: &str = "BAKING";
 /// See [`DEPLOYMENT_DEPLOYING`].
 pub const DEPLOYMENT_COMPLETE: &str = "COMPLETE";
 
-/// `EnvironmentState` values this service moves an environment through, from
-/// `ENVIRONMENT_STATE_VALUES` in `crate::ops::types`.
-pub const ENVIRONMENT_READY_FOR_DEPLOYMENT: &str = "READY_FOR_DEPLOYMENT";
+/// `EnvironmentState` values this service moves an environment through — the WIRE
+/// values, which for this one enum are NOT the model's member names.
+///
+/// `ENVIRONMENT_STATE_VALUES` in `crate::ops::types` lists the member names
+/// (`READY_FOR_DEPLOYMENT`, `DEPLOYING`, …), but AppConfig serves `Environment$State`
+/// in the CamelCase form its API Reference lists as that member's valid values —
+/// `ReadyForDeployment | Deploying | RollingBack | RolledBack | Reverted` — and that
+/// is what every recorded response carries. The shipped model JSON in
+/// `smithy-model/` carries no `@enumValue` trait on the enum's members, so the
+/// generated value list fell back to the member names; the recorded wire form is
+/// authoritative and these constants are the single place the service spells it.
+///
+/// Every other enum this module names a value of (`DeploymentState`, `GrowthType`,
+/// `DeploymentEventType`, `TriggeredBy`) is served as its member name, exactly as the
+/// AppConfig API Reference lists those members' valid values, so their constants are
+/// unchanged.
+pub const ENVIRONMENT_READY_FOR_DEPLOYMENT: &str = "ReadyForDeployment";
 /// See [`ENVIRONMENT_READY_FOR_DEPLOYMENT`].
-pub const ENVIRONMENT_DEPLOYING: &str = "DEPLOYING";
+pub const ENVIRONMENT_DEPLOYING: &str = "Deploying";
+/// See [`ENVIRONMENT_READY_FOR_DEPLOYMENT`]. No operation moves an environment here
+/// yet — AppConfig enters it only while rolling a deployment back — so the value is
+/// carried for completeness of the wire catalog.
+pub const ENVIRONMENT_ROLLING_BACK: &str = "RollingBack";
+/// See [`ENVIRONMENT_ROLLING_BACK`].
+pub const ENVIRONMENT_ROLLED_BACK: &str = "RolledBack";
+/// See [`ENVIRONMENT_ROLLING_BACK`].
+pub const ENVIRONMENT_REVERTED: &str = "Reverted";
 
 /// `GrowthType` values, from `GROWTH_TYPE_VALUES` in `crate::ops::types`.
 pub const GROWTH_LINEAR: &str = "LINEAR";
@@ -56,6 +83,13 @@ pub const EVENT_PERCENTAGE_UPDATED: &str = "PERCENTAGE_UPDATED";
 pub const EVENT_BAKE_TIME_STARTED: &str = "BAKE_TIME_STARTED";
 /// See [`EVENT_DEPLOYMENT_STARTED`].
 pub const EVENT_DEPLOYMENT_COMPLETED: &str = "DEPLOYMENT_COMPLETED";
+
+/// The `DeploymentType` value of a deployment a caller started with `StartDeployment`,
+/// from `DEPLOYMENT_TYPE_VALUES` in `crate::ops::types` (the model's `DeploymentType`
+/// enum, `USER | MANAGED`). The other value is for a deployment AppConfig starts on its
+/// own behalf, which this emulator never does: every deployment it holds was asked for by
+/// a caller.
+pub const DEPLOYMENT_TYPE_USER: &str = "USER";
 
 /// `TriggeredBy` values, from `TRIGGERED_BY_VALUES` in `crate::ops::types`.
 pub const TRIGGERED_BY_USER: &str = "USER";
@@ -109,6 +143,15 @@ pub const BYTES_PER_KILOBYTE: f32 = 1024.0;
 /// `BYTES_MEASURE_VALUES` in `crate::ops::types`.
 pub const BYTES_MEASURE_KILOBYTES: &str = "KILOBYTES";
 
+/// The message AppConfig refuses an over-sized hosted configuration with.
+///
+/// A FIXED service-owned constant, not a sentence built from the request: the recorded
+/// refusal carries exactly this text whatever the payload's size, and
+/// `PayloadTooLargeException`'s own `Measure` / `Limit` / `Size` members are what
+/// report the numbers. The emulator must not substitute prose of its own here — a
+/// client that surfaces the service's message would then show emulator internals.
+pub const CONTENT_SIZE_LIMIT_EXCEEDED_MESSAGE: &str = "Content size limit exceeded.";
+
 /// How many deployment records an environment keeps.
 ///
 /// AppConfig retains an environment's deployment history; this emulator retains the most
@@ -122,11 +165,50 @@ pub const MAX_RETAINED_DEPLOYMENTS_PER_ENVIRONMENT: usize = 200;
 /// model documents on `CreateConfigurationProfile`'s `LocationUri` member.
 pub const HOSTED_LOCATION_URI: &str = "hosted";
 
+/// The `LocationUri` prefix that selects a CodePipeline pipeline: "For an Amazon Web
+/// Services CodePipeline pipeline, specify the URI in the following format:
+/// `codepipeline`://<pipeline name>", as the model documents on
+/// `CreateConfigurationProfile`'s `LocationUri` member.
+pub const CODEPIPELINE_LOCATION_PREFIX: &str = "codepipeline://";
+
+/// Whether a configuration profile stored at `location_uri` needs a `RetrievalRoleArn`.
+///
+/// The model's own `RetrievalRoleArn` documentation states the rule: "A retrieval role
+/// ARN is not required for configurations stored in CodePipeline or the AppConfig hosted
+/// configuration store. It is required for all other sources that store your
+/// configuration." So a role is required for every location except those two — the
+/// member is optional in the model, which makes this a server-side cross-field rule
+/// rather than one the schema walk can refuse.
+pub fn location_uri_requires_retrieval_role(location_uri: &str) -> bool {
+    location_uri != HOSTED_LOCATION_URI
+        && !location_uri.starts_with(CODEPIPELINE_LOCATION_PREFIX)
+}
+
+/// How AppConfig refuses a configuration profile whose `LocationUri` needs a
+/// `RetrievalRoleArn` the request did not carry.
+///
+/// A cross-field rule, stated in the same `N validation error detected: …` envelope the
+/// boundary validator uses for a modelled constraint, naming the member that was null
+/// and the uri that made it required — so the message is derived from the request, not
+/// from a stored sentence.
+pub fn retrieval_role_required_message(location_uri: &str) -> String {
+    format!(
+        "1 validation error detected: Value null at 'retrievalRoleArn' failed to satisfy \
+         constraint: Member must not be null if the request has the following uri: \
+         {location_uri}"
+    )
+}
+
 /// The `Type` values a configuration profile accepts. The model's own
 /// `CreateConfigurationProfile` `Type` documentation says: "When calling this API, enter
 /// one of the following values for `Type`: `AWS.AppConfig.FeatureFlags`,
 /// `AWS.Freeform`."
-pub const CONFIGURATION_PROFILE_TYPES: &[&str] = &["AWS.AppConfig.FeatureFlags", "AWS.Freeform"];
+pub const CONFIGURATION_PROFILE_TYPES: &[&str] = &[FEATURE_FLAGS_PROFILE_TYPE, "AWS.Freeform"];
+
+/// The configuration profile `Type` whose hosted configuration content AppConfig runs
+/// through the feature-flags helper extension before storing it; see
+/// [`feature_flags`].
+pub const FEATURE_FLAGS_PROFILE_TYPE: &str = "AWS.AppConfig.FeatureFlags";
 
 /// This service's namespace in an ARN: the third colon-separated section of every ARN
 /// that addresses an AppConfig resource. An ARN naming any other service addresses no
@@ -272,8 +354,8 @@ pub fn first_parameter_rejection(parameters: &HashMap<String, Parameter>) -> Opt
 /// (`application/<id>`, `application/<id>/environment/<id>`,
 /// `application/<id>/configurationprofile/<id>`,
 /// `application/<id>/environment/<id>/deployment/<number>`) or, for a resource that has no
-/// owning application, at the resource type itself (`deploymentstrategy/<id>`), which is
-/// what [`parse_resource_arn`] reads.
+/// owning application, at the resource type itself (`deploymentstrategy/<id>`,
+/// `extension/<id>/<version>`), which is what [`parse_resource_arn`] reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaggedResource<'arn> {
     /// `application/<application id>`.
@@ -389,15 +471,24 @@ pub fn parse_resource_arn(resource_arn: &str) -> Option<TaggedResource<'_>> {
     }
 }
 
-/// The floor on a deployment's rollout window.
+
+/// The description of each `DeploymentEvent` this service records.
 ///
-/// `AppConfig.AllAtOnce` has a deployment duration of 0 minutes, so its rollout would
-/// otherwise be owed at the very instant the deployment started and `StartDeployment`
-/// would answer a deployment that had already left `DEPLOYING`. The window is floored
-/// here instead, so a caller reading straight after the start call still observes the
-/// deployment rolling out. The length is chosen (AWS documents no floor); every
-/// strategy whose deployment duration is at least a minute is unaffected by it.
-const MINIMUM_ROLLOUT: Duration = Duration::from_millis(500);
+/// AppConfig's own wording, which the model documents only by example ("Descriptions
+/// include, but are not limited to, the following",
+/// `smithy_query(query="doc",shape="DeploymentEvent",member="Description")`): the start and
+/// completion texts are the recorded service's, which carry no trailing stop, and the
+/// bake and percentage texts follow the same form.
+const DESCRIPTION_DEPLOYMENT_STARTED: &str = "Deployment started";
+/// See [`DESCRIPTION_DEPLOYMENT_STARTED`].
+const DESCRIPTION_DEPLOYMENT_COMPLETED: &str = "Deployment completed";
+/// See [`DESCRIPTION_DEPLOYMENT_STARTED`]. A deployment whose completion falls due at the
+/// instant it was asked for took no time at all, which is what its event says.
+const DESCRIPTION_DEPLOYMENT_COMPLETED_INSTANTLY: &str = "Deployment completed instantly";
+
+/// The percentage of targets a finished rollout has reached, and the ceiling every growth
+/// step is capped at: the maximum of the model's `Percentage` shape (`range 1..100`).
+const FULL_PERCENTAGE: f32 = 100.0;
 
 /// The most growth steps a rollout is split into.
 ///
@@ -421,6 +512,8 @@ const ID_LENGTH: usize = 7;
 pub struct PredefinedStrategy {
     /// The strategy id, which for a predefined strategy is also its name.
     pub id: &'static str,
+    /// What the published table says the strategy is for.
+    pub description: &'static str,
     /// Total time the rollout lasts.
     pub deployment_duration_in_minutes: i32,
     /// How the percentage of targets grows over that time.
@@ -432,14 +525,18 @@ pub struct PredefinedStrategy {
 }
 
 /// AppConfig's predefined deployment strategies, from the AWS AppConfig User Guide's
-/// "Predefined deployment strategies" table. Each row's deployment duration and
-/// growth factor are the ones the strategy's own name states — `Linear20Percent`
-/// `Every6Minutes` adds 20% of targets every 6 minutes, i.e. five steps across a
-/// 30-minute deployment — and `AppConfig.AllAtOnce` reaches every target at once with
-/// a 10-minute bake time.
+/// "Predefined deployment strategies" table — in the order that table publishes them,
+/// which is the order a listing of the catalogue reports them in. Every column of that
+/// table is a published AWS fact rather than a value this emulator may choose: the
+/// `description` is the table's "Description" ("Quick", "Test/Demo", "AWS Recommended"),
+/// and the deployment duration, growth type, growth factor and final bake time are the
+/// table's own — `Linear20Percent` `Every6Minutes` adds 20% of targets every 6 minutes,
+/// i.e. five steps across its 30-minute deployment, and then bakes for 30 minutes, while
+/// `AppConfig.AllAtOnce` reaches every target at once and bakes for 10.
 pub const PREDEFINED_DEPLOYMENT_STRATEGIES: &[PredefinedStrategy] = &[
     PredefinedStrategy {
         id: "AppConfig.AllAtOnce",
+        description: "Quick",
         deployment_duration_in_minutes: 0,
         growth_type: GROWTH_LINEAR,
         growth_factor: 100.0,
@@ -447,6 +544,7 @@ pub const PREDEFINED_DEPLOYMENT_STRATEGIES: &[PredefinedStrategy] = &[
     },
     PredefinedStrategy {
         id: "AppConfig.Linear50PercentEvery30Seconds",
+        description: "Test/Demo",
         deployment_duration_in_minutes: 1,
         growth_type: GROWTH_LINEAR,
         growth_factor: 50.0,
@@ -454,6 +552,7 @@ pub const PREDEFINED_DEPLOYMENT_STRATEGIES: &[PredefinedStrategy] = &[
     },
     PredefinedStrategy {
         id: "AppConfig.Canary10Percent20Minutes",
+        description: "AWS Recommended",
         deployment_duration_in_minutes: 20,
         growth_type: GROWTH_EXPONENTIAL,
         growth_factor: 10.0,
@@ -461,12 +560,21 @@ pub const PREDEFINED_DEPLOYMENT_STRATEGIES: &[PredefinedStrategy] = &[
     },
     PredefinedStrategy {
         id: "AppConfig.Linear20PercentEvery6Minutes",
+        description: "AWS Recommended",
         deployment_duration_in_minutes: 30,
         growth_type: GROWTH_LINEAR,
         growth_factor: 20.0,
-        final_bake_time_in_minutes: 10,
+        final_bake_time_in_minutes: 30,
     },
 ];
+
+/// The prefix a catalogue cursor key carries for a predefined strategy, and the one it
+/// carries for a strategy this account created. `'0'` sorts before `'1'`, which is what
+/// puts the published table ahead of the account's own strategies. See
+/// [`ComAmazonawsAppconfigAmazonappconfigState::all_strategies`].
+const PREDEFINED_STRATEGY_KEY_PREFIX: char = '0';
+/// See [`PREDEFINED_STRATEGY_KEY_PREFIX`].
+const CREATED_STRATEGY_KEY_PREFIX: char = '1';
 
 /// A deployment strategy: the rollout schedule a deployment follows.
 #[derive(Debug, Clone)]
@@ -492,7 +600,7 @@ impl From<&PredefinedStrategy> for DeploymentStrategy {
             id: predefined.id.to_string(),
             // A predefined strategy's name is its id; it is not replicated anywhere.
             name: predefined.id.to_string(),
-            description: None,
+            description: Some(predefined.description.to_string()),
             deployment_duration_in_minutes: predefined.deployment_duration_in_minutes,
             growth_type: predefined.growth_type.to_string(),
             growth_factor: predefined.growth_factor,
@@ -744,6 +852,22 @@ pub struct Deployment {
     pub final_bake_time_in_minutes: i32,
     pub state: String,
     pub percentage_complete: f32,
+    /// The `DeploymentType` this deployment reports: [`DEPLOYMENT_TYPE_USER`], because
+    /// every deployment this service holds was started by a caller's own
+    /// `StartDeployment` call.
+    pub deployment_type: String,
+    /// The extensions this deployment invoked, which the `Deployment` document reports as
+    /// `AppliedExtensions`: "the extensions that were previously associated to the
+    /// configuration profile, environment, or the application when `StartDeployment` was
+    /// called".
+    ///
+    /// Recorded when the deployment starts, so a later read reports what was applied THEN
+    /// rather than what is associated now. It is empty for every deployment this emulator
+    /// starts, and that is a computed fact rather than a placeholder: an extension reaches
+    /// a deployment only through an extension ASSOCIATION, and every operation that writes
+    /// one (`CreateExtensionAssociation`, `UpdateExtensionAssociation`) still answers 501,
+    /// so no association exists for a deployment to invoke.
+    pub applied_extensions: Vec<AppliedExtension>,
     pub started_at: SystemTime,
     pub completed_at: Option<SystemTime>,
     pub event_log: Vec<DeploymentEvent>,
@@ -773,9 +897,12 @@ pub struct NewDeployment {
 impl Deployment {
     /// Start a deployment at `started_at`, paced by `strategy`.
     ///
-    /// The deployment begins `DEPLOYING` with its first growth step applied and one
-    /// `DEPLOYMENT_STARTED` event; every later state, percentage and event is owed by
-    /// the clock and materialised by [`Deployment::materialize`].
+    /// The deployment begins at 0% of its targets with one `DEPLOYMENT_STARTED` event,
+    /// because nothing has rolled out yet at the instant it was asked for; every later
+    /// state, percentage and event is owed by the clock and materialised by
+    /// [`Deployment::materialize`], which is called once here so a strategy whose rollout
+    /// window and bake time are both zero — which has nothing left to wait for — is
+    /// already `COMPLETE` when `StartDeployment` answers.
     pub fn start(new: NewDeployment, strategy: &DeploymentStrategy, started_at: SystemTime) -> Self {
         let mut deployment = Self {
             deployment_number: new.deployment_number,
@@ -793,20 +920,24 @@ impl Deployment {
             final_bake_time_in_minutes: strategy.final_bake_time_in_minutes,
             state: DEPLOYMENT_DEPLOYING.to_string(),
             percentage_complete: 0.0,
+            deployment_type: DEPLOYMENT_TYPE_USER.to_string(),
+            // Nothing to apply: see the field's own note.
+            applied_extensions: Vec::new(),
             started_at,
             completed_at: None,
             event_log: vec![deployment_event(
                 EVENT_DEPLOYMENT_STARTED,
                 TRIGGERED_BY_USER,
-                "Deployment started.".to_string(),
+                DESCRIPTION_DEPLOYMENT_STARTED.to_string(),
                 started_at,
             )],
             kms_key_identifier: new.kms_key_identifier,
             version_label: new.version_label,
             tags: new.tags,
         };
-        // The first growth step is due at the start instant, so the deployment is
-        // never reported as having reached 0% of its targets.
+        // Whatever the clock already owes this deployment at the instant it started: for a
+        // strategy with a rollout window that is nothing at all, and for one with none it
+        // is the whole deployment.
         deployment.materialize(started_at);
         deployment
     }
@@ -820,11 +951,14 @@ impl Deployment {
         )
     }
 
-    /// How long the rollout itself lasts: the strategy's deployment duration, floored
-    /// at [`MINIMUM_ROLLOUT`].
+    /// How long the rollout itself lasts: the strategy's deployment duration.
+    ///
+    /// Not floored: a strategy declaring a duration of 0 minutes (`AppConfig.AllAtOnce`,
+    /// or any created strategy with `DeploymentDurationInMinutes` 0) reaches every target
+    /// at the instant the deployment starts, which is what AppConfig answers for one —
+    /// with no bake time to follow, `StartDeployment` reports it `COMPLETE`.
     fn rollout_duration(&self) -> Duration {
-        let duration = Duration::from_secs(60 * self.deployment_duration_in_minutes.max(0) as u64);
-        duration.max(MINIMUM_ROLLOUT)
+        Duration::from_secs(60 * self.deployment_duration_in_minutes.max(0) as u64)
     }
 
     /// How long AppConfig monitors the deployment after the rollout before completing
@@ -848,9 +982,11 @@ impl Deployment {
     ///
     /// `LINEAR` adds `GrowthFactor` percent of targets per step; `EXPONENTIAL` reaches
     /// `GrowthFactor * 2^N` percent at step `N`, the formula the model's `GrowthType`
-    /// documentation gives. The steps are spread evenly across the rollout window with
-    /// the first one due at the start instant, so `AppConfig.Linear50PercentEvery30`
-    /// `Seconds` reaches 50% at the start and 100% thirty seconds in.
+    /// documentation gives. A step is one INTERVAL of the rollout window, so the steps
+    /// are spread evenly across that window with the first one due at the END of the
+    /// first interval and the last exactly at the window's end:
+    /// `AppConfig.Linear50PercentEvery30Seconds` reaches 50% thirty seconds in and 100% at
+    /// sixty, and a deployment just started has reached nobody yet.
     ///
     /// The step count is bounded by [`MAX_ROLLOUT_STEPS`] and the loop runs over a
     /// fixed range, so this terminates whatever the stored growth factor is — a growth
@@ -860,9 +996,9 @@ impl Deployment {
         // A growth factor that is not a finite percentage cannot pace anything, so it
         // is normalised to a single-step rollout before it reaches the loop below.
         let growth_factor = if self.growth_factor.is_finite() {
-            self.growth_factor.clamp(1.0, 100.0)
+            self.growth_factor.clamp(1.0, FULL_PERCENTAGE)
         } else {
-            100.0
+            FULL_PERCENTAGE
         };
 
         let mut percentages: Vec<f32> = Vec::with_capacity(MAX_ROLLOUT_STEPS);
@@ -874,9 +1010,9 @@ impl Deployment {
                 // Step `n` has added the growth factor `n + 1` times.
                 step as f32 + 1.0
             };
-            let reached = (growth_factor * multiplier).min(100.0);
+            let reached = (growth_factor * multiplier).min(FULL_PERCENTAGE);
             percentages.push(reached);
-            if reached >= 100.0 {
+            if reached >= FULL_PERCENTAGE {
                 break;
             }
         }
@@ -887,7 +1023,7 @@ impl Deployment {
             .into_iter()
             .enumerate()
             .map(|(index, reached)| {
-                let due = self.started_at + rollout.mul_f64(index as f64 / steps);
+                let due = self.started_at + rollout.mul_f64((index as f64 + 1.0) / steps);
                 (due, reached)
             })
             .collect()
@@ -903,19 +1039,27 @@ impl Deployment {
             return;
         }
 
+        // A `PERCENTAGE_UPDATED` event records a growth interval that ELAPSED, so a step
+        // falling due at the start instant itself — every step of a strategy with no
+        // rollout window at all — records none.
         for (due, reached) in self.rollout_schedule() {
-            if due <= now && reached > self.percentage_complete {
+            if due > self.started_at && due <= now && reached > self.percentage_complete {
                 self.percentage_complete = reached;
                 self.event_log.push(deployment_event(
                     EVENT_PERCENTAGE_UPDATED,
                     TRIGGERED_BY_APPCONFIG,
-                    format!("The configuration reached {reached}% of deployment targets."),
+                    format!("Configuration available to {reached}% of clients"),
                     due,
                 ));
             }
         }
 
         let rollout_end = self.rollout_end();
+        if now >= rollout_end {
+            // The rollout window is over, so every target holds the configuration —
+            // including when the window was empty and no interval elapsed on the way.
+            self.percentage_complete = FULL_PERCENTAGE;
+        }
         if self.state == DEPLOYMENT_DEPLOYING
             && now >= rollout_end
             && !self.bake_duration().is_zero()
@@ -925,7 +1069,7 @@ impl Deployment {
                 EVENT_BAKE_TIME_STARTED,
                 TRIGGERED_BY_APPCONFIG,
                 format!(
-                    "The deployment is baking for {} minute(s).",
+                    "Deployment bake time started for {} minute(s)",
                     self.final_bake_time_in_minutes
                 ),
                 rollout_end,
@@ -936,10 +1080,17 @@ impl Deployment {
         if now >= completion_due {
             self.state = DEPLOYMENT_COMPLETE.to_string();
             self.completed_at = Some(completion_due);
+            // A deployment whose completion falls due at the instant it was asked for
+            // took no time at all, which is what its event says.
+            let description = if completion_due == self.started_at {
+                DESCRIPTION_DEPLOYMENT_COMPLETED_INSTANTLY
+            } else {
+                DESCRIPTION_DEPLOYMENT_COMPLETED
+            };
             self.event_log.push(deployment_event(
                 EVENT_DEPLOYMENT_COMPLETED,
                 TRIGGERED_BY_APPCONFIG,
-                "Deployment completed.".to_string(),
+                description.to_string(),
                 completion_due,
             ));
         }
@@ -976,11 +1127,267 @@ pub fn to_date_time(at: SystemTime) -> ::aws_smithy_types::DateTime {
     ::aws_smithy_types::DateTime::from_secs_f64(since_epoch.as_secs_f64())
 }
 
+// =============================================================================
+// `ResourceNotFoundException` messages
+// =============================================================================
+
+/// How AppConfig words a `ResourceNotFoundException`, as the recorded refusals show it:
+///
+/// ```text
+/// <Resource kind> with <Label> <value>[, <Label> <value>]… and <Label> <value> \
+///     could not be found for account <account id>
+/// ```
+///
+/// The sentence is DERIVED from the request — the kind of resource that was looked up,
+/// every identifier the request used to scope that lookup under AppConfig's own label
+/// for it, and the account the lookup was scoped to — so each builder below takes the
+/// request's values and nothing is stored. The account is always
+/// [`::engine::emulator_account_id`], the single account a generated emulator presents.
+///
+/// `terminator` is the sentence's final punctuation: the recorded messages end with a
+/// full stop for every resource except the hosted configuration version, whose recorded
+/// message ends without one, so it is passed in per resource rather than appended here.
+fn not_found_message(kind: &str, identifiers: &[(&str, &str)], terminator: &str) -> String {
+    format!(
+        "{kind} with {} could not be found for account {}{terminator}",
+        identifier_phrase(identifiers),
+        ::engine::emulator_account_id()
+    )
+}
+
+/// The identifier clause of a [`not_found_message`]: each `<Label> <value>` pair in the
+/// order the resource's path nests them, comma-separated with `and` before the last and
+/// the Oxford comma kept from three identifiers on — the form the recorded hosted
+/// configuration version message uses.
+fn identifier_phrase(identifiers: &[(&str, &str)]) -> String {
+    let parts: Vec<String> = identifiers
+        .iter()
+        .map(|(label, value)| format!("{label} {value}"))
+        .collect();
+    match parts.as_slice() {
+        [] => String::new(),
+        [only] => only.clone(),
+        [first, second] => format!("{first} and {second}"),
+        [leading @ .., last] => format!("{}, and {last}", leading.join(", ")),
+    }
+}
+
+/// AppConfig ends a not-found message with a full stop …
+const NOT_FOUND_FULL_STOP: &str = ".";
+/// … except the hosted configuration version's, which the recorded refusal ends without
+/// one.
+const NOT_FOUND_NO_FULL_STOP: &str = "";
+
+/// `Message` for an application the account does not hold.
+pub fn application_not_found(application_id: &str) -> String {
+    not_found_message(
+        "Application",
+        &[("Id", application_id)],
+        NOT_FOUND_FULL_STOP,
+    )
+}
+
+/// `Message` for an environment the named application does not hold.
+pub fn environment_not_found(application_id: &str, environment_id: &str) -> String {
+    not_found_message(
+        "Environment",
+        &[
+            ("Application Id", application_id),
+            ("Environment Id", environment_id),
+        ],
+        NOT_FOUND_FULL_STOP,
+    )
+}
+
+/// `Message` for a configuration profile the named application does not hold.
+pub fn configuration_profile_not_found(
+    application_id: &str,
+    configuration_profile_id: &str,
+) -> String {
+    not_found_message(
+        "Configuration Profile",
+        &[
+            ("Application Id", application_id),
+            ("Configuration Profile Id", configuration_profile_id),
+        ],
+        NOT_FOUND_FULL_STOP,
+    )
+}
+
+/// `Message` for a hosted configuration version the named profile does not hold.
+pub fn hosted_configuration_version_not_found(
+    application_id: &str,
+    configuration_profile_id: &str,
+    version_number: i32,
+) -> String {
+    not_found_message(
+        "Hosted Configuration Version",
+        &[
+            ("Application Id", application_id),
+            ("Configuration Profile Id", configuration_profile_id),
+            ("Version", &version_number.to_string()),
+        ],
+        NOT_FOUND_NO_FULL_STOP,
+    )
+}
+
+/// `Message` for a deployment number the named environment never issued.
+pub fn deployment_not_found(
+    application_id: &str,
+    environment_id: &str,
+    deployment_number: i32,
+) -> String {
+    not_found_message(
+        "Deployment",
+        &[
+            ("Application Id", application_id),
+            ("Environment Id", environment_id),
+            ("Deployment Number", &deployment_number.to_string()),
+        ],
+        NOT_FOUND_FULL_STOP,
+    )
+}
+
+/// `Message` for a deployment strategy that is neither created nor predefined.
+pub fn deployment_strategy_not_found(deployment_strategy_id: &str) -> String {
+    not_found_message(
+        "Deployment Strategy",
+        &[("Id", deployment_strategy_id)],
+        NOT_FOUND_FULL_STOP,
+    )
+}
+
+/// `Message` for an extension no `ExtensionIdentifier` resolves to.
+pub fn extension_not_found(extension_identifier: &str) -> String {
+    not_found_message(
+        "Extension",
+        &[("Id", extension_identifier)],
+        NOT_FOUND_FULL_STOP,
+    )
+}
+
+/// `Message` for a `ResourceArn` that addresses no resource this service holds — the
+/// identifier the tagging operations scope their lookup with.
+pub fn resource_arn_not_found(resource_arn: &str) -> String {
+    not_found_message("Resource", &[("Arn", resource_arn)], NOT_FOUND_FULL_STOP)
+}
+
+/// `Message` for a version an extension does not hold.
+pub fn extension_version_not_found(extension_identifier: &str, version_number: i32) -> String {
+    not_found_message(
+        "Extension",
+        &[
+            ("Id", extension_identifier),
+            ("Version Number", &version_number.to_string()),
+        ],
+        NOT_FOUND_FULL_STOP,
+    )
+}
+
+// =============================================================================
+// Account-level settings
+// =============================================================================
+
+/// AppConfig's documented default protection period: "The default interval specified by
+/// `ProtectionPeriodInMinutes` is 60", from the model's `DeletionProtectionSettings`
+/// documentation.
+pub const DEFAULT_PROTECTION_PERIOD_IN_MINUTES: i32 = 60;
+
+/// The account's AppConfig settings: what `GetAccountSettings` reports and what
+/// `UpdateAccountSettings` writes.
+///
+/// An account that has never called `UpdateAccountSettings` is not unconfigured — it is
+/// running on AppConfig's documented defaults — so [`Default`] is those defaults rather
+/// than absent values.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountSettingsRecord {
+    /// Whether deletion protection is on. Off until a caller turns it on: AppConfig
+    /// documents the protection period's default but describes deletion protection
+    /// itself as something a caller configures.
+    pub deletion_protection_enabled: bool,
+    /// The interval deletion protection watches for configuration reads over, in
+    /// minutes. Defaults to [`DEFAULT_PROTECTION_PERIOD_IN_MINUTES`]; the model's
+    /// `DeletionProtectionDuration` bounds a written value to 15..=1440, which the
+    /// schema walk enforces before any handler runs.
+    pub protection_period_in_minutes: i32,
+    /// Whether vended metrics are enabled, or `None` while nobody has set them: the
+    /// model states no default for `VendedMetricsSettings$Enabled`, so none is
+    /// substituted and the member is not reported until it has been written.
+    pub vended_metrics_enabled: Option<bool>,
+}
+
+impl Default for AccountSettingsRecord {
+    fn default() -> Self {
+        Self {
+            deletion_protection_enabled: false,
+            protection_period_in_minutes: DEFAULT_PROTECTION_PERIOD_IN_MINUTES,
+            vended_metrics_enabled: None,
+        }
+    }
+}
+
+impl AccountSettingsRecord {
+    /// This record's deletion protection as the model's `DeletionProtectionSettings`.
+    ///
+    /// Both members always have a value to report: `Enabled` is a flag, and
+    /// `ProtectionPeriodInMinutes` carries AppConfig's documented default until a write
+    /// replaces it.
+    pub fn deletion_protection(&self) -> DeletionProtectionSettings {
+        DeletionProtectionSettings {
+            enabled: Some(self.deletion_protection_enabled),
+            protection_period_in_minutes: Some(self.protection_period_in_minutes),
+        }
+    }
+
+    /// This record's vended metrics as the model's `VendedMetricsSettings`, or `None`
+    /// while nobody has set them: the model states no default for
+    /// `VendedMetricsSettings$Enabled`, so reporting one would be fabricating it.
+    pub fn vended_metrics(&self) -> Option<VendedMetricsSettings> {
+        self.vended_metrics_enabled
+            .map(|enabled| VendedMetricsSettings {
+                enabled: Some(enabled),
+            })
+    }
+
+    /// Apply one `UpdateAccountSettings` request to this record.
+    ///
+    /// `UpdateAccountSettings` is a `PATCH`: a member the request omits keeps the value
+    /// the account already holds, and that applies inside `DeletionProtection` too —
+    /// naming only `Enabled` leaves the stored protection period alone. The written
+    /// values are already within the model's bounds, because the schema walk refuses a
+    /// `ProtectionPeriodInMinutes` outside `DeletionProtectionDuration`'s 15..=1440
+    /// range before this handler runs.
+    pub fn apply(
+        &mut self,
+        deletion_protection: Option<&DeletionProtectionSettings>,
+        vended_metrics: Option<&VendedMetricsSettings>,
+    ) {
+        if let Some(deletion_protection) = deletion_protection {
+            if let Some(enabled) = deletion_protection.enabled {
+                self.deletion_protection_enabled = enabled;
+            }
+            if let Some(period) = deletion_protection.protection_period_in_minutes {
+                self.protection_period_in_minutes = period;
+            }
+        }
+        if let Some(vended_metrics) = vended_metrics {
+            if let Some(enabled) = vended_metrics.enabled {
+                self.vended_metrics_enabled = Some(enabled);
+            }
+        }
+    }
+}
+
 /// Per-service state for com-amazonaws-appconfig-amazonappconfig. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsAppconfigAmazonappconfigState {
     /// Every application, by application id.
     pub applications: HashMap<String, Application>,
+    /// This account's AppConfig settings, as `UpdateAccountSettings` last wrote them —
+    /// [`AccountSettingsRecord::default`] (AppConfig's documented defaults) until it
+    /// does. Account-scoped rather than per-application: the settings surface is
+    /// `/settings`, with no resource in its path.
+    pub account_settings: AccountSettingsRecord,
     /// Deployment strategies this account created, by strategy id.
     ///
     /// PRIVATE on purpose: [`Self::try_insert_strategy`] is the only way in, so the
@@ -1115,11 +1522,34 @@ impl ComAmazonawsAppconfigAmazonappconfigState {
         true
     }
 
-    /// Forget an extension this account created. Nothing calls this yet —
-    /// `DeleteExtension` is still a stub, and this is the hook it needs so deleting an
-    /// extension frees its slot.
+    /// Forget an extension this account created, with every version it holds.
+    /// `DeleteExtension` is the caller this exists for, and removing the record is what
+    /// frees its slot.
     pub fn remove_extension(&mut self, extension_id: &str) -> Option<Extension> {
         self.extensions.remove(extension_id)
+    }
+
+    /// Forget ONE version of an extension this account created, answering the version
+    /// that was removed, or `None` when no extension answers to `extension_id` or it
+    /// holds no such version.
+    ///
+    /// An extension exists only as its versions — the id and the name are properties of
+    /// the set, and the description, actions, parameters and tags belong to a version —
+    /// so an extension whose last version is removed is itself gone, and
+    /// [`Self::resolve_extension`] stops answering for it. That is the same bookkeeping
+    /// [`Self::remove_extension`] does, reached one version at a time, so a deleted
+    /// version never leaves an extension that answers with nothing.
+    pub fn remove_extension_version(
+        &mut self,
+        extension_id: &str,
+        version_number: i32,
+    ) -> Option<ExtensionVersion> {
+        let extension = self.extensions.get_mut(extension_id)?;
+        let removed = extension.versions.remove(&version_number)?;
+        if extension.versions.is_empty() {
+            self.extensions.remove(extension_id);
+        }
+        Some(removed)
     }
 
     /// Resolve a deployment strategy id to the strategy it names: one this account
@@ -1153,9 +1583,10 @@ impl ComAmazonawsAppconfigAmazonappconfigState {
         true
     }
 
-    /// Forget a deployment strategy this account created. Nothing calls this yet —
-    /// `DeleteDeploymentStrategy` is still a stub, and this is the hook it needs so
-    /// deleting a strategy frees its slot.
+    /// Forget a deployment strategy this account created, answering the record that was
+    /// removed, or `None` when this account created no strategy under `id`.
+    /// `DeleteDeploymentStrategy` is the caller this exists for, and removing the record
+    /// frees its slot.
     pub fn remove_strategy(&mut self, id: &str) -> Option<DeploymentStrategy> {
         self.deployment_strategies.remove(id)
     }
@@ -1164,6 +1595,59 @@ impl ComAmazonawsAppconfigAmazonappconfigState {
     /// them without reaching into the map.
     pub fn created_strategies(&self) -> impl Iterator<Item = &DeploymentStrategy> {
         self.deployment_strategies.values()
+    }
+
+    /// The whole deployment-strategy catalogue this account can deploy with, in the order
+    /// a listing reports it, each entry beside the key that order is a TOTAL order on.
+    ///
+    /// The catalogue is AppConfig's predefined `AppConfig.*` strategies in the order the
+    /// published table carries them ([`PREDEFINED_DEPLOYMENT_STRATEGIES`]), followed by
+    /// every strategy this account created, in ascending id order. A key is derived from
+    /// the entry itself — its position in the published table, or its id — and never from
+    /// how many entries precede it, so a strategy created between two pages of a walk
+    /// shifts no later page.
+    ///
+    /// This is [`resolve_strategy`] read over the whole catalogue rather than for one id —
+    /// including its precedence: a created strategy holding an id a predefined one also
+    /// holds takes that slot, so the catalogue reports each id exactly once and never with
+    /// a record `resolve_strategy` would not answer for it. `ListDeploymentStrategies` is
+    /// the caller this exists for.
+    ///
+    /// [`resolve_strategy`]: ComAmazonawsAppconfigAmazonappconfigState::resolve_strategy
+    pub fn all_strategies(&self) -> Vec<(String, DeploymentStrategy)> {
+        let mut catalogue: Vec<(String, DeploymentStrategy)> = PREDEFINED_DEPLOYMENT_STRATEGIES
+            .iter()
+            .enumerate()
+            .map(|(position, predefined)| {
+                let strategy = self
+                    .deployment_strategies
+                    .get(predefined.id)
+                    .cloned()
+                    .unwrap_or_else(|| DeploymentStrategy::from(predefined));
+                (
+                    format!("{PREDEFINED_STRATEGY_KEY_PREFIX}{position:04}"),
+                    strategy,
+                )
+            })
+            .collect();
+        // Ascending by id, and without the ids already reported in a predefined slot.
+        let created: BTreeMap<&str, &DeploymentStrategy> = self
+            .deployment_strategies
+            .iter()
+            .filter(|(id, _)| {
+                !PREDEFINED_DEPLOYMENT_STRATEGIES
+                    .iter()
+                    .any(|predefined| predefined.id == id.as_str())
+            })
+            .map(|(id, strategy)| (id.as_str(), strategy))
+            .collect();
+        catalogue.extend(created.into_iter().map(|(id, strategy)| {
+            (
+                format!("{CREATED_STRATEGY_KEY_PREFIX}{id}"),
+                strategy.clone(),
+            )
+        }));
+        catalogue
     }
 
     /// Account for `bytes` about to be stored as a hosted configuration version.
@@ -1363,6 +1847,14 @@ pub const LISTING_CONFIGURATION_PROFILES: &str = "ListConfigurationProfiles";
 /// The `kind` a `ListEnvironments` cursor is stamped with, so a token minted by another
 /// listing cannot resume this one. See [`paginate`].
 pub const LISTING_ENVIRONMENTS: &str = "ListEnvironments";
+
+/// The `kind` a `ListDeploymentStrategies` cursor is stamped with, so a token minted by
+/// another listing cannot resume this one. See [`paginate`].
+pub const LISTING_DEPLOYMENT_STRATEGIES: &str = "ListDeploymentStrategies";
+
+/// The `kind` a `ListExtensions` cursor is stamped with, so a token minted by another
+/// listing cannot resume this one. See [`paginate`].
+pub const LISTING_EXTENSIONS: &str = "ListExtensions";
 
 /// One page of a list operation: the items on it, and the token that resumes the walk
 /// after them (`None` on the last page).

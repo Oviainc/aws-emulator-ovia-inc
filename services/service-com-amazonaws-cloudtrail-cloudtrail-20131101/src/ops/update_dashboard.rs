@@ -1,15 +1,29 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateDashboard
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateDashboard`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Updates one CloudTrail Lake dashboard in the shared dashboard registry
+//! (`crate::state`) and reports the stored record back.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateDashboard::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The rules it applies, each from the modelled contract below:
+//!
+//! * the dashboard is the one `DashboardId` names — "the name or ARN of the
+//!   dashboard" — and an identifier naming none is `ResourceNotFoundException`;
+//! * every optional member is applied only when the request carries it: `Widgets`
+//!   REPLACES the stored list wholesale ("To add new widgets, pass in an array that
+//!   includes the existing widgets along with any new widgets … To remove widgets,
+//!   pass in an array that includes the existing widgets minus the widgets you want
+//!   removed"), `RefreshSchedule` and `TerminationProtectionEnabled` replace their
+//!   stored values, and an absent member leaves the stored one alone;
+//! * a custom dashboard carries at most ten widgets, and a refresh schedule's
+//!   frequency and time of day are the ones the model publishes — the same rules
+//!   `CreateDashboard` applies, from `crate::state`;
+//! * the CloudTrail-managed Highlights dashboard keeps its own widgets and its
+//!   documented refresh schedule.
+//!
+//! The dashboard's `DashboardStatus` is left as it stands: the model declares
+//! `UPDATING`/`UPDATED`, but no recording shows whether CloudTrail moves a dashboard
+//! back into a transient status for an update, so this handler does not invent one —
+//! it stamps `UpdatedTimestamp` and leaves the status the create path settled.
 //!
 //! ## Shape of an operation
 //!
@@ -197,18 +211,140 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateDashboard` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateDashboardErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateDashboard"))
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+
+        // "You can add up to 10 widgets to a custom dashboard" — and `Widgets` is the
+        // whole list, not an addition to it, so the bound applies to what was sent. The
+        // bound and its wording live in `crate::state`, so this path and
+        // `CreateDashboard` refuse alike.
+        // This and the schedule below are checks on the REQUEST, so they run before
+        // the dashboard is resolved; no recording fixes which of the two answers a
+        // bad patch against a dashboard that does not exist, so the request is
+        // checked first and the identifier after it.
+        if let Some(message) = input.widgets.as_ref().and_then(|widgets| {
+            crate::state::widget_query::widgets_beyond_dashboard_limit_message(widgets.len())
+        }) {
+            return Err(UpdateDashboardErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        // A widget's `QueryStatement` has to be a query CloudTrail Lake can run:
+        // "The query that was submitted has validation errors, or uses incorrect
+        // syntax or unsupported keywords." The statement is parsed rather than
+        // matched, by the same reading `CreateDashboard` applies
+        // (`crate::state::widget_query`), so the two paths cannot drift.
+        if let Some(widgets) = input.widgets.as_ref() {
+            if crate::state::widget_query::first_unrunnable_statement(widgets).is_some() {
+                return Err(UpdateDashboardErrorModeled::InvalidQueryStatementException(
+                    InvalidQueryStatementException {
+                        message: Some(
+                            crate::state::widget_query::INVALID_QUERY_STATEMENT_MESSAGE.to_string(),
+                        ),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // The frequency and the time of day are rules the model documents in prose,
+        // so the boundary validator cannot refuse them; `TimeOfDay` defaults to
+        // 00:00, which is what the dashboard then reports. The same normalisation
+        // `CreateDashboard` applies, so the two paths cannot drift.
+        let refresh_schedule = match input.refresh_schedule.as_ref() {
+            Some(schedule) => Some(
+                crate::state::normalize_refresh_schedule(schedule)
+                    .map_err(crate::scaffolded::Scaffolded::validation)?,
+            ),
+            None => None,
+        };
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateDashboardErrorModeled::UnsupportedOperationException(
+                UnsupportedOperationException {
+                    message: Some(
+                        "UpdateDashboard needs the CloudTrail dashboard registry, which this \
+                         engine does not carry"
+                            .to_string(),
+                    ),
+                },
+            )
+        })?;
+        let mut store = state.lock();
+
+        // `DashboardId` is "the name or ARN of the dashboard": a bare name addresses
+        // the caller's own Region, an ARN the Region it carries. An identifier that
+        // can name no dashboard is answered the same way as one that names none.
+        // Resolving also settles whatever transition the clock already owed, so the
+        // update starts from the dashboard's current status.
+        let record = store
+            .resolve_dashboard_mut(&input.dashboard_id, &region, now)
+            .ok_or_else(|| {
+                UpdateDashboardErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message: Some(crate::state::DASHBOARD_NOT_FOUND_MESSAGE.to_string()),
+                })
+            })?;
+
+        // CloudTrail Lake manages the Highlights dashboard: its widgets are not the
+        // caller's to compose, and its refresh schedule is the documented one. An
+        // empty list is the same no-op `CreateDashboard` accepts, so the predicate
+        // is the one that path uses.
+        if record.is_managed() {
+            if input.widgets.as_ref().is_some_and(|widgets| !widgets.is_empty()) {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "Widgets cannot be set on the {} dashboard: CloudTrail Lake manages that \
+                     dashboard's widgets",
+                    crate::state::HIGHLIGHTS_DASHBOARD_NAME
+                )));
+            }
+            if refresh_schedule
+                .as_ref()
+                .is_some_and(|schedule| !crate::state::is_highlights_refresh_schedule(schedule))
+            {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "The {} dashboard needs a RefreshSchedule with Status {} and a Frequency of \
+                     {} {}",
+                    crate::state::HIGHLIGHTS_DASHBOARD_NAME,
+                    crate::state::REFRESH_SCHEDULE_ENABLED,
+                    crate::state::HIGHLIGHTS_REFRESH_FREQUENCY_VALUE,
+                    crate::state::REFRESH_FREQUENCY_UNIT_HOURS,
+                )));
+            }
+        }
+
+        // Every optional member is applied only when the request carries it: an
+        // absent member leaves the stored value alone. A managed dashboard's widgets
+        // are CloudTrail's, so the empty list the guard above tolerates stays a
+        // no-op here rather than clearing them.
+        if let Some(widgets) = input.widgets.filter(|_| !record.is_managed()) {
+            record.widgets = widgets
+                .into_iter()
+                .map(crate::state::request_widget_to_widget)
+                .collect();
+        }
+        if let Some(schedule) = refresh_schedule {
+            record.refresh_schedule = Some(schedule);
+        }
+        if let Some(enabled) = input.termination_protection_enabled {
+            record.termination_protection_enabled = enabled;
+        }
+        record.updated_at = now;
+
+        // Report the stored record, so the response and every later read of this
+        // dashboard are the same values.
+        Ok(UpdateDashboardOutput {
+            dashboard_arn: Some(record.dashboard_arn.clone()),
+            name: Some(record.name.clone()),
+            r#type: Some(record.dashboard_type.clone()),
+            widgets: Some(record.widgets.clone()),
+            refresh_schedule: record.refresh_schedule.clone(),
+            termination_protection_enabled: Some(record.termination_protection_enabled),
+            created_timestamp: Some(::aws_smithy_types::DateTime::from(record.created_at)),
+            updated_timestamp: Some(::aws_smithy_types::DateTime::from(record.updated_at)),
+        })
     }
 }

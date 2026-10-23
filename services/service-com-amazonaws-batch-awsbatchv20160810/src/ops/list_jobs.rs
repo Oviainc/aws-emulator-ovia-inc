@@ -223,75 +223,80 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::state as batch;
 
-        let _ = ctx;
         let Some(state) = batch::service_state(&*self.engine) else {
             return Err(ListJobsErrorModeled::ServerException(batch::unreachable_state()).into());
         };
         let now = batch::now_millis();
-        let mut state = state.lock();
-        state.materialize_due(now);
+        // The store's lock lives in THIS block and no longer, so nothing holds it while
+        // the transitions it materialised are published below (that call reaches another
+        // service in-process).
+        let mut jobs: Vec<batch::Job> = {
+            let mut state = state.lock();
+            state.materialize_due(now);
 
-        let selectors = [
-            input.job_queue.as_deref(),
-            input.array_job_id.as_deref(),
-            input.multi_node_job_id.as_deref(),
-        ];
-        // A filter-SELECTION error is what AWS Batch refuses ListJobs for: naming NO
-        // filter, or naming two of the three at once. Which jobs the named filter selects
-        // is a question about the store, answered below with a page (possibly empty) and
-        // never with a refusal.
-        let named = selectors.iter().filter(|selector| selector.is_some()).count();
-        // These are the request-validation refusals Batch's frontend raises, which it
-        // answers inside its envelope naming the id of the call being refused
-        // (`batch::client_exception_enveloped`).
-        if named == 0 {
-            return Err(ListJobsErrorModeled::ClientException(
-                batch::client_exception_enveloped("Job queue name is required."),
-            )
-            .into());
-        }
-        if input.array_job_id.is_some() && input.multi_node_job_id.is_some() {
-            return Err(ListJobsErrorModeled::ClientException(
-                batch::client_exception_enveloped(
-                    "Array job id and multinode job id cannot both be set.",
-                ),
-            )
-            .into());
-        }
-        if named > 1 {
-            return Err(ListJobsErrorModeled::ClientException(
-                batch::client_exception_enveloped(
-                    "Only one of job queue, array job id and multinode job id can be set.",
-                ),
-            )
-            .into());
-        }
+            let selectors = [
+                input.job_queue.as_deref(),
+                input.array_job_id.as_deref(),
+                input.multi_node_job_id.as_deref(),
+            ];
+            // A filter-SELECTION error is what AWS Batch refuses ListJobs for: naming NO
+            // filter, or naming two of the three at once. Which jobs the named filter
+            // selects is a question about the store, answered below with a page (possibly
+            // empty) and never with a refusal.
+            let named = selectors.iter().filter(|selector| selector.is_some()).count();
+            // These are the request-validation refusals Batch's frontend raises, which it
+            // answers inside its envelope naming the id of the call being refused
+            // (`batch::client_exception_enveloped`).
+            if named == 0 {
+                return Err(ListJobsErrorModeled::ClientException(
+                    batch::client_exception_enveloped("Job queue name is required."),
+                )
+                .into());
+            }
+            if input.array_job_id.is_some() && input.multi_node_job_id.is_some() {
+                return Err(ListJobsErrorModeled::ClientException(
+                    batch::client_exception_enveloped(
+                        "Array job id and multinode job id cannot both be set.",
+                    ),
+                )
+                .into());
+            }
+            if named > 1 {
+                return Err(ListJobsErrorModeled::ClientException(
+                    batch::client_exception_enveloped(
+                        "Only one of job queue, array job id and multinode job id can be set.",
+                    ),
+                )
+                .into());
+            }
 
-        // The jobs the named filter selects. A filter target this service does not hold —
-        // an unknown job queue, or an array / multi-node parent id that names no job —
-        // selects NOTHING: it is an empty page, not a refusal, so a caller may poll a
-        // queue before it exists or list by array id defensively.
-        let mut jobs: Vec<batch::Job> = match input.job_queue.as_deref() {
-            Some(reference) => match state.job_queue(reference) {
-                Some(queue) => {
-                    let queue_arn = queue.arn.clone();
-                    state
-                        .jobs_by_queue
-                        .get(&queue_arn)
-                        .into_iter()
-                        .flatten()
-                        .filter_map(|id| state.jobs.get(id))
-                        .cloned()
-                        .collect()
-                }
+            // The jobs the named filter selects. A filter target this service does not
+            // hold — an unknown job queue, or an array / multi-node parent id that names
+            // no job — selects NOTHING: it is an empty page, not a refusal, so a caller
+            // may poll a queue before it exists or list by array id defensively.
+            match input.job_queue.as_deref() {
+                Some(reference) => match state.job_queue(reference) {
+                    Some(queue) => {
+                        let queue_arn = queue.arn.clone();
+                        state
+                            .jobs_by_queue
+                            .get(&queue_arn)
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|id| state.jobs.get(id))
+                            .cloned()
+                            .collect()
+                    }
+                    None => Vec::new(),
+                },
+                // The children of an array or multi-node parent. `SubmitJob` creates none
+                // (it answers 501 for `arrayProperties`/`nodeOverrides`), so a parent
+                // that exists has no children to list and one that does not exist selects
+                // nothing: both are the same empty page.
                 None => Vec::new(),
-            },
-            // The children of an array or multi-node parent. `SubmitJob` creates none (it
-            // answers 501 for `arrayProperties`/`nodeOverrides`), so a parent that exists
-            // has no children to list and one that does not exist selects nothing: both
-            // are the same empty page.
-            None => Vec::new(),
+            }
         };
+        batch::publish_job_state_changes(ctx, &*self.engine, &batch::request_region(ctx)).await;
 
         let filters = input.filters.unwrap_or_default();
         if filters.len() > 1 {

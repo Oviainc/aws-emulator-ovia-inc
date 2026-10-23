@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeMatchmakingConfigurations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeMatchmakingConfigurations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeMatchmakingConfigurations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the matchmakers `CreateMatchmakingConfiguration` persisted — selected by name
+//! or ARN, or by the rule set they match with, and paged. A name no stored configuration
+//! carries is REFUSED rather than silently absent from the page, so "this matchmaker does
+//! not exist" never looks like "this page is empty".
 //!
 //! ## Shape of an operation
 //!
@@ -163,20 +159,116 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeMatchmakingConfigurations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeMatchmakingConfigurationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeMatchmakingConfigurations"))
+        let invalid = |message: String| -> Self::Error {
+            DescribeMatchmakingConfigurationsErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(message),
+                },
+            )
+            .into()
+        };
+
+        // `Limit`'s doc: "This parameter is limited to 10." The modelled `PositiveInteger`
+        // range bounds it only below, so the documented maximum is refused here — before
+        // any state is locked and before a single record is cloned.
+        if let Some(limit) = input.limit {
+            if limit > MAX_RESULTS_PER_PAGE {
+                return Err(invalid(format!(
+                    "Limit asks for {limit} results; up to {MAX_RESULTS_PER_PAGE} can be \
+                     requested."
+                )));
+            }
+        }
+        // The model bounds `MatchmakingConfigurationNameList` neither above nor below, and
+        // each entry that is an ARN is resolved by a scan of the configuration store, so
+        // the work one request can ask for is the PRODUCT of the list length and the
+        // stored configuration count — refused here for the same reason, and in the same
+        // place, as `DescribeGameSessionQueues` refuses an oversized `Names`.
+        if let Some(names) = input.names.as_ref() {
+            if names.len() > crate::state::MAX_CONFIGURATION_NAMES_PER_REQUEST {
+                return Err(invalid(format!(
+                    "Names names {} configuration identifiers; the maximum allowed number is {}.",
+                    names.len(),
+                    crate::state::MAX_CONFIGURATION_NAMES_PER_REQUEST
+                )));
+            }
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                DescribeMatchmakingConfigurationsErrorModeled::InternalServiceException(
+                    InternalServiceException {
+                        message: Some("the GameLift emulator state is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let mut state = state.lock();
+        state.tick(::std::time::SystemTime::now());
+
+        // "A unique identifier for the matchmaking configuration(s) to retrieve. You can
+        // use either the configuration name or ARN value. To request all existing
+        // configurations, leave this parameter empty." The operation's own prose adds
+        // "when specifying a list of names, only configurations that currently exist are
+        // returned", which describes what a page HOLDS; the recorded service refuses a
+        // name that names no configuration at all rather than omitting it, so a caller
+        // can tell an absent matchmaker from an empty result page.
+        let requested: Option<::std::collections::HashSet<String>> = match input.names.as_ref() {
+            Some(names) => {
+                let mut selected = ::std::collections::HashSet::new();
+                for name_or_arn in names {
+                    let Some(name) = state.resolve_matchmaking_configuration_name(name_or_arn)
+                    else {
+                        return Err(invalid(format!("Configuration not found: {name_or_arn}")));
+                    };
+                    selected.insert(name);
+                }
+                Some(selected)
+            }
+            None => None,
+        };
+        // "Use this parameter to retrieve all matchmaking configurations that use this
+        // rule set": a rule set this store does not hold is used by no configuration, so
+        // the page is empty rather than refused.
+        let by_rule_set: Option<String> = input
+            .rule_set_name
+            .as_deref()
+            .map(|name_or_arn| state.resolve_rule_set_name(name_or_arn).unwrap_or_default());
+
+        let configurations: Vec<MatchmakingConfiguration> = state
+            .matchmaking_configurations_in_order()
+            .into_iter()
+            .filter(|configuration| {
+                requested
+                    .as_ref()
+                    .is_none_or(|selected| selected.contains(&configuration.name))
+                    && by_rule_set
+                        .as_ref()
+                        .is_none_or(|rule_set| &configuration.rule_set_name == rule_set)
+            })
+            .map(crate::state::MatchmakingConfigurationRecord::to_modelled)
+            .collect();
+
+        let Some((page, next_token)) = crate::state::paginate(
+            crate::state::PageKind::MatchmakingConfigurations,
+            &configurations,
+            input.limit,
+            input.next_token.as_deref(),
+        ) else {
+            return Err(invalid(
+                "NextToken is not a pagination token this service issued.".to_string(),
+            ));
+        };
+        Ok(DescribeMatchmakingConfigurationsOutput {
+            configurations: Some(page),
+            next_token,
+        })
     }
 }
+
+/// How many configurations one page may hold: `Limit`'s own doc — "This parameter is
+/// limited to 10."
+const MAX_RESULTS_PER_PAGE: i32 = 10;

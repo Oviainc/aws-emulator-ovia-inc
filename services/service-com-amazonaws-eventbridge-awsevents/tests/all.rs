@@ -25,5 +25,7 @@ mod reserved_event_source;
 mod rule_lifecycle;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/target_delivery.rs"]
+mod target_delivery;
 #[path = "all/target_response_members.rs"]
 mod target_response_members;

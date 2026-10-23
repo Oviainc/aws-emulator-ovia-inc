@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutAccountSetting
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutAccountSetting`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutAccountSetting::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Stores one account setting for ONE principal in this service's account-settings
+//! store, which `ListAccountSettings` reports and a cluster that set no
+//! `containerInsights` of its own inherits
+//! ([`crate::state::ComAmazonawsEcsAmazonec2containerservicev20141113State::cluster_effective_settings`]).
 //!
 //! ## Shape of an operation
 //!
@@ -175,18 +171,80 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutAccountSetting` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutAccountSettingErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutAccountSetting"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            PutAccountSettingErrorModeled::ServerException(ServerException {
+                message: Some("the ECS store is unavailable".to_string()),
+            })
+        })?;
+        let _ = ctx;
+
+        // "`aws_managed` account settings are read-only, as Amazon Web Services manages
+        // such on the customer's behalf" (`Setting$type`), and `guardDutyActivate` "is
+        // read-only in Amazon ECS" — so a write of one is refused rather than stored.
+        if crate::state::account_setting_spec(&input.name)
+            .is_some_and(|spec| spec.setting_type == crate::state::SETTING_TYPE_AWS_MANAGED)
+        {
+            return Err(PutAccountSettingErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(format!(
+                        "{} is managed by Amazon Web Services and is read-only",
+                        input.name
+                    )),
+                },
+            )
+            .into());
+        }
+
+        if let Err(message) =
+            crate::state::validate_account_setting_value(&input.name, &input.value)
+        {
+            return Err(PutAccountSettingErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        // "If this field is omitted, the setting is changed only for the authenticated
+        // user" — the one identity this emulator authenticates every request as. "If you
+        // specify the root user, it modifies the account setting for all users, roles,
+        // and the root user of the account unless a user or role explicitly overrides
+        // these settings", which is what the store's defaults map holds.
+        let principal_arn = match input.principal_arn.as_deref() {
+            Some(arn) if !crate::state::is_principal_arn(arn) => {
+                return Err(PutAccountSettingErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(format!(
+                            "principalArn must be the ARN of an IAM user, role or the root \
+                             user; got {arn:?}"
+                        )),
+                    },
+                )
+                .into())
+            }
+            Some(arn) => arn.to_string(),
+            None => crate::state::caller_identity_arn(),
+        };
+
+        let setting = state
+            .lock()
+            .put_account_setting(&principal_arn, &input.name, &input.value)
+            .map_err(|crate::state::AccountSettingCapacityExceeded| {
+                // Nothing was stored: this emulator already holds settings for as many
+                // principals as it keeps, so the request is refused whole rather than
+                // letting a caller grow the store without limit.
+                PutAccountSettingErrorModeled::ClientException(ClientException {
+                    message: Some(format!(
+                        "this emulator holds account settings for at most {} principals; \
+                         the account default applies to the rest",
+                        crate::state::MAX_ACCOUNT_SETTING_PRINCIPALS
+                    )),
+                })
+            })?;
+
+        Ok(PutAccountSettingOutput {
+            setting: Some(setting),
+        })
     }
 }

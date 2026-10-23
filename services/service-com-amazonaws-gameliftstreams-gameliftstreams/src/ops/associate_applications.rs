@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AssociateApplications
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AssociateApplications`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AssociateApplications::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Links applications to a stream group and PERSISTS the link: the group's
+//! `AssociatedApplications`, each application's `AssociatedStreamGroups` and the
+//! content replication each of the group's locations then owes are all written, and
+//! the response is read back out of the stored group.
 //!
 //! ## Shape of an operation
 //!
@@ -173,18 +168,156 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AssociateApplications` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AssociateApplicationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(AssociateApplicationsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: crate::state::with_internal_id(
+                        "the gameliftstreams emulator holds no state on this engine",
+                    ),
+                },
+            )
+            .into());
+        };
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::region_of(ctx.parts());
+        let mut state = state.lock();
+        state.materialize(now);
+
+        let Some(group) = state.stream_group(&input.identifier) else {
+            return Err(AssociateApplicationsErrorModeled::ResourceNotFoundException(
+                crate::state::resource_not_found(&crate::state::resolved_arn(
+                    &region,
+                    &input.identifier,
+                    crate::state::STREAM_GROUP_RESOURCE,
+                )),
+            )
+            .into());
+        };
+        let group_id = group.id.clone();
+        let group_arn = group.arn.clone();
+
+        // "The stream group must be in ACTIVE status." This operation models no
+        // `ConflictException`, so a group that is not there yet is refused with the
+        // client-input error it does model.
+        if group.status != crate::state::STREAM_GROUP_ACTIVE {
+            return Err(AssociateApplicationsErrorModeled::ValidationException(
+                ValidationException {
+                    message: crate::state::with_internal_id(format!(
+                        "stream group {group_id} is in {} status; applications can only be \
+                         associated with a stream group in ACTIVE status",
+                        group.status
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Every identifier is resolved BEFORE anything is written, so a request
+        // naming one application that does not exist leaves the group's
+        // associations exactly as they were.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AssociateApplications"))
+        // Each resolved application is carried as the (id, ARN) pair the STORE
+        // holds: the id is the store's own key, so nothing below has to find the
+        // record again by re-parsing an ARN. An ARN is a formatted string, and
+        // parsing one back is a step that can fail (a region carrying a colon, say,
+        // shifts every field after it) — a record this call already holds must
+        // never depend on it.
+        let mut applications: Vec<(String, String)> = Vec::new();
+        for identifier in &input.application_identifiers {
+            let Some(application) = state.application(identifier) else {
+                return Err(AssociateApplicationsErrorModeled::ResourceNotFoundException(
+                    crate::state::resource_not_found(&crate::state::resolved_arn(
+                        &region,
+                        identifier,
+                        crate::state::APPLICATION_RESOURCE,
+                    )),
+                )
+                .into());
+            };
+            let resolved = (application.id.clone(), application.arn.clone());
+            if !applications.iter().any(|(id, _)| id == &resolved.0) {
+                applications.push(resolved);
+            }
+        }
+
+        let locations: Vec<String> = state.stream_groups[&group_id]
+            .locations
+            .iter()
+            .map(|slot| slot.name.clone())
+            .collect();
+
+        // @idempotent: an application already linked to this group is left as it is,
+        // so a repeated call neither duplicates the link nor restarts replication.
+        for (application_id, application_arn) in &applications {
+            let already_linked = state.stream_groups[&group_id]
+                .associated_applications
+                .contains(application_arn);
+            if already_linked {
+                continue;
+            }
+            // Keyed by the store's own id, not by the ARN: the lookup cannot be
+            // defeated by the SPELLING of a stored ARN. A store that no longer
+            // holds the record this call just resolved under the same lock is a
+            // broken emulator, answered with the modelled server error rather than
+            // a panic that would leave the write half applied.
+            let Some(application) = state.applications.get_mut(application_id) else {
+                return Err(AssociateApplicationsErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: crate::state::with_internal_id(format!(
+                            "the gameliftstreams emulator lost application {application_id} \
+                             while associating it"
+                        )),
+                    },
+                )
+                .into());
+            };
+            application.associated_stream_groups.push(group_arn.clone());
+            application.last_updated_at = now;
+            // The application now replicates its content to every location this
+            // group holds, exactly as it does when a group is created with it as the
+            // default application.
+            for location in &locations {
+                application.replications.push(crate::state::Replication {
+                    stream_group_arn: group_arn.clone(),
+                    location: location.clone(),
+                    completes_at: now + crate::state::TRANSITION,
+                });
+            }
+            let group = state
+                .stream_groups
+                .get_mut(&group_id)
+                .expect("the stream group was resolved above");
+            group.associated_applications.push(application_arn.clone());
+            group.last_updated_at = now;
+        }
+
+        // "If a stream group does not already have a linked application, Amazon
+        // GameLift Streams will automatically assign the first application provided
+        // in ApplicationIdentifiers as the default." The FIRST identifier the
+        // request named, not the first one this call happened to link, so a group
+        // that already holds an association picks the same default either way.
+        let first_application = applications.first().cloned();
+        let group = state
+            .stream_groups
+            .get_mut(&group_id)
+            .expect("the stream group was resolved above");
+        if let (None, Some((application_id, application_arn))) =
+            (&group.default_application, first_application)
+        {
+            // The id comes from the stored record, never from re-reading the ARN.
+            group.default_application = Some(DefaultApplication {
+                id: Some(application_id),
+                arn: Some(application_arn),
+            });
+            group.last_updated_at = now;
+        }
+
+        // Answered from the stored group, so the response is what a later
+        // `GetStreamGroup` reports.
+        let group = &state.stream_groups[&group_id];
+        Ok(AssociateApplicationsOutput {
+            arn: Some(group.arn.clone()),
+            application_arns: Some(group.associated_applications.clone()),
+        })
     }
 }

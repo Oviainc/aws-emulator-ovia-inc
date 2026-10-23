@@ -7,7 +7,8 @@
 //! `policyRevision` is optimistic locking: when the caller supplies one it must be the
 //! revision currently attached, otherwise the delete is refused with `ConflictException`
 //! (409) and the policy stays attached. A domain that holds no policy has nothing to
-//! delete, which is `ResourceNotFoundException` (404).
+//! remove, which is the delete's goal already met: the call succeeds with the bare
+//! `ResourcePolicy` envelope naming the domain it targeted ([`crate::state::deleted_policy`]).
 //!
 //! ## Shape of an operation
 //!
@@ -189,30 +190,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
-        // Nothing attached means there is no policy resource to delete: reported the same
-        // way `GetDomainPermissionsPolicy` reports an unset policy, so a caller sees one
-        // answer for "this domain has no policy" whichever way it asks. Decided BEFORE the
-        // lock below, so a domain that never had a policy answers the same way whether or
-        // not the caller named a revision.
-        if domain.policy.is_none() {
-            return Err(
-                DeleteDomainPermissionsPolicyErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: crate::state::no_policy_message(
-                            DOMAIN_RESOURCE_TYPE,
-                            &input.domain,
-                        ),
-                        resource_id: Some(input.domain.clone()),
-                        resource_type: Some(DOMAIN_RESOURCE_TYPE.to_string()),
-                    },
-                )
-                .into(),
-            );
-        }
-
         // The optimistic lock, exactly as the put applies it: a caller that named a
         // revision is deleting the policy it read, so a stale revision is refused and the
-        // policy stays attached.
+        // policy stays attached. A domain holding no policy carries no revision, so a
+        // named revision cannot match it either.
         if !crate::state::policy_revision_matches(
             domain.policy.as_ref(),
             input.policy_revision.as_deref(),
@@ -231,9 +212,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // Removed, and answered with the record as it was immediately before removal, so
-        // the very next read of this domain reports no policy.
-        let policy = domain.policy.take();
+        // the very next read of this domain reports no policy. A domain that held none is
+        // not a failure: the answer is the envelope naming the domain the request targeted.
+        let removed = domain.policy.take();
 
-        Ok(DeleteDomainPermissionsPolicyOutput { policy })
+        Ok(DeleteDomainPermissionsPolicyOutput {
+            policy: Some(crate::state::deleted_policy(&domain.arn, removed)),
+        })
     }
 }

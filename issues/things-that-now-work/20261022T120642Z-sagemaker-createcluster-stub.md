@@ -1,0 +1,73 @@
+Issue-Severity: HIGH
+Issue-Corpus: simparity-behavioral-aws-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: sagemaker.attach-cluster-node-volume-unknown-node-not-found sagemaker.batch-add-cluster-nodes-wrong-state-rejected sagemaker.batch-delete-cluster-nodes-not-found sagemaker.batch-delete-cluster-nodes-partial-not-found sagemaker.batch-replace-cluster-nodes-preserves-node-identity-order sagemaker.batch-replace-cluster-nodes-stale-reference-rejected sagemaker.cluster-create-active-delete-lifecycle sagemaker.cluster-lifecycle-create-describe-delete sagemaker.cluster-node-add-and-cluster-delete-lifecycle sagemaker.e2e-cluster-node-delete-then-reboot-fails
+Issue-Shape-Id: com.amazonaws.sagemaker#SageMaker
+Issue-Key: sagemaker|CreateCluster|NotImplemented
+Issue-Commit: d2e37a828af0176472a4a50a2ff1b55038dac16f
+
+# Implement sagemaker CreateCluster: unimplemented scaffold stub
+
+> _Note: this issue was identified against the code base at commit `d2e37a828af0176472a4a50a2ff1b55038dac16f`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+CreateCluster
+
+## Description
+`CreateCluster` is an unmodified scaffold stub, so it answers HTTP 501 and persists nothing. Implement it in `services/service-com-amazonaws-sagemaker-sagemaker/src/ops/create_cluster.rs`: replace the `Err(crate::scaffolded::Scaffolded::not_implemented(..))` with a real handler that reads and writes the service's state, then DELETE that file's `//! SCAFFOLDED, NOT IMPLEMENTED:` header line.
+
+That header line is the stub census — the one record of which operations are still scaffolds. Deleting it without implementing the handler, or leaving it in place on a handler you did implement, corrupts that record rather than closing this issue. A stub's 501 is also CORRECT for a stub: this issue asks you to implement the operation, never to change the error it returns while unimplemented.
+
+10 recorded unit(s) fail on their `CreateCluster` call, so each one unblocks only when `CreateCluster` works: `sagemaker.attach-cluster-node-volume-unknown-node-not-found`, `sagemaker.batch-add-cluster-nodes-wrong-state-rejected`, `sagemaker.batch-delete-cluster-nodes-not-found`, `sagemaker.batch-delete-cluster-nodes-partial-not-found`, `sagemaker.batch-replace-cluster-nodes-preserves-node-identity-order`, `sagemaker.batch-replace-cluster-nodes-stale-reference-rejected`, `sagemaker.cluster-create-active-delete-lifecycle`, `sagemaker.cluster-lifecycle-create-describe-delete`, `sagemaker.cluster-node-add-and-cluster-delete-lifecycle`, `sagemaker.e2e-cluster-node-delete-then-reboot-fails`.
+
+## Evidence
+The handler carries the scaffold marker `//! SCAFFOLDED, NOT IMPLEMENTED:` at the top of `services/service-com-amazonaws-sagemaker-sagemaker/src/ops/create_cluster.rs`. Replaying the corpus, the emulator refused the `CreateCluster` call: File "run.py", line 175, in <lambda>
+    finished, exc, frame = _on_daemon_thread(lambda: fn(ctx), f"check:{name}", timeout_s)
+                                                     ~~^^^^^
+  File "check_sagemaker_attach_cluster_node_volume_unknown_node_not_found.py", line 73, in run
+    raise AssertionError(
+    ...<4 lines>...
+    )
+AssertionError: this account/region rejects a minimal one-instance-group HyperPod cluster outright (NotImplemented: operation CreateCluster is scaffolded but not implemented in this emulator); AttachClusterNodeVolume's precondition check needs at least this much of a real cluster to hold a genuine ClusterArn.
+
+## Steps to Reproduce
+Boot the sagemaker emulator
+Call CreateCluster and observe HTTP 501 with no state persisted
+Replay any of the blocked units above and observe it fail on that refusal
+
+## Status note (added by the `ListClusters` fix)
+
+`CreateCluster` has since been implemented, in the same change that implemented
+`ListClusters` (`issues/things-that-now-work/20261022T120642Z-sagemaker-listclusters-stub.md`):
+a listing that no operation can ever put a cluster into would have had nothing to
+report. `src/ops/create_cluster.rs` now persists the cluster in `crate::state`, mints
+its `ClusterArn`, refuses a name already in use with the modelled `ResourceInUse`, a
+full store with the modelled `ResourceLimitExceeded` and a malformed `Orchestrator`
+with a `ValidationException`, and its `//! SCAFFOLDED, NOT IMPLEMENTED:` census line is
+deleted. The report is left here rather than moved because the move belongs to whoever
+is dispatched for this issue; anyone picking it up should verify the handler and the
+`tests/all/hyperpod_cluster_listing.rs` coverage and then close it.
+
+## Closing note (this issue's fix)
+
+Verified: `src/ops/create_cluster.rs` carries no `//! SCAFFOLDED, NOT IMPLEMENTED:`
+line, persists the cluster in `crate::state::ComAmazonawsSagemakerSagemakerState::clusters`
+and answers a minted `ClusterArn`. The change that closes this report:
+
+* implements `DescribeCluster` (its census line deleted), the reader that proves the
+  create round trip, with the `*Details` / `*Output` projections and the
+  `ClusterNameOrArn` lookup in `src/state/cluster.rs`;
+* adds `tests/all/hyperpod_cluster_lifecycle.rs` (the create/describe round trip, the
+  minted ARN, the clock-owed `Creating` -> `InService` move, `ResourceInUse`,
+  `ResourceNotFound` and the `Orchestrator` rule) and
+  `tests/all/create_cluster_admission.rs` (the account quota bound, `InstanceGroups`'
+  `1..100` list bounds, `ClusterInstanceCount`'s `0..6758` range, and `ClusterName`'s
+  length and pattern);
+* makes the modelled `ResourceInUse` conflict precede the `ResourceLimitExceeded` quota
+  check, so a create that cannot add a record is refused for the conflict whatever the
+  store's occupancy.
+
+The other operations the recorded units also call (`DeleteCluster`,
+`BatchAddClusterNodes`, `BatchDeleteClusterNodes`, `BatchReplaceClusterNodes`,
+`AttachClusterNodeVolume`, `BatchRebootClusterNodes`) are still scaffolds answering 501
+under their own stub issues.

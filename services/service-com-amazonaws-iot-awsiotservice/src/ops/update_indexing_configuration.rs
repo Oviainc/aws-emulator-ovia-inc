@@ -1,15 +1,29 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateIndexingConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateIndexingConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateIndexingConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Writes the account's fleet-indexing configuration into this service's state, where
+//! `GetIndexingConfiguration` reads it back.
+//!
+//! A section the request SUPPLIES replaces the stored one in full (the request
+//! carries a whole `ThingIndexingConfiguration` / `ThingGroupIndexingConfiguration`,
+//! not a patch of it), and a section it OMITS is left as it was; see
+//! [`crate::state::IndexingConfiguration::set_thing`] for how a supplied section is
+//! recorded.
+//!
+//! Every mode member targets a modelled enum, so the boundary validator has already
+//! refused a value outside one by the time this handler runs. What it refuses itself,
+//! with the modelled `InvalidRequestException` (HTTP 400), is the rule the model
+//! states in prose — "To enable thing connectivity indexing, *thingIndexMode* must
+//! not be set to OFF" — and a custom-field list past the emulator's own ceiling.
+//!
+//! That is the ONLY cross-member rule this model states: the `deviceDefenderIndexingMode`
+//! and `namedShadowIndexingMode` docs each constrain only themselves ("To enable
+//! Device Defender indexing, *deviceDefenderIndexingMode* must not be set to OFF",
+//! and likewise for named shadows), so neither is read here as a condition on
+//! `thingIndexingMode` and a configuration combining them is recorded as asked. Read
+//! them with
+//! `smithy_query(query="doc",shape="ThingIndexingConfiguration",member="deviceDefenderIndexingMode")`.
 //!
 //! ## Shape of an operation
 //!
@@ -106,6 +120,85 @@ impl From<UpdateIndexingConfigurationErrorModeled> for UpdateIndexingConfigurati
     }
 }
 
+/// Refuse this request as invalid, with the operation's modelled
+/// `InvalidRequestException` ("The request is not valid", HTTP 400).
+///
+/// The message names the member and the rule it broke, so the caller can fix the
+/// request from the text alone.
+fn invalid_request(message: String) -> UpdateIndexingConfigurationError {
+    UpdateIndexingConfigurationErrorModeled::InvalidRequestException(InvalidRequestException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// Check every `Field` in one `Fields` list against
+/// [`crate::state::MAX_CUSTOM_FIELDS`].
+///
+/// A field's `type` is NOT checked here: `FieldType` is a modelled enum, and the
+/// boundary validator refuses a value outside an enum's value set before this
+/// handler runs.
+fn check_fields(
+    member: &str,
+    fields: Option<&Vec<Field>>,
+) -> Result<(), UpdateIndexingConfigurationError> {
+    let Some(fields) = fields else {
+        return Ok(());
+    };
+    if fields.len() > crate::state::MAX_CUSTOM_FIELDS {
+        return Err(invalid_request(format!(
+            "{member} may carry at most {} fields, got {}",
+            crate::state::MAX_CUSTOM_FIELDS,
+            fields.len()
+        )));
+    }
+    Ok(())
+}
+
+/// Check a supplied `thingIndexingConfiguration` before any of it is recorded.
+///
+/// Every mode member targets a modelled enum and the custom-field names carry
+/// modelled constraints, so the boundary validator has already refused anything
+/// outside them. What is left is the rule the model states in PROSE rather than in a
+/// trait: `thingConnectivityIndexingMode` documents "STATUS – Your thing index
+/// contains connectivity status. To enable thing connectivity indexing,
+/// *thingIndexMode* must not be set to OFF", so connectivity indexing on a disabled
+/// thing index is not a configuration a caller can ask for — and the emulator's own
+/// ceiling on the caller-grown custom-field list.
+fn check_thing_configuration(
+    configuration: &ThingIndexingConfiguration,
+) -> Result<(), UpdateIndexingConfigurationError> {
+    let thing_mode = configuration.thing_indexing_mode.as_str();
+    let connectivity = configuration
+        .thing_connectivity_indexing_mode
+        .as_deref()
+        .unwrap_or(crate::state::INDEXING_MODE_OFF);
+    if connectivity != crate::state::INDEXING_MODE_OFF
+        && thing_mode == crate::state::INDEXING_MODE_OFF
+    {
+        return Err(invalid_request(format!(
+            "thingIndexingConfiguration.thingConnectivityIndexingMode '{connectivity}' requires \
+             thingIndexingMode not to be {thing_mode}"
+        )));
+    }
+    check_fields(
+        "thingIndexingConfiguration.customFields",
+        configuration.custom_fields.as_ref(),
+    )
+}
+
+/// Check a supplied `thingGroupIndexingConfiguration` before any of it is recorded,
+/// under the same division of labour as
+/// [`check_thing_configuration`].
+fn check_thing_group_configuration(
+    configuration: &ThingGroupIndexingConfiguration,
+) -> Result<(), UpdateIndexingConfigurationError> {
+    check_fields(
+        "thingGroupIndexingConfiguration.customFields",
+        configuration.custom_fields.as_ref(),
+    )
+}
+
 /// The `UpdateIndexingConfiguration` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -142,18 +235,45 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateIndexingConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateIndexingConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateIndexingConfiguration"))
+        // The configuration is account-wide, so no request metadata selects what is
+        // written.
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateIndexingConfigurationErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the IoT emulator has no state store attached".to_string()),
+                },
+            )
+        })?;
+
+        // BOTH supplied sections are checked before EITHER is recorded, so a request
+        // the service refuses leaves the stored configuration exactly as it was.
+        if let Some(configuration) = input.thing_indexing_configuration.as_ref() {
+            check_thing_configuration(configuration)?;
+        }
+        if let Some(configuration) = input.thing_group_indexing_configuration.as_ref() {
+            check_thing_group_configuration(configuration)?;
+        }
+
+        {
+            let mut store = state.lock();
+            if let Some(configuration) = input.thing_indexing_configuration {
+                store.indexing_configuration.set_thing(configuration);
+            }
+            // A request that supplies neither section changes nothing: both members
+            // are optional, and an omitted section is one the caller did not ask to
+            // change.
+            if let Some(configuration) = input.thing_group_indexing_configuration {
+                store
+                    .indexing_configuration
+                    .set_thing_group(configuration);
+            }
+        }
+
+        // `UpdateIndexingConfigurationResponse` models no members, so a successful
+        // update is an empty 200 and what it persisted is read back through
+        // `GetIndexingConfiguration`.
+        Ok(UpdateIndexingConfigurationOutput {})
     }
 }

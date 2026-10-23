@@ -233,6 +233,68 @@ fn transport_family(protocol: &str) -> &'static str {
     }
 }
 
+/// The maximum number of policies one load balancer holds.
+///
+/// AWS publishes no quota for policies per load balancer, and every policy is minted by
+/// a CALLER, so this is a bound the emulator chooses to keep the store one caller can
+/// grow finite. `TooManyPoliciesException` — "The quota for the number of policies for
+/// this load balancer has been reached" — is the error every policy-creating operation
+/// models for reaching it.
+pub const MAX_POLICIES_PER_LOAD_BALANCER: usize = 100;
+
+/// The `CookieExpirationPeriod` a duration-based stickiness policy gets when the create
+/// request names none, from `CreateLBCookieStickinessPolicy`'s own documentation: "If you
+/// do not specify this parameter, the default value is 0, which indicates that the sticky
+/// session should last for the duration of the browser session."
+pub const DEFAULT_COOKIE_EXPIRATION_PERIOD_SECONDS: i64 = 0;
+
+/// What one stored policy configures: one variant per policy-creating operation, so the
+/// list a describe projects a policy into follows from the stored record rather than from
+/// a type string a handler wrote.
+#[derive(Debug, Clone)]
+pub enum PolicyKind {
+    /// Created by `CreateLBCookieStickinessPolicy`: duration-based session stickiness,
+    /// whose cookie goes stale after `cookie_expiration_period` seconds — 0 meaning "the
+    /// duration of the browser session", the documented default.
+    LbCookieStickiness { cookie_expiration_period: i64 },
+}
+
+/// One policy of a load balancer, as a policy-creating operation persists it and
+/// `DescribeLoadBalancers` reports it.
+///
+/// A policy name "must be unique within the set of policies for this load balancer"
+/// (`PolicyName`'s own documentation), so EVERY policy of one load balancer lives in the
+/// one [`LoadBalancer::policies`] map whatever created it: a second map beside it would
+/// let two creates mint two policies under one name.
+#[derive(Debug, Clone)]
+pub struct PolicyRecord {
+    pub name: String,
+    pub kind: PolicyKind,
+}
+
+/// Why `name` is not a policy name, or `Ok(())` when it is one.
+///
+/// From `PolicyName`'s documentation on every operation that creates a policy: "Policy
+/// names must consist of alphanumeric characters and dashes (-)." The model declares the
+/// member a plain string with no `@pattern` or `@length`, so nothing has refused a
+/// malformed name by the time a handler runs. The message names the member and the rule
+/// it broke, which is what a caller fixes the request from.
+pub fn policy_name_rejection(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("PolicyName must not be empty".to_string());
+    }
+    match name
+        .chars()
+        .find(|character| !(character.is_ascii_alphanumeric() || *character == '-'))
+    {
+        Some(rejected) => Err(format!(
+            "PolicyName must consist of alphanumeric characters and dashes (-); \
+             '{name}' contains '{rejected}'"
+        )),
+        None => Ok(()),
+    }
+}
+
 /// A load balancer's health-check configuration.
 ///
 /// Seeded at create with the Classic Load Balancer defaults so
@@ -389,6 +451,10 @@ pub struct LoadBalancer {
     /// [`MAX_INSTANCES_PER_LOAD_BALANCER`].
     pub instances: InstanceSet,
     pub health_check: HealthCheckConfig,
+    /// Every policy created for this load balancer, keyed by `PolicyName` so one name
+    /// holds one policy and a describe reports them in one stable order. Bounded by
+    /// [`MAX_POLICIES_PER_LOAD_BALANCER`].
+    pub policies: BTreeMap<String, PolicyRecord>,
     /// The modifiable attributes `DescribeLoadBalancerAttributes` reports and
     /// `ModifyLoadBalancerAttributes` writes, seeded with the service defaults.
     pub attributes: AttributeConfig,

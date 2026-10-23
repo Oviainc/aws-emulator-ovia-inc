@@ -26,8 +26,9 @@ tracing = { workspace = true }
 # Hex codec for the opaque NextToken (the page boundary, encoded) this service's
 # listings mint, and for rendering the hex id a lineage entity's ARN carries.
 hex = { workspace = true }
-# Digest behind `state::mint_opaque_resource_id`, the server-generated id an ARN that
-# does not carry its resource's name is minted with.
+# Digest behind `state::mint_opaque_resource_id`, the one scheme every server-generated
+# id in this service is minted with (cluster/compute-quota/scheduler-config ids, EC2
+# instance ids, node logical ids, presigned-URL grant tokens).
 sha2 = { workspace = true }
 
 [build-dependencies]

@@ -13,5 +13,7 @@
 // points it into `tests/all/`.
 #[path = "all/connection_recording_preferences.rs"]
 mod connection_recording_preferences;
+#[path = "all/jit_node_access_gate_and_error_messages.rs"]
+mod jit_node_access_gate_and_error_messages;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

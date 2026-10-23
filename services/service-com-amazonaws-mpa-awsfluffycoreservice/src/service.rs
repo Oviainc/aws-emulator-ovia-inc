@@ -99,14 +99,39 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // The centralized walk calls this on a framework-level refusal (an absent
         // required member, or a value outside a declared bound) to let this
         // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // wording.
+        //
+        // MPA validates an Amazon Resource Name as a SERVICE RULE, not as a
+        // per-member model constraint: a value that is not a well-formed MPA ARN
+        // earns one fixed sentence
+        // ([`crate::state::INVALID_ARN_MESSAGE`]) that names neither the member
+        // nor the grammar, whichever ARN-valued member carried it. The framework
+        // would instead render the constraint report it builds for every
+        // violation — echoing the member name and the model's own regex, neither
+        // of which this service exposes — so the ARN class is reworded here, in
+        // the one place every operation's boundary refusal passes through,
+        // rather than per operation.
+        //
+        // The code is replaced along with the message, and with the same code the
+        // framework picks for a constraint refusal on this protocol
+        // (`ValidationException`, which is also what this service's model
+        // declares for a refused input, HTTP 400): the status and the envelope
+        // stay with the protocol.
+        match refusal {
+            Refusal::Invalid(violations)
+                if violations
+                    .iter()
+                    .any(crate::state::is_malformed_arn_violation) =>
+            {
+                Some(Refused {
+                    code: "ValidationException".to_string(),
+                    message: crate::state::INVALID_ARN_MESSAGE.to_string(),
+                })
+            }
+            // Every other refusal keeps the framework's wording: this service has
+            // one recorded rule for the ARN class and none for the rest.
+            _ => None,
+        }
     }
 
     fn override_routing_error(

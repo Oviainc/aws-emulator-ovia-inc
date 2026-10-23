@@ -21,10 +21,16 @@ mod authorization;
 mod cw_log_delivery;
 #[path = "all/list_tags_for_resource.rs"]
 mod list_tags_for_resource;
+#[path = "all/metric_destination_summary_members.rs"]
+mod metric_destination_summary_members;
+#[path = "all/metrics_destination_removal.rs"]
+mod metrics_destination_removal;
 #[path = "all/metrics_destinations.rs"]
 mod metrics_destinations;
 #[path = "all/not_found_and_conflict_bodies.rs"]
 mod not_found_and_conflict_bodies;
+#[path = "all/platform_domain_authority.rs"]
+mod platform_domain_authority;
 #[path = "all/resource_policy.rs"]
 mod resource_policy;
 #[path = "all/resource_tagging.rs"]

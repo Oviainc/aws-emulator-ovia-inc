@@ -367,10 +367,11 @@ async fn global_network_and_site_lifecycle_round_trips_through_stored_state() {
         "DescribeGlobalNetworks after delete: expected no networks, got {described}"
     );
 
-    // Every operation that addresses a global network 404s once it is gone.
+    // Every operation that ACTS ON a global network 404s once it is gone. `CreateSite`
+    // only REFERENCES one, so it is refused as a field-validation failure instead (see
+    // `unknown_parent_reference`).
     for (case, method, uri) in [
         ("GetSites", "GET", format!("/global-networks/{network_id}/sites")),
-        ("CreateSite", "POST", format!("/global-networks/{network_id}/sites")),
         ("UpdateGlobalNetwork", "PATCH", format!("/global-networks/{network_id}")),
         ("DeleteGlobalNetwork", "DELETE", format!("/global-networks/{network_id}")),
         (
@@ -395,17 +396,35 @@ async fn global_network_and_site_lifecycle_round_trips_through_stored_state() {
             "case {case}: wrong error code in {answer}"
         );
     }
+
+    // The create that references the deleted global network is refused as a field failure.
+    let (status, answer) = emulator
+        .post(
+            &format!("/global-networks/{network_id}/sites"),
+            json!({ "Description": "orphan" }),
+        )
+        .await;
+    assert_eq!(
+        status, 400,
+        "case CreateSite: expected 400 for a deleted global network, got {status} with {answer}"
+    );
+    assert_eq!(
+        error_code(&answer),
+        "ValidationException",
+        "case CreateSite: wrong error code in {answer}"
+    );
 }
 
 #[tokio::test]
 async fn unknown_global_network_is_not_found_for_every_operation_that_addresses_one() {
     let emulator = Emulator::new();
     // A well-formed id of the right shape that was never created, and one that is not a
-    // Network Manager id at all: neither names a stored record, so both are 404.
+    // Network Manager id at all: neither names a stored record, so both are 404 for the
+    // operations that ACT ON the global network. `CreateSite` only REFERENCES one, so it is
+    // refused as a field-validation failure instead (see `unknown_parent_reference`).
     for unknown in ["global-network-00000000000000000", "nope"] {
         for (case, method, uri) in [
             ("GetSites", "GET", format!("/global-networks/{unknown}/sites")),
-            ("CreateSite", "POST", format!("/global-networks/{unknown}/sites")),
             (
                 "UpdateGlobalNetwork",
                 "PATCH",

@@ -40,10 +40,18 @@
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
 
+use aws_smithy_schema_server::{envelope, Violation, ViolationKind};
 use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service,
 };
 use std::sync::Arc;
+
+/// Whether `violation` is a `StreamClass` value outside the model's enum — the
+/// refusal whose enumerated set this service narrows.
+fn is_stream_class_enum_violation(violation: &Violation) -> bool {
+    violation.path == crate::state::STREAM_CLASS_PATH
+        && matches!(violation.kind, ViolationKind::EnumValue(_))
+}
 
 /// The `com-amazonaws-gameliftstreams-gameliftstreams` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -98,14 +106,61 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
         // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
+        // service reword it. Both rewordings below are recorded behaviour of
+        // Amazon GameLift Streams that the model cannot express.
+        let Refusal::Invalid(violations) = refusal else {
+            return None;
+        };
+
+        // A `ResourceArn` that is not an ARN at all is answered by this API with
+        // the error code `BadRequestException` (HTTP 400) — not the
+        // `ValidationException` the rest of the API refuses a bad value with, and
+        // not a code the model lists for the tagging operations at all. A client
+        // branching on the code needs the code the service sends.
+        //
+        // A `resourceArn` pattern violation takes PRECEDENCE over any other
+        // violation in the same request, deliberately: a request that is malformed
+        // this way and in another way too is answered as a bad resource ARN,
+        // because that is the refusal the caller has to fix first — the ARN names
+        // what the rest of the request is about.
+        if violations.iter().any(|violation| {
+            violation.path == crate::state::RESOURCE_ARN_PATH
+                && matches!(violation.kind, ViolationKind::Pattern(_))
+        }) {
+            return Some(Refused {
+                code: "BadRequestException".to_string(),
+                message: "Invalid input resource arn: bad syntax".to_string(),
+            });
+        }
+
+        // The `StreamClass` set the service accepts is NARROWER than the model's
+        // enum (see `crate::state::SERVICE_STREAM_CLASSES`), so the set this
+        // refusal enumerates is narrowed to the one the service would enumerate.
+        // The two model-only values are refused by the `CreateStreamGroup` handler,
+        // which words its refusal through the very same envelope.
+        if violations.iter().any(is_stream_class_enum_violation) {
+            let narrowed: Vec<Violation> = violations
+                .iter()
+                .map(|violation| {
+                    if is_stream_class_enum_violation(violation) {
+                        // One source for the accepted set and its wording, shared
+                        // with the `CreateStreamGroup` handler.
+                        crate::state::stream_class_violation(violation.value.as_deref())
+                    } else {
+                        violation.clone()
+                    }
+                })
+                .collect();
+            // Falling back to the framework's own wording is NOT an option here:
+            // that is the message carrying the wider model enum, which is the one
+            // thing this branch exists to replace. The same plain sentence the
+            // handler falls back to is used instead.
+            let message = envelope(&narrowed).unwrap_or_else(crate::state::stream_class_fallback);
+            return Some(Refused {
+                code: "ValidationException".to_string(),
+                message,
+            });
+        }
         None
     }
 

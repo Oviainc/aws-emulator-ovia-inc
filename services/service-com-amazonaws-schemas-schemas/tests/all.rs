@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/aws_managed_and_versions.rs"]
 mod aws_managed_and_versions;
+#[path = "all/aws_managed_catalog_metadata.rs"]
+mod aws_managed_catalog_metadata;
 #[path = "all/aws_managed_event_catalog.rs"]
 mod aws_managed_event_catalog;
 #[path = "all/code_binding_lifecycle.rs"]
@@ -27,6 +29,8 @@ mod empty_response_framing;
 mod error_body_codes;
 #[path = "all/iso8601_timestamps.rs"]
 mod iso8601_timestamps;
+#[path = "all/json_refusal_diagnostics.rs"]
+mod json_refusal_diagnostics;
 #[path = "all/malformed_content_and_policy_deletion.rs"]
 mod malformed_content_and_policy_deletion;
 #[path = "all/registry_schema_lifecycle.rs"]

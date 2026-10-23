@@ -19,6 +19,8 @@ mod notification_configurations;
 mod notification_hubs;
 #[path = "all/organization_access.rs"]
 mod organization_access;
+#[path = "all/resource_tags.rs"]
+mod resource_tags;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/validation_message_rendering.rs"]

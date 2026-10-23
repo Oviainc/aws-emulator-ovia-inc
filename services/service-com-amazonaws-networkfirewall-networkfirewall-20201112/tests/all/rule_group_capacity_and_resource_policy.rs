@@ -132,9 +132,10 @@ async fn a_policy_reports_the_capacity_the_rule_groups_it_references_reserve() {
     }
 }
 
-/// RULE: the fixed action set a resource policy may grant is the one the shared
-/// resource's TYPE admits, so a rule group takes the rule-group set — whichever
-/// of the rule-group ARN forms names it — and refuses anything else with
+/// RULE: the actions a resource policy may grant are the ones the shared
+/// resource's TYPE permits, and the test is CONTAINMENT: a rule group — whichever
+/// of the rule-group ARN forms names it — accepts any non-empty subset of the
+/// rule-group set and refuses a document naming an action outside it with
 /// `InvalidResourcePolicyException` (HTTP 400), attaching nothing.
 ///
 /// The permitted set is the one the AWS `PutResourcePolicy` documentation lists
@@ -162,14 +163,15 @@ async fn only_the_permitted_action_set_is_attached_to_a_shared_rule_group() {
     ];
 
     for (kind, arn) in &resources {
-        let cases: [(&str, Vec<&str>, bool); 4] = [
+        let cases: [(&str, Vec<&str>, bool); 5] = [
             ("exact-set", permitted.clone(), true),
             (
                 "reversed-set",
                 permitted.iter().copied().rev().collect(),
                 true,
             ),
-            ("missing-an-action", permitted[..2].to_vec(), false),
+            ("a-two-action-subset", permitted[..2].to_vec(), true),
+            ("a-single-action-subset", vec![permitted[2]], true),
             (
                 "with-the-firewall-policy-set",
                 state::FIREWALL_POLICY_POLICY_ACTIONS.to_vec(),

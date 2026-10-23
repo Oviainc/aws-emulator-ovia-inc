@@ -274,8 +274,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 CreatePullThroughCacheRuleErrorModeled::PullThroughCacheRuleAlreadyExistsException(
                     PullThroughCacheRuleAlreadyExistsException {
                         message: Some(format!(
-                            "A pull through cache rule with ECR repository prefix \
-                             '{prefix}' already exists for the registry with id '{}'",
+                            "A pull-through cache rule with repository prefix \
+                             '{prefix}' already exists in the registry with id '{}'",
                             crate::state::registry_id()
                         )),
                     },

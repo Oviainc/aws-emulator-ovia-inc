@@ -88,11 +88,20 @@
 //! ZIGBEE_QR_BAR_CODE, DISCOVERED_DEVICE, PRE_ONBOARDED_CLOUD]`, comes back as
 //! `[PRE_ONBOARDED_CLOUD, ZIGBEE_QR_BAR_CODE, ZWAVE_QR_BAR_CODE, WIFI_SETUP_QR_BAR_CODE,
 //! DISCOVERED_DEVICE, CUSTOM_PROTOCOL_QR_BAR_CODE]` — not the declaration order, not its
-//! reverse (which would list `DISCOVERED_DEVICE` second), and not sorted. Reproducing it
-//! would mean storing one permutation per enum, taken from one recording. The set, the
-//! member path, the requirement, the code and the status
-//! are what a caller can act on, and all of those are the framework's; the listing order
-//! stays the framework's too rather than being fitted to one recording.
+//! reverse (which would list `DISCOVERED_DEVICE` second, where the recording lists it
+//! fifth), not sorted either way, and not a hash order (a `java.util.HashSet` of
+//! `[FLEET_PROVISIONING, JITR]` iterates `FLEET_PROVISIONING` first, where the recording
+//! lists `JITR` first). Reversing the declaration therefore reproduces the two-value
+//! recording and contradicts the six-value one, and reproducing both would mean storing
+//! one permutation per enum, taken from one recording. The set, the member path, the
+//! requirement, the code and the status are what a caller can act on, and all of those
+//! are the framework's; the listing order stays the framework's too rather than being
+//! fitted to one recording.
+//!
+//! What IS pinned, in `tests/all/enum_value_set_rendering.rs`, is the part of the clause a
+//! rule produces: an out-of-set enum member is stated with EXACTLY the value set the model
+//! declares for it — every declared value once, nothing undeclared, the same set whichever
+//! operation, binding or rejected value reached it — rendered `[a, b, c]`.
 //!
 //! Everything else about the clause — which constraint classes exist and how each one
 //! words its requirement — stays the framework's, so a constraint class added there
@@ -418,6 +427,33 @@ fn stated(violations: &[Violation]) -> Option<String> {
             ))
         }
     }
+}
+
+/// The refusal a HANDLER owes for a value outside an enum's value set, worded through the
+/// one path every refusal of this service is worded through ([`clause`], [`stated`]).
+///
+/// The constraint walk in front of every operation ([`InModelledEnvelope`]) refuses an
+/// out-of-set enum before any handler sees one, so a handler's own check is a second line
+/// — and a second line must not state the same refusal differently from the first. The
+/// sentence is the framework's envelope with the rejected value left out: `1 validation
+/// error detected: Value at '<member path>' failed to satisfy constraint: Member must
+/// satisfy enum value set: [...]`. `rejected` is what the request sent, and it is passed
+/// only so [`clause`] can lift the framework's echo of it back out — it is never
+/// published, which also keeps a `@sensitive` member's value out of the body.
+///
+/// `member_path` is the wire (lowerCamel) path the clause names, and `allowed` is the
+/// member's declared value set. The ORDER `allowed` is listed in is not part of the
+/// contract (see the module docs), so a caller passes whatever list of the member's
+/// declared values it holds; the SET is what a caller acts on.
+pub(crate) fn enum_value_set_refusal(member_path: &str, allowed: &[&str], rejected: &str) -> String {
+    let violation = Violation {
+        path: member_path.to_string(),
+        kind: ViolationKind::EnumValue(allowed.iter().map(|value| (*value).to_string()).collect()),
+        value: Some(rejected.to_string()),
+    };
+    // One violation, so `stated` answers `Some`; the fallback states the same clause
+    // without the count rather than asserting that with a panic in a request path.
+    stated(std::slice::from_ref(&violation)).unwrap_or_else(|| clause(&violation))
 }
 
 impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {

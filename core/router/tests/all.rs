@@ -27,7 +27,7 @@ mod apigateway_signing_name_routing;
 mod appconfig_signing_name_routing;
 #[path = "all/aws_marketplace_signing_name_routing.rs"]
 mod aws_marketplace_signing_name_routing;
-// These three sit in the SORTED block rather than being appended below, deliberately: the
+// These sit in the SORTED block rather than being appended below, deliberately: the
 // appended region at the end of this file is where every concurrent suite lands, so a
 // line added there conflicts with every other suite in the same window. Here the
 // neighbouring lines are stable.
@@ -39,6 +39,8 @@ mod bedrock_agentcore_signing_name_routing;
 mod bedrock_agent_runtime_session_authorization;
 #[path = "all/bedrock_signing_name_routing.rs"]
 mod bedrock_signing_name_routing;
+#[path = "all/billingconductor_payer_account.rs"]
+mod billingconductor_payer_account;
 #[path = "all/boot_serve.rs"]
 mod boot_serve;
 #[path = "all/cloudformation_provisions_stack_resources.rs"]
@@ -132,6 +134,8 @@ mod scheduler_execution_role;
 mod servicecatalog_signing_name_routing;
 #[path = "all/shared_signing_name_routing.rs"]
 mod shared_signing_name_routing;
+#[path = "all/ssm_contacts_replication_set.rs"]
+mod ssm_contacts_replication_set;
 #[path = "all/transcribe_signing_name_routing.rs"]
 mod transcribe_signing_name_routing;
 #[path = "all/transfer_user_with_iam_role.rs"]
@@ -169,3 +173,15 @@ mod cloudformation_provisions_ecr_public_repository;
 mod cloudformation_provisions_sqs_queues;
 #[path = "all/cloudformation_provisions_container_platform_resources.rs"]
 mod cloudformation_provisions_container_platform_resources;
+#[path = "all/kinesis_video_signing_name_routing.rs"]
+mod kinesis_video_signing_name_routing;
+#[path = "all/apigatewayv2_websocket_deploy_then_connections.rs"]
+mod apigatewayv2_websocket_deploy_then_connections;
+#[path = "all/cloudformation_provisions_fis_experiment_templates.rs"]
+mod cloudformation_provisions_fis_experiment_templates;
+#[path = "all/cloudformation_provisions_sns_topics.rs"]
+mod cloudformation_provisions_sns_topics;
+#[path = "all/cloudformation_provisions_waf_regional_ip_sets.rs"]
+mod cloudformation_provisions_waf_regional_ip_sets;
+#[path = "all/mediapackagev2_published_data_plane_urls.rs"]
+mod mediapackagev2_published_data_plane_urls;

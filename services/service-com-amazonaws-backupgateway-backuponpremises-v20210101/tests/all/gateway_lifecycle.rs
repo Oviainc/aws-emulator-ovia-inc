@@ -1048,7 +1048,13 @@ async fn operations_outside_this_slice_still_answer_501() {
             "UntagResource",
             json!({ "ResourceARN": arn, "TagKeys": ["env"] }),
         ),
-        ("ListVirtualMachines", json!({})),
+        (
+            "GetVirtualMachine",
+            json!({ "ResourceArn": format!(
+                "arn:aws:backup-gateway:{REGION}:{}:vm/vm-0000000000000000",
+                engine::EMULATOR_ACCOUNT_ID
+            ) }),
+        ),
         (
             "PutMaintenanceStartTime",
             json!({ "GatewayArn": arn, "HourOfDay": 2, "MinuteOfHour": 0, "DayOfWeek": 1 }),

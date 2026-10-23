@@ -302,6 +302,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
         for additional in additional_version_weights.keys() {
+            // The map's own key shape (`AdditionalVersion`, pattern `^[0-9]+$`) admits
+            // only a published version number, and the wire does not check a map KEY's
+            // pattern, so a key that is not one is refused here with the validation
+            // message that names the member and the constraint it failed.
+            if additional.is_empty() || !additional.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err(invalid_parameter(format!(
+                    "1 validation error detected: Value '{additional}' at \
+                     'routingConfig.additionalVersionWeights' failed to satisfy constraint: Map \
+                     keys must satisfy regular expression pattern: ^[0-9]+$"
+                )));
+            }
             // Traffic is shifted between two SNAPSHOTS of the function, and the
             // unpublished version is not one: its code and configuration keep changing
             // under the weights.
@@ -370,3 +381,4 @@ fn not_found(message: String) -> CreateAliasError {
     })
     .into()
 }
+

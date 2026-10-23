@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutAccountSettings
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutAccountSettings`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutAccountSettings::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates or overwrites exactly the account-level EVS settings the request names, in
+//! the Region the caller addressed, in `crate::state`'s `account_settings` map, and
+//! reports the settings it modified. A setting the request omits keeps its current
+//! value; `GetAccountSettings` reads the result back.
+//!
+//! A setting's name must be one `AccountSetting$name` documents and its value must be
+//! inside the domain that documentation gives the named setting — the catalog
+//! `crate::state::ACCOUNT_SETTINGS` holds — so a request inside the modelled
+//! `@length`/`@pattern` of the two members can still be refused here, with this
+//! operation's modelled `ValidationException`.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +151,56 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutAccountSettings` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutAccountSettingsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutAccountSettings"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            PutAccountSettingsErrorModeled::InternalServerException(InternalServerException {
+                message: "The Amazon EVS account settings store is unavailable.".to_string(),
+            })
+        })?;
+        // Authorization first: AWS decides it at the IAM layer. An account-level write
+        // names no resource of its own, so only a statement covering every resource
+        // decides it.
+        if let Some(denied) =
+            crate::state::authorization::denied(&*self.engine, ctx, Self::NAME, None)
+        {
+            return Err(denied);
+        }
+
+        // "Creates or updates account-level EVS settings for your Amazon Web Services
+        // account in the specified Amazon Web Services Region": the settings are
+        // regional, so they are written under the Region the caller addressed.
+        // Each setting's own `@length`/`@pattern` is already enforced by the boundary
+        // validator, so reaching here means every name and value has the SHAPE of a
+        // setting; what is checked here is the DOMAIN `AccountSetting$name` documents —
+        // which names exist, and what values each of them takes.
+        let region = crate::state::request_region(ctx.parts());
+        let failures = crate::state::account_setting_failures(&input.settings);
+        if !failures.is_empty() {
+            return Err(PutAccountSettingsErrorModeled::ValidationException(
+                crate::state::aggregate_validation_error(failures),
+            )
+            .into());
+        }
+
+        let mut state = state.lock();
+        if !input.settings.is_empty() && !state.has_room_for_account_settings(&region) {
+            // The emulator's own bound on how many Regions it holds settings for, so a
+            // caller cannot grow the store by naming new Regions. Refused rather than
+            // served by discarding settings somebody already set.
+            return Err(PutAccountSettingsErrorModeled::ValidationException(
+                crate::state::request_validation_error(format!(
+                    "This emulator holds account settings for at most {} Regions.",
+                    crate::state::MAX_ACCOUNT_SETTING_REGIONS
+                )),
+            )
+            .into());
+        }
+
+        let modified = state.put_account_settings(&region, &input.settings);
+        // "A list of regional account-level EVS settings, and their values, that were
+        // modified in this request" — the settings this call wrote, read back out of the
+        // store it wrote them to.
+        Ok(PutAccountSettingsOutput {
+            settings: Some(modified),
+        })
     }
 }

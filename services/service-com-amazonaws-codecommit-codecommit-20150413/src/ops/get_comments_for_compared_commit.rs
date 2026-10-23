@@ -140,14 +140,16 @@ impl From<GetCommentsForComparedCommitErrorModeled> for GetCommentsForComparedCo
 
 /// A commit id named in the request: absent (empty) is `CommitIdRequiredException`,
 /// and anything that is not a git object name is `InvalidCommitIdException`.
-fn checked_commit_id(
-    member: &str,
-    commit_id: &str,
-) -> Result<(), GetCommentsForComparedCommitError> {
+///
+/// Each message comes from the one place this crate words that code
+/// (`crate::state`), which `crate::service` uses for the same code when the request
+/// boundary refuses the member: one code, one message, and nothing naming the
+/// emulator's own validator.
+fn checked_commit_id(commit_id: &str) -> Result<(), GetCommentsForComparedCommitError> {
     if commit_id.is_empty() {
         return Err(GetCommentsForComparedCommitErrorModeled::CommitIdRequiredException(
             CommitIdRequiredException {
-                message: Some(format!("a commit id is required (member: {member})")),
+                message: Some(crate::state::COMMIT_ID_REQUIRED_MESSAGE.to_string()),
             },
         )
         .into());
@@ -155,9 +157,7 @@ fn checked_commit_id(
     if !crate::state::is_object_id(commit_id) {
         return Err(GetCommentsForComparedCommitErrorModeled::InvalidCommitIdException(
             InvalidCommitIdException {
-                message: Some(format!(
-                    "the commit id {commit_id} is not valid (member: {member})"
-                )),
+                message: Some(crate::state::INVALID_COMMIT_ID_MESSAGE.to_string()),
             },
         )
         .into());
@@ -165,25 +165,55 @@ fn checked_commit_id(
     Ok(())
 }
 
+/// Every comment in the repository by the comment it replies to: the reply edges of
+/// the whole store, built ONCE per request.
+///
+/// [`thread`] walks these edges per root, so without this index each step would
+/// rescan the repository's whole comment map and rendering one page would cost
+/// roots x comments.
+fn replies_by_parent(
+    repository: &crate::state::Repository,
+) -> ::std::collections::HashMap<&str, Vec<&crate::state::CommentRecord>> {
+    let mut index: ::std::collections::HashMap<&str, Vec<&crate::state::CommentRecord>> =
+        ::std::collections::HashMap::new();
+    for comment in repository.comments.values() {
+        if let Some(parent) = comment.in_reply_to.as_deref() {
+            index.entry(parent).or_default().push(comment);
+        }
+    }
+    for replies in index.values_mut() {
+        replies.sort_by_key(|comment| comment.sequence);
+    }
+    index
+}
+
 /// One comment thread: the root comment, then the comments replying to it, each
 /// level in the order it was posted. A comment and its replies are one entry of
 /// the comparison's data, which is why they are collected together.
+///
+/// Each comment is expanded AT MOST ONCE, tracked in `expanded`: the reply edges are
+/// stored data, so a record whose `in_reply_to` named itself or an ancestor would
+/// otherwise make this walk re-expand the same records for ever — growing `members`
+/// without end while the store lock is held, which is a hang of the whole service
+/// rather than of one request. Visiting each record once also bounds the thread by
+/// the repository's comment count, itself bounded by
+/// [`crate::state::MAX_COMMENTS_PER_REPOSITORY`].
 fn thread(
-    repository: &crate::state::Repository,
+    replies: &::std::collections::HashMap<&str, Vec<&crate::state::CommentRecord>>,
     root: &crate::state::CommentRecord,
 ) -> Vec<Comment> {
     let mut members: Vec<&crate::state::CommentRecord> = vec![root];
+    let mut expanded: ::std::collections::HashSet<&str> =
+        ::std::collections::HashSet::from([root.comment_id.as_str()]);
     let mut next = 0usize;
     while next < members.len() {
-        let parent = members[next].comment_id.clone();
+        let parent = members[next].comment_id.as_str();
         next += 1;
-        let mut replies: Vec<&crate::state::CommentRecord> = repository
-            .comments
-            .values()
-            .filter(|comment| comment.in_reply_to.as_deref() == Some(parent.as_str()))
-            .collect();
-        replies.sort_by_key(|comment| comment.sequence);
-        members.extend(replies);
+        for reply in replies.get(parent).into_iter().flatten() {
+            if expanded.insert(reply.comment_id.as_str()) {
+                members.push(reply);
+            }
+        }
     }
     members
         .iter()
@@ -237,13 +267,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             {
                 max_results
             }
-            Some(max_results) => {
+            Some(_) => {
                 return Err(
                     GetCommentsForComparedCommitErrorModeled::InvalidMaxResultsException(
                         InvalidMaxResultsException {
-                            message: Some(format!(
-                                "the maximum results value {max_results} is not valid: expected 1 to {}",
-                                crate::state::COMMENTS_PAGE_MAX
+                            // The one place this crate words this code; the upper
+                            // bound is this operation's own published page maximum.
+                            message: Some(crate::state::invalid_max_results_message(
+                                1,
+                                crate::state::COMMENTS_PAGE_MAX,
                             )),
                         },
                     )
@@ -253,7 +285,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let page_size = usize::try_from(page_size).unwrap_or(0);
 
-        checked_commit_id("afterCommitId", &input.after_commit_id)?;
+        checked_commit_id(&input.after_commit_id)?;
         // A blank `beforeCommitId` narrows nothing, the same as leaving the optional
         // member out.
         let before_commit_id = input
@@ -261,7 +293,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .as_deref()
             .filter(|commit_id| !commit_id.is_empty());
         if let Some(before_commit_id) = before_commit_id {
-            checked_commit_id("beforeCommitId", before_commit_id)?;
+            checked_commit_id(before_commit_id)?;
         }
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
@@ -328,8 +360,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .ok_or_else(|| {
                     GetCommentsForComparedCommitErrorModeled::InvalidContinuationTokenException(
                         InvalidContinuationTokenException {
-                            message: Some(format!(
-                                "the continuation token {token} is not valid"
+                            message: Some(crate::state::invalid_continuation_token_message(
+                                token,
                             )),
                         },
                     )
@@ -337,6 +369,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let end = roots.len().min(start.saturating_add(page_size));
 
+        // The reply edges of the whole store, built once for the whole page.
+        let replies = replies_by_parent(repository);
         let data: Vec<CommentsForComparedCommit> = roots[start..end]
             .iter()
             .map(|root| CommentsForComparedCommit {
@@ -346,7 +380,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 before_blob_id: root.comparison.before_blob_id.clone(),
                 after_blob_id: root.comparison.after_blob_id.clone(),
                 location: root.location.clone(),
-                comments: Some(thread(repository, root)),
+                comments: Some(thread(&replies, root)),
             })
             .collect();
 

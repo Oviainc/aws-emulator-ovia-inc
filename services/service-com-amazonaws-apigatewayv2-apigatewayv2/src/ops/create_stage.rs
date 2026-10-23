@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateStage
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateStage`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateStage::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: mints a `Stage` under the api that owns it, keyed by its `StageName`,
+//! and reports the stored record back; `GetStage` reads that same record.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -182,18 +176,210 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateStage` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateStageErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateStage"))
+        let _ = ctx;
+
+        // The request's own members are checked before any resource is resolved: each
+        // is a rule on the REQUEST, so it holds whatever the store holds. Every message
+        // names the member and the rule it broke, which is all a caller has to fix it.
+        crate::state::validate_stage_name(&input.stage_name).map_err(bad_request)?;
+        if let Some(description) = input.description.as_ref() {
+            let length = description.chars().count();
+            if length > MAX_DESCRIPTION_LEN {
+                return Err(bad_request(format!(
+                    "Invalid value for Description: must have length less than or equal \
+                     to {MAX_DESCRIPTION_LEN}, got {length}."
+                )));
+            }
+        }
+        let stage_variables: ::std::collections::BTreeMap<String, String> = input
+            .stage_variables
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        crate::state::validate_stage_variables(stage_variables.iter()).map_err(bad_request)?;
+        if let Some(settings) = input.access_log_settings.as_ref() {
+            crate::state::validate_access_log_settings(settings).map_err(bad_request)?;
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in the assembled emulator — see the note in `create_api`.
+            return Err(crate::scaffolded::Scaffolded::not_implemented("CreateStage"));
+        };
+        let mut store = state.lock();
+
+        let Some(api) = store.apis.get_mut(&input.api_id) else {
+            return Err(CreateStageErrorModeled::NotFoundException(NotFoundException {
+                message: Some(format!(
+                    "Invalid API identifier specified {}:{}",
+                    ::engine::emulator_account_id(),
+                    input.api_id
+                )),
+                resource_type: ::std::option::Option::None,
+            })
+            .into());
+        };
+
+        // "Supported only for WebSocket APIs" (`CreateStage$ClientCertificateId`), so a
+        // client certificate on a stage of any other protocol names a setting the stage
+        // could never apply.
+        if input.client_certificate_id.is_some()
+            && api.protocol_type != crate::state::WEBSOCKET_PROTOCOL_TYPE
+        {
+            return Err(bad_request(format!(
+                "ClientCertificateId is supported only for WebSocket APIs, and the \
+                 ProtocolType of this API is {}.",
+                api.protocol_type
+            )));
+        }
+
+        // A stage is identified by its name within its api, so one api cannot carry two
+        // stages with the same name.
+        if api.stages.contains_key(&input.stage_name) {
+            return Err(CreateStageErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "Stage with name {} already exists for this API.",
+                    input.stage_name
+                )),
+            })
+            .into());
+        }
+
+        // Bound the growth a caller drives: AWS's published quota is 10 stages per API,
+        // and `TooManyRequestsException` is the modelled error for "a limit has been
+        // exceeded" (it carries the limit's name in `LimitType`). The name check above
+        // refuses a DUPLICATE name; this bounds the number of distinct ones.
+        if api.stages.len() >= crate::state::MAX_STAGES_PER_API {
+            return Err(CreateStageErrorModeled::TooManyRequestsException(
+                TooManyRequestsException {
+                    limit_type: Some("Stage".to_string()),
+                    message: Some(format!(
+                        "The maximum number of stages ({}) for this API has been reached.",
+                        crate::state::MAX_STAGES_PER_API
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The stage serves ONE deployment of its own api: a `DeploymentId` naming no
+        // deployment of this api names a resource that is not there.
+        if let Some(deployment_id) = input.deployment_id.as_ref() {
+            if !api.deployments.contains_key(deployment_id) {
+                return Err(CreateStageErrorModeled::NotFoundException(NotFoundException {
+                    message: Some(format!(
+                        "Invalid Deployment identifier specified {}:{}",
+                        ::engine::emulator_account_id(),
+                        deployment_id
+                    )),
+                    resource_type: ::std::option::Option::None,
+                })
+                .into());
+            }
+        }
+
+        let now = ::std::time::SystemTime::now();
+        // "Specifies whether updates to an API automatically trigger a new deployment.
+        // The default value is false" (`CreateStage$AutoDeploy`).
+        let auto_deploy = input.auto_deploy.unwrap_or(false);
+
+        let mut deployment_id = input.deployment_id;
+        let mut last_deployment_status_message = ::std::option::Option::None;
+        if auto_deploy && deployment_id.is_none() {
+            // An auto-deploying stage has its deployments RELEASED BY THE SERVICE
+            // ("Specifies whether a deployment was automatically released",
+            // `Deployment$AutoDeployed`), so creating one releases the api's current
+            // routes and integrations to it straight away — which is what makes the
+            // stage callable. Deploying is synchronous here, exactly as
+            // `CreateDeployment` resolves it, so the release is complete by the time
+            // this call answers.
+            if api.deployments.len() < crate::state::MAX_DEPLOYMENTS_PER_API {
+                let released = api.mint_deployment_id();
+                api.deployments.insert(
+                    released.clone(),
+                    crate::state::Deployment {
+                        deployment_id: released.clone(),
+                        // The service released this one; no caller described it.
+                        description: ::std::option::Option::None,
+                        deployment_status: crate::state::DEPLOYMENT_STATUS_DEPLOYED.to_string(),
+                        deployment_status_message: ::std::option::Option::None,
+                        auto_deployed: true,
+                        created_date: now,
+                    },
+                );
+                last_deployment_status_message = Some(format!(
+                    "Successfully deployed stage with deployment id '{released}'"
+                ));
+                deployment_id = Some(released);
+            } else {
+                // The api is at its deployments quota, so there is no deployment to
+                // release to the stage. The stage is still created — the quota belongs
+                // to the deployment, not to the stage — and reports why its last
+                // deployment did not happen.
+                last_deployment_status_message = Some(format!(
+                    "Failed to deploy stage: the maximum number of deployments ({}) for \
+                     this API has been reached.",
+                    crate::state::MAX_DEPLOYMENTS_PER_API
+                ));
+            }
+        }
+
+        let record = crate::state::Stage {
+            stage_name: input.stage_name.clone(),
+            description: input.description,
+            auto_deploy,
+            tags: input.tags.unwrap_or_default().into_iter().collect(),
+            deployment_id,
+            access_log_settings: input.access_log_settings,
+            client_certificate_id: input.client_certificate_id,
+            default_route_settings: input.default_route_settings,
+            route_settings: input.route_settings.unwrap_or_default().into_iter().collect(),
+            stage_variables,
+            last_deployment_status_message,
+            created_date: now,
+            // Nothing has rewritten the record yet, so it was last updated when it was
+            // created; `UpdateStage` is what moves this on.
+            last_updated_date: now,
+            // Only the `$default` stage quick create mints alongside an api is
+            // API-Gateway-managed; a stage the caller asked for is its own.
+            api_gateway_managed: false,
+        };
+
+        // Read the response back out of the STORE, so what the caller gets is what a
+        // later GetStage will report. The duplicate-name check above means this name
+        // keys no existing stage and this inserts.
+        let stored = api
+            .stages
+            .entry(input.stage_name)
+            .or_insert(record)
+            .to_wire();
+        Ok(CreateStageOutput {
+            access_log_settings: stored.access_log_settings,
+            api_gateway_managed: stored.api_gateway_managed,
+            auto_deploy: stored.auto_deploy,
+            client_certificate_id: stored.client_certificate_id,
+            created_date: stored.created_date,
+            default_route_settings: stored.default_route_settings,
+            deployment_id: stored.deployment_id,
+            description: stored.description,
+            last_deployment_status_message: stored.last_deployment_status_message,
+            last_updated_date: stored.last_updated_date,
+            route_settings: stored.route_settings,
+            stage_name: Some(stored.stage_name),
+            stage_variables: stored.stage_variables,
+            tags: stored.tags,
+        })
     }
+}
+
+/// The longest `Description` this operation accepts: the upper bound of
+/// `StringWithLengthBetween0And1024`, the shape `CreateStage$Description` targets.
+const MAX_DESCRIPTION_LEN: usize = 1024;
+
+/// Refuse the request with this operation's `BadRequestException` (HTTP 400) —
+/// "the input is incomplete or incorrect".
+fn bad_request(message: String) -> CreateStageError {
+    CreateStageErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message),
+    })
+    .into()
 }

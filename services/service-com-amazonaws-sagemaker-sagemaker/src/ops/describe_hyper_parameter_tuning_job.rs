@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeHyperParameterTuningJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeHyperParameterTuningJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: replays the tuning job `CreateHyperParameterTuningJob` stored, after
+//! materialising the terminal transition the clock already owed it; a name no job holds
+//! is the modelled `ResourceNotFound`. This is the ONLY file to touch for this
+//! operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeHyperParameterTuningJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The training-job and objective counters are all zero and no best training job is
+//! reported: this emulator launches no training job, so there is nothing to count and no
+//! objective metric was ever evaluated (see
+//! [`crate::state::NO_TRAINING_RUNNER_FAILURE_REASON`]).
 //!
 //! ## Shape of an operation
 //!
@@ -185,18 +185,78 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeHyperParameterTuningJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeHyperParameterTuningJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeHyperParameterTuningJob"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        let mut store = state.lock();
+        // The name is not case sensitive, so the lookup folds it the way the create did.
+        let Some(job) = store
+            .tuning_jobs
+            .get_mut(&crate::state::entity_key(
+                &input.hyper_parameter_tuning_job_name,
+            ))
+        else {
+            return Err(DescribeHyperParameterTuningJobErrorModeled::ResourceNotFound(
+                ResourceNotFound {
+                    message: Some(format!(
+                        "Could not find hyperparameter tuning job \"{}\".",
+                        input.hyper_parameter_tuning_job_name
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // The only write a reporting call makes: the transition the clock already owed.
+        // It was due at the stored instant whether or not anybody described the job, so a
+        // waiter terminates and no caller's read changes the outcome.
+        let settled = job.settle_status(::std::time::SystemTime::now());
+
+        let output = DescribeHyperParameterTuningJobOutput {
+            hyper_parameter_tuning_job_name: job.name.clone(),
+            hyper_parameter_tuning_job_arn: job.arn.clone(),
+            hyper_parameter_tuning_job_config: job.config.clone(),
+            training_job_definition: job.training_job_definition.clone(),
+            training_job_definitions: job.training_job_definitions.clone(),
+            hyper_parameter_tuning_job_status: job.status.clone(),
+            creation_time: crate::state::timestamp(job.creation_time),
+            hyper_parameter_tuning_end_time: job.end_time.map(crate::state::timestamp),
+            last_modified_time: Some(crate::state::timestamp(job.last_modified_time)),
+            // Both counter structures are `@required`, and every counter in them is zero:
+            // no training job was launched, so none is in progress, completed, stopped or
+            // failed, and no objective metric was evaluated.
+            training_job_status_counters: TrainingJobStatusCounters {
+                completed: Some(0),
+                in_progress: Some(0),
+                retryable_error: Some(0),
+                non_retryable_error: Some(0),
+                stopped: Some(0),
+            },
+            objective_status_counters: ObjectiveStatusCounters {
+                succeeded: Some(0),
+                pending: Some(0),
+                failed: Some(0),
+            },
+            // No training job ran, so there is no best one and no overall best one to
+            // name; reporting either would claim an objective metric nothing computed.
+            best_training_job: None,
+            overall_best_training_job: None,
+            warm_start_config: job.warm_start_config.clone(),
+            autotune: job.autotune.clone(),
+            failure_reason: job.failure_reason.clone(),
+            // Completion details report convergence an optimisation run detected, and
+            // consumed resources the runtime it spent; nothing ran, so neither exists.
+            tuning_job_completion_details: None,
+            consumed_resources: None,
+        };
+        let arn = job.arn.clone();
+        drop(store);
+
+        if settled {
+            // The transition is a state change, so it leaves the same record a create
+            // does rather than happening unobservably on a read path.
+            crate::state::record_state_change(Self::NAME, &arn, ctx);
+        }
+        Ok(output)
     }
 }

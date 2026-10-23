@@ -19,8 +19,12 @@ mod action_executions;
 mod action_revisions;
 #[path = "all/action_type_catalog.rs"]
 mod action_type_catalog;
+#[path = "all/action_type_declarations.rs"]
+mod action_type_declarations;
 #[path = "all/action_type_definitions.rs"]
 mod action_type_definitions;
+#[path = "all/custom_action_job_results.rs"]
+mod custom_action_job_results;
 #[path = "all/custom_action_jobs.rs"]
 mod custom_action_jobs;
 #[path = "all/custom_action_types.rs"]
@@ -39,6 +43,8 @@ mod rule_executions;
 mod stage_transitions;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/third_party_job_failure_results.rs"]
+mod third_party_job_failure_results;
 #[path = "all/third_party_job_results.rs"]
 mod third_party_job_results;
 #[path = "all/third_party_jobs.rs"]

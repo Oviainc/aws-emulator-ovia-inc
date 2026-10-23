@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UntagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UntagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UntagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the tag keys the caller's `tagKeys` names from the resource its `resourceArn`
+//! names:
+//!
+//! * the ARN is resolved the way `TagResource` and `ListTagsForResource` resolve it
+//!   ([`crate::state::resolve_taggable`]) — a value outside this service's ARN namespace
+//!   is a bad REQUEST, and a well-formed one naming no record this store holds is a
+//!   resource that is not found;
+//! * a key the resource holds is DELETED from the one tag list stored on the record, so
+//!   `ListTagsForResource` — which reads that same list — cannot still report it;
+//! * a key the resource does not hold removes nothing, so repeating an untag answers the
+//!   same success: the operation is idempotent, which is also why it models no conflict;
+//! * a key the request does not name keeps its value AND its position, because the stored
+//!   list is filtered in place rather than rebuilt.
 //!
 //! ## Shape of an operation
 //!
@@ -141,20 +146,69 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UntagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UntagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UntagResource"))
+        // The ONE resolution of a caller-supplied `resourceArn`, shared with
+        // `TagResource` and `ListTagsForResource` (`state::resolve_taggable`): a value
+        // that is not a well-formed ARN of this service's own namespace names nothing this
+        // API can address, so it is refused on the INPUT, while a well-formed one naming
+        // no kind this store holds is a resource that is not found.
+        let reference = match crate::state::resolve_taggable(&input.resource_arn) {
+            Ok(reference) => reference,
+            Err(crate::state::TagArnRefusal::NotThisServicesArn) => {
+                return Err(UntagResourceErrorModeled::ValidationException(
+                    ValidationException {
+                        message: format!(
+                            "resourceArn {} is not a CodeArtifact resource ARN.",
+                            input.resource_arn
+                        ),
+                        reason: Some("CANNOT_PARSE".to_string()),
+                    },
+                )
+                .into());
+            }
+            Err(crate::state::TagArnRefusal::NoSuchResource) => {
+                return Err(UntagResourceErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!("Resource {} not found.", input.resource_arn),
+                        resource_id: Some(input.resource_arn.clone()),
+                        // The ARN parsed but names no kind this store holds, so there is
+                        // no resolved kind to report.
+                        resource_type: None,
+                    },
+                )
+                .into());
+            }
+        };
+
+        // Every path below that cannot find the resource answers with ONE refusal, for the
+        // same reason `TagResource` does: a well-formed ARN of this namespace either names
+        // a record this store holds or names no resource at all. An engine holding no
+        // state for this service holds no domain either, so it is that same not-found —
+        // never a server fault, which this operation does not model. The kind IS resolved
+        // here, so the refusal reports it.
+        let not_found = || {
+            UntagResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: format!("Resource {} not found.", input.resource_arn),
+                resource_id: Some(input.resource_arn.clone()),
+                resource_type: crate::state::reported_resource_type(&reference),
+            })
+        };
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(not_found().into());
+        };
+        let mut store = state.lock();
+        let Some(held) = store.resource_tags_mut(&reference) else {
+            return Err(not_found().into());
+        };
+
+        // A tag's KEY is its identity, so the request's keys decide what goes: what stays
+        // is every held tag whose key the request did not name, in the position the
+        // resource held it. A key that is not held matches nothing and removes nothing.
+        held.retain(|tag| !input.tag_keys.contains(&tag.key));
+
+        Ok(UntagResourceOutput {})
     }
 }
+

@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetResponseHeadersPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetResponseHeadersPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetResponseHeadersPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the response headers policy an id names, read from the ONE record the create
+//! that minted it persisted: the policy's id, its `LastModifiedTime` and the
+//! configuration as submitted, beside the version token an `If-Match` is checked
+//! against. A REPORTING operation — it writes nothing, so what a later caller sees is
+//! unchanged by it.
+//!
+//! An id no policy holds is `NoSuchResponseHeadersPolicy` (HTTP 404), whatever shape the
+//! id takes.
 //!
 //! ## Shape of an operation
 //!
@@ -147,18 +147,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetResponseHeadersPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetResponseHeadersPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetResponseHeadersPolicy"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::store_unavailable());
+        };
+        let _ = ctx;
+        let store = state.lock();
+
+        let Some(stored) = store.response_headers_policy(&input.id) else {
+            return Err(
+                GetResponseHeadersPolicyErrorModeled::NoSuchResponseHeadersPolicy(
+                    crate::state::no_such_response_headers_policy(),
+                )
+                .into(),
+            );
+        };
+
+        Ok(GetResponseHeadersPolicyOutput {
+            // "Contains a response headers policy" — the stored record, not the request.
+            response_headers_policy: Some(stored.to_response_headers_policy()),
+            // "The version identifier for the current version of the response headers
+            // policy": the token the last mutation handed back.
+            e_tag: Some(stored.etag.clone()),
+        })
     }
 }

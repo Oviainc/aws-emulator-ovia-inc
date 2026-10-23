@@ -11,6 +11,8 @@
 // `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` resolves to a SIBLING
 // (`tests/describe_vpcs.rs`) — which the layout check refuses. The `#[path]` is what
 // points it into `tests/all/`.
+#[path = "all/address_transfers.rs"]
+mod address_transfers;
 #[path = "all/allowed_images_settings.rs"]
 mod allowed_images_settings;
 #[path = "all/application_status.rs"]
@@ -21,16 +23,22 @@ mod associate_address;
 mod availability_zones;
 #[path = "all/byoip_cidr_lifecycle.rs"]
 mod byoip_cidr_lifecycle;
+#[path = "all/byoip_cidrs.rs"]
+mod byoip_cidrs;
 #[path = "all/capacity_block_offerings.rs"]
 mod capacity_block_offerings;
 #[path = "all/capacity_blocks.rs"]
 mod capacity_blocks;
+#[path = "all/capacity_reservation_fleets.rs"]
+mod capacity_reservation_fleets;
 #[path = "all/coip_pools.rs"]
 mod coip_pools;
 #[path = "all/copy_volumes.rs"]
 mod copy_volumes;
 #[path = "all/create_security_group.rs"]
 mod create_security_group;
+#[path = "all/dedicated_hosts.rs"]
+mod dedicated_hosts;
 #[path = "all/default_network.rs"]
 mod default_network;
 #[path = "all/delete_vpc.rs"]
@@ -50,6 +58,10 @@ mod dry_run_and_unknown_ids;
 // The shared ec2Query plumbing every suite drives the service through.
 #[path = "all/ec2_query.rs"]
 mod ec2_query;
+// The ec2Query response envelope: the success flag and the media type every response
+// carries, whichever operation answered.
+#[path = "all/ec2_query_envelope.rs"]
+mod ec2_query_envelope;
 #[path = "all/elastic_ip_addresses.rs"]
 mod elastic_ip_addresses;
 #[path = "all/fast_launch_images.rs"]
@@ -58,6 +70,8 @@ mod fast_launch_images;
 mod fpga_image_tasks_and_volume_io;
 #[path = "all/get_password_data.rs"]
 mod get_password_data;
+#[path = "all/image_usage_reports.rs"]
+mod image_usage_reports;
 #[path = "all/images.rs"]
 mod images;
 #[path = "all/import_image_tasks.rs"]
@@ -74,10 +88,14 @@ mod local_gateway_route_table_virtual_interface_group_associations;
 mod mac_dedicated_hosts;
 #[path = "all/modify_subnet_attribute.rs"]
 mod modify_subnet_attribute;
+#[path = "all/network_insights_access_scope_analyses.rs"]
+mod network_insights_access_scope_analyses;
 #[path = "all/network_performance_data.rs"]
 mod network_performance_data;
 #[path = "all/placement_groups.rs"]
 mod placement_groups;
+#[path = "all/regions.rs"]
+mod regions;
 #[path = "all/secondary_networks.rs"]
 mod secondary_networks;
 #[path = "all/secondary_subnets.rs"]
@@ -88,6 +106,8 @@ mod security_group_filter_limits;
 mod security_groups;
 #[path = "all/snapshot_block_public_access.rs"]
 mod snapshot_block_public_access;
+#[path = "all/spot_instance_requests.rs"]
+mod spot_instance_requests;
 #[path = "all/spot_placement_scores.rs"]
 mod spot_placement_scores;
 #[path = "all/stale_security_groups.rs"]
@@ -98,6 +118,8 @@ mod state_roundtrip;
 mod transit_gateway_acceptance;
 #[path = "all/transit_gateway_lifecycle.rs"]
 mod transit_gateway_lifecycle;
+#[path = "all/transit_gateway_policy_table_associations.rs"]
+mod transit_gateway_policy_table_associations;
 #[path = "all/transit_gateway_route_table_propagation.rs"]
 mod transit_gateway_route_table_propagation;
 // The Verified Access trust provider slice: create, then read it back.
@@ -124,3 +146,6 @@ mod vpn_connection_device_types;
 // Reading one VPC back out of an ec2Query response, on top of `ec2_query`'s plumbing.
 #[path = "all/wire.rs"]
 mod wire;
+// Stopping the advertisement of a BYOIP address range, and what that refuses.
+#[path = "all/withdraw_byoip_cidr.rs"]
+mod withdraw_byoip_cidr;

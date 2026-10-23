@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateAppVersionResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateAppVersionResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateAppVersionResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: adds a physical resource to the application's DRAFT version in
+//! [`crate::state::ComAmazonawsResiliencehubAwsresiliencehubState::app_versions`],
+//! creating any Application Component the request names that the draft does not
+//! hold yet, so `DescribeAppVersionResource` reads back what this call persisted.
 //!
 //! ## Shape of an operation
 //!
@@ -120,6 +116,8 @@
 //!   limit on the number of requests per second.
 //! * `ValidationException` (HTTP 400) — This exception occurs when a request is not valid.
 
+use std::collections::BTreeSet;
+
 #[allow(unused_imports)]
 use super::types::*;
 
@@ -197,18 +195,476 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateAppVersionResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateAppVersionResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateAppVersionResource"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_failure());
+        };
+
+        // Every modeled constraint on this input is already refused by the boundary
+        // validator before this handler runs, EXCEPT the one it structurally cannot
+        // reach: the `@length` of the value list inside an `AdditionalInfoMap`.
+        if let Some(additional_info) = input.additional_info.as_ref() {
+            if let Some(message) =
+                crate::state::additional_info_violation("additionalInfo", additional_info)
+            {
+                return Err(invalid_request(message));
+            }
+        }
+
+        // `physicalResourceId` arrives as a `String2048` and is stored as
+        // `PhysicalResourceId$identifier`, a `String255`: a longer one has no
+        // representation in the resource this call would persist, so it is refused
+        // rather than truncated.
+        if input.physical_resource_id.len() > PHYSICAL_IDENTIFIER_MAX_LENGTH {
+            return Err(invalid_request(format!(
+                "physicalResourceId is {} characters; a physical resource identifier is at \
+                 most {PHYSICAL_IDENTIFIER_MAX_LENGTH} characters",
+                input.physical_resource_id.len()
+            )));
+        }
+
+        // `appComponents` carries no modelled `@length`, and one entry of it becomes
+        // a STORED Application Component record that is echoed back in the response,
+        // so the list is CLAMPED here — before any allocation sized from it, and
+        // before the service-wide state lock is taken — to the same ceiling
+        // `CreateAppVersionAppComponent` creates components up to. A resource cannot
+        // belong to more components than one app version can hold.
+        if input.app_components.len() > crate::state::MAX_APP_COMPONENTS_PER_APP_VERSION {
+            return Err(too_many_named_app_components(input.app_components.len()));
+        }
+
+        let mut store = state.lock();
+
+        // The resource belongs to an application, so the application has to exist:
+        // storing it under an unknown `appArn` would make a later read report a
+        // resource of an application that was never created.
+        if !store.apps.contains_key(&input.app_arn) {
+            return Err(app_not_found(&input.app_arn));
+        }
+
+        let physical_resource_id = physical_identifier(&input);
+        let resource_key = crate::state::logical_resource_key(&input.logical_resource_id);
+        let draft = store.app_version(&input.app_arn, crate::state::DRAFT_APP_VERSION);
+
+        // "If an Application Component is not part of the Resilience Hub
+        // application, it will be added" (the model's own documentation for
+        // `appComponents`): each name is resolved against the draft HERE, before
+        // anything is written, so a call this handler goes on to refuse creates no
+        // component.
+        let bindings = resolve_app_components(draft, &input.app_components);
+
+        // A replayed `@idempotencyToken` returns the resource its first call created
+        // instead of creating a second one.
+        if let Some(token) = input.client_token.as_deref() {
+            if let Some(first_resource) = store.created_by_token(Self::NAME, token).cloned() {
+                let first = resource_key_of(&first_resource, &input.app_arn)
+                    .and_then(|key| draft.and_then(|version| version.resources.get(key)));
+                match first {
+                    Some(first)
+                        if describes_same_resource(
+                            first,
+                            &input,
+                            &physical_resource_id,
+                            &bindings,
+                        ) =>
+                    {
+                        return Ok(draft_output(input.app_arn.clone(), first.clone()));
+                    }
+                    // The token is in use: either for a resource of this app that
+                    // this request describes differently, or for a resource of
+                    // another application altogether.
+                    _ => {
+                        return Err(conflict(
+                            format!(
+                                "clientToken {token} was already used to create another \
+                                 resource of application {}",
+                                input.app_arn
+                            ),
+                            first
+                                .map(|first| first.logical_resource_id.identifier.clone())
+                                .unwrap_or_else(|| {
+                                    input.logical_resource_id.identifier.clone()
+                                }),
+                            "PhysicalResource",
+                        ));
+                    }
+                }
+            }
+        }
+
+        // The `logicalResourceId` identifies the resource within the app version,
+        // so a second resource cannot take one that is already in use.
+        if draft.is_some_and(|draft| draft.resources.contains_key(&resource_key)) {
+            return Err(conflict(
+                format!(
+                    "a resource with logicalResourceId {} already exists in the {} version of \
+                     application {}",
+                    input.logical_resource_id.identifier,
+                    crate::state::DRAFT_APP_VERSION,
+                    input.app_arn
+                ),
+                input.logical_resource_id.identifier.clone(),
+                "PhysicalResource",
+            ));
+        }
+
+        // `resourceName` is one of the three members `DescribeAppVersionResource`
+        // addresses a single resource by, so two resources of one version cannot
+        // share one: the name would no longer resolve to one resource.
+        if let Some(resource_name) = input.resource_name.as_deref() {
+            if draft.is_some_and(|draft| draft.resource_by_name(resource_name).is_some()) {
+                return Err(conflict(
+                    format!(
+                        "a resource named {resource_name} already exists in the {} version of \
+                         application {}",
+                        crate::state::DRAFT_APP_VERSION,
+                        input.app_arn
+                    ),
+                    resource_name.to_string(),
+                    "PhysicalResource",
+                ));
+            }
+        }
+
+        // The store is bounded: past the ceiling no further resource is created.
+        if draft.is_some_and(|draft| {
+            draft.resources.len() >= crate::state::MAX_RESOURCES_PER_APP_VERSION
+        }) {
+            return Err(too_many_resources());
+        }
+
+        // The components this call would create are counted BEFORE any of them is
+        // written, so a request that crosses the per-version ceiling mid-list is
+        // refused having stored nothing.
+        let held_components = draft.map(|draft| draft.app_components.len()).unwrap_or(0);
+        let creating = bindings
+            .iter()
+            .filter(|binding| matches!(binding, ComponentBinding::New(_)))
+            .count();
+        if held_components + creating > crate::state::MAX_APP_COMPONENTS_PER_APP_VERSION {
+            return Err(too_many_app_components());
+        }
+
+        let draft = store.draft_app_version_mut(&input.app_arn);
+
+        // Each resolved binding becomes one entry of the stored resource, in the
+        // order the request listed it: a name the draft already holds binds to THAT
+        // component, and a name it does not is created here with a server-generated
+        // id, exactly as a `CreateAppVersionAppComponent` that named none gets one.
+        let mut app_components: Vec<AppComponent> = Vec::with_capacity(bindings.len());
+        for binding in bindings {
+            let component = match binding {
+                ComponentBinding::Held(held) => held,
+                ComponentBinding::New(name) => {
+                    let id = crate::state::mint_app_component_id();
+                    let component = AppComponent {
+                        name,
+                        r#type: CREATED_APP_COMPONENT_TYPE.to_string(),
+                        id: Some(id.clone()),
+                        additional_info: None,
+                    };
+                    draft.app_components.insert(id, component.clone());
+                    component
+                }
+            };
+            app_components.push(component);
+        }
+
+        let physical_resource = PhysicalResource {
+            resource_name: input.resource_name.clone(),
+            logical_resource_id: input.logical_resource_id.clone(),
+            physical_resource_id,
+            resource_type: input.resource_type.clone(),
+            app_components: Some(app_components),
+            additional_info: input.additional_info.clone(),
+            // A resource the caller just added is part of the assessment until
+            // something excludes it (`UpdateAppVersionResource$excluded` is what
+            // does), so it is reported included rather than left unanswered.
+            excluded: Some(false),
+            // `ResourceSourceType` is `AppTemplate` or `Discovered`: this resource
+            // was declared through the application's template by this call, not
+            // discovered from a physical stack by `ResolveAppVersionResources`.
+            source_type: Some(APP_TEMPLATE_SOURCE_TYPE.to_string()),
+            // Nothing in this request names a parent resource.
+            parent_resource_name: None,
+        };
+        draft
+            .resources
+            .insert(resource_key.clone(), physical_resource.clone());
+
+        if let Some(token) = input.client_token.as_deref() {
+            let resource = resource_token_key(&input.app_arn, &resource_key);
+            store.record_idempotency_token(Self::NAME, token, &resource);
+        }
+
+        Ok(draft_output(input.app_arn, physical_resource))
     }
+}
+
+/// The modelled `@length` ceiling of `PhysicalResourceId$identifier`
+/// (`String255`, 1..255, from `smithy_query query="shape"
+/// shape="PhysicalResourceId"`) — which this operation's `physicalResourceId`
+/// input (`String2048`) is stored as.
+const PHYSICAL_IDENTIFIER_MAX_LENGTH: usize = 255;
+
+/// The `PhysicalResource$sourceType` of a resource added through this API: one of
+/// the two values the modelled `ResourceSourceType` enum has (`AppTemplate`,
+/// `Discovered`).
+const APP_TEMPLATE_SOURCE_TYPE: &str = "AppTemplate";
+
+/// The `type` of an Application Component this operation has to create because the
+/// request names one the draft does not hold.
+///
+/// `AppComponent$type` is REQUIRED by the model while this operation's
+/// `appComponents` carries only names, so the created component needs a type that
+/// claims nothing the request did not say: the generic "AppCommon" component type
+/// from the Resilience Hub user guide's "Grouping resources in an AppComponent"
+/// list — the same catalogue the sibling `CreateAppVersionAppComponent` handler's
+/// suite cites.
+const CREATED_APP_COMPONENT_TYPE: &str = "AWS::ResilienceHub::AppCommonAppComponent";
+
+/// The stored `physicalResourceId` of the resource `input` describes.
+///
+/// The identifier is the caller's. Its `type` is derived from the identifier
+/// itself, as the model's own doc for `PhysicalResourceId$type` draws the line
+/// (`Arn`: "The resource identifier is an Amazon Resource Name (ARN)"; `Native`:
+/// "an Resilience Hub-native identifier"). The owning region and account are the
+/// caller's when the request names them; otherwise they are the ones the physical
+/// identifier itself carries when it is an ARN, since an ARN names the region and
+/// account its resource lives in.
+fn physical_identifier(input: &CreateAppVersionResourceInput) -> PhysicalResourceId {
+    let identifier = input.physical_resource_id.clone();
+    let (arn_region, arn_account) = crate::state::arn_region_and_account(&identifier);
+    PhysicalResourceId {
+        aws_region: input
+            .aws_region
+            .clone()
+            .or_else(|| arn_region.map(str::to_string)),
+        aws_account_id: input
+            .aws_account_id
+            .clone()
+            .or_else(|| arn_account.map(str::to_string)),
+        r#type: physical_identifier_type(&identifier).to_string(),
+        identifier,
+    }
+}
+
+/// Whether `identifier` is an ARN or a Resilience Hub-native id — the two values
+/// of the modelled `PhysicalIdentifierType` enum. An ARN is exactly a value in the
+/// `arn:<partition>:<service>:...` form.
+fn physical_identifier_type(identifier: &str) -> &'static str {
+    if identifier.starts_with("arn:") {
+        "Arn"
+    } else {
+        "Native"
+    }
+}
+
+/// The response for a resource of `app_arn`'s draft version.
+///
+/// The operation "updates the Resilience Hub application draft version" (the
+/// model's own documentation for it), so the version it reports is always the
+/// draft: `PublishAppVersion` is what mints a numbered version from it.
+fn draft_output(
+    app_arn: String,
+    physical_resource: PhysicalResource,
+) -> CreateAppVersionResourceOutput {
+    CreateAppVersionResourceOutput {
+        app_arn,
+        app_version: crate::state::DRAFT_APP_VERSION.to_string(),
+        physical_resource: Some(physical_resource),
+    }
+}
+
+/// How this operation records what a `clientToken` created: the sub-resource key
+/// `<appArn>/resource/<logical resource key>`, so `DeleteApp` releases it with the
+/// rest of the application's tokens.
+fn resource_token_key(app_arn: &str, resource_key: &str) -> String {
+    format!("{app_arn}/resource/{resource_key}")
+}
+
+/// The stored resource key a remembered token created, when the token created one
+/// under `app_arn` — `None` when the same token was first used for another
+/// application, which is a conflict rather than a replay.
+fn resource_key_of<'a>(resource: &'a str, app_arn: &str) -> Option<&'a str> {
+    resource.strip_prefix(&resource_token_key(app_arn, ""))
+}
+
+/// Whether `stored` is the resource `request` asks for — the idempotency check: a
+/// replayed token with the same parameters replays the first result, a replayed
+/// token with different parameters is a conflict.
+///
+/// Covers EVERY member this operation stores from the request: the physical
+/// identifier as this request would store it, and the Application Components the
+/// request's names RESOLVE to, compared by the identity a binding and a stored
+/// component share — so a request that repeats a name, or names a component by the
+/// id it is stored under, still replays rather than conflicting.
+fn describes_same_resource(
+    stored: &PhysicalResource,
+    request: &CreateAppVersionResourceInput,
+    physical_resource_id: &PhysicalResourceId,
+    bindings: &[ComponentBinding],
+) -> bool {
+    let stored_components: Vec<&str> = stored
+        .app_components
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .map(component_identity)
+        .collect();
+    let bound_components: Vec<&str> =
+        bindings.iter().map(ComponentBinding::identity).collect();
+
+    stored.resource_name == request.resource_name
+        && stored.resource_type == request.resource_type
+        && stored.additional_info == request.additional_info
+        && stored.physical_resource_id.identifier == physical_resource_id.identifier
+        && stored.physical_resource_id.r#type == physical_resource_id.r#type
+        && stored.physical_resource_id.aws_region == physical_resource_id.aws_region
+        && stored.physical_resource_id.aws_account_id == physical_resource_id.aws_account_id
+        && stored_components == bound_components
+}
+
+/// One entry of a request's `appComponents`, resolved against the app version the
+/// resource is being added to.
+enum ComponentBinding {
+    /// A component the version already holds, which this name binds to.
+    Held(AppComponent),
+    /// A name the version holds no component for: this call creates it.
+    New(String),
+}
+
+impl ComponentBinding {
+    /// What identifies the component this binding is for: the stored `id` of a
+    /// component the version holds, or the name of one that has yet to be created.
+    fn identity(&self) -> &str {
+        match self {
+            Self::Held(held) => component_identity(held),
+            Self::New(name) => name,
+        }
+    }
+}
+
+/// What identifies a stored Application Component: its `id`, falling back to its
+/// `name` for the `AppComponent$id` the model leaves optional.
+fn component_identity(component: &AppComponent) -> &str {
+    component
+        .id
+        .as_deref()
+        .unwrap_or(component.name.as_str())
+}
+
+/// The request's `appComponents` names resolved against `draft`, in the order the
+/// request listed them and WITHOUT writing anything.
+///
+/// A resource belongs to a SET of Application Components, so a name that resolves
+/// to a component already bound — a repeated name, or the same component named
+/// once by `name` and once by its stored `id` — is not bound twice, and cannot grow
+/// the stored record beyond the number of components that exist.
+fn resolve_app_components(
+    draft: Option<&crate::state::AppVersionContents>,
+    names: &[String],
+) -> Vec<ComponentBinding> {
+    let mut bindings: Vec<ComponentBinding> = Vec::new();
+    let mut bound: BTreeSet<String> = BTreeSet::new();
+    for name in names {
+        let binding = match draft.and_then(|draft| draft.app_component_named(name)) {
+            Some(held) => ComponentBinding::Held(held.clone()),
+            None => ComponentBinding::New(name.clone()),
+        };
+        if bound.insert(binding.identity().to_string()) {
+            bindings.push(binding);
+        }
+    }
+    bindings
+}
+
+/// The 500 for a service mounted on an engine that holds no state for it.
+fn internal_failure() -> CreateAppVersionResourceError {
+    CreateAppVersionResourceErrorModeled::InternalServerException(InternalServerException {
+        message: Some("resiliencehub state is unavailable on this engine".to_string()),
+    })
+    .into()
+}
+
+/// A 400 `ValidationException` — the operation's OWN modelled one, not the
+/// scaffold's synthetic shape — for a request outside a constraint the boundary
+/// validator could not reach.
+fn invalid_request(message: String) -> CreateAppVersionResourceError {
+    CreateAppVersionResourceErrorModeled::ValidationException(ValidationException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// A 404 `ResourceNotFoundException` for an `appArn` that was never created, or was
+/// deleted.
+fn app_not_found(app_arn: &str) -> CreateAppVersionResourceError {
+    CreateAppVersionResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("application {app_arn} does not exist")),
+        resource_id: Some(app_arn.to_string()),
+        resource_type: Some("App".to_string()),
+    })
+    .into()
+}
+
+/// A 409 `ConflictException` naming the resource already holding the identifier,
+/// the name or the replayed `clientToken`.
+fn conflict(
+    message: impl Into<String>,
+    resource_id: String,
+    resource_type: &str,
+) -> CreateAppVersionResourceError {
+    CreateAppVersionResourceErrorModeled::ConflictException(ConflictException {
+        message: Some(message.into()),
+        resource_id: Some(resource_id),
+        resource_type: Some(resource_type.to_string()),
+    })
+    .into()
+}
+
+/// The 402 for a request that would take one app version past
+/// [`crate::state::MAX_RESOURCES_PER_APP_VERSION`].
+fn too_many_resources() -> CreateAppVersionResourceError {
+    CreateAppVersionResourceErrorModeled::ServiceQuotaExceededException(
+        ServiceQuotaExceededException {
+            message: Some(format!(
+                "this emulator stores at most {} resources per app version; \
+                 delete one before creating another",
+                crate::state::MAX_RESOURCES_PER_APP_VERSION
+            )),
+        },
+    )
+    .into()
+}
+
+/// The 402 for a request naming more Application Components than one app version
+/// can hold, refused BEFORE anything is allocated or stored for them.
+fn too_many_named_app_components(named: usize) -> CreateAppVersionResourceError {
+    CreateAppVersionResourceErrorModeled::ServiceQuotaExceededException(
+        ServiceQuotaExceededException {
+            message: Some(format!(
+                "appComponents names {named} Application Components; an app version holds at \
+                 most {} in this emulator",
+                crate::state::MAX_APP_COMPONENTS_PER_APP_VERSION
+            )),
+        },
+    )
+    .into()
+}
+
+/// The 402 for a request whose `appComponents` would take one app version past
+/// [`crate::state::MAX_APP_COMPONENTS_PER_APP_VERSION`] — the same ceiling
+/// `CreateAppVersionAppComponent` answers with its own 402 at.
+fn too_many_app_components() -> CreateAppVersionResourceError {
+    CreateAppVersionResourceErrorModeled::ServiceQuotaExceededException(
+        ServiceQuotaExceededException {
+            message: Some(format!(
+                "this emulator stores at most {} Application Components per app version; \
+                 delete one before creating another",
+                crate::state::MAX_APP_COMPONENTS_PER_APP_VERSION
+            )),
+        },
+    )
+    .into()
 }

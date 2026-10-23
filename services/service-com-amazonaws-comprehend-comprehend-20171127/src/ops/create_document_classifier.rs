@@ -3,14 +3,19 @@
 //! @op CreateDocumentClassifier
 //!
 //! IMPLEMENTED. Mints the classifier's ARN, persists the whole submitted record in
-//! [`crate::state`] as `SUBMITTED`, and lets the clock walk it on from there
+//! [`crate::state`] as `SUBMITTED`, FITS the model on the labelled documents the
+//! training data holds, and lets the clock walk the classifier on from there
 //! ([`crate::state::DocumentClassifier::settle`]). A repeated `ClientRequestToken`
 //! resolves to the classifier it already created instead of creating a second one.
 //!
-//! Training itself is NOT performed: see
-//! [`crate::state::DocumentClassifier::settle`] for why a started training ends in
-//! the modelled `IN_ERROR` status rather than reporting a `TRAINED` model that
-//! nothing trained.
+//! Training is REAL: the labelled documents are read from the Amazon S3 location
+//! `InputDataConfig` names through this emulator's own object storage, a
+//! [`crate::state::TrainedClassifier`] is fitted on them and the metrics the record
+//! reports are measured on the held-out test documents. A training the emulator
+//! cannot carry out — nothing readable at the input location, a data format whose
+//! text extraction this emulator does not perform — ends in the modelled `IN_ERROR`
+//! status with the reason, rather than reporting a `TRAINED` model that nothing
+//! trained.
 //!
 //! ## Shape of an operation
 //!
@@ -143,9 +148,53 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use std::time::SystemTime;
+use std::collections::{BTreeMap, BTreeSet};
+use std::time::{Duration, SystemTime};
 
-use crate::state::{document_classifier_arn, DocumentClassifier, DEFAULT_CLASSIFIER_DATA_FORMAT};
+use crate::state::{
+    document_classifier_arn, input_objects_within_bounds, parse_s3_uri, read_input_object,
+    s3_client, ClassifierTrainingOutcome, DocumentClassifier, TrainedClassifier, TrainingBudget,
+    DEFAULT_CLASSIFIER_DATA_FORMAT, MAX_CLASSIFIER_FIT_OPERATIONS, MAX_CLASSIFIER_LABELS,
+    MAX_TEST_DOCUMENTS, MAX_TOTAL_INPUT_BYTES, MAX_TRAINING_DOCUMENTS, TRAINING_TEST_SPLIT,
+};
+
+/// How long a creation waits for its training to fit and measure a model.
+///
+/// The EMULATOR's bound, enforced INSIDE the fit and the measuring pass through
+/// [`crate::state::TrainingBudget`], so it bounds the work rather than only the
+/// caller's wait: the blocking task checks the deadline as it goes and stops itself.
+/// A training that reaches it ends the classifier `IN_ERROR` saying so, because
+/// nothing was fitted and no model may be invented for it. Chosen so every corpus
+/// within the bounds above finishes well inside it.
+const TRAINING_TIME_BUDGET: Duration = Duration::from_secs(10);
+
+/// How many classifier trainings this process fits at once.
+///
+/// The EMULATOR's bound on the CPU-bound work concurrent creations can occupy: a
+/// training holds one permit while it fits and measures, so N concurrent
+/// `CreateDocumentClassifier` calls cannot put N CPU-bound tasks on the blocking
+/// pool at once. A creation that finds every permit taken waits for one rather than
+/// being refused — the wait is bounded by the permit holders' own
+/// [`TRAINING_TIME_BUDGET`].
+const MAX_CONCURRENT_TRAINING_RUNS: usize = 4;
+
+/// The permits [`MAX_CONCURRENT_TRAINING_RUNS`] hands out, one per process.
+static TRAINING_PERMITS: ::tokio::sync::Semaphore =
+    ::tokio::sync::Semaphore::const_new(MAX_CONCURRENT_TRAINING_RUNS);
+
+/// The delimiter the labels of one `MULTI_LABEL` training row are separated by when
+/// the request names none.
+///
+/// From the modelled documentation of
+/// `DocumentClassifierInputDataConfig$LabelDelimiter`: "If you do not specify a
+/// delimiter, the default delimiter is the pipe character."
+const DEFAULT_LABEL_DELIMITER: &str = "|";
+
+/// The `DocumentClassifierMode` whose rows carry more than one label.
+const MULTI_LABEL_MODE: &str = "MULTI_LABEL";
+
+/// One labelled training row: the labels it carries, and the document text.
+type LabelledDocument = (Vec<String>, String);
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -183,6 +232,471 @@ pub type CreateDocumentClassifierError = crate::scaffolded::Scaffolded<CreateDoc
 impl From<CreateDocumentClassifierErrorModeled> for CreateDocumentClassifierError {
     fn from(modeled: CreateDocumentClassifierErrorModeled) -> Self {
         crate::scaffolded::Scaffolded::Modeled(modeled)
+    }
+}
+
+/// The labels a training row's first column carries, or `Err` when the row names
+/// more than a classifier can hold.
+///
+/// A `MULTI_LABEL` row names every class the document belongs to, separated by the
+/// configured delimiter ("Indicates the delimiter used to separate each label for
+/// training a multi-label classifier"); every other mode's row names exactly one
+/// class, so its column is the label whatever it contains.
+///
+/// The labels are deduplicated through a set rather than a scan per label, so a row
+/// naming many of them costs time in their number rather than its square, and the
+/// count is bounded by [`MAX_CLASSIFIER_LABELS`]: the delimiter and the column are
+/// both request-controlled, so one row could otherwise name as many labels as its
+/// bytes allow.
+fn row_labels(column: &str, multi_label: bool, delimiter: &str) -> Result<Vec<String>, String> {
+    if !multi_label {
+        let label = column.trim();
+        return Ok(if label.is_empty() {
+            Vec::new()
+        } else {
+            vec![label.to_string()]
+        });
+    }
+    let mut labels: BTreeSet<&str> = BTreeSet::new();
+    for label in column.split(delimiter) {
+        let label = label.trim();
+        if label.is_empty() {
+            continue;
+        }
+        labels.insert(label);
+        if labels.len() > MAX_CLASSIFIER_LABELS {
+            return Err(format!(
+                "A row of the training data names more than the {MAX_CLASSIFIER_LABELS} labels \
+                 a custom classifier can carry, so no classifier was trained."
+            ));
+        }
+    }
+    Ok(labels.into_iter().map(str::to_string).collect())
+}
+
+/// The labelled documents one `COMPREHEND_CSV` object holds, appended to
+/// `documents`, with the number of rows that held no usable pair counted in
+/// `skipped`.
+///
+/// The format `DocumentClassifierInputDataConfig$DataFormat` documents: "a two-column
+/// CSV file" whose first column is the label and whose second is the document, with
+/// no header row. Parsed by the `csv` crate, so the quoting and embedded newlines
+/// RFC 4180 allows are read the way AWS reads them; a row carrying further columns
+/// has them joined back onto the document, which is what an unquoted comma in the
+/// text means.
+///
+/// `Err` is the reason the data could not be used, raised as soon as a ROW crosses a
+/// bound rather than once the whole object has been parsed.
+fn read_csv_rows(
+    text: &str,
+    multi_label: bool,
+    delimiter: &str,
+    documents: &mut Vec<LabelledDocument>,
+    skipped: &mut usize,
+) -> Result<(), String> {
+    let mut reader = ::csv::ReaderBuilder::new()
+        .has_headers(false)
+        .flexible(true)
+        .from_reader(text.as_bytes());
+    for record in reader.records() {
+        let Ok(record) = record else {
+            *skipped += 1;
+            continue;
+        };
+        let labels = row_labels(record.get(0).unwrap_or_default(), multi_label, delimiter)?;
+        let document = record
+            .iter()
+            .skip(1)
+            .collect::<Vec<&str>>()
+            .join(",")
+            .trim()
+            .to_string();
+        if labels.is_empty() || document.is_empty() {
+            *skipped += 1;
+            continue;
+        }
+        documents.push((labels, document));
+        if documents.len() > MAX_TRAINING_DOCUMENTS {
+            return Err(format!(
+                "The training data holds more than the {MAX_TRAINING_DOCUMENTS} labelled \
+                 documents this emulator fits a model on."
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Read every labelled document the `COMPREHEND_CSV` data under `uri` holds, and how
+/// many rows held no usable label/document pair.
+///
+/// `remaining_bytes` is the input budget this whole training run may still read, so a
+/// creation naming both its training and its test data reads ONE budget between them
+/// rather than one each.
+///
+/// An `Err` is the reason the training could not be carried out, ready for the
+/// classifier's `IN_ERROR` message.
+async fn labelled_documents(
+    client: &::aws_sdk_s3::Client,
+    uri: &str,
+    multi_label: bool,
+    delimiter: &str,
+    remaining_bytes: &mut usize,
+) -> Result<(Vec<LabelledDocument>, usize), String> {
+    let Some(location) = parse_s3_uri(uri) else {
+        return Err(format!("The training data location {uri} is not an Amazon S3 URI."));
+    };
+    let objects = input_objects_within_bounds(client, &location, uri).await?;
+    let mut documents: Vec<LabelledDocument> = Vec::new();
+    let mut skipped = 0usize;
+    for (key, _) in &objects {
+        let text = read_input_object(client, &location, key, remaining_bytes).await?;
+        read_csv_rows(&text, multi_label, delimiter, &mut documents, &mut skipped)?;
+        // Parsing is CPU work with no await of its own; the next object's fetch is
+        // the pass's yield point.
+        ::tokio::task::yield_now().await;
+    }
+    Ok((documents, skipped))
+}
+
+/// The metrics `model` scores on `test`, measured by classifying every test document
+/// and comparing the labels the model gives it with the ones its row carried.
+///
+/// Every value is MEASURED, never assumed: `Accuracy` is the share of test documents
+/// whose label set came out exactly right, the macro figures average each label's own
+/// precision and recall, the micro figures pool every label decision, and
+/// `HammingLoss` is the share of label decisions that came out wrong — the metrics
+/// `ClassifierEvaluationMetrics` documents.
+/// Charged against `budget`, which every classification shares with the fit, so the
+/// pass stops itself rather than running for as long as the test documents, the
+/// model's labels and their tokens multiply out to. `Err` is the reason it stopped.
+fn evaluation_metrics(
+    model: &TrainedClassifier,
+    test: &[LabelledDocument],
+    budget: &mut TrainingBudget,
+) -> Result<ClassifierEvaluationMetrics, String> {
+    let labels: Vec<&String> = model.labels.keys().collect();
+    let mut true_positives: BTreeMap<&String, usize> = BTreeMap::new();
+    let mut false_positives: BTreeMap<&String, usize> = BTreeMap::new();
+    let mut false_negatives: BTreeMap<&String, usize> = BTreeMap::new();
+    let mut exact = 0usize;
+    for (expected, text) in test {
+        let predicted = model.predict(text, budget)?;
+        if predicted.len() == expected.len()
+            && expected.iter().all(|label| predicted.contains(label))
+        {
+            exact += 1;
+        }
+        for label in &labels {
+            let want = expected.iter().any(|carried| carried == *label);
+            let got = predicted.iter().any(|given| given == *label);
+            match (want, got) {
+                (true, true) => *true_positives.entry(label).or_default() += 1,
+                (false, true) => *false_positives.entry(label).or_default() += 1,
+                (true, false) => *false_negatives.entry(label).or_default() += 1,
+                (false, false) => {}
+            }
+        }
+    }
+
+    let count = |counts: &BTreeMap<&String, usize>, label: &String| -> f64 {
+        counts.get(label).copied().unwrap_or(0) as f64
+    };
+    let ratio = |numerator: f64, denominator: f64| -> f64 {
+        if denominator == 0.0 {
+            0.0
+        } else {
+            numerator / denominator
+        }
+    };
+    let mut precision_sum = 0.0;
+    let mut recall_sum = 0.0;
+    for label in &labels {
+        let tp = count(&true_positives, label);
+        let fp = count(&false_positives, label);
+        let fn_ = count(&false_negatives, label);
+        precision_sum += ratio(tp, tp + fp);
+        recall_sum += ratio(tp, tp + fn_);
+    }
+    let label_count = labels.len().max(1) as f64;
+    let precision = precision_sum / label_count;
+    let recall = recall_sum / label_count;
+    let total_tp: f64 = labels.iter().map(|label| count(&true_positives, label)).sum();
+    let total_fp: f64 = labels
+        .iter()
+        .map(|label| count(&false_positives, label))
+        .sum();
+    let total_fn: f64 = labels
+        .iter()
+        .map(|label| count(&false_negatives, label))
+        .sum();
+    let micro_precision = ratio(total_tp, total_tp + total_fp);
+    let micro_recall = ratio(total_tp, total_tp + total_fn);
+    let f1 = |precision: f64, recall: f64| ratio(2.0 * precision * recall, precision + recall);
+
+    Ok(ClassifierEvaluationMetrics {
+        accuracy: Some(ratio(exact as f64, test.len() as f64)),
+        precision: Some(precision),
+        recall: Some(recall),
+        f1_score: Some(f1(precision, recall)),
+        micro_precision: Some(micro_precision),
+        micro_recall: Some(micro_recall),
+        micro_f1_score: Some(f1(micro_precision, micro_recall)),
+        hamming_loss: Some(ratio(
+            total_fp + total_fn,
+            test.len() as f64 * label_count,
+        )),
+    })
+}
+
+/// [`TrainedClassifier::fit`] and [`evaluation_metrics`] run OFF the async worker:
+/// fitting a model and measuring it are synchronous, CPU-bound work with no await of
+/// their own, so they go to the blocking pool and the worker serving this request is
+/// released while they run. The `spawn_blocking(..).await` is a real await point, so
+/// a creation waiting on a training can be cancelled, and the
+/// [`MAX_CONCURRENT_TRAINING_RUNS`] permit this holds while it runs bounds how many
+/// of them occupy the pool at once.
+///
+/// The operation and time budgets are carried INTO the blocking task
+/// ([`TrainingBudget`]), so they stop the work itself rather than only the caller's
+/// wait: dropping a blocking task only detaches it, so a bound the task does not
+/// check is a bound the process cannot honour.
+///
+/// `Err` is the reason nothing was fitted — a bound the training data crossed, the
+/// operation budget, or the deadline — ready for the classifier's `IN_ERROR`
+/// message: no model and no metrics are reported for a fit that did not finish.
+async fn fit_and_measure(
+    mode: String,
+    documents: Vec<LabelledDocument>,
+    test: Vec<LabelledDocument>,
+) -> Result<(TrainedClassifier, ClassifierMetadata), String> {
+    // One permit per concurrent training. Taken BEFORE the blocking task is spawned,
+    // so a burst of creations waits here rather than on the blocking pool.
+    let _permit = TRAINING_PERMITS
+        .acquire()
+        .await
+        .map_err(|_| "the training queue is closed".to_string())?;
+    let fit = ::tokio::task::spawn_blocking(move || {
+        let mut budget = TrainingBudget::new(MAX_CLASSIFIER_FIT_OPERATIONS, TRAINING_TIME_BUDGET);
+        let model = TrainedClassifier::fit(&mode, &documents, &mut budget)?;
+        // A corpus too small to hold back a test share is measured on the documents
+        // it was fitted on: the metrics are then resubstitution metrics over real
+        // predictions, never numbers for a measurement that did not happen.
+        let measured_on: &[LabelledDocument] = if test.is_empty() { &documents } else { &test };
+        let metadata = ClassifierMetadata {
+            number_of_labels: Some(i32::try_from(model.labels.len()).unwrap_or(i32::MAX)),
+            number_of_trained_documents: Some(
+                i32::try_from(documents.len()).unwrap_or(i32::MAX),
+            ),
+            number_of_test_documents: Some(i32::try_from(test.len()).unwrap_or(i32::MAX)),
+            evaluation_metrics: Some(evaluation_metrics(&model, measured_on, &mut budget)?),
+        };
+        Ok((model, metadata))
+    });
+    match fit.await {
+        Ok(fitted) => fitted,
+        Err(error) => Err(format!("the training did not complete: {error}")),
+    }
+}
+
+/// Run one classifier's training: read the labelled documents, fit a model on the
+/// training share and measure it on the test share.
+///
+/// Answers a [`ClassifierTrainingOutcome`] rather than an error channel: the training
+/// is the classifier's own work, so what it could not do is the modelled `IN_ERROR`
+/// status and its `Message`, never a failure of the `CreateDocumentClassifier`
+/// request that submitted it.
+async fn train(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    mode: &str,
+    config: &DocumentClassifierInputDataConfig,
+) -> ClassifierTrainingOutcome {
+    let data_format = config
+        .data_format
+        .as_deref()
+        .unwrap_or(DEFAULT_CLASSIFIER_DATA_FORMAT);
+    if data_format != DEFAULT_CLASSIFIER_DATA_FORMAT {
+        return ClassifierTrainingOutcome::failed(format!(
+            "Training data in the {data_format} format is not read by this emulator, which \
+             fits a model on {DEFAULT_CLASSIFIER_DATA_FORMAT} training data only, so no \
+             document was read and no classifier was trained."
+        ));
+    }
+    if config.documents.is_some() || config.document_reader_config.is_some() {
+        return ClassifierTrainingOutcome::failed(
+            "Training on native documents asks for Amazon Textract text extraction, which \
+             this emulator does not perform, so no document was read and no classifier was \
+             trained."
+                .to_string(),
+        );
+    }
+    let Some(uri) = config.s3_uri.clone() else {
+        return ClassifierTrainingOutcome::failed(
+            "InputDataConfig.S3Uri names no training data, so no document was read and no \
+             classifier was trained."
+                .to_string(),
+        );
+    };
+
+    let multi_label = mode == MULTI_LABEL_MODE;
+    let delimiter = config
+        .label_delimiter
+        .as_deref()
+        .unwrap_or(DEFAULT_LABEL_DELIMITER);
+    let client = s3_client(ctx, region);
+    // ONE input budget for the whole run, so a creation naming both its training and
+    // its test data cannot read twice what one naming only training data may.
+    let mut remaining_bytes = MAX_TOTAL_INPUT_BYTES;
+    let (mut documents, skipped) =
+        match labelled_documents(&client, &uri, multi_label, delimiter, &mut remaining_bytes).await
+        {
+            Ok(read) => read,
+            Err(reason) => {
+                return ClassifierTrainingOutcome::failed(format!(
+                    "Could not read the training documents from {uri}: {reason}"
+                ))
+            }
+        };
+    if documents.is_empty() {
+        return ClassifierTrainingOutcome::failed(format!(
+            "The training data at {uri} holds no labelled document: every one of the \
+             {skipped} row(s) read was missing a label or a document, so no classifier was \
+             trained."
+        ));
+    }
+
+    // Where the test documents come from: the location `TestS3Uri` names when the
+    // request names one ("The Amazon S3 URI for the input data. The Amazon S3 bucket
+    // must be in the same Region as the API endpoint that you are calling"), and
+    // otherwise the documented share of the training data itself — "Amazon Comprehend
+    // uses 10 percent of your training documents to test the custom classifier".
+    let mut test: Vec<LabelledDocument> = Vec::new();
+    // What the training has to say about its own data, beside the model: every note
+    // here is something a caller reading the metrics needs to know, and a run with
+    // nothing to report ends `TRAINED` rather than `TRAINED_WITH_WARNING`.
+    let mut notes: Vec<String> = Vec::new();
+    if let Some(test_uri) = config.test_s3_uri.clone() {
+        match labelled_documents(
+            &client,
+            &test_uri,
+            multi_label,
+            delimiter,
+            &mut remaining_bytes,
+        )
+        .await
+        {
+            Ok((rows, _)) => test = rows,
+            Err(reason) => notes.push(format!(
+                "The test documents at {test_uri} could not be read ({reason})."
+            )),
+        }
+    } else if documents.len() >= TRAINING_TEST_SPLIT {
+        let mut kept: Vec<LabelledDocument> = Vec::new();
+        for (index, row) in documents.into_iter().enumerate() {
+            if (index + 1).is_multiple_of(TRAINING_TEST_SPLIT) && test.len() < MAX_TEST_DOCUMENTS {
+                test.push(row);
+            } else {
+                kept.push(row);
+            }
+        }
+        documents = kept;
+    }
+    // The measuring pass costs one prediction per (test document, label), so the
+    // documents it measures are bounded; the rest train the model instead.
+    if test.len() > MAX_TEST_DOCUMENTS {
+        documents.extend(test.split_off(MAX_TEST_DOCUMENTS));
+    }
+    if skipped > 0 {
+        notes.push(format!(
+            "{skipped} row(s) of the training data were skipped because they named no label \
+             or held no document."
+        ));
+    }
+    // A caller reading `NumberOfTestDocuments: 0` beside a full set of metrics has to
+    // be told WHERE they came from: with nothing held back they are resubstitution
+    // metrics over the training documents, which a held-out measurement they are not.
+    if test.is_empty() {
+        notes.push(format!(
+            "No test documents were held back — the training data holds fewer than the \
+             {TRAINING_TEST_SPLIT} labelled documents a test share is taken from — so the \
+             evaluation metrics were measured on the training documents themselves."
+        ));
+    }
+
+    // The corpus is MOVED into the fit, so the documents are never held twice.
+    let trained_count = documents.len();
+    let (model, metadata) = match fit_and_measure(mode.to_string(), documents, test).await {
+        Ok(fitted) => fitted,
+        Err(reason) => {
+            return ClassifierTrainingOutcome::failed(format!(
+                "Could not fit a classifier on the training documents at {uri}: {reason}"
+            ))
+        }
+    };
+    let warning = (!notes.is_empty()).then(|| {
+        format!(
+            "The classifier was trained on {trained_count} document(s). {}",
+            notes.join(" ")
+        )
+    });
+    ClassifierTrainingOutcome::trained(model, metadata, warning)
+}
+
+/// Records against the stored classifier what its training reported — and, if it is
+/// dropped without a report, the modelled failure for a training that will never
+/// report.
+///
+/// The classifier's counterpart of [`crate::state::RunOutcomeRecorder`], and there
+/// for the same reason: a classifier whose training never reports would otherwise
+/// stay `TRAINING` for the life of the process. `Drop` runs on EVERY exit from the
+/// handler, which is what makes that unreachable.
+struct TrainingOutcomeRecorder {
+    store: ::engine::ServiceState<crate::state::ComAmazonawsComprehendComprehend20171127State>,
+    classifier_arn: String,
+    reported: bool,
+}
+
+impl TrainingOutcomeRecorder {
+    /// Record `outcome` as what this classifier's training reported. The clock
+    /// reveals it once the training span is over, never before.
+    ///
+    /// The outcome goes through the store's own admission
+    /// ([`crate::state::ComAmazonawsComprehendComprehend20171127State::admit_training_outcome`]),
+    /// so a fitted model is only taken if the store can hold it beside the models it
+    /// already has.
+    fn report(&mut self, outcome: ClassifierTrainingOutcome) {
+        self.reported = true;
+        let now = SystemTime::now();
+        let mut store = self.store.lock();
+        let outcome = store.admit_training_outcome(outcome);
+        if let Some(classifier) = store.document_classifiers.get_mut(&self.classifier_arn) {
+            classifier.record_training_outcome(outcome, now);
+        }
+    }
+}
+
+impl Drop for TrainingOutcomeRecorder {
+    fn drop(&mut self) {
+        if self.reported {
+            return;
+        }
+        let now = SystemTime::now();
+        let mut store = self.store.lock();
+        if let Some(classifier) = store.document_classifiers.get_mut(&self.classifier_arn) {
+            // Nothing is recorded against a classifier that has already left the
+            // training path: one whose outcome the clock has already revealed, or
+            // which a later creation displaced under the same ARN, is not this run's
+            // to report on.
+            if classifier.training_outcome.is_none() && !classifier.is_terminal() {
+                classifier.record_training_outcome(
+                    ClassifierTrainingOutcome::failed(
+                        "The training did not complete: the request that started it ended \
+                         before the training reported an outcome.",
+                    ),
+                    now,
+                );
+            }
+        }
     }
 }
 
@@ -286,26 +800,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let region = crate::state::request_region(ctx.parts());
         let now = SystemTime::now();
-        let mut store = state.lock();
-        // Report from a store whose clock-owed changes are already materialised, so a
-        // name freed by a completed deletion is free here too.
-        store.settle_document_classifiers(now);
-
-        // `ClientRequestToken` is `@idempotencyToken`: the same token re-submitted
-        // names the classifier it already created. The TOKEN decides, not the rest of
-        // the request — the model declares no error for a token reused with different
-        // members, so a reuse resolves to the first classifier rather than being
-        // refused.
-        if let Some(token) = input.client_request_token.as_ref() {
-            if let Some(existing) = store.classifier_idempotency_tokens.get(token).cloned() {
-                if store.document_classifiers.contains_key(&existing) {
-                    return Ok(CreateDocumentClassifierOutput {
-                        document_classifier_arn: Some(existing),
-                    });
-                }
-            }
-        }
-
         // The ARN form the output member's own pattern states, rendered by the one
         // place that states it, `crate::state::document_classifier_arn`. It carries
         // the name, the version and the REGION the request was signed for, so it is
@@ -317,44 +811,102 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &input.document_classifier_name,
             input.version_name.as_deref(),
         );
+        let input_data_config = input.input_data_config.clone();
+        let mode = input
+            .mode
+            .clone()
+            .unwrap_or_else(|| crate::state::DEFAULT_CLASSIFIER_MODE.to_string());
 
-        // One name (and version) names one classifier: a second creation under a live
-        // ARN is the "specified resource name is already in use" this operation
-        // models.
-        if store.document_classifiers.contains_key(&arn) {
-            return Err(CreateDocumentClassifierErrorModeled::ResourceInUseException(
-                ResourceInUseException {
-                    message: Some(format!(
-                        "The document classifier {arn} is already in use. Use a different \
-                         name and try your request again."
-                    )),
-                },
-            )
-            .into());
+        // The guard is scoped so the store lock is released before this handler
+        // awaits the training's own object-storage work below.
+        {
+            let mut store = state.lock();
+            // Report from a store whose clock-owed changes are already materialised,
+            // so a name freed by a completed deletion is free here too.
+            store.settle_document_classifiers(now);
+
+            // `ClientRequestToken` is `@idempotencyToken`: the same token
+            // re-submitted names the classifier it already created. The TOKEN
+            // decides, not the rest of the request — the model declares no error for
+            // a token reused with different members, so a reuse resolves to the first
+            // classifier rather than being refused.
+            if let Some(token) = input.client_request_token.as_ref() {
+                if let Some(existing) = store.classifier_idempotency_tokens.get(token).cloned() {
+                    if store.document_classifiers.contains_key(&existing) {
+                        return Ok(CreateDocumentClassifierOutput {
+                            document_classifier_arn: Some(existing),
+                        });
+                    }
+                }
+            }
+
+            // One name (and version) names one classifier: a second creation under a
+            // live ARN is the "specified resource name is already in use" this
+            // operation models.
+            if store.document_classifiers.contains_key(&arn) {
+                return Err(CreateDocumentClassifierErrorModeled::ResourceInUseException(
+                    ResourceInUseException {
+                        message: Some(format!(
+                            "The document classifier {arn} is already in use. Use a different \
+                             name and try your request again."
+                        )),
+                    },
+                )
+                .into());
+            }
+
+            let seq = store.mint_document_classifier_seq();
+            let mut classifier = DocumentClassifier::submitted(
+                seq,
+                arn.clone(),
+                input.document_classifier_name,
+                input.language_code,
+                now,
+            );
+            classifier.version_name = input.version_name;
+            classifier.input_data_config = Some(input.input_data_config);
+            classifier.output_data_config = input.output_data_config;
+            classifier.data_access_role_arn = Some(input.data_access_role_arn);
+            classifier.volume_kms_key_id = input.volume_kms_key_id;
+            classifier.model_kms_key_id = input.model_kms_key_id;
+            classifier.vpc_config = input.vpc_config;
+            classifier.mode = mode.clone();
+            // `ModelPolicy` is "the resource-based policy to attach to your custom
+            // model", i.e. the policy `DescribeResourcePolicy` reports and
+            // `PutResourcePolicy` replaces, so a creation that carries one attaches
+            // the model's first policy revision here.
+            if let Some(policy) = input.model_policy {
+                let revision_id = store.mint_policy_revision_id(&arn, &policy, now);
+                classifier.resource_policy = Some(crate::state::ResourcePolicy {
+                    policy,
+                    revision_id,
+                    creation_time: now,
+                    last_modified_time: now,
+                });
+            }
+            classifier.tags = tags;
+            classifier.client_request_token = input.client_request_token;
+            // The record is persisted BEFORE the training starts, so the classifier
+            // exists (and its token is claimed) from the instant the creation is
+            // accepted. Its terminal status is unknown until the training reports,
+            // which is exactly what a classifier still training has.
+            store.insert_document_classifier(classifier);
         }
 
-        let seq = store.mint_document_classifier_seq();
-        let mut classifier = DocumentClassifier::submitted(
-            seq,
-            arn.clone(),
-            input.document_classifier_name,
-            input.language_code,
-            now,
-        );
-        classifier.version_name = input.version_name;
-        classifier.input_data_config = Some(input.input_data_config);
-        classifier.output_data_config = input.output_data_config;
-        classifier.data_access_role_arn = Some(input.data_access_role_arn);
-        classifier.volume_kms_key_id = input.volume_kms_key_id;
-        classifier.model_kms_key_id = input.model_kms_key_id;
-        classifier.vpc_config = input.vpc_config;
-        if let Some(mode) = input.mode {
-            classifier.mode = mode;
-        }
-        classifier.model_policy = input.model_policy;
-        classifier.tags = tags;
-        classifier.client_request_token = input.client_request_token;
-        store.insert_document_classifier(classifier);
+        // From here on the classifier exists, so whatever the training does —
+        // including this handler never getting to report it — is recorded against the
+        // record by the recorder's `Drop`.
+        let mut recorder = TrainingOutcomeRecorder {
+            store: state.clone(),
+            classifier_arn: arn.clone(),
+            reported: false,
+        };
+        let outcome = train(ctx, &region, &mode, &input_data_config).await;
+        // The outcome is RECORDED, not revealed: the clock owes the terminal status
+        // only once the classifier's training span is over, which
+        // `DocumentClassifier::settle` applies.
+        recorder.report(outcome);
+        drop(recorder);
 
         Ok(CreateDocumentClassifierOutput {
             document_classifier_arn: Some(arn),

@@ -19,6 +19,8 @@ mod account_configuration_tokens;
 mod acme_account_listing;
 #[path = "all/acme_directory_endpoint.rs"]
 mod acme_directory_endpoint;
+#[path = "all/acme_domain_validation_lifecycle.rs"]
+mod acme_domain_validation_lifecycle;
 #[path = "all/acme_endpoint_lifecycle.rs"]
 mod acme_endpoint_lifecycle;
 #[path = "all/acme_endpoint_list.rs"]
@@ -51,6 +53,8 @@ mod email_validation_dispatch;
 mod refusal_codes_and_search_projection;
 #[path = "all/resend_validation_email.rs"]
 mod resend_validation_email;
+#[path = "all/resource_tag_input_constraints.rs"]
+mod resource_tag_input_constraints;
 #[path = "all/resource_tagging.rs"]
 mod resource_tagging;
 #[path = "all/state_roundtrip.rs"]

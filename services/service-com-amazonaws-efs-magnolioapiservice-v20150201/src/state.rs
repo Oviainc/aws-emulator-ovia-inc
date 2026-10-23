@@ -237,6 +237,24 @@ impl Subnet {
     }
 }
 
+/// A throughput change an `UpdateFileSystem` call has ACCEPTED and the clock has not
+/// applied yet.
+///
+/// `UpdateFileSystem` answers HTTP 202, an acceptance rather than a completion: the file
+/// system moves to the `updating` lifecycle phase and goes on reporting the throughput it
+/// currently has until the transition finishes, so the requested values wait here instead
+/// of on the reported members. See
+/// [`ComAmazonawsEfsMagnolioapiserviceV20150201State::materialize_due_transitions`], which
+/// applies them when [`CREATING_FOR`] has elapsed.
+#[derive(Debug, Clone)]
+pub struct PendingThroughput {
+    /// The `ThroughputMode` the file system will carry once the change is applied.
+    pub throughput_mode: String,
+    /// The `ProvisionedThroughputInMibps` it will carry then — `None` for a mode the
+    /// member is not valid for.
+    pub provisioned_throughput_in_mibps: Option<f64>,
+}
+
 /// One stored EFS file system. `NumberOfMountTargets` is not a field: it is the length
 /// of [`Self::mount_target_ids`], so the count cannot drift from the mount targets that
 /// back it.
@@ -261,16 +279,27 @@ pub struct FileSystem {
     /// system, and `None` while none has been. See [`THROUGHPUT_CHANGE_COOLDOWN`].
     pub last_restricted_throughput_change: Option<SystemTime>,
     pub provisioned_throughput_in_mibps: Option<f64>,
-    pub encrypted: Option<bool>,
+    /// The throughput change an accepted `UpdateFileSystem` has not applied yet, and
+    /// `None` when none is outstanding. While one is held the file system reports its
+    /// CURRENT throughput and the `updating` phase; see [`PendingThroughput`].
+    pub pending_throughput: Option<PendingThroughput>,
+    /// Whether this file system is encrypted. `FileSystemDescription$Encrypted` is "A
+    /// Boolean value that, if true, indicates that the file system is encrypted" — a fact
+    /// every file system has, so the description reports it either way rather than leaving
+    /// the member out of an unencrypted one's.
+    pub encrypted: bool,
     pub kms_key_id: Option<String>,
     pub availability_zone_name: Option<String>,
     pub availability_zone_id: Option<String>,
     /// Whether automatic backups were requested at creation. Read by the backup-policy
     /// operations, which are still scaffolded.
     pub backup: bool,
-    /// The last known metered size, in bytes, and when it was metered.
+    /// The last known metered size, in bytes, and when it was metered — `None` while no
+    /// metering has happened, which is what leaves `SizeInBytes.Timestamp` ("the time at
+    /// which the size of data, returned in the Value field, was determined") out of the
+    /// description. This emulator stores no file data, so nothing meters a file system.
     pub size_in_bytes: i64,
-    pub size_measured_at: SystemTime,
+    pub size_measured_at: Option<SystemTime>,
     pub tags: Vec<Tag>,
     pub mount_target_ids: Vec<String>,
     /// This file system's replication overwrite protection: one of
@@ -298,15 +327,20 @@ impl FileSystem {
             name: self.name.clone(),
             number_of_mount_targets: i32::try_from(self.mount_target_ids.len())
                 .unwrap_or(i32::MAX),
+            // "The latest known metered size (in bytes) of data stored in the file
+            // system, in its Value field, and the time at which that size was determined
+            // in its Timestamp field": every per-storage-class member is reported — a
+            // class holding nothing reports zero rather than being left out — and
+            // `Timestamp` only once a metering time exists on the record.
             size_in_bytes: FileSystemSize {
                 value: self.size_in_bytes,
-                timestamp: Some(epoch_seconds(self.size_measured_at)),
+                timestamp: self.size_measured_at.map(epoch_seconds),
                 value_in_ia: Some(0),
                 value_in_standard: Some(self.size_in_bytes),
-                value_in_archive: None,
+                value_in_archive: Some(0),
             },
             performance_mode: self.performance_mode.clone(),
-            encrypted: self.encrypted,
+            encrypted: Some(self.encrypted),
             kms_key_id: self.kms_key_id.clone(),
             throughput_mode: Some(self.throughput_mode.clone()),
             provisioned_throughput_in_mibps: self.provisioned_throughput_in_mibps,
@@ -351,6 +385,19 @@ impl FileSystem {
             availability_zone_id: described.availability_zone_id,
             tags: described.tags,
             file_system_protection: described.file_system_protection,
+        }
+    }
+
+    /// Apply the throughput change the clock owes this file system, if it carries one.
+    ///
+    /// Called where the `updating` -> `available` transition is materialised, so the
+    /// requested throughput becomes the file system's OWN configuration at exactly the
+    /// instant the transition completes — never before, which is what makes the 202 an
+    /// acceptance rather than a completion.
+    fn settle_throughput_change(&mut self) {
+        if let Some(pending) = self.pending_throughput.take() {
+            self.throughput_mode = pending.throughput_mode;
+            self.provisioned_throughput_in_mibps = pending.provisioned_throughput_in_mibps;
         }
     }
 }
@@ -644,6 +691,10 @@ impl ComAmazonawsEfsMagnolioapiserviceV20150201State {
                 || file_system.life_cycle_state == LIFE_CYCLE_UPDATING)
                 && file_system.available_at <= now
             {
+                // The throughput change an `updating` file system was accepted for is
+                // applied by the completion of that transition, not by the call that
+                // started it.
+                file_system.settle_throughput_change();
                 file_system.life_cycle_state = LIFE_CYCLE_AVAILABLE.to_string();
             }
         }
@@ -1030,19 +1081,86 @@ fn compound_initials(word: &str) -> String {
     initials
 }
 
-/// The key ARN EFS reports for an encrypted file system's KMS key. A `KmsKeyId` may
-/// arrive as a key id, a key ARN, an alias or an alias ARN
-/// (`CreateFileSystem$KmsKeyId`); the description carries the ARN.
+/// The `alias/` resource prefix a KMS alias carries, bare or inside an ARN, which is how
+/// an alias is told apart from the key it points at. Both forms appear in the modelled
+/// `KmsKeyId` pattern (`smithy_query(query="shape",shape="KmsKeyId")`).
+pub const KMS_ALIAS_PREFIX: &str = "alias/";
+
+/// The seed a KMS key id derived from an alias name is finalised from. A fixed salt, so
+/// a derived key id can never collide with an id this store minted from its own counter.
+const KMS_ALIAS_SEED: u64 = 0x4B4D_5341_4C49_4153;
+
+/// The KEY IDENTIFIER EFS reports for an encrypted file system's KMS key.
+///
+/// `CreateFileSystem$KmsKeyId` accepts "the ID of the KMS key that you want to use" as a
+/// key id, a key ARN, an alias or an alias ARN, and `FileSystemDescription$KmsKeyId` is
+/// "the ID of an KMS key used to protect the encrypted file system" — the key itself. An
+/// alias is a pointer to a key and not a key, so an alias in the request is RESOLVED to
+/// the key ARN of the key it names (`arn:aws:kms:<region>:<account>:key/<key id>`, one of
+/// the forms the modelled pattern admits), rather than echoed: a client that feeds the
+/// reported value to KMS or pins it against a configured CMK needs the key.
+///
+/// The key an alias resolves to is derived from the alias name, so one alias always names
+/// the same key and two aliases never name the same one, without this service standing up
+/// a KMS key store of its own.
 pub fn kms_key_arn(key: &str, region: &str) -> String {
-    if key.starts_with("arn:") {
-        return key.to_string();
-    }
-    let resource = if key.starts_with("alias/") {
-        key.to_string()
+    let is_arn = key.starts_with("arn:");
+    // An ARN names the Region its key lives in; a bare form lives in the request's.
+    let region = if is_arn {
+        arn_region(key).unwrap_or(region)
     } else {
-        format!("key/{key}")
+        region
     };
-    ::engine::emulator_arn("kms", region, &resource)
+    // The resource segment of an ARN (`key/…` or `alias/…`) is its last colon field.
+    let resource = if is_arn {
+        key.rsplit(':').next().unwrap_or(key)
+    } else {
+        key
+    };
+    match resource.strip_prefix(KMS_ALIAS_PREFIX) {
+        Some(alias_name) => ::engine::emulator_arn(
+            "kms",
+            region,
+            &format!("key/{}", kms_key_id_of_alias(alias_name)),
+        ),
+        // A key ARN already names the key, in the account that owns it.
+        None if is_arn => key.to_string(),
+        None => ::engine::emulator_arn("kms", region, &format!("key/{key}")),
+    }
+}
+
+/// The key id the KMS alias `alias_name` resolves to: `8-4-4-4-12` lowercase hex digits,
+/// the key-id form the modelled `KmsKeyId` pattern admits.
+///
+/// Derived from the alias name through [`digest_of`] and [`hex_of`], so the resolution is
+/// stable — every read of a file system created under one alias reports the same key — and
+/// injective in practice, so distinct aliases resolve to distinct keys.
+fn kms_key_id_of_alias(alias_name: &str) -> String {
+    let seed = KMS_ALIAS_SEED ^ digest_of(alias_name);
+    let digits = format!(
+        "{}{}",
+        hex_of(seed),
+        hex_of(seed.wrapping_add(SPLITMIX64_STEP))
+    );
+    format!(
+        "{}-{}-{}-{}-{}",
+        &digits[..8],
+        &digits[8..12],
+        &digits[12..16],
+        &digits[16..20],
+        &digits[20..32]
+    )
+}
+
+/// A 64-bit digest of `value`, from the hasher the standard library ships: a name a
+/// request carries derives the same emulated resource on every call, with no hash
+/// algorithm written here and no dependency added for one.
+fn digest_of(value: &str) -> u64 {
+    use ::std::hash::{Hash, Hasher};
+
+    let mut hasher = ::std::collections::hash_map::DefaultHasher::new();
+    value.hash(&mut hasher);
+    hasher.finish()
 }
 
 /// A value a request named, as EFS renders it inside an error message: in single
@@ -1145,6 +1263,34 @@ pub fn tag_list_problem(tags: &[Tag]) -> Option<String> {
         }
     }
     None
+}
+
+/// Why a tag write cannot be stored, as the `BadRequest` sentence to refuse it with —
+/// `None` when it can be. Two rules, applied to the set the write LEAVES rather than to
+/// the request alone: the caller-supplied list must itself be storable
+/// ([`tag_list_problem`]), and the resulting set must stay inside the published quota. A
+/// requested key the resource already carries replaces a value instead of adding a tag,
+/// so only the keys that are new count towards the quota.
+///
+/// Built here once rather than per handler, so `TagResource` and the deprecated
+/// `CreateTags` — two write paths onto ONE stored tag set — refuse the same write the
+/// same way.
+pub fn tag_write_problem(held: &[Tag], requested: &[Tag], resource_id: &str) -> Option<String> {
+    if let Some(problem) = tag_list_problem(requested) {
+        return Some(problem);
+    }
+    let added = requested
+        .iter()
+        .filter(|tag| !held.iter().any(|tag_held| tag_held.key == tag.key))
+        .count();
+    let resulting = held.len() + added;
+    (resulting > MAX_TAGS_PER_RESOURCE).then(|| {
+        format!(
+            "resource {} would hold {resulting} tags, more than the maximum of {}",
+            quoted(resource_id),
+            MAX_TAGS_PER_RESOURCE
+        )
+    })
 }
 
 /// The tag key whose value a resource's reported `Name` is: "Name your file system on

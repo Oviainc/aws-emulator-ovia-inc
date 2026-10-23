@@ -611,11 +611,11 @@ async fn refusals_come_from_state_and_from_the_filterable_properties() {
 
     let cases: &[(Value, u16, &str)] = &[
         // Absent names, in each form a folded `UserName` takes.
-        (json!({ "UserName": "nobody" }), 404, "UserNotFoundFault"),
-        (json!({ "UserName": "Z" }), 404, "UserNotFoundFault"),
+        (json!({ "UserName": "nobody" }), 400, "UserNotFoundFault"),
+        (json!({ "UserName": "Z" }), 400, "UserNotFoundFault"),
         (
             json!({ "UserName": "data-reader-2" }),
-            404,
+            400,
             "UserNotFoundFault",
         ),
         // A name that is not one of the service's filterable properties — including the

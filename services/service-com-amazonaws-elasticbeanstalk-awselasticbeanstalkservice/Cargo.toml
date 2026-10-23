@@ -21,6 +21,12 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Amazon S3 client the two creates that build a resource FROM a caller-named archive
+# (CreateApplicationVersion's SourceBundle, CreatePlatformVersion's
+# PlatformDefinitionBundle) download that archive with, over the in-process callback
+# into this same emulator (no network client feature is enabled: the transport is the
+# emulator's own).
+aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -28,6 +34,10 @@ emulator-core-build-support = { workspace = true }
 [dev-dependencies]
 sha2 = { workspace = true }
 hex = { workspace = true }
+# The source-bundle suite mounts the S3 service beside Elastic Beanstalk on one engine,
+# because CreateApplicationVersion and CreatePlatformVersion download the archive their
+# request names by calling object storage in process.
+service-com-amazonaws-s3-amazons3 = { workspace = true }
 
 [lints]
 workspace = true

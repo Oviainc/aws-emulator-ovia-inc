@@ -556,8 +556,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     return Err(
                         ListAllowedNodeTypeModificationsErrorModeled::CacheClusterNotFoundFault(
                             CacheClusterNotFoundFault {
-                                message: Some(format!(
-                                    "Cache cluster {cache_cluster_id} not found."
+                                message: Some(crate::state::cache_cluster_not_found_message(
+                                    cache_cluster_id,
                                 )),
                             },
                         )

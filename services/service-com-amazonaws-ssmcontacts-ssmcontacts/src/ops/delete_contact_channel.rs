@@ -6,6 +6,12 @@
 //! and `ListContactChannels` no longer reports it — which is also what frees the
 //! containing contact to be deleted.
 //!
+//! The ACCOUNT-level Incident Manager precondition
+//! ([`crate::state::ComAmazonawsSsmcontactsSsmcontactsState::require_active_replication_set`])
+//! is evaluated FIRST: the channel lives in the Regions of the account's replication set,
+//! so an account with no ACTIVE one is refused with the modelled `ValidationException`
+//! (HTTP 400) before `ContactChannelId` is resolved and before anything is removed.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -157,6 +163,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let mut state = state.lock();
+
+        // The account gate comes FIRST: the channel this call would remove lives in the
+        // Regions of the account's Incident Manager replication set, so until the account
+        // has an ACTIVE one there is nothing to resolve the request against and the call
+        // is refused rather than serviced — before `ContactChannelId` is resolved, and
+        // before anything is removed.
+        state
+            .require_active_replication_set()
+            .map_err(account_precondition_failed)?;
+
         if state
             .contact_channels
             .remove(&input.contact_channel_id)
@@ -180,4 +196,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(DeleteContactChannelOutput {})
     }
+}
+
+/// The account precondition's refusal: this operation's modelled `ValidationException`,
+/// which the model classifies `client` with `httpError` 400.
+///
+/// `reason` carries `OTHER` (the account-level failure is none of the model's
+/// `CANNOT_PARSE`/`FIELD_VALIDATION_FAILED`/`UNKNOWN_OPERATION`) and `fields` is present
+/// but EMPTY, because no member of the request is at fault.
+fn account_precondition_failed(message: String) -> DeleteContactChannelError {
+    DeleteContactChannelErrorModeled::ValidationException(ValidationException {
+        message,
+        reason: Some("OTHER".to_string()),
+        fields: Some(Vec::new()),
+    })
+    .into()
 }

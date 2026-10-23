@@ -20,9 +20,7 @@
 
 use serde_json::{json, Value};
 
-use service_com_amazonaws_ssmcontacts_ssmcontacts::state::{
-    service_state, AccountReplicationSet,
-};
+use service_com_amazonaws_ssmcontacts_ssmcontacts::state::{service_state, AccountReplicationSet};
 
 use crate::contact_lifecycle::{error_code, parse, Emulator, ACCOUNT, REGION};
 
@@ -340,8 +338,8 @@ async fn an_update_is_refused_when_the_account_has_no_active_replication_set() {
         (
             "a replication set that is not active yet",
             Some(AccountReplicationSet {
-                arn: format!("arn:aws:ssm-incidents::{ACCOUNT}:replication-set/emulator-set"),
                 active: false,
+                ..active_replication_set()
             }),
         ),
     ];

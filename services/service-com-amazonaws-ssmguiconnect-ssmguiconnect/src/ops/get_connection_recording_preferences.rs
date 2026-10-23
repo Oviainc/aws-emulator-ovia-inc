@@ -164,9 +164,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             audit(Self::NAME, ctx, AuditOutcome::NotFound);
             return Err(GetConnectionRecordingPreferencesErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: "no connection recording preferences are configured for this account \
-                              and Region"
-                        .to_string(),
+                    message: crate::state::resource_not_found_message(
+                        crate::state::CONNECTION_RECORDING_PREFERENCES,
+                    ),
                 },
             )
             .into());

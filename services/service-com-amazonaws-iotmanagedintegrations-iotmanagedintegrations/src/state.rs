@@ -3,10 +3,11 @@
 //! Engine state for the com-amazonaws-iotmanagedintegrations-iotmanagedintegrations service.
 
 use std::collections::HashMap;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::{
-    CapabilityReport, CapabilitySchemaItem, ResourceNotFoundException, WiFiSimpleSetupConfiguration,
+    CapabilityReport, CapabilitySchemaItem, ConfigurationStatus, PushConfig,
+    ResourceNotFoundException, WiFiSimpleSetupConfiguration,
 };
 
 /// The region an ARN carries when the request names none (the emulator's default
@@ -17,10 +18,14 @@ pub const DEFAULT_REGION: &str = "us-east-1";
 /// `ManagedThingArn` pattern (`^arn:aws:iotmanagedintegrations:…`) requires.
 pub const SERVICE_ARN_NAMESPACE: &str = "iotmanagedintegrations";
 
-/// The `Role`, `AuthMaterialType` and `HubNetworkMode` value lists the handlers
-/// validate against, re-exported from the MODEL-GENERATED constants in
-/// `crate::ops::types` so there is no second copy to drift from the model.
-pub use crate::ops::types::{AUTH_MATERIAL_TYPE_VALUES, HUB_NETWORK_MODE_VALUES, ROLE_VALUES};
+/// The `Role`, `AuthMaterialType`, `HubNetworkMode`, `EncryptionType`, `LogLevel` and
+/// `ConfigurationState` value lists the handlers validate against and report, re-exported
+/// from the MODEL-GENERATED constants in `crate::ops::types` so there is no second copy
+/// to drift from the model.
+pub use crate::ops::types::{
+    AUTH_MATERIAL_TYPE_VALUES, CONFIGURATION_STATE_VALUES, ENCRYPTION_TYPE_VALUES,
+    HUB_NETWORK_MODE_VALUES, LOG_LEVEL_VALUES, ROLE_VALUES,
+};
 
 /// The `ProvisioningStatus` a freshly created managed thing carries: it is not yet
 /// associated with a physical device. Leaving this state needs the device to be
@@ -81,6 +86,197 @@ pub struct ManagedThing {
     pub sequence: u64,
 }
 
+/// One stored over-the-air (OTA) task configuration: the authoritative record every
+/// OTA-task-configuration operation reads and writes. `CreateOtaTaskConfiguration`
+/// inserts it and `GetOtaTaskConfiguration` projects it onto its output shape.
+#[derive(Debug, Clone)]
+pub struct OtaTaskConfiguration {
+    /// The generated `OtaTaskConfigurationId` this record is keyed by.
+    pub id: String,
+    /// The region the creating request was signed for. An OTA task configuration is a
+    /// regional resource: only that region's endpoint resolves it.
+    pub region: String,
+    /// `OtaTaskConfigurationName` — `@sensitive`, and absent when the create named none
+    /// (the model marks no member of the create request `@required`).
+    pub name: Option<String>,
+    /// `OtaDescription`.
+    pub description: Option<String>,
+    /// `PushConfig`, stored exactly as the create supplied it so a read reports the
+    /// configuration the caller submitted.
+    pub push_config: Option<PushConfig>,
+    pub created_at: SystemTime,
+    /// Monotonic insertion sequence, taken from [`Self::take_sequence`], so the records
+    /// have a deterministic order independent of the hash map.
+    pub sequence: u64,
+}
+
+/// The `EncryptionType` an account's managed-integrations data is encrypted with until a
+/// `PutDefaultEncryptionConfiguration` sets another: the service's own key, which needs no
+/// `KmsKeyArn`. A member of [`ENCRYPTION_TYPE_VALUES`].
+pub const DEFAULT_ENCRYPTION_TYPE: &str = "MANAGED_INTEGRATIONS_DEFAULT_ENCRYPTION";
+
+/// The `EncryptionType` that encrypts with a customer managed AWS KMS key — the type
+/// `KmsKeyArn` belongs to. A member of [`ENCRYPTION_TYPE_VALUES`].
+pub const CUSTOMER_KEY_ENCRYPTION_TYPE: &str = "CUSTOMER_KEY_ENCRYPTION";
+
+/// The `ConfigurationState` a default encryption configuration carries once the
+/// encryption it names is in force. A member of [`CONFIGURATION_STATE_VALUES`].
+pub const CONFIGURATION_STATE_ENABLED: &str = "ENABLED";
+
+/// The `ConfigurationState` a default encryption configuration carries while the switch a
+/// put started is not in force yet. A member of [`CONFIGURATION_STATE_VALUES`].
+pub const CONFIGURATION_STATE_UPDATE_IN_PROGRESS: &str = "UPDATE_IN_PROGRESS";
+
+/// How long after a `PutDefaultEncryptionConfiguration` that CHANGES the configuration the
+/// new encryption is in force.
+///
+/// The model declares `UPDATE_IN_PROGRESS` beside `ENABLED` on `ConfigurationState`, so
+/// changing the key an account's data is encrypted under is an ASYNCHRONOUS change: the
+/// call that starts it answers with a configuration that is not in force yet, and the
+/// clock completes it. AWS publishes no duration for it, so this span is CHOSEN — inside
+/// the emulator's 250..750 ms window, so a caller that reads straight after the put still
+/// observes `UPDATE_IN_PROGRESS`. It is stored as a due instant and never slept on.
+pub const ENCRYPTION_UPDATE_DELAY: Duration = Duration::from_millis(500);
+
+/// The most regions one store keeps a default encryption configuration for.
+///
+/// The configuration is keyed by the region the request was SIGNED for, which comes from
+/// the caller, so past this bound a put for a region the store does not already hold is
+/// refused rather than grown into: a caller that varies its signing region cannot make
+/// this emulator's memory grow without end. A bound CHOSEN for the emulator (AWS publishes
+/// no such quota, and offers far fewer regions than this), like [`MAX_MANAGED_THINGS`].
+pub const MAX_CONFIGURED_REGIONS: usize = 64;
+
+/// The longest region name this service will key a stored configuration by, in
+/// characters: longer than every region AWS publishes (`us-gov-east-1` is 13), and short
+/// enough that a stored key is bounded in size as well as in count.
+pub const MAX_REGION_NAME_LENGTH: usize = 32;
+
+/// Whether `region` is shaped like an AWS region name — 1..=[`MAX_REGION_NAME_LENGTH`]
+/// characters of lowercase letters, digits and hyphens.
+///
+/// [`request_region`] reads the region out of the request's SigV4 credential scope, so an
+/// operation that keys STATE by it checks the shape first: a configuration is then never
+/// held under an arbitrary caller-supplied string.
+pub fn is_region_name(region: &str) -> bool {
+    !region.is_empty()
+        && region.len() <= MAX_REGION_NAME_LENGTH
+        && region
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
+/// The default encryption configuration of this account in ONE region: what the last
+/// `PutDefaultEncryptionConfiguration` wrote, and when the switch it started comes into
+/// force.
+#[derive(Debug, Clone)]
+pub struct DefaultEncryptionConfiguration {
+    /// `EncryptionType` enum value.
+    pub encryption_type: String,
+    /// The customer managed KMS key the data is encrypted under. Set only with
+    /// [`CUSTOMER_KEY_ENCRYPTION_TYPE`]: the service-owned encryption uses no key of the
+    /// caller's, so it stores none.
+    pub kms_key_arn: Option<String>,
+    /// The instant the change the last put started comes into force, or `None` when
+    /// nothing is changing. Before it the configuration reports
+    /// [`CONFIGURATION_STATE_UPDATE_IN_PROGRESS`], from it
+    /// [`CONFIGURATION_STATE_ENABLED`] — see [`Self::state_at`]. Storing the instant is
+    /// what keeps a read a pure read: the state is DERIVED from the clock, so nothing has
+    /// to be written when the switch becomes due.
+    pub update_due_at: Option<SystemTime>,
+}
+
+impl Default for DefaultEncryptionConfiguration {
+    /// The configuration an account has in a region no call has configured: managed
+    /// integrations' own key, no customer key, and nothing in progress.
+    fn default() -> Self {
+        Self {
+            encryption_type: DEFAULT_ENCRYPTION_TYPE.to_string(),
+            kms_key_arn: None,
+            update_due_at: None,
+        }
+    }
+}
+
+impl DefaultEncryptionConfiguration {
+    /// The `ConfigurationState` this configuration is in at `now`: the switch a put
+    /// started is in progress until its due instant, and enabled from it.
+    pub fn state_at(&self, now: SystemTime) -> &'static str {
+        if self.update_due_at.is_some_and(|due| now < due) {
+            CONFIGURATION_STATE_UPDATE_IN_PROGRESS
+        } else {
+            CONFIGURATION_STATE_ENABLED
+        }
+    }
+
+    /// The modelled `ConfigurationStatus` of this configuration at `now`.
+    ///
+    /// `Error` stays absent: it describes a FAILED configuration update
+    /// (`smithy_query(query="shape",shape="ConfigurationStatus")`), and no switch this
+    /// emulator performs fails.
+    pub fn status_at(&self, now: SystemTime) -> ConfigurationStatus {
+        ConfigurationStatus {
+            error: None,
+            state: self.state_at(now).to_string(),
+        }
+    }
+
+    /// Whether putting `encryption_type` with `kms_key_arn` would CHANGE this
+    /// configuration — which is what decides whether a put starts a switch at all.
+    pub fn would_change(&self, encryption_type: &str, kms_key_arn: Option<&str>) -> bool {
+        self.encryption_type != encryption_type || self.kms_key_arn.as_deref() != kms_key_arn
+    }
+}
+
+/// One stored event log configuration: the logging level this account has in force for ONE
+/// log target. `CreateEventLogConfiguration` inserts it and `GetEventLogConfiguration`
+/// projects it onto its output shape.
+#[derive(Debug, Clone)]
+pub struct EventLogConfiguration {
+    /// The generated `LogConfigurationId` this record is keyed by.
+    pub id: String,
+    /// The region the creating request was signed for. Every resource of this service is
+    /// regional (see [`ManagedThing::region`]): only that region's endpoint resolves this
+    /// configuration.
+    pub region: String,
+    /// `SmartHomeResourceType`: a resource type, or `*` for the whole account.
+    pub resource_type: String,
+    /// `SmartHomeResourceId`, absent when the configuration addresses every resource of
+    /// [`Self::resource_type`] rather than one of them.
+    pub resource_id: Option<String>,
+    /// `LogLevel` enum value, one of [`LOG_LEVEL_VALUES`].
+    pub event_log_level: String,
+    /// Monotonic insertion sequence, which is also what makes [`Self::id`] unique. A later
+    /// `ListEventLogConfigurations` pages by it, as `ListManagedThings` does.
+    pub sequence: u64,
+}
+
+impl EventLogConfiguration {
+    /// The log TARGET this configuration addresses: the resource type it names, and the
+    /// resource within that type when it names one. The target is what an event log
+    /// configuration configures, so two records with the same target would be two
+    /// configurations of one thing — which is what makes a second create for a target a
+    /// conflict rather than another record.
+    pub fn target(&self) -> (&str, Option<&str>) {
+        (self.resource_type.as_str(), self.resource_id.as_deref())
+    }
+}
+
+/// The `ResourceType` this service reports an event log configuration under — the Smithy
+/// resource name, which is what `ResourceNotFoundException`'s `ResourceType` member
+/// carries, as [`MANAGED_THING_RESOURCE_TYPE`] does for a managed thing.
+pub const EVENT_LOG_CONFIGURATION_RESOURCE_TYPE: &str = "EventLogConfiguration";
+
+/// The event-log-configuration resource as a READ's reason names it — the resource's name
+/// in words ([`resource_not_found_message`]), as [`MANAGED_THING_RESOURCE_NAME`] is for a
+/// managed thing.
+pub const EVENT_LOG_CONFIGURATION_RESOURCE_NAME: &str = "Event Log Configuration";
+
+/// The most event log configurations one store holds. A create past it is refused rather
+/// than grown into, so a caller cannot make this emulator's memory grow without end. A
+/// bound CHOSEN for the emulator, like [`MAX_MANAGED_THINGS`], not a published AWS quota.
+pub const MAX_EVENT_LOG_CONFIGURATIONS: usize = 1_000;
+
 /// Per-service state for com-amazonaws-iotmanagedintegrations-iotmanagedintegrations. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsIotmanagedintegrationsIotmanagedintegrationsState {
@@ -89,14 +285,68 @@ pub struct ComAmazonawsIotmanagedintegrationsIotmanagedintegrationsState {
     /// Insertion order of managed-thing ids, so `ListManagedThings` pages
     /// deterministically. An id is appended on create and removed on delete.
     pub managed_thing_order: Vec<String>,
-    /// `ClientToken` (`@idempotencyToken`) -> what the first call created, so a
-    /// replayed `CreateManagedThing` returns the original record instead of a duplicate.
+    /// The authoritative OTA-task-configuration store, keyed by the generated
+    /// `OtaTaskConfigurationId`.
+    pub ota_task_configurations: HashMap<String, OtaTaskConfiguration>,
+    /// A resource kind plus a `ClientToken` (`@idempotencyToken`) -> what the first call
+    /// created, so a replayed create returns the original record instead of a duplicate.
+    /// The key carries the resource kind because a `ClientToken` is scoped to the
+    /// operation that minted it: the same token on two different creates is two tokens.
     /// Bounded by [`IDEMPOTENCY_TTL`] and [`MAX_IDEMPOTENCY_TOKENS`].
-    pub idempotency_tokens: HashMap<String, IdempotencyRecord>,
-    /// Source of [`ManagedThing::sequence`] values and of the per-record suffix that
-    /// makes a generated id unique.
+    pub idempotency_tokens: HashMap<IdempotencyKey, IdempotencyRecord>,
+    /// Source of [`ManagedThing::sequence`] / [`OtaTaskConfiguration::sequence`] values
+    /// and of the per-record suffix that makes a generated id unique.
     pub next_sequence: u64,
+    /// The hub configuration a `PutHubConfiguration` has SET in each region, keyed by
+    /// region. A region with no entry has had none set, so it reports the service
+    /// default ([`DEFAULT_HUB_TOKEN_TIMER_EXPIRY_IN_SECONDS`]) and no `UpdatedAt`.
+    /// Keyed by a region the request carries, so it is bounded by
+    /// [`MAX_CONFIGURED_REGIONS`] like this service's other per-region configuration
+    /// store. See [`HubConfiguration`].
+    pub hub_configurations: HashMap<String, HubConfiguration>,
+    /// This account's default encryption configuration, keyed by region: the setting is
+    /// per account AND per region (`GetDefaultEncryptionConfiguration` reports it "for the
+    /// Amazon Web Services account in the default or specified region"), so each region's
+    /// endpoint reports its own. A region no put has configured holds no entry and reports
+    /// [`DefaultEncryptionConfiguration::default`].
+    pub default_encryption: HashMap<String, DefaultEncryptionConfiguration>,
+    /// The authoritative event-log-configuration store, keyed by the generated
+    /// `LogConfigurationId`. At most one record per log target per region — see
+    /// [`Self::event_log_configuration_for_target`].
+    pub event_log_configurations: HashMap<String, EventLogConfiguration>,
 }
+
+/// One region's hub configuration: the hub token timer expiry an account set there, and
+/// when it was set.
+///
+/// The hub configuration is a SINGLETON per account and region — `PutHubConfiguration`
+/// carries no identifier and `GetHubConfiguration` resolves none — so one record per
+/// region is the whole store, mirroring how every other resource of this service is
+/// scoped to the region its request was signed for.
+///
+/// A record exists only where a caller SET the configuration: the expiry an unconfigured
+/// region reports is [`DEFAULT_HUB_TOKEN_TIMER_EXPIRY_IN_SECONDS`], and its `UpdatedAt`
+/// stays absent because nothing has updated it.
+#[derive(Debug, Clone)]
+pub struct HubConfiguration {
+    /// `HubTokenTimerExpirySettingInSeconds` (modelled `long`, range 1..) exactly as the
+    /// last accepted `PutHubConfiguration` set it.
+    pub hub_token_timer_expiry_setting_in_seconds: i64,
+    /// When that call set it — what `GetHubConfiguration` reports on `UpdatedAt`.
+    pub updated_at: SystemTime,
+}
+
+/// The hub token timer expiry a region reports before any `PutHubConfiguration` sets
+/// one.
+///
+/// A hub configuration always EXISTS: `GetHubConfiguration` recorded against an account
+/// that had never put one still reports `HubTokenTimerExpirySettingInSeconds`, so the
+/// setting has a service default rather than being absent until a caller defines it.
+/// Neither the model nor the AWS documentation publishes that default's value, so this
+/// is a value CHOSEN for the emulator — one day, inside the member's modelled range
+/// (`long`, 1..). Only the VALUE is chosen; that the member is reported is recorded
+/// behaviour.
+pub const DEFAULT_HUB_TOKEN_TIMER_EXPIRY_IN_SECONDS: i64 = 86_400;
 
 /// The most `ManagedThingSummary` items one `ListManagedThings` page carries, and the
 /// page size an absent `MaxResults` gets. A caller reaches the rest of the store
@@ -109,6 +359,11 @@ pub const MANAGED_THING_PAGE_LIMIT: usize = 100;
 /// is a bound CHOSEN for the emulator, not a published AWS quota.
 pub const MAX_MANAGED_THINGS: usize = 10_000;
 
+/// The most OTA task configurations one store holds, for the same reason and on the same
+/// terms as [`MAX_MANAGED_THINGS`]: a bound CHOSEN for the emulator, not a published AWS
+/// quota.
+pub const MAX_OTA_TASK_CONFIGURATIONS: usize = 10_000;
+
 /// How long a `ClientToken` keeps replaying its original answer. A CHOSEN bound (AWS
 /// does not publish this window), so the idempotency map cannot keep a record for a
 /// caller-supplied token for the life of the process.
@@ -118,12 +373,32 @@ pub const IDEMPOTENCY_TTL: ::std::time::Duration = ::std::time::Duration::from_s
 /// oldest, so the map is bounded even when every token is still inside its TTL.
 pub const MAX_IDEMPOTENCY_TOKENS: usize = 10_000;
 
-/// What a `ClientToken` replays into: the managed thing the first call created, and
-/// when the token was minted (so [`IDEMPOTENCY_TTL`] can retire it).
+/// What a `ClientToken` replays into: the resource the first call created, and when the
+/// token was minted (so [`IDEMPOTENCY_TTL`] can retire it). Which KIND of resource that
+/// id names is the [`IdempotencyKey`] the record is stored under.
 #[derive(Debug, Clone)]
 pub struct IdempotencyRecord {
-    pub managed_thing_id: String,
+    pub resource_id: String,
     pub minted_at: SystemTime,
+}
+
+/// What an idempotency record is stored under: the kind of resource the create makes —
+/// the resource type the service reports it as, e.g. [`MANAGED_THING_RESOURCE_TYPE`] —
+/// and the `ClientToken` the caller sent.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct IdempotencyKey {
+    pub resource_type: String,
+    pub token: String,
+}
+
+impl IdempotencyKey {
+    /// The key `token` occupies for `resource_type`.
+    pub fn new(resource_type: &str, token: &str) -> Self {
+        Self {
+            resource_type: resource_type.to_string(),
+            token: token.to_string(),
+        }
+    }
 }
 
 impl ComAmazonawsIotmanagedintegrationsIotmanagedintegrationsState {
@@ -135,11 +410,134 @@ impl ComAmazonawsIotmanagedintegrationsIotmanagedintegrationsState {
             .filter(|thing| thing.region == region)
     }
 
+    /// The OTA task configuration `region`'s endpoint holds under `id`, if any. A record
+    /// created in another region is not visible here, as for every regional resource.
+    pub fn ota_task_configuration_in(
+        &self,
+        region: &str,
+        id: &str,
+    ) -> Option<&OtaTaskConfiguration> {
+        self.ota_task_configurations
+            .get(id)
+            .filter(|configuration| configuration.region == region)
+    }
+
     /// [`Self::managed_thing_in`], mutably.
     pub fn managed_thing_in_mut(&mut self, region: &str, id: &str) -> Option<&mut ManagedThing> {
         self.managed_things
             .get_mut(id)
             .filter(|thing| thing.region == region)
+    }
+
+    /// The hub configuration `region`'s endpoint holds, or `None` when no
+    /// `PutHubConfiguration` has set one there.
+    pub fn hub_configuration_in(&self, region: &str) -> Option<&HubConfiguration> {
+        self.hub_configurations.get(region)
+    }
+
+    /// The hub token timer expiry `region` reports: the one its last accepted
+    /// `PutHubConfiguration` set, else the service default
+    /// ([`DEFAULT_HUB_TOKEN_TIMER_EXPIRY_IN_SECONDS`]) — the configuration exists
+    /// whether or not a caller has ever set it.
+    pub fn hub_token_timer_expiry_in(&self, region: &str) -> i64 {
+        self.hub_configuration_in(region).map_or(
+            DEFAULT_HUB_TOKEN_TIMER_EXPIRY_IN_SECONDS,
+            |config| config.hub_token_timer_expiry_setting_in_seconds,
+        )
+    }
+
+    /// Store `seconds` as `region`'s hub token timer expiry, stamped `at`, answering the
+    /// record now held — or `None` when this store cannot take on another region.
+    ///
+    /// A put REPLACES the configuration — its request carries every member of it — so the
+    /// stored expiry is always the last one accepted and `updated_at` is always when that
+    /// call ran. Overwriting a region the store already holds always succeeds; taking on
+    /// a region it does not is refused once the store holds [`MAX_CONFIGURED_REGIONS`] of
+    /// them, which is what bounds this map's cardinality however many distinct regions a
+    /// caller signs for — the same rule, and the same bound, as
+    /// [`Self::set_default_encryption_in`].
+    pub fn put_hub_configuration(
+        &mut self,
+        region: &str,
+        seconds: i64,
+        at: SystemTime,
+    ) -> Option<HubConfiguration> {
+        if !self.hub_configurations.contains_key(region)
+            && self.hub_configurations.len() >= MAX_CONFIGURED_REGIONS
+        {
+            return None;
+        }
+        let record = HubConfiguration {
+            hub_token_timer_expiry_setting_in_seconds: seconds,
+            updated_at: at,
+        };
+        self.hub_configurations
+            .insert(region.to_string(), record.clone());
+        Some(record)
+    }
+
+    /// The default encryption configuration `region`'s endpoint reports: the one a put
+    /// stored there, or the account default for a region none has configured.
+    ///
+    /// A pure read: a region nobody configured gets NO record written for it, so reading
+    /// one region's configuration cannot change what a later caller sees anywhere.
+    pub fn default_encryption_in(&self, region: &str) -> DefaultEncryptionConfiguration {
+        self.default_encryption
+            .get(region)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Store `configuration` as the default encryption configuration of `region`,
+    /// answering whether it was stored.
+    ///
+    /// The counterpart of [`Self::default_encryption_in`], so the keying rule — the region
+    /// selects the record — lives in one place for both sides. Overwriting a region the
+    /// store already holds always succeeds; taking on a region it does not is refused once
+    /// the store holds [`MAX_CONFIGURED_REGIONS`] of them, which is what bounds this map's
+    /// cardinality however many distinct regions a caller signs for.
+    pub fn set_default_encryption_in(
+        &mut self,
+        region: &str,
+        configuration: DefaultEncryptionConfiguration,
+    ) -> bool {
+        if !self.default_encryption.contains_key(region)
+            && self.default_encryption.len() >= MAX_CONFIGURED_REGIONS
+        {
+            return false;
+        }
+        self.default_encryption
+            .insert(region.to_string(), configuration);
+        true
+    }
+
+    /// The record `region`'s endpoint holds under `id`, if any. A configuration created in
+    /// another region is not visible here.
+    pub fn event_log_configuration_in(
+        &self,
+        region: &str,
+        id: &str,
+    ) -> Option<&EventLogConfiguration> {
+        self.event_log_configurations
+            .get(id)
+            .filter(|configuration| configuration.region == region)
+    }
+
+    /// The configuration `region` already holds for the log target `resource_type` and
+    /// `resource_id` name, if any.
+    ///
+    /// A target has at most ONE configuration — a logging level is a single setting of the
+    /// thing it configures — so this is what a create consults before minting a record.
+    pub fn event_log_configuration_for_target(
+        &self,
+        region: &str,
+        resource_type: &str,
+        resource_id: Option<&str>,
+    ) -> Option<&EventLogConfiguration> {
+        self.event_log_configurations.values().find(|configuration| {
+            configuration.region == region
+                && configuration.target() == (resource_type, resource_id)
+        })
     }
 
     /// Take the next insertion sequence number.
@@ -159,6 +557,44 @@ impl ComAmazonawsIotmanagedintegrationsIotmanagedintegrationsState {
                 // A record minted "after" now (a clock that went backwards) is not old.
                 Err(_) => true,
             });
+    }
+
+    /// The id of the `resource_type` resource the first call carrying `token` created, if
+    /// that token is still in the map. Call
+    /// [`Self::retire_expired_idempotency_tokens`] first: a token past its TTL does not
+    /// replay.
+    pub fn replayed_resource_id(&self, resource_type: &str, token: &str) -> Option<String> {
+        self.idempotency_tokens
+            .get(&IdempotencyKey::new(resource_type, token))
+            .map(|record| record.resource_id.clone())
+    }
+
+    /// Record that `token` created the `resource_type` resource `resource_id` at
+    /// `minted_at`, so a retry of the same create replays it. Keeps the map under
+    /// [`MAX_IDEMPOTENCY_TOKENS`].
+    pub fn record_idempotency_token(
+        &mut self,
+        resource_type: &str,
+        token: &str,
+        resource_id: &str,
+        minted_at: SystemTime,
+    ) {
+        self.make_room_for_idempotency_token();
+        self.idempotency_tokens.insert(
+            IdempotencyKey::new(resource_type, token),
+            IdempotencyRecord {
+                resource_id: resource_id.to_string(),
+                minted_at,
+            },
+        );
+    }
+
+    /// Forget every token that replays into the `resource_type` resource `resource_id`:
+    /// a `ClientToken` whose resource is gone must not replay into a deleted id.
+    pub fn forget_idempotency_tokens_for(&mut self, resource_type: &str, resource_id: &str) {
+        self.idempotency_tokens.retain(|key, record| {
+            key.resource_type != resource_type || record.resource_id != resource_id
+        });
     }
 
     /// Evict the oldest idempotency records while the map is at
@@ -516,6 +952,15 @@ pub const MANAGED_THING_RESOURCE_TYPE: &str = "ManagedThing";
 /// ([`resource_not_found_message`]).
 pub const MANAGED_THING_RESOURCE_NAME: &str = "Managed Thing";
 
+/// The `ResourceType` this service reports an OTA task configuration under — the Smithy
+/// resource name, as [`MANAGED_THING_RESOURCE_TYPE`] is for a managed thing. It is also
+/// the resource kind an [`IdempotencyKey`] of a `CreateOtaTaskConfiguration` carries.
+pub const OTA_TASK_CONFIGURATION_RESOURCE_TYPE: &str = "OtaTaskConfiguration";
+
+/// The OTA-task-configuration resource as a READ's reason names it: the resource's name
+/// in words, the way [`MANAGED_THING_RESOURCE_NAME`] is for a managed thing.
+pub const OTA_TASK_CONFIGURATION_RESOURCE_NAME: &str = "Ota Task Configuration";
+
 /// How a MUTATION of this service states that the resource its `Identifier` named does
 /// not exist: the resource's type, the identifier the request carried, and that it was
 /// not found.
@@ -551,7 +996,20 @@ pub fn managed_thing_not_found_on_mutation(identifier: &str) -> ResourceNotFound
             MANAGED_THING_RESOURCE_TYPE,
             identifier,
         )),
-        ..managed_thing_not_found(identifier)
+        ..resource_not_found(MANAGED_THING_RESOURCE_TYPE, identifier)
+    }
+}
+
+/// The modelled `ResourceNotFoundException` a READ answers for an event log configuration
+/// the store does not hold under the `Id` the request named: the read path's reason
+/// ([`resource_not_found_message`]) plus the `ResourceId` and `ResourceType` members, worded
+/// through the same two helpers every other resource of this service uses.
+pub fn event_log_configuration_not_found_on_read(id: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(resource_not_found_message(
+            EVENT_LOG_CONFIGURATION_RESOURCE_NAME,
+        )),
+        ..resource_not_found(EVENT_LOG_CONFIGURATION_RESOURCE_TYPE, id)
     }
 }
 
@@ -560,19 +1018,33 @@ pub fn managed_thing_not_found_on_mutation(identifier: &str) -> ResourceNotFound
 pub fn managed_thing_not_found_on_read(identifier: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
         message: Some(resource_not_found_message(MANAGED_THING_RESOURCE_NAME)),
-        ..managed_thing_not_found(identifier)
+        ..resource_not_found(MANAGED_THING_RESOURCE_TYPE, identifier)
     }
 }
 
-/// The `ResourceId` and `ResourceType` half of a managed thing's 404, which both paths
-/// report the same way: the identifier the request carried, and the resource's type. The
-/// reason is the caller's to fill, so this is not public — reach it through
-/// [`managed_thing_not_found_on_read`] or [`managed_thing_not_found_on_mutation`].
-fn managed_thing_not_found(identifier: &str) -> ResourceNotFoundException {
+/// The `ResourceId` and `ResourceType` half of any resource's 404, which every path reports
+/// the same way: the identifier the request carried, and the resource's type. The reason is
+/// the caller's to fill, so this is not public — reach it through one of the
+/// `*_not_found_on_read` / `*_not_found_on_mutation` helpers above.
+fn resource_not_found(resource_type: &str, identifier: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
         message: None,
         resource_id: Some(identifier.to_string()),
-        resource_type: Some(MANAGED_THING_RESOURCE_TYPE.to_string()),
+        resource_type: Some(resource_type.to_string()),
+    }
+}
+
+/// The modelled `ResourceNotFoundException` a READ answers for an OTA task configuration
+/// the store does not hold under the identifier a request named: the read path's reason
+/// ([`resource_not_found_message`]) plus the `ResourceId` and `ResourceType` members the
+/// shape declares, reported exactly as a managed thing's read 404 reports them.
+pub fn ota_task_configuration_not_found_on_read(identifier: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(resource_not_found_message(
+            OTA_TASK_CONFIGURATION_RESOURCE_NAME,
+        )),
+        resource_id: Some(identifier.to_string()),
+        resource_type: Some(OTA_TASK_CONFIGURATION_RESOURCE_TYPE.to_string()),
     }
 }
 

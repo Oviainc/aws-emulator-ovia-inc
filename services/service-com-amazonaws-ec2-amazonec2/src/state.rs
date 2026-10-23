@@ -38,6 +38,11 @@
 //! [`instance_type_offerings`] derives them from the Region and the modelled
 //! `InstanceType` catalog, and `DescribeInstanceTypeOfferings` writes nothing either.
 //!
+//! The REGIONS themselves are facts of the account's partition in the same way — no EC2
+//! operation creates a Region, and opting one in or out is the Account API's job — so
+//! [`regions_for_request`] derives them from the Region catalog and the Region the request
+//! was signed for, and `DescribeRegions` writes nothing either.
+//!
 //! ## Resources callers create are stored
 //!
 //! [`ComAmazonawsEc2Amazonec2State::vpcs`] holds the account's VPCs as the modelled
@@ -147,12 +152,18 @@
 //!
 //! [`ComAmazonawsEc2Amazonec2State::byoip_cidrs`] holds the address ranges the account has
 //! brought to AWS as [`ByoipCidrRecord`]s: the modelled [`ByoipCidr`] every operation that
-//! reports one answers with, plus the release the clock owes a range a
-//! `DeprovisionByoipCidr` has started ([`ByoipCidrRecord::released_at`], on the same monotonic
-//! clock and the same [`TRANSITION_DELAY`] as a `pending` VPC's `available` move). Keyed by
+//! reports one answers with, plus the two moves the clock can owe one — the state move a
+//! `ProvisionByoipCidr` or an `AdvertiseByoipCidr` left non-terminal
+//! ([`ByoipCidrRecord::pending`], the [`PendingStateMove`] every other record of this store
+//! carries) and the release a `DeprovisionByoipCidr` has started
+//! ([`ByoipCidrRecord::released_at`], beside it because WHAT a release ends as is decided at
+//! its due instant rather than when it starts). Both run on the same monotonic clock and the
+//! same [`TRANSITION_DELAY`] span as a `pending` VPC's `available` move, and are applied by
+//! [`ComAmazonawsEc2Amazonec2State::materialize_due_transitions`]. Keyed by
 //! the range itself in its canonical form ([`canonical_byoip_cidr`]), because the range IS
 //! the name the API takes — every BYOIP operation is addressed by `Cidr`, not by a minted id
-//! — which also gives the describe path one stable order. That key comes from a REQUEST, so
+//! — which also gives the describe path one stable order, the order `DescribeByoipCidrs`
+//! reports and pages over. That key comes from a REQUEST, so
 //! the store is bounded like every other one here: a new range has to fit inside the record
 //! ceiling ([`ComAmazonawsEc2Amazonec2State::has_byoip_cidr_capacity`]) and the byte budget,
 //! and [`byoip_cidr_payload_bytes`] is the one definition of what a range is charged, given
@@ -178,6 +189,23 @@
 //! ([`ComAmazonawsEc2Amazonec2State::detach_elastic_ip`]) clears both sides, and
 //! [`ComAmazonawsEc2Amazonec2State::allocation_id_associated_with_instance`] answers which
 //! address an instance holds.
+//!
+//! ## Elastic IP address transfers
+//!
+//! [`ComAmazonawsEc2Amazonec2State::address_transfers`] holds the Elastic IP address
+//! transfers the source account can see, as [`AddressTransferRecord`]s: the modelled
+//! [`AddressTransfer`] every operation that reports one answers with, plus the instant the
+//! record stops being one of that account's transfers
+//! ([`AddressTransferRecord::visible_until`]), which the shape carries no member for.
+//! Keyed by the `AllocationId` of the address being transferred, because an address has at
+//! most one transfer at a time — `EnableAddressTransfer` starts the one offer on it — which
+//! also gives the describe path one stable order to report and page over.
+//!
+//! Unlike a `pending` VPC's move, those instants are DOCUMENTED spans rather than chosen
+//! ones ([`ADDRESS_TRANSFER_OFFER_WINDOW`], [`ADDRESS_TRANSFER_ACCEPTED_VISIBILITY`]), so
+//! they are kept on the wall clock the reported timestamps are on;
+//! [`ComAmazonawsEc2Amazonec2State::expire_due_address_transfers`] drops a record whose
+//! instant has passed, from [`ComAmazonawsEc2Amazonec2State::materialize_due_transitions`].
 //!
 //! ## Dedicated Hosts
 //!
@@ -246,6 +274,33 @@
 //! record carries the [`PendingStateMove`] the clock owes it, which
 //! [`ComAmazonawsEc2Amazonec2State::materialize_due_transitions`] applies — the BYOIP range
 //! above included, whose record carries one beside the release it may owe.
+//!
+//! ## Network Access Scopes and their analyses
+//!
+//! [`ComAmazonawsEc2Amazonec2State::network_insights_access_scopes`] holds the account's
+//! Network Access Scopes as the modelled [`NetworkInsightsAccessScope`] shape itself, keyed
+//! by `NetworkInsightsAccessScopeId`: it is where
+//! `StartNetworkInsightsAccessScopeAnalysis` resolves the scope a caller asks to analyze,
+//! so a scope the account does not hold is refused rather than analyzed.
+//!
+//! [`ComAmazonawsEc2Amazonec2State::network_insights_access_scope_analyses`] holds the
+//! analyses that start has started, keyed by `NetworkInsightsAccessScopeAnalysisId`, as
+//! [`NetworkInsightsAccessScopeAnalysisRecord`]s: the modelled
+//! [`NetworkInsightsAccessScopeAnalysis`] every operation that reports one answers with,
+//! plus the move the clock owes it. An analysis AWS hands back is `running`, a non-terminal
+//! `AnalysisStatus`, so its end is owed to the clock on the same [`TRANSITION_DELAY`] as
+//! every other transition this module records, and
+//! [`ComAmazonawsEc2Amazonec2State::materialize_due_transitions`] applies it.
+//!
+//! That end is `failed`, carrying [`ANALYSIS_UNSUPPORTED_STATUS_MESSAGE`]: a Network Access
+//! Scope analysis is a reachability computation over the account's real network, which this
+//! emulator does not perform, so the analysis ends in the `AnalysisStatus` catalog's own
+//! failure member with a message saying why rather than reporting findings nothing
+//! computed.
+//!
+//! [`ComAmazonawsEc2Amazonec2State::network_insights_access_scope_analysis_client_tokens`]
+//! maps one start's `ClientToken` to the analysis it started, so a replay of the same
+//! request answers that analysis instead of starting a second one.
 //!
 //! ## VPC Block Public Access exclusions
 //!
@@ -352,6 +407,27 @@
 //! `TransitGatewayOptions$AssociationDefaultRouteTableId` and
 //! `$PropagationDefaultRouteTableId` report name that record.
 //!
+//! ## Transit gateway policy tables and their associations
+//!
+//! [`ComAmazonawsEc2Amazonec2State::transit_gateway_policy_tables`] holds the account's
+//! policy tables as [`TransitGatewayPolicyTableRecord`]s, keyed by
+//! `TransitGatewayPolicyTableId` in a [`BTreeMap`]: the modelled [`TransitGatewayPolicyTable`]
+//! every operation that reports one answers with, plus the thing that shape carries no
+//! member for — the attachments associated with the table, keyed by
+//! `TransitGatewayAttachmentId`, each as the modelled
+//! [`TransitGatewayPolicyTableAssociation`] its own report answers with beside the
+//! [`PendingStateMove`] the clock owes it. An association is per (table, attachment), so
+//! that is what the key is, and the order it gives is the order
+//! `GetTransitGatewayPolicyTableAssociations` reports and pages over.
+//!
+//! `AssociateTransitGatewayPolicyTable` answers an association in the non-terminal
+//! `associating` state, so the clock owes it `associated` one [`TRANSITION_DELAY`] later,
+//! on the same monotonic clock as every other move this store owes, and
+//! [`ComAmazonawsEc2Amazonec2State::materialize_due_transitions`] applies it. An attachment
+//! is associated with at most ONE policy table
+//! ([`ComAmazonawsEc2Amazonec2State::policy_table_of_attachment`]), so a second association
+//! of the same attachment is refused rather than stored beside the first.
+//!
 //! Which attachment propagates its routes into which of those route tables is a resource of
 //! its own too — "Enables the specified attachment to propagate routes to the specified
 //! propagation route table" (`EnableTransitGatewayRouteTablePropagation`) — so
@@ -379,6 +455,20 @@
 //! two different words for it. Only the states no clock drives — a block AWS could not
 //! deliver, one that was cancelled, one whose payment is pending or failed — are stored, as
 //! [`CapacityBlockRecord::pinned_state`].
+//!
+//! ## Capacity Reservation Fleets
+//!
+//! [`ComAmazonawsEc2Amazonec2State::capacity_reservation_fleets`] holds the account's
+//! Capacity Reservation Fleets as [`CapacityReservationFleetRecord`]s: the modelled
+//! [`CapacityReservationFleet`] every operation that reports one answers with — including
+//! the individual Capacity Reservations the create reserved its capacity through — plus the
+//! move the clock owes it ([`CapacityReservationFleetTransition`]) — `submitted` ->
+//! `active` after `CreateCapacityReservationFleet`, and `cancelling` -> `cancelled` after
+//! `CancelCapacityReservationFleets`. Both fall due on the same monotonic clock and the same
+//! [`TRANSITION_DELAY`] as an instance's [`PendingTransition`], and
+//! [`ComAmazonawsEc2Amazonec2State::materialize_due_transitions`] applies them. The store is
+//! keyed by `CapacityReservationFleetId` in a [`BTreeMap`], the order
+//! `DescribeCapacityReservationFleets` reports and pages over.
 //!
 //! ## Secondary subnets
 //!
@@ -435,6 +525,21 @@
 //! of progress an active task reports is derived per read, being a fact of elapsed time
 //! that no store could hold.
 //!
+//! ## Spot Instance requests
+//!
+//! [`ComAmazonawsEc2Amazonec2State::spot_instance_requests`] holds the Spot Instance
+//! requests `RequestSpotInstances` mints as [`SpotInstanceRequestRecord`]s: the modelled
+//! [`SpotInstanceRequest`] `DescribeSpotInstanceRequests` reports, plus the fulfillment the
+//! clock owes an `open` request and the instant its own `ValidUntil` expires it. Keyed by
+//! `SpotInstanceRequestId` in a [`BTreeMap`], like every other store here, so a pagination
+//! token can name the id the next page starts at. A request AWS hands back is `open`, so
+//! both moves are owed by the clock and applied once by
+//! [`ComAmazonawsEc2Amazonec2State::materialize_due_spot_instance_requests`] — and the
+//! fulfillment LAUNCHES an instance into
+//! [`ComAmazonawsEc2Amazonec2State::instances`], which is why an instance carries the
+//! [`InstanceRecord::spot_instance_request_id`] of the request that launched it rather than
+//! Spot Instances being kept in a store of their own.
+//!
 //! ## Placement groups
 //!
 //! [`ComAmazonawsEc2Amazonec2State::placement_groups`] holds the account's placement
@@ -451,20 +556,23 @@ use std::net::Ipv6Addr;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::{
-    Address, ApplicationStatus, ApplicationStatusDetail, AttachVolumeOutput, AvailabilityZone,
-    AvailabilityZoneMessage, BlockDeviceMapping, BlockPublicAccessStates, ByoipCidr,
+    Address, AddressTransfer, ApplicationStatus, ApplicationStatusDetail, AttachVolumeOutput,
+    AvailabilityZone, AvailabilityZoneMessage, BlockDeviceMapping, BlockPublicAccessStates,
+    ByoipCidr,
     CapacityBlock, ExportTask, FpgaImage, FpgaImageState, ImageUsageReport, LoadPermission,
+    CapacityReservationFleet, FleetCapacityReservation,
     StorageLocation, VolumeRecycleBinInfo,
     CreateVolumeOutput, DescribeFastLaunchImagesSuccessItem, DisableFastLaunchOutput,
     VolumeModification,
     EbsBlockDevice, EnableFastLaunchOutput, GroupIdentifier, Host, INSTANCE_TYPE_VALUES, Image,
     ImageCriterion, Instance, InstanceApplicationStatus, IpamPool,
     InstanceState, InstanceTypeOffering, IpPermission, IpRange, LOCATION_TYPE_VALUES,
-    LaunchTemplate, MacHost, Monitoring, OperatorResponse, PeeringAttachmentStatus, Placement,
+    LaunchTemplate, MacHost, Monitoring, NetworkInsightsAccessScope,
+    NetworkInsightsAccessScopeAnalysis, OperatorResponse, PeeringAttachmentStatus, Placement,
     PlacementGroup,
     PrivateDnsNameOptionsOnLaunch,
     DnsEntry, PayerResponsibilityEntry,
-    RequestLaunchTemplateData, RunInstancesOutput, SecondaryNetwork,
+    Region, RequestLaunchTemplateData, RunInstancesOutput, SecondaryNetwork,
     SecondaryNetworkIpv4CidrBlockAssociation, SecondarySubnet,
     SecondarySubnetIpv4CidrBlockAssociation, SecurityGroup, ServiceConfiguration,
     SpotPlacementScore, StateReason,
@@ -472,7 +580,9 @@ use crate::ops::types::{
     TagSpecification,
     TransitGateway, TransitGatewayClientVpnAttachment,
     TransitGatewayMulticastDomainAssociation, TransitGatewayOptions,
-    TransitGatewayPeeringAttachment, TransitGatewayPropagation, TransitGatewayRequestOptions,
+    TransitGatewayPeeringAttachment, TransitGatewayPolicyTable,
+    TransitGatewayPolicyTableAssociation, TransitGatewayPropagation,
+    TransitGatewayRequestOptions,
     TransitGatewayRouteTable, TransitGatewayRouteTableAnnouncement,
     TransitGatewayRouteTablePropagation,
     TransitGatewayVpcAttachment,
@@ -671,6 +781,7 @@ pub const SUPPORTED_INSTANCE_FILTERS: &[&str] = &[
     "instance-type",
     "instance.group-id",
     "instance.group-name",
+    "instance-lifecycle",
     "key-name",
     "launch-index",
     "monitoring-state",
@@ -678,6 +789,7 @@ pub const SUPPORTED_INSTANCE_FILTERS: &[&str] = &[
     "private-dns-name",
     "private-ip-address",
     "reservation-id",
+    "spot-instance-request-id",
     "subnet-id",
     "tag-key",
 ];
@@ -811,6 +923,11 @@ pub struct InstanceRecord {
     pub disable_api_termination: bool,
     pub tags: BTreeMap<String, String>,
     pub client_token: Option<String>,
+    /// The Spot Instance request this instance was launched to fulfill, for an instance
+    /// that was: "if the request is a Spot Instance request, the ID of the request"
+    /// (`Instance$SpotInstanceRequestId`). `None` for an on-demand launch, which is what
+    /// makes the instance's reported `InstanceLifecycle` absent too.
+    pub spot_instance_request_id: Option<String>,
 }
 
 /// One stored reservation: the unit of state one `RunInstances` call creates.
@@ -851,7 +968,18 @@ pub const OPT_IN_NOT_REQUIRED: &str = "opt-in-not-required";
 /// EC2 models no error shapes at all (`smithy_query(query="operation", …)` reports
 /// `errors: []`), so this code is answered through
 /// [`crate::scaffolded::Scaffolded::service_error`].
+/// EC2's error code for a request member whose value is not valid.
 pub const INVALID_PARAMETER_VALUE: &str = "InvalidParameterValue";
+
+/// EC2's error code for a `Filters` entry naming a filter the operation does not document —
+/// "The specified filter is not valid" (EC2 API error codes). Answered through
+/// [`invalid_filter`].
+pub const INVALID_FILTER: &str = "InvalidFilter";
+
+/// EC2's error code for a request that reuses a `ClientToken` with a different request —
+/// "The request uses the same client token as a previous, but non-identical request" (EC2
+/// API error codes). Answered through [`idempotent_parameter_mismatch`].
+pub const IDEMPOTENT_PARAMETER_MISMATCH: &str = "IdempotentParameterMismatch";
 
 /// EC2's error code for a request that leaves out a member the action requires.
 pub const MISSING_PARAMETER: &str = "MissingParameter";
@@ -1152,6 +1280,24 @@ pub struct ComAmazonawsEc2Amazonec2State {
         String,
         crate::ops::types::LocalGatewayRouteTableVirtualInterfaceGroupAssociation,
     >,
+    /// Every Network Access Scope the account holds, by `NetworkInsightsAccessScopeId`, as
+    /// the modelled [`NetworkInsightsAccessScope`] shape itself — see the module docs.
+    /// Ordered by id, the stable order every reader of it reports in.
+    ///
+    /// `StartNetworkInsightsAccessScopeAnalysis` resolves the scope it is asked to analyze
+    /// here; `CreateNetworkInsightsAccessScope` is its writer.
+    pub network_insights_access_scopes: BTreeMap<String, NetworkInsightsAccessScope>,
+    /// Every Network Access Scope analysis the account has started, by
+    /// `NetworkInsightsAccessScopeAnalysisId` — see the module docs. Ordered by id, which is
+    /// the order `DescribeNetworkInsightsAccessScopeAnalyses` reports and pages over.
+    pub network_insights_access_scope_analyses:
+        BTreeMap<String, NetworkInsightsAccessScopeAnalysisRecord>,
+    /// A `StartNetworkInsightsAccessScopeAnalysis` `ClientToken` and the analysis id that
+    /// request started, so a repeat of the same request answers with that analysis instead
+    /// of starting a second one: "Unique, case-sensitive identifier that you provide to
+    /// ensure the idempotency of the request"
+    /// (`StartNetworkInsightsAccessScopeAnalysisRequest$ClientToken`).
+    pub network_insights_access_scope_analysis_client_tokens: HashMap<String, String>,
     /// Every subnet the account holds, by `SubnetId`, as the modelled [`Subnet`] shape
     /// itself — so a member a writer sets round-trips through `DescribeSubnets` without a
     /// field-by-field copy. Ordered by id, which is the order the describe reports and
@@ -1256,6 +1402,12 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// Monotonic source of the Elastic IP addresses [`Self::mint_elastic_ip`] hands out,
     /// so one allocation can never be given an address another still holds.
     next_elastic_ip: u64,
+    /// Every Elastic IP address transfer the source account can see, by the `AllocationId`
+    /// of the address being transferred — see the module docs. Ordered by that id, which is
+    /// the order `DescribeAddressTransfers` reports and pages over.
+    ///
+    /// Starts EMPTY: an account has no transfer until `EnableAddressTransfer` starts one.
+    pub address_transfers: BTreeMap<String, AddressTransferRecord>,
     /// Every transit gateway the account holds, by `TransitGatewayId`, as the modelled
     /// [`TransitGateway`] shape itself — so a member a writer sets round-trips through
     /// `DescribeTransitGateways` without a field-by-field copy. Ordered by id, which is
@@ -1360,6 +1512,17 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// `TransitGatewayRouteTableAnnouncementId`.
     pub transit_gateway_route_table_announcements:
         BTreeMap<String, TransitGatewayRouteTableAnnouncementRecord>,
+    /// Every transit gateway policy table the account holds, by
+    /// `TransitGatewayPolicyTableId`, each with the attachments associated with it — see
+    /// [`TransitGatewayPolicyTableRecord`] and the module docs. Ordered by id, the stable
+    /// order every reader of it reports in.
+    ///
+    /// `CreateTransitGatewayPolicyTable` is the operation that adds one and
+    /// `DeleteTransitGatewayPolicyTable` the one that removes it; both are still scaffolds,
+    /// so a fresh account holds none — which is why `AssociateTransitGatewayPolicyTable`
+    /// answers `InvalidTransitGatewayPolicyTableId.NotFound` for every id until one of them
+    /// is written, exactly as the real service does for a table that does not exist.
+    pub transit_gateway_policy_tables: BTreeMap<String, TransitGatewayPolicyTableRecord>,
     /// Every IPAM pool the account holds, by `IpamPoolId`, as the modelled [`IpamPool`]
     /// shape itself.
     pub ipam_pools: BTreeMap<String, IpamPool>,
@@ -1375,6 +1538,13 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// same request answers with that task instead of starting a second import: "The token
     /// to enable idempotency for VM import requests" (`ImportImageRequest$ClientToken`).
     pub import_image_task_client_tokens: HashMap<String, String>,
+    /// Every Capacity Reservation Fleet the account holds, by `CapacityReservationFleetId`,
+    /// as a [`CapacityReservationFleetRecord`] — see the module docs. Ordered by id, which
+    /// is the order `DescribeCapacityReservationFleets` reports and pages over.
+    pub capacity_reservation_fleets: BTreeMap<String, CapacityReservationFleetRecord>,
+    /// A `CreateCapacityReservationFleet` `ClientToken` and the Fleet id it minted, so a
+    /// repeat of the same request answers with that Fleet instead of creating a second one.
+    pub capacity_reservation_fleet_client_tokens: HashMap<String, String>,
     /// The account's placement groups, as the modelled [`PlacementGroup`] shape every
     /// operation that reports one answers with, keyed by `GroupId` in a [`BTreeMap`] — the
     /// same stable order the other stores are kept in, which is the order
@@ -1387,6 +1557,16 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// The state of the account's *block public access for snapshots* setting — see the
     /// module docs.
     ///
+    /// Every Spot Instance request the account holds, by `SpotInstanceRequestId` — see the
+    /// module docs. Ordered by id, which is the order `DescribeSpotInstanceRequests`
+    /// reports and pages over.
+    pub spot_instance_requests: BTreeMap<String, SpotInstanceRequestRecord>,
+    /// A `RequestSpotInstances` `ClientToken` and the request ids that call minted, so a
+    /// repeat of the same request answers with those requests instead of asking for more
+    /// capacity. One token names EVERY request of the one call, because one call mints
+    /// `InstanceCount` of them — the same arrangement as
+    /// [`Self::dedicated_host_client_tokens`].
+    pub spot_instance_request_client_tokens: HashMap<String, Vec<String>>,
     /// A `&'static str` so only a member of the modelled `SnapshotBlockPublicAccessState`
     /// catalog can ever be stored here: the word comes from this module's own constants,
     /// never from a request. Read it through
@@ -1419,6 +1599,9 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             verified_access_trust_providers: BTreeMap::new(),
             verified_access_trust_provider_client_tokens: HashMap::new(),
             local_gateway_route_table_virtual_interface_group_associations: BTreeMap::new(),
+            network_insights_access_scopes: BTreeMap::new(),
+            network_insights_access_scope_analyses: BTreeMap::new(),
+            network_insights_access_scope_analysis_client_tokens: HashMap::new(),
             images: BTreeMap::new(),
             security_groups: BTreeMap::new(),
             launch_templates: BTreeMap::new(),
@@ -1429,6 +1612,7 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             volume_modifications: BTreeMap::new(),
             secondary_networks: BTreeMap::new(),
             secondary_network_client_tokens: HashMap::new(),
+            // A fresh account has brought no address range of its own.
             byoip_cidrs: BTreeMap::new(),
             coip_pools: BTreeMap::new(),
             capacity_blocks: BTreeMap::new(),
@@ -1436,6 +1620,7 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             fast_launch_images: BTreeMap::new(),
             addresses: BTreeMap::new(),
             next_elastic_ip: 0,
+            address_transfers: BTreeMap::new(),
             transit_gateways: BTreeMap::new(),
             transit_gateway_available_at: BTreeMap::new(),
             transit_gateway_route_tables: BTreeMap::new(),
@@ -1456,10 +1641,15 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             transit_gateway_attachments: BTreeMap::new(),
             transit_gateway_multicast_domains: BTreeMap::new(),
             transit_gateway_route_table_announcements: BTreeMap::new(),
+            transit_gateway_policy_tables: BTreeMap::new(),
             ipam_pools: BTreeMap::new(),
             vpc_block_public_access_exclusions: BTreeMap::new(),
             import_image_tasks: BTreeMap::new(),
             import_image_task_client_tokens: HashMap::new(),
+            capacity_reservation_fleets: BTreeMap::new(),
+            capacity_reservation_fleet_client_tokens: HashMap::new(),
+            spot_instance_requests: BTreeMap::new(),
+            spot_instance_request_client_tokens: HashMap::new(),
             placement_groups: BTreeMap::new(),
             // "Public sharing is not blocked" is where an account that has never called
             // `EnableSnapshotBlockPublicAccess` sits.
@@ -2414,14 +2604,16 @@ impl ComAmazonawsEc2Amazonec2State {
     /// its IPv6 association moving `associating` -> `associated`, a `pending` subnet
     /// becoming `available`, a `pending` transit gateway with the route tables that come up
     /// with it, a VPC BPA exclusion reaching `create-complete`, a Windows fast launch
-    /// configuration reaching `enabled` or finishing the cleanup a disable started, and a
+    /// configuration reaching `enabled` or finishing the cleanup a disable started, a
+    /// `pending-withdrawal` BYOIP range reaching the end of its withdrawal, and a
     /// `pending-deprovision` BYOIP range reaching the end of its release — leaving the
     /// account, or landing in `failed-deprovision` when addresses are still allocated from
     /// it.
     ///
     /// An `active` import image task becoming `completed` with the AMI it created is one of
     /// them too; it is documented on [`Self::complete_due_import_image_tasks`], which this
-    /// calls.
+    /// calls. A `running` Network Access Scope analysis reaching its terminal
+    /// `AnalysisStatus` is one as well.
     pub fn materialize_due_transitions(&mut self) {
         let now = Instant::now();
         for instance in self.instances.values_mut() {
@@ -2511,7 +2703,9 @@ impl ComAmazonawsEc2Amazonec2State {
             if held.is_empty() {
                 // The release succeeded: the range is not one of the account's any more, so
                 // the bytes its record held go back to the budget — exactly what
-                // [`Self::insert_byoip_cidr`] charged for it.
+                // [`Self::insert_byoip_cidr`] charged for it. The move the clock may still
+                // have owed the range goes with the record that carried it
+                // ([`ByoipCidrRecord::pending`]), so nothing can resurrect a released range.
                 if let Some(record) = self.byoip_cidrs.remove(&cidr) {
                     self.release_stored_bytes(byoip_cidr_payload_bytes(&record));
                 }
@@ -2590,6 +2784,32 @@ impl ComAmazonawsEc2Amazonec2State {
                 }
             }
         });
+        // The end of a Network Access Scope analysis `StartNetworkInsightsAccessScopeAnalysis`
+        // answered as `running`: at its due instant the analysis reaches the terminal
+        // `AnalysisStatus` the start recorded for it, whether or not anybody called again —
+        // the same contract as a `pending` VPC's move above.
+        for record in self.network_insights_access_scope_analyses.values_mut() {
+            let Some(pending) = record
+                .pending
+                .as_ref()
+                .filter(|pending| now >= pending.due_at)
+                .cloned()
+            else {
+                continue;
+            };
+            record.view.status = Some(pending.to.to_string());
+            // "The analysis end date" (`NetworkInsightsAccessScopeAnalysis$EndDate`): the
+            // analysis ended when the move fell due, not when somebody next asked about it.
+            record.view.end_date = Some(system_time_to_date_time(pending.at));
+            record.view.status_message = Some(ANALYSIS_UNSUPPORTED_STATUS_MESSAGE.to_string());
+            // "Indicates whether there are findings"
+            // (`NetworkInsightsAccessScopeAnalysis$FindingsFound`): nothing analyzed this
+            // scope, so whether it has findings was never determined — which is exactly
+            // what the `FindingsFound` catalog's `unknown` member says. `AnalyzedEniCount`
+            // stays absent for the same reason: no network interface was analyzed.
+            record.view.findings_found = Some(FINDINGS_FOUND_UNKNOWN.to_string());
+            record.pending = None;
+        }
         // The resources whose own record carries the move the clock owes it
         // ([`PendingStateMove`]): a transit gateway attachment an acceptance or a rejection
         // left transient, one subnet association of a multicast domain, a route table
@@ -2631,6 +2851,23 @@ impl ComAmazonawsEc2Amazonec2State {
                 record.pending = None;
             }
         }
+        // One attachment's association with a policy table, which
+        // `AssociateTransitGatewayPolicyTable` leaves in the transient `associating` state
+        // with `associated` owed: the same contract as the multicast domain associations
+        // above.
+        for table in self.transit_gateway_policy_tables.values_mut() {
+            for association in table.associations.values_mut() {
+                if let Some(state) = association
+                    .pending
+                    .as_ref()
+                    .and_then(|pending| pending.due_by(now))
+                    .map(str::to_string)
+                {
+                    association.view.state = Some(state);
+                    association.pending = None;
+                }
+            }
+        }
         for record in self.byoip_cidrs.values_mut() {
             if let Some(state) = record
                 .pending
@@ -2638,6 +2875,15 @@ impl ComAmazonawsEc2Amazonec2State {
                 .and_then(|pending| pending.due_by(now))
                 .map(str::to_string)
             {
+                // A range leaving `pending-provision` is one whose provision has just
+                // completed — "the address range is not ready to use until its status
+                // changes from pending-provision to provisioned" (`ProvisionByoipCidr`) —
+                // and "Upon success, contains the ID of the address pool"
+                // (`ByoipCidr$StatusMessage`) is what there is to report from that instant
+                // on, where until it there was no success to report.
+                if record.byoip_cidr.state.as_deref() == Some(BYOIP_CIDR_STATE_PENDING_PROVISION) {
+                    record.byoip_cidr.status_message = record.byoip_cidr.pool_id.clone();
+                }
                 record.byoip_cidr.state = Some(state);
                 record.pending = None;
             }
@@ -2684,7 +2930,15 @@ impl ComAmazonawsEc2Amazonec2State {
             // The move is applied once; nothing is owed on this connection any more.
             false
         });
+        // An Elastic IP address transfer the clock has taken past the end of what the
+        // source account is shown: the offer expired and ownership returned to that
+        // account, or an accepted transfer's 14 days of visibility ran out. Both were due
+        // at their instant whether or not anybody called, and both are spans AWS
+        // documents, so they are read off the wall clock rather than `now`.
+        self.expire_due_address_transfers(SystemTime::now());
         self.complete_due_import_image_tasks(now);
+        self.materialize_due_capacity_reservation_fleet_moves(now);
+        self.materialize_due_spot_instance_requests(now);
     }
 
     /// The modelled `Instance` for one stored instance.
@@ -2739,6 +2993,14 @@ impl ComAmazonawsEc2Amazonec2State {
             ),
             client_token: instance.client_token.clone(),
             tags: Some(tag_list(&instance.tags)),
+            // "spot - the instance is a Spot Instance" (`Instance$InstanceLifecycle`) is
+            // reported only for an instance a Spot Instance request launched; an
+            // on-demand instance has no lifecycle word and no request id.
+            instance_lifecycle: instance
+                .spot_instance_request_id
+                .as_ref()
+                .map(|_| INSTANCE_LIFECYCLE_SPOT.to_string()),
+            spot_instance_request_id: instance.spot_instance_request_id.clone(),
             ..Default::default()
         }
     }
@@ -2813,6 +3075,17 @@ impl ComAmazonawsEc2Amazonec2State {
                     .filter_map(|(_, group_name)| group_name.clone())
                     .collect(),
             ),
+            // "instance-lifecycle - Indicates whether this is a Spot Instance" and
+            // "spot-instance-request-id - The ID of the Spot Instance request"
+            // (`DescribeInstancesRequest$Filters`): an on-demand instance holds no value
+            // for either, so a filter naming one selects only Spot Instances.
+            "instance-lifecycle" => single(
+                instance
+                    .spot_instance_request_id
+                    .as_ref()
+                    .map(|_| INSTANCE_LIFECYCLE_SPOT.to_string()),
+            ),
+            "spot-instance-request-id" => single(instance.spot_instance_request_id.clone()),
             "key-name" => single(instance.key_name.clone()),
             "launch-index" => single(Some(instance.ami_launch_index.to_string())),
             "monitoring-state" => single(Some(instance.monitoring_state.clone())),
@@ -2889,10 +3162,18 @@ pub fn filter_name_supported(name: &str) -> bool {
 /// The caller-chosen bytes one stored instance holds.
 ///
 /// Only the members whose length the REQUEST chose count: an id, a state or a
-/// timestamp this emulator mints is a fixed size.
+/// timestamp this emulator mints is a fixed size. EVERY such member counts, though —
+/// the image id, the instance type, the subnet, the key pair name and the zone are
+/// cloned onto every instance a launch mints just as its user data is, so leaving them
+/// out would let one request retain bytes the store's ceiling never saw.
 pub fn instance_payload_bytes(record: &InstanceRecord) -> usize {
     record.user_data.as_ref().map_or(0, String::len)
         + record.client_token.as_ref().map_or(0, String::len)
+        + record.image_id.as_ref().map_or(0, String::len)
+        + record.instance_type.len()
+        + record.subnet_id.as_ref().map_or(0, String::len)
+        + record.key_name.as_ref().map_or(0, String::len)
+        + record.placement_az.len()
         + tag_bytes(&record.tags)
         + record
             .security_groups
@@ -2991,9 +3272,11 @@ pub const LONG_RESOURCE_ID_DIGITS: usize = 17;
 ///   `i-00000000000000000` with `InvalidInstanceID.Malformed` too, and the mint counts
 ///   from one, so no instance can ever hold the null id.
 ///
-/// The structural part of this is the INSTANCE id's rule, not a rule about every EC2
-/// id: the same all-zero suffix on a network interface (`eni-00000000000000000`) IS
-/// answered `NotFound`, so it is not generalised to the other id readers here.
+/// The structural part of this is the rule of SOME EC2 id kinds, not of every one
+/// ([`issued_long_id_is_well_formed`], which a Capacity Reservation Fleet id reads through
+/// too on its own recorded evidence): the same all-zero suffix on a network interface
+/// (`eni-00000000000000000`) IS answered `NotFound`, so it is not generalised to the other
+/// id readers here.
 ///
 /// ## Where each clause's evidence is, so the rule can be re-checked
 ///
@@ -3015,15 +3298,7 @@ pub const LONG_RESOURCE_ID_DIGITS: usize = 17;
 ///   (cause 1, the same id under `DryRun`), whose cause 7 is also where the
 ///   `eni-00000000000000000` -> `NotFound` counter-example comes from.
 pub fn instance_id_is_well_formed(id: &str) -> bool {
-    let Some(suffix) = id.strip_prefix("i-") else {
-        return false;
-    };
-    suffix.len() == LONG_RESOURCE_ID_DIGITS
-        && suffix
-            .bytes()
-            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
-        && suffix.starts_with('0')
-        && suffix.bytes().any(|byte| byte != b'0')
+    issued_long_id_is_well_formed("i", id)
 }
 
 /// Refuse an instance id the request named that this service cannot resolve: a
@@ -3428,43 +3703,251 @@ pub fn offering_page_cursor(offering: &InstanceTypeOfferingRecord) -> String {
 }
 
 // =============================================================================
-// Spot placement scores
+// Regions
 // =============================================================================
+
+/// Every AWS partition that is not the commercial one: the prefix every Region code of
+/// that partition starts with, and the DNS suffix its service endpoints carry.
+///
+/// The prefixes are AWS's own partition prefixes — AWS China, GovCloud and the isolated
+/// partitions — the same ones
+/// `service-com-amazonaws-observabilityadmin-observabilityadmin` partitions
+/// `KNOWN_REGIONS` by. The suffix of each is the `dnsSuffix` that partition publishes in
+/// the AWS SDK partition metadata (`endpoints.json`), which is what every regional
+/// endpoint of the partition is built from: `aws-cn` `amazonaws.com.cn`, `aws-us-gov`
+/// `amazonaws.com`, `aws-iso` `c2s.ic.gov`, `aws-iso-b` `sc2s.sgov.gov`, `aws-iso-e`
+/// `cloud.adc-e.uk`, `aws-iso-f` `csp.hci.ic.gov`.
+///
+/// Every prefix ends in a hyphen, so `us-iso-` cannot swallow `us-isob-` and the order of
+/// the entries carries no meaning.
+const NON_COMMERCIAL_PARTITIONS: [(&str, &str); 6] = [
+    ("cn-", "amazonaws.com.cn"),
+    ("us-gov-", "amazonaws.com"),
+    ("us-iso-", "c2s.ic.gov"),
+    ("us-isob-", "sc2s.sgov.gov"),
+    ("us-isof-", "csp.hci.ic.gov"),
+    ("eu-isoe-", "cloud.adc-e.uk"),
+];
+
+/// The DNS suffix the commercial (`aws`) partition's endpoints carry — the one
+/// `DescribeRegionsRequest$Filters` spells out for the `endpoint` filter
+/// (`ec2.us-east-1.amazonaws.com`).
+pub const COMMERCIAL_DNS_SUFFIX: &str = "amazonaws.com";
+
+/// This service's endpoint prefix: the `endpointPrefix` of its `aws.api#service` trait
+/// (`smithy_query(query="service_info")`), which is the first label of every regional
+/// endpoint the service is reached through.
+pub const EC2_ENDPOINT_PREFIX: &str = "ec2";
+
+/// The Regions of the commercial partition an account can use WITHOUT opting in: the
+/// "Regions that are enabled by default" table of the Amazon Web Services Account
+/// Management Reference Guide, "Specify which Amazon Web Services Regions your account can
+/// use" — the guide `DescribeRegions`'s own documentation links to.
+///
+/// The ENABLED set is the written list and the opt-in set is its complement, rather than
+/// the other way round, because that is the direction AWS's rule runs: a Region
+/// introduced after the guide's cut-off is disabled until the account opts in, so a Region
+/// this emulator's catalog gains later is an opt-in Region without this list being
+/// touched. Regions outside the commercial partition are not in it at all — an account of
+/// the China, GovCloud or an isolated partition reaches its own partition's Regions
+/// directly — which is why [`region_opt_in_status`] asks about the partition first.
+pub const REGIONS_ENABLED_BY_DEFAULT: [&str; 17] = [
+    "ap-northeast-1",
+    "ap-northeast-2",
+    "ap-northeast-3",
+    "ap-south-1",
+    "ap-southeast-1",
+    "ap-southeast-2",
+    "ca-central-1",
+    "eu-central-1",
+    "eu-north-1",
+    "eu-west-1",
+    "eu-west-2",
+    "eu-west-3",
+    "sa-east-1",
+    "us-east-1",
+    "us-east-2",
+    "us-west-1",
+    "us-west-2",
+];
+
+/// `Region$OptInStatus` for a Region the account has opted in to — one of the three
+/// values the member's own doc lists ("The possible values are `opt-in-not-required`,
+/// `opted-in`, and `not-opted-in`").
+pub const OPT_IN_STATUS_OPTED_IN: &str = "opted-in";
+
+/// `Region$OptInStatus` for a Region that requires an opt-in the account has not made.
+pub const OPT_IN_STATUS_NOT_OPTED_IN: &str = "not-opted-in";
+
+/// Every filter `DescribeRegions` documents, as its `Filters` member lists them
+/// (`smithy_query(query="doc",shape="DescribeRegionsRequest",member="Filters")`). A
+/// filter outside this set is refused; a filter inside it is answered by
+/// [`RegionRecord::filter_values`], which must cover every entry.
+pub const REGION_FILTERS: [&str; 3] = ["endpoint", "opt-in-status", "region-name"];
+
+/// The [`NON_COMMERCIAL_PARTITIONS`] entry `region` belongs to, or `None` when `region`
+/// belongs to the commercial partition, whose Region codes carry no partition prefix at
+/// all.
+///
+/// One lookup answers both the prefix and the DNS suffix, so [`partition_prefix_of`] and
+/// [`partition_dns_suffix`] can never disagree about which prefix wins.
+fn partition_of(region: &str) -> Option<&'static (&'static str, &'static str)> {
+    NON_COMMERCIAL_PARTITIONS
+        .iter()
+        .find(|(prefix, _)| region.starts_with(prefix))
+}
+
+/// The Region-code prefix of `region`'s partition, or `None` when `region` belongs to the
+/// commercial partition.
+fn partition_prefix_of(region: &str) -> Option<&'static str> {
+    partition_of(region).map(|(prefix, _)| *prefix)
+}
+
+/// The DNS suffix the endpoints of `region`'s partition carry.
+pub fn partition_dns_suffix(region: &str) -> &'static str {
+    partition_of(region).map_or(COMMERCIAL_DNS_SUFFIX, |(_, suffix)| *suffix)
+}
+
+/// `region`'s EC2 service endpoint: this service's endpoint prefix, the Region code, and
+/// the DNS suffix of the Region's partition — `ec2.us-east-1.amazonaws.com`, the form
+/// `DescribeRegions`'s `endpoint` filter doc gives.
+pub fn region_endpoint(region: &str) -> String {
+    format!(
+        "{EC2_ENDPOINT_PREFIX}.{region}.{}",
+        partition_dns_suffix(region)
+    )
+}
+
+/// Every Region of the partition `region` belongs to, in Region-code order.
+///
+/// Neither the Smithy model nor any operation of this emulator carries a Region catalog —
+/// the model's endpoint rule set resolves ONE Region name rather than enumerating them,
+/// and no operation creates a Region — so the catalog is
+/// `emulator_telemetry::policy::KNOWN_REGIONS` ("every AWS region the wire may carry",
+/// already sorted for binary search), the same source two other services derive their
+/// Region catalogs from, rather than a second hand-written list that would drift from it.
+///
+/// It is narrowed to ONE partition because a partition is what bounds the Regions an
+/// account can ever see: an account lives in exactly one, and its Region codes are what
+/// name it. The order the catalog inherits is Region-code order, which is what makes
+/// [`MAX_SCORED_REGIONS`] a prefix of [`commercial_regions`].
+pub fn regions_in_partition_of(region: &str) -> Vec<&'static str> {
+    let partition = partition_prefix_of(region);
+    ::emulator_telemetry::policy::KNOWN_REGIONS
+        .iter()
+        .copied()
+        .filter(|known| partition_prefix_of(known) == partition)
+        .collect()
+}
 
 /// The Regions of the commercial (`aws`) partition, in Region-code order: the ones a
 /// `GetSpotPlacementScores` request that narrows nothing is scored over.
 ///
 /// `RegionNames` holds "the Regions used to narrow down the list of Regions to be
 /// scored" (`GetSpotPlacementScoresRequest$RegionNames`), so the list it narrows has to
-/// exist, and neither the Smithy model nor any operation of this emulator carries one —
-/// the model's endpoint rule set resolves ONE Region name rather than enumerating them,
-/// and no operation creates a Region. The catalog is therefore
-/// `emulator_telemetry::policy::KNOWN_REGIONS` ("every AWS region the wire may carry",
-/// already sorted for binary search) with the other partitions' Regions filtered out by
-/// [`NON_COMMERCIAL_REGION_PREFIXES`] — the same source two other services derive their
-/// Region catalogs from, rather than a second hand-written list that would drift from it.
-/// The order it inherits is what makes [`MAX_SCORED_REGIONS`] a prefix of this list.
-///
-/// Nothing here is tied to one operation: `DescribeRegions` is still a scaffold stub and
-/// wants exactly this catalog.
+/// exist; it is [`regions_in_partition_of`] for the partition [`DEFAULT_REGION`] belongs
+/// to.
 pub fn commercial_regions() -> Vec<&'static str> {
-    ::emulator_telemetry::policy::KNOWN_REGIONS
-        .iter()
-        .copied()
-        .filter(|region| {
-            !NON_COMMERCIAL_REGION_PREFIXES
-                .iter()
-                .any(|prefix| region.starts_with(prefix))
+    regions_in_partition_of(DEFAULT_REGION)
+}
+
+/// `region`'s opt-in status for an account calling in `signed_region`.
+///
+/// A Region outside the commercial partition, and a commercial Region of
+/// [`REGIONS_ENABLED_BY_DEFAULT`], needs no opt-in at all. Of the rest — the ones an
+/// account must enable — the Region the request was SIGNED for is one the account has
+/// evidently enabled, since a regional endpoint of a disabled Region answers nothing;
+/// this emulator holds no account-level opt-in store and EC2 has no operation that opts a
+/// Region in or out (that is the Account API's `EnableRegion`), so that is the one opt-in
+/// a request itself evidences, and every other opt-in Region is reported
+/// `not-opted-in`.
+pub fn region_opt_in_status(region: &str, signed_region: &str) -> &'static str {
+    if partition_prefix_of(region).is_some() || REGIONS_ENABLED_BY_DEFAULT.contains(&region) {
+        OPT_IN_NOT_REQUIRED
+    } else if region == signed_region {
+        OPT_IN_STATUS_OPTED_IN
+    } else {
+        OPT_IN_STATUS_NOT_OPTED_IN
+    }
+}
+
+/// One Region of the account's partition, as the describe reads it.
+///
+/// `opt_in_status` is a `&'static str` because it is one of the three words
+/// `Region$OptInStatus` documents rather than text a request can carry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegionRecord {
+    /// `us-east-1` — the Region code.
+    pub region_name: String,
+    /// The Region's EC2 service endpoint, as [`region_endpoint`] builds it.
+    pub endpoint: String,
+    /// `opt-in-not-required`, `opted-in` or `not-opted-in`.
+    pub opt_in_status: &'static str,
+}
+
+impl RegionRecord {
+    /// This Region as the modelled `Region` shape.
+    ///
+    /// `Geography` is absent because the geography of a Region ("for example, `United
+    /// States of America`") is display data AWS publishes per Region that neither the
+    /// model nor the request yields — reported absent rather than invented, the same way
+    /// [`AvailabilityZoneRecord::to_availability_zone`] leaves a zone's geography out.
+    pub fn to_region(&self) -> Region {
+        Region {
+            region_name: Some(self.region_name.clone()),
+            endpoint: Some(self.endpoint.clone()),
+            opt_in_status: Some(self.opt_in_status.to_string()),
+            geography: None,
+        }
+    }
+
+    /// Whether this Region is enabled for the account: every Region but one carrying an
+    /// opt-in the account has not made.
+    pub fn is_enabled(&self) -> bool {
+        self.opt_in_status != OPT_IN_STATUS_NOT_OPTED_IN
+    }
+
+    /// The values the EC2 filter `name` compares against this Region, or `None` when
+    /// `name` is not one of [`REGION_FILTERS`].
+    pub fn filter_values(&self, name: &str) -> Option<Vec<&str>> {
+        let values = match name {
+            "endpoint" => vec![self.endpoint.as_str()],
+            "opt-in-status" => vec![self.opt_in_status],
+            "region-name" => vec![self.region_name.as_str()],
+            _ => return None,
+        };
+        Some(values)
+    }
+}
+
+/// The Regions a request signed for `signed_region` can see, in Region-code order:
+/// every Region of that Region's partition ([`regions_in_partition_of`]), each with its
+/// endpoint and its opt-in status.
+///
+/// A well-formed `signed_region` the catalog does not hold is reported beside them, so a
+/// caller is never told the Region it is calling in does not exist — the same allowance
+/// `GetSpotPlacementScores` makes for the Region a call was signed for. A credential
+/// scope is caller-controlled text, so one that is not shaped like a Region code
+/// ([`region_name_is_well_formed`]) adds nothing.
+pub fn regions_for_request(signed_region: &str) -> Vec<RegionRecord> {
+    let mut names: Vec<&str> = regions_in_partition_of(signed_region);
+    if region_name_is_well_formed(signed_region) && !names.contains(&signed_region) {
+        names.push(signed_region);
+        names.sort_unstable();
+    }
+    names
+        .into_iter()
+        .map(|name| RegionRecord {
+            region_name: name.to_string(),
+            endpoint: region_endpoint(name),
+            opt_in_status: region_opt_in_status(name, signed_region),
         })
         .collect()
 }
 
-/// The region-code prefixes of the partitions that are not the commercial one: AWS China,
-/// GovCloud and the isolated partitions (`us-iso`, `us-isob`, `us-isof`, `eu-isoe` — the
-/// shorter prefixes cover the longer ones). They are AWS's own partition prefixes, the
-/// same ones `service-com-amazonaws-observabilityadmin-observabilityadmin` partitions
-/// `KNOWN_REGIONS` by.
-const NON_COMMERCIAL_REGION_PREFIXES: [&str; 4] = ["cn-", "us-gov-", "us-iso", "eu-iso"];
+// =============================================================================
+// Spot placement scores
+// =============================================================================
 
 /// The most Regions one `GetSpotPlacementScores` response scores: "The Spot placement
 /// score for the top 10 Regions or Availability Zones"
@@ -3834,6 +4317,35 @@ pub fn matches_every_filter<'a>(
 /// with a message naming the value at fault.
 pub fn invalid_parameter_value<E>(message: impl Into<String>) -> crate::scaffolded::Scaffolded<E> {
     crate::scaffolded::Scaffolded::service_error(INVALID_PARAMETER_VALUE, 400, message)
+}
+
+/// Refuse a `Filters` entry naming a filter the operation does not support, the way EC2
+/// does: HTTP 400 [`INVALID_FILTER`], with a message enumerating the names it DOES support.
+///
+/// A filter name is not an ordinary member value: EC2 has a code of its own for one it does
+/// not recognise, and the message it answers names the whole supported catalog rather than
+/// the entry at fault, so `supported` is given in the order the service enumerates it.
+pub fn invalid_filter<E>(supported: &[&str]) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_error(
+        INVALID_FILTER,
+        400,
+        format!("Filter name must be one of [{}]", supported.join(", ")),
+    )
+}
+
+/// Refuse a request that reuses an idempotency token for a request that is not the one that
+/// token already named, the way EC2 does: HTTP 400 [`IDEMPOTENT_PARAMETER_MISMATCH`].
+///
+/// The message is EC2's own documented wording for the code, which says what the caller has
+/// to change rather than echoing what it sent.
+pub fn idempotent_parameter_mismatch<E>() -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_error(
+        IDEMPOTENT_PARAMETER_MISMATCH,
+        400,
+        "The request uses the same client token as a previous, but non-identical request. \
+         Do not reuse a client token with different requests, unless the requests are \
+         identical.",
+    )
 }
 
 /// Refuse a request that named a VPC id no VPC of the account has, the way EC2 does:
@@ -4780,14 +5292,29 @@ impl ComAmazonawsEc2Amazonec2State {
             };
             // No room for the AMI means the import cannot produce one at all, so it ends in
             // the state a failed import ends in rather than staying `active` for ever: the
-            // task is `deleted` and its message says which ceiling stopped it.
-            if !self.has_image_capacity() {
+            // task is `deleted` and its message says which ceiling stopped it — the number of
+            // images this store holds, or the caller-chosen bytes they hold, a count of
+            // records being no bound on the bytes each one carries.
+            let no_room = if !self.has_image_capacity() {
+                Some(format!(
+                    "This emulator holds {MAX_IMAGES} images, which is as many as it \
+                     stores, so the imported AMI could not be created"
+                ))
+            } else {
+                let payload_bytes = image_payload_bytes(&spec);
+                self.would_exceed_stored_bytes(payload_bytes).then(|| {
+                    format!(
+                        "This emulator holds {held} of at most {MAX_STORED_BYTES} bytes of \
+                         caller-supplied data, so the imported AMI could not be created \
+                         with {payload_bytes} more",
+                        held = self.stored_bytes()
+                    )
+                })
+            };
+            if let Some(reason) = no_room {
                 if let Some(record) = self.import_image_tasks.get_mut(&task_id) {
                     record.view.status = Some(IMPORT_TASK_STATE_DELETED.to_string());
-                    record.view.status_message = Some(format!(
-                        "This emulator holds {MAX_IMAGES} images, which is as many as it \
-                         stores, so the imported AMI could not be created"
-                    ));
+                    record.view.status_message = Some(reason);
                     record.view.progress = None;
                     for detail in record.view.snapshot_details.iter_mut().flatten() {
                         detail.status = Some(IMPORT_TASK_STATE_DELETED.to_string());
@@ -5996,11 +6523,17 @@ pub fn image_is_deprecated(image: &Image, now: SystemTime) -> bool {
 
 /// Refuse a request that named an AMI id the account can see no image for, the way EC2
 /// does: HTTP 400 `InvalidAMIID.NotFound`.
+///
+/// The message is EC2's own: it names the ids it could not resolve as a BRACKETED list,
+/// because the refusal is made over the ids the request supplied — "The image id
+/// '[ami-12345678]' does not exist" is what the real service answers, recorded by the
+/// corpus unit `ec2.op-contract-request-spot-instances`. A refusal here names the one id at
+/// fault.
 pub fn invalid_ami_id_not_found<E>(image_id: &str) -> Scaffolded<E> {
     Scaffolded::service_error(
         INVALID_AMI_ID_NOT_FOUND,
         400,
-        format!("The image id '{image_id}' does not exist"),
+        format!("The image id '[{image_id}]' does not exist"),
     )
 }
 
@@ -6103,11 +6636,52 @@ impl Default for ImageSpec {
     }
 }
 
+/// The caller-chosen bytes one stored AMI holds: its tags, and every string of the record
+/// whose LENGTH a request chose — the name (which the derived `ImageLocation` holds a
+/// second copy of), the description, the architecture, the root device name (stored on the
+/// image and on its block device mapping), the volume type, the state, the billing strings,
+/// the creation date, the owning account and its alias, the deprecation time, the public
+/// parameter name, the platform, the boot mode and the IMDS support. The ids, the snapshot
+/// and the fixed facts of an EBS-backed HVM image are derived by this module, so they are
+/// fixed-size.
+///
+/// The ONE definition of that charge, the way [`address_payload_bytes`] is for an Elastic
+/// IP address: [`ComAmazonawsEc2Amazonec2State::insert_image`] charges exactly it, so no
+/// path can store those bytes uncharged, and a writer that asks
+/// [`ComAmazonawsEc2Amazonec2State::would_exceed_stored_bytes`] first asks it with this
+/// number. A string stored twice is counted twice, because that is what the store holds.
+pub fn image_payload_bytes(spec: &ImageSpec) -> usize {
+    let optional = |value: Option<&String>| -> usize { value.map_or(0, String::len) };
+    tag_list_bytes(&spec.tags)
+        // `Image$Name`, and the `<owner>/<name>` `ImageLocation` derived from it.
+        .saturating_add(spec.name.len().saturating_mul(2))
+        .saturating_add(spec.description.len())
+        .saturating_add(spec.architecture.len())
+        // `Image$RootDeviceName`, and the block device mapping's own `DeviceName`.
+        .saturating_add(spec.root_device_name.len().saturating_mul(2))
+        .saturating_add(spec.root_volume_type.len())
+        .saturating_add(spec.state.len())
+        .saturating_add(spec.platform_details.len())
+        .saturating_add(spec.usage_operation.len())
+        .saturating_add(spec.creation_date.len())
+        // The owning account, and the `ImageLocation` prefix when no alias replaces it.
+        .saturating_add(spec.owner_id.len().saturating_mul(2))
+        // `Image$ImageOwnerAlias`, and the `ImageLocation` prefix when it is set.
+        .saturating_add(optional(spec.owner_alias.as_ref()).saturating_mul(2))
+        .saturating_add(optional(spec.deprecation_time.as_ref()))
+        .saturating_add(optional(spec.public_ssm_parameter_name.as_ref()))
+        .saturating_add(optional(spec.platform.as_ref()))
+        .saturating_add(optional(spec.boot_mode.as_ref()))
+        .saturating_add(optional(spec.imds_support.as_ref()))
+}
+
 impl ComAmazonawsEc2Amazonec2State {
     /// Whether another image fits inside the store's ceiling ([`MAX_IMAGES`]).
     ///
     /// The same contract as [`Self::has_vpc_capacity`]: a create asks first and refuses
-    /// instead of growing the store past its ceiling.
+    /// instead of growing the store past its ceiling. A writer asks
+    /// [`Self::would_exceed_stored_bytes`] with [`image_payload_bytes`] beside it, because a
+    /// count of records is no bound on the caller-chosen bytes each one holds.
     pub fn has_image_capacity(&self) -> bool {
         self.images.len() < MAX_IMAGES
     }
@@ -6119,8 +6693,14 @@ impl ComAmazonawsEc2Amazonec2State {
     /// manifest location `<owner>/<name>` the `manifest-location` filter selects on, and
     /// the fixed facts of an EBS-backed HVM machine image — so two writers cannot report
     /// the same image differently. Like [`Self::insert_vpc`], the caller-chosen bytes of
-    /// `spec.tags` are charged against the store's byte budget here.
+    /// the record are charged against the store's byte budget here, counted by the ONE
+    /// definition of that charge ([`image_payload_bytes`]) rather than by the tags alone:
+    /// a count ceiling ([`MAX_IMAGES`]) is no memory bound on its own, so every string
+    /// whose LENGTH a request chose is charged against [`MAX_STORED_BYTES`] too.
     pub fn insert_image(&mut self, spec: ImageSpec) -> String {
+        // Counted BEFORE `spec` is taken apart below, so the charge covers what the
+        // caller supplied rather than what survived into the record.
+        let payload_bytes = image_payload_bytes(&spec);
         let image_id = self.next_id("ami");
         let snapshot_id = self.next_id("snap");
         let owner = spec
@@ -6214,7 +6794,7 @@ impl ComAmazonawsEc2Amazonec2State {
             ramdisk_id: None,
             platform: spec.platform,
         };
-        self.add_stored_bytes(tag_list_bytes(image.tags.as_deref().unwrap_or_default()));
+        self.add_stored_bytes(payload_bytes);
         self.images.insert(image_id.clone(), image);
         image_id
     }
@@ -6517,7 +7097,12 @@ pub struct InstanceApplicationStatusRecord {
 
 /// A modelled timestamp as a sortable key, so two of them can be ordered without
 /// assuming anything about the timestamp type's own comparison traits.
-fn date_time_key(at: ::aws_smithy_types::DateTime) -> (i64, u32) {
+///
+/// The ONE definition of that key for this crate: the modelled timestamp type carries no
+/// `Ord`, and comparing two instants through `f64` seconds would lose the precision a
+/// `MillisecondDateTime` keeps, so every path that orders or windows timestamps — a
+/// describe's `*TimeBegin`/`*TimeEnd` window included — compares what this returns.
+pub fn date_time_key(at: ::aws_smithy_types::DateTime) -> (i64, u32) {
     (at.secs(), at.subsec_nanos())
 }
 
@@ -7324,8 +7909,69 @@ impl ComAmazonawsEc2Amazonec2State {
 }
 
 // ---------------------------------------------------------------------------
-// BYOIP address ranges
+// BYOIP address ranges: the modelled states, the address family, and what a
+// provision is held to. The published prefix bounds, the non-public address
+// catalogs and the provision path itself continue under the `part 2` banner
+// further down.
 // ---------------------------------------------------------------------------
+
+/// "pending-provision: You've submitted a request to provision an address range and it's
+/// pending" (`ByoipCidr$State`) — the state a range is in until the clock has given it
+/// [`TRANSITION_DELAY`], because "provisioning an address range is an asynchronous
+/// operation, so the call returns immediately, but the address range is not ready to use
+/// until its status changes from pending-provision to provisioned"
+/// (`ProvisionByoipCidr`).
+pub const BYOIP_CIDR_STATE_PENDING_PROVISION: &str = "pending-provision";
+
+/// The `ByoipCidrState` of a range whose withdrawal has been accepted and has not taken
+/// effect yet: "It can take a few minutes before traffic to the specified addresses stops
+/// routing to Amazon Web Services because of BGP propagation delays"
+/// (`WithdrawByoipCidr`) — the mirror of `pending-advertising`, declared beside the other
+/// pending state so one enum's transient words read together.
+pub const BYOIP_CIDR_STATE_PENDING_WITHDRAWAL: &str = "pending-withdrawal";
+
+/// The address family of a CIDR block: which of the two address spaces it names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddressFamily {
+    /// IPv4, read by the crate's own `canonical_ipv4_cidr` and the published-bound
+    /// readers on top of it ([`canonical_vpc_ipv4_cidr`] and friends).
+    Ipv4,
+    /// IPv6, read by [`canonical_ipv6_cidr`].
+    Ipv6,
+}
+
+impl AddressFamily {
+    /// The `ResourceType` of the address pool "provisioning an IPv4 or IPv6 address range
+    /// … creates a corresponding address pool" (`ProvisionByoipCidr`) for a range of this
+    /// family: the `ResourceType` enum's `ipv4pool-ec2` and `ipv6pool-ec2` members. It is
+    /// both the type a `PoolTagSpecifications` entry may name and the prefix of the pool's
+    /// own id, which is how EC2 spells a public pool id (`ipv4pool-ec2-…`).
+    pub fn pool_resource_type(self) -> &'static str {
+        match self {
+            Self::Ipv4 => "ipv4pool-ec2",
+            Self::Ipv6 => "ipv6pool-ec2",
+        }
+    }
+
+    /// The family of `cidr`: an IPv6 block is the one that carries a `:`, no IPv4
+    /// presentation form having one.
+    pub fn of_cidr(cidr: &str) -> Self {
+        if cidr.contains(':') {
+            Self::Ipv6
+        } else {
+            Self::Ipv4
+        }
+    }
+
+    /// How the model spells this family in an `AddressFamily` member
+    /// ([`ADDRESS_FAMILY_IPV4`] / [`ADDRESS_FAMILY_IPV6`]).
+    pub fn wire_name(self) -> &'static str {
+        match self {
+            Self::Ipv4 => ADDRESS_FAMILY_IPV4,
+            Self::Ipv6 => ADDRESS_FAMILY_IPV6,
+        }
+    }
+}
 
 /// `ByoipCidrState` of a range AWS has finished provisioning and will advertise on
 /// request.
@@ -7394,13 +8040,15 @@ pub struct ByoipCidrRecord {
     /// [`ComAmazonawsEc2Amazonec2State::materialize_due_transitions`], from the addresses
     /// the account holds out of the range then.
     pub released_at: Option<Instant>,
-    /// The state move an ADVERTISEMENT owes the range, for a range `AdvertiseByoipCidr` left
-    /// in `pending-advertising`; `None` for a range nothing is advertising.
+    /// The state move the clock owes the range for the work a request has STARTED on it: a
+    /// range `ProvisionByoipCidr` left in `pending-provision`, or one `AdvertiseByoipCidr`
+    /// left in `pending-advertising`; `None` for a range nothing is owed.
     ///
     /// Beside [`Self::released_at`] rather than folded into it because the two owe different
     /// things: a release's outcome is decided at its due instant from the addresses the
-    /// account holds then, while an advertisement's is known when it is asked for, so it is
-    /// carried as the [`PendingStateMove`] every other record of this store uses.
+    /// account holds then, while a provision's and an advertisement's are known when they
+    /// are asked for, so they are carried as the [`PendingStateMove`] every other record of
+    /// this store uses.
     pub pending: Option<PendingStateMove>,
 }
 
@@ -7530,6 +8178,11 @@ impl ComAmazonawsEc2Amazonec2State {
         record.byoip_cidr.state = Some(BYOIP_CIDR_STATE_PENDING_DEPROVISION.to_string());
         record.byoip_cidr.status_message = None;
         record.released_at = Some(Instant::now() + TRANSITION_DELAY);
+        // The release supersedes whatever state move was owed the range: a range being
+        // released is not going to land in the state an earlier provision or advertisement
+        // was moving it to, so that move is dropped rather than left to overwrite the
+        // release's own outcome.
+        record.pending = None;
         Some(record.byoip_cidr.clone())
     }
 
@@ -7610,7 +8263,8 @@ pub fn invalid_cidr_not_found<E>(cidr: &str) -> Scaffolded<E> {
 // The error code and refusal for a resource whose current state does not admit the request
 // — "The resource is not in the correct state for the request" (EC2 API error codes) — are
 // `INCORRECT_STATE` / `incorrect_state`, declared with the fast launch codes below;
-// `DeprovisionByoipCidr`'s state refusal uses that one rather than a second copy.
+// `WithdrawByoipCidr`'s and `DeprovisionByoipCidr`'s state refusals use that one rather
+// than a second copy.
 
 // ---------------------------------------------------------------------------
 // Capacity Blocks
@@ -7717,22 +8371,15 @@ impl CapacityBlockRecord {
         if let Some(pinned) = self.pinned_state {
             return pinned;
         }
-        let now = timestamp_key(system_time_to_date_time(now));
-        if self.block.start_date.map(timestamp_key).is_some_and(|start| now < start) {
+        let now = date_time_key(system_time_to_date_time(now));
+        if self.block.start_date.map(date_time_key).is_some_and(|start| now < start) {
             return CAPACITY_BLOCK_STATE_SCHEDULED;
         }
-        if self.block.end_date.map(timestamp_key).is_some_and(|end| now >= end) {
+        if self.block.end_date.map(date_time_key).is_some_and(|end| now >= end) {
             return CAPACITY_BLOCK_STATE_EXPIRED;
         }
         CAPACITY_BLOCK_STATE_ACTIVE
     }
-}
-
-/// A timestamp as a totally ordered key: the modelled timestamp type carries no `Ord`, and
-/// comparing the two instants of a window through `f64` seconds would lose precision the
-/// `MillisecondDateTime` the model uses for them keeps.
-fn timestamp_key(at: ::aws_smithy_types::DateTime) -> (i64, u32) {
-    (at.secs(), at.subsec_nanos())
 }
 
 /// What one stored Capacity Block is created with, for
@@ -7775,13 +8422,21 @@ impl ComAmazonawsEc2Amazonec2State {
         self.capacity_blocks.len().saturating_add(count) <= MAX_STORED_CAPACITY_BLOCKS
     }
 
-    /// Store one Capacity Block and answer the `CapacityBlockId` it was given.
+    /// Store one Capacity Block and answer the `CapacityBlockId` it was given, or `None`
+    /// with NOTHING written when the store has no room for it.
     ///
     /// The one place a Capacity Block enters this store, so every writer of one — and
     /// `DescribeCapacityBlocks`, which reports what this wrote — agrees on the id form, the
     /// stored shape and which members a block carries. The caller-chosen bytes the record
     /// retains are charged here, so no path can store them uncharged.
-    pub fn insert_capacity_block(&mut self, spec: CapacityBlockSpec) -> String {
+    ///
+    /// Both ceilings are also asked HERE, the way [`Self::insert_byoip_cidr`] asks its own,
+    /// so no path can get past them by forgetting to: the record ceiling
+    /// ([`Self::has_capacity_block_capacity`], because nothing in this emulator reclaims a
+    /// stored block) and the byte budget ([`Self::would_exceed_stored_bytes`], because a
+    /// count of records is no bound on the caller-chosen bytes each one holds). A writer maps
+    /// the `None` to the quota refusal its own operation answers with.
+    pub fn insert_capacity_block(&mut self, spec: CapacityBlockSpec) -> Option<String> {
         let capacity_block_id = self.next_id(CAPACITY_BLOCK_ID_PREFIX);
         let block = CapacityBlock {
             capacity_block_id: Some(capacity_block_id.clone()),
@@ -7797,7 +8452,11 @@ impl ComAmazonawsEc2Amazonec2State {
             state: None,
             tags: Some(spec.tags),
         };
-        self.add_stored_bytes(capacity_block_payload_bytes(&block));
+        let charge = capacity_block_payload_bytes(&block);
+        if !self.has_capacity_block_capacity(1) || self.would_exceed_stored_bytes(charge) {
+            return None;
+        }
+        self.add_stored_bytes(charge);
         self.capacity_blocks.insert(
             capacity_block_id.clone(),
             CapacityBlockRecord {
@@ -7805,7 +8464,7 @@ impl ComAmazonawsEc2Amazonec2State {
                 pinned_state: spec.pinned_state,
             },
         );
-        capacity_block_id
+        Some(capacity_block_id)
     }
 }
 
@@ -8137,6 +8796,357 @@ impl<T> ClockTransition<T> {
             due_at: Instant::now() + TRANSITION_DELAY,
             at: SystemTime::now() + TRANSITION_DELAY,
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// BYOIP address ranges (`ByoipCidr`), part 2: what a provision is held to, and
+// the stored record. Continues the `part 1` banner above.
+// ---------------------------------------------------------------------------
+
+/// The most specific IPv4 prefix a BYOIP range may have: "The most specific IPv4 prefix
+/// that you can specify is /24" (`ProvisionByoipCidrRequest$Cidr`).
+pub const MOST_SPECIFIC_BYOIP_IPV4_PREFIX: u8 = 24;
+
+/// The most specific IPv6 prefix a publicly advertisable BYOIP range may have: "The most
+/// specific IPv6 address range that you can bring is /48 for CIDRs that are publicly
+/// advertisable" (`ProvisionByoipCidrRequest$Cidr`).
+pub const MOST_SPECIFIC_BYOIP_IPV6_PREFIX: u8 = 48;
+
+/// The most specific IPv6 prefix a range that is NOT publicly advertisable may have: "…
+/// and /56 for CIDRs that are not publicly advertisable"
+/// (`ProvisionByoipCidrRequest$Cidr`).
+pub const MOST_SPECIFIC_BYOIP_IPV6_PREFIX_NOT_PUBLICLY_ADVERTISABLE: u8 = 56;
+
+/// "(IPv6 only) Indicate whether the address range will be publicly advertised to the
+/// internet. Default: true" (`ProvisionByoipCidrRequest$PubliclyAdvertisable`).
+pub const DEFAULT_PUBLICLY_ADVERTISABLE: bool = true;
+
+/// The Local Zone network border groups a BYOIPv4 range may be provisioned to: "You can
+/// provision BYOIP address ranges to and advertise them in the following Local Zone
+/// network border groups: us-east-1-dfw-2 us-west-2-lax-1 us-west-2-phx-2"
+/// (`ProvisionByoipCidrRequest$NetworkBorderGroup`).
+pub const LOCAL_ZONE_NETWORK_BORDER_GROUPS: [&str; 3] =
+    ["us-east-1-dfw-2", "us-west-2-lax-1", "us-west-2-phx-2"];
+
+/// May a range of `family` be provisioned to the network border group `group` from
+/// `region`?
+///
+/// The Region a request was signed for is always a network border group of its own — it is
+/// the group a request that names none gets — and beside it a BYOIPv4 range may name one of
+/// the Region's own Local Zone groups ([`LOCAL_ZONE_NETWORK_BORDER_GROUPS`], each of which
+/// starts with its parent Region's name). "You cannot provision or advertise BYOIPv6
+/// address ranges in Local Zones at this time"
+/// (`ProvisionByoipCidrRequest$NetworkBorderGroup`), so for IPv6 only the Region itself
+/// holds.
+pub fn byoip_network_border_group_allowed(
+    group: &str,
+    region: &str,
+    family: AddressFamily,
+) -> bool {
+    group == region
+        || (family == AddressFamily::Ipv4
+            && group.starts_with(region)
+            && LOCAL_ZONE_NETWORK_BORDER_GROUPS.contains(&group))
+}
+
+/// The error code a provision past the store's record ceiling carries, in EC2's own
+/// `<Resource>LimitExceeded` naming — the same convention as [`VPC_LIMIT_EXCEEDED`],
+/// [`SUBNET_LIMIT_EXCEEDED`] and [`VOLUME_LIMIT_EXCEEDED`], each of which is the code the
+/// real service answers that resource's quota with.
+pub const BYOIP_CIDR_LIMIT_EXCEEDED: &str = "ByoipCidrLimitExceeded";
+
+/// Refuse a provision that would take the store past the BYOIP record ceiling
+/// ([`ComAmazonawsEc2Amazonec2State::has_byoip_cidr_capacity`]): HTTP 400
+/// [`BYOIP_CIDR_LIMIT_EXCEEDED`].
+pub fn byoip_cidr_limit_exceeded<E>() -> Scaffolded<E> {
+    Scaffolded::service_error(
+        BYOIP_CIDR_LIMIT_EXCEEDED,
+        400,
+        format!(
+            "The maximum number of BYOIP address ranges has been reached \
+             ({MAX_STORED_RECORDS_PER_STORE})"
+        ),
+    )
+}
+
+/// Why a requested BYOIP address range cannot be provisioned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ByoipCidrProblem {
+    /// The value is not a CIDR block of either address family.
+    Malformed,
+    /// The block parses, but its prefix is more specific than the most specific one the
+    /// family (and, for IPv6, the advertisability) admits — the carried bound.
+    PrefixLength(u8),
+    /// The block parses, but it is not public address space, so it cannot be an address
+    /// range brought to AWS: `ProvisionByoipCidrRequest$Cidr` is "The public IPv4 or IPv6
+    /// address range".
+    NotPublic,
+}
+
+/// One readable BYOIP address range: the block in canonical form, and its family.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ByoipCidrBlock {
+    /// The block with its host bits cleared, the form this crate stores every CIDR in.
+    pub cidr: String,
+    /// Which address space it names, which decides the pool's resource type and the
+    /// prefix bound it was held to.
+    pub family: AddressFamily,
+}
+
+/// A requested BYOIP address range, read the one way this crate reads a CIDR block and
+/// held to what `ProvisionByoipCidrRequest$Cidr` publishes for one: a PUBLIC IPv4 or IPv6
+/// range, no more specific than /24 for IPv4, /48 for a publicly advertisable IPv6 range
+/// and /56 for one that is not.
+///
+/// The canonical form is the one the store keys its ranges by ([`canonical_byoip_cidr`]);
+/// what this adds is the published bounds a PROVISION is held to, which a range already in
+/// the store is not re-checked against.
+pub fn provisionable_byoip_cidr(
+    value: &str,
+    publicly_advertisable: bool,
+) -> Result<ByoipCidrBlock, ByoipCidrProblem> {
+    let family = AddressFamily::of_cidr(value);
+    let canonical = canonical_byoip_cidr(value).map_err(|_| ByoipCidrProblem::Malformed)?;
+    let (prefix_length, most_specific) = match family {
+        AddressFamily::Ipv4 => {
+            let (_, prefix_length) =
+                split_ipv4_cidr(&canonical).ok_or(ByoipCidrProblem::Malformed)?;
+            (prefix_length, MOST_SPECIFIC_BYOIP_IPV4_PREFIX)
+        }
+        AddressFamily::Ipv6 => {
+            let (_, prefix_length) =
+                split_ipv6_cidr(&canonical).ok_or(ByoipCidrProblem::Malformed)?;
+            let most_specific = if publicly_advertisable {
+                MOST_SPECIFIC_BYOIP_IPV6_PREFIX
+            } else {
+                MOST_SPECIFIC_BYOIP_IPV6_PREFIX_NOT_PUBLICLY_ADVERTISABLE
+            };
+            (prefix_length, most_specific)
+        }
+    };
+    if prefix_length > most_specific {
+        return Err(ByoipCidrProblem::PrefixLength(most_specific));
+    }
+    if !cidr_block_is_public(&canonical) {
+        return Err(ByoipCidrProblem::NotPublic);
+    }
+    Ok(ByoipCidrBlock {
+        cidr: canonical,
+        family,
+    })
+}
+
+/// Every IPv4 block the IANA IPv4 Special-Purpose Address Registry (RFC 6890) marks as
+/// NOT globally reachable: this host, private use, shared address space, loopback,
+/// link local, protocol assignments, the three documentation blocks, the AS112 and AMT
+/// assignments, benchmarking, 6to4 relay anycast, multicast and reserved space.
+///
+/// An address range brought to AWS is "The public IPv4 or IPv6 address range"
+/// (`ProvisionByoipCidrRequest$Cidr`) — a range the account holds a registry allocation and
+/// an RPKI ROA for — so a block that meets any of these cannot be one.
+const NON_PUBLIC_IPV4_BLOCKS: [&str; 18] = [
+    "0.0.0.0/8",
+    "10.0.0.0/8",
+    "100.64.0.0/10",
+    "127.0.0.0/8",
+    "169.254.0.0/16",
+    "172.16.0.0/12",
+    "192.0.0.0/24",
+    "192.0.2.0/24",
+    "192.31.196.0/24",
+    "192.52.193.0/24",
+    "192.88.99.0/24",
+    "192.168.0.0/16",
+    "192.175.48.0/24",
+    "198.18.0.0/15",
+    "198.51.100.0/24",
+    "203.0.113.0/24",
+    "224.0.0.0/4",
+    "240.0.0.0/4",
+];
+
+/// Every IPv6 block the IANA IPv6 Special-Purpose Address Registry marks as not globally
+/// reachable while sitting INSIDE global unicast space: Teredo, benchmarking, ORCHIDv2 and
+/// the two documentation blocks, plus 6to4. Everything outside global unicast is excluded
+/// by [`GLOBAL_UNICAST_IPV6_BLOCK`] instead.
+const NON_PUBLIC_IPV6_BLOCKS: [&str; 6] = [
+    "2001::/32",
+    "2001:2::/48",
+    "2001:20::/28",
+    "2001:db8::/32",
+    "2002::/16",
+    "3fff::/20",
+];
+
+/// The one global unicast IPv6 block: IANA's IPv6 Global Unicast Address Assignments give
+/// `2000::/3` as the only space handed to the registries, so a BYOIPv6 range has to be
+/// inside it.
+const GLOBAL_UNICAST_IPV6_BLOCK: &str = "2000::/3";
+
+/// Is every address of `block` public address space — space a registry allocates, as
+/// opposed to the special-purpose blocks no one can bring to AWS?
+///
+/// A block that is only PARTLY public is not: a caller cannot hold an allocation for a
+/// range that reaches into reserved space, which is why this asks about overlap rather
+/// than about the block's base address.
+pub fn cidr_block_is_public(block: &str) -> bool {
+    match AddressFamily::of_cidr(block) {
+        AddressFamily::Ipv4 => NON_PUBLIC_IPV4_BLOCKS
+            .iter()
+            .all(|reserved| !ipv4_cidr_blocks_overlap(block, reserved)),
+        AddressFamily::Ipv6 => {
+            ipv6_cidr_block_contains(GLOBAL_UNICAST_IPV6_BLOCK, block)
+                && NON_PUBLIC_IPV6_BLOCKS
+                    .iter()
+                    .all(|reserved| !ipv6_cidr_blocks_overlap(block, reserved))
+        }
+    }
+}
+
+/// `block` as its base address and prefix length, for a block already in canonical form —
+/// the IPv6 counterpart of [`split_ipv4_cidr`].
+fn split_ipv6_cidr(block: &str) -> Option<(u128, u8)> {
+    let (address, prefix_length) = block.split_once('/')?;
+    let base = u128::from(address.parse::<Ipv6Addr>().ok()?);
+    let prefix_length: u8 = prefix_length.parse().ok()?;
+    (prefix_length <= 128).then_some((base, prefix_length))
+}
+
+/// The first and last address of `block`, or `None` when it is not an IPv6 CIDR block.
+fn ipv6_cidr_bounds(block: &str) -> Option<(u128, u128)> {
+    let (base, prefix_length) = split_ipv6_cidr(block)?;
+    let size = 1u128
+        .checked_shl(u32::from(128 - prefix_length))
+        .unwrap_or_default();
+    // A /0 spans the whole space, whose size does not fit a u128; its last address is the
+    // largest one there is.
+    let last = match size {
+        0 => u128::MAX,
+        size => base.checked_add(size - 1)?,
+    };
+    Some((base, last))
+}
+
+/// Do `left` and `right` share any IPv6 address? The IPv6 counterpart of
+/// [`ipv4_cidr_blocks_overlap`], on the same terms: a block this emulator cannot read
+/// overlaps nothing.
+pub fn ipv6_cidr_blocks_overlap(left: &str, right: &str) -> bool {
+    match (ipv6_cidr_bounds(left), ipv6_cidr_bounds(right)) {
+        (Some((left_first, left_last)), Some((right_first, right_last))) => {
+            left_first <= right_last && right_first <= left_last
+        }
+        _ => false,
+    }
+}
+
+/// Is every address of `inner` an address of `outer`? The IPv6 counterpart of
+/// [`ipv4_cidr_block_contains`].
+pub fn ipv6_cidr_block_contains(outer: &str, inner: &str) -> bool {
+    match (ipv6_cidr_bounds(outer), ipv6_cidr_bounds(inner)) {
+        (Some((outer_first, outer_last)), Some((inner_first, inner_last))) => {
+            outer_first <= inner_first && inner_last <= outer_last
+        }
+        _ => false,
+    }
+}
+
+/// Do `left` and `right` share an address, whatever family they are?
+///
+/// Two blocks of DIFFERENT families share nothing — an IPv4 address is not an IPv6 one —
+/// so the question is only ever asked within one family, and this is the one reader that
+/// picks which. It is what "The address range cannot overlap with another address range
+/// that you've brought to this or another Region" (`ProvisionByoipCidrRequest$Cidr`) asks.
+pub fn cidr_blocks_overlap(left: &str, right: &str) -> bool {
+    match (AddressFamily::of_cidr(left), AddressFamily::of_cidr(right)) {
+        (AddressFamily::Ipv4, AddressFamily::Ipv4) => ipv4_cidr_blocks_overlap(left, right),
+        (AddressFamily::Ipv6, AddressFamily::Ipv6) => ipv6_cidr_blocks_overlap(left, right),
+        _ => false,
+    }
+}
+
+/// What a provision stores: everything about one BYOIP range that comes from the request,
+/// read and validated by `ProvisionByoipCidr` before the store is touched.
+#[derive(Debug, Clone)]
+pub struct ByoipCidrSpec {
+    /// The range, canonical, as [`provisionable_byoip_cidr`] read it.
+    pub block: ByoipCidrBlock,
+    /// "A description for the address range and the address pool"
+    /// (`ProvisionByoipCidrRequest$Description`).
+    pub description: Option<String>,
+    /// The network border group the range is advertised from: the one the request named,
+    /// or the Region it was signed for.
+    pub network_border_group: String,
+    /// Whether the range "will be publicly advertised to the internet"
+    /// (`ProvisionByoipCidrRequest$PubliclyAdvertisable`).
+    pub publicly_advertisable: bool,
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// The BYOIP range the store holds that shares an address with `cidr`, if any.
+    ///
+    /// "The address range cannot overlap with another address range that you've brought to
+    /// this or another Region" (`ProvisionByoipCidrRequest$Cidr`) — asked over the whole
+    /// store, so a range that merely CONTAINS or sits inside a provisioned one is caught
+    /// as well as an exact repeat.
+    pub fn byoip_cidr_overlapping(&self, cidr: &str) -> Option<&str> {
+        self.byoip_cidrs
+            .keys()
+            .find(|held| cidr_blocks_overlap(cidr, held))
+            .map(String::as_str)
+    }
+
+    /// Store `spec` as a newly provisioned BYOIP range and answer it as the provision
+    /// reports it — `pending-provision`, the state the clock owes `provisioned`
+    /// [`TRANSITION_DELAY`] from now ([`ByoipCidrRecord::pending`]).
+    ///
+    /// The pool the range gets ("creates a corresponding address pool",
+    /// `ProvisionByoipCidr`) is minted here from the store's own id counter, so no caller
+    /// can choose a pool id. The record goes in through [`Self::insert_byoip_cidr`], the one
+    /// write path, which charges the bytes it holds and REFUSES a record that does not fit
+    /// the store's ceilings — so `None`, with nothing stored, rather than a range reported
+    /// to a caller that the store does not hold.
+    pub fn provision_byoip_cidr(&mut self, spec: ByoipCidrSpec) -> Option<ByoipCidr> {
+        let pool_id = self.next_id(spec.block.family.pool_resource_type());
+        let becomes = match (spec.block.family, spec.publicly_advertisable) {
+            (AddressFamily::Ipv6, false) => BYOIP_CIDR_STATE_PROVISIONED_NOT_PUBLICLY_ADVERTISABLE,
+            _ => BYOIP_CIDR_STATE_PROVISIONED,
+        };
+        let record = ByoipCidrRecord {
+            byoip_cidr: ByoipCidr {
+                cidr: Some(spec.block.cidr.clone()),
+                description: spec.description,
+                // "The BYOIP CIDR associations with ASNs" (`ByoipCidr$AsnAssociations`):
+                // none until `AssociateIpamByoasn` makes one.
+                asn_associations: Some(Vec::new()),
+                // "Upon success, contains the ID of the address pool"
+                // (`ByoipCidr$StatusMessage`) — the provision has not succeeded yet, so
+                // there is nothing to report until the clock says it has.
+                status_message: None,
+                state: Some(BYOIP_CIDR_STATE_PENDING_PROVISION.to_string()),
+                network_border_group: Some(spec.network_border_group),
+                // `ByoipCidr$AdvertisementType` is how the range IS advertised, and this
+                // one is not advertised yet — `AdvertiseByoipCidr` is what starts that.
+                advertisement_type: None,
+                pool_id: Some(pool_id),
+                // "The ID of the IPAM pool associated with the CIDR"
+                // (`ByoipCidr$IpamPoolId`): a range provisioned through this operation is
+                // not in an IPAM pool; `MoveByoipCidrToIpam` is what puts one there.
+                ipam_pool_id: None,
+            },
+            released_at: None,
+            // What the clock now owes this range, recorded rather than slept for: "the
+            // address range is not ready to use until its status changes from
+            // pending-provision to provisioned" (`ProvisionByoipCidr`), one
+            // [`TRANSITION_DELAY`] from now, off the same monotonic clock as every other
+            // move this store owes. WHAT it becomes is decided by the REQUEST — an IPv6
+            // range the caller asked not to have advertised lands in
+            // `provisioned-not-publicly-advertisable` — so it is recorded here rather than
+            // guessed at the due instant.
+            pending: Some(PendingStateMove::starting_now(becomes)),
+        };
+        let reported = record.byoip_cidr.clone();
+        self.insert_byoip_cidr(record).then_some(reported)
     }
 }
 
@@ -8705,6 +9715,156 @@ pub fn address_limit_exceeded<E>(message: impl Into<String>) -> Scaffolded<E> {
 /// one border group.
 pub fn network_border_group_of_region(region: &str) -> String {
     region.to_string()
+}
+
+// ---------------------------------------------------------------------------
+// Elastic IP address transfers
+// ---------------------------------------------------------------------------
+
+/// A transfer the source account has started that has neither been accepted nor expired:
+/// the `AddressTransferStatus` enum's `pending` member
+/// (`smithy_query(query="shape",shape="AddressTransferStatus")`).
+pub const ADDRESS_TRANSFER_STATUS_PENDING: &str = "pending";
+
+/// A transfer offer the source account has withdrawn: the `AddressTransferStatus` enum's
+/// `disabled` member, which is what "Disables Elastic IP address transfer"
+/// (`DisableAddressTransfer`) leaves behind.
+pub const ADDRESS_TRANSFER_STATUS_DISABLED: &str = "disabled";
+
+/// A transfer the transfer account has taken: the `AddressTransferStatus` enum's
+/// `accepted` member.
+pub const ADDRESS_TRANSFER_STATUS_ACCEPTED: &str = "accepted";
+
+/// How long a transfer offer stands before it expires on its own.
+///
+/// DOCUMENTED, not chosen: "When the source account starts the transfer, the transfer
+/// account has seven days to accept the Elastic IP address transfer … After seven days,
+/// the transfer expires and ownership of the Elastic IP address returns to the source
+/// account" (`DescribeAddressTransfers`). It is also the instant
+/// `AddressTransfer$TransferOfferExpirationTimestamp` reports.
+pub const ADDRESS_TRANSFER_OFFER_WINDOW: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+/// How long an accepted transfer stays visible to the source account.
+///
+/// DOCUMENTED, not chosen: "Accepted transfers are visible to the source account for 14
+/// days after the transfers have been accepted" (`DescribeAddressTransfers`).
+pub const ADDRESS_TRANSFER_ACCEPTED_VISIBILITY: Duration =
+    Duration::from_secs(14 * 24 * 60 * 60);
+
+/// One Elastic IP address transfer the source account can see: the modelled
+/// [`AddressTransfer`] every operation that reports one answers with, plus when the record
+/// stops being one of that account's transfers — the one fact that shape carries no member
+/// for.
+///
+/// Built in exactly one place ([`ComAmazonawsEc2Amazonec2State::offer_address_transfer`]),
+/// so the instant beside the record and the timestamps on it cannot disagree.
+#[derive(Debug, Clone)]
+pub struct AddressTransferRecord {
+    /// The transfer as every operation that reports one answers with it.
+    pub transfer: AddressTransfer,
+    /// When this record stops being one of the source account's transfers: the end of the
+    /// offer window for a transfer that was never accepted, and
+    /// [`ADDRESS_TRANSFER_ACCEPTED_VISIBILITY`] after the acceptance for one that was. On
+    /// the wall clock, because both spans are documented in days and are the same instants
+    /// the record's own timestamps report.
+    pub visible_until: SystemTime,
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// Start the transfer of the Elastic IP address `allocation_id` to
+    /// `transfer_account_id`, as of `at`, and answer the `AllocationId` the record is keyed
+    /// by.
+    ///
+    /// "Enables Elastic IP address transfer" (`EnableAddressTransfer`): the offer is
+    /// `pending` and stands for [`ADDRESS_TRANSFER_OFFER_WINDOW`], which is the instant
+    /// `TransferOfferExpirationTimestamp` reports and the instant the record stops being
+    /// visible. An address has at most one transfer at a time, so starting one on an
+    /// address that already carries a record REPLACES it: the call says what the account
+    /// wants the address's transfer to be, and the model declares no error for an address
+    /// that already has one.
+    ///
+    /// No byte charge is made for the record: it is keyed by an id of [`Self::addresses`],
+    /// so there can be no more of them than there are stored addresses, and the only
+    /// caller-supplied value it retains is an account id, which is
+    /// [`AWS_ACCOUNT_ID_DIGITS`] digits.
+    pub fn offer_address_transfer(
+        &mut self,
+        allocation_id: &str,
+        public_ip: Option<&str>,
+        transfer_account_id: &str,
+        at: SystemTime,
+    ) -> String {
+        let expires_at = at + ADDRESS_TRANSFER_OFFER_WINDOW;
+        let record = AddressTransferRecord {
+            transfer: AddressTransfer {
+                public_ip: public_ip.map(str::to_string),
+                allocation_id: Some(allocation_id.to_string()),
+                transfer_account_id: Some(transfer_account_id.to_string()),
+                transfer_offer_expiration_timestamp: Some(system_time_to_date_time(expires_at)),
+                // Nothing has accepted the offer: "The timestamp when the Elastic IP
+                // address transfer was accepted"
+                // (`AddressTransfer$TransferOfferAcceptedTimestamp`) names no instant yet.
+                transfer_offer_accepted_timestamp: None,
+                address_transfer_status: Some(ADDRESS_TRANSFER_STATUS_PENDING.to_string()),
+            },
+            visible_until: expires_at,
+        };
+        self.address_transfers
+            .insert(allocation_id.to_string(), record);
+        allocation_id.to_string()
+    }
+
+    /// Withdraw the transfer offer on `allocation_id`, answering whether there was a
+    /// `pending` one to withdraw.
+    ///
+    /// "Disables Elastic IP address transfer" (`DisableAddressTransfer`): only a `pending`
+    /// offer can be withdrawn — an accepted transfer has already moved the address, and a
+    /// disabled one is already withdrawn — so this answers `false` for every other state
+    /// and the caller refuses the request with
+    /// [`address_transfer_not_available`]. The record keeps the expiration instant it was
+    /// offered with: withdrawing the offer does not move when the offer would have run out,
+    /// which is also when the record stops being reported.
+    pub fn withdraw_address_transfer(&mut self, allocation_id: &str) -> bool {
+        let Some(record) = self.address_transfers.get_mut(allocation_id) else {
+            return false;
+        };
+        if record.transfer.address_transfer_status.as_deref()
+            != Some(ADDRESS_TRANSFER_STATUS_PENDING)
+        {
+            return false;
+        }
+        record.transfer.address_transfer_status =
+            Some(ADDRESS_TRANSFER_STATUS_DISABLED.to_string());
+        true
+    }
+
+    /// Drop every transfer record the clock has taken past
+    /// [`AddressTransferRecord::visible_until`].
+    ///
+    /// Reached through [`Self::materialize_due_transitions`], so a reporting operation may
+    /// apply it: "After seven days, the transfer expires and ownership of the Elastic IP
+    /// address returns to the source account", and an accepted transfer is visible "for 14
+    /// days after the transfers have been accepted" (`DescribeAddressTransfers`) — each was
+    /// already owed at `now` whether or not anybody asked.
+    pub fn expire_due_address_transfers(&mut self, now: SystemTime) {
+        self.address_transfers
+            .retain(|_allocation_id, record| now < record.visible_until);
+    }
+}
+
+/// Refuse a request the Elastic IP address transfer surface has no transfer to act on:
+/// HTTP 400 `InvalidAddress.NotFound`.
+///
+/// The message is the one the real service answers there — `The Elastic IP address
+/// '<address>' does not exist or is not available.`, naming the address from the request —
+/// which is a different sentence from [`invalid_address_not_found`]'s, that one being for an
+/// address the account holds no allocation for at all.
+pub fn address_transfer_not_available<E>(address: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_ADDRESS_NOT_FOUND,
+        400,
+        format!("The Elastic IP address '{address}' does not exist or is not available."),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -9877,6 +11037,37 @@ pub fn prefixed_id_is_well_formed(prefix: &str, id: &str) -> bool {
             .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
 }
 
+/// Whether `id` is a well-formed LONG-form EC2 resource id of the kind `prefix` names that
+/// EC2 could have ISSUED.
+///
+/// The stricter reading of [`prefixed_id_is_well_formed`], for the resource kinds AWS answers
+/// `Invalid<Kind>.Malformed` for an id that merely LOOKS hexadecimal: the suffix carries
+/// exactly [`LONG_RESOURCE_ID_DIGITS`] lowercase hexadecimal digits, its leading digit is
+/// `0` (the long form carries 68 bits for a 64-bit internal identifier, so an issued id
+/// always reads `<prefix>-0…`, which is also what [`ComAmazonawsEc2Amazonec2State::next_id`]
+/// mints), and they are not all `0` (the placeholder every client reaches for, which the
+/// mint counting from one can never produce).
+///
+/// Which resource kinds read ids this way is a fact about each kind, not about every EC2 id:
+/// [`instance_id_is_well_formed`] and [`capacity_reservation_fleet_id_is_well_formed`] do,
+/// each on the evidence recorded with it, while a network interface id answers `NotFound`
+/// for the same all-zero suffix and so reads ids through
+/// [`prefixed_id_is_well_formed`] instead.
+pub fn issued_long_id_is_well_formed(prefix: &str, id: &str) -> bool {
+    let Some(suffix) = id
+        .strip_prefix(prefix)
+        .and_then(|rest| rest.strip_prefix('-'))
+    else {
+        return false;
+    };
+    suffix.len() == LONG_RESOURCE_ID_DIGITS
+        && suffix
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+        && suffix.starts_with('0')
+        && suffix.bytes().any(|byte| byte != b'0')
+}
+
 /// Whether `id` is a well-formed VPC ENDPOINT id, as opposed to an id of one of the two
 /// other resources whose ids also begin `vpce-`.
 ///
@@ -10079,15 +11270,33 @@ impl TransitGatewayAttachmentView {
         }
     }
 
-    /// The caller-chosen bytes this attachment holds: its tags, the only member of any kind
-    /// that a caller sizes.
+    /// The caller-chosen bytes this attachment holds: its tags, and — for an attachment
+    /// shape that carries none — the ids of what it attaches, which a writer supplies.
+    ///
+    /// NOTHING here answers zero for a whole variant: the fixed per-record overhead
+    /// [`STORED_RECORD_OVERHEAD_BYTES`] is charged beside it by
+    /// [`ComAmazonawsEc2Amazonec2State::insert_transit_gateway_attachment`], so no stored
+    /// attachment is free against the byte budget whatever it carries.
     fn payload_bytes(&self) -> usize {
         match self {
             Self::Vpc(attachment) => tag_list_bytes(attachment.tags.as_deref().unwrap_or_default()),
             Self::Peering(attachment) => {
                 tag_list_bytes(attachment.tags.as_deref().unwrap_or_default())
             }
-            Self::ClientVpn(_) => 0,
+            // `TransitGatewayClientVpnAttachment` models no tags, so what a writer sizes
+            // here is the Client VPN endpoint it names and the account that owns it.
+            Self::ClientVpn(attachment) => attachment
+                .client_vpn_endpoint_id
+                .as_deref()
+                .unwrap_or_default()
+                .len()
+                .saturating_add(
+                    attachment
+                        .client_vpn_owner_id
+                        .as_deref()
+                        .unwrap_or_default()
+                        .len(),
+                ),
         }
     }
 }
@@ -10206,6 +11415,245 @@ pub const ANNOUNCEMENT_STATE_DELETING: &str = "deleting";
 pub const ANNOUNCEMENT_STATE_DELETED: &str = "deleted";
 
 // =============================================================================
+// Transit gateway policy tables, and the attachments associated with them
+// =============================================================================
+
+/// The id prefix a transit gateway policy table is minted with.
+pub const TRANSIT_GATEWAY_POLICY_TABLE_ID_PREFIX: &str = "tgw-ptb";
+
+/// A policy table association being carried out: the `TransitGatewayAssociationState`
+/// enum's `associating` member
+/// (`smithy_query(query="shape",shape="TransitGatewayAssociationState")`, whose members are
+/// `associating`, `associated`, `disassociating`, `disassociated`).
+pub const TRANSIT_GATEWAY_ASSOCIATION_STATE_ASSOCIATING: &str = "associating";
+
+/// An association in force: that enum's `associated` member.
+pub const TRANSIT_GATEWAY_ASSOCIATION_STATE_ASSOCIATED: &str = "associated";
+
+/// A policy table in service: the `TransitGatewayPolicyTableState` enum's `available`
+/// member (that enum being `pending`, `available`, `deleting`, `deleted`).
+pub const TRANSIT_GATEWAY_POLICY_TABLE_STATE_AVAILABLE: &str = "available";
+
+/// One attachment's association with a transit gateway policy table: the modelled
+/// [`TransitGatewayPolicyTableAssociation`] every operation that reports one answers with,
+/// plus the move the clock owes it.
+///
+/// The modelled shape itself rather than a parallel record, for the reason every other
+/// store here holds one: a member a writer sets round-trips through
+/// `GetTransitGatewayPolicyTableAssociations` without a field-by-field copy that can
+/// silently drop one.
+#[derive(Debug, Clone)]
+pub struct TransitGatewayPolicyTableAssociationRecord {
+    /// The association as the model shapes it, carrying the state reached so far.
+    pub view: TransitGatewayPolicyTableAssociation,
+    /// The move to `associated` an association owes while it is still `associating`;
+    /// `None` for one that owes none.
+    pub pending: Option<PendingStateMove>,
+}
+
+/// One transit gateway policy table and the attachments associated with it.
+///
+/// The associations are keyed by `TransitGatewayAttachmentId`, because an association IS
+/// per (table, attachment): one attachment cannot be associated with one table twice, and
+/// the key order is the stable order a report of them pages over.
+#[derive(Debug, Clone)]
+pub struct TransitGatewayPolicyTableRecord {
+    /// The policy table itself, as the modelled shape its own operations report.
+    pub view: TransitGatewayPolicyTable,
+    /// The attachments associated with this table, by `TransitGatewayAttachmentId`.
+    pub associations: BTreeMap<String, TransitGatewayPolicyTableAssociationRecord>,
+}
+
+/// `InvalidTransitGatewayPolicyTableId.NotFound` (HTTP 400): the request named a transit
+/// gateway policy table id this account holds no policy table for.
+pub const INVALID_TRANSIT_GATEWAY_POLICY_TABLE_ID_NOT_FOUND: &str =
+    "InvalidTransitGatewayPolicyTableId.NotFound";
+
+/// `InvalidTransitGatewayPolicyTableId.Malformed` (HTTP 400): the request named something
+/// that is not a transit gateway policy table id at all.
+pub const INVALID_TRANSIT_GATEWAY_POLICY_TABLE_ID_MALFORMED: &str =
+    "InvalidTransitGatewayPolicyTableId.Malformed";
+
+/// Refuse a request that named a transit gateway policy table id no policy table of the
+/// account has: HTTP 400 `InvalidTransitGatewayPolicyTableId.NotFound`, worded the way
+/// [`invalid_transit_gateway_id_not_found`] words the transit gateway's own.
+pub fn invalid_transit_gateway_policy_table_id_not_found<E>(
+    transit_gateway_policy_table_id: &str,
+) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_TRANSIT_GATEWAY_POLICY_TABLE_ID_NOT_FOUND,
+        400,
+        format!(
+            "Transit Gateway Policy Table {transit_gateway_policy_table_id} was deleted or does \
+             not exist."
+        ),
+    )
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// The transit gateway policy table `transit_gateway_policy_table_id` names, refusing a
+    /// malformed id first and an unknown one second — the order
+    /// [`require_well_formed_id`] documents, so "not an id of this kind" is never reported
+    /// as "no such policy table".
+    ///
+    /// The ONE place a `TransitGatewayPolicyTableId` is resolved, so every operation that
+    /// takes one refuses the same id the same way.
+    pub fn require_transit_gateway_policy_table<E>(
+        &self,
+        transit_gateway_policy_table_id: &str,
+    ) -> Result<&TransitGatewayPolicyTableRecord, Scaffolded<E>> {
+        require_well_formed_id(
+            TRANSIT_GATEWAY_POLICY_TABLE_ID_PREFIX,
+            transit_gateway_policy_table_id,
+            INVALID_TRANSIT_GATEWAY_POLICY_TABLE_ID_MALFORMED,
+        )?;
+        self.transit_gateway_policy_tables
+            .get(transit_gateway_policy_table_id)
+            .ok_or_else(|| {
+                invalid_transit_gateway_policy_table_id_not_found(transit_gateway_policy_table_id)
+            })
+    }
+
+    /// The policy table `transit_gateway_attachment_id` is already associated with, if any.
+    ///
+    /// An attachment is associated with at most one policy table, so this answers at most
+    /// one id; it is a scan of the tables the account holds, which is bounded by
+    /// [`MAX_STORED_RECORDS_PER_STORE`] like every other store here.
+    pub fn policy_table_of_attachment(&self, transit_gateway_attachment_id: &str) -> Option<&str> {
+        self.transit_gateway_policy_tables
+            .iter()
+            .find(|(_, table)| {
+                table
+                    .associations
+                    .contains_key(transit_gateway_attachment_id)
+            })
+            .map(|(policy_table_id, _)| policy_table_id.as_str())
+    }
+
+    /// Store a transit gateway policy table and answer the `TransitGatewayPolicyTableId` it
+    /// was given — or `None` when the store is full.
+    ///
+    /// The id is minted here rather than taken from `view`, exactly as
+    /// [`Self::insert_transit_gateway_attachment`] mints an attachment id, and the
+    /// caller-chosen bytes the table holds (its tags) are charged here on top of the fixed
+    /// [`STORED_RECORD_OVERHEAD_BYTES`] every stored record costs, so no path can store one
+    /// uncharged. A table is stored with no associations: every association is made by a
+    /// request.
+    pub fn insert_transit_gateway_policy_table(
+        &mut self,
+        mut view: TransitGatewayPolicyTable,
+    ) -> Option<String> {
+        if self.transit_gateway_policy_tables.len() >= MAX_STORED_RECORDS_PER_STORE {
+            return None;
+        }
+        let policy_table_id = self.next_id(TRANSIT_GATEWAY_POLICY_TABLE_ID_PREFIX);
+        view.transit_gateway_policy_table_id = Some(policy_table_id.clone());
+        self.add_stored_bytes(
+            STORED_RECORD_OVERHEAD_BYTES + tag_list_bytes(view.tags.as_deref().unwrap_or_default()),
+        );
+        self.transit_gateway_policy_tables.insert(
+            policy_table_id.clone(),
+            TransitGatewayPolicyTableRecord {
+                view,
+                associations: BTreeMap::new(),
+            },
+        );
+        Some(policy_table_id)
+    }
+}
+
+/// Associate the transit gateway attachment `transit_gateway_attachment_id` with the
+/// transit gateway policy table `transit_gateway_policy_table_id`, and answer the
+/// association as it now stands.
+///
+/// The rule `AssociateTransitGatewayPolicyTable` follows, in one place so a later
+/// disassociation and report cannot disagree with it: both resources must exist, an
+/// attachment already associated with a policy table cannot be associated with another, and
+/// a new association starts in the TRANSIENT `associating` state with the clock owing it
+/// `associated` — the span is never zero, so a caller acting straight after this call still
+/// sees `associating`.
+///
+/// The association's `ResourceId` and `ResourceType` are read off the stored attachment
+/// ("The resource ID of the transit gateway attachment" /  "The resource type for the
+/// transit gateway policy table association",
+/// `TransitGatewayPolicyTableAssociation$ResourceId` / `$ResourceType`), never off the
+/// request, which names neither. The CALLER refuses a malformed id of either kind first, so
+/// nothing here depends on the request's form.
+pub fn associate_transit_gateway_policy_table<E>(
+    store: &mut ComAmazonawsEc2Amazonec2State,
+    transit_gateway_policy_table_id: &str,
+    transit_gateway_attachment_id: &str,
+) -> Result<TransitGatewayPolicyTableAssociation, Scaffolded<E>> {
+    // The clock first: an association whose move has fallen due is already `associated`, so
+    // what this call is asked against is the state the store is ACTUALLY in.
+    store.materialize_due_transitions();
+
+    // The policy table the request names, before the attachment: the operation's members
+    // name the table first, and a request naming two unknown resources is told about the
+    // first one.
+    store.require_transit_gateway_policy_table(transit_gateway_policy_table_id)?;
+
+    // "The ID of the transit gateway attachment to associate with the policy table"
+    // (`AssociateTransitGatewayPolicyTableRequest$TransitGatewayAttachmentId`): an id
+    // naming no attachment of the account is refused with the attachment's own NotFound
+    // code rather than silently associating nothing.
+    let attachment = store
+        .transit_gateway_attachments
+        .get(transit_gateway_attachment_id)
+        .ok_or_else(|| {
+            id_not_found(
+                INVALID_TRANSIT_GATEWAY_ATTACHMENT_ID_NOT_FOUND,
+                "transit gateway attachment ID",
+                transit_gateway_attachment_id,
+            )
+        })?;
+    let resource_id = attachment.view.resource_id().map(str::to_string);
+    let resource_type = attachment.view.resource_type().to_string();
+
+    // One attachment, at most one policy table — so a second association is refused with
+    // EC2's own `Resource.AlreadyAssociated` and NOTHING is written, whether the table it
+    // already belongs to is this one or another.
+    if let Some(holder) = store.policy_table_of_attachment(transit_gateway_attachment_id) {
+        return Err(resource_already_associated(format!(
+            "The transit gateway attachment '{transit_gateway_attachment_id}' is already \
+             associated with the transit gateway policy table '{holder}'"
+        )));
+    }
+
+    let view = TransitGatewayPolicyTableAssociation {
+        transit_gateway_policy_table_id: Some(transit_gateway_policy_table_id.to_string()),
+        transit_gateway_attachment_id: Some(transit_gateway_attachment_id.to_string()),
+        resource_id,
+        resource_type: Some(resource_type),
+        state: Some(TRANSIT_GATEWAY_ASSOCIATION_STATE_ASSOCIATING.to_string()),
+    };
+    // An association retains no caller-chosen text at all — every string on it is either a
+    // word this module chose or an id read back out of another store, and an attachment is
+    // associated at most once, so the table cannot hold more associations than the
+    // attachment store holds attachments ([`MAX_STORED_RECORDS_PER_STORE`]). No byte charge
+    // is made for one, for the reason a Windows fast launch configuration makes none.
+    let table = store
+        .transit_gateway_policy_tables
+        .get_mut(transit_gateway_policy_table_id)
+        .ok_or_else(|| {
+            internal_error(format!(
+                "the transit gateway policy table '{transit_gateway_policy_table_id}' resolved a \
+                 moment ago is not in the store any more"
+            ))
+        })?;
+    table.associations.insert(
+        transit_gateway_attachment_id.to_string(),
+        TransitGatewayPolicyTableAssociationRecord {
+            view: view.clone(),
+            pending: Some(PendingStateMove::starting_now(
+                TRANSIT_GATEWAY_ASSOCIATION_STATE_ASSOCIATED,
+            )),
+        },
+    );
+    Ok(view)
+}
+
+// =============================================================================
 // IPAM pools, and the one BYOIP state the release path has no word for
 // =============================================================================
 
@@ -10232,13 +11680,14 @@ pub const ADDRESS_FAMILY_IPV4: &str = "ipv4";
 /// The `AddressFamily` of an IPv6 pool or range.
 pub const ADDRESS_FAMILY_IPV6: &str = "ipv6";
 
-/// The address family a canonical BYOIP range belongs to, as `AddressFamily` spells it.
+/// The address family a canonical BYOIP range belongs to, as `AddressFamily` spells it on
+/// the wire.
+///
+/// One definition of "which family is this range": the decision is
+/// [`AddressFamily::of_cidr`]'s and this only names the result the way the model does
+/// ([`AddressFamily::wire_name`]), so the two cannot drift.
 pub fn byoip_cidr_address_family(cidr: &str) -> &'static str {
-    if cidr.contains(':') {
-        ADDRESS_FAMILY_IPV6
-    } else {
-        ADDRESS_FAMILY_IPV4
-    }
+    AddressFamily::of_cidr(cidr).wire_name()
 }
 
 // =============================================================================
@@ -11286,6 +12735,652 @@ impl ComAmazonawsEc2Amazonec2State {
 }
 
 // ---------------------------------------------------------------------------
+// Spot Instance requests
+// ---------------------------------------------------------------------------
+//
+// A Spot Instance request is a STANDING ORDER for capacity, not a resource that is
+// finished when the call returns: "the request becomes active at this date and time and
+// remains active until all instances launch, the request expires, or the request is
+// canceled" (`RequestSpotInstancesRequest$ValidFrom`). So a stored request carries the
+// modelled `SpotInstanceRequest` the describes report plus the two moves the CLOCK owes
+// it — the fulfillment that launches its instance, and the expiry its own `ValidUntil`
+// makes due — each applied once by
+// [`ComAmazonawsEc2Amazonec2State::materialize_due_spot_instance_requests`], which
+// [`ComAmazonawsEc2Amazonec2State::materialize_due_transitions`] calls.
+//
+// Fulfilling a request LAUNCHES AN INSTANCE into this store's own instance lifecycle —
+// "the instance ID, if an instance has been launched to fulfill the Spot Instance
+// request" (`SpotInstanceRequest$InstanceId`) — so a Spot Instance is one instance of
+// this account like any other, reported by `DescribeInstances` with the
+// `spot` lifecycle and the id of the request that launched it.
+
+// The modelled shapes this slice reads, named HERE rather than in the module's shared
+// `use crate::ops::types::{..}` list at the top, the way the VM import slice does it.
+use crate::ops::types::{SpotInstanceRequest, SpotInstanceStatus};
+
+/// "`open` - The request is waiting to be fulfilled" — the `SpotInstanceState` enum's
+/// `open` member, which is where every request a `RequestSpotInstances` mints starts.
+pub const SPOT_REQUEST_STATE_OPEN: &str = "open";
+
+/// "`active` - The request is fulfilled and has an associated Spot Instance" — the
+/// `SpotInstanceState` enum's `active` member.
+pub const SPOT_REQUEST_STATE_ACTIVE: &str = "active";
+
+/// "`closed` - The request is unfulfillable" — the `SpotInstanceState` enum's `closed`
+/// member, which an expired request lands in.
+pub const SPOT_REQUEST_STATE_CLOSED: &str = "closed";
+
+/// "`cancelled` - The request was canceled" — the `SpotInstanceState` enum's `cancelled`
+/// member.
+pub const SPOT_REQUEST_STATE_CANCELLED: &str = "cancelled";
+
+/// The status code of a request that has been submitted and not yet evaluated, the first
+/// of the Spot request status codes `SpotInstanceStatus$Code` points at.
+pub const SPOT_STATUS_PENDING_EVALUATION: &str = "pending-evaluation";
+
+/// The status code of a request whose instance has been launched.
+pub const SPOT_STATUS_FULFILLED: &str = "fulfilled";
+
+/// The status code of a request whose own validity window ended before it was fulfilled.
+pub const SPOT_STATUS_SCHEDULE_EXPIRED: &str = "schedule-expired";
+
+/// The status code of a request that could not be fulfilled for want of capacity.
+pub const SPOT_STATUS_CAPACITY_NOT_AVAILABLE: &str = "capacity-not-available";
+
+/// The description [`SPOT_STATUS_PENDING_EVALUATION`] carries: "The description for the
+/// status code" (`SpotInstanceStatus$Message`). An EXAMPLE wording of the code, which is
+/// what clients branch on.
+pub const SPOT_STATUS_MESSAGE_PENDING_EVALUATION: &str =
+    "Your Spot request has been submitted for review, and is pending evaluation.";
+
+/// The description [`SPOT_STATUS_FULFILLED`] carries.
+pub const SPOT_STATUS_MESSAGE_FULFILLED: &str = "Your Spot request is fulfilled.";
+
+/// The description [`SPOT_STATUS_SCHEDULE_EXPIRED`] carries.
+pub const SPOT_STATUS_MESSAGE_SCHEDULE_EXPIRED: &str =
+    "Your Spot request has expired because the end of its validity period was reached.";
+
+/// The description [`SPOT_STATUS_CAPACITY_NOT_AVAILABLE`] carries.
+pub const SPOT_STATUS_MESSAGE_CAPACITY_NOT_AVAILABLE: &str =
+    "There is no Spot capacity available that matches your request.";
+
+/// The id prefix of a Spot Instance request, the form
+/// `SpotInstanceRequest$SpotInstanceRequestId` carries.
+pub const SPOT_INSTANCE_REQUEST_ID_PREFIX: &str = "sir";
+
+/// [`SPOT_INSTANCE_REQUEST_ID_PREFIX`] and the hyphen that separates it from the id's hex
+/// suffix, as one static, so recognising an id allocates nothing on the request path.
+pub const SPOT_INSTANCE_REQUEST_ID_PREFIX_WITH_HYPHEN: &str = "sir-";
+
+/// "`one-time`" — the `SpotInstanceType` enum's `one-time` member, and the type
+/// `RequestSpotInstancesRequest$Type` documents as its default ("Default: one-time").
+pub const SPOT_INSTANCE_TYPE_ONE_TIME: &str = "one-time";
+
+/// "`persistent`" — the `SpotInstanceType` enum's other member.
+pub const SPOT_INSTANCE_TYPE_PERSISTENT: &str = "persistent";
+
+/// The whole `SpotInstanceType` catalog, which the `type` filter selects over.
+pub const SPOT_INSTANCE_TYPES: [&str; 2] = [
+    SPOT_INSTANCE_TYPE_ONE_TIME,
+    SPOT_INSTANCE_TYPE_PERSISTENT,
+];
+
+/// "The behavior when a Spot Instance is interrupted. The default is terminate"
+/// (`RequestSpotInstancesRequest$InstanceInterruptionBehavior`): the
+/// `InstanceInterruptionBehavior` enum's `terminate` member.
+pub const INSTANCE_INTERRUPTION_BEHAVIOR_TERMINATE: &str = "terminate";
+
+/// The resource type a `RequestSpotInstances` `TagSpecification` may name: "The value for
+/// ResourceType must be spot-instances-request, otherwise the Spot Instance request fails"
+/// (`RequestSpotInstancesRequest$TagSpecifications`).
+pub const SPOT_REQUEST_TAGGABLE_RESOURCE: &str = "spot-instances-request";
+
+/// How long a Spot Instance request stays valid when the request names no `ValidUntil`.
+///
+/// DOCUMENTED, not chosen: "By default, the request is valid for 7 days from the date the
+/// request was created" (`RequestSpotInstancesRequest$ValidUntil`).
+pub const DEFAULT_SPOT_REQUEST_VALIDITY: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+/// How many Spot Instances one `RequestSpotInstances` call may ask for.
+///
+/// CHOSEN for the same reason as [`MAX_INSTANCES_PER_RUN`], and equal to it: "the maximum
+/// number of Spot Instances to launch" (`RequestSpotInstancesRequest$InstanceCount`)
+/// arrives as a plain integer with no modelled `@range`, and one request mints a stored
+/// record — and later an instance — per unit of it.
+pub const MAX_SPOT_INSTANCES_PER_REQUEST: i32 = MAX_INSTANCES_PER_RUN;
+
+/// How many Spot Instance requests this emulator stores before `RequestSpotInstances` is
+/// refused.
+///
+/// CHOSEN, like [`MAX_STORED_IMPORT_IMAGE_TASKS`] and for the same reason: nothing here
+/// reclaims a closed request, so the store needs a ceiling that is not the process's
+/// memory. The caller-chosen BYTES of each request are charged against
+/// [`MAX_STORED_BYTES`] separately ([`spot_instance_request_payload_bytes`]).
+pub const MAX_STORED_SPOT_INSTANCE_REQUESTS: usize = 4_096;
+
+/// "`spot` - the instance is a Spot Instance" — the `InstanceLifecycleType` enum's `spot`
+/// member, which is what an instance launched to fulfill a Spot Instance request reports
+/// as its `InstanceLifecycle`.
+pub const INSTANCE_LIFECYCLE_SPOT: &str = "spot";
+
+/// The `MonitoringState` enum's `enabled` member, which an instance launched with detailed
+/// monitoring reports.
+pub const MONITORING_STATE_ENABLED: &str = "enabled";
+
+/// The `MonitoringState` enum's `disabled` member, which an instance launched without
+/// detailed monitoring reports ("Default: Disabled",
+/// `RequestSpotLaunchSpecification$Monitoring`).
+pub const MONITORING_STATE_DISABLED: &str = "disabled";
+
+/// The product description of a Spot request for a Linux AMI: "`product-description` - The
+/// product description associated with the instance (`Linux/UNIX` | `Windows`)"
+/// (`DescribeSpotInstanceRequestsRequest$Filters`), and a member of the modelled
+/// `RIProductDescription` catalog.
+pub const PRODUCT_DESCRIPTION_LINUX_UNIX: &str = "Linux/UNIX";
+
+/// The product description of a Spot request for a Windows AMI, from the same sentence.
+pub const PRODUCT_DESCRIPTION_WINDOWS: &str = IMAGE_PLATFORM_WINDOWS;
+
+/// EC2's code for a Spot Instance request id no request of the account has.
+pub const INVALID_SPOT_INSTANCE_REQUEST_ID_NOT_FOUND: &str =
+    "InvalidSpotInstanceRequestID.NotFound";
+
+/// EC2's code for something that is not a Spot Instance request id at all.
+pub const INVALID_SPOT_INSTANCE_REQUEST_ID_MALFORMED: &str =
+    "InvalidSpotInstanceRequestID.Malformed";
+
+/// The furthest ahead this emulator carries an instant computed from a caller-supplied
+/// date: a century.
+///
+/// `Instant + Duration` and `SystemTime + Duration` PANIC when the sum is not
+/// representable, and a `ValidFrom` / `ValidUntil` is an unbounded timestamp off a single
+/// request, so every due instant computed from one is capped here and added with CHECKED
+/// arithmetic ([`due_instant`], [`due_system_time`]). A request valid for longer than this
+/// process will ever run is indistinguishable from one valid for a century, so the cap
+/// changes nothing a caller can observe — and no request can reach the overflow.
+pub const MAX_CLOCK_HORIZON: Duration = Duration::from_secs(100 * 365 * 24 * 60 * 60);
+
+/// `Instant::now()` plus `delay`, capped at [`MAX_CLOCK_HORIZON`] and added with checked
+/// arithmetic: a delay this platform's monotonic clock cannot represent is halved until it
+/// can, so a caller-supplied date can never panic a handler.
+pub fn due_instant(delay: Duration) -> Instant {
+    let now = Instant::now();
+    let mut wanted = delay.min(MAX_CLOCK_HORIZON);
+    loop {
+        match now.checked_add(wanted) {
+            Some(due_at) => return due_at,
+            None if wanted.is_zero() => return now,
+            None => wanted /= 2,
+        }
+    }
+}
+
+/// The wall-clock counterpart of [`due_instant`]: `base` plus `delay`, capped and checked
+/// the same way, for the instant a move is reported to have fallen due.
+pub fn due_system_time(base: SystemTime, delay: Duration) -> SystemTime {
+    let mut wanted = delay.min(MAX_CLOCK_HORIZON);
+    loop {
+        match base.checked_add(wanted) {
+            Some(at) => return at,
+            None if wanted.is_zero() => return base,
+            None => wanted /= 2,
+        }
+    }
+}
+
+/// A move the clock owes one Spot Instance request, with the instants it falls due on.
+///
+/// The same shape, and the same reasons for both fields, as [`FastLaunchTransition`]:
+/// `due_at` is monotonic because it is only ever compared against the clock, and `at` is
+/// the wall-clock instant the move fell due, which the request reports as its status
+/// `UpdateTime` once the move has been applied.
+#[derive(Debug, Clone)]
+pub struct SpotTransition {
+    /// The instant from which the move is due.
+    pub due_at: Instant,
+    /// The wall-clock instant the move falls due.
+    pub at: SystemTime,
+}
+
+impl SpotTransition {
+    /// A move due `delay` from now, on both clocks.
+    ///
+    /// `delay` can come from a caller's `ValidFrom`, so both instants are computed by the
+    /// capped, checked helpers rather than by the panicking `+`.
+    pub fn due_in(delay: Duration) -> Self {
+        Self {
+            due_at: due_instant(delay),
+            at: due_system_time(SystemTime::now(), delay),
+        }
+    }
+}
+
+/// One stored Spot Instance request: the modelled [`SpotInstanceRequest`] every operation
+/// that reports one answers with, plus the facts that shape carries no member for.
+///
+/// The stored view is the truth about the request — `RequestSpotInstances` answers it and
+/// `DescribeSpotInstanceRequests` reports it, so the two cannot describe one request
+/// differently — and every clock-owed move is written onto it ONCE
+/// ([`ComAmazonawsEc2Amazonec2State::materialize_due_spot_instance_requests`]), because a
+/// fulfillment MINTS an instance that has to be the same in every later read.
+#[derive(Debug, Clone)]
+pub struct SpotInstanceRequestRecord {
+    /// The request as the model shapes it, carrying the state reached so far.
+    pub view: SpotInstanceRequest,
+    /// The fulfillment the clock owes this request while it is `open`, or `None` once it
+    /// has been fulfilled, has expired or could not be fulfilled at all.
+    pub fulfillment: Option<SpotTransition>,
+    /// The instant this request stops being valid, on the monotonic clock: the
+    /// `ValidUntil` the view reports, which is compared against the clock here and never
+    /// reported from here, so a wall-clock adjustment cannot un-expire a request.
+    pub valid_until_at: Instant,
+    /// The Region the request was made in, which the instance a fulfillment launches
+    /// needs for its private DNS name. Not a member of any modelled Spot shape.
+    pub region: String,
+}
+
+/// The caller-chosen bytes one stored Spot Instance request holds: the launch
+/// specification's user data, the ids and names the launch named, the zone it placed the
+/// instance in, its tags, the launch and Availability Zone groups, the maximum price and
+/// the `ClientToken` the token map keeps for it. Everything else on the record — the id,
+/// the state, the status code, the type and the interruption behaviour — is derived here or
+/// drawn from a closed catalog, so it is fixed-size.
+///
+/// The ONE definition of that charge: `RequestSpotInstances` asks it before the write and
+/// charges exactly it, per request it mints. It also COVERS the caller-chosen bytes of the
+/// instance a fulfillment later launches ([`instance_payload_bytes`]), which is what bounds
+/// that launch's own charge: the instance carries no caller-chosen member its request does
+/// not — and the one member it can hold that the request did not name, the zone the service
+/// picks when the request named none, is a name out of the Region's own zone set rather
+/// than anything a caller sized.
+pub fn spot_instance_request_payload_bytes(
+    view: &SpotInstanceRequest,
+    client_token: Option<&str>,
+) -> usize {
+    let launch = view.launch_specification.as_ref();
+    // The zone the instance is placed in: named by the request when it names one, and
+    // retained on the instance a fulfillment launches, so it is charged here too.
+    let placement_bytes = launch
+        .and_then(|launch| launch.placement.as_ref())
+        .and_then(|placement| placement.availability_zone.as_ref())
+        .map_or(0, String::len);
+    let group_bytes: usize = launch.map_or(0, |launch| {
+        launch
+            .security_groups
+            .iter()
+            .flatten()
+            .map(|group| {
+                group.group_id.as_ref().map_or(0, String::len)
+                    + group.group_name.as_ref().map_or(0, String::len)
+            })
+            .sum()
+    });
+    launch
+        .and_then(|launch| launch.user_data.as_ref())
+        .map_or(0, String::len)
+        .saturating_add(
+            launch
+                .and_then(|launch| launch.image_id.as_ref())
+                .map_or(0, String::len),
+        )
+        .saturating_add(
+            launch
+                .and_then(|launch| launch.key_name.as_ref())
+                .map_or(0, String::len),
+        )
+        .saturating_add(
+            launch
+                .and_then(|launch| launch.subnet_id.as_ref())
+                .map_or(0, String::len),
+        )
+        .saturating_add(
+            launch
+                .and_then(|launch| launch.instance_type.as_ref())
+                .map_or(0, String::len),
+        )
+        .saturating_add(group_bytes)
+        .saturating_add(placement_bytes)
+        .saturating_add(tag_list_bytes(view.tags.as_deref().unwrap_or_default()))
+        .saturating_add(view.launch_group.as_ref().map_or(0, String::len))
+        .saturating_add(view.availability_zone_group.as_ref().map_or(0, String::len))
+        .saturating_add(view.spot_price.as_ref().map_or(0, String::len))
+        .saturating_add(client_token.map_or(0, str::len))
+}
+
+/// Whether `id` is a well-formed Spot Instance request id.
+///
+/// `sir-` followed by 8 or 17 lowercase hexadecimal digits — the short and the long id
+/// form every EC2 resource id takes, read the same way
+/// [`import_image_task_id_is_well_formed`] reads an import task's.
+pub fn spot_instance_request_id_is_well_formed(id: &str) -> bool {
+    let Some(suffix) = id.strip_prefix(SPOT_INSTANCE_REQUEST_ID_PREFIX_WITH_HYPHEN) else {
+        return false;
+    };
+    matches!(suffix.len(), 8 | 17)
+        && suffix
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Refuse something that is not a Spot Instance request id at all: HTTP 400
+/// [`INVALID_SPOT_INSTANCE_REQUEST_ID_MALFORMED`]. There is nothing to look up for it, so
+/// it is refused before any lookup, the way this service answers every malformed resource
+/// id.
+pub fn require_well_formed_spot_instance_request_id<E>(
+    request_id: &str,
+) -> Result<(), crate::scaffolded::Scaffolded<E>> {
+    if spot_instance_request_id_is_well_formed(request_id) {
+        return Ok(());
+    }
+    Err(crate::scaffolded::Scaffolded::service_error(
+        INVALID_SPOT_INSTANCE_REQUEST_ID_MALFORMED,
+        400,
+        format!("Invalid id: '{request_id}'"),
+    ))
+}
+
+/// Refuse a request that named a Spot Instance request id no request of the account has:
+/// HTTP 400 [`INVALID_SPOT_INSTANCE_REQUEST_ID_NOT_FOUND`].
+pub fn invalid_spot_instance_request_id_not_found<E>(
+    request_id: &str,
+) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_error(
+        INVALID_SPOT_INSTANCE_REQUEST_ID_NOT_FOUND,
+        400,
+        format!("The spot instance request ID '{request_id}' does not exist"),
+    )
+}
+
+/// A modelled timestamp as a wall-clock instant: the inverse of
+/// [`system_time_to_date_time`], for a `ValidFrom` / `ValidUntil` the caller named and the
+/// service has to compare against the clock.
+pub fn date_time_to_system_time(at: ::aws_smithy_types::DateTime) -> SystemTime {
+    let offset = Duration::new(at.secs().unsigned_abs(), at.subsec_nanos());
+    if at.secs() >= 0 {
+        UNIX_EPOCH.checked_add(offset).unwrap_or(UNIX_EPOCH)
+    } else {
+        UNIX_EPOCH.checked_sub(offset).unwrap_or(UNIX_EPOCH)
+    }
+}
+
+/// How far `at` is in the future, or [`Duration::ZERO`] when it is not in the future.
+pub fn duration_until(at: SystemTime) -> Duration {
+    at.duration_since(SystemTime::now()).unwrap_or_default()
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// Whether another Spot Instance request fits inside the store's ceiling
+    /// ([`MAX_STORED_SPOT_INSTANCE_REQUESTS`]).
+    ///
+    /// The same contract as [`Self::has_import_image_task_capacity`]: a create asks first,
+    /// for every request the call would mint, and refuses instead of growing the store
+    /// past its ceiling.
+    pub fn has_spot_instance_request_capacity(&self, wanted: usize) -> bool {
+        self.spot_instance_requests
+            .len()
+            .saturating_add(wanted)
+            <= MAX_STORED_SPOT_INSTANCE_REQUESTS
+    }
+
+    /// Store one Spot Instance request under a freshly minted id, and answer that id.
+    ///
+    /// The one writer of a Spot Instance request: the id comes from the store's own mint,
+    /// the view's own `SpotInstanceRequestId` is set from it, and the record's bytes are
+    /// charged against [`MAX_STORED_BYTES`] by the one definition of that charge, so no
+    /// caller can store a request the byte budget has not been told about.
+    pub fn insert_spot_instance_request(
+        &mut self,
+        mut view: SpotInstanceRequest,
+        fulfillment: Option<SpotTransition>,
+        valid_until_at: Instant,
+        region: &str,
+        client_token: Option<&str>,
+    ) -> String {
+        let request_id = self.next_id(SPOT_INSTANCE_REQUEST_ID_PREFIX);
+        view.spot_instance_request_id = Some(request_id.clone());
+        self.add_stored_bytes(spot_instance_request_payload_bytes(&view, client_token));
+        self.spot_instance_requests.insert(
+            request_id.clone(),
+            SpotInstanceRequestRecord {
+                view,
+                fulfillment,
+                valid_until_at,
+                region: region.to_string(),
+            },
+        );
+        request_id
+    }
+
+    /// Apply every move the clock owed a Spot Instance request by `now`.
+    ///
+    /// Reached only through [`Self::materialize_due_transitions`], so a reporting operation
+    /// observes these moves without having caused them: each was owed at this instant
+    /// whether or not anybody called. Two moves, in this order, because a request whose
+    /// validity ended before its fulfillment fell due was never fulfillable:
+    ///
+    /// 1. EXPIRY — "for a one-time request, the request remains active until all instances
+    ///    launch, the request is canceled, or the `validUntil` date and time is reached"
+    ///    (`SpotInstanceRequest$ValidUntil`): an `open` request whose window has closed is
+    ///    [`SPOT_REQUEST_STATE_CLOSED`] with the status code
+    ///    [`SPOT_STATUS_SCHEDULE_EXPIRED`].
+    /// 2. FULFILLMENT — "the instance ID, if an instance has been launched to fulfill the
+    ///    Spot Instance request" (`SpotInstanceRequest$InstanceId`): the request becomes
+    ///    [`SPOT_REQUEST_STATE_ACTIVE`] with the status code [`SPOT_STATUS_FULFILLED`] and
+    ///    an instance of this account's own instance store. It is a WRITE rather than a
+    ///    derive for the same reason an import's completion is: it mints an instance every
+    ///    later read has to agree on.
+    pub fn materialize_due_spot_instance_requests(&mut self, now: Instant) {
+        let expired: Vec<String> = self
+            .spot_instance_requests
+            .iter()
+            .filter(|(_, record)| {
+                record.view.state.as_deref() == Some(SPOT_REQUEST_STATE_OPEN)
+                    && now >= record.valid_until_at
+            })
+            .map(|(request_id, _)| request_id.clone())
+            .collect();
+        for request_id in expired {
+            let Some(record) = self.spot_instance_requests.get_mut(&request_id) else {
+                continue;
+            };
+            record.view.state = Some(SPOT_REQUEST_STATE_CLOSED.to_string());
+            // The window closed when `ValidUntil` was reached, not when somebody next
+            // asked, so that is the instant the status update reports.
+            record.view.status = Some(SpotInstanceStatus {
+                code: Some(SPOT_STATUS_SCHEDULE_EXPIRED.to_string()),
+                message: Some(SPOT_STATUS_MESSAGE_SCHEDULE_EXPIRED.to_string()),
+                update_time: record.view.valid_until,
+            });
+            // Nothing is owed on a request that can no longer be fulfilled.
+            record.fulfillment = None;
+        }
+
+        let due: Vec<String> = self
+            .spot_instance_requests
+            .iter()
+            .filter(|(_, record)| {
+                record.view.state.as_deref() == Some(SPOT_REQUEST_STATE_OPEN)
+                    && record
+                        .fulfillment
+                        .as_ref()
+                        .is_some_and(|fulfillment| now >= fulfillment.due_at)
+            })
+            .map(|(request_id, _)| request_id.clone())
+            .collect();
+        for request_id in due {
+            self.fulfill_spot_instance_request(&request_id);
+        }
+    }
+
+    /// Launch the instance one due Spot Instance request asked for, and move the request to
+    /// `active` / `fulfilled`.
+    ///
+    /// Every launch parameter comes off the request's own stored launch specification, so
+    /// the instance is the one the request described; the request keeps its tags (they tag
+    /// "the Spot Instance request on creation",
+    /// `RequestSpotInstancesRequest$TagSpecifications`, not the instance).
+    ///
+    /// A request this store has no room to launch for — no instance slot, or no private
+    /// address left — stays `open` carrying [`SPOT_STATUS_CAPACITY_NOT_AVAILABLE`], which
+    /// is what the real service reports for a request it cannot place, and owes nothing
+    /// further.
+    ///
+    /// The instance's own byte charge is made by [`Self::insert_instance`] and is NOT asked
+    /// for again here, because `RequestSpotInstances` already asked for it: every
+    /// caller-chosen string the instance holds is one
+    /// [`spot_instance_request_payload_bytes`] charged for the request that launched it, so
+    /// the store's byte ceiling was cleared before this move was ever owed.
+    fn fulfill_spot_instance_request(&mut self, request_id: &str) {
+        let Some(record) = self.spot_instance_requests.get(request_id) else {
+            return;
+        };
+        let launch = record.view.launch_specification.clone().unwrap_or_default();
+        let region = record.region.clone();
+        let at = record
+            .fulfillment
+            .as_ref()
+            .map_or_else(SystemTime::now, |fulfillment| fulfillment.at);
+        let availability_zone = launch
+            .placement
+            .as_ref()
+            .and_then(|placement| placement.availability_zone.clone())
+            .or_else(|| {
+                availability_zones_in_region(&region)
+                    .first()
+                    .map(|zone| zone.zone_name.clone())
+            })
+            .unwrap_or_else(|| region.clone());
+
+        if self.instances.len() >= MAX_STORED_INSTANCES {
+            self.leave_spot_instance_request_unplaced(request_id, at);
+            return;
+        }
+        let Some(private_ip) = self.allocate_private_ip() else {
+            self.leave_spot_instance_request_unplaced(request_id, at);
+            return;
+        };
+
+        // A Spot Instance is its own reservation: one instance launched by one request.
+        let reservation_id = self.mint_reservation_id();
+        self.insert_reservation(ReservationRecord {
+            reservation_id: reservation_id.clone(),
+            owner_id: ::engine::emulator_account_id().to_string(),
+            requester_id: None,
+            instance_ids: Vec::new(),
+        });
+        let instance_id = self.mint_instance_id();
+        let instance_type = launch
+            .instance_type
+            .clone()
+            .unwrap_or_else(|| DEFAULT_INSTANCE_TYPE.to_string());
+        self.insert_instance(InstanceRecord {
+            instance_id: instance_id.clone(),
+            reservation_id,
+            image_id: launch.image_id.clone(),
+            instance_type: instance_type.clone(),
+            key_name: launch.key_name.clone(),
+            subnet_id: launch.subnet_id.clone(),
+            security_groups: launch
+                .security_groups
+                .iter()
+                .flatten()
+                .map(|group| (group.group_id.clone(), group.group_name.clone()))
+                .collect(),
+            private_dns_name: private_dns_name(&private_ip, &region),
+            private_ip,
+            // A public address comes from a default-VPC subnet or an Elastic IP, neither of
+            // which this slice models — the same answer `RunInstances` gives.
+            public_ip: None,
+            // An instance AWS has just launched is `pending`; the clock owes it `running`,
+            // on the same span as every other transition of this crate.
+            state: InstanceStateName::Pending,
+            pending_transition: Some(PendingTransition::starting_now(InstanceStateName::Running)),
+            state_transition_reason: None,
+            state_reason: None,
+            // The instance was launched when the fulfillment fell due, not when somebody
+            // next asked about it.
+            launch_time: at,
+            ami_launch_index: 0,
+            user_data: launch.user_data.clone(),
+            placement_az: availability_zone.clone(),
+            monitoring_state: if launch
+                .monitoring
+                .as_ref()
+                .is_some_and(|monitoring| monitoring.enabled)
+            {
+                MONITORING_STATE_ENABLED.to_string()
+            } else {
+                MONITORING_STATE_DISABLED.to_string()
+            },
+            architecture: architecture_for(&instance_type),
+            ebs_optimized: launch.ebs_optimized.unwrap_or(false),
+            // Hibernation is `InstanceInterruptionBehavior`'s business for a Spot
+            // Instance, and the launch specification carries no hibernation member.
+            hibernation_configured: false,
+            disable_api_termination: false,
+            // The request's tags tag the REQUEST; nothing tags the instance.
+            tags: BTreeMap::new(),
+            client_token: None,
+            spot_instance_request_id: Some(request_id.to_string()),
+        });
+
+        if let Some(record) = self.spot_instance_requests.get_mut(request_id) {
+            record.view.state = Some(SPOT_REQUEST_STATE_ACTIVE.to_string());
+            record.view.status = Some(SpotInstanceStatus {
+                code: Some(SPOT_STATUS_FULFILLED.to_string()),
+                message: Some(SPOT_STATUS_MESSAGE_FULFILLED.to_string()),
+                update_time: Some(system_time_to_date_time(at)),
+            });
+            record.view.instance_id = Some(instance_id);
+            // "The Availability Zone in which the request is launched" — known only now
+            // that it has been launched. Its zone ID is deliberately NOT set beside it:
+            // "either launchedAvailabilityZone or launchedAvailabilityZoneId can be
+            // specified, but not both" (`SpotInstanceRequest$LaunchedAvailabilityZone`).
+            record.view.launched_availability_zone = Some(availability_zone);
+            record.fulfillment = None;
+        }
+    }
+
+    /// Leave one due Spot Instance request `open` carrying
+    /// [`SPOT_STATUS_CAPACITY_NOT_AVAILABLE`]: there was no capacity in this store to
+    /// place its instance in.
+    fn leave_spot_instance_request_unplaced(&mut self, request_id: &str, at: SystemTime) {
+        if let Some(record) = self.spot_instance_requests.get_mut(request_id) {
+            record.view.status = Some(SpotInstanceStatus {
+                code: Some(SPOT_STATUS_CAPACITY_NOT_AVAILABLE.to_string()),
+                message: Some(SPOT_STATUS_MESSAGE_CAPACITY_NOT_AVAILABLE.to_string()),
+                update_time: Some(system_time_to_date_time(at)),
+            });
+            record.fulfillment = None;
+        }
+    }
+
+    /// The product description a Spot request for `image_id` carries: which operating
+    /// system the Spot Instance runs, read off the AMI the launch names when this account
+    /// can see it.
+    ///
+    /// An AMI this store does not hold leaves the description at the Linux one, which is
+    /// what the overwhelming majority of AMIs are and what EC2 reports for an AMI with no
+    /// `Platform` of its own ("the value is `windows` for Windows AMIs; otherwise blank",
+    /// `Image$Platform`).
+    pub fn spot_product_description(&self, image_id: Option<&str>) -> &'static str {
+        let windows = image_id
+            .and_then(|image_id| self.images.get(image_id))
+            .is_some_and(|image| {
+                image
+                    .platform
+                    .as_deref()
+                    .is_some_and(|platform| platform.eq_ignore_ascii_case(IMAGE_PLATFORM_WINDOWS))
+            });
+        if windows {
+            PRODUCT_DESCRIPTION_WINDOWS
+        } else {
+            PRODUCT_DESCRIPTION_LINUX_UNIX
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Secondary subnets
 // ---------------------------------------------------------------------------
 
@@ -11414,8 +13509,10 @@ impl ComAmazonawsEc2Amazonec2State {
     /// caller — the subnet's id, the ARN built from it, the owning account, and the
     /// association id of each IPv4 CIDR block — so two writers cannot report the same
     /// secondary subnet differently. Like [`Self::insert_subnet`], the caller-chosen bytes
-    /// the record holds are charged against the store's byte budget here, so no writer can
-    /// store them uncharged, and the ceiling is checked BEFORE any id is minted, so a
+    /// the record holds are charged against the store's byte budget here — by
+    /// [`secondary_subnet_payload_bytes`], which is the one definition of that charge and
+    /// already carries the fixed per-record overhead, so a tag-free subnet is not free
+    /// against the budget either — and the ceiling is checked BEFORE any id is minted, so a
     /// refused write consumes nothing at all.
     pub fn insert_secondary_subnet(&mut self, spec: SecondarySubnetSpec) -> Option<String> {
         if !self.has_secondary_subnet_capacity() {
@@ -11449,6 +13546,9 @@ impl ComAmazonawsEc2Amazonec2State {
             state_reason: spec.state_reason,
             tags: Some(spec.tags),
         };
+        // `secondary_subnet_payload_bytes` is the ONE definition of this charge and
+        // already carries the fixed per-record overhead, so the call site adds nothing to
+        // it: a removal path gives back exactly this number.
         self.add_stored_bytes(secondary_subnet_payload_bytes(&secondary_subnet));
         self.secondary_subnets
             .insert(secondary_subnet_id.clone(), secondary_subnet);
@@ -11759,6 +13859,797 @@ impl ComAmazonawsEc2Amazonec2State {
             },
         );
         stored
+    }
+}
+
+// =============================================================================
+// Capacity Reservation Fleets
+// =============================================================================
+
+/// The id prefix every Capacity Reservation Fleet is minted with, the `crf-` of the
+/// `CapacityReservationFleetId` AWS's own error text spells ("Capacity Reservation Fleet ID
+/// 'crf-…'").
+pub const CAPACITY_RESERVATION_FLEET_ID_PREFIX: &str = "crf";
+
+/// The id prefix of one Capacity Reservation — the resource a Fleet creates per instance
+/// type it reserves for (`FleetCapacityReservation$CapacityReservationId`).
+pub const CAPACITY_RESERVATION_ID_PREFIX: &str = "cr";
+
+/// The `ResourceType` a `CreateCapacityReservationFleet` tag specification may name: the
+/// Fleet it creates (the modelled `ResourceType` enum's `capacity-reservation-fleet`
+/// member). "The tags are automatically assigned to the Capacity Reservations in the Fleet"
+/// (`CreateCapacityReservationFleetRequest$TagSpecifications`), so the one tag list is the
+/// Fleet's and its reservations'.
+pub const RESOURCE_TYPE_CAPACITY_RESERVATION_FLEET: &str = "capacity-reservation-fleet";
+
+/// "`submitted` - The Capacity Reservation Fleet request has been submitted and Amazon
+/// Elastic Compute Cloud is preparing to create the Capacity Reservations"
+/// (`CapacityReservationFleet$State`): where every Fleet starts, and a NON-terminal state,
+/// so the clock owes it [`CAPACITY_RESERVATION_FLEET_STATE_ACTIVE`].
+pub const CAPACITY_RESERVATION_FLEET_STATE_SUBMITTED: &str = "submitted";
+
+/// "`modifying` - The Capacity Reservation Fleet is being modified"
+/// (`CapacityReservationFleet$State`).
+pub const CAPACITY_RESERVATION_FLEET_STATE_MODIFYING: &str = "modifying";
+
+/// "`active` - The Capacity Reservation Fleet has fulfilled its total target capacity and
+/// it is attempting to maintain this capacity" (`CapacityReservationFleet$State`).
+pub const CAPACITY_RESERVATION_FLEET_STATE_ACTIVE: &str = "active";
+
+/// "`partially_fulfilled` - The Capacity Reservation Fleet has partially fulfilled its
+/// total target capacity" (`CapacityReservationFleet$State`).
+pub const CAPACITY_RESERVATION_FLEET_STATE_PARTIALLY_FULFILLED: &str = "partially_fulfilled";
+
+/// "`expiring` - The Capacity Reservation Fleet has reach its end date and it is in the
+/// process of expiring" (`CapacityReservationFleet$State`).
+pub const CAPACITY_RESERVATION_FLEET_STATE_EXPIRING: &str = "expiring";
+
+/// "`cancelling` - The Capacity Reservation Fleet is in the process of being cancelled"
+/// (`CapacityReservationFleet$State`): where a cancellation puts a Fleet, and a NON-terminal
+/// state, so the clock owes it [`CAPACITY_RESERVATION_FLEET_STATE_CANCELLED`].
+pub const CAPACITY_RESERVATION_FLEET_STATE_CANCELLING: &str = "cancelling";
+
+/// "The Capacity Reservation Fleet's status changes to `cancelled`"
+/// (`CancelCapacityReservationFleets`): the end of a cancellation, and terminal.
+pub const CAPACITY_RESERVATION_FLEET_STATE_CANCELLED: &str = "cancelled";
+
+/// The states a Capacity Reservation Fleet can be cancelled FROM.
+///
+/// A cancellation moves a Fleet that is still doing something — one preparing its
+/// reservations, one being modified, one holding capacity, one expiring — into
+/// [`CAPACITY_RESERVATION_FLEET_STATE_CANCELLING`]. The states left out are the ones a Fleet
+/// has already left: `cancelling` and `cancelled` (the cancellation has already happened),
+/// and `expired` and `failed`, where "The Fleet can't create new Capacity Reservations"
+/// (`CapacityReservationFleet$State`) and so there is nothing left to cancel.
+pub const CAPACITY_RESERVATION_FLEET_CANCELLABLE_STATES: [&str; 5] = [
+    CAPACITY_RESERVATION_FLEET_STATE_SUBMITTED,
+    CAPACITY_RESERVATION_FLEET_STATE_MODIFYING,
+    CAPACITY_RESERVATION_FLEET_STATE_ACTIVE,
+    CAPACITY_RESERVATION_FLEET_STATE_PARTIALLY_FULFILLED,
+    CAPACITY_RESERVATION_FLEET_STATE_EXPIRING,
+];
+
+/// "Currently, only the `prioritized` allocation strategy is supported […] Valid values:
+/// `prioritized`" (`CreateCapacityReservationFleetRequest$AllocationStrategy`), so it is
+/// both the only value a request may name and the strategy a request that names none gets.
+pub const FLEET_ALLOCATION_STRATEGY_PRIORITIZED: &str = "prioritized";
+
+/// The capacity units one instance provides when a specification names no `Weight`.
+///
+/// "The number of capacity units provided by the specified instance type. This value,
+/// together with the total target capacity that you specify for the Fleet determine the
+/// number of instances for which the Fleet reserves capacity. Both values are based on units
+/// that make sense for your workload"
+/// (`ReservationFleetInstanceSpecification$Weight`) — the model publishes no default, so a
+/// specification that names no weight is read in units of instances: one instance provides
+/// one unit, which makes `TotalTargetCapacity` a count of instances.
+pub const DEFAULT_FLEET_INSTANCE_WEIGHT: f64 = 1.0;
+
+/// The largest number of instance type specifications one `CreateCapacityReservationFleet`
+/// may carry.
+///
+/// A bound in the same style as [`MAX_FILTERS`], not an AWS quota: the model declares no
+/// `@length` for `ReservationFleetInstanceSpecificationList`, and each entry is work and
+/// memory this process does, so the number a caller can send has to be finite.
+pub const MAX_FLEET_INSTANCE_TYPE_SPECIFICATIONS: usize = 100;
+
+/// The largest number of Capacity Reservation Fleets this in-memory store holds.
+///
+/// A capacity bound in the same style as [`MAX_VPCS`], not an AWS quota: each Fleet is a
+/// record in this process's memory, so the number a caller can create has to be finite.
+/// [`ComAmazonawsEc2Amazonec2State::has_capacity_reservation_fleet_capacity`] is the
+/// predicate a writer asks before inserting; a create past it refuses with
+/// [`capacity_reservation_fleet_limit_exceeded`].
+pub const MAX_CAPACITY_RESERVATION_FLEETS: usize = 1_000;
+
+/// The code a create past [`MAX_CAPACITY_RESERVATION_FLEETS`] answers with, following the
+/// `<Resource>LimitExceeded` convention every per-resource quota refusal of this service
+/// uses ([`VPC_LIMIT_EXCEEDED`], [`VPC_BPA_EXCLUSION_LIMIT_EXCEEDED`]).
+pub const CAPACITY_RESERVATION_FLEET_LIMIT_EXCEEDED: &str = "CapacityReservationFleetLimitExceeded";
+
+/// The code EC2 answers for something that is not a Capacity Reservation Fleet id at all,
+/// BEFORE it looks the id up — so a caller can tell a typo from a Fleet the account does not
+/// hold.
+pub const INVALID_CAPACITY_RESERVATION_FLEET_ID_MALFORMED: &str =
+    "InvalidCapacityReservationFleetId.Malformed";
+
+/// The code EC2 answers for a well-formed Capacity Reservation Fleet id the account holds no
+/// Fleet under.
+pub const INVALID_CAPACITY_RESERVATION_FLEET_ID_NOT_FOUND: &str =
+    "InvalidCapacityReservationFleetId.NotFound";
+
+/// Whether `id` is a well-formed Capacity Reservation Fleet id — one EC2 could have ISSUED.
+///
+/// The long-form rule ([`issued_long_id_is_well_formed`]) under this resource's own `crf`
+/// prefix: `CapacityReservationFleetId` is a plain string in the model
+/// (`smithy_query(query="shape",shape="CapacityReservationFleetId")`), so the form is the one
+/// AWS's `InvalidCapacityReservationFleetId.Malformed` answers for anything outside —
+/// including an id whose leading digit is above zero and the all-zero placeholder, both of
+/// which the recorded units behind
+/// `issues/.../20261023T102725Z-ec2-cancelcapacityreservationfleets-stub.md` and
+/// `issues/.../20261023T102725Z-ec2-modifycapacityreservationfleet-stub.md` were answered
+/// `InvalidCapacityReservationFleetId.Malformed` for.
+pub fn capacity_reservation_fleet_id_is_well_formed(id: &str) -> bool {
+    issued_long_id_is_well_formed(CAPACITY_RESERVATION_FLEET_ID_PREFIX, id)
+}
+
+/// Refuse something that is not a Capacity Reservation Fleet id: HTTP 400
+/// [`INVALID_CAPACITY_RESERVATION_FLEET_ID_MALFORMED`].
+pub fn invalid_capacity_reservation_fleet_id_malformed<E>(fleet_id: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_CAPACITY_RESERVATION_FLEET_ID_MALFORMED,
+        400,
+        format!("Capacity Reservation Fleet ID '{fleet_id}' is malformed"),
+    )
+}
+
+/// Why a well-formed Capacity Reservation Fleet id resolves to nothing.
+///
+/// ONE wording, so the request-level refusal `DescribeCapacityReservationFleets` answers and
+/// the per-Fleet entry `CancelCapacityReservationFleets` reports in its
+/// `FailedFleetCancellations` say the same thing about the same id.
+pub fn capacity_reservation_fleet_not_found_message(fleet_id: &str) -> String {
+    format!("The Capacity Reservation Fleet ID '{fleet_id}' does not exist")
+}
+
+/// Refuse a Capacity Reservation Fleet id the account holds no Fleet under: HTTP 400
+/// [`INVALID_CAPACITY_RESERVATION_FLEET_ID_NOT_FOUND`].
+pub fn invalid_capacity_reservation_fleet_id_not_found<E>(fleet_id: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_CAPACITY_RESERVATION_FLEET_ID_NOT_FOUND,
+        400,
+        capacity_reservation_fleet_not_found_message(fleet_id),
+    )
+}
+
+/// Refuse a create that would take the store past [`MAX_CAPACITY_RESERVATION_FLEETS`]: HTTP
+/// 400 [`CAPACITY_RESERVATION_FLEET_LIMIT_EXCEEDED`].
+pub fn capacity_reservation_fleet_limit_exceeded<E>() -> Scaffolded<E> {
+    Scaffolded::service_error(
+        CAPACITY_RESERVATION_FLEET_LIMIT_EXCEEDED,
+        400,
+        format!(
+            "The maximum number of Capacity Reservation Fleets has been reached \
+             ({MAX_CAPACITY_RESERVATION_FLEETS})"
+        ),
+    )
+}
+
+/// The move the clock owes one Capacity Reservation Fleet: a [`ClockTransition`] to the
+/// `CapacityReservationFleetState` member it becomes.
+///
+/// The `to` is a `&'static str` so only a word from this module's own catalog constants can
+/// be stored — never a request's text.
+pub type CapacityReservationFleetTransition = ClockTransition<&'static str>;
+
+/// One Capacity Reservation Fleet: the modelled [`CapacityReservationFleet`] every operation
+/// that reports one answers with, plus the two facts that shape carries no member for.
+///
+/// `CreateCapacityReservationFleet`, `DescribeCapacityReservationFleets` and
+/// `CancelCapacityReservationFleets` all report the same Fleet, so the one stored view is
+/// what all of them answer from and they cannot describe one Fleet differently — the create
+/// result's flat member set is a projection of this view
+/// ([`CapacityReservationFleetRecord::view`]), not a second copy of it.
+#[derive(Debug, Clone)]
+pub struct CapacityReservationFleetRecord {
+    /// The Fleet as the model shapes it, carrying the state reached so far and the Capacity
+    /// Reservations it reserves its capacity through.
+    pub view: CapacityReservationFleet,
+    /// The move the clock owes this Fleet, while one is owed.
+    pub pending: Option<CapacityReservationFleetTransition>,
+}
+
+impl CapacityReservationFleetRecord {
+    /// The Fleet's `CapacityReservationFleetState` as it was last reported.
+    pub fn state(&self) -> &str {
+        self.view.state.as_deref().unwrap_or_default()
+    }
+
+    /// The Fleet's own id.
+    pub fn capacity_reservation_fleet_id(&self) -> &str {
+        self.view
+            .capacity_reservation_fleet_id
+            .as_deref()
+            .unwrap_or_default()
+    }
+
+    /// Start cancelling this Fleet, answering the state it was in, or `None` when its
+    /// current state is not one a cancellation runs from
+    /// ([`CAPACITY_RESERVATION_FLEET_CANCELLABLE_STATES`]).
+    ///
+    /// "The Capacity Reservation Fleet's status changes to `cancelled`"
+    /// (`CancelCapacityReservationFleets`) by way of `cancelling`, "the process of being
+    /// cancelled" the state catalog names — so the caller is answered the transient state
+    /// and the clock owes the terminal one. Any move that was owed before (a `submitted`
+    /// Fleet's `active`) is REPLACED: the Fleet is being cancelled, not activated.
+    pub fn begin_cancellation(&mut self) -> Option<String> {
+        let previous = self.state().to_string();
+        if !CAPACITY_RESERVATION_FLEET_CANCELLABLE_STATES.contains(&previous.as_str()) {
+            return None;
+        }
+        self.view.state = Some(CAPACITY_RESERVATION_FLEET_STATE_CANCELLING.to_string());
+        self.pending = Some(CapacityReservationFleetTransition::starting_now(
+            CAPACITY_RESERVATION_FLEET_STATE_CANCELLED,
+        ));
+        Some(previous)
+    }
+
+    /// Apply the move the clock owed this Fleet.
+    ///
+    /// `active` is where the Fleet "has fulfilled its total target capacity and it is
+    /// attempting to maintain this capacity" (`CapacityReservationFleet$State`): the capacity
+    /// was reserved by the create, so reaching it changes the Fleet's state word and nothing
+    /// else. `cancelled` is the end of a cancellation, where "The individual Capacity
+    /// Reservations in the Fleet are cancelled" (`CancelCapacityReservationFleets`) — so the
+    /// Fleet then holds no capacity and reports no reservations.
+    fn apply_due_move(&mut self, to: &'static str) {
+        self.view.state = Some(to.to_string());
+        if to == CAPACITY_RESERVATION_FLEET_STATE_CANCELLED {
+            self.view.total_fulfilled_capacity = Some(0.0);
+            // The set is still reported, now empty: EC2's ec2Query XML carries a set element
+            // for an empty list, and a cancelled Fleet holds no Capacity Reservation.
+            self.view.instance_type_specifications = Some(Vec::new());
+        }
+        self.pending = None;
+    }
+}
+
+/// How many instances one Capacity Reservation takes to cover `total_target_capacity` at
+/// `weight` capacity units per instance: the quotient rounded UP, because an instance is not
+/// reserved in fractions.
+///
+/// A count outside the modelled `Integer` member's range is clamped to its ends rather than
+/// wrapping: `weight` is bounded below by the modelled `@range` (`min: 0.001`) and
+/// `total_target_capacity` above by `Integer`, so the clamp is unreachable for any request
+/// the boundary validator admits — it is there so the conversion cannot be lossy by
+/// construction.
+fn fleet_instance_count(total_target_capacity: i32, weight: f64) -> i32 {
+    let count = (f64::from(total_target_capacity) / weight).ceil();
+    if !count.is_finite() || count <= 0.0 {
+        return 0;
+    }
+    if count >= f64::from(i32::MAX) {
+        return i32::MAX;
+    }
+    // Inside `i32`, and integral after `ceil`, so this conversion is exact.
+    count as i32
+}
+
+/// "The capacity units that have been fulfilled"
+/// (`CapacityReservationFleet$TotalFulfilledCapacity`): the sum of what each of the Fleet's
+/// Capacity Reservations fulfils, so the Fleet's total and its reservations cannot disagree.
+pub fn fleet_fulfilled_capacity(reservations: &[FleetCapacityReservation]) -> f64 {
+    reservations
+        .iter()
+        .filter_map(|reservation| reservation.fulfilled_capacity)
+        .sum()
+}
+
+/// One instance type a Capacity Reservation Fleet reserves capacity for, as a writer has
+/// already validated it: the words come out of the modelled catalogs rather than from the
+/// request's text, and the zone is one the signed Region has.
+#[derive(Debug, Clone)]
+pub struct CapacityReservationFleetInstanceSpec {
+    /// "The instance type for which the Capacity Reservation Fleet reserves capacity"
+    /// (`ReservationFleetInstanceSpecification$InstanceType`), a member of the modelled
+    /// `InstanceType` enum.
+    pub instance_type: &'static str,
+    /// "The type of operating system for which the Capacity Reservation Fleet reserves
+    /// capacity" (`$InstancePlatform`), a member of the modelled
+    /// `CapacityReservationInstancePlatform` enum.
+    pub instance_platform: &'static str,
+    /// The Availability Zone the capacity is reserved in, and its id: "A Capacity
+    /// Reservation Fleet can't span Availability Zones", so every specification of one
+    /// Fleet carries the same zone.
+    pub availability_zone: String,
+    /// The id of [`Self::availability_zone`], resolved against the signed Region's zones.
+    pub availability_zone_id: String,
+    /// "The number of capacity units provided by the specified instance type" (`$Weight`),
+    /// defaulted to [`DEFAULT_FLEET_INSTANCE_WEIGHT`].
+    pub weight: f64,
+    /// "The priority to assign to the instance type […] A lower value indicates a high
+    /// priority" (`$Priority`), or `None` when the request assigned none.
+    pub priority: Option<i32>,
+    /// "Indicates whether the Capacity Reservation Fleet supports EBS-optimized instances
+    /// types" (`$EbsOptimized`).
+    pub ebs_optimized: bool,
+}
+
+/// What a writer must say to store a Capacity Reservation Fleet; everything else about the
+/// record — the Fleet's id, its ARN, the state it starts in, the Capacity Reservations it
+/// reserves through, the move the clock owes it and the bytes it charges — is derived by
+/// [`ComAmazonawsEc2Amazonec2State::insert_capacity_reservation_fleet`].
+#[derive(Debug, Clone)]
+pub struct CapacityReservationFleetSpec {
+    /// The Region the request was signed for, which the Fleet's ARN names.
+    pub region: String,
+    /// The allocation strategy the Fleet reserves capacity by, as a `&'static str` out of
+    /// this module's catalog ([`FLEET_ALLOCATION_STRATEGY_PRIORITIZED`]).
+    pub allocation_strategy: &'static str,
+    /// The instance matching criteria every Capacity Reservation of the Fleet inherits, out
+    /// of the GENERATED catalog of the modelled `FleetInstanceMatchCriteria` enum
+    /// (`crate::ops::types::FLEET_INSTANCE_MATCH_CRITERIA_VALUES`), whose single member
+    /// `open` is also the default — "Currently, Capacity Reservation Fleets support `open`
+    /// instance matching criteria only" (`CapacityReservationFleet$InstanceMatchCriteria`).
+    pub instance_match_criteria: &'static str,
+    /// The tenancy every Capacity Reservation of the Fleet inherits, out of the GENERATED
+    /// catalog of the modelled `FleetCapacityReservationTenancy` enum
+    /// (`crate::ops::types::FLEET_CAPACITY_RESERVATION_TENANCY_VALUES`), whose single member
+    /// is "`default` - The Capacity Reservation Fleet is created on hardware that is shared
+    /// with other Amazon Web Services accounts" (`CapacityReservationFleet$Tenancy`).
+    pub tenancy: &'static str,
+    /// "The total number of capacity units to be reserved by the Capacity Reservation
+    /// Fleet" (`CreateCapacityReservationFleetRequest$TotalTargetCapacity`).
+    pub total_target_capacity: i32,
+    /// "The date and time at which the Capacity Reservation Fleet expires"
+    /// (`$EndDate`), or `None` for a Fleet the request gave no end date.
+    pub end_date: Option<::aws_smithy_types::DateTime>,
+    /// The instance types the Fleet may reserve capacity for, in the order the request gave
+    /// them.
+    pub instance_specs: Vec<CapacityReservationFleetInstanceSpec>,
+    /// The tags the request's `TagSpecifications` assign to the Fleet.
+    pub tags: Vec<Tag>,
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// Whether another Capacity Reservation Fleet fits inside the store's ceiling
+    /// ([`MAX_CAPACITY_RESERVATION_FLEETS`]).
+    ///
+    /// The same contract as [`Self::has_vpc_capacity`]: a create asks first and refuses with
+    /// [`capacity_reservation_fleet_limit_exceeded`] when it answers `false`.
+    pub fn has_capacity_reservation_fleet_capacity(&self) -> bool {
+        self.capacity_reservation_fleets.len() < MAX_CAPACITY_RESERVATION_FLEETS
+    }
+
+    /// The Capacity Reservations one Fleet reserves its target capacity through: one per
+    /// instance type specification the request named, in the order it named them.
+    ///
+    /// "Information about the instance types for which to reserve the capacity"
+    /// (`CapacityReservationFleet$InstanceTypeSpecifications`) — every specification is
+    /// reported, carrying what the Fleet reserved on it. WHICH of them that is follows the
+    /// allocation strategy: `prioritized` "uses the priority that you assigned to each
+    /// instance type to determine which of the specified instance types to use" first,
+    /// moving on only when the capacity it asked for is not available
+    /// (`CreateCapacityReservationFleetRequest$AllocationStrategy`), and "A lower value
+    /// indicates a high priority" (`ReservationFleetInstanceSpecification$Priority`), a
+    /// specification that assigned none coming after every one that did. The capacity this
+    /// emulator reserves is always available, so the highest-priority specification covers
+    /// the whole target and the others reserve nothing.
+    ///
+    /// How many instances covering the target takes is the target capacity divided by what
+    /// one instance of that type provides, rounded UP: "This value, together with the total
+    /// target capacity that you specify for the Fleet determine the number of instances for
+    /// which the Fleet reserves capacity" (`$Weight`), and an instance is not reserved in
+    /// fractions — so the capacity fulfilled is that count times the weight, which is at
+    /// least the target. A specification nothing was reserved on holds no Capacity
+    /// Reservation, so it reports neither an id nor a create date: there is no reservation to
+    /// name.
+    fn fleet_capacity_reservations(
+        &mut self,
+        spec: &CapacityReservationFleetSpec,
+        created_at: SystemTime,
+    ) -> Vec<FleetCapacityReservation> {
+        // The specification the strategy reserves on: the lowest `Priority` value, the
+        // earliest of them when several share it (`min_by_key` keeps the first).
+        let chosen = spec
+            .instance_specs
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, instance_spec)| instance_spec.priority.unwrap_or(i32::MAX))
+            .map(|(index, _)| index);
+        let mut reservations: Vec<FleetCapacityReservation> =
+            Vec::with_capacity(spec.instance_specs.len());
+        for (index, instance_spec) in spec.instance_specs.iter().enumerate() {
+            let weight = if instance_spec.weight > 0.0 {
+                instance_spec.weight
+            } else {
+                DEFAULT_FLEET_INSTANCE_WEIGHT
+            };
+            let reserved_here = chosen == Some(index);
+            let total_instance_count = if reserved_here {
+                fleet_instance_count(spec.total_target_capacity, weight)
+            } else {
+                0
+            };
+            reservations.push(FleetCapacityReservation {
+                capacity_reservation_id: reserved_here
+                    .then(|| self.next_id(CAPACITY_RESERVATION_ID_PREFIX)),
+                availability_zone: Some(instance_spec.availability_zone.clone()),
+                availability_zone_id: Some(instance_spec.availability_zone_id.clone()),
+                instance_type: Some(instance_spec.instance_type.to_string()),
+                instance_platform: Some(instance_spec.instance_platform.to_string()),
+                total_instance_count: Some(total_instance_count),
+                fulfilled_capacity: Some(f64::from(total_instance_count) * weight),
+                ebs_optimized: Some(instance_spec.ebs_optimized),
+                create_date: reserved_here.then(|| system_time_to_date_time(created_at)),
+                weight: Some(weight),
+                priority: instance_spec.priority,
+            });
+        }
+        reservations
+    }
+
+    /// Store a Capacity Reservation Fleet and answer it as it was stored.
+    ///
+    /// The one way a Fleet is stored, so the id it carries, the ARN it reports, the state it
+    /// starts in, the Capacity Reservations it reserves through, the move the clock owes it
+    /// and the bytes it charges cannot be built two ways.
+    ///
+    /// The CALL reserves the capacity: "Creates a Capacity Reservation Fleet"
+    /// (`CreateCapacityReservationFleet`) answers with the
+    /// `FleetCapacityReservations` it created and the capacity they fulfil, so those are
+    /// facts of the create rather than of a later instant. What the Fleet still owes the
+    /// clock is its own STATE word: a Fleet is answered in the non-terminal `submitted`,
+    /// where "Amazon Elastic Compute Cloud is preparing to create the Capacity Reservations"
+    /// (`CapacityReservationFleet$State`), and reaches `active` one [`TRANSITION_DELAY`]
+    /// later.
+    ///
+    /// What comes back is the stored view itself, so a create answers exactly what a later
+    /// `DescribeCapacityReservationFleets` will report without reading the store a second
+    /// time.
+    pub fn insert_capacity_reservation_fleet(
+        &mut self,
+        spec: CapacityReservationFleetSpec,
+    ) -> CapacityReservationFleet {
+        let fleet_id = self.next_id(CAPACITY_RESERVATION_FLEET_ID_PREFIX);
+        let created_at = SystemTime::now();
+        let reservations = self.fleet_capacity_reservations(&spec, created_at);
+        let view = CapacityReservationFleet {
+            capacity_reservation_fleet_id: Some(fleet_id.clone()),
+            // "The ARN of the Capacity Reservation Fleet"
+            // (`CapacityReservationFleet$CapacityReservationFleetArn`): an EC2 ARN in the
+            // Region the request was signed for, under the resource type the modelled
+            // `ResourceType` catalog publishes for this resource.
+            capacity_reservation_fleet_arn: Some(::engine::emulator_arn(
+                "ec2",
+                &spec.region,
+                &format!("{RESOURCE_TYPE_CAPACITY_RESERVATION_FLEET}/{fleet_id}"),
+            )),
+            state: Some(CAPACITY_RESERVATION_FLEET_STATE_SUBMITTED.to_string()),
+            total_target_capacity: Some(spec.total_target_capacity),
+            // "The capacity units that have been fulfilled" — what the Capacity Reservations
+            // this call created fulfil, summed in one place.
+            total_fulfilled_capacity: Some(fleet_fulfilled_capacity(&reservations)),
+            tenancy: Some(spec.tenancy.to_string()),
+            end_date: spec.end_date,
+            create_time: Some(system_time_to_date_time(created_at)),
+            instance_match_criteria: Some(spec.instance_match_criteria.to_string()),
+            allocation_strategy: Some(spec.allocation_strategy.to_string()),
+            instance_type_specifications: Some(reservations),
+            tags: Some(spec.tags),
+        };
+        self.add_stored_bytes(tag_list_bytes(view.tags.as_deref().unwrap_or_default()));
+        let stored = view.clone();
+        self.capacity_reservation_fleets.insert(
+            fleet_id,
+            CapacityReservationFleetRecord {
+                view,
+                pending: Some(CapacityReservationFleetTransition::starting_now(
+                    CAPACITY_RESERVATION_FLEET_STATE_ACTIVE,
+                )),
+            },
+        );
+        stored
+    }
+
+    /// Apply every Capacity Reservation Fleet move the clock owes, as of `now`.
+    ///
+    /// Called by [`Self::materialize_due_transitions`], which is the one place every owed
+    /// move is applied from.
+    fn materialize_due_capacity_reservation_fleet_moves(&mut self, now: Instant) {
+        for record in self.capacity_reservation_fleets.values_mut() {
+            let due = record
+                .pending
+                .as_ref()
+                .filter(|pending| now >= pending.due_at)
+                .map(|pending| pending.to);
+            if let Some(to) = due {
+                record.apply_due_move(to);
+            }
+        }
+    }
+}
+// ---------------------------------------------------------------------------
+// Network Access Scopes and their analyses
+// ---------------------------------------------------------------------------
+
+/// The id prefix of a Network Access Scope, as AWS mints one: `nis-<hex>` (the AWS CLI
+/// reference for `ec2 create-network-insights-access-scope` reports ids of that form).
+///
+/// [`ComAmazonawsEc2Amazonec2State::next_id`] appends the 17 lowercase hexadecimal digits
+/// every EC2 resource id of the long form carries.
+pub const NETWORK_INSIGHTS_ACCESS_SCOPE_ID_PREFIX: &str = "nis";
+
+/// The id prefix of a Network Access Scope ANALYSIS, as AWS mints one: `nisa-<hex>` (the
+/// AWS CLI reference for `ec2 start-network-insights-access-scope-analysis` reports ids of
+/// that form), with the same 17-hex-digit suffix as every other long EC2 id.
+pub const NETWORK_INSIGHTS_ACCESS_SCOPE_ANALYSIS_ID_PREFIX: &str = "nisa";
+
+/// An analysis AWS is still running: the `AnalysisStatus` enum's `running` member, which is
+/// what `StartNetworkInsightsAccessScopeAnalysis` answers with until [`TRANSITION_DELAY`]
+/// has passed.
+pub const ANALYSIS_STATUS_RUNNING: &str = "running";
+
+/// An analysis that did not produce a result: the `AnalysisStatus` enum's `failed` member.
+///
+/// The terminal status the clock owes every analysis this emulator starts — see
+/// [`ANALYSIS_UNSUPPORTED_STATUS_MESSAGE`] and the module docs.
+pub const ANALYSIS_STATUS_FAILED: &str = "failed";
+
+/// "The status message" (`NetworkInsightsAccessScopeAnalysis$StatusMessage`) of an analysis
+/// this emulator could not run.
+///
+/// A Network Access Scope analysis evaluates the account's real network against the scope;
+/// this emulator runs no such evaluation, so the analysis ends in
+/// [`ANALYSIS_STATUS_FAILED`] carrying this reason rather than reporting findings, an
+/// analyzed interface count or a `succeeded` status that nothing computed.
+pub const ANALYSIS_UNSUPPORTED_STATUS_MESSAGE: &str =
+    "This emulator does not perform Network Access Scope reachability analysis, so no \
+     findings were produced for this scope.";
+
+/// The `FindingsFound` enum's `unknown` member: whether the scope has findings was never
+/// determined, which is what an analysis that did not run can say about it.
+pub const FINDINGS_FOUND_UNKNOWN: &str = "unknown";
+
+/// The `ResourceType` a `StartNetworkInsightsAccessScopeAnalysis` tag specification may
+/// name: the analysis it starts (the modelled `ResourceType` enum's
+/// `network-insights-access-scope-analysis` member).
+pub const RESOURCE_TYPE_NETWORK_INSIGHTS_ACCESS_SCOPE_ANALYSIS: &str =
+    "network-insights-access-scope-analysis";
+
+/// The `ResourceType` enum's `network-insights-access-scope` member, which an access
+/// scope's own ARN names.
+pub const RESOURCE_TYPE_NETWORK_INSIGHTS_ACCESS_SCOPE: &str = "network-insights-access-scope";
+
+/// The largest number of Network Access Scope analyses this in-memory store holds.
+///
+/// The crate's one store ceiling, [`MAX_STORED_RECORDS_PER_STORE`], named here because the
+/// start path's refusal message and this module's capacity predicate both read better for
+/// the resource than for "a store": the bound itself has ONE spelling, so no two stores of
+/// this module can drift apart. Like every other, it is a capacity bound on this process's
+/// memory rather than an AWS quota, and
+/// [`ComAmazonawsEc2Amazonec2State::has_network_insights_access_scope_analysis_capacity`] is
+/// the predicate the start path asks before inserting.
+pub const MAX_NETWORK_INSIGHTS_ACCESS_SCOPE_ANALYSES: usize = MAX_STORED_RECORDS_PER_STORE;
+
+/// The code EC2 answers for a Network Access Scope id the account holds no scope under.
+///
+/// The same `Invalid<Resource>Id.NotFound` convention as
+/// [`INVALID_LAUNCH_TEMPLATE_ID_NOT_FOUND`].
+pub const INVALID_NETWORK_INSIGHTS_ACCESS_SCOPE_ID_NOT_FOUND: &str =
+    "InvalidNetworkInsightsAccessScopeId.NotFound";
+
+/// The code EC2 answers for an analysis id the account holds no analysis under (see
+/// [`INVALID_NETWORK_INSIGHTS_ACCESS_SCOPE_ID_NOT_FOUND`] for the convention).
+pub const INVALID_NETWORK_INSIGHTS_ACCESS_SCOPE_ANALYSIS_ID_NOT_FOUND: &str =
+    "InvalidNetworkInsightsAccessScopeAnalysisId.NotFound";
+
+/// The move the clock owes one Network Access Scope analysis: a [`ClockTransition`] to the
+/// `AnalysisStatus` member it reaches, reported as the analysis's `EndDate`.
+///
+/// The `to` is a `&'static str` so only a word from this module's own catalog constants can
+/// be stored — never a request's text.
+pub type AnalysisTransition = ClockTransition<&'static str>;
+
+/// One Network Access Scope analysis: the modelled [`NetworkInsightsAccessScopeAnalysis`]
+/// every operation that reports one answers with, plus the move the clock owes it.
+///
+/// `StartNetworkInsightsAccessScopeAnalysis` and
+/// `DescribeNetworkInsightsAccessScopeAnalyses` answer with that one shape, so the one
+/// stored view is what both report and they cannot describe one analysis differently.
+#[derive(Debug, Clone)]
+pub struct NetworkInsightsAccessScopeAnalysisRecord {
+    /// The analysis as the model shapes it, carrying the status reached so far.
+    pub view: NetworkInsightsAccessScopeAnalysis,
+    /// The move the clock owes this analysis, while one is owed.
+    pub pending: Option<AnalysisTransition>,
+}
+
+/// What a writer must say to store a Network Access Scope analysis; everything else about
+/// the record is derived by
+/// [`ComAmazonawsEc2Amazonec2State::insert_network_insights_access_scope_analysis`].
+#[derive(Debug, Clone)]
+pub struct NetworkInsightsAccessScopeAnalysisSpec {
+    /// "The ID of the Network Access Scope"
+    /// (`StartNetworkInsightsAccessScopeAnalysisRequest$NetworkInsightsAccessScopeId`), as
+    /// resolved against [`ComAmazonawsEc2Amazonec2State::network_insights_access_scopes`].
+    pub network_insights_access_scope_id: String,
+    /// The Region the request was signed for, which the analysis's ARN names.
+    pub region: String,
+    /// The tags the request's `TagSpecifications` assign to the analysis.
+    pub tags: Vec<Tag>,
+    /// The request's `ClientToken`, which names this analysis from now on.
+    pub client_token: String,
+}
+
+/// The caller-chosen bytes one stored analysis holds: its tags and the client token that
+/// names it, on top of the record's own fixed overhead ([`STORED_RECORD_OVERHEAD_BYTES`]),
+/// so an untagged analysis is not free against [`MAX_STORED_BYTES`]. Everything else on the
+/// record — the ids, the ARN, the status, the dates — is derived by this module or bounded
+/// by the model, so it is fixed-size, which is what that overhead stands for.
+///
+/// The ONE definition of that charge, so a writer cannot ask one number and charge another.
+pub fn network_insights_access_scope_analysis_payload_bytes(
+    tags: &[Tag],
+    client_token: &str,
+) -> usize {
+    tag_list_bytes(tags)
+        .saturating_add(client_token.len())
+        .saturating_add(STORED_RECORD_OVERHEAD_BYTES)
+}
+
+/// Refuse a Network Access Scope id a request named that the account holds no scope under:
+/// HTTP 400 [`INVALID_NETWORK_INSIGHTS_ACCESS_SCOPE_ID_NOT_FOUND`].
+pub fn invalid_network_insights_access_scope_id_not_found<E>(scope_id: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_NETWORK_INSIGHTS_ACCESS_SCOPE_ID_NOT_FOUND,
+        400,
+        format!("The Network Access Scope ID '{scope_id}' does not exist"),
+    )
+}
+
+/// Refuse an analysis id a request named that the account holds no analysis under: HTTP 400
+/// [`INVALID_NETWORK_INSIGHTS_ACCESS_SCOPE_ANALYSIS_ID_NOT_FOUND`].
+pub fn invalid_network_insights_access_scope_analysis_id_not_found<E>(
+    analysis_id: &str,
+) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_NETWORK_INSIGHTS_ACCESS_SCOPE_ANALYSIS_ID_NOT_FOUND,
+        400,
+        format!("The Network Access Scope analysis ID '{analysis_id}' does not exist"),
+    )
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// Whether another Network Access Scope analysis fits inside the store's ceiling
+    /// ([`MAX_NETWORK_INSIGHTS_ACCESS_SCOPE_ANALYSES`]).
+    ///
+    /// The same contract as [`Self::has_vpc_endpoint_connection_capacity`]: the start path
+    /// asks first and refuses with EC2's own quota code when it answers `false`, and
+    /// [`Self::insert_network_insights_access_scope_analysis`] asks it again for itself, so
+    /// no path can get past the ceiling by forgetting to.
+    pub fn has_network_insights_access_scope_analysis_capacity(&self) -> bool {
+        self.network_insights_access_scope_analyses.len()
+            < MAX_NETWORK_INSIGHTS_ACCESS_SCOPE_ANALYSES
+    }
+
+    /// Whether another Network Access Scope fits inside the store's ceiling
+    /// ([`MAX_STORED_RECORDS_PER_STORE`]), on the contract of
+    /// [`Self::has_transit_gateway_attachment_capacity`].
+    pub fn has_network_insights_access_scope_capacity(&self) -> bool {
+        self.network_insights_access_scopes.len() < MAX_STORED_RECORDS_PER_STORE
+    }
+
+    /// Store a Network Access Scope, as the one way a scope enters the store, and answer
+    /// the `NetworkInsightsAccessScopeId` it was given — or `None` when the store is at
+    /// [`MAX_STORED_RECORDS_PER_STORE`] and NOTHING was stored.
+    ///
+    /// Reached from `StartNetworkInsightsAccessScopeAnalysis`'s own suite today and from
+    /// `CreateNetworkInsightsAccessScope` once that scaffold is implemented (its stub issue
+    /// is `20261022T235108Z-ec2-createnetworkinsightsaccessscope-stub`): it is the ONE path
+    /// a scope enters the store by, so the create has nothing of its own to derive.
+    ///
+    /// Everything the service owns is derived here rather than taken from the caller — the
+    /// id, the ARN built from it and the creation date — so no two writers can report the
+    /// same scope differently. A scope AWS hands back is ready, so it has no clock-owed
+    /// move: only the analyses started against it do. The caller-chosen bytes it holds are
+    /// charged on top of [`STORED_RECORD_OVERHEAD_BYTES`], so an untagged scope is not free
+    /// against [`MAX_STORED_BYTES`] either.
+    pub fn insert_network_insights_access_scope(
+        &mut self,
+        region: &str,
+        tags: Vec<Tag>,
+    ) -> Option<String> {
+        if !self.has_network_insights_access_scope_capacity() {
+            return None;
+        }
+        let scope_id = self.next_id(NETWORK_INSIGHTS_ACCESS_SCOPE_ID_PREFIX);
+        // "The creation date" (`NetworkInsightsAccessScope$CreatedDate`); nothing has
+        // changed the scope since, so that is also when it was last updated.
+        let created_date = system_time_to_date_time(SystemTime::now());
+        let scope = NetworkInsightsAccessScope {
+            network_insights_access_scope_id: Some(scope_id.clone()),
+            network_insights_access_scope_arn: Some(::engine::emulator_arn(
+                "ec2",
+                region,
+                &format!("{RESOURCE_TYPE_NETWORK_INSIGHTS_ACCESS_SCOPE}/{scope_id}"),
+            )),
+            created_date: Some(created_date),
+            updated_date: Some(created_date),
+            tags: Some(tags),
+        };
+        self.add_stored_bytes(
+            tag_list_bytes(scope.tags.as_deref().unwrap_or_default())
+                .saturating_add(STORED_RECORD_OVERHEAD_BYTES),
+        );
+        self.network_insights_access_scopes
+            .insert(scope_id.clone(), scope);
+        Some(scope_id)
+    }
+
+    /// Start one Network Access Scope analysis and answer it as it was stored — or `None`
+    /// when the store is at [`MAX_NETWORK_INSIGHTS_ACCESS_SCOPE_ANALYSES`] and NOTHING was
+    /// stored.
+    ///
+    /// The one way an analysis is stored, so the id it carries, the ARN it reports, the
+    /// status it starts in, the move the clock owes it, the token that names it and the
+    /// bytes it charges cannot be built two ways. An analysis is answered in the
+    /// non-terminal `running` status, so the clock owes it its terminal
+    /// [`ANALYSIS_STATUS_FAILED`] one [`TRANSITION_DELAY`] later (the module docs say why
+    /// that is the terminal status this emulator can honestly reach).
+    ///
+    /// The ceiling is enforced HERE as well as by
+    /// [`Self::has_network_insights_access_scope_analysis_capacity`], so a writer that
+    /// forgets the gate cannot grow the store without bound either, and a writer that sees
+    /// `None` refuses the request rather than reporting an analysis the store does not
+    /// hold.
+    ///
+    /// What comes back is the stored view itself, so a start answers exactly what a later
+    /// `DescribeNetworkInsightsAccessScopeAnalyses` will report.
+    pub fn insert_network_insights_access_scope_analysis(
+        &mut self,
+        spec: NetworkInsightsAccessScopeAnalysisSpec,
+    ) -> Option<NetworkInsightsAccessScopeAnalysis> {
+        if !self.has_network_insights_access_scope_analysis_capacity() {
+            return None;
+        }
+        let analysis_id = self.next_id(NETWORK_INSIGHTS_ACCESS_SCOPE_ANALYSIS_ID_PREFIX);
+        let view = NetworkInsightsAccessScopeAnalysis {
+            network_insights_access_scope_analysis_id: Some(analysis_id.clone()),
+            network_insights_access_scope_analysis_arn: Some(::engine::emulator_arn(
+                "ec2",
+                &spec.region,
+                &format!("{RESOURCE_TYPE_NETWORK_INSIGHTS_ACCESS_SCOPE_ANALYSIS}/{analysis_id}"),
+            )),
+            network_insights_access_scope_id: Some(spec.network_insights_access_scope_id),
+            status: Some(ANALYSIS_STATUS_RUNNING.to_string()),
+            // "The status message" and "The warning message": nothing to report while the
+            // analysis is still running.
+            status_message: None,
+            warning_message: None,
+            // "The analysis start date" (`StartDate`) is now; the end date, the findings and
+            // the analyzed interface count are owed by the clock, not by this call.
+            start_date: Some(system_time_to_date_time(SystemTime::now())),
+            end_date: None,
+            findings_found: None,
+            analyzed_eni_count: None,
+            tags: Some(spec.tags),
+        };
+        self.add_stored_bytes(network_insights_access_scope_analysis_payload_bytes(
+            view.tags.as_deref().unwrap_or_default(),
+            &spec.client_token,
+        ));
+        let stored = view.clone();
+        self.network_insights_access_scope_analyses.insert(
+            analysis_id.clone(),
+            NetworkInsightsAccessScopeAnalysisRecord {
+                view,
+                pending: Some(AnalysisTransition::starting_now(ANALYSIS_STATUS_FAILED)),
+            },
+        );
+        self.network_insights_access_scope_analysis_client_tokens
+            .insert(spec.client_token, analysis_id);
+        Some(stored)
     }
 }
 
@@ -12335,3 +15226,4 @@ pub fn allowed_images_settings_full<E>(region: &str, full: AllowedImagesSettings
         )),
     }
 }
+

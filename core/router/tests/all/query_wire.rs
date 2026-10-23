@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! The two things every awsQuery suite in this test crate needs: the percent-encoder that
-//! builds a form body, and the reader that pulls one element's text out of the XML answer.
+//! builds a form body, and the readers that pull one element's text — or every occurrence
+//! of a repeated one — out of the XML answer.
 //!
 //! They live here, ONCE, because a suite that writes its own drifts from the others: an
 //! encoder that leaves one more byte literal, or a reader that stops at a different tag,
@@ -57,6 +58,37 @@ pub(crate) fn element(body: &str, name: &str) -> String {
     opt_element(body, name).unwrap_or_else(|| panic!("no <{name}> element in {body}"))
 }
 
+/// The text of EVERY `<name>…</name>` element of an XML answer, in document order, with
+/// the five entities this emulator's XML serializer escapes decoded back — so a value that
+/// is itself a document (an attribute carrying JSON, a policy) compares as the service
+/// wrote it rather than as its escaping.
+///
+/// The repeated-element and decoding counterpart of [`opt_element`], for a suite reading a
+/// LIST of a tag (every `<OutputValue>`, every `<key>`); the same reader, not an XML
+/// parser, and under the same assumption about the documents it is pointed at.
+pub(crate) fn elements(body: &str, name: &str) -> Vec<String> {
+    let (open, close) = (format!("<{name}>"), format!("</{name}>"));
+    let mut found = Vec::new();
+    let mut rest = body;
+    while let Some(start) = rest.find(&open) {
+        let after = &rest[start + open.len()..];
+        let Some(end) = after.find(&close) else { break };
+        found.push(unescape(&after[..end]));
+        rest = &after[end + close.len()..];
+    }
+    found
+}
+
+/// The five entities an XML serializer escapes, decoded back. `&amp;` LAST, so a value
+/// that carried a literal `&lt;` is not turned into a `<`.
+fn unescape(text: &str) -> String {
+    text.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -103,5 +135,46 @@ mod tests {
             "<Code>A</Code><Code>B</Code>",
             "case \"a parent element\": got {body}"
         );
+    }
+
+    /// The repeated-element reader answers every one of them, in document order, with the
+    /// serializer's escaping undone.
+    #[test]
+    fn the_repeated_element_reader_finds_every_one_decoded() {
+        // (case, the answer, the tag read, the texts it carries)
+        let rows: [(&str, &str, &str, &[&str]); 4] = [
+            (
+                "two of a tag",
+                "<R><Code>A</Code><Code>B</Code></R>",
+                "Code",
+                &["A", "B"],
+            ),
+            (
+                "a tag the answer does not carry",
+                "<R><Code>A</Code></R>",
+                "Message",
+                &[],
+            ),
+            (
+                "an escaped document value",
+                "<R><value>{&quot;a&quot;:1}</value></R>",
+                "value",
+                &[r#"{"a":1}"#],
+            ),
+            (
+                "every entity the serializer escapes",
+                "<R><value>&lt;a&gt; &amp; &apos;b&apos;</value></R>",
+                "value",
+                &["<a> & 'b'"],
+            ),
+        ];
+
+        for (case, body, tag, expected) in rows {
+            let read = elements(body, tag);
+            assert_eq!(
+                read, expected,
+                "case {case:?}: expected {expected:?}, got {read:?}"
+            );
+        }
     }
 }

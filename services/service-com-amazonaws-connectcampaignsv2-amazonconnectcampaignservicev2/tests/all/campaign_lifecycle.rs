@@ -20,14 +20,58 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_connectcampaignsv2_amazonconnectcampaignservicev2::state::{
-    CampaignAction, CampaignState,
+    CampaignAction, CampaignState, ONBOARDING_JOB_DURATION,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
 use super::common::{call, error_code, router};
 
-/// `CreateCampaign`, asserting it succeeded, and returning the response body.
+/// Onboard the Connect instance a `CreateCampaign` body names, so the create has a
+/// campaign target: `CreateCampaign` mints a campaign only for an instance whose
+/// onboarding job has SUCCEEDED, and that job settles one
+/// [`ONBOARDING_JOB_DURATION`] after `StartInstanceOnboardingJob`. Idempotent and
+/// cheap to repeat: an instance already onboarded is left alone, so the wait is paid
+/// once per instance rather than once per create.
+async fn onboard_for(router: &MultiServiceRouter, region: &str, body: &Value) {
+    let Some(instance) = body.get("connectInstanceId").and_then(Value::as_str) else {
+        return;
+    };
+    let (status, status_body) = call(
+        router,
+        region,
+        "GET",
+        &format!("/v2/connect-instance/{instance}/onboarding"),
+        &Value::Null,
+    )
+    .await;
+    if status == 200
+        && status_body
+            .pointer("/connectInstanceOnboardingJobStatus/status")
+            .and_then(Value::as_str)
+            == Some("SUCCEEDED")
+    {
+        return;
+    }
+    let (status, started) = call(
+        router,
+        region,
+        "PUT",
+        &format!("/v2/connect-instance/{instance}/onboarding"),
+        &json!({"encryptionConfig": {"enabled": false}}),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "StartInstanceOnboardingJob {instance}: expected 200, got {status} {started}"
+    );
+    tokio::time::sleep(ONBOARDING_JOB_DURATION + std::time::Duration::from_millis(100)).await;
+}
+
+/// `CreateCampaign`, asserting it succeeded, and returning the response body. The
+/// instance the body names is onboarded first (see [`onboard_for`]) — a campaign
+/// belongs to an onboarded Connect instance, so a create without one is a 404.
 async fn create(router: &MultiServiceRouter, region: &str, body: &Value) -> Value {
+    onboard_for(router, region, body).await;
     let (status, response) = call(router, region, "PUT", "/v2/campaigns", body).await;
     assert_eq!(
         status, 200,
@@ -214,12 +258,12 @@ async fn create_then_describe_returns_every_stored_member() {
                 "connectInstanceId": "instance_2.a",
                 "type": "MANAGED",
                 "channelSubtypeConfig": merged(&telephony_config(), &sms_config()),
-                // The model targets `TimeStamp`; this emulator's restJson1 schemas
-                // carry no `@timestampFormat`, so a timestamp is the protocol
-                // default, epoch seconds.
+                // `Schedule$startTime` / `$endTime` target `TimeStamp`, which the
+                // model marks `@timestampFormat("date-time")`, so each is an RFC 3339
+                // instant on the wire — the form every AWS SDK sends and expects back.
                 "schedule": {
-                    "startTime": 1_767_225_600,
-                    "endTime": 1_769_903_999,
+                    "startTime": "2026-01-01T00:00:00Z",
+                    "endTime": "2026-02-01T23:59:59Z",
                     "refreshFrequency": "P1D"
                 },
                 "entryLimitsConfig": {"maxEntryCount": 7, "minEntryInterval": "P1D"},

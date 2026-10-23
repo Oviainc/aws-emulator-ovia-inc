@@ -190,7 +190,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(mut record) = state.firewall_policies.remove(&key) else {
             return Err(DeleteFirewallPolicyErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!("Firewall policy {key} does not exist.")),
+                    message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
                 },
             )
             .into());
@@ -205,6 +205,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // of the resource this call just removed.
         record.status = crate::state::RESOURCE_DELETING.to_string();
         record.last_modified_time = ::std::time::SystemTime::now();
+        // The response projects the removed record rather than echoing a
+        // request, so the policy's tag collection is reported as a list — empty
+        // when it carries no tags (see `state::removed_resource_tags`).
+        record.tags = crate::state::removed_resource_tags(record.tags.take());
         let consumed = state.consumed_policy_capacity(&record.policy);
 
         Ok(DeleteFirewallPolicyOutput {
@@ -215,6 +219,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
 crate::state::impl_resolve_error!(
     delete_lookup_error -> DeleteFirewallPolicyError, DeleteFirewallPolicyErrorModeled,
-    resource = "firewall policy", plural = "firewall policies",
+    plural = "firewall policies",
     name_member = "FirewallPolicyName", arn_member = "FirewallPolicyArn"
 );

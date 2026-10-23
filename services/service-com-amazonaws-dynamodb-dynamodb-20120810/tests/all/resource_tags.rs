@@ -15,8 +15,9 @@
 //! an empty 200. The documented ceiling is 50 tags per table ("You can add up to 50
 //! tags to a single DynamoDB table" — the `Tag` doc), the `aws:` key prefix is one
 //! "the user cannot assign" (same doc), and an ARN naming no table is
-//! `ResourceNotFoundException` while a value that is not a table ARN at all is a
-//! `ValidationException`.
+//! `ResourceNotFoundException` while a value that is not an in-scope table ARN is a
+//! `ValidationException` (the refusal WORDING is pinned by
+//! `arn_addressed_tag_refusals`).
 //!
 //! Every table below spans the class the rule generalises over — the number of tags,
 //! the value (including the empty one), the key's case, the modelled length bounds,
@@ -183,7 +184,8 @@ fn assert_empty_body(case: &str, body: &Value) {
 /// applies, and the whole set the resource must then report. The rows differ along what
 /// the rule generalises over — the number of tags, the value (including the empty one
 /// and the modelled maximum length), the key's case and length, and whether the batch
-/// overwrites a stored key, adds a new one or repeats a key inside itself.
+/// overwrites a stored key or adds a new one. A batch that repeats a key is REFUSED
+/// rather than merged (`arn_addressed_tag_refusals`), so no row here carries one.
 struct MergeCase {
     name: &'static str,
     created: &'static [(&'static str, &'static str)],
@@ -205,7 +207,7 @@ fn longest_value() -> String {
 async fn tagging_merges_the_batch_into_the_stored_set_and_reports_it_back() {
     let router = emulator();
 
-    let cases: [MergeCase; 8] = [
+    let cases: [MergeCase; 7] = [
         MergeCase {
             name: "a first tag on an untagged table",
             created: &[],
@@ -247,12 +249,6 @@ async fn tagging_merges_the_batch_into_the_stored_set_and_reports_it_back() {
             created: &[("env", "staging")],
             batch: &[],
             expected: &[("env", "staging")],
-        },
-        MergeCase {
-            name: "a key repeated inside one batch keeps the last value",
-            created: &[],
-            batch: &[("env", "staging"), ("env", "prod")],
-            expected: &[("env", "prod")],
         },
     ];
 
@@ -595,7 +591,9 @@ async fn a_resource_arn_naming_no_table_is_refused_on_every_tagging_operation() 
         (
             "a table that exists only in another region",
             format!("arn:aws:dynamodb:eu-west-1:{account}:table/tagged-table"),
-            "ResourceNotFoundException",
+            // Out of the scope this endpoint answers for, so an INPUT refusal rather
+            // than a lookup miss — see `arn_addressed_tag_refusals`.
+            "ValidationException",
         ),
         (
             "a bare table name rather than an ARN",

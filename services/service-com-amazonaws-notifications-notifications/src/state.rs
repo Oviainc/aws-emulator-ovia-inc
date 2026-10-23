@@ -87,6 +87,43 @@ pub struct NotificationConfigurationRecord {
     pub sequence: u64,
 }
 
+/// The most tags one resource carries at once.
+///
+/// This is the `max` of the modelled `TagMap`'s `@length` constraint
+/// (`0..200`) — the shape both `TagResource`'s `tags` input and
+/// `ListTagsForResource`'s `tags` output are typed as. A tag write that left
+/// more than this many tags on a record would make the later read exceed the
+/// bound its own model declares, so a write past it is refused instead. The
+/// number comes from the model, not from this emulator.
+pub const MAX_TAGS_PER_RESOURCE: usize = 200;
+
+impl NotificationConfigurationRecord {
+    /// How many tags this record would carry after merging `keys` into it,
+    /// counted WITHOUT writing anything.
+    ///
+    /// Tagging adds or overwrites the keys it is given and leaves every other
+    /// key alone, so the resulting count is the stored count plus the incoming
+    /// keys this record does not already carry. A write is all-or-nothing, so
+    /// the count has to be known before the first insert.
+    pub fn tag_count_after_merge<'a, I: IntoIterator<Item = &'a str>>(&self, keys: I) -> usize {
+        self.tags.len()
+            + keys
+                .into_iter()
+                .filter(|key| !self.tags.contains_key(*key))
+                .count()
+    }
+
+    /// Merge `tags` into this record's tag set: each supplied key is inserted
+    /// or overwritten, and a key the request does not mention keeps the value
+    /// it had. Repeating the same merge is therefore a no-op, which is what
+    /// `TagResource`'s `@idempotent` trait requires.
+    pub fn merge_tags<I: IntoIterator<Item = (String, String)>>(&mut self, tags: I) {
+        for (key, value) in tags {
+            self.tags.insert(key, value);
+        }
+    }
+}
+
 /// `REGISTERING`, the status a freshly registered `NotificationHub` carries.
 ///
 /// One of `NotificationHubStatus`'s four modelled values

@@ -1,10 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteUser
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteUser`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
 //! broken". Replace the `Err(..)` in [`DeleteUser::handle`] with real behaviour and
 //! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
@@ -159,18 +155,140 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteUser` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteUserErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteUser"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+
+        // Same identity rule as `CreateUser`: `UserId` "is stored as a lowercase
+        // string", so that is the key every lookup resolves against.
+        let user_id = input.user_id.to_ascii_lowercase();
+        // The upper bound on a user id the model does not express; see
+        // `crate::state::user_id_rejection`. Checked BEFORE the lookup: an id the
+        // service would never have stored names no user to look up, so the answer
+        // is what is wrong with the id, not that nothing carries it.
+        if let Some(message) = crate::state::user_id_rejection(&user_id) {
+            return Err(DeleteUserErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+        // One instant for the whole request: the event is dated at it, and the
+        // removal the clock owes is due a span after it.
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // A user whose removal already fell due is gone, so a delete naming it
+        // answers not-found rather than deleting it twice.
+        store.settle_users(now);
+
+        // "The user does not exist or could not be found": the modelled 404.
+        if !store.users.contains_key(&user_id) {
+            return Err(DeleteUserErrorModeled::UserNotFoundFault(UserNotFoundFault {
+                message: Some(format!("User {} not found.", input.user_id)),
+            })
+            .into());
+        }
+        // "Returns a list of the user group IDs the user belongs to": the groups
+        // that list this user, read before the record is borrowed mutably below.
+        // They are what the default-user refusal branches on, and what this call
+        // withdraws — `DeleteUser` documents that the user "will be removed from
+        // all user groups".
+        let user_group_ids = store.user_group_ids_of(&user_id);
+        // The built-in `default` user is the one ElastiCache gives every account
+        // and the one every user group must contain (see
+        // `crate::state::DEFAULT_USER_ID`): no call creates it, and none deletes
+        // it.
+        if user_id == crate::state::DEFAULT_USER_ID {
+            // `DefaultUserAssociatedToUserGroupFault`: "The default user assigned
+            // to the user group" — the modelled fault for exactly the state a
+            // group that still lists it puts the account in. With no group
+            // holding it the refusal is about the VALUE, so it is the modelled
+            // `InvalidParameterValueException` instead.
+            if let Some(group) = user_group_ids.first() {
+                return Err(
+                    DeleteUserErrorModeled::DefaultUserAssociatedToUserGroupFault(
+                        DefaultUserAssociatedToUserGroupFault {
+                            message: Some(format!(
+                                "User {} is the default user of user group {group}.",
+                                input.user_id
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            return Err(DeleteUserErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    message: Some(format!(
+                        "Invalid value {} for UserId: the {} user cannot be deleted.",
+                        input.user_id,
+                        crate::state::DEFAULT_USER_ID
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let Some(user) = store.users.get_mut(&user_id) else {
+            // Unreachable: the containment check above holds the same lock.
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+        // `InvalidUserStateFault`: "The user is not in active state." A user
+        // already on its way out is the case a caller reaches, by deleting the
+        // same user twice inside the span the removal takes.
+        if user.status != crate::state::USER_STATUS_ACTIVE {
+            return Err(DeleteUserErrorModeled::InvalidUserStateFault(
+                InvalidUserStateFault {
+                    message: Some(format!(
+                        "User {user_id} is in {} state, not active.",
+                        user.status
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The user is leaving: this call answers with it `deleting` — the last
+        // thing this API reports about it — and the clock owes its removal a
+        // span later, after which every lookup answers `UserNotFoundFault`.
+        user.status = crate::state::USER_STATUS_DELETING.to_string();
+        user.pending_removal = Some(now + crate::state::USER_DELETION_TRANSITION);
+        // Read back out of the store, so the response is the persisted user
+        // rather than the request echoed. `User` is generated once per operation,
+        // so the stored user's ONE modelled view is remapped onto this
+        // operation's copy of that shape rather than built a second time.
+        let deleting = user.to_modeled();
+        // "The user will be removed from all user groups and in turn removed from
+        // all replication groups": the membership ends with this call, so the
+        // answer above already reports the user in no group and no later read of
+        // a group lists it.
+        store.withdraw_user_from_groups(&user_id);
+        // Deleting a user is one of the events this service records; see
+        // `crate::state::EventRecord`. The log outlives the record, so the events
+        // of a deleted user are still reported.
+        store.record_event(
+            crate::state::SOURCE_TYPE_USER,
+            &user_id,
+            "User deleted",
+            now,
+        );
+
+        Ok(DeleteUserOutput {
+            user_id: deleting.user_id,
+            user_name: deleting.user_name,
+            status: deleting.status,
+            engine: deleting.engine,
+            minimum_engine_version: deleting.minimum_engine_version,
+            access_string: deleting.access_string,
+            user_group_ids: deleting.user_group_ids,
+            authentication: deleting.authentication,
+            arn: deleting.arn,
+        })
     }
 }

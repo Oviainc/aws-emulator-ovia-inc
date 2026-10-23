@@ -17,6 +17,8 @@ mod agentcore_stack_outputs;
 mod callback_signature;
 #[path = "all/change_set_lifecycle.rs"]
 mod change_set_lifecycle;
+#[path = "all/change_set_preview.rs"]
+mod change_set_preview;
 #[path = "all/drift_and_resource_reads.rs"]
 mod drift_and_resource_reads;
 #[path = "all/ecs_elbv2_stack_identifiers.rs"]
@@ -35,6 +37,8 @@ mod extension_registry;
 mod nested_resource_outputs;
 #[path = "all/provisioned_resources.rs"]
 mod provisioned_resources;
+#[path = "all/published_type_schema.rs"]
+mod published_type_schema;
 #[path = "all/resolved_properties.rs"]
 mod resolved_properties;
 #[path = "all/scratch.rs"]
@@ -49,6 +53,10 @@ mod stack_outputs;
 mod stack_reported_members;
 #[path = "all/stack_resource_detail.rs"]
 mod stack_resource_detail;
+#[path = "all/stack_resource_providers.rs"]
+mod stack_resource_providers;
+#[path = "all/stack_resource_provisioning.rs"]
+mod stack_resource_provisioning;
 #[path = "all/stack_resources.rs"]
 mod stack_resources;
 #[path = "all/stack_role_trust.rs"]

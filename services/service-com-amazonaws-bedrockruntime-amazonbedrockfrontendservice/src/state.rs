@@ -30,8 +30,10 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use crate::ops::types::{
-    AsyncInvokeOutputDataConfig, ContentBlock, Message, SystemContentBlock, Tag, Tool,
-    ToolConfiguration,
+    AsyncInvokeOutputDataConfig, CitationGeneratedContent, CitationSourceContent, ContentBlock,
+    DocumentBlock, DocumentContentBlock, DocumentSource, GuardrailConverseContentBlock, Message,
+    ReasoningContentBlock, SearchResultBlock, SystemContentBlock, Tag, TokenUsage, Tool,
+    ToolChoice, ToolConfiguration, ToolInputSchema, ToolReference, ToolResultContentBlock,
 };
 
 /// The most async-invoke records this emulator retains.
@@ -340,6 +342,12 @@ pub struct ModelEntry {
     /// lists the Cohere Command (text) models as `InvokeModel`-only, for
     /// instance — and `Converse` must refuse one that is not.
     pub supports_converse: bool,
+    /// Whether `CountTokens` serves this model. The count is the MODEL's own
+    /// tokenizer's, so the operation is published per model family —
+    /// `CountTokens`'s "Supported models" in the Amazon Bedrock User Guide lists
+    /// the Anthropic Claude family — and a model outside that set is refused
+    /// rather than answered with another tokenizer's count.
+    pub supports_count_tokens: bool,
     /// The model's own ceiling on generated tokens, which caps
     /// `inferenceConfig.maxTokens`. Zero for a model that generates no text.
     pub max_output_tokens: u32,
@@ -370,6 +378,11 @@ fn seed_models() -> Vec<ModelEntry> {
         modality: ModelModality::Text,
         lifecycle: ModelLifecycle::Active,
         supports_converse,
+        // `CountTokens` counts with the MODEL's own tokenizer, and AWS publishes
+        // it for the Anthropic Claude family (`CountTokens` "Supported
+        // models"); the recorded corpus shows the service refusing the count for
+        // a model outside that set rather than answering one.
+        supports_count_tokens: matches!(family, ModelFamily::AnthropicMessages),
         max_output_tokens: max,
     };
     // A recognised model whose modality this emulator computes nothing for.
@@ -379,6 +392,7 @@ fn seed_models() -> Vec<ModelEntry> {
         modality,
         lifecycle: ModelLifecycle::Active,
         supports_converse: false,
+        supports_count_tokens: false,
         max_output_tokens: 0,
     };
     // A model past its end of life: recognised, not servable.
@@ -388,6 +402,7 @@ fn seed_models() -> Vec<ModelEntry> {
         modality,
         lifecycle: ModelLifecycle::EndOfLife,
         supports_converse: false,
+        supports_count_tokens: false,
         max_output_tokens: 0,
     };
     use ModelFamily::{AnthropicMessages, CohereCommand, Llama, Mistral, Nova, TitanText};
@@ -402,9 +417,8 @@ fn seed_models() -> Vec<ModelEntry> {
         text("anthropic.claude-3-5-sonnet-20240620-v1:0", AnthropicMessages, true, 8192),
         text("anthropic.claude-3-5-sonnet-20241022-v2:0", AnthropicMessages, true, 8192),
         text("anthropic.claude-3-7-sonnet-20250219-v1:0", AnthropicMessages, true, 8192),
-        // Amazon Titan Text.
+        // Amazon Titan Text. Titan Text Express is past its end of life (below).
         text("amazon.titan-text-lite-v1", TitanText, true, 4096),
-        text("amazon.titan-text-express-v1", TitanText, true, 8192),
         text("amazon.titan-text-premier-v1:0", TitanText, true, 3072),
         // Amazon Nova understanding models — 5k max output tokens.
         text("amazon.nova-micro-v1:0", Nova, true, 5120),
@@ -445,7 +459,11 @@ fn seed_models() -> Vec<ModelEntry> {
         unserved("amazon.nova-canvas-v1:0", Image),
         unserved("amazon.nova-reel-v1:0", Video),
         unserved("amazon.nova-reel-v1:1", Video),
-        // Past end of life ("Model lifecycle").
+        // Past end of life ("Model lifecycle"). Amazon Titan Text Express and
+        // the first generation of Anthropic Claude on Bedrock are there: the
+        // recorded corpus shows the service answering 404 with the end-of-life
+        // reason for them, which is what makes the id recognised but unserved.
+        retired("amazon.titan-text-express-v1", Text),
         retired("anthropic.claude-v1", Text),
         retired("anthropic.claude-v2", Text),
         retired("anthropic.claude-v2:1", Text),
@@ -577,10 +595,14 @@ pub fn request_region(parts: &::http::request::Parts) -> String {
 pub enum InvokeKind {
     /// `InvokeModel`.
     Sync,
+    /// `InvokeModelWithResponseStream`.
+    SyncStream,
     /// `StartAsyncInvoke`.
     Async,
     /// `Converse`.
     Converse,
+    /// `ConverseStream`.
+    ConverseStream,
 }
 
 /// One served inference call.
@@ -821,39 +843,309 @@ pub fn truncate_to_tokens(text: &str, max_tokens: u32) -> String {
     }
 }
 
-/// The tokens a `Converse`-shaped input is, counted over its text: the system
-/// blocks, the message content blocks, and the names and descriptions of the
-/// tools offered to the model. `CountTokens` and `Converse` both call this, so
-/// the two agree for identical input.
+/// Every piece of text a `Converse`-shaped input sends to the model, in request
+/// order.
+///
+/// The count an inference call reports covers the WHOLE prompt the service hands
+/// the model, not only the plain-text blocks of the conversation: `CountTokens`
+/// documents its count as the tokens of "the input" for the request as a whole,
+/// a `Converse` input is its `system` blocks, its `messages` and its
+/// `toolConfig`, and every tool offered reaches the model verbatim — its name,
+/// its description and its JSON input schema — so each of those is prompt text
+/// too. The same holds inside a message: a document's text, a tool use's input,
+/// a tool result's text or JSON, guarded content, reasoning text, a citation's
+/// text and a search result's content are all text the model is given.
+///
+/// What carries no text contributes nothing: a media payload (`image`, `video`,
+/// `audio`, or a document carried as bytes or an S3 location) has no published
+/// token cost per byte, so this emulator counts no tokens it cannot derive
+/// rather than inventing a rate, and a marker that is not prompt text at all
+/// (`cachePoint`, a tool choice of `auto` or `any`) adds nothing.
+pub fn converse_prompt_pieces(
+    system: Option<&Vec<SystemContentBlock>>,
+    messages: Option<&Vec<Message>>,
+    tool_config: Option<&ToolConfiguration>,
+) -> Vec<String> {
+    let mut pieces = Vec::new();
+    for block in system.map(Vec::as_slice).unwrap_or_default() {
+        match block {
+            SystemContentBlock::Text(text) => pieces.push(text.clone()),
+            SystemContentBlock::guardContent(guard) => push_guard_text(guard, &mut pieces),
+            SystemContentBlock::cachePoint(_) => {}
+        }
+    }
+    for message in messages.map(Vec::as_slice).unwrap_or_default() {
+        for block in &message.content {
+            push_content_text(block, &mut pieces);
+        }
+    }
+    if let Some(config) = tool_config {
+        for tool in &config.tools {
+            match tool {
+                Tool::toolSpec(spec) => {
+                    pieces.push(spec.name.clone());
+                    if let Some(description) = &spec.description {
+                        pieces.push(description.clone());
+                    }
+                    match &spec.input_schema {
+                        ToolInputSchema::Json(schema) => {
+                            pieces.push(document_to_json(schema).to_string())
+                        }
+                    }
+                }
+                Tool::systemTool(tool) => pieces.push(tool.name.clone()),
+                Tool::cachePoint(_) => {}
+            }
+        }
+        match &config.tool_choice {
+            Some(ToolChoice::Tool(choice)) => pieces.push(choice.name.clone()),
+            Some(ToolChoice::Auto(_) | ToolChoice::Any(_)) | None => {}
+        }
+    }
+    pieces
+}
+
+/// The text a guarded content block carries. A guarded image carries none.
+fn push_guard_text(block: &GuardrailConverseContentBlock, pieces: &mut Vec<String>) {
+    match block {
+        GuardrailConverseContentBlock::Text(text) => pieces.push(text.text.clone()),
+        GuardrailConverseContentBlock::Image(_) => {}
+    }
+}
+
+/// The text a document block carries: its name and context, plus its source
+/// when the source IS text. Bytes and an S3 location are not text.
+fn push_document_text(block: &DocumentBlock, pieces: &mut Vec<String>) {
+    pieces.push(block.name.clone());
+    if let Some(context) = &block.context {
+        pieces.push(context.clone());
+    }
+    match &block.source {
+        DocumentSource::Text(text) => pieces.push(text.clone()),
+        DocumentSource::Content(blocks) => {
+            for block in blocks {
+                match block {
+                    DocumentContentBlock::Text(text) => pieces.push(text.clone()),
+                }
+            }
+        }
+        DocumentSource::Bytes(_) | DocumentSource::s3Location(_) => {}
+    }
+}
+
+/// The text a search result carries: where it came from, its title and its
+/// content.
+fn push_search_result_text(block: &SearchResultBlock, pieces: &mut Vec<String>) {
+    pieces.push(block.source.clone());
+    pieces.push(block.title.clone());
+    for content in &block.content {
+        pieces.push(content.text.clone());
+    }
+}
+
+/// The text a reference to a tool carries: whatever of it the caller named.
+fn push_tool_reference_text(reference: &ToolReference, pieces: &mut Vec<String>) {
+    for value in [
+        reference.r#type.as_ref(),
+        reference.name.as_ref(),
+        reference.server_name.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        pieces.push(value.clone());
+    }
+}
+
+/// The text one message content block sends the model.
+fn push_content_text(block: &ContentBlock, pieces: &mut Vec<String>) {
+    match block {
+        ContentBlock::Text(text) => pieces.push(text.clone()),
+        // A media payload carries no text; see `converse_prompt_pieces`.
+        ContentBlock::Image(_) | ContentBlock::Video(_) | ContentBlock::Audio(_) => {}
+        ContentBlock::Document(document) => push_document_text(document, pieces),
+        ContentBlock::toolUse(tool_use) => {
+            pieces.push(tool_use.name.clone());
+            pieces.push(document_to_json(&tool_use.input).to_string());
+        }
+        ContentBlock::toolResult(result) => {
+            for content in &result.content {
+                match content {
+                    ToolResultContentBlock::Text(text) => pieces.push(text.clone()),
+                    ToolResultContentBlock::Json(json) => {
+                        pieces.push(document_to_json(json).to_string())
+                    }
+                    ToolResultContentBlock::Document(document) => {
+                        push_document_text(document, pieces)
+                    }
+                    ToolResultContentBlock::searchResult(result) => {
+                        push_search_result_text(result, pieces)
+                    }
+                    ToolResultContentBlock::Image(_) | ToolResultContentBlock::Video(_) => {}
+                }
+            }
+        }
+        ContentBlock::guardContent(guard) => push_guard_text(guard, pieces),
+        ContentBlock::cachePoint(_) => {}
+        ContentBlock::reasoningContent(reasoning) => match reasoning {
+            ReasoningContentBlock::reasoningText(text) => pieces.push(text.text.clone()),
+            ReasoningContentBlock::redactedContent(_) => {}
+        },
+        ContentBlock::citationsContent(citations) => {
+            for generated in citations.content.iter().flatten() {
+                match generated {
+                    CitationGeneratedContent::Text(text) => pieces.push(text.clone()),
+                }
+            }
+            for citation in citations.citations.iter().flatten() {
+                if let Some(title) = &citation.title {
+                    pieces.push(title.clone());
+                }
+                for source in citation.source_content.iter().flatten() {
+                    match source {
+                        CitationSourceContent::Text(text) => pieces.push(text.clone()),
+                    }
+                }
+            }
+        }
+        ContentBlock::searchResult(result) => push_search_result_text(result, pieces),
+        ContentBlock::toolAddition(addition) => {
+            push_tool_reference_text(&addition.tool, pieces)
+        }
+        ContentBlock::toolRemoval(removal) => push_tool_reference_text(&removal.tool, pieces),
+    }
+}
+
+/// The tokens a `Converse`-shaped input is: the tokens of every piece of prompt
+/// text it carries ([`converse_prompt_pieces`]). `CountTokens` and `Converse`
+/// both call this, so the two agree for identical input.
 pub fn converse_input_tokens(
     system: Option<&Vec<SystemContentBlock>>,
     messages: Option<&Vec<Message>>,
     tool_config: Option<&ToolConfiguration>,
 ) -> u32 {
-    let mut total = 0u32;
-    for block in system.map(Vec::as_slice).unwrap_or_default() {
-        if let SystemContentBlock::Text(text) = block {
-            total = total.saturating_add(count_text_tokens(text));
+    converse_prompt_pieces(system, messages, tool_config)
+        .iter()
+        .fold(0u32, |total, piece| {
+            total.saturating_add(count_text_tokens(piece))
+        })
+}
+
+/// The message-sequence rule both Converse APIs state: a conversation is a
+/// non-empty sequence of turns that starts with the user and alternates between
+/// the user and the assistant.
+///
+/// `Err` carries the refusal sentence, which the caller answers with the
+/// operation's own modelled `ValidationException` (400); each sentence states the
+/// rule the conversation broke, as the Converse API's own validation does.
+/// `Converse` and `ConverseStream` share this, so the same conversation is
+/// accepted or refused identically by both.
+pub fn validate_conversation(messages: Option<&Vec<Message>>) -> Result<&Vec<Message>, String> {
+    let messages = match messages {
+        Some(messages) if !messages.is_empty() => messages,
+        _ => {
+            return Err("A conversation must start with a user message. Try again with a \
+                 conversation that starts with a user message."
+                .to_string())
+        }
+    };
+    if messages[0].role != "user" {
+        return Err("A conversation must start with a user message. Try again with a \
+             conversation that starts with a user message."
+            .to_string());
+    }
+    for (turn, message) in messages.iter().enumerate() {
+        let expected = if turn % 2 == 0 { "user" } else { "assistant" };
+        if message.role != expected {
+            return Err(format!(
+                "A conversation must alternate between user and assistant roles. Try again \
+                 with a conversation that alternates properly between user and assistant \
+                 roles: messages[{turn}] has role {}.",
+                message.role
+            ));
         }
     }
-    for message in messages.map(Vec::as_slice).unwrap_or_default() {
-        for block in &message.content {
-            if let ContentBlock::Text(text) = block {
-                total = total.saturating_add(count_text_tokens(text));
-            }
+    Ok(messages)
+}
+
+/// One served Converse-API turn: the assistant text this emulator answers with,
+/// the token accounting computed for it, and whether the generation cap cut it
+/// short.
+#[derive(Debug, Clone)]
+pub struct ConverseTurn {
+    /// The assistant's text. No model runs here, so it is
+    /// [`emulated_completion_text`] — never the request's own text echoed back.
+    pub text: String,
+    pub input_tokens: u32,
+    pub output_tokens: u32,
+    /// Whether the generation cap cut the text short, which is what makes the
+    /// turn stop on `max_tokens` instead of `end_turn`.
+    pub truncated: bool,
+}
+
+impl ConverseTurn {
+    /// The modelled `StopReason` this turn ended on.
+    pub fn stop_reason(&self) -> &'static str {
+        if self.truncated {
+            "max_tokens"
+        } else {
+            "end_turn"
         }
     }
-    if let Some(config) = tool_config {
-        for tool in &config.tools {
-            if let Tool::toolSpec(spec) = tool {
-                total = total.saturating_add(count_text_tokens(&spec.name));
-                if let Some(description) = &spec.description {
-                    total = total.saturating_add(count_text_tokens(description));
-                }
-            }
+
+    /// The modelled `TokenUsage` for this turn: the counts actually served, with
+    /// `totalTokens` their sum.
+    pub fn usage(&self) -> TokenUsage {
+        TokenUsage {
+            input_tokens: token_count_i32(self.input_tokens),
+            output_tokens: token_count_i32(self.output_tokens),
+            total_tokens: token_count_i32(self.input_tokens.saturating_add(self.output_tokens)),
+            cache_read_input_tokens: None,
+            cache_write_input_tokens: None,
+            cache_details: None,
         }
     }
-    total
+}
+
+/// Serve one Converse-API turn from the request that was actually supplied.
+///
+/// `Converse` and `ConverseStream` both call this, so the text, the stop reason
+/// and the token counts the two report for identical input agree by construction;
+/// the only difference between them is how the turn is framed on the wire.
+///
+/// `requested_max_tokens` is `inferenceConfig.maxTokens`; the model's own ceiling
+/// caps it, and hitting the cap is what truncates the turn.
+pub fn converse_turn(
+    model: &ModelEntry,
+    system: Option<&Vec<SystemContentBlock>>,
+    messages: Option<&Vec<Message>>,
+    tool_config: Option<&ToolConfiguration>,
+    requested_max_tokens: Option<i32>,
+) -> ConverseTurn {
+    let input_tokens = converse_input_tokens(system, messages, tool_config);
+    let max_output_tokens = requested_max_tokens
+        .and_then(|max| u32::try_from(max).ok())
+        .unwrap_or(model.max_output_tokens)
+        .min(model.max_output_tokens);
+    let turns = messages.map(Vec::len).unwrap_or_default();
+    let full_text = emulated_completion_text(
+        &model.model_id,
+        u32::try_from(turns).unwrap_or(u32::MAX),
+        input_tokens,
+    );
+    let truncated = count_text_tokens(&full_text) > max_output_tokens;
+    let text = if truncated {
+        truncate_to_tokens(&full_text, max_output_tokens)
+    } else {
+        full_text
+    };
+    let output_tokens = count_text_tokens(&text);
+    ConverseTurn {
+        text,
+        input_tokens,
+        output_tokens,
+        truncated,
+    }
 }
 
 /// The field names an `InvokeModel` request body carries prompt text under.
@@ -874,35 +1166,62 @@ pub const PROMPT_TEXT_FIELDS: [&str; 6] = [
     "content",
 ];
 
-/// Every string the body binds under a [`PROMPT_TEXT_FIELDS`] name, joined by
-/// newlines in key order. The walk stops at [`MAX_DOCUMENT_DEPTH`], so a deeply
-/// nested body cannot drive unbounded recursion.
+/// The body members whose WHOLE subtree is prompt text.
+///
+/// A tool definition reaches the model verbatim — the same rule
+/// [`converse_prompt_pieces`] states for `toolConfig` — so every string inside
+/// one is prompt text, not only the strings bound to a
+/// [`PROMPT_TEXT_FIELDS`] name. These are the names the per-family request
+/// formats bind tool definitions to: Anthropic Claude's and Mistral's `tools`,
+/// and Nova's `toolConfig`.
+pub const TOOL_DEFINITION_FIELDS: [&str; 2] = ["tools", "toolConfig"];
+
+/// Every string the body binds under a [`PROMPT_TEXT_FIELDS`] name, plus every
+/// string inside a [`TOOL_DEFINITION_FIELDS`] subtree, joined by newlines in key
+/// order. The walk stops at [`MAX_DOCUMENT_DEPTH`], so a deeply nested body
+/// cannot drive unbounded recursion.
 fn prompt_text_of_json(value: &serde_json::Value) -> String {
-    fn walk(value: &serde_json::Value, field: Option<&str>, depth: usize, out: &mut Vec<String>) {
+    fn walk(
+        value: &serde_json::Value,
+        field: Option<&str>,
+        in_tool_definition: bool,
+        depth: usize,
+        out: &mut Vec<String>,
+    ) {
         if depth > MAX_DOCUMENT_DEPTH {
             return;
         }
         match value {
             serde_json::Value::String(text) => {
-                if field.is_some_and(|name| PROMPT_TEXT_FIELDS.contains(&name)) {
+                if in_tool_definition
+                    || field.is_some_and(|name| PROMPT_TEXT_FIELDS.contains(&name))
+                {
                     out.push(text.clone());
                 }
             }
             serde_json::Value::Array(items) => {
                 for item in items {
-                    walk(item, field, depth + 1, out);
+                    walk(item, field, in_tool_definition, depth + 1, out);
                 }
             }
             serde_json::Value::Object(members) => {
                 for (name, member) in members {
-                    walk(member, Some(name.as_str()), depth + 1, out);
+                    let in_tool_definition = in_tool_definition
+                        || TOOL_DEFINITION_FIELDS.contains(&name.as_str());
+                    walk(
+                        member,
+                        Some(name.as_str()),
+                        in_tool_definition,
+                        depth + 1,
+                        out,
+                    );
                 }
             }
             _ => {}
         }
     }
     let mut parts = Vec::new();
-    walk(value, None, 0, &mut parts);
+    walk(value, None, false, 0, &mut parts);
     parts.join("\n")
 }
 
@@ -925,6 +1244,168 @@ pub fn body_max_tokens(family: ModelFamily, body: &serde_json::Value) -> Option<
         .and_then(serde_json::Value::as_u64)
         .and_then(|value| u32::try_from(value).ok())
         .filter(|value| *value > 0)
+}
+
+/// The only body MIME type the invoke APIs accept: "The MIME type of the input
+/// data in the request. You must specify application/json."
+pub const JSON_MIME: &str = "application/json";
+
+/// The sentence the service answers a `contentType` the model does not read
+/// with. The member's own documentation states the rule ("You must specify
+/// application/json"), and this is the wording the recorded corpus shows the
+/// service using for the refusal.
+pub const INVALID_CONTENT_TYPE_MESSAGE: &str =
+    "The provided Content Type is invalid or not supported for this model";
+
+/// The same, for the `accept` member: the MIME type the caller asked the
+/// inference body to come back in.
+pub const INVALID_ACCEPT_MESSAGE: &str =
+    "The provided Accept header is invalid or not supported for this model";
+
+/// The body field that carries a guardrail configuration inline. Naming it
+/// without a `guardrailIdentifier` is one of the error situations both invoke
+/// operations document.
+pub const INLINE_GUARDRAIL_CONFIG_FIELD: &str = "amazon-bedrock-guardrailConfig";
+
+/// A MIME type with its parameters (`; charset=utf-8`) and casing removed, so
+/// `application/json; charset=utf-8` compares equal to `application/json`.
+pub fn mime_essence(value: &str) -> String {
+    value
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+}
+
+/// Every refusal both invoke surfaces make, in the order they make them.
+///
+/// `InvokeModel` and `InvokeModelWithResponseStream` take the SAME request — the
+/// two shapes differ only in which header `accept` binds — so they refuse the same
+/// requests for the same reasons, and both call this. `Err` carries the sentence
+/// the caller answers with its own modelled `ValidationException` (400).
+pub fn validate_invoke_request(
+    family: ModelFamily,
+    content_type: Option<&str>,
+    accept: Option<&str>,
+    body: &[u8],
+    guardrail_identifier: Option<&str>,
+    guardrail_version: Option<&str>,
+) -> Result<(), String> {
+    // "You must provide the body in JSON format", and the response is in the
+    // format the `accept` header asks for, whose only documented value is
+    // `application/json` (its default).
+    if let Some(content_type) = content_type {
+        if mime_essence(content_type) != JSON_MIME {
+            return Err(INVALID_CONTENT_TYPE_MESSAGE.to_string());
+        }
+    }
+    if let Some(accept) = accept {
+        let essence = mime_essence(accept);
+        if essence != JSON_MIME && essence != "*/*" {
+            return Err(INVALID_ACCEPT_MESSAGE.to_string());
+        }
+    }
+    if body.is_empty() {
+        return Err("The request body must contain the prompt and inference parameters.".to_string());
+    }
+
+    // The three guardrail combinations the model documents as errors. The
+    // second one ("you enable the guardrail but the contentType isn't
+    // application/json") is already refused above, for guarded and unguarded
+    // requests alike.
+    let guardrail_identifier = guardrail_identifier.filter(|value| !value.is_empty());
+    let guardrail_version = guardrail_version.filter(|value| !value.is_empty());
+    if guardrail_identifier.is_some() && guardrail_version.is_none() {
+        return Err(
+            "guardrailVersion must be specified when guardrailIdentifier is provided.".to_string(),
+        );
+    }
+    if guardrail_identifier.is_none()
+        && serde_json::from_slice::<serde_json::Value>(body)
+            .ok()
+            .is_some_and(|value| value.get(INLINE_GUARDRAIL_CONFIG_FIELD).is_some())
+    {
+        return Err(format!(
+            "guardrailIdentifier must be specified when the request body contains \
+             {INLINE_GUARDRAIL_CONFIG_FIELD}."
+        ));
+    }
+
+    // The body is model-specific, so the model's own family is what says
+    // whether it can be read: a body that is not a JSON object, or that omits a
+    // member the family's documented request schema requires, is refused naming
+    // the violation.
+    if let Some(message) = invoke_body_violation(family, body) {
+        return Err(message);
+    }
+    Ok(())
+}
+
+/// One served invoke-API inference: the model's own response envelope and the
+/// token accounting computed for it.
+#[derive(Debug, Clone)]
+pub struct InvokeTurn {
+    /// The response body in the model family's own envelope, as
+    /// [`invoke_model_response_body`] renders it.
+    pub response: serde_json::Value,
+    pub input_tokens: u32,
+    pub output_tokens: u32,
+}
+
+/// Serve one invoke-API inference from the body that was actually supplied.
+///
+/// `InvokeModel` and `InvokeModelWithResponseStream` both call this, so the
+/// payload the two answer for identical input agrees by construction; the only
+/// difference between them is whether that payload is the response body or the
+/// `bytes` of a `chunk` event. `family` is the model's own response family,
+/// which the caller has already resolved (a model this emulator renders no
+/// envelope for is refused before any inference is served).
+pub fn invoke_turn(model: &ModelEntry, family: ModelFamily, body: &[u8]) -> InvokeTurn {
+    let parsed_body = serde_json::from_slice::<serde_json::Value>(body).ok();
+    // The generation cap the body carries for this family, bounded by the model's
+    // own ceiling; reaching it is what makes the family's response report its
+    // length stop reason instead of a completed one.
+    let max_output_tokens = parsed_body
+        .as_ref()
+        .and_then(|value| body_max_tokens(family, value))
+        .unwrap_or(model.max_output_tokens)
+        .min(model.max_output_tokens);
+
+    let input_tokens = body_input_tokens(body);
+    let full_text = emulated_completion_text(&model.model_id, 1, input_tokens);
+    let truncated = count_text_tokens(&full_text) > max_output_tokens;
+    let text = if truncated {
+        truncate_to_tokens(&full_text, max_output_tokens)
+    } else {
+        full_text
+    };
+    let output_tokens = count_text_tokens(&text);
+
+    // A completion id is a per-run, server-generated value; deriving it from the
+    // request keeps it stable for an identical call without inventing an id that
+    // looks recorded.
+    let completion_id = {
+        use sha2::{Digest, Sha256};
+        let mut digest = Sha256::new();
+        digest.update(model.model_id.as_bytes());
+        digest.update(body);
+        hex::encode(digest.finalize())[..24].to_string()
+    };
+
+    InvokeTurn {
+        response: invoke_model_response_body(
+            family,
+            &model.model_id,
+            &completion_id,
+            &text,
+            input_tokens,
+            output_tokens,
+            truncated,
+        ),
+        input_tokens,
+        output_tokens,
+    }
 }
 
 /// The prompt text an `InvokeModel` body carries.

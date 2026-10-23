@@ -257,8 +257,8 @@ pub struct ComAmazonawsConnecthealthConnecthealthState {
     /// Every live `Domain`, keyed by `domainId`.
     pub domains: BTreeMap<String, Domain>,
     /// The ONE tag store, keyed by resource ARN so domain and subscription ARNs both
-    /// work. `CreateDomain` seeds it; `TagResource`/`UntagResource`/
-    /// `ListTagsForResource` (still scaffolded) will share it.
+    /// work. `CreateDomain` seeds it and `TagResource` merges into it;
+    /// `UntagResource`/`ListTagsForResource` (still scaffolded) share it.
     pub tags_by_arn: BTreeMap<String, BTreeMap<String, String>>,
     /// Monotonic per-process sequence folded into every minted id, so two ids minted
     /// in the same nanosecond still differ.
@@ -344,6 +344,54 @@ impl ComAmazonawsConnecthealthConnecthealthState {
     /// reports a resource's tags projects them through here.
     pub fn reported_tags(&self, arn: &str) -> std::collections::HashMap<String, String> {
         self.tags_for(arn).into_iter().collect()
+    }
+
+    /// Whether `arn` names a resource this service currently holds: the ARN of a live
+    /// `Domain`, or of a live `Subscription` under one.
+    ///
+    /// The SAME liveness the readers use ([`Self::live_domain`] /
+    /// [`Self::live_subscription`]), so a resource a caller can read is exactly the one
+    /// it can address by ARN — tags can never attach to an ARN no reader resolves, and a
+    /// purged resource's ARN stops resolving with it.
+    pub fn holds_resource_arn(&self, arn: &str) -> bool {
+        self.domains.values().any(|domain| {
+            domain.status == DomainStatus::Active
+                && (domain.arn == arn
+                    || domain
+                        .subscriptions
+                        .values()
+                        .any(|subscription| subscription.is_live() && subscription.arn == arn))
+        })
+    }
+
+    /// The tag set `arn` would carry once `tags` were merged into it, without writing
+    /// anything: the entries already recorded, with every key `tags` names taking the
+    /// value `tags` gives it.
+    ///
+    /// Separate from [`Self::merge_tags`] so a caller can bound the RESULT of a merge —
+    /// the limit is on the resource's tag set, not on one request — and refuse before
+    /// the store has been touched.
+    pub fn tags_after_merge(
+        &self,
+        arn: &str,
+        tags: impl IntoIterator<Item = (String, String)>,
+    ) -> BTreeMap<String, String> {
+        let mut merged = self.tags_for(arn);
+        merged.extend(tags);
+        merged
+    }
+
+    /// Record `tags` as the tag set of `arn`.
+    ///
+    /// The caller passes the already-merged set ([`Self::tags_after_merge`]). An EMPTY
+    /// set is stored as no entry at all, so "no tags" has one representation in the
+    /// store whether the resource was never tagged or had every tag removed.
+    pub fn set_tags(&mut self, arn: &str, tags: BTreeMap<String, String>) {
+        if tags.is_empty() {
+            self.tags_by_arn.remove(arn);
+        } else {
+            self.tags_by_arn.insert(arn.to_string(), tags);
+        }
     }
 
     /// The live domain `domain_id` names, for reading.

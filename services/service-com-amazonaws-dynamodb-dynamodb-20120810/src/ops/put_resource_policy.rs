@@ -217,10 +217,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         let now = ::std::time::SystemTime::now();
         let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
-        // The ARN is the caller's whole selector: it names the region the table lives
-        // in as well as the table, exactly as it does for the tagging operations.
-        let resource =
-            crate::state::resolve_resource_arn(&input.resource_arn).map_err(lift)?;
+        // The ARN is the caller's whole selector, and it must address a table of the
+        // endpoint this request reached, exactly as it does for the tagging operations.
+        let resource = crate::state::resolve_resource_arn(
+            &input.resource_arn,
+            &crate::state::request_region(ctx.parts()),
+        )
+        .map_err(lift)?;
         // The document is parsed BEFORE any table is looked up: whether it is a policy
         // at all does not depend on the resource it would be attached to. Its
         // application is ASYNCHRONOUS — "PutResourcePolicy is an asynchronous
@@ -236,9 +239,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
         store.apply_due_transitions(now);
-        let table = store
-            .table_mut(&resource.region, &resource.table)
-            .map_err(lift)?;
+        let table = store.table_by_arn_mut(&resource).map_err(lift)?;
         // No status requirement: `CreateTable$ResourcePolicy` attaches a policy to a
         // table that is still `CREATING`, so a policy is not something only an ACTIVE
         // table can carry. A table whose deletion is already due is gone by the time

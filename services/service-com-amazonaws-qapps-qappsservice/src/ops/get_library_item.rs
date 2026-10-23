@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetLibraryItem
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetLibraryItem`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetLibraryItem::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the library item `CreateLibraryItem` published under the
+//! request's `instance-id`, with the ratings its users have associated with it.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -178,18 +172,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetLibraryItem` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetLibraryItemErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetLibraryItem"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetLibraryItemErrorModeled::InternalServerException(InternalServerException {
+                message: "the qapps store is unavailable".to_string(),
+                retry_after_seconds: None,
+            })
+        })?;
+        let principal = crate::state::caller_principal(ctx);
+
+        let store = state.lock();
+        let not_found = || {
+            GetLibraryItemErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: format!("library item {} was not found", input.library_item_id),
+                resource_id: input.library_item_id.clone(),
+                resource_type: "library-item".to_string(),
+            })
+        };
+        let item = store
+            .library_item(&input.instance_id, &input.library_item_id)
+            .ok_or_else(not_found)?;
+
+        // `appId` names the Q App the item is expected to carry, so an item
+        // published from another app is not the one asked for.
+        if input.app_id.as_ref().is_some_and(|app_id| *app_id != item.app_id) {
+            return Err(not_found().into());
+        }
+
+        Ok(GetLibraryItemOutput {
+            library_item_id: item.library_item_id.clone(),
+            app_id: item.app_id.clone(),
+            app_version: item.app_version,
+            categories: store.item_categories(&input.instance_id, item),
+            status: item.status.as_wire().to_string(),
+            created_at: item.created_at,
+            created_by: item.created_by.clone(),
+            updated_at: item.updated_at,
+            updated_by: item.updated_by.clone(),
+            rating_count: item.rating_count(),
+            // A statement about THIS caller, so it is decided per read rather
+            // than stored.
+            is_rated_by_user: Some(item.is_rated_by(&principal)),
+            // "The number of users who have associated the Q App with their
+            // account" is what `AssociateQAppWithUser` records, and that
+            // operation is still a scaffold: this emulator holds no such
+            // association, so it reports none rather than a count it did not
+            // compute.
+            user_count: None,
+            is_verified: Some(item.is_verified),
+        })
     }
 }

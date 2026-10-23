@@ -16,8 +16,21 @@
 //!   progression is owed by the clock, so repeated reads never disagree.
 //! * The three tagging operations edit and report the stored tag map of the invocation
 //!   their `resourceARN` names.
-//! * An ARN naming no stored invocation is `ResourceNotFoundException` (404); an ARN
+//! * An ARN naming no stored invocation is `ResourceNotFoundException`, answered with
+//!   HTTP 400 rather than the 404 the shape's advisory `@httpError` declares; an ARN
 //!   outside the modelled pattern or length is `ValidationException` (400).
+//! * A submission must name EXACTLY one extraction target — a data-automation project or
+//!   an inline blueprint. Both members are optional in the model, so the rule is the
+//!   service's, and both invoke operations refuse a submission naming neither, or both,
+//!   with `ValidationException` (400).
+//! * Every tag key must satisfy the modelled `TagKey` pattern, including the negative
+//!   lookahead the framework's regex engine cannot compile, so the reserved `aws:`
+//!   namespace and the character class are both enforced by the three operations that
+//!   accept a tag key.
+//! * A refusal the framework's boundary walk raises is stated in this service's own
+//!   wording: the `ValidationException` envelope, a clause that names the member and the
+//!   constraint without echoing the offending value, and the declared pattern printed
+//!   without its anchors.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -40,6 +53,16 @@ const REGION: &str = "us-west-2";
 /// A legal `dataAutomationProfileArn` (pattern from `smithy_query` shape
 /// `DataAutomationProfileArn`, whose account segment accepts the literal `aws`).
 const PROFILE_ARN: &str = "arn:aws:bedrock:us-west-2:aws:data-automation-profile/us.data-automation-v1";
+
+/// A legal `dataAutomationConfiguration.dataAutomationProjectArn` (pattern from
+/// `smithy_query` shape `DataAutomationProjectArn`).
+///
+/// Every accepted submission below names either this project or an inline blueprint:
+/// one of the two is what tells the service WHAT to extract, and a submission carrying
+/// neither is refused (see
+/// `a_submission_naming_neither_a_project_nor_a_blueprint_is_refused`).
+const PROJECT_ARN: &str =
+    "arn:aws:bedrock:us-west-2:000000000000:data-automation-project/invoices";
 
 /// The modelled `AutomationJobStatus` values, as `AUTOMATION_JOB_STATUS_VALUES` lists
 /// them.
@@ -148,11 +171,16 @@ async fn submit(router: &MultiServiceRouter, case: &str, body: Value) -> String 
 }
 
 /// The smallest legal submission body, parameterised by the output prefix.
+///
+/// "Legal" includes the cross-member rule the model cannot express: a submission must
+/// name a data-automation project or an inline blueprint, so the project is part of the
+/// minimum even though the model marks `dataAutomationConfiguration` optional.
 fn minimal_submission(output_s3_uri: &str) -> Value {
     json!({
         "inputConfiguration": {"s3Uri": "s3://in-bucket/assets/doc.pdf"},
         "outputConfiguration": {"s3Uri": output_s3_uri},
         "dataAutomationProfileArn": PROFILE_ARN,
+        "dataAutomationConfiguration": {"dataAutomationProjectArn": PROJECT_ARN},
     })
 }
 
@@ -350,7 +378,7 @@ async fn each_submission_is_persisted_and_reported_back_from_state() {
     // operation must persist, which is what the two readers below report.
     let rows: Vec<SubmissionCase> = vec![
         (
-            "only the three required members",
+            "the required members plus the project that says what to extract",
             minimal_submission("s3://out-bucket/plain/"),
             "s3://out-bucket/plain/",
             vec![],
@@ -362,7 +390,7 @@ async fn each_submission_is_persisted_and_reported_back_from_state() {
                 "outputConfiguration": {"s3Uri": "s3://out-bucket/project/"},
                 "dataAutomationProfileArn": PROFILE_ARN,
                 "dataAutomationConfiguration": {
-                    "dataAutomationProjectArn": "arn:aws:bedrock:us-west-2:000000000000:data-automation-project/invoices",
+                    "dataAutomationProjectArn": PROJECT_ARN,
                     "stage": "LIVE",
                 },
                 "tags": [{"key": "env", "value": "dev"}],
@@ -479,6 +507,7 @@ async fn an_accepted_client_token_replays_the_one_invocation() {
             "inputConfiguration": {"s3Uri": "s3://in-bucket/assets/doc.pdf"},
             "outputConfiguration": {"s3Uri": "s3://out-bucket/first/"},
             "dataAutomationProfileArn": PROFILE_ARN,
+            "dataAutomationConfiguration": {"dataAutomationProjectArn": PROJECT_ARN},
         });
         let first = submit(&router, token, body.clone()).await;
         let replay = submit(&router, token, body).await;
@@ -494,6 +523,7 @@ async fn an_accepted_client_token_replays_the_one_invocation() {
             "inputConfiguration": {"s3Uri": "s3://in-bucket/assets/other.pdf"},
             "outputConfiguration": {"s3Uri": "s3://out-bucket/second/"},
             "dataAutomationProfileArn": PROFILE_ARN,
+            "dataAutomationConfiguration": {"dataAutomationProjectArn": PROJECT_ARN},
         });
         let third = submit(&router, token, second_payload).await;
         assert_eq!(
@@ -694,15 +724,27 @@ async fn every_arn_keyed_operation_refuses_unknown_and_malformed_arns() {
         for arn in &unknown {
             let case = format!("{operation} on unknown {arn}");
             let answer = call(&router, operation, build(arn)).await;
+            // 400, not the 404 the `ResourceNotFoundException` shape's advisory
+            // `@httpError` declares: on this awsJson1_1 service the status says only
+            // "the caller is at fault" and the body's `__type` says which fault.
             assert_eq!(
-                answer.status, 404,
-                "case {case:?}: expected 404, got {} / {}",
+                answer.status, 400,
+                "case {case:?}: expected 400, got {} / {}",
                 answer.status, answer.body
             );
             assert_eq!(
                 answer.error_code(),
                 "ResourceNotFoundException",
                 "case {case:?}: expected ResourceNotFoundException, got {}",
+                answer.body
+            );
+            assert_eq!(
+                answer.body["message"].as_str(),
+                // Spelled out rather than read off the crate, so a wording change fails
+                // here: this is the service's own fixed not-found string.
+                Some("Data Automation Invocation ARN not found."),
+                "case {case:?}: the refusal must carry this service's own not-found \
+                 message and nothing from the request, got {}",
                 answer.body
             );
         }
@@ -720,6 +762,37 @@ async fn every_arn_keyed_operation_refuses_unknown_and_malformed_arns() {
                 "case {case:?}: expected ValidationException, got {}",
                 answer.body
             );
+            // This service's own wording for a boundary refusal: the AWS
+            // `ValidationException` envelope, a clause naming the member and the
+            // constraint, the declared pattern printed WITHOUT its anchors, and no echo
+            // of the offending value.
+            let message = answer.body["message"].as_str().unwrap_or_default();
+            assert!(
+                message.contains("validation error")
+                    && (message.contains("'resourceARN'") || message.contains("'invocationArn'")),
+                "case {case:?}: the clause must sit in the validation envelope and name \
+                 the member, got {message:?}"
+            );
+            assert!(
+                !message.contains("Value '"),
+                "case {case:?}: the clause must not echo the offending value, got \
+                 {message:?}"
+            );
+            assert!(
+                !message.contains(arn.as_str()),
+                "case {case:?}: the refusal must not echo the submitted value, got \
+                 {message:?}"
+            );
+            let Some((_, pattern)) =
+                message.split_once("Member must satisfy regular expression pattern: ")
+            else {
+                panic!("case {case:?}: no pattern clause in {message:?}");
+            };
+            assert!(
+                !pattern.starts_with('^'),
+                "case {case:?}: the pattern must be printed without its anchors, got \
+                 {pattern:?}"
+            );
         }
     }
 }
@@ -735,6 +808,7 @@ async fn tag_and_untag_edit_the_stored_tag_map() {
             "inputConfiguration": {"s3Uri": "s3://in-bucket/assets/doc.pdf"},
             "outputConfiguration": {"s3Uri": "s3://out-bucket/tags/"},
             "dataAutomationProfileArn": PROFILE_ARN,
+            "dataAutomationConfiguration": {"dataAutomationProjectArn": PROJECT_ARN},
             "tags": [{"key": "env", "value": "dev"}],
         }),
     )
@@ -832,6 +906,7 @@ async fn tagging_past_the_modelled_tag_bound_is_refused_and_changes_nothing() {
             "inputConfiguration": {"s3Uri": "s3://in-bucket/assets/doc.pdf"},
             "outputConfiguration": {"s3Uri": "s3://out-bucket/quota/"},
             "dataAutomationProfileArn": PROFILE_ARN,
+            "dataAutomationConfiguration": {"dataAutomationProjectArn": PROJECT_ARN},
             "tags": full,
         }),
     )
@@ -1099,12 +1174,393 @@ fn a_stream_of_distinct_client_tokens_cannot_grow_the_store_past_its_bound() {
     );
 }
 
+/// One submission shape under the cross-member rule, exercised through BOTH invoke
+/// operations.
+struct ExtractionTargetCase {
+    /// How the row reads in an assertion message.
+    name: &'static str,
+    /// The `dataAutomationConfiguration` member to send, or `Value::Null` to omit it.
+    configuration: Value,
+    /// The `blueprints` member to send, or `Value::Null` to omit it.
+    blueprints: Value,
+    /// The `inputConfiguration` the SYNCHRONOUS row sends: `SyncInputConfiguration`
+    /// (`smithy_query` shape) accepts either an `s3Uri` or inline `bytes`, and the rule
+    /// under test is independent of which.
+    sync_input: Value,
+    /// `None` when this shape is accepted; otherwise the `ValidationException` message
+    /// both invoke operations answer with.
+    refusal: Option<&'static str>,
+}
+
+/// An `InvokeDataAutomationAsync` body carrying `case`'s extraction members.
+fn async_submission(case: &ExtractionTargetCase) -> Value {
+    let mut body = json!({
+        "inputConfiguration": {"s3Uri": "s3://in-bucket/assets/doc.pdf"},
+        "outputConfiguration": {"s3Uri": "s3://out-bucket/extraction-rule/"},
+        "dataAutomationProfileArn": PROFILE_ARN,
+    });
+    if !case.configuration.is_null() {
+        body["dataAutomationConfiguration"] = case.configuration.clone();
+    }
+    if !case.blueprints.is_null() {
+        body["blueprints"] = case.blueprints.clone();
+    }
+    body
+}
+
+/// An `InvokeDataAutomation` body carrying `case`'s extraction members.
+fn sync_submission(case: &ExtractionTargetCase) -> Value {
+    let mut body = json!({
+        "inputConfiguration": case.sync_input.clone(),
+        "dataAutomationProfileArn": PROFILE_ARN,
+    });
+    if !case.configuration.is_null() {
+        body["dataAutomationConfiguration"] = case.configuration.clone();
+    }
+    if !case.blueprints.is_null() {
+        body["blueprints"] = case.blueprints.clone();
+    }
+    body
+}
+
+/// One public blueprint ARN, inside the modelled `BlueprintArn` pattern's
+/// `bedrock-data-automation-public-[a-zA-Z0-9-_]{1,30}` alternative (`smithy_query`
+/// shape `BlueprintArn`).
+fn public_blueprint(suffix: &str) -> Value {
+    json!({"blueprintArn": format!("arn:aws:bedrock:us-west-2:aws:blueprint/bedrock-data-automation-public-{suffix}")})
+}
+
+/// The `ValidationException` message both invoke operations answer when a submission
+/// names NEITHER a data-automation project nor an inline blueprint. Spelled out rather
+/// than read off the crate, so the test pins the wire text.
+const MISSING_PROJECT_OR_BLUEPRINTS: &str =
+    "At least one of project or inline blueprints must be provided in the request.";
+
+/// The `ValidationException` message both invoke operations answer when a submission
+/// names BOTH.
+const BOTH_PROJECT_AND_BLUEPRINTS: &str =
+    "Only one of project or inline blueprints can be provided in the request.";
+
+#[tokio::test]
+async fn a_submission_must_name_exactly_one_of_a_project_or_blueprints() {
+    // A data-automation submission has to say WHAT to extract, and it says so in exactly
+    // ONE of two optional members: `dataAutomationConfiguration`'s project ARN, or an
+    // inline `blueprints` list. No Smithy trait expresses "exactly one of", so the rule
+    // is the service's and both invoke operations apply it identically: naming neither,
+    // or naming both, is `ValidationException` (HTTP 400); naming exactly one is past the
+    // rule.
+    //
+    // The rows differ along what the rule generalises over — which of the two members is
+    // present, how many blueprints there are, whether the blueprint carries its optional
+    // version/stage, which form the synchronous input takes, and whether an unrelated
+    // optional member is present — not along renamed values.
+    let router = service();
+
+    let rows: Vec<ExtractionTargetCase> = vec![
+        ExtractionTargetCase {
+            name: "neither member present",
+            configuration: Value::Null,
+            blueprints: Value::Null,
+            sync_input: json!({"s3Uri": "s3://in-bucket/assets/doc.pdf"}),
+            refusal: Some(MISSING_PROJECT_OR_BLUEPRINTS),
+        },
+        ExtractionTargetCase {
+            name: "neither member present, inline input bytes",
+            configuration: Value::Null,
+            blueprints: Value::Null,
+            // Base64 of `{"a":1}`: `SyncInputConfiguration.bytes` is an unconstrained
+            // blob, so any payload exercises the same rule.
+            sync_input: json!({"bytes": "eyJhIjoxfQ=="}),
+            refusal: Some(MISSING_PROJECT_OR_BLUEPRINTS),
+        },
+        ExtractionTargetCase {
+            name: "a project only",
+            configuration: json!({"dataAutomationProjectArn": PROJECT_ARN}),
+            blueprints: Value::Null,
+            sync_input: json!({"s3Uri": "s3://in-bucket/assets/scan.tiff"}),
+            refusal: None,
+        },
+        ExtractionTargetCase {
+            name: "a project with its optional stage",
+            configuration: json!({"dataAutomationProjectArn": PROJECT_ARN, "stage": "DEVELOPMENT"}),
+            blueprints: Value::Null,
+            sync_input: json!({"s3Uri": "s3://in-bucket/assets/doc.pdf"}),
+            refusal: None,
+        },
+        ExtractionTargetCase {
+            name: "one inline blueprint only",
+            configuration: Value::Null,
+            blueprints: json!([public_blueprint("video")]),
+            sync_input: json!({"bytes": "eyJhIjoxfQ=="}),
+            refusal: None,
+        },
+        ExtractionTargetCase {
+            name: "three inline blueprints only",
+            configuration: Value::Null,
+            blueprints: json!([
+                public_blueprint("video"),
+                public_blueprint("audio"),
+                public_blueprint("document"),
+            ]),
+            sync_input: json!({"s3Uri": "s3://in-bucket/assets/clip.mp4"}),
+            refusal: None,
+        },
+        ExtractionTargetCase {
+            name: "one blueprint carrying its optional version and stage",
+            configuration: Value::Null,
+            blueprints: json!([{
+                "blueprintArn": "arn:aws:bedrock:us-west-2:aws:blueprint/bedrock-data-automation-public-image",
+                "version": "1",
+                "stage": "LIVE",
+            }]),
+            sync_input: json!({"s3Uri": "s3://in-bucket/assets/photo.png"}),
+            refusal: None,
+        },
+        ExtractionTargetCase {
+            name: "both a project and one blueprint",
+            configuration: json!({"dataAutomationProjectArn": PROJECT_ARN}),
+            blueprints: json!([public_blueprint("document")]),
+            sync_input: json!({"s3Uri": "s3://in-bucket/assets/doc.pdf"}),
+            refusal: Some(BOTH_PROJECT_AND_BLUEPRINTS),
+        },
+        ExtractionTargetCase {
+            name: "both a project with a stage and three blueprints",
+            configuration: json!({"dataAutomationProjectArn": PROJECT_ARN, "stage": "LIVE"}),
+            blueprints: json!([
+                public_blueprint("video"),
+                public_blueprint("audio"),
+                public_blueprint("document"),
+            ]),
+            sync_input: json!({"bytes": "eyJhIjoxfQ=="}),
+            refusal: Some(BOTH_PROJECT_AND_BLUEPRINTS),
+        },
+    ];
+
+    let mut minted: Vec<String> = Vec::new();
+    for case in &rows {
+        // The ASYNCHRONOUS operation: refused with 400 `ValidationException`, or
+        // accepted with the invocation it minted.
+        let answer = call(&router, "InvokeDataAutomationAsync", async_submission(case)).await;
+        match case.refusal {
+            None => {
+                assert_eq!(
+                    (answer.status, answer.error_code()),
+                    (200, ""),
+                    "case {:?}: a submission naming exactly one extraction target must be \
+                     accepted by InvokeDataAutomationAsync, got {} / {}",
+                    case.name,
+                    answer.status,
+                    answer.body
+                );
+                minted.push(
+                    answer.body["invocationArn"]
+                        .as_str()
+                        .unwrap_or_else(|| {
+                            panic!("case {:?}: no invocationArn in {}", case.name, answer.body)
+                        })
+                        .to_string(),
+                );
+            }
+            Some(message) => assert_eq!(
+                (answer.status, answer.error_code(), answer.body["message"].as_str()),
+                (400, "ValidationException", Some(message)),
+                "case {:?}: InvokeDataAutomationAsync must answer 400 ValidationException \
+                 {message:?}, got {} / {}",
+                case.name,
+                answer.status,
+                answer.body
+            ),
+        }
+
+        // The SYNCHRONOUS operation applies the same rule, so a refused shape is the
+        // same 400 there. A shape that passes the rule reaches the part of the operation
+        // that is still scaffolded, which is the 501 — never a 400.
+        let answer = call(&router, "InvokeDataAutomation", sync_submission(case)).await;
+        let expected = match case.refusal {
+            None => (501, "NotImplemented", None),
+            Some(message) => (400, "ValidationException", Some(message)),
+        };
+        assert_eq!(
+            (
+                answer.status,
+                answer.error_code(),
+                case.refusal.and(answer.body["message"].as_str())
+            ),
+            expected,
+            "case {:?}: InvokeDataAutomation must answer {expected:?}, got {} / {}",
+            case.name,
+            answer.status,
+            answer.body
+        );
+    }
+
+    // Only the accepted rows minted anything: each answered with its own ARN, and every
+    // one of them resolves through the reader. A refused submission left no record, so
+    // the count of distinct ARNs is exactly the count of accepted rows.
+    let accepted = rows.iter().filter(|case| case.refusal.is_none()).count();
+    assert_eq!(
+        minted.len(),
+        accepted,
+        "every accepted submission must mint one invocation, got {minted:?}"
+    );
+    let mut distinct = minted.clone();
+    distinct.sort();
+    distinct.dedup();
+    assert_eq!(
+        distinct.len(),
+        minted.len(),
+        "two submissions must never share an invocationArn, got {minted:?}"
+    );
+    for arn in &minted {
+        let answer = call(&router, "GetDataAutomationStatus", json!({"invocationArn": arn})).await;
+        assert_eq!(
+            answer.status, 200,
+            "the invocation {arn:?} minted by an accepted submission must read back, got \
+             {} / {}",
+            answer.status, answer.body
+        );
+    }
+}
+
+#[tokio::test]
+async fn every_operation_that_accepts_a_tag_key_applies_the_modelled_tag_key_pattern() {
+    // The modelled `TagKey` pattern is `^(?!aws:)[\p{L}\p{Z}\p{N}_.:/=+\-@]*$`
+    // (`smithy_query` shape `TagKey`). Its negative lookahead cannot be compiled by the
+    // boundary walk's regex engine, and an uncompilable `@pattern` is treated as matching
+    // every value — which drops the character class with it — so the three operations
+    // that accept a tag key apply the whole pattern themselves.
+    //
+    // Rows span both halves of the pattern: the reserved prefix, and characters inside
+    // and outside the class (Unicode letters, numbers and separators, which the class
+    // admits; combining marks, symbols and ASCII punctuation outside it, which it does
+    // not). The one boundary the rows do NOT pin is `Other_Alphabetic`: `std` exposes
+    // `Alphabetic`, not `\p{L}`, and `crate::state::is_tag_key_char` documents that
+    // narrow deviation.
+    let router = service();
+    let arn = submit(
+        &router,
+        "tag key pattern",
+        minimal_submission("s3://out-bucket/tag-keys/"),
+    )
+    .await;
+
+    // (case, tag key, whether the pattern admits it).
+    let keys: [(&str, &str, bool); 12] = [
+        ("a plain ASCII key", "env", true),
+        ("every punctuation character the class admits", "a_b.c:d/e=f+g-h@i", true),
+        ("a Unicode letter key (\\p{L})", "ümgebung", true),
+        ("a Unicode number key (\\p{N})", "stage٣", true),
+        ("a separator inside the key (\\p{Z})", "cost center", true),
+        ("the empty-ish single character", "x", true),
+        (
+            // A symbol (`So`) is in none of the three categories the class names.
+            "an emoji, outside the class",
+            "env\u{1f680}",
+            false,
+        ),
+        (
+            // …and so is a plain combining mark.
+            "a plain combining mark, outside the class",
+            "e\u{301}nv",
+            false,
+        ),
+        ("the reserved prefix exactly", "aws:", false),
+        ("a key under the reserved prefix", "aws:cloudformation:stack-name", false),
+        ("a character outside the class", "bad!key", false),
+        ("another character outside the class", "bad#key", false),
+    ];
+
+    for (case, key, admitted) in keys {
+        // TagResource carries the key in `tags`; UntagResource carries it in `tagKeys`.
+        // Both must agree, because both are bound by the same `TagKey` shape.
+        let rows: [(&str, Value); 2] = [
+            (
+                "TagResource",
+                json!({"resourceARN": arn, "tags": [{"key": key, "value": "v"}]}),
+            ),
+            (
+                "UntagResource",
+                json!({"resourceARN": arn, "tagKeys": [key]}),
+            ),
+        ];
+        for (operation, body) in rows {
+            let answer = call(&router, operation, body).await;
+            if admitted {
+                assert_eq!(
+                    answer.status, 200,
+                    "case {case:?} ({key:?}) on {operation}: the modelled TagKey pattern \
+                     admits this key, got {} / {}",
+                    answer.status, answer.body
+                );
+            } else {
+                assert_eq!(
+                    (answer.status, answer.error_code()),
+                    (400, "ValidationException"),
+                    "case {case:?} ({key:?}) on {operation}: the modelled TagKey pattern \
+                     rejects this key, got {} / {}",
+                    answer.status,
+                    answer.body
+                );
+                // The refusal reads in this service's own wording — the same wording the
+                // boundary walk's refusals get, since one logical failure must not read
+                // two ways: the member is named, the offending value is not echoed, and
+                // the declared pattern is printed without its anchors.
+                let message = answer.body["message"].as_str().unwrap_or_default();
+                assert!(
+                    message.starts_with("1 validation error detected: Value at '")
+                        && !message.contains("Value '"),
+                    "case {case:?} ({key:?}) on {operation}: the refusal must name the \
+                     member without echoing the value, got {message:?}"
+                );
+                let Some((_, pattern)) =
+                    message.split_once("Member must satisfy regular expression pattern: ")
+                else {
+                    panic!("case {case:?} ({key:?}) on {operation}: no pattern clause in {message:?}");
+                };
+                assert!(
+                    !pattern.starts_with('^'),
+                    "case {case:?} ({key:?}) on {operation}: the pattern must be printed \
+                     without its anchors, got {pattern:?}"
+                );
+            }
+        }
+
+        // And the submission that creates a resource is bound by the same shape.
+        let mut body = minimal_submission("s3://out-bucket/tag-keys/");
+        body["tags"] = json!([{"key": key, "value": "v"}]);
+        let answer = call(&router, "InvokeDataAutomationAsync", body).await;
+        let expected = if admitted {
+            (200, "")
+        } else {
+            (400, "ValidationException")
+        };
+        assert_eq!(
+            (answer.status, answer.error_code()),
+            expected,
+            "case {case:?} ({key:?}) on InvokeDataAutomationAsync: expected \
+             {expected:?}, got {} / {}",
+            answer.status,
+            answer.body
+        );
+    }
+
+    // A refused tag key changed nothing: the resource still carries only what the
+    // admitted rows left on it, and `aws:`-prefixed keys never reached the tag map.
+    let tags = list_tags(&router, "tag key pattern", &arn).await;
+    assert!(
+        tags.iter().all(|(key, _)| !key.starts_with("aws:")),
+        "no reserved tag key may be stored, got {tags:?}"
+    );
+}
+
 #[tokio::test]
 async fn the_synchronous_invoke_data_automation_is_still_a_stub() {
     // `InvokeDataAutomation` returns the analysis of the asset itself
     // (`semanticModality` plus `outputSegments`), which no engine in this emulator can
     // produce. It therefore keeps the scaffold's 501 rather than answering with
-    // synthesised output; this pins that it is a 501 and not an empty 200.
+    // synthesised output; this pins that it is a 501 and not an empty 200. The
+    // submission names a project, so it is past the cross-member rule the operation DOES
+    // enforce — a 501 here is about the missing analysis, not about a bad request.
     let router = service();
     let answer = call(
         &router,
@@ -1112,6 +1568,7 @@ async fn the_synchronous_invoke_data_automation_is_still_a_stub() {
         json!({
             "inputConfiguration": {"s3Uri": "s3://in-bucket/assets/doc.pdf"},
             "dataAutomationProfileArn": PROFILE_ARN,
+            "dataAutomationConfiguration": {"dataAutomationProjectArn": PROJECT_ARN},
         }),
     )
     .await;

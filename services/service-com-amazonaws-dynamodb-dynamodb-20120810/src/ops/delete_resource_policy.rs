@@ -190,14 +190,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         let now = ::std::time::SystemTime::now();
         let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
-        let resource =
-            crate::state::resolve_resource_arn(&input.resource_arn).map_err(lift)?;
+        let resource = crate::state::resolve_resource_arn(
+            &input.resource_arn,
+            &crate::state::request_region(ctx.parts()),
+        )
+        .map_err(lift)?;
 
         let mut store = state.lock();
         store.apply_due_transitions(now);
-        let table = store
-            .table_mut(&resource.region, &resource.table)
-            .map_err(lift)?;
+        let table = store.table_by_arn_mut(&resource).map_err(lift)?;
         // "When you provide an expected revision ID, if the revision ID of the existing
         // policy on the resource doesn't match or if there's no policy attached to the
         // resource, the request will fail and return a PolicyNotFoundException"

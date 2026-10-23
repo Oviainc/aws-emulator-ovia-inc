@@ -951,12 +951,16 @@ async fn the_stateless_analyzer_reports_the_documented_findings() {
 
 /// RULE: a resource created without an `EncryptionConfiguration` reports the
 /// Amazon Web Services owned key — "your data is encrypted by default with an
-/// Amazon Web Services owned key" — and one created with a configuration reports
-/// exactly what was given.
+/// Amazon Web Services owned key" — naming that key in both members, and one
+/// created with a configuration reports exactly what was given.
+///
+/// `response_projections` covers this rule over the whole class of requested
+/// configurations and every path that reports one; this row keeps the
+/// lifecycle suite's own create assertions honest.
 #[tokio::test]
 async fn encryption_configuration_defaults_to_the_aws_owned_key() {
     let customer_key = json!({ "Type": "CUSTOMER_KMS", "KeyId": "alias/net-fw" });
-    let aws_owned = json!({ "Type": "AWS_OWNED_KMS_KEY" });
+    let aws_owned = json!({ "Type": "AWS_OWNED_KMS_KEY", "KeyId": "AWS_OWNED_KMS_KEY" });
 
     let harness = Harness::new();
     for (suffix, requested) in [("default", None), ("explicit", Some(&customer_key))] {

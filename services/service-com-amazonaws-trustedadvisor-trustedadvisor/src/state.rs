@@ -14,7 +14,7 @@
 //! SELECTS which copy the response reports. A check and the recommendation it
 //! produced share one catalog, so they cannot disagree.
 //!
-//! Three maps, each keyed by the identifier its API looks a resource up by, so
+//! Four maps, each keyed by the identifier its API looks a resource up by, so
 //! `BTreeMap` iteration order is also the stable pagination order:
 //!
 //! * [`checks`](ComAmazonawsTrustedadvisorTrustedadvisorState::checks) — keyed by check id.
@@ -25,6 +25,11 @@
 //! * [`recommendation_resources`](ComAmazonawsTrustedadvisorTrustedadvisorState::recommendation_resources) —
 //!   keyed by recommendation-resource ARN, which is what
 //!   `BatchUpdateRecommendationResourceExclusion` names its entries by.
+//! * [`organization_recommendations`](ComAmazonawsTrustedadvisorTrustedadvisorState::organization_recommendations) —
+//!   keyed by organization-recommendation ARN, which is what
+//!   `GetOrganizationRecommendation` and
+//!   `UpdateOrganizationRecommendationLifecycle` take as their `@httpLabel`,
+//!   and what `ListOrganizationRecommendations` reports in that key order.
 //!
 //! A recommendation does NOT keep a list of its resource ARNs: a resource
 //! carries its owning `recommendation_arn`, so
@@ -32,9 +37,13 @@
 //! derives the set from the one copy rather than keeping a second one that
 //! could disagree. For the same reason `resourcesAggregates` is never stored:
 //! [`aggregates_for`](ComAmazonawsTrustedadvisorTrustedadvisorState::aggregates_for)
-//! counts the recommendation's own resources on every read.
+//! counts the recommendation's own resources on every read, and
+//! [`organization_aggregates_for`](ComAmazonawsTrustedadvisorTrustedadvisorState::organization_aggregates_for)
+//! counts an organization recommendation's by summing those of the member
+//! accounts' recommendations it aggregates — an organization recommendation
+//! stores no resources of its own.
 //!
-//! Beside the three maps the store holds the calling account's
+//! Beside the four maps the store holds the calling account's
 //! [`SupportPlan`] — the whole input to the support-level authorization stage
 //! [`support_level_refusal`], which every operation applies before it resolves
 //! an identifier or writes anything. An operation whose input names an AWS
@@ -44,7 +53,10 @@
 
 use std::collections::BTreeMap;
 
-use crate::ops::types::{AccessDeniedException, RecommendationResourcesAggregates};
+use crate::ops::types::{
+    AccessDeniedException, RecommendationCostOptimizingAggregates,
+    RecommendationPillarSpecificAggregates, RecommendationResourcesAggregates,
+};
 
 /// What this service answers a caller whose account's support plan does not
 /// include the Trusted Advisor API: the support-level gate's refusal, carried by
@@ -113,8 +125,36 @@ pub const EXCLUSION_EXCLUDED: &str = "excluded";
 
 /// The `RecommendationType` whose lifecycle `UpdateRecommendationLifecycle` can
 /// move: its model doc says "This API only supports prioritized
-/// recommendations".
+/// recommendations". `UpdateOrganizationRecommendationLifecycle` carries the
+/// same sentence, so the two share this value.
 pub const RECOMMENDATION_TYPE_PRIORITY: &str = "priority";
+
+/// The one `UpdateRecommendationLifecycleStage` value that RESOLVES a
+/// recommendation (see `UPDATE_RECOMMENDATION_LIFECYCLE_STAGE_VALUES` in
+/// `ops::types::shared_types`): the stage on which an update stamps
+/// `resolvedAt`, documented "When the Recommendation was resolved". Shared by
+/// the account-level and the organization-level lifecycle update, which model
+/// the same stage enum.
+pub const LIFECYCLE_STAGE_RESOLVED: &str = "resolved";
+
+/// The one `RecommendationPillar`
+/// `RecommendationPillarSpecificAggregates` reports an aggregate for: that
+/// structure models exactly one member, `costOptimizing`, and
+/// `Recommendation$pillarSpecificAggregates` is documented "The pillar
+/// aggregations for cost savings" (`RECOMMENDATION_PILLAR_VALUES` in
+/// `ops::types::shared_types` holds every pillar a recommendation can carry).
+pub const PILLAR_COST_OPTIMIZING: &str = "cost_optimizing";
+
+/// The check-metadata column a Trusted Advisor cost check reports a resource's
+/// estimated monthly saving in — the per-resource figure the cost aggregate
+/// sums.
+///
+/// The savings are read out of the resource's own metadata because that is
+/// where the check reports them (`CheckSummary$metadata` names the columns and
+/// `RecommendationResourceSummary$metadata` carries this resource's values), so
+/// the aggregate is derived from the ONE copy a caller can also read, rather
+/// than from a second, shadow number that could disagree with the column.
+pub const METADATA_ESTIMATED_MONTHLY_SAVINGS: &str = "Estimated Monthly Savings";
 
 /// The three values `ResourceStatus` models, each with the
 /// `RecommendationResourcesAggregates` counter it feeds (see
@@ -142,6 +182,19 @@ pub fn recommendation_arn(recommendation_id: &str) -> String {
         "",
         &format!("recommendation/{recommendation_id}"),
     )
+}
+
+/// An organization-recommendation ARN:
+/// `arn:aws:trustedadvisor:::organization-recommendation/<id>`, matching
+/// `OrganizationRecommendationArn`'s
+/// `^arn:[\w-]+:trustedadvisor:::organization-recommendation\/[\w-]+$`.
+///
+/// Formatted here rather than through `engine::emulator_arn`, which always
+/// writes the account segment: an organization recommendation spans the
+/// organization's accounts, so its ARN carries an EMPTY account — the same
+/// reason [`check_arn`] is formatted by hand.
+pub fn organization_recommendation_arn(organization_recommendation_id: &str) -> String {
+    format!("arn:aws:trustedadvisor:::organization-recommendation/{organization_recommendation_id}")
 }
 
 /// A recommendation-resource ARN:
@@ -174,6 +227,14 @@ pub fn now_millis() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |since| i64::try_from(since.as_millis()).unwrap_or(i64::MAX))
+}
+
+/// A modelled `date-time` as milliseconds since the Unix epoch, so a filter
+/// bound and a stored `lastUpdatedAt` are compared on one scale. `to_millis` is
+/// the exact conversion — going through seconds as an `f64` could move an
+/// inclusive bound by a millisecond. The inverse of [`date_time`].
+pub fn millis_of(value: &::aws_smithy_types::DateTime) -> i64 {
+    value.to_millis().unwrap_or(i64::MAX)
 }
 
 /// Milliseconds since the Unix epoch as the modelled `date-time` timestamp.
@@ -315,6 +376,51 @@ pub struct RecommendationEntry {
     pub update_reason_code: Option<String>,
 }
 
+/// A recommendation for the accounts of an AWS Organizations organization: the
+/// unit `ListOrganizationRecommendations`, `GetOrganizationRecommendation` and
+/// `UpdateOrganizationRecommendationLifecycle` work on.
+///
+/// Its lifecycle stage, update reason and resolution instant are its OWN: an
+/// organization recommendation is a separate resource from the member accounts'
+/// recommendations, so moving one does not move the other.
+///
+/// The organization-level view of one check's findings, so it carries the same
+/// classification members as the account-level [`RecommendationEntry`] and
+/// shares that check's [`TextCatalog`]. It stores NO resources of its own:
+/// `member_recommendation_arns` names the accounts' recommendations it
+/// aggregates, and
+/// [`organization_aggregates_for`](ComAmazonawsTrustedadvisorTrustedadvisorState::organization_aggregates_for)
+/// counts their resources on every read.
+#[derive(Debug, Clone)]
+pub struct OrganizationRecommendationEntry {
+    pub id: String,
+    pub arn: String,
+    /// This recommendation's `name`/`description` — the text of the check that
+    /// produced it. `GetOrganizationRecommendation` models no `language`, so
+    /// the organization operations report the [`DEFAULT_LANGUAGE`] copy.
+    pub text: TextCatalog,
+    pub check_arn: Option<String>,
+    pub r#type: String,
+    pub status: String,
+    pub lifecycle_stage: Option<String>,
+    pub pillars: Vec<String>,
+    pub source: String,
+    pub aws_services: Vec<String>,
+    /// The ARNs of the member accounts' recommendations this organization
+    /// recommendation aggregates — keys of
+    /// [`recommendations`](ComAmazonawsTrustedadvisorTrustedadvisorState::recommendations).
+    /// The emulator presents exactly one account
+    /// (`engine::EMULATOR_ACCOUNT_ID`), so the seed records that account's
+    /// recommendation for the same check; the member set is a list so an
+    /// organization with more accounts needs no second shape.
+    pub member_recommendation_arns: Vec<String>,
+    pub created_at_millis: i64,
+    pub last_updated_at_millis: i64,
+    pub resolved_at_millis: Option<i64>,
+    pub update_reason: Option<String>,
+    pub update_reason_code: Option<String>,
+}
+
 /// One AWS resource a recommendation flagged.
 #[derive(Debug, Clone)]
 pub struct ResourceEntry {
@@ -329,6 +435,15 @@ pub struct ResourceEntry {
     pub metadata: BTreeMap<String, String>,
     pub last_updated_at_millis: i64,
     pub exclusion_status: String,
+    /// What this resource currently costs per month — the DENOMINATOR of
+    /// `RecommendationCostOptimizingAggregates$estimatedPercentMonthlySavings`,
+    /// which is the recommendation's estimated monthly saving as a percentage
+    /// of what its resources are being spent on today.
+    ///
+    /// `None` for a resource of a check that does not look at cost: no modelled
+    /// member reports this figure, so it exists only where a cost aggregate is
+    /// computed from it, and a non-cost resource contributes nothing.
+    pub estimated_monthly_spend: Option<f64>,
 }
 
 /// Per-service state for com-amazonaws-trustedadvisor-trustedadvisor. A handler reaches it through [`service_state`].
@@ -340,6 +455,8 @@ pub struct ComAmazonawsTrustedadvisorTrustedadvisorState {
     pub recommendations: BTreeMap<String, RecommendationEntry>,
     /// Keyed by recommendation-resource ARN.
     pub recommendation_resources: BTreeMap<String, ResourceEntry>,
+    /// Keyed by organization-recommendation ARN.
+    pub organization_recommendations: BTreeMap<String, OrganizationRecommendationEntry>,
     /// The AWS Support plan the calling account holds — the whole input to the
     /// support-level gate [`support_level_refusal`] applies ahead of every
     /// operation.
@@ -426,6 +543,176 @@ impl ComAmazonawsTrustedadvisorTrustedadvisorState {
             excluded_count: Some(excluded_count),
         }
     }
+
+    /// `resourcesAggregates` for an organization recommendation, SUMMED over
+    /// the member accounts' recommendations it aggregates: an organization
+    /// recommendation owns no resources, so its counters are the counters of
+    /// those recommendations' resources, counted on every read.
+    ///
+    /// An ARN naming no stored organization recommendation aggregates nothing,
+    /// so every counter is zero — a caller never reaches this without
+    /// resolving the ARN first, which answers `ResourceNotFoundException`.
+    pub fn organization_aggregates_for(
+        &self,
+        organization_recommendation_arn: &str,
+    ) -> RecommendationResourcesAggregates {
+        let mut total = RecommendationResourcesAggregates {
+            ok_count: 0,
+            warning_count: 0,
+            error_count: 0,
+            excluded_count: Some(0),
+        };
+        let members = self
+            .organization_recommendations
+            .get(organization_recommendation_arn)
+            .map(|entry| entry.member_recommendation_arns.as_slice())
+            .unwrap_or_default();
+        for member in members {
+            let aggregates = self.aggregates_for(member);
+            total.ok_count += aggregates.ok_count;
+            total.warning_count += aggregates.warning_count;
+            total.error_count += aggregates.error_count;
+            total.excluded_count = Some(
+                total.excluded_count.unwrap_or_default()
+                    + aggregates.excluded_count.unwrap_or_default(),
+            );
+        }
+        total
+    }
+
+    /// The check a recommendation was produced from, or `None` for a
+    /// recommendation that names no check (`Recommendation$checkArn` is
+    /// optional) or names one the store does not hold.
+    ///
+    /// The check map is keyed by check id, so the id is taken back out of the
+    /// stored ARN rather than scanning the map.
+    pub fn check_of(&self, recommendation: &RecommendationEntry) -> Option<&Check> {
+        let arn = recommendation.check_arn.as_deref()?;
+        let (_, check_id) = arn.split_once(":check/")?;
+        self.checks.get(check_id)
+    }
+
+    /// `pillarSpecificAggregates` for a recommendation, COMPUTED from that
+    /// recommendation's own resources on every read.
+    ///
+    /// `Some(..)` exactly when the recommendation optimizes the cost pillar
+    /// ([`PILLAR_COST_OPTIMIZING`]): the structure models one member,
+    /// `costOptimizing`, so a recommendation that optimizes no cost has no
+    /// pillar aggregate to report and the optional member stays absent.
+    ///
+    /// Both members the cost aggregate declares `@required` are totals over
+    /// that recommendation's resources:
+    ///
+    /// * `estimatedMonthlySavings` sums the per-resource saving the check
+    ///   reports in its [`METADATA_ESTIMATED_MONTHLY_SAVINGS`] column;
+    /// * `estimatedPercentMonthlySavings` is that sum as a percentage of the
+    ///   same resources' [`ResourceEntry::estimated_monthly_spend`] — zero when
+    ///   nothing is being spent on them, since no percentage of zero spend is
+    ///   defined.
+    ///
+    /// Both totals span EVERY resource of the recommendation, exactly as
+    /// [`Self::aggregates_for`]'s status counts do: an exclusion is reported on
+    /// its own, as `resourcesAggregates.excludedCount`, rather than by taking
+    /// the resource out of the other aggregates. Nothing is stored, so a
+    /// resource's metadata or spend changing is visible on the very next read.
+    pub fn pillar_aggregates_for(
+        &self,
+        recommendation_arn: &str,
+    ) -> Option<RecommendationPillarSpecificAggregates> {
+        let (savings, spend) = self.cost_totals(recommendation_arn)?;
+        Some(cost_aggregate(savings, spend))
+    }
+
+    /// `pillarSpecificAggregates` for an ORGANIZATION recommendation, computed
+    /// the same way over the member accounts' recommendations it aggregates:
+    /// the cost totals of each member are summed and the percentage is taken
+    /// from those sums, so the organization's figure is the organization's own
+    /// ratio rather than an average of ratios.
+    ///
+    /// `Some(..)` exactly when at least one member recommendation optimizes the
+    /// cost pillar, for the reason [`Self::pillar_aggregates_for`] gives: the
+    /// structure models only `costOptimizing`.
+    pub fn organization_pillar_aggregates_for(
+        &self,
+        organization_recommendation_arn: &str,
+    ) -> Option<RecommendationPillarSpecificAggregates> {
+        let entry = self
+            .organization_recommendations
+            .get(organization_recommendation_arn)?;
+        let mut totals: Option<(f64, f64)> = None;
+        for member in &entry.member_recommendation_arns {
+            if let Some((savings, spend)) = self.cost_totals(member) {
+                let (total_savings, total_spend) = totals.unwrap_or((0.0, 0.0));
+                totals = Some((total_savings + savings, total_spend + spend));
+            }
+        }
+        let (savings, spend) = totals?;
+        Some(cost_aggregate(savings, spend))
+    }
+
+    /// The cost totals of one recommendation's resources — the sum of the
+    /// per-resource saving the check reports in its
+    /// [`METADATA_ESTIMATED_MONTHLY_SAVINGS`] column, and the sum of their
+    /// [`ResourceEntry::estimated_monthly_spend`] — or `None` when the
+    /// recommendation does not optimize the cost pillar and so has no cost
+    /// aggregate at all.
+    fn cost_totals(&self, recommendation_arn: &str) -> Option<(f64, f64)> {
+        let entry = self.recommendations.get(recommendation_arn)?;
+        if !entry
+            .pillars
+            .iter()
+            .any(|pillar| pillar == PILLAR_COST_OPTIMIZING)
+        {
+            return None;
+        }
+
+        // The positional key of the savings column in this check's headings;
+        // `None` for a cost check that reports no such column, whose resources
+        // then contribute no saving.
+        let savings_column = self
+            .check_of(entry)
+            .and_then(|check| metadata_column(check, METADATA_ESTIMATED_MONTHLY_SAVINGS));
+
+        let mut savings = 0.0f64;
+        let mut spend = 0.0f64;
+        for (_, resource) in self.resources_of(recommendation_arn) {
+            savings += savings_column
+                .and_then(|column| resource.metadata.get(column))
+                .and_then(|value| value.trim().parse::<f64>().ok())
+                .unwrap_or(0.0);
+            spend += resource.estimated_monthly_spend.unwrap_or(0.0);
+        }
+        Some((savings, spend))
+    }
+}
+
+/// The cost pillar aggregate for `savings` out of `spend`: the savings as
+/// reported, and as a percentage of the spend — zero when nothing is being
+/// spent, since no percentage of zero spend is defined.
+fn cost_aggregate(savings: f64, spend: f64) -> RecommendationPillarSpecificAggregates {
+    let percent = if spend > 0.0 {
+        savings / spend * 100.0
+    } else {
+        0.0
+    };
+    RecommendationPillarSpecificAggregates {
+        cost_optimizing: Some(RecommendationCostOptimizingAggregates {
+            estimated_monthly_savings: savings,
+            estimated_percent_monthly_savings: percent,
+        }),
+    }
+}
+
+/// The key under which a check's resources carry the `heading` column, i.e. the
+/// positional index of that heading in the check's `metadata` headings, as the
+/// string both metadata maps are keyed by. `None` when the check declares no
+/// such column.
+fn metadata_column<'a>(check: &'a Check, heading: &str) -> Option<&'a str> {
+    check
+        .metadata
+        .iter()
+        .find(|(_, column)| column.as_str() == heading)
+        .map(|(key, _)| key.as_str())
 }
 
 // ---------------------------------------------------------------------------
@@ -568,6 +855,16 @@ struct SeedResource {
     /// Positionally aligned with the check's `metadata_headings`.
     metadata: &'static [&'static str],
     exclusion_status: &'static str,
+    /// What the account is spending on this resource per month, for a resource
+    /// of a cost-optimizing check: the denominator
+    /// `estimatedPercentMonthlySavings` is taken against (see
+    /// [`ComAmazonawsTrustedadvisorTrustedadvisorState::pillar_aggregates_for`]).
+    /// `None` for a resource of a check that does not look at cost.
+    ///
+    /// Each figure is at least the resource's "Estimated Monthly Savings"
+    /// column: a check's saving is what stopping or right-sizing the resource
+    /// would recover out of that spend, so it can never exceed it.
+    estimated_monthly_spend: Option<f64>,
 }
 
 /// One seeded check, the recommendation it produced, and that recommendation's
@@ -702,6 +999,7 @@ const SEED: &[SeedRow] = &[
                 status: RESOURCE_STATUS_WARNING,
                 metadata: &["us-east-1", "i-0abc1de23f4567890", "m5.xlarge", "72.00"],
                 exclusion_status: EXCLUSION_INCLUDED,
+                estimated_monthly_spend: Some(144.00),
             },
             SeedResource {
                 id: "res-ec2-0002",
@@ -710,6 +1008,7 @@ const SEED: &[SeedRow] = &[
                 status: RESOURCE_STATUS_OK,
                 metadata: &["us-west-2", "i-0abc2de23f4567891", "t3.medium", "0.00"],
                 exclusion_status: EXCLUSION_INCLUDED,
+                estimated_monthly_spend: Some(36.00),
             },
             SeedResource {
                 id: "res-ec2-0003",
@@ -718,6 +1017,7 @@ const SEED: &[SeedRow] = &[
                 status: RESOURCE_STATUS_WARNING,
                 metadata: &["eu-west-1", "i-0abc3de23f4567892", "c5.2xlarge", "148.00"],
                 exclusion_status: EXCLUSION_INCLUDED,
+                estimated_monthly_spend: Some(260.00),
             },
         ],
     },
@@ -811,6 +1111,8 @@ const SEED: &[SeedRow] = &[
                     "412",
                 ],
                 exclusion_status: EXCLUSION_INCLUDED,
+                // Fault tolerance, not cost: nothing to take a percentage of.
+                estimated_monthly_spend: None,
             },
             SeedResource {
                 id: "res-ebs-0002",
@@ -826,6 +1128,7 @@ const SEED: &[SeedRow] = &[
                 // Seeded excluded, so the `exclusionStatus` filter and
                 // `excludedCount` have a row from the first read.
                 exclusion_status: EXCLUSION_EXCLUDED,
+                estimated_monthly_spend: None,
             },
         ],
     },
@@ -909,6 +1212,7 @@ const SEED: &[SeedRow] = &[
             status: RESOURCE_STATUS_OK,
             metadata: &["us-east-1", "build-agent", "AKIAIOSFODNN7EXAMPLE", "14"],
             exclusion_status: EXCLUSION_INCLUDED,
+            estimated_monthly_spend: None,
         }],
     },
     SeedRow {
@@ -1003,6 +1307,7 @@ const SEED: &[SeedRow] = &[
                 status: RESOURCE_STATUS_WARNING,
                 metadata: &["us-east-1", "reporting-prod", "db.m5.large", "21", "131.40"],
                 exclusion_status: EXCLUSION_INCLUDED,
+                estimated_monthly_spend: Some(146.00),
             },
             SeedResource {
                 id: "res-rds-0002",
@@ -1011,6 +1316,7 @@ const SEED: &[SeedRow] = &[
                 status: RESOURCE_STATUS_OK,
                 metadata: &["us-west-2", "analytics-staging", "db.t3.medium", "1", "0.00"],
                 exclusion_status: EXCLUSION_INCLUDED,
+                estimated_monthly_spend: Some(72.00),
             },
         ],
     },
@@ -1040,6 +1346,7 @@ impl Default for ComAmazonawsTrustedadvisorTrustedadvisorState {
             checks: BTreeMap::new(),
             recommendations: BTreeMap::new(),
             recommendation_resources: BTreeMap::new(),
+            organization_recommendations: BTreeMap::new(),
             support_plan: SupportPlan::Basic,
         };
         for (index, row) in SEED.iter().enumerate() {
@@ -1084,6 +1391,36 @@ impl Default for ComAmazonawsTrustedadvisorTrustedadvisorState {
                 RecommendationEntry {
                     id: recommendation_id.clone(),
                     arn: recommendation_arn.clone(),
+                    text: text.clone(),
+                    check_arn: Some(check_arn.clone()),
+                    r#type: row.recommendation_type.to_string(),
+                    status: row.recommendation_status.to_string(),
+                    lifecycle_stage: row.lifecycle_stage.map(str::to_string),
+                    pillars: owned(row.pillars),
+                    source: row.source.to_string(),
+                    aws_services: owned(row.aws_services),
+                    created_at_millis: SEED_CREATED_AT_MILLIS,
+                    last_updated_at_millis,
+                    resolved_at_millis: None,
+                    update_reason: None,
+                    update_reason_code: None,
+                },
+            );
+
+            // The organization-level view of the same check: one organization
+            // recommendation per row, aggregating the member accounts'
+            // recommendations for that check (here the emulator's one
+            // account). Its classification members are the check's, so the two
+            // views of one finding cannot disagree.
+            let organization_recommendation_id =
+                format!("{}-organization-recommendation", row.check_id);
+            let organization_arn =
+                organization_recommendation_arn(&organization_recommendation_id);
+            state.organization_recommendations.insert(
+                organization_arn.clone(),
+                OrganizationRecommendationEntry {
+                    id: organization_recommendation_id,
+                    arn: organization_arn,
                     text,
                     check_arn: Some(check_arn),
                     r#type: row.recommendation_type.to_string(),
@@ -1092,6 +1429,7 @@ impl Default for ComAmazonawsTrustedadvisorTrustedadvisorState {
                     pillars: owned(row.pillars),
                     source: row.source.to_string(),
                     aws_services: owned(row.aws_services),
+                    member_recommendation_arns: vec![recommendation_arn.clone()],
                     created_at_millis: SEED_CREATED_AT_MILLIS,
                     last_updated_at_millis,
                     resolved_at_millis: None,
@@ -1114,6 +1452,7 @@ impl Default for ComAmazonawsTrustedadvisorTrustedadvisorState {
                         metadata: positional_map(resource.metadata),
                         last_updated_at_millis,
                         exclusion_status: resource.exclusion_status.to_string(),
+                        estimated_monthly_spend: resource.estimated_monthly_spend,
                     },
                 );
             }

@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateOrganizationRecommendationLifecycle
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateOrganizationRecommendationLifecycle`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! MUTATES the stored organization recommendation: the model's own doc says
+//! "Update the lifecycle of a Recommendation within an Organization. This API
+//! only supports prioritized recommendations", so this handler writes
+//! `lifecycleStage`, `updateReason` and `updateReasonCode` onto the stored
+//! [`crate::state::OrganizationRecommendationEntry`], stamps `lastUpdatedAt`
+//! from the clock, and sets `resolvedAt` when (and only when) the new stage is
+//! `resolved`. A following `GetOrganizationRecommendation` reports the new
+//! values.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateOrganizationRecommendationLifecycle::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Refusals: a well-formed ARN naming nothing in the store is a
+//! `ResourceNotFoundException` (404); an organization recommendation whose
+//! `type` is not `priority` is a `ConflictException` (409), because that
+//! sentence makes the operation inapplicable to it. `lifecycleStage` outside
+//! `UpdateRecommendationLifecycleStage`, an `updateReason` shorter than 10
+//! characters, and an identifier outside the ARN pattern are all refused by the
+//! framework as a `ValidationException` (400) before `handle` runs.
 //!
 //! ## Shape of an operation
 //!
@@ -83,6 +90,12 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+// The lifecycle stage that resolves a recommendation, and the recommendation
+// type whose lifecycle this operation can move — both shared with the
+// account-level `UpdateRecommendationLifecycle`, which models the same enums
+// and carries the same "only supports prioritized recommendations" sentence.
+use crate::state::{LIFECYCLE_STAGE_RESOLVED, RECOMMENDATION_TYPE_PRIORITY};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -181,14 +194,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // The support-level gate is a service-wide stage, so it sits ahead of this
-        // (unwritten) body too: a caller whose account's support plan does not include
-        // the Trusted Advisor API is refused with the modelled `AccessDeniedException`,
-        // which is the WHOLE answer the service gives such a request — no unimplemented
-        // behaviour is involved. An entitled caller still gets the 501 below. See
+        // `ctx` carries only request metadata; this operation reads nothing from it.
+        let _ = ctx;
+        // The support-level gate, ahead of everything else this handler does —
+        // ahead of resolving the identifier and of the lifecycle write, so a
+        // request this account may not make changes nothing. See
         // [`crate::state::support_level_refusal`].
         if let Some(denied) = crate::state::support_level_refusal(&*self.engine) {
             return Err(
@@ -198,15 +208,65 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         }
-        // Implement `UpdateOrganizationRecommendationLifecycle` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateOrganizationRecommendationLifecycleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateOrganizationRecommendationLifecycle"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                UpdateOrganizationRecommendationLifecycleErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the Trusted Advisor store is unavailable".to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+        let mut state = state.lock();
+
+        let Some(entry) = state
+            .organization_recommendations
+            .get_mut(&input.organization_recommendation_identifier)
+        else {
+            return Err(
+                UpdateOrganizationRecommendationLifecycleErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!(
+                            "no organization recommendation with the identifier {}",
+                            input.organization_recommendation_identifier
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        if entry.r#type != RECOMMENDATION_TYPE_PRIORITY {
+            return Err(
+                UpdateOrganizationRecommendationLifecycleErrorModeled::ConflictException(
+                    ConflictException {
+                        message: format!(
+                            "the lifecycle of the {} organization recommendation {} cannot be \
+                             updated: this operation only supports prioritized recommendations",
+                            entry.r#type, entry.arn
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // `@idempotent` PUT semantics: the request REPLACES the lifecycle of
+        // the organization recommendation, so an omitted
+        // `updateReason`/`updateReasonCode` clears the stored one rather than
+        // leaving the previous update's wording attached to the new stage.
+        let updated_at = crate::state::now_millis();
+        entry.lifecycle_stage = Some(input.lifecycle_stage.clone());
+        entry.update_reason = input.update_reason.clone();
+        entry.update_reason_code = input.update_reason_code.clone();
+        entry.last_updated_at_millis = updated_at;
+        // `resolvedAt` is "When the Recommendation was resolved": set it on the
+        // update that resolves the recommendation, and clear it on one that
+        // moves the recommendation back out of `resolved`.
+        entry.resolved_at_millis =
+            (input.lifecycle_stage == LIFECYCLE_STAGE_RESOLVED).then_some(updated_at);
+
+        Ok(UpdateOrganizationRecommendationLifecycleOutput)
     }
 }

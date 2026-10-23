@@ -191,43 +191,85 @@ pub mod event_source_type {
     pub const PARAMETER_GROUP: &str = "parameter-group";
 }
 
-/// What happened to a resource, as the event recording it reports.
+/// What a call did, as the event recording it reports — the operation that was
+/// performed, plus the OTHER resource a two-resource operation named.
 ///
 /// One vocabulary for every source type, so the message an event carries is built by
 /// one rule rather than spelled out per operation: a create records
-/// [`EventKind::Created`], a change to an existing resource [`EventKind::Modified`] and
-/// a delete [`EventKind::Deleted`].
+/// [`EventKind::Created`], a change to an existing resource [`EventKind::Modified`], a
+/// delete [`EventKind::Deleted`], and a change to one ACL MEMBER the membership
+/// operation that named both resources ([`EventKind::UserAdded`] /
+/// [`EventKind::UserRemoved`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EventKind {
+pub enum EventKind<'a> {
     Created,
     Modified,
     Deleted,
+    /// One user this call added to the ACL the event is recorded against.
+    UserAdded { user_name: &'a str },
+    /// One user this call removed from the ACL the event is recorded against.
+    UserRemoved { user_name: &'a str },
 }
 
-impl EventKind {
-    /// The past-tense verb this kind reads as in an event message.
-    fn verb(self) -> &'static str {
+impl EventKind<'_> {
+    /// The operation phrase this kind reads as in an event message: the operation that
+    /// was performed, followed by the resource(s) the request named for it.
+    ///
+    /// `resource` is the resource the event is recorded against, already written as
+    /// `<kind> <name>` by [`event_resource_phrase`]; a membership change names the
+    /// other resource too, so the user and the ACL both appear in the one message.
+    fn operation_phrase(self, resource: &str) -> String {
         match self {
-            EventKind::Created => "created",
-            EventKind::Modified => "modified",
-            EventKind::Deleted => "deleted",
+            EventKind::Created => format!("Create {resource}"),
+            EventKind::Modified => format!("Modify {resource}"),
+            EventKind::Deleted => format!("Delete {resource}"),
+            EventKind::UserAdded { user_name } => {
+                format!(
+                    "Add {} to {resource}",
+                    event_resource_phrase(event_source_type::USER, user_name)
+                )
+            }
+            EventKind::UserRemoved { user_name } => {
+                format!(
+                    "Remove {} from {resource}",
+                    event_resource_phrase(event_source_type::USER, user_name)
+                )
+            }
         }
     }
 }
 
-/// How an event message names the kind of resource it is about, per source type.
-///
-/// AWS documents no message text for `Event$Message` ("The text of the event"), so the
-/// WORDING is this emulator's: the kind of resource and what happened to it, with WHICH
-/// resource left to `Event$SourceName` — which is what the service fixes.
-fn source_type_label(source_type: &str) -> &str {
+/// How an event message names the kind of resource it is about, per source type: the
+/// noun as it reads mid-sentence, which for an acronym is the acronym itself.
+fn source_type_noun(source_type: &str) -> &str {
     match source_type {
-        event_source_type::CLUSTER => "Cluster",
+        event_source_type::CLUSTER => "cluster",
         event_source_type::ACL => "ACL",
-        event_source_type::USER => "User",
-        event_source_type::PARAMETER_GROUP => "Parameter group",
+        event_source_type::USER => "user",
+        event_source_type::PARAMETER_GROUP => "parameter group",
         other => other,
     }
+}
+
+/// How an event message names ONE resource: its kind, then the name the request gave
+/// it (as the store keys it, folded).
+fn event_resource_phrase(source_type: &str, name: &str) -> String {
+    format!("{} {name}", source_type_noun(source_type))
+}
+
+/// The `Event$Message` text for one recorded change.
+///
+/// AWS documents no text for `Event$Message` ("The text of the event"), but the service
+/// builds it from the REQUEST: it states the operation that was performed and the
+/// resource(s) that request named, in the form `<Operation> <kind> <name> operation
+/// completed.` — and a membership change names both the user and the ACL, one event per
+/// member changed. One rule for every source type and every operation, so no write path
+/// can word the same kind of change differently.
+fn event_message(source_type: &str, source_name: &str, kind: EventKind<'_>) -> String {
+    format!(
+        "{} operation completed.",
+        kind.operation_phrase(&event_resource_phrase(source_type, source_name))
+    )
 }
 
 /// An event as this emulator records it: what happened to which resource, and when.
@@ -1165,8 +1207,9 @@ impl ComAmazonawsMemorydbAmazonmemorydbState {
     /// calls this, so the event log is a record of what the store actually took rather
     /// than something `DescribeEvents` makes up: the event carries the resource's
     /// `SourceType` and its stored (folded) name, the instant of the change, and a
-    /// message built by one rule for every source type.
-    pub fn record_event(&mut self, source_type: &str, source_name: &str, kind: EventKind) {
+    /// message built by one rule ([`event_message`]) from the operation that was
+    /// performed and the resources the request named for it.
+    pub fn record_event(&mut self, source_type: &str, source_name: &str, kind: EventKind<'_>) {
         let date = SystemTime::now();
         let sequence = self.next_event_sequence;
         self.next_event_sequence = sequence.saturating_add(1);
@@ -1174,11 +1217,7 @@ impl ComAmazonawsMemorydbAmazonmemorydbState {
             sequence,
             source_type: source_type.to_string(),
             source_name: source_name.to_string(),
-            message: format!(
-                "{} {}",
-                source_type_label(source_type),
-                kind.verb()
-            ),
+            message: event_message(source_type, source_name, kind),
             date,
         });
         self.forget_unreportable_events(date);
@@ -1375,9 +1414,9 @@ impl ComAmazonawsMemorydbAmazonmemorydbState {
     /// * an ARN that is not a MemoryDB resource ARN at all —
     ///   [`TagTargetRejection::InvalidArn`], the 400 `InvalidARNFault`;
     /// * a well-formed one naming no resource in this store —
-    ///   [`TagTargetRejection::NotFound`] carrying the kind whose 404 the operation
-    ///   models. A resource's ARN is STORED rather than rebuilt per call, so an ARN
-    ///   naming an existing resource in another region or account resolves to nothing
+    ///   [`TagTargetRejection::NotFound`] carrying the kind whose not-found fault the
+    ///   operation models. A resource's ARN is STORED rather than rebuilt per call, so an
+    ///   ARN naming an existing resource in another region or account resolves to nothing
     ///   too.
     pub fn tag_target(&self, resource_arn: &str) -> Result<String, TagTargetRejection> {
         let Some((kind, name)) = parse_resource_arn(resource_arn) else {
@@ -2486,7 +2525,8 @@ pub fn parse_resource_arn(resource_arn: &str) -> Option<(ResourceKind, &str)> {
 pub enum TagTargetRejection {
     /// The ARN is not a MemoryDB resource ARN at all: the 400 `InvalidARNFault`.
     InvalidArn(String),
-    /// The ARN is well formed but names no resource in this store: that kind's 404.
+    /// The ARN is well formed but names no resource in this store: that kind's
+    /// not-found fault.
     NotFound(ResourceKind, String),
 }
 

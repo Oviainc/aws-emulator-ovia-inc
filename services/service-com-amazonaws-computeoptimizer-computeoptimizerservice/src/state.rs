@@ -12,9 +12,13 @@
 //!
 //! The analysis output this service REPORTS lives here too. The FINDINGS CATALOG holds one
 //! row per resource Compute Optimizer has analysed for the account (its finding, its reason
-//! codes, its performance risk, what it costs and what the recommendation would cost), part
-//! of the store's initial value so every findings reader aggregates the same rows without
-//! any of them writing to the store. Idle resource recommendations have their own store
+//! codes, its performance risk, what it costs and what the recommendation would cost, and —
+//! for a resource analysed as an Amazon Aurora or RDS database — the database configuration
+//! the analysis observed), part of the store's initial value so every findings reader
+//! aggregates the same rows without any of them writing to the store. A row records a
+//! resource's REGION-FREE identity, because Compute Optimizer is regional: the ARN a reader
+//! reports names the region of the endpoint the request addressed
+//! ([`AnalysedResource::arn_in`], [`request_region`]). Idle resource recommendations have their own store
 //! ([`IdleRecommendationStore`]): no operation of this API creates one — Compute Optimizer's
 //! own analysis of an observed workload does — so the store is what `GetIdleRecommendations`
 //! filters, orders and pages over, and the rules it applies to a stored recommendation (the
@@ -28,12 +32,19 @@ use ::aws_smithy_types::DateTime;
 use ::sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    AutoScalingGroupConfiguration, CustomizableMetricParameters, EffectivePreferredResource,
-    EffectiveRecommendationPreferences, ExternalMetricsPreference, IdleRecommendation,
-    IdleRecommendationFilter, InstanceSavingsEstimationMode, PreferredResource,
-    PutRecommendationPreferencesInput, RecommendationPreferencesDetail, Scope, UtilizationMetric,
-    UtilizationPreference, IDLE_FINDING_VALUES, IDLE_RECOMMENDATION_FILTER_NAME_VALUES,
-    IDLE_RECOMMENDATION_RESOURCE_TYPE_VALUES,
+    AutoScalingGroupConfiguration, CustomizableMetricParameters, DBStorageConfiguration,
+    EBSEffectiveRecommendationPreferences, EBSEstimatedMonthlySavings, EBSSavingsEstimationMode,
+    EBSSavingsOpportunityAfterDiscounts, EBSUtilizationMetric, EffectivePreferredResource,
+    EffectiveRecommendationPreferences, EstimatedMonthlySavings, ExternalMetricsPreference,
+    IdleRecommendation, IdleRecommendationFilter, InstanceSavingsEstimationMode, PreferredResource,
+    PutRecommendationPreferencesInput, RDSDBRecommendation, RDSDBRecommendationFilter,
+    RDSDBUtilizationMetric, RecommendationPreferencesDetail, SavingsOpportunity, Scope, Tag,
+    UtilizationMetric, UtilizationPreference, VolumeConfiguration, VolumeRecommendation,
+    VolumeRecommendationOption, IDLE_FINDING_VALUES, IDLE_RECOMMENDATION_FILTER_NAME_VALUES,
+    IDLE_RECOMMENDATION_RESOURCE_TYPE_VALUES, IDLE_VALUES,
+    R_D_S_D_B_RECOMMENDATION_FILTER_NAME_VALUES, R_D_S_INSTANCE_FINDING_REASON_CODE_VALUES,
+    R_D_S_INSTANCE_FINDING_VALUES, R_D_S_STORAGE_FINDING_REASON_CODE_VALUES,
+    R_D_S_STORAGE_FINDING_VALUES,
 };
 
 /// The look-back period in force when no preference sets one. From the model's own
@@ -412,6 +423,21 @@ pub fn is_account_id(value: &str) -> bool {
     value.len() == 12 && value.bytes().all(|b| b.is_ascii_digit())
 }
 
+/// The region an ARN names when the request carries no SigV4 credential scope to read one
+/// from: the region the emulator's own shared AWS config names, so an unsigned call and a
+/// default-configured client agree.
+pub const DEFAULT_REGION: &str = "us-east-1";
+
+/// The region this request was signed for, defaulting to [`DEFAULT_REGION`].
+///
+/// A resource ARN is region-scoped and Compute Optimizer is a regional service, so the
+/// region in a request's SigV4 credential scope is the region whose resources it is asking
+/// about — and the one the ARNs in its answer name.
+pub fn request_region(ctx: &smithy_server_runtime::OperationContext<'_>) -> String {
+    ::emulator_server::sigv4_credential_scope(&ctx.parts().headers)
+        .map_or_else(|| DEFAULT_REGION.to_string(), |scope| scope.region)
+}
+
 /// An EC2 instance or Auto Scaling group ARN, split into the parts the preference rules
 /// read: the account that owns the resource and the `ResourceType` it is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -491,6 +517,16 @@ pub fn scope_rejection(scope: Option<&Scope>) -> Option<String> {
 fn scope_precedence(key: &PreferenceKey, arn: &str, account_id: &str) -> Option<u8> {
     match (key.scope_name.as_deref(), key.scope_value.as_deref()) {
         (Some(SCOPE_RESOURCE_ARN), Some(value)) if value == arn => Some(0),
+        _ => account_scope_precedence(key, account_id),
+    }
+}
+
+/// [`scope_precedence`] for a resource no `ResourceArn` scope can name — a `ResourceArn`
+/// scope's "value must be the Amazon Resource Name (ARN) of an EC2 instance or an Auto
+/// Scaling group" (`Scope$value`), so for any other resource type only the account-level
+/// and organization-level records apply, in the same order they do above.
+fn account_scope_precedence(key: &PreferenceKey, account_id: &str) -> Option<u8> {
+    match (key.scope_name.as_deref(), key.scope_value.as_deref()) {
         (Some(SCOPE_ACCOUNT_ID), Some(value)) if value == account_id => Some(1),
         (None, _) => Some(2),
         (Some(SCOPE_ORGANIZATION), _) => Some(3),
@@ -516,6 +552,423 @@ pub fn decode_page_token(token: &str) -> Option<PreferenceKey> {
         scope_name,
         scope_value,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Amazon EBS volumes: the inventory Compute Optimizer observes, and the volume
+// recommendations it derives from it.
+// ---------------------------------------------------------------------------
+
+/// The `ResourceType` an EBS volume preference is written for, beside
+/// [`RESOURCE_TYPE_EC2_INSTANCE`]. The `RecommendationSourceType` of the same spelling,
+/// which the findings catalog records, is [`SOURCE_TYPE_EBS_VOLUME`].
+pub const RESOURCE_TYPE_EBS_VOLUME: &str = "EbsVolume";
+
+/// The one `EBSFilterName` value the model declares, and so the one filter name a volume
+/// recommendation request can carry (`smithy_query query="shape" shape="EBSFilterName"`;
+/// the request boundary refuses every other name against that closed enum, including the
+/// `tag:key` and `tag-key` names `EBSFilter$name`'s prose mentions).
+pub const EBS_FILTER_NAME_FINDING: &str = "Finding";
+
+/// The `EBSMetricName` values, in the order
+/// [`ObservedVolume::utilization_metrics`] reports them
+/// (`smithy_query query="shape" shape="EBSMetricName"`).
+pub const EBS_METRIC_READ_OPS_PER_SECOND: &str = "VolumeReadOpsPerSecond";
+/// See [`EBS_METRIC_READ_OPS_PER_SECOND`].
+pub const EBS_METRIC_WRITE_OPS_PER_SECOND: &str = "VolumeWriteOpsPerSecond";
+/// See [`EBS_METRIC_READ_OPS_PER_SECOND`].
+pub const EBS_METRIC_READ_BYTES_PER_SECOND: &str = "VolumeReadBytesPerSecond";
+/// See [`EBS_METRIC_READ_OPS_PER_SECOND`].
+pub const EBS_METRIC_WRITE_BYTES_PER_SECOND: &str = "VolumeWriteBytesPerSecond";
+/// See [`EBS_METRIC_READ_OPS_PER_SECOND`].
+pub const EBS_METRIC_IOPS_EXCEEDED: &str = "VolumeIOPSExceeded";
+/// See [`EBS_METRIC_READ_OPS_PER_SECOND`].
+pub const EBS_METRIC_THROUGHPUT_EXCEEDED: &str = "VolumeThroughputExceeded";
+
+/// The volume type every EBS volume recommendation option this service builds is of:
+/// gp3 is the current-generation general purpose SSD type, whose performance is
+/// provisioned independently of size, so one option expresses both a performance change
+/// and a cost change.
+pub const VOLUME_TYPE_GP3: &str = "gp3";
+
+/// gp3's included performance, from the Amazon EBS volume types documentation: a gp3
+/// volume includes 3,000 IOPS and 125 MiB/s of throughput at every size, and can be
+/// provisioned up to 16,000 IOPS and 1,000 MiB/s, at most 500 IOPS per GiB and at most
+/// 0.25 MiB/s of throughput per provisioned IOPS.
+pub const GP3_INCLUDED_IOPS: i32 = 3_000;
+/// See [`GP3_INCLUDED_IOPS`].
+pub const GP3_INCLUDED_THROUGHPUT_MIB: i32 = 125;
+/// See [`GP3_INCLUDED_IOPS`].
+pub const GP3_MAX_IOPS: i32 = 16_000;
+/// See [`GP3_INCLUDED_IOPS`].
+pub const GP3_MAX_THROUGHPUT_MIB: i32 = 1_000;
+/// See [`GP3_INCLUDED_IOPS`].
+pub const GP3_MAX_IOPS_PER_GIB: i32 = 500;
+/// See [`GP3_INCLUDED_IOPS`].
+pub const GP3_MAX_THROUGHPUT_MIB_PER_IOPS: f64 = 0.25;
+
+/// The headroom a recommendation option is sized with: the option has to carry the
+/// observed peak with room to spare, or adopting it would trade cost for a performance
+/// risk. The service documents no headroom for EBS volumes, so this is the emulator's
+/// own, taken from the only headroom the service does document — "`PERCENT_20` for
+/// headroom" (`PutRecommendationPreferences$utilizationPreferences`).
+pub const RECOMMENDATION_HEADROOM: f64 = 0.20;
+
+/// Bytes in a MiB: EBS reports volume throughput in MiB/s and CloudWatch reports the
+/// `VolumeRead/WriteBytesPerSecond` metrics in bytes per second.
+pub const BYTES_PER_MIB: f64 = 1_048_576.0;
+
+/// One observation of a volume's demand: the per-second read and write rates measured
+/// over one interval of the period Compute Optimizer analyses.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct VolumeSample {
+    /// How many days before the recommendation's last refresh this sample was taken, so
+    /// the look-back period in force decides whether it is analysed at all.
+    pub days_ago: f64,
+    /// `VolumeReadOpsPerSecond`.
+    pub read_ops_per_second: f64,
+    /// `VolumeWriteOpsPerSecond`.
+    pub write_ops_per_second: f64,
+    /// `VolumeReadBytesPerSecond`.
+    pub read_bytes_per_second: f64,
+    /// `VolumeWriteBytesPerSecond`.
+    pub write_bytes_per_second: f64,
+}
+
+impl VolumeSample {
+    /// The I/O operations per second this sample demanded, read plus write — what a
+    /// volume's IOPS capacity has to carry.
+    pub fn iops(&self) -> f64 {
+        self.read_ops_per_second + self.write_ops_per_second
+    }
+
+    /// The throughput this sample demanded in MiB/s, read plus write — what a volume's
+    /// throughput capacity has to carry.
+    pub fn throughput_mib_per_second(&self) -> f64 {
+        (self.read_bytes_per_second + self.write_bytes_per_second) / BYTES_PER_MIB
+    }
+}
+
+/// One Amazon EBS volume Compute Optimizer observes: its configuration, its tags, and
+/// the metric samples a recommendation for it is computed from. This is the OBSERVATION;
+/// everything a `VolumeRecommendation` reports is derived from it, so no two readers of
+/// the same volume can disagree.
+#[derive(Debug, Clone)]
+pub struct ObservedVolume {
+    /// The volume's EC2 volume id, which is its key in the inventory. The ARN a reader
+    /// reports is built from it and the region the request was signed for
+    /// ([`ObservedVolume::volume_arn`]), because Compute Optimizer is a REGIONAL service:
+    /// the volumes it reports are the ones in the Region the caller addressed.
+    pub volume_id: String,
+    /// The account that owns the volume.
+    pub account_id: String,
+    /// The volume's configuration as EC2 reports it: type, size, and the baseline and
+    /// burst IOPS and throughput that type and size deliver.
+    pub configuration: VolumeConfiguration,
+    /// The volume's tags, as key/value pairs, in the order EC2 reports them.
+    pub tags: Vec<(String, String)>,
+    /// How many days Compute Optimizer has been observing this volume. A look-back
+    /// preference longer than this cannot be honoured, so the analysed period is the
+    /// shorter of the two.
+    pub days_observed: f64,
+    /// The metric samples observed, most recent first.
+    pub samples: Vec<VolumeSample>,
+}
+
+impl ObservedVolume {
+    /// This volume's ARN in `region`: `arn:aws:ec2:<region>:<account>:volume/<id>`.
+    pub fn volume_arn(&self, region: &str) -> String {
+        ::engine::emulator_arn("ec2", region, &format!("volume/{}", self.volume_id))
+    }
+
+    /// The samples the look-back period in force analyses: those taken within
+    /// `look_back_days` of the last refresh.
+    fn analysed_samples(&self, look_back_days: f64) -> impl Iterator<Item = &VolumeSample> {
+        self.samples
+            .iter()
+            .filter(move |sample| sample.days_ago <= look_back_days)
+    }
+
+    /// The peak of one sample measurement over the analysed period, or `0.0` when the
+    /// period holds no sample.
+    fn peak(&self, look_back_days: f64, of: fn(&VolumeSample) -> f64) -> f64 {
+        self.analysed_samples(look_back_days)
+            .map(of)
+            .fold(0.0_f64, f64::max)
+    }
+
+    /// How many analysed samples `exceeded` answers true for.
+    fn samples_exceeding(
+        &self,
+        look_back_days: f64,
+        exceeded: impl Fn(&VolumeSample) -> bool,
+    ) -> f64 {
+        self.analysed_samples(look_back_days)
+            .filter(|sample| exceeded(sample))
+            .count() as f64
+    }
+
+    /// "The number of days for which utilization metrics were analyzed for the volume"
+    /// (`VolumeRecommendation$lookBackPeriodInDays`): the preferred look-back period
+    /// ([`look_back_period_in_days`]), or however long this volume has been observed when
+    /// that is shorter.
+    pub fn analysed_days(&self, look_back_period: &str) -> f64 {
+        look_back_period_in_days(look_back_period).min(self.days_observed)
+    }
+
+    /// The metrics `VolumeRecommendation$utilizationMetrics` reports: every
+    /// `EBSMetricName` the model declares, each the peak of the analysed samples — and,
+    /// for the two "exceeded" metrics, the number of analysed samples whose demand went
+    /// past the capacity the volume's configuration delivers.
+    pub fn utilization_metrics(&self, look_back_days: f64) -> Vec<EBSUtilizationMetric> {
+        let iops_capacity = configured_iops_capacity(&self.configuration);
+        let throughput_capacity = configured_throughput_capacity(&self.configuration);
+        let metric = |name: &str, value: f64| EBSUtilizationMetric {
+            name: Some(name.to_string()),
+            statistic: Some(METRIC_STATISTIC_MAXIMUM.to_string()),
+            value,
+        };
+        vec![
+            metric(
+                EBS_METRIC_READ_OPS_PER_SECOND,
+                self.peak(look_back_days, |sample| sample.read_ops_per_second),
+            ),
+            metric(
+                EBS_METRIC_WRITE_OPS_PER_SECOND,
+                self.peak(look_back_days, |sample| sample.write_ops_per_second),
+            ),
+            metric(
+                EBS_METRIC_READ_BYTES_PER_SECOND,
+                self.peak(look_back_days, |sample| sample.read_bytes_per_second),
+            ),
+            metric(
+                EBS_METRIC_WRITE_BYTES_PER_SECOND,
+                self.peak(look_back_days, |sample| sample.write_bytes_per_second),
+            ),
+            metric(
+                EBS_METRIC_IOPS_EXCEEDED,
+                self.samples_exceeding(look_back_days, |sample| sample.iops() > iops_capacity),
+            ),
+            metric(
+                EBS_METRIC_THROUGHPUT_EXCEEDED,
+                self.samples_exceeding(look_back_days, |sample| {
+                    sample.throughput_mib_per_second() > throughput_capacity
+                }),
+            ),
+        ]
+    }
+
+    /// The configuration this service recommends for the volume: gp3 at the same size,
+    /// with IOPS and throughput provisioned to carry the analysed peak plus
+    /// [`RECOMMENDATION_HEADROOM`], inside gp3's documented limits. A volume whose peak
+    /// already fits gp3's included performance gets gp3's included performance.
+    pub fn recommended_configuration(&self, look_back_days: f64) -> VolumeConfiguration {
+        let size = self.configuration.volume_size.max(0);
+        let headroom = 1.0 + RECOMMENDATION_HEADROOM;
+
+        let peak_iops = self.peak(look_back_days, VolumeSample::iops);
+        let iops_ceiling = GP3_MAX_IOPS
+            .min(size.saturating_mul(GP3_MAX_IOPS_PER_GIB))
+            .max(GP3_INCLUDED_IOPS);
+        let iops = ((peak_iops * headroom).ceil() as i32).clamp(GP3_INCLUDED_IOPS, iops_ceiling);
+
+        let peak_throughput = self.peak(look_back_days, VolumeSample::throughput_mib_per_second);
+        let throughput_ceiling = GP3_MAX_THROUGHPUT_MIB
+            .min((f64::from(iops) * GP3_MAX_THROUGHPUT_MIB_PER_IOPS) as i32)
+            .max(GP3_INCLUDED_THROUGHPUT_MIB);
+        let throughput = ((peak_throughput * headroom).ceil() as i32)
+            .clamp(GP3_INCLUDED_THROUGHPUT_MIB, throughput_ceiling);
+
+        VolumeConfiguration {
+            volume_type: Some(VOLUME_TYPE_GP3.to_string()),
+            volume_size: size,
+            volume_baseline_iops: iops,
+            // gp3 performance is provisioned rather than bursted — a gp3 volume uses no
+            // burst credits — so the option delivers its baseline and nothing above it.
+            volume_burst_iops: 0,
+            volume_baseline_throughput: throughput,
+            volume_burst_throughput: 0,
+            // A recommendation changes a volume's type and provisioned performance; the
+            // volume stays attached where it was, so whether it is a root volume is a
+            // property of the volume, not of the option.
+            root_volume: self.configuration.root_volume,
+        }
+    }
+
+    /// How close the analysed peak came to what `configuration` sustains, as a
+    /// `PerformanceRisk` on the model's 0..4 scale: 0 while the peak stays under a
+    /// quarter of the sustained capacity, 4 once it reaches 125% of it. "The higher the
+    /// risk, the more likely the current EBS volume doesn't have sufficient capacity"
+    /// (`VolumeRecommendation$currentPerformanceRisk`), so the score rises with that
+    /// ratio and is measured against the BASELINE: burst capacity is not sustained.
+    pub fn performance_risk(
+        &self,
+        configuration: &VolumeConfiguration,
+        look_back_days: f64,
+    ) -> f64 {
+        let baseline_iops = f64::from(configuration.volume_baseline_iops.max(0));
+        let baseline_throughput = f64::from(configuration.volume_baseline_throughput.max(0));
+        let iops_ratio = demand_ratio(self.peak(look_back_days, VolumeSample::iops), baseline_iops);
+        let throughput_ratio = demand_ratio(
+            self.peak(look_back_days, VolumeSample::throughput_mib_per_second),
+            baseline_throughput,
+        );
+        let ratio = iops_ratio.max(throughput_ratio);
+        ((ratio - 0.25) / 0.25).clamp(0.0, 4.0)
+    }
+
+    /// The volume's tags as the modelled `Tags` list, or `None` when it carries none.
+    pub fn tag_list(&self) -> Option<Vec<Tag>> {
+        (!self.tags.is_empty()).then(|| {
+            self.tags
+                .iter()
+                .map(|(key, value)| Tag {
+                    key: Some(key.clone()),
+                    value: Some(value.clone()),
+                })
+                .collect()
+        })
+    }
+
+    /// The volume recommendation this observation yields in `region` under
+    /// `look_back_period`, as generated at `last_refresh_timestamp`.
+    ///
+    /// Every figure is computed here from the stored configuration and samples: the
+    /// metrics are the analysed peaks, the option is the configuration those peaks ask
+    /// for, each cost comes from [`volume_monthly_cost`], and the finding is
+    /// `NotOptimized` exactly when the option would either carry a peak the current
+    /// configuration does not sustain or cost less than it — "a volume is considered not
+    /// optimized when Compute Optimizer identifies a recommendation that can provide
+    /// better performance for your workload", and `Optimized` otherwise, where "Compute
+    /// Optimizer might [still] recommend a new generation volume type"
+    /// (`VolumeRecommendation$finding`).
+    pub fn to_recommendation(
+        &self,
+        region: &str,
+        look_back_period: &str,
+        last_refresh_timestamp: Option<DateTime>,
+    ) -> VolumeRecommendation {
+        let look_back_days = self.analysed_days(look_back_period);
+        let current = self.configuration.clone();
+        let recommended = self.recommended_configuration(look_back_days);
+        let current_risk = self.performance_risk(&current, look_back_days);
+        let option_risk = self.performance_risk(&recommended, look_back_days);
+        let savings = self.savings(look_back_days);
+
+        VolumeRecommendation {
+            volume_arn: Some(self.volume_arn(region)),
+            account_id: Some(self.account_id.clone()),
+            current_configuration: Some(current),
+            finding: Some(self.finding(look_back_days).to_string()),
+            utilization_metrics: Some(self.utilization_metrics(look_back_days)),
+            look_back_period_in_days: look_back_days,
+            volume_recommendation_options: Some(vec![VolumeRecommendationOption {
+                configuration: Some(recommended),
+                performance_risk: option_risk,
+                // One option, so it is the first-ranked one. "Rank 1 is considered the
+                // best" (`VolumeRecommendationOption$rank`).
+                rank: 1,
+                savings_opportunity: savings.map(|(percentage, value)| SavingsOpportunity {
+                    savings_opportunity_percentage: percentage,
+                    estimated_monthly_savings: Some(EstimatedMonthlySavings {
+                        currency: Some(CURRENCY_USD.to_string()),
+                        value,
+                    }),
+                }),
+                // This emulator prices a volume from the public price table in
+                // [`volume_monthly_cost`] and records no negotiated discount for storage,
+                // so the after-discount figures are the before-discount ones — which is
+                // what the reported [`SAVINGS_ESTIMATION_SOURCE`] says.
+                savings_opportunity_after_discounts: savings.map(|(percentage, value)| {
+                    EBSSavingsOpportunityAfterDiscounts {
+                        savings_opportunity_percentage: percentage,
+                        estimated_monthly_savings: Some(EBSEstimatedMonthlySavings {
+                            currency: Some(CURRENCY_USD.to_string()),
+                            value,
+                        }),
+                    }
+                }),
+            }]),
+            last_refresh_timestamp,
+            current_performance_risk: Some(performance_risk_band(current_risk).to_string()),
+            effective_recommendation_preferences: Some(EBSEffectiveRecommendationPreferences {
+                savings_estimation_mode: Some(EBSSavingsEstimationMode {
+                    source: Some(SAVINGS_ESTIMATION_SOURCE.to_string()),
+                }),
+                look_back_period: Some(look_back_period.to_string()),
+            }),
+            tags: self.tag_list(),
+        }
+    }
+
+    /// The volume's `EBSFinding` over the analysed period: `NotOptimized` exactly when the
+    /// recommended configuration would either carry a peak the current one does not
+    /// sustain or cost less than it, `Optimized` otherwise. `EBSFinding`'s two values are
+    /// [`FINDING_NOT_OPTIMIZED`] and [`FINDING_OPTIMIZED`].
+    pub fn finding(&self, look_back_days: f64) -> &'static str {
+        let recommended = self.recommended_configuration(look_back_days);
+        let safer = self.performance_risk(&recommended, look_back_days)
+            < self.performance_risk(&self.configuration, look_back_days);
+        let cheaper = match (
+            volume_monthly_cost(&self.configuration),
+            volume_monthly_cost(&recommended),
+        ) {
+            (Some(current), Some(option)) => option < current,
+            _ => false,
+        };
+        if safer || cheaper {
+            FINDING_NOT_OPTIMIZED
+        } else {
+            FINDING_OPTIMIZED
+        }
+    }
+
+    /// What adopting the recommended configuration saves per month and that saving as a
+    /// percentage of what the volume costs today, or `None` for a volume type this
+    /// emulator holds no price for ([`volume_monthly_cost`]) — whose recommendation then
+    /// carries no savings figure rather than an invented one.
+    pub fn savings(&self, look_back_days: f64) -> Option<(f64, f64)> {
+        let current = volume_monthly_cost(&self.configuration)?;
+        let option = volume_monthly_cost(&self.recommended_configuration(look_back_days))?;
+        let saved = round_hundredths((current - option).max(0.0));
+        Some((percentage_of(saved, current), saved))
+    }
+
+    /// This volume as a row of the findings catalog, i.e. as `GetRecommendationSummaries`
+    /// aggregates it, under the look-back period in force.
+    ///
+    /// The projection is what keeps one volume's analysis in ONE place: the summary reader
+    /// and `GetEBSVolumeRecommendations` both answer from this observation, so they cannot
+    /// disagree about a volume's finding, its performance risk or what adopting its
+    /// recommendation saves. A volume recommendation reports no finding reason codes
+    /// (`VolumeRecommendation` declares no such member) and infers no workload type, so
+    /// the row carries neither.
+    pub fn to_analysed_resource(&self, look_back_period: &str) -> AnalysedResource {
+        let look_back_days = self.analysed_days(look_back_period);
+        let current_monthly_cost = volume_monthly_cost(&self.configuration).unwrap_or_default();
+        let recommended_monthly_cost =
+            volume_monthly_cost(&self.recommended_configuration(look_back_days))
+                .unwrap_or(current_monthly_cost);
+        AnalysedResource {
+            account_id: self.account_id.clone(),
+            resource_type: SOURCE_TYPE_EBS_VOLUME.to_string(),
+            // The catalog records a resource's REGION-FREE identity
+            // ([`AnalysedResource::arn_in`]), which for a volume is its EC2 volume id.
+            arn_service: "ec2".to_string(),
+            arn_resource: format!("volume/{}", self.volume_id),
+            finding: self.finding(look_back_days).to_string(),
+            finding_reason_codes: Vec::new(),
+            current_performance_risk: performance_risk_band(
+                self.performance_risk(&self.configuration, look_back_days),
+            )
+            .to_string(),
+            current_monthly_cost,
+            recommended_monthly_cost,
+            inferred_workload_types: Vec::new(),
+            // A volume is not a database, so there is no database configuration to record.
+            rds_database: None,
+        }
+    }
 }
 
 /// The opaque `nextToken` a recommendation reader hands out: the ARN of the resource the
@@ -699,6 +1152,131 @@ impl GroupConfiguration {
     }
 }
 
+/// How much of `capacity` a peak demand of `demand` takes. A configuration that
+/// sustains nothing is saturated by any demand at all, and idle under none.
+fn demand_ratio(demand: f64, capacity: f64) -> f64 {
+    if capacity > 0.0 {
+        demand / capacity
+    } else if demand > 0.0 {
+        f64::INFINITY
+    } else {
+        0.0
+    }
+}
+
+/// The `CurrentPerformanceRisk` band a `PerformanceRisk` score falls in: the model's
+/// four bands over the score's 0..4 range, lowest risk first, so the reported band and
+/// the option's numeric risk always say the same thing.
+pub fn performance_risk_band(score: f64) -> &'static str {
+    const BANDS: [&str; 4] = [
+        PERFORMANCE_RISK_VERY_LOW,
+        PERFORMANCE_RISK_LOW,
+        PERFORMANCE_RISK_MEDIUM,
+        PERFORMANCE_RISK_HIGH,
+    ];
+    let band = (score.max(0.0) as usize).min(BANDS.len() - 1);
+    BANDS[band]
+}
+
+/// The IOPS a configuration can deliver, burst included.
+pub fn configured_iops_capacity(configuration: &VolumeConfiguration) -> f64 {
+    f64::from(
+        configuration
+            .volume_baseline_iops
+            .max(configuration.volume_burst_iops)
+            .max(0),
+    )
+}
+
+/// The throughput in MiB/s a configuration can deliver, burst included.
+pub fn configured_throughput_capacity(configuration: &VolumeConfiguration) -> f64 {
+    f64::from(
+        configuration
+            .volume_baseline_throughput
+            .max(configuration.volume_burst_throughput)
+            .max(0),
+    )
+}
+
+/// What one month of a volume with this configuration costs in USD, or `None` for a
+/// volume type this emulator holds no price for — whose recommendation then carries no
+/// savings figure rather than an invented one.
+///
+/// Amazon EBS public pricing in the `us-east-1` Region, as the EBS pricing page lists
+/// it: `gp3` $0.08 per GiB-month plus $0.005 per provisioned IOPS-month above the 3,000
+/// included and $0.040 per provisioned MiB/s-month above the 125 included; `gp2` $0.10
+/// per GiB-month; `io1` $0.125 per GiB-month plus $0.065 per provisioned IOPS-month;
+/// `io2` $0.125 per GiB-month plus provisioned IOPS tiered at $0.065 for the first
+/// 32,000, $0.046 up to 64,000 and $0.032 above; `st1` $0.045, `sc1` $0.015 and
+/// `standard` $0.05 per GiB-month. Every cost and saving this service reports is
+/// computed from this one table, so the figures of a recommendation agree with each
+/// other.
+pub fn volume_monthly_cost(configuration: &VolumeConfiguration) -> Option<f64> {
+    let volume_type = configuration.volume_type.as_deref()?;
+    let size = f64::from(configuration.volume_size.max(0));
+    let provisioned_iops = configuration.volume_baseline_iops.max(0);
+    let provisioned_throughput = configuration.volume_baseline_throughput.max(0);
+    let cost = match volume_type {
+        "gp3" => {
+            0.08 * size
+                + 0.005 * f64::from((provisioned_iops - GP3_INCLUDED_IOPS).max(0))
+                + 0.040 * f64::from((provisioned_throughput - GP3_INCLUDED_THROUGHPUT_MIB).max(0))
+        }
+        "gp2" => 0.10 * size,
+        "io1" => 0.125 * size + 0.065 * f64::from(provisioned_iops),
+        "io2" => 0.125 * size + io2_provisioned_iops_cost(provisioned_iops),
+        "st1" => 0.045 * size,
+        "sc1" => 0.015 * size,
+        "standard" => 0.05 * size,
+        _ => return None,
+    };
+    Some(round_hundredths(cost))
+}
+
+/// The tiered provisioned-IOPS charge of an `io2` volume, per [`volume_monthly_cost`].
+fn io2_provisioned_iops_cost(provisioned_iops: i32) -> f64 {
+    let first_tier = provisioned_iops.min(32_000);
+    let second_tier = (provisioned_iops - 32_000).clamp(0, 32_000);
+    let third_tier = (provisioned_iops - 64_000).max(0);
+    0.065 * f64::from(first_tier) + 0.046 * f64::from(second_tier) + 0.032 * f64::from(third_tier)
+}
+
+/// An Amazon EBS volume ARN — `arn:<partition>:ec2:<region>:<account>:volume/<id>` —
+/// split into the parts the readers need, or `None` for anything that is not one.
+/// `GetEBSVolumeRecommendations$volumeArns` takes "the Amazon Resource Name (ARN) of the
+/// volumes for which to return recommendations", so anything else is not a volume ARN.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParsedVolumeArn<'a> {
+    /// The ARN's account-id field: the account that owns the volume.
+    pub account_id: &'a str,
+    /// The ARN's region field: the Region the volume is in, which a regional service
+    /// answers for only when the request was signed for it.
+    pub region: &'a str,
+    /// The EC2 volume id, which is the inventory's key.
+    pub volume_id: &'a str,
+}
+
+/// Parse an Amazon EBS volume ARN, or `None` for anything that is not one. See
+/// [`ParsedVolumeArn`].
+pub fn parse_volume_arn(arn: &str) -> Option<ParsedVolumeArn<'_>> {
+    let fields: Vec<&str> = arn.splitn(6, ':').collect();
+    let [prefix, _partition, service, region, account_id, resource] = fields.as_slice() else {
+        return None;
+    };
+    if *prefix != "arn" || *service != "ec2" {
+        return None;
+    }
+    let (resource_kind, volume_id) = resource.split_once('/')?;
+    if resource_kind != "volume" || volume_id.is_empty() {
+        return None;
+    }
+    Some(ParsedVolumeArn {
+        account_id,
+        region,
+        volume_id,
+    })
+}
+
 /// One Auto Scaling group Compute Optimizer has analysed: the group as it is configured,
 /// the utilization it observed, and the candidate configurations the analysis found for
 /// it. Every value a recommendation REPORTS is either one of these stored observations
@@ -857,10 +1435,19 @@ impl AnalyzedAutoScalingGroup {
     /// reason codes (`AutoScalingGroupRecommendation` declares no such member), so the
     /// row carries none.
     pub fn to_analysed_resource(&self) -> AnalysedResource {
+        // The catalog records a resource's REGION-FREE identity
+        // ([`AnalysedResource::arn_in`]), so the group's own ARN is split back into the
+        // fields a reader rebuilds it from.
+        let parsed = parse_arn(&self.arn);
         AnalysedResource {
             account_id: self.account_id.clone(),
             resource_type: SOURCE_TYPE_AUTO_SCALING_GROUP.to_string(),
-            resource_arn: self.arn.clone(),
+            arn_service: parsed
+                .map(|arn| arn.service.to_string())
+                .unwrap_or_default(),
+            arn_resource: parsed
+                .map(|arn| arn.resource.to_string())
+                .unwrap_or_default(),
             finding: self.finding().to_string(),
             finding_reason_codes: Vec::new(),
             current_performance_risk: self.current_performance_risk.clone(),
@@ -871,6 +1458,8 @@ impl AnalyzedAutoScalingGroup {
                 .unwrap_or(&self.current)
                 .monthly_cost(),
             inferred_workload_types: self.inferred_workload_types.clone(),
+            // A group is not a database, so there is no database configuration to record.
+            rds_database: None,
         }
     }
 }
@@ -1233,8 +1822,12 @@ pub struct AnalysedResource {
     pub account_id: String,
     /// The `RecommendationSourceType` the resource is analysed as.
     pub resource_type: String,
-    /// The resource's ARN.
-    pub resource_arn: String,
+    /// The service namespace the resource belongs to — the `ec2`, `rds`, … field of its ARN.
+    pub arn_service: String,
+    /// Everything after the account field of the resource's ARN (`db:orders-primary`),
+    /// separators included: the resource's identity WITHOUT the region, which
+    /// [`Self::arn_in`] builds the ARN for one regional endpoint from.
+    pub arn_resource: String,
     /// The `Finding` the analysis reached for it.
     pub finding: String,
     /// The `FindingReasonCode`s behind that finding; empty where the finding has none.
@@ -1249,9 +1842,34 @@ pub struct AnalysedResource {
     pub recommended_monthly_cost: f64,
     /// The `InferredWorkloadType`s running on the resource; empty where none was inferred.
     pub inferred_workload_types: Vec<String>,
+    /// What the analysis recorded about the resource AS A DATABASE, for a row analysed as an
+    /// Amazon Aurora or RDS database; `None` for every other resource type, and for a
+    /// database whose configuration the analysis did not record. See [`RdsDatabaseDetail`].
+    pub rds_database: Option<RdsDatabaseDetail>,
 }
 
 impl AnalysedResource {
+    /// This resource's ARN as the endpoint in `region` reports it.
+    ///
+    /// Compute Optimizer is a REGIONAL service: each regional endpoint analyses and reports
+    /// the resources of its own region, so a resource the catalog holds is a resource of the
+    /// region whose endpoint a request addressed, and the ARN reported for it names that
+    /// region. The catalog therefore records the resource's region-free identity and every
+    /// reader builds the ARN for the region its request was signed for
+    /// ([`request_region`]).
+    pub fn arn_in(&self, region: &str) -> String {
+        if self.account_id == ::engine::emulator_account_id() {
+            ::engine::emulator_arn(&self.arn_service, region, &self.arn_resource)
+        } else {
+            // `emulator_arn` always names the emulator's own account; a row recorded for
+            // another account keeps that account in its ARN.
+            format!(
+                "arn:aws:{}:{region}:{}:{}",
+                self.arn_service, self.account_id, self.arn_resource
+            )
+        }
+    }
+
     /// The monthly saving of adopting the recommendation for this resource: what it costs
     /// today less what the recommended configuration costs, and NOTHING where the
     /// recommendation does not cost less — an underprovisioned resource is recommended a
@@ -1294,13 +1912,14 @@ pub const DIMENSION_SAVINGS_VALUE_AFTER_DISCOUNT: &str = "SavingsValueAfterDisco
 /// `Asc | Desc`); see [`idle_sorts_descending`].
 pub const ORDER_DESC: &str = "Desc";
 
-/// The `IdleRecommendationError$code` this service reports for the one condition it can
-/// report: the request named a resource the service holds no idle recommendation for, which
-/// is exactly what `IdleRecommendationError` describes ("Returns of list of resources that
-/// doesn't have idle recommendations"). The model documents `code` only as "The error code"
-/// and names no vocabulary for it, so this is the emulator's own stable code; the
-/// requirement the entry carries is its `identifier`.
-pub const IDLE_NO_RECOMMENDATION_CODE: &str = "ResourceNotFound";
+/// The error `code` a findings reader reports for the one condition it can report: the
+/// request named a resource this service holds no recommendation for, which is exactly what
+/// `IdleRecommendationError` ("Returns of list of resources that doesn't have idle
+/// recommendations") and `GetRecommendationError` ("Describes an error experienced when
+/// getting recommendations") describe. The model documents `code` only as "The error code"
+/// and names no vocabulary for it, so this is the emulator's own stable code, stated once so
+/// every reader reports the same one; the requirement the entry carries is its `identifier`.
+pub const NO_RECOMMENDATION_CODE: &str = "ResourceNotFound";
 
 /// The idle resource recommendations this service holds, keyed by the resource ARN that
 /// identifies one, in the order they were recorded.
@@ -1486,7 +2105,7 @@ pub fn idle_sorts_descending(order: Option<&str>) -> bool {
 /// with a different selection is refused instead of answered with a page of another result
 /// set.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct IdlePageCursor {
+pub struct PageCursor {
     /// How many selected recommendations the previous pages already reported.
     pub offset: usize,
     /// The fingerprint of the request members that select and order the result set.
@@ -1501,21 +2120,228 @@ pub fn fingerprint<T: std::fmt::Debug>(value: &T) -> String {
     ::hex::encode(Sha256::digest(format!("{value:?}").as_bytes()))
 }
 
-/// The opaque `nextToken` `GetIdleRecommendations` hands out: the cursor itself,
-/// hex-encoded, so a page token needs no server-side entry and a read never writes.
-pub fn encode_idle_page_token(cursor: &IdlePageCursor) -> String {
+/// The opaque `nextToken` an offset-paged reader hands out: the cursor itself, hex-encoded,
+/// so a page token needs no server-side entry and a read never writes. Shared by every
+/// reader of this service that walks a selected sequence by offset, each of which binds its
+/// own operation name into the selection fingerprint, so one reader's token resumes no
+/// other's walk.
+pub fn encode_offset_page_token(cursor: &PageCursor) -> String {
     ::hex::encode(format!("{}:{}", cursor.offset, cursor.selection_fingerprint))
 }
 
 /// The cursor a `nextToken` this service issued stands for, or `None` for a token it did
 /// not issue. What a decoded cursor may resume is the caller's own check: it compares the
 /// cursor's fingerprint against the one it would issue for this request.
-pub fn decode_idle_page_token(token: &str) -> Option<IdlePageCursor> {
+pub fn decode_offset_page_token(token: &str) -> Option<PageCursor> {
     let decoded = String::from_utf8(::hex::decode(token).ok()?).ok()?;
     let (offset, selection_fingerprint) = decoded.split_once(':')?;
-    Some(IdlePageCursor {
+    Some(PageCursor {
         offset: offset.parse().ok()?,
         selection_fingerprint: selection_fingerprint.to_string(),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Amazon Aurora and RDS database recommendations
+//
+// `GetRDSDatabaseRecommendations` "Returns Amazon Aurora and RDS database
+// recommendations", which Compute Optimizer "generates ... for Amazon Aurora and RDS
+// databases that meet a specific set of requirements" from the utilization it OBSERVES.
+// So, like every other findings reader of this service, it REPORTS the rows the findings
+// catalog holds — here the ones analysed as `RdsDBInstance`, the source type the model's
+// `RDSDBRecommendation` describes — and writes nothing. The rules below are the ones that
+// turn a stored row into the modelled recommendation and select over it: the filter
+// vocabulary, which finding member a stored `Finding` is reported on, and how a look-back
+// preference reads as a number of days.
+// ---------------------------------------------------------------------------
+
+/// The `RDSDBRecommendationFilterName` values
+/// (`crate::ops::types::R_D_S_D_B_RECOMMENDATION_FILTER_NAME_VALUES`), named so the filter
+/// rules below read as the model's own vocabulary.
+pub const RDS_FILTER_INSTANCE_FINDING: &str = "InstanceFinding";
+/// See [`RDS_FILTER_INSTANCE_FINDING`].
+pub const RDS_FILTER_INSTANCE_FINDING_REASON_CODE: &str = "InstanceFindingReasonCode";
+/// See [`RDS_FILTER_INSTANCE_FINDING`].
+pub const RDS_FILTER_STORAGE_FINDING: &str = "StorageFinding";
+/// See [`RDS_FILTER_INSTANCE_FINDING`].
+pub const RDS_FILTER_STORAGE_FINDING_REASON_CODE: &str = "StorageFindingReasonCode";
+/// See [`RDS_FILTER_INSTANCE_FINDING`].
+pub const RDS_FILTER_IDLE: &str = "Idle";
+
+/// The `Idle` enum values (`crate::ops::types::IDLE_VALUES`), which `RDSDBRecommendation$idle`
+/// carries: whether the service also holds an IDLE recommendation for the database.
+pub const IDLE_TRUE: &str = "True";
+/// See [`IDLE_TRUE`].
+pub const IDLE_FALSE: &str = "False";
+
+/// What the findings catalog records about a resource it analysed as an Amazon Aurora or RDS
+/// DATABASE, beyond the finding, risk and costs every analysed resource carries: the
+/// database's configuration, the configuration the analysis would move it to, and the
+/// utilization it observed.
+///
+/// `None` on a row the analysis recorded no database configuration for, and every field is
+/// optional in its own right, so a reader reports exactly what was observed and omits the
+/// members nothing was recorded for rather than inventing a value for them.
+#[derive(Debug, Clone, Default)]
+pub struct RdsDatabaseDetail {
+    /// `RDSDBRecommendation$engine` — "The database engine of the DB instance".
+    pub engine: Option<String>,
+    /// `RDSDBRecommendation$engineVersion`.
+    pub engine_version: Option<String>,
+    /// `RDSDBRecommendation$promotionTier`, set only for an Aurora cluster member.
+    pub promotion_tier: Option<i32>,
+    /// `RDSDBRecommendation$dbClusterIdentifier`, set only for a cluster member.
+    pub db_cluster_identifier: Option<String>,
+    /// `RDSDBRecommendation$currentDBInstanceClass`.
+    pub current_db_instance_class: Option<String>,
+    /// The DB instance class the analysis would move the database to, which is what an
+    /// `RDSDBInstanceRecommendationOption` names. Absent where the analysis would keep the
+    /// current class.
+    pub recommended_db_instance_class: Option<String>,
+    /// `RDSDBRecommendation$currentStorageConfiguration`.
+    pub current_storage_configuration: Option<DBStorageConfiguration>,
+    /// The storage configuration the analysis would move the database to, which is what an
+    /// `RDSDBStorageRecommendationOption` names.
+    pub recommended_storage_configuration: Option<DBStorageConfiguration>,
+    /// The `RDSDBUtilizationMetric`s the analysis observed over its look-back period.
+    pub utilization_metrics: Vec<RDSDBUtilizationMetric>,
+    /// When the recommendation was last generated (`lastRefreshTimestamp`).
+    pub last_refresh_timestamp: Option<DateTime>,
+    /// The tags of the database.
+    pub tags: Vec<Tag>,
+}
+
+/// Which `RDSDBRecommendation` findings a stored `Finding` is reported as: the instance
+/// finding and the storage finding, in that order.
+///
+/// Compute Optimizer analyses a database's INSTANCE and its STORAGE, and reports a finding
+/// for each, in the vocabulary the model declares for that member: `RDSInstanceFinding` is
+/// `Optimized | Overprovisioned | Underprovisioned`, and `RDSStorageFinding` declares those
+/// three plus `NotOptimized`. The catalog records ONE finding per analysed resource, so that
+/// finding is reported on the side whose enum declares it — the instance side when both do,
+/// since `NotOptimized` is the one finding only storage can carry — and the other side
+/// reports `Optimized`, the value both vocabularies use for a configuration the analysis
+/// would not change, because the analysis recorded nothing against it. Every `Finding` the
+/// catalog can hold is declared by at least one of the two; a value outside both is reported
+/// on neither member.
+pub fn rds_finding_members(finding: &str) -> (Option<&str>, Option<&str>) {
+    // `FINDING_OPTIMIZED` is the `Finding` value `RDSInstanceFinding` and `RDSStorageFinding`
+    // both declare, so one constant names it for all three.
+    match (
+        R_D_S_INSTANCE_FINDING_VALUES.contains(&finding),
+        R_D_S_STORAGE_FINDING_VALUES.contains(&finding),
+    ) {
+        (true, _) => (Some(finding), Some(FINDING_OPTIMIZED)),
+        (false, true) => (Some(FINDING_OPTIMIZED), Some(finding)),
+        (false, false) => (None, None),
+    }
+}
+
+/// The stored reason codes `vocabulary` declares, in stored order.
+///
+/// A resource's reason codes are reported on the member whose enum declares them —
+/// `instanceFindingReasonCodes` targets `RDSInstanceFindingReasonCode` and
+/// `storageFindingReasonCodes` targets `RDSStorageFindingReasonCode` — so a stored code is
+/// reported on the member that can carry it and on no other.
+pub fn reason_codes_in(vocabulary: &[&str], codes: &[String]) -> Vec<String> {
+    codes
+        .iter()
+        .filter(|code| vocabulary.contains(&code.as_str()))
+        .cloned()
+        .collect()
+}
+
+/// Check an `RDSDBRecommendationFilters` list against the vocabulary the model declares for
+/// it, returning the reason it is not valid.
+///
+/// `name` is an `RDSDBRecommendationFilterName` and the values a filter carries are the value
+/// set of the member that name selects on. A name or a value outside those sets is refused
+/// rather than silently matching nothing — the same rule [`idle_filter_rejection`] applies to
+/// the other findings reader's filters.
+pub fn rds_filter_rejection(filters: &[RDSDBRecommendationFilter]) -> Option<String> {
+    for filter in filters {
+        let Some(name) = filter.name.as_deref() else {
+            return Some(format!(
+                "The value supplied for parameter filters is not valid: a filter name must be \
+                 supplied, one of [{}].",
+                R_D_S_D_B_RECOMMENDATION_FILTER_NAME_VALUES.join(", ")
+            ));
+        };
+        let Some(vocabulary) = rds_filter_vocabulary(name) else {
+            return Some(format!(
+                "The value supplied for parameter filters is not valid: {name} is not a filter \
+                 name, which must be one of [{}].",
+                R_D_S_D_B_RECOMMENDATION_FILTER_NAME_VALUES.join(", ")
+            ));
+        };
+        if let Some(value) = filter
+            .values
+            .iter()
+            .flatten()
+            .find(|value| !vocabulary.contains(&value.as_str()))
+        {
+            return Some(format!(
+                "The value supplied for parameter filters is not valid: {value} is not a value \
+                 of the {name} filter, which must be one of [{}].",
+                vocabulary.join(", ")
+            ));
+        }
+    }
+    None
+}
+
+/// The value set an `RDSDBRecommendationFilterName` selects on, or `None` for a name the
+/// model does not declare.
+fn rds_filter_vocabulary(name: &str) -> Option<&'static [&'static str]> {
+    match name {
+        RDS_FILTER_INSTANCE_FINDING => Some(R_D_S_INSTANCE_FINDING_VALUES),
+        RDS_FILTER_INSTANCE_FINDING_REASON_CODE => {
+            Some(R_D_S_INSTANCE_FINDING_REASON_CODE_VALUES)
+        }
+        RDS_FILTER_STORAGE_FINDING => Some(R_D_S_STORAGE_FINDING_VALUES),
+        RDS_FILTER_STORAGE_FINDING_REASON_CODE => Some(R_D_S_STORAGE_FINDING_REASON_CODE_VALUES),
+        RDS_FILTER_IDLE => Some(IDLE_VALUES),
+        _ => None,
+    }
+}
+
+/// Does `recommendation` satisfy every `GetRDSDatabaseRecommendations` filter?
+///
+/// A filter matches when the member its name selects on equals any of the filter's values —
+/// for a member that is a LIST of reason codes, when any stored code is among them. Several
+/// filters are ANDed, and a filter carrying no values constrains nothing. A member the
+/// recommendation does not carry matches nothing. An unrecognised name never reaches here:
+/// [`rds_filter_rejection`] refuses the request first.
+pub fn rds_recommendation_matches_filters(
+    recommendation: &RDSDBRecommendation,
+    filters: &[RDSDBRecommendationFilter],
+) -> bool {
+    filters.iter().all(|filter| {
+        let Some(values) = filter.values.as_ref().filter(|values| !values.is_empty()) else {
+            return true;
+        };
+        let matches_one = |member: Option<&str>| {
+            member.is_some_and(|member| values.iter().any(|value| value == member))
+        };
+        let matches_any = |members: Option<&Vec<String>>| {
+            members.is_some_and(|members| {
+                members
+                    .iter()
+                    .any(|member| values.iter().any(|value| value == member))
+            })
+        };
+        match filter.name.as_deref() {
+            Some(RDS_FILTER_INSTANCE_FINDING) => matches_one(recommendation.instance_finding.as_deref()),
+            Some(RDS_FILTER_STORAGE_FINDING) => matches_one(recommendation.storage_finding.as_deref()),
+            Some(RDS_FILTER_IDLE) => matches_one(recommendation.idle.as_deref()),
+            Some(RDS_FILTER_INSTANCE_FINDING_REASON_CODE) => {
+                matches_any(recommendation.instance_finding_reason_codes.as_ref())
+            }
+            Some(RDS_FILTER_STORAGE_FINDING_REASON_CODE) => {
+                matches_any(recommendation.storage_finding_reason_codes.as_ref())
+            }
+            _ => false,
+        }
     })
 }
 
@@ -1528,6 +2354,13 @@ pub struct ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
     /// Every stored recommendation preference, ordered by key so a page boundary is
     /// stable across calls.
     pub preferences: BTreeMap<PreferenceKey, PreferenceRecord>,
+    /// The Amazon EBS volumes Compute Optimizer observes, by volume id, so a page
+    /// boundary is stable across calls. Part of the store's initial value rather than
+    /// something a reader writes on first use: `GetEBSVolumeRecommendations` REPORTS this
+    /// observation and must not mutate the store (see [`observed_volumes`]). It is the
+    /// SINGLE source for a volume: the EBS volume rows of [`Self::analysed_resources`]
+    /// are projected from it.
+    pub volumes: BTreeMap<String, ObservedVolume>,
     /// Every Auto Scaling group Compute Optimizer has analysed, in analysis order, so a
     /// page boundary is stable across calls. Part of the store's initial value rather than
     /// something a reader writes on first use: `GetAutoScalingGroupRecommendations` REPORTS
@@ -1538,9 +2371,10 @@ pub struct ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
     /// The resources Compute Optimizer has analysed, in catalog order. Part of the
     /// store's initial value rather than something a reader writes on first use, so every
     /// findings reader serves the same rows and none of them mutates the store. The Auto
-    /// Scaling group rows are PROJECTED from [`Self::auto_scaling_group_analyses`]
-    /// ([`seed_analysed_resources`]), so the two readers of a group cannot disagree about
-    /// its finding, its risk or what it costs.
+    /// Scaling group rows are PROJECTED from [`Self::auto_scaling_group_analyses`] and the
+    /// EBS volume rows from [`Self::volumes`] ([`seed_analysed_resources`]), so the two
+    /// readers of one resource cannot disagree about its finding, its risk or what it
+    /// costs.
     pub analysed_resources: Vec<AnalysedResource>,
     /// The idle resource recommendations this service holds, which
     /// `GetIdleRecommendations` reports. See [`IdleRecommendationStore`]: no operation of
@@ -1550,13 +2384,17 @@ pub struct ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
 
 impl Default for ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
     /// The store's initial value: the account is not opted in, nobody has written a
-    /// preference, the Auto Scaling group analysis and the findings catalog this emulator
-    /// analysed — which a reader only sees once the account is enrolled — and no idle
-    /// resource recommendation (only an analysis records one).
+    /// preference, the EBS volume observation, the Auto Scaling group analysis and the
+    /// findings catalog this emulator analysed — which a reader only sees once the account
+    /// is enrolled — and no idle resource recommendation (only an analysis records one).
     fn default() -> Self {
         Self {
             enrollment: Enrollment::default(),
             preferences: BTreeMap::new(),
+            volumes: observed_volumes()
+                .into_iter()
+                .map(|volume| (volume.volume_id.clone(), volume))
+                .collect(),
             auto_scaling_group_analyses: seed_auto_scaling_group_analyses(),
             analysed_resources: seed_analysed_resources(),
             idle_recommendations: IdleRecommendationStore::default(),
@@ -1576,12 +2414,15 @@ impl Default for ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
 /// vocabularies of several resource types so an aggregate over it is not a single row
 /// restated: it holds a resource whose recommendation saves money, one the analysis would
 /// GROW (so it saves none), and one it leaves alone.
+///
+/// A row records a resource's REGION-FREE identity (its service namespace and resource
+/// part): Compute Optimizer is regional, so the region a reported ARN names is the region
+/// of the endpoint the request addressed ([`AnalysedResource::arn_in`]).
 fn seed_analysed_resources() -> Vec<AnalysedResource> {
     let account = ::engine::emulator_account_id();
-    let east = "us-east-1";
-    let west = "us-west-2";
     let row = |resource_type: &str,
-               resource_arn: String,
+               arn_service: &str,
+               arn_resource: &str,
                finding: &str,
                finding_reason_codes: &[&str],
                current_performance_risk: &str,
@@ -1590,7 +2431,8 @@ fn seed_analysed_resources() -> Vec<AnalysedResource> {
                inferred_workload_types: &[&str]| AnalysedResource {
         account_id: account.to_string(),
         resource_type: resource_type.to_string(),
-        resource_arn,
+        arn_service: arn_service.to_string(),
+        arn_resource: arn_resource.to_string(),
         finding: finding.to_string(),
         finding_reason_codes: finding_reason_codes
             .iter()
@@ -1603,13 +2445,17 @@ fn seed_analysed_resources() -> Vec<AnalysedResource> {
             .iter()
             .map(|workload| (*workload).to_string())
             .collect(),
+        // Set below for the rows analysed as a database; every other resource type has no
+        // database configuration to record.
+        rds_database: None,
     };
 
     vec![
         // An over-provisioned instance: the recommendation is smaller, so it saves.
         row(
             SOURCE_TYPE_EC2_INSTANCE,
-            ::engine::emulator_arn("ec2", east, "instance/i-0a1b2c3d4e5f60001"),
+            "ec2",
+            "instance/i-0a1b2c3d4e5f60001",
             FINDING_OVERPROVISIONED,
             &[METRIC_REASON_MEMORY_OVERPROVISIONED],
             PERFORMANCE_RISK_VERY_LOW,
@@ -1621,7 +2467,8 @@ fn seed_analysed_resources() -> Vec<AnalysedResource> {
         // nothing even though its configuration changes.
         row(
             SOURCE_TYPE_EC2_INSTANCE,
-            ::engine::emulator_arn("ec2", east, "instance/i-0a1b2c3d4e5f60002"),
+            "ec2",
+            "instance/i-0a1b2c3d4e5f60002",
             FINDING_UNDERPROVISIONED,
             &[METRIC_REASON_MEMORY_UNDERPROVISIONED],
             PERFORMANCE_RISK_HIGH,
@@ -1632,39 +2479,19 @@ fn seed_analysed_resources() -> Vec<AnalysedResource> {
         // An optimized instance: nothing to change, nothing to save.
         row(
             SOURCE_TYPE_EC2_INSTANCE,
-            ::engine::emulator_arn("ec2", west, "instance/i-0a1b2c3d4e5f60003"),
+            "ec2",
+            "instance/i-0a1b2c3d4e5f60003",
             FINDING_OPTIMIZED,
             &[],
             PERFORMANCE_RISK_VERY_LOW,
             140.16,
             140.16,
-            &[],
-        ),
-        row(
-            SOURCE_TYPE_EBS_VOLUME,
-            ::engine::emulator_arn("ec2", east, "volume/vol-00112233445566001"),
-            FINDING_NOT_OPTIMIZED,
-            &[],
-            PERFORMANCE_RISK_VERY_LOW,
-            50.0,
-            40.0,
-            &[],
-        ),
-        // A volume the analysis leaves alone: optimized, so there is nothing to save on
-        // it, and the EbsVolume summary counts a resource at each of its two findings.
-        row(
-            SOURCE_TYPE_EBS_VOLUME,
-            ::engine::emulator_arn("ec2", east, "volume/vol-00112233445566002"),
-            FINDING_OPTIMIZED,
-            &[],
-            PERFORMANCE_RISK_VERY_LOW,
-            25.0,
-            25.0,
             &[],
         ),
         row(
             SOURCE_TYPE_LAMBDA_FUNCTION,
-            ::engine::emulator_arn("lambda", west, "function:invoice-renderer"),
+            "lambda",
+            "function:invoice-renderer",
             FINDING_NOT_OPTIMIZED,
             &[METRIC_REASON_MEMORY_OVERPROVISIONED],
             PERFORMANCE_RISK_VERY_LOW,
@@ -1674,7 +2501,8 @@ fn seed_analysed_resources() -> Vec<AnalysedResource> {
         ),
         row(
             SOURCE_TYPE_ECS_SERVICE,
-            ::engine::emulator_arn("ecs", east, "service/payments/checkout"),
+            "ecs",
+            "service/payments/checkout",
             FINDING_OVERPROVISIONED,
             &[METRIC_REASON_MEMORY_OVERPROVISIONED],
             PERFORMANCE_RISK_VERY_LOW,
@@ -1682,16 +2510,65 @@ fn seed_analysed_resources() -> Vec<AnalysedResource> {
             80.0,
             &[],
         ),
-        row(
-            SOURCE_TYPE_RDS_DB_INSTANCE,
-            ::engine::emulator_arn("rds", east, "db:orders-primary"),
-            FINDING_OVERPROVISIONED,
-            &[],
-            PERFORMANCE_RISK_MEDIUM,
-            300.0,
-            225.0,
-            &[],
-        ),
+        // An over-provisioned Aurora/RDS database: the analysis recommends a smaller DB
+        // instance class, so it saves. The database's own configuration and the utilization
+        // observed on it are recorded too, which is what `GetRDSDatabaseRecommendations`
+        // reports beside the finding, the risk and the costs every analysed row carries.
+        AnalysedResource {
+            rds_database: Some(RdsDatabaseDetail {
+                // `Engine`/`EngineVersion` are free-form strings in the model; these are the
+                // engine name and version an RDS PostgreSQL instance reports.
+                engine: Some("postgres".to_string()),
+                engine_version: Some("15.4".to_string()),
+                // Not a cluster member, so no promotion tier and no cluster identifier.
+                promotion_tier: None,
+                db_cluster_identifier: None,
+                current_db_instance_class: Some("db.r6g.2xlarge".to_string()),
+                recommended_db_instance_class: Some("db.r6g.xlarge".to_string()),
+                current_storage_configuration: Some(DBStorageConfiguration {
+                    storage_type: Some("gp3".to_string()),
+                    allocated_storage: 500,
+                    iops: Some(3_000),
+                    max_allocated_storage: Some(1_000),
+                    storage_throughput: Some(125),
+                }),
+                // The analysis would keep the storage as it is: its finding is about the
+                // instance, so there is no storage configuration to move to.
+                recommended_storage_configuration: None,
+                // `RDSDBMetricName` / `RDSDBMetricStatistic` values
+                // (`crate::ops::types::R_D_S_D_B_METRIC_NAME_VALUES`).
+                utilization_metrics: vec![
+                    RDSDBUtilizationMetric {
+                        name: Some("CPU".to_string()),
+                        statistic: Some("Maximum".to_string()),
+                        value: 17.5,
+                    },
+                    RDSDBUtilizationMetric {
+                        name: Some("Memory".to_string()),
+                        statistic: Some("Maximum".to_string()),
+                        value: 24.0,
+                    },
+                    RDSDBUtilizationMetric {
+                        name: Some("DatabaseConnections".to_string()),
+                        statistic: Some("Maximum".to_string()),
+                        value: 12.0,
+                    },
+                ],
+                last_refresh_timestamp: None,
+                tags: Vec::new(),
+            }),
+            ..row(
+                SOURCE_TYPE_RDS_DB_INSTANCE,
+                "rds",
+                "db:orders-primary",
+                FINDING_OVERPROVISIONED,
+                &[],
+                PERFORMANCE_RISK_MEDIUM,
+                300.0,
+                225.0,
+                &[],
+            )
+        },
     ]
     .into_iter()
     // The Auto Scaling group rows are the SAME analysis
@@ -1703,6 +2580,16 @@ fn seed_analysed_resources() -> Vec<AnalysedResource> {
         seed_auto_scaling_group_analyses()
             .iter()
             .map(AnalyzedAutoScalingGroup::to_analysed_resource),
+    )
+    // The Amazon EBS volume rows are the SAME observation
+    // `GetEBSVolumeRecommendations` reports, projected the same way
+    // ([`ObservedVolume::to_analysed_resource`]) under the look-back period in force when
+    // no preference sets one, so a summary of the account's volumes counts exactly the
+    // volumes that reader reports and agrees with it on each one's finding, risk and cost.
+    .chain(
+        observed_volumes()
+            .iter()
+            .map(|volume| volume.to_analysed_resource(DEFAULT_LOOK_BACK_PERIOD)),
     )
     .collect()
 }
@@ -1748,18 +2635,241 @@ impl ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
         resource_arn: &str,
         arn: ParsedResourceArn<'_>,
     ) -> Vec<&PreferenceRecord> {
+        self.records_applying_to_resource(resource_arn, arn.resource_type, arn.account_id)
+    }
+
+    /// The stored records that apply to one resource of `resource_type` owned by
+    /// `account_id`, MOST SPECIFIC FIRST — the same precedence [`records_applying_to`]
+    /// resolves with, for a resource whose type and account a caller already knows (a
+    /// findings reader reporting the preferences in force for a row it holds, say) rather
+    /// than one it parses out of an ARN.
+    ///
+    /// [`records_applying_to`]: Self::records_applying_to
+    pub fn records_applying_to_resource(
+        &self,
+        resource_arn: &str,
+        resource_type: &str,
+        account_id: &str,
+    ) -> Vec<&PreferenceRecord> {
         let mut applicable: Vec<(u8, &PreferenceRecord)> = self
             .preferences
             .iter()
-            .filter(|(key, _)| key.resource_type == arn.resource_type)
+            .filter(|(key, _)| key.resource_type == resource_type)
             .filter_map(|(key, record)| {
-                scope_precedence(key, resource_arn, arn.account_id).map(|rank| (rank, record))
+                scope_precedence(key, resource_arn, account_id).map(|rank| (rank, record))
             })
             .collect();
         applicable.sort_by_key(|(rank, _)| *rank);
         applicable.into_iter().map(|(_, record)| record).collect()
     }
 
+    /// The stored records that apply to a resource of `resource_type` owned by
+    /// `account_id`, MOST SPECIFIC FIRST — [`records_applying_to`] for a resource type no
+    /// `ResourceArn` scope can name (see [`account_scope_precedence`]).
+    ///
+    /// [`records_applying_to`]: Self::records_applying_to
+    pub fn records_for_account(
+        &self,
+        resource_type: &str,
+        account_id: &str,
+    ) -> Vec<&PreferenceRecord> {
+        let mut applicable: Vec<(u8, &PreferenceRecord)> = self
+            .preferences
+            .iter()
+            .filter(|(key, _)| key.resource_type == resource_type)
+            .filter_map(|(key, record)| {
+                account_scope_precedence(key, account_id).map(|rank| (rank, record))
+            })
+            .collect();
+        applicable.sort_by_key(|(rank, _)| *rank);
+        applicable.into_iter().map(|(_, record)| record).collect()
+    }
+
+    /// The look-back period in force for a resource of `resource_type` owned by
+    /// `account_id`: the value the most specific record that sets it carries, or
+    /// [`DEFAULT_LOOK_BACK_PERIOD`] when none does.
+    pub fn effective_look_back_period(&self, resource_type: &str, account_id: &str) -> String {
+        self.records_for_account(resource_type, account_id)
+            .into_iter()
+            .find_map(|record| record.look_back_period.clone())
+            .unwrap_or_else(|| DEFAULT_LOOK_BACK_PERIOD.to_string())
+    }
+
+    /// The Amazon EBS volumes whose observation a caller can read, by volume id.
+    ///
+    /// The same gate [`visible_auto_scaling_group_analyses`] applies: Compute Optimizer
+    /// reports recommendations for an ENROLLED account only, and only once the analysis
+    /// that enrollment starts is due ([`ANALYSIS_DELAY`]), so an account that never opted
+    /// in, one that opted out, and one that has just opted in all read the empty set
+    /// rather than an analysis nothing has produced yet.
+    ///
+    /// [`visible_auto_scaling_group_analyses`]: Self::visible_auto_scaling_group_analyses
+    pub fn visible_volumes(&self) -> impl Iterator<Item = &ObservedVolume> {
+        let visible = self.enrollment.is_opted_in() && self.enrollment.analysis_due();
+        self.volumes.values().filter(move |_| visible)
+    }
+}
+
+/// The Amazon EBS volume inventory this emulator observes, generated once when the store
+/// is created.
+///
+/// The emulator watches no real workload, so the volumes and their metric samples are a
+/// fixed observation rather than something derived from traffic. Everything a
+/// recommendation reports is nevertheless computed from what is stored here — the
+/// analysed peaks come from these samples, the recommended configuration from those
+/// peaks, and every cost from [`volume_monthly_cost`] — so a reader cannot report a
+/// figure the observation does not support.
+///
+/// The set spans the cases a volume recommendation distinguishes: a previous-generation
+/// volume whose demand fits its capacity (cheaper on gp3), a gp3 volume whose demand
+/// outruns its provisioned IOPS (needs more performance), a heavily over-provisioned
+/// Provisioned IOPS volume whose peak demand arrived outside the default look-back
+/// period, and a gp3 volume already provisioned for its workload.
+fn observed_volumes() -> Vec<ObservedVolume> {
+    let account_id = ::engine::emulator_account_id().to_string();
+
+    vec![
+        // gp2, 500 GiB: 3 IOPS per GiB of baseline (1,500) with a 3,000 IOPS burst and
+        // 250 MiB/s of throughput. Its peak fits that comfortably, so the gp3 option
+        // carries the same workload for less money.
+        ObservedVolume {
+            volume_id: "vol-0a1b2c3d4e5f60001".to_string(),
+            account_id: account_id.clone(),
+            configuration: VolumeConfiguration {
+                volume_type: Some("gp2".to_string()),
+                volume_size: 500,
+                volume_baseline_iops: 1_500,
+                volume_burst_iops: 3_000,
+                volume_baseline_throughput: 250,
+                volume_burst_throughput: 250,
+                root_volume: Some(true),
+            },
+            tags: vec![("Owner".to_string(), "TeamA".to_string())],
+            days_observed: 93.0,
+            samples: vec![
+                VolumeSample {
+                    days_ago: 0.0,
+                    read_ops_per_second: 300.0,
+                    write_ops_per_second: 400.0,
+                    read_bytes_per_second: 20.0 * BYTES_PER_MIB,
+                    write_bytes_per_second: 25.0 * BYTES_PER_MIB,
+                },
+                VolumeSample {
+                    days_ago: 3.0,
+                    read_ops_per_second: 450.0,
+                    write_ops_per_second: 450.0,
+                    read_bytes_per_second: 30.0 * BYTES_PER_MIB,
+                    write_bytes_per_second: 30.0 * BYTES_PER_MIB,
+                },
+                VolumeSample {
+                    days_ago: 40.0,
+                    read_ops_per_second: 200.0,
+                    write_ops_per_second: 150.0,
+                    read_bytes_per_second: 10.0 * BYTES_PER_MIB,
+                    write_bytes_per_second: 8.0 * BYTES_PER_MIB,
+                },
+            ],
+        },
+        // gp3, 100 GiB at its included performance, driven past it: the option has to
+        // provision more IOPS and more throughput, which costs MORE than the volume
+        // costs today — a recommendation is not always a saving.
+        ObservedVolume {
+            volume_id: "vol-0a1b2c3d4e5f60002".to_string(),
+            account_id: account_id.clone(),
+            configuration: VolumeConfiguration {
+                volume_type: Some(VOLUME_TYPE_GP3.to_string()),
+                volume_size: 100,
+                volume_baseline_iops: GP3_INCLUDED_IOPS,
+                volume_burst_iops: 0,
+                volume_baseline_throughput: GP3_INCLUDED_THROUGHPUT_MIB,
+                volume_burst_throughput: 0,
+                root_volume: Some(false),
+            },
+            tags: vec![("Owner".to_string(), "TeamB".to_string())],
+            days_observed: 93.0,
+            samples: vec![
+                VolumeSample {
+                    days_ago: 0.0,
+                    read_ops_per_second: 2_400.0,
+                    write_ops_per_second: 2_400.0,
+                    read_bytes_per_second: 60.0 * BYTES_PER_MIB,
+                    write_bytes_per_second: 60.0 * BYTES_PER_MIB,
+                },
+                VolumeSample {
+                    days_ago: 10.0,
+                    read_ops_per_second: 1_000.0,
+                    write_ops_per_second: 900.0,
+                    read_bytes_per_second: 40.0 * BYTES_PER_MIB,
+                    write_bytes_per_second: 30.0 * BYTES_PER_MIB,
+                },
+            ],
+        },
+        // io1, 200 GiB with 8,000 provisioned IOPS: far more than the workload asks for,
+        // and its heaviest day falls OUTSIDE the default look-back period, so a longer
+        // look-back preference changes the option this volume gets.
+        ObservedVolume {
+            volume_id: "vol-0a1b2c3d4e5f60003".to_string(),
+            account_id: account_id.clone(),
+            configuration: VolumeConfiguration {
+                volume_type: Some("io1".to_string()),
+                volume_size: 200,
+                volume_baseline_iops: 8_000,
+                volume_burst_iops: 0,
+                volume_baseline_throughput: 500,
+                volume_burst_throughput: 0,
+                root_volume: Some(false),
+            },
+            tags: vec![
+                ("Owner".to_string(), "TeamB".to_string()),
+                ("Environment".to_string(), "production".to_string()),
+            ],
+            days_observed: 93.0,
+            samples: vec![
+                VolumeSample {
+                    days_ago: 1.0,
+                    read_ops_per_second: 600.0,
+                    write_ops_per_second: 600.0,
+                    read_bytes_per_second: 30.0 * BYTES_PER_MIB,
+                    write_bytes_per_second: 20.0 * BYTES_PER_MIB,
+                },
+                VolumeSample {
+                    days_ago: 50.0,
+                    read_ops_per_second: 1_500.0,
+                    write_ops_per_second: 1_500.0,
+                    read_bytes_per_second: 100.0 * BYTES_PER_MIB,
+                    write_bytes_per_second: 60.0 * BYTES_PER_MIB,
+                },
+            ],
+        },
+        // gp3, 50 GiB, already provisioned for its workload — and observed for only a
+        // week, so the period analysed is that week however long a look-back period the
+        // account prefers.
+        ObservedVolume {
+            volume_id: "vol-0a1b2c3d4e5f60004".to_string(),
+            account_id,
+            configuration: VolumeConfiguration {
+                volume_type: Some(VOLUME_TYPE_GP3.to_string()),
+                volume_size: 50,
+                volume_baseline_iops: GP3_INCLUDED_IOPS,
+                volume_burst_iops: 0,
+                volume_baseline_throughput: GP3_INCLUDED_THROUGHPUT_MIB,
+                volume_burst_throughput: 0,
+                root_volume: Some(false),
+            },
+            tags: Vec::new(),
+            days_observed: 7.0,
+            samples: vec![VolumeSample {
+                days_ago: 0.0,
+                read_ops_per_second: 700.0,
+                write_ops_per_second: 800.0,
+                read_bytes_per_second: 20.0 * BYTES_PER_MIB,
+                write_bytes_per_second: 20.0 * BYTES_PER_MIB,
+            }],
+        },
+    ]
+}
+
+impl ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
     /// The preferences in force for one resource: the value from the most specific scope
     /// that sets each field, and the service's documented default for every field no
     /// record sets — "considers all applicable preferences that you might have set at the
@@ -1774,7 +2884,23 @@ impl ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
         resource_arn: &str,
         arn: ParsedResourceArn<'_>,
     ) -> EffectivePreferences {
-        let applicable = self.records_applying_to(resource_arn, arn);
+        self.effective_preferences_for(resource_arn, arn.resource_type, arn.account_id)
+    }
+
+    /// The preferences in force for one resource of `resource_type` owned by `account_id` —
+    /// the same resolution [`effective_preferences`] performs, for a resource whose type and
+    /// account a caller already knows (a findings reader reporting the preferences a stored
+    /// row's recommendation was generated under, say) rather than one it parses out of an
+    /// ARN.
+    ///
+    /// [`effective_preferences`]: Self::effective_preferences
+    pub fn effective_preferences_for(
+        &self,
+        resource_arn: &str,
+        resource_type: &str,
+        account_id: &str,
+    ) -> EffectivePreferences {
+        let applicable = self.records_applying_to_resource(resource_arn, resource_type, account_id);
         let effective = |field: fn(&PreferenceRecord) -> bool| {
             applicable.iter().copied().find(|record| field(record))
         };
@@ -1799,7 +2925,7 @@ impl ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
             utilization_preferences: effective(|record| !record.utilization_preferences.is_empty())
                 .map(|record| record.utilization_preferences.clone())
                 .unwrap_or_else(|| {
-                    if arn.resource_type == RESOURCE_TYPE_EC2_INSTANCE {
+                    if resource_type == RESOURCE_TYPE_EC2_INSTANCE {
                         default_utilization_preferences()
                     } else {
                         Vec::new()

@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Merges the supplied tag map into the tag set persisted on the
+//! `NotificationConfiguration` the arn names: each supplied key is added or
+//! overwritten, and a key the request does not mention keeps the value it had.
+//! `ListTagsForResource` reports the result. An arn no configuration is stored
+//! under is a 404.
 //!
 //! ## Shape of an operation
 //!
@@ -147,18 +144,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            TagResourceErrorModeled::InternalServerException(InternalServerException {
+                message: "the notifications store is unavailable".to_string(),
+            })
+        })?;
+        let mut store = state.lock();
+
+        // Tags live ON the configuration record, so the arn has to name one:
+        // an arn the store does not hold has no tag set to write to, whatever
+        // its shape. ("This is only supported for NotificationConfigurations".)
+        let record = store.configurations.get_mut(&input.arn).ok_or_else(|| {
+            TagResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: format!("no NotificationConfiguration exists with arn {}", input.arn),
+                resource_id: input.arn.clone(),
+            })
+        })?;
+
+        // The merge is all-or-nothing, so the resulting size is checked before
+        // the first insert: a record carrying more than `TagMap`'s modelled
+        // `@length` maximum could not be reported back through that same shape.
+        // The boundary validator only bounds the map this ONE request carries,
+        // which says nothing about its union with what is already stored.
+        let resulting = record.tag_count_after_merge(input.tags.keys().map(String::as_str));
+        if resulting > crate::state::MAX_TAGS_PER_RESOURCE {
+            return Err(TagResourceErrorModeled::ValidationException(ValidationException {
+                message: format!(
+                    "tags would leave {resulting} tags on the resource, more than the maximum of {}",
+                    crate::state::MAX_TAGS_PER_RESOURCE
+                ),
+                reason: Some("fieldValidationFailed".to_string()),
+                field_list: Some(vec![ValidationExceptionField {
+                    name: "tags".to_string(),
+                    message: format!(
+                        "a resource holds at most {} tags",
+                        crate::state::MAX_TAGS_PER_RESOURCE
+                    ),
+                }]),
+            })
+            .into());
+        }
+
+        record.merge_tags(input.tags);
+
+        // The response has no members: the tag set is what changed, which
+        // `ListTagsForResource` reports on its own.
+        Ok(TagResourceOutput {})
     }
 }

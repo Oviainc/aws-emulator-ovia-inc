@@ -216,8 +216,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .ok_or_else(|| {
                     ListRepositoriesErrorModeled::InvalidContinuationTokenException(
                         InvalidContinuationTokenException {
-                            message: Some(format!(
-                                "the continuation token {token} is not valid"
+                            message: Some(crate::state::invalid_continuation_token_message(
+                                token,
                             )),
                         },
                     )

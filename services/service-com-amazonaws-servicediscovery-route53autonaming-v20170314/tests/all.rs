@@ -41,5 +41,9 @@ mod service_listing;
 mod state_roundtrip;
 #[path = "all/tagging.rs"]
 mod tagging;
+#[path = "all/update_dns_namespace.rs"]
+mod update_dns_namespace;
 #[path = "all/update_http_namespace.rs"]
 mod update_http_namespace;
+#[path = "all/update_service.rs"]
+mod update_service;

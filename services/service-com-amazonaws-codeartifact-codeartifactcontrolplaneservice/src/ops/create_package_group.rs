@@ -181,17 +181,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A pattern is a path from the domain root, so it begins with `/` — that is what
         // makes `/*` the ancestor of `/npm/*`. `PackageGroupPattern` models only length
         // and "no control or whitespace characters", so the boundary validator passed
-        // anything else and the shape of the identifier is checked here.
-        if !pattern.starts_with('/') {
-            return Err(CreatePackageGroupErrorModeled::ValidationException(
-                ValidationException {
-                    message: format!(
-                        "Invalid package group pattern '{pattern}'. A package group pattern is a path from the domain root and must begin with '/'."
-                    ),
-                    reason: Some("FIELD_VALIDATION_FAILED".to_string()),
-                },
-            )
-            .into());
+        // anything else and the shape of the identifier is checked here — stated in the
+        // SAME constraint-violation envelope the boundary states a modelled constraint in,
+        // naming the member and the requirement it failed
+        // (`crate::state::package_group_pattern_refusal`).
+        if let Some(refusal) = crate::state::package_group_pattern_refusal(&pattern) {
+            return Err(CreatePackageGroupErrorModeled::ValidationException(refusal).into());
         }
 
         let mut store = state.lock();

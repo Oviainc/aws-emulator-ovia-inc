@@ -557,7 +557,7 @@ async fn create_link_refuses_a_type_or_provider_outside_the_documented_constrain
 }
 
 #[tokio::test]
-async fn create_link_and_get_links_are_not_found_for_a_parent_that_does_not_exist() {
+async fn create_link_refuses_a_parent_that_does_not_exist_and_get_links_is_not_found() {
     let emulator = Emulator::new();
     let network = emulator.create_global_network("parents").await;
     let site = emulator.create_site(&network, "hq").await;
@@ -565,7 +565,11 @@ async fn create_link_and_get_links_are_not_found_for_a_parent_that_does_not_exis
     let other_site = emulator.create_site(&other_network, "elsewhere").await;
 
     // Rows differ along which parent is missing: the global network in the path, the site
-    // in the body, and a site that exists but under a different global network.
+    // in the body, and a site that exists but under a different global network. `CreateLink`
+    // validates the references its input carries before anything is minted, so each of them
+    // is a field-validation failure on the member that carried it (the full rule, with the
+    // member and prose each refusal reports, is pinned by `unknown_parent_reference`);
+    // `GetLinks` addresses the global network itself, so an absent one stays a not-found.
     let cases: Vec<(&str, String, String)> = vec![
         (
             "an unknown global network",
@@ -592,12 +596,12 @@ async fn create_link_and_get_links_are_not_found_for_a_parent_that_does_not_exis
     for (case, path_network, body_site) in cases {
         let (status, answer) = create_link(&emulator, &path_network, &body_site, &plain_link()).await;
         assert_eq!(
-            status, 404,
-            "case {case}: CreateLink expected 404, got {status} with {answer}"
+            status, 400,
+            "case {case}: CreateLink expected 400, got {status} with {answer}"
         );
         assert_eq!(
             error_code(&answer),
-            "ResourceNotFoundException",
+            "ValidationException",
             "case {case}: wrong error code in {answer}"
         );
     }

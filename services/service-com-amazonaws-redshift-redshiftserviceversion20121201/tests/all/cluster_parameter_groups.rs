@@ -55,6 +55,17 @@ fn default_group_name() -> String {
     state::default_parameter_group(state::DEFAULT_CLUSTER_VERSION)
 }
 
+/// The name of EVERY default parameter group a fresh account already has, in the
+/// order the store seeds them: one per published parameter group family (the
+/// engine versions' families, plus the family a new cluster's default group
+/// belongs to).
+fn default_group_names() -> Vec<String> {
+    state::published_parameter_group_families()
+        .iter()
+        .map(|family| state::family_default_parameter_group(family))
+        .collect()
+}
+
 /// One row of the tag-filter table: the case name, the request's filter
 /// parameters, and the group names that must come back.
 type FilterCase = (
@@ -246,12 +257,12 @@ async fn a_created_parameter_group_is_reported_exactly_as_stored() {
     let all = emulator
         .call("DescribeClusterParameterGroups", &[])
         .await;
-    let mut expected: Vec<String> = vec![default_group_name()];
+    let mut expected: Vec<String> = default_group_names();
     expected.extend(cases.iter().map(|case| case.stored_name.clone()));
     assert_eq!(
         listed_groups(&all.body),
         expected,
-        "case list every group: expected the default group then the created ones in creation order, got {:?}",
+        "case list every group: expected the default groups then the created ones in creation order, got {:?}",
         listed_groups(&all.body)
     );
 }
@@ -375,7 +386,7 @@ async fn the_parameter_group_name_syntax_is_enforced() {
     let all = emulator
         .call("DescribeClusterParameterGroups", &[])
         .await;
-    let mut expected: Vec<String> = vec![default_group_name()];
+    let mut expected: Vec<String> = default_group_names();
     expected.extend(
         cases
             .iter()
@@ -409,8 +420,8 @@ async fn the_parameter_group_family_catalogue_is_the_default_groups_families() {
     let families = all_text(&defaults.body, "ParameterGroupFamily");
     assert_eq!(
         families,
-        vec![default_family()],
-        "case the default groups' families: expected the engine version's family, got {families:?}"
+        state::published_parameter_group_families(),
+        "case the default groups' families: expected every published family, got {families:?}"
     );
 
     // Each row names a family and whether the catalogue above holds it.
@@ -420,7 +431,12 @@ async fn the_parameter_group_family_catalogue_is_the_default_groups_families() {
             families[0].clone(),
             true,
         ),
-        ("an engine version that does not exist", "redshift-2.0".to_string(), false),
+        (
+            "the family a new cluster's default group belongs to",
+            state::DEFAULT_PARAMETER_GROUP_FAMILY.to_string(),
+            true,
+        ),
+        ("an engine version that does not exist", "redshift-9.9".to_string(), false),
         ("another service's family", "mysql8.0".to_string(), false),
         ("the family in another case", families[0].to_uppercase(), false),
         ("no family at all", String::new(), false),
@@ -535,8 +551,8 @@ async fn describing_parameter_groups_is_a_pure_report() {
         .await;
     assert_eq!(
         listed_groups(&first_read.body),
-        vec![default_group_name()],
-        "case a fresh account: expected only the default parameter group, got {:?}",
+        default_group_names(),
+        "case a fresh account: expected only the default parameter groups, got {:?}",
         listed_groups(&first_read.body)
     );
     let second_read = emulator
@@ -599,9 +615,11 @@ async fn describing_parameter_groups_is_a_pure_report() {
 async fn parameter_groups_are_paginated_over_the_documented_window() {
     let emulator = Emulator::new();
 
-    // 24 created groups plus the default group: more than one page of 20.
+    // 25 groups in all: the default groups a fresh account has, plus enough
+    // created ones to need more than one page of 20.
     let total = 25usize;
-    for index in 1..total {
+    let seeded = total - default_group_names().len();
+    for index in 1..=seeded {
         let params = vec![
             ("ParameterGroupName".to_string(), format!("page-group-{index:03}")),
             (
@@ -768,7 +786,8 @@ async fn parameter_groups_are_selected_by_their_tags() {
         (
             "no filter lists every group, tagged or not",
             vec![],
-            std::iter::once(default_group_name())
+            default_group_names()
+                .into_iter()
                 .chain(names(&[
                     "tagged-owner-admin",
                     "tagged-owner-tester",

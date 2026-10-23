@@ -13,5 +13,9 @@
 // points it into `tests/all/`.
 #[path = "all/behavior_graph_lifecycle.rs"]
 mod behavior_graph_lifecycle;
+#[path = "all/not_found_and_validation_semantics.rs"]
+mod not_found_and_validation_semantics;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/support.rs"]
+mod support;

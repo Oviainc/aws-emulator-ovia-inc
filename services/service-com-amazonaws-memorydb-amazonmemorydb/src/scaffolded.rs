@@ -177,13 +177,44 @@ impl SerializableStruct for ValidationException {
     }
 }
 
+/// The HTTP status this service answers a MODELED fault with, given the status the
+/// fault's shape declares.
+///
+/// MemoryDB speaks `awsJson1_1`: every call is a `POST /` whose operation is named in
+/// the `X-Amz-Target` header, so the request URI identifies the ENDPOINT and never a
+/// resource. A `404` from such an endpoint says the endpoint itself did not resolve the
+/// request — which is how clients, proxies and SDK classifiers read it — while a fault
+/// about the request's CONTENT is a client fault and is carried as `400` with the
+/// fault's `__type` in the body. That is what the recorded MemoryDB endpoint answers
+/// for the whole `*NotFoundFault` family: `ClusterNotFoundFault`, `ACLNotFoundFault`,
+/// `UserNotFoundFault`, `ParameterGroupNotFoundFault`, `SnapshotNotFoundFault`,
+/// `SubnetGroupNotFoundFault`, `MultiRegionClusterNotFoundFault`,
+/// `MultiRegionParameterGroupNotFoundFault`, `ShardNotFoundFault`, `TagNotFoundFault`,
+/// `ReservedNode*NotFoundFault` and `ServiceUpdateNotFoundFault` are every one
+/// `errorKind` client with an inert `awsQueryError` and `@httpError 404` in the model,
+/// and the wire answers `400`. So NO modeled fault of this service renders `404`,
+/// whatever `@httpError` its shape declares.
+///
+/// Every OTHER status a shape declares is kept exactly as the model gives it: this maps
+/// one status onto one status, so an already-exists or invalid-state fault still answers
+/// its modeled `400`, and nothing here can flatten a `5xx` server fault into a client
+/// one.
+const fn modeled_wire_status(declared: u16) -> u16 {
+    match declared {
+        404 => 400,
+        other => other,
+    }
+}
+
 /// An operation's error channel: either the synthetic scaffold signal, or one of the
 /// operation's own modeled errors.
 #[derive(Debug)]
 pub enum Scaffolded<E> {
     /// The operation is generated but has no implementation. Renders as HTTP 501.
     NotImplemented(NotImplemented),
-    /// A modeled error the operation declares. Renders with the model's own status.
+    /// A modeled error the operation declares. Renders with the status this service's
+    /// wire answers that fault with — see [`modeled_wire_status`], which is the one
+    /// place that decides it for every operation.
     Modeled(E),
     /// The request was refused as invalid. Renders as HTTP 400 with the error code
     /// `ValidationException`.
@@ -282,10 +313,15 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
     ///
     /// Keep it 501 and not a 5xx server fault: SDK retry classifiers treat those as
     /// retryable, so a client would retry an operation that can never succeed.
+    ///
+    /// A modeled fault's status goes through [`modeled_wire_status`], which is where
+    /// this service states what its `awsJson1_1` wire answers rather than taking
+    /// `@httpError` verbatim. It is here, on the one error channel EVERY operation of
+    /// this service shares, so one mapping covers every fault of every operation.
     fn http_status(&self) -> u16 {
         match self {
             Self::NotImplemented(_) => 501,
-            Self::Modeled(e) => e.http_status(),
+            Self::Modeled(e) => modeled_wire_status(e.http_status()),
             Self::ValidationException(_) => 400,
         }
     }

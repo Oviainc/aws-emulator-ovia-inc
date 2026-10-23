@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetBucketWebsite
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetBucketWebsite`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! The read of a general purpose bucket's website subresource: this handler reports the
+//! `WebsiteConfiguration` `PutBucketWebsite` stored on the bucket, and answers
+//! `NoSuchWebsiteConfiguration` for a bucket that carries none.
 //!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetBucketWebsite::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! broken".
 //!
 //! ## Shape of an operation
 //!
@@ -89,14 +86,21 @@ use super::types::*;
 // `GetBucketWebsiteError` enum is never produced.
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-s3-amazons3.json");
 
-// The operation's MODELED errors. `#[operation_error]` accepts only variants the
-// model declares for this operation, so the scaffold's `NotImplemented` cannot live
-// here — hence the `GetBucketWebsiteError` alias below. An operation that models no errors
-// generates an UNINHABITED enum here, which is correct and expected: there is nothing
-// to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.s3#GetBucketWebsite")]
+// The operation's MODELED errors, widened by `NoSuchBucket`.
+//
+// The model's error list for this operation is empty
+// (`smithy_query(query="operation",operation="GetBucketWebsite")` reports `errors: []`),
+// but `Bucket` is an @httpLabel, so a request can name a bucket that does not exist and
+// AWS answers the service-wide `NoSuchBucket` ("The specified bucket does not exist",
+// `httpError 404`) — the same 404 `PutBucketWebsite` answers for that name, which is why
+// the shape is widened in here rather than a second rule invented.
+#[smithy_macros::operation_error(
+    "com.amazonaws.s3#GetBucketWebsite",
+    extra_errors = ["NoSuchBucket"]
+)]
 #[derive(Debug)]
 pub enum GetBucketWebsiteErrorModeled {
+    NoSuchBucket(NoSuchBucket),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -150,18 +154,86 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetBucketWebsite` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetBucketWebsiteErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetBucketWebsite"))
+        // A read needs nothing from the request beyond its deserialized input.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Nothing can be reported about a bucket the emulator cannot look up, and
+            // neither "no such bucket" nor "no website configuration" would be a true
+            // statement about it — so this answers the server fault S3 publishes for a
+            // request it could not carry out at all.
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::INTERNAL_ERROR_CODE,
+                crate::state::INTERNAL_ERROR_STATUS,
+                "the shared S3 store is unreachable from this engine",
+            ));
+        };
+
+        // Read-only: the guard is taken, the configuration is copied out, and nothing is
+        // written — a later caller sees exactly what this one saw.
+        let store = state.lock();
+        let Some(bucket) = store.bucket(&input.bucket) else {
+            return Err(GetBucketWebsiteErrorModeled::NoSuchBucket(NoSuchBucket {}).into());
+        };
+        let Some(website) = bucket.website() else {
+            // "To host website on Amazon S3, you can configure a bucket as website by
+            // adding a website configuration" (this operation's own documentation): a
+            // bucket that has had none added has no configuration to report, and every
+            // output member is optional, so a 200 with an empty document would report an
+            // empty website configuration rather than the absence of one. AWS answers the
+            // code below with HTTP 404; the model declares no shape for it, so it goes out
+            // through the unmodelled channel.
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::NO_SUCH_WEBSITE_CONFIGURATION_CODE,
+                NO_SUCH_WEBSITE_CONFIGURATION_STATUS,
+                crate::state::NO_SUCH_WEBSITE_CONFIGURATION_MESSAGE,
+            ));
+        };
+
+        Ok(GetBucketWebsiteOutput {
+            redirect_all_requests_to: website.redirect_all_requests_to.as_ref().map(|redirect| {
+                RedirectAllRequestsTo {
+                    host_name: redirect.host_name.clone(),
+                    protocol: redirect.protocol.clone(),
+                }
+            }),
+            index_document: website
+                .index_document_suffix
+                .as_ref()
+                .map(|suffix| IndexDocument {
+                    suffix: suffix.clone(),
+                }),
+            error_document: website
+                .error_document_key
+                .as_ref()
+                .map(|key| ErrorDocument { key: key.clone() }),
+            // The container is reported exactly when the bucket carries a rule in it: the
+            // store keeps no empty `RoutingRules` (`PutBucketWebsite` refuses a container
+            // naming no `RoutingRule`), so `None` here means the configuration named none.
+            routing_rules: (!website.routing_rules.is_empty()).then(|| {
+                website
+                    .routing_rules
+                    .iter()
+                    .map(|rule| RoutingRule {
+                        condition: rule.condition.as_ref().map(|condition| Condition {
+                            http_error_code_returned_equals: condition
+                                .http_error_code_returned_equals
+                                .clone(),
+                            key_prefix_equals: condition.key_prefix_equals.clone(),
+                        }),
+                        redirect: Redirect {
+                            host_name: rule.redirect.host_name.clone(),
+                            http_redirect_code: rule.redirect.http_redirect_code.clone(),
+                            protocol: rule.redirect.protocol.clone(),
+                            replace_key_prefix_with: rule.redirect.replace_key_prefix_with.clone(),
+                            replace_key_with: rule.redirect.replace_key_with.clone(),
+                        },
+                    })
+                    .collect()
+            }),
+        })
     }
 }
+
+/// The HTTP status AWS answers `NoSuchWebsiteConfiguration` with: 404, the status S3's
+/// error-responses list carries for a subresource that is not there.
+const NO_SUCH_WEBSITE_CONFIGURATION_STATUS: u16 = 404;

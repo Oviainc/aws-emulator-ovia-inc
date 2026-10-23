@@ -252,19 +252,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The region a not-found message's resolved ARN is built in. It is never
-        // written to a record: a stream group this call updates keeps the ARN it was
-        // minted with.
-        let region = crate::state::region_of(ctx.parts());
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(UpdateStreamGroupErrorModeled::InternalServerException(
                 InternalServerException {
-                    message: "the gameliftstreams emulator holds no state on this engine"
-                        .to_string(),
+                    message: crate::state::with_internal_id(
+                        "the gameliftstreams emulator holds no state on this engine",
+                    ),
                 },
             )
             .into());
         };
+        // The region an identifier this call cannot resolve is NAMED in: a not-found
+        // message names the resolved ARN of the resource that is missing, which is
+        // built from the credential scope of the request that asked for it.
+        let region = crate::state::region_of(ctx.parts());
         let now = ::std::time::SystemTime::now();
         let mut state = state.lock();
         state.materialize(now);
@@ -278,7 +279,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // `CreateStreamGroup` and `AddStreamGroupLocations` apply.
             if let Some(message) = crate::state::unstorable_location_configuration(configuration) {
                 return Err(UpdateStreamGroupErrorModeled::ValidationException(
-                    ValidationException { message },
+                    ValidationException {
+                        message: crate::state::with_internal_id(message),
+                    },
                 )
                 .into());
             }
@@ -289,10 +292,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if !configured.insert(configuration.location_name.as_str()) {
                 return Err(UpdateStreamGroupErrorModeled::ValidationException(
                     ValidationException {
-                        message: format!(
+                        message: crate::state::with_internal_id(format!(
                             "LocationConfigurations configures location {} more than once",
                             configuration.location_name
-                        ),
+                        )),
                     },
                 )
                 .into());
@@ -321,12 +324,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if group.status != crate::state::STREAM_GROUP_ACTIVE {
             return Err(UpdateStreamGroupErrorModeled::ConflictException(
                 ConflictException {
-                    message: format!(
+                    message: crate::state::with_internal_id(format!(
                         "stream group {} is in {} status; UpdateStreamGroup requires {} status",
                         group.id,
                         group.status,
                         crate::state::STREAM_GROUP_ACTIVE
-                    ),
+                    )),
                 },
             )
             .into());
@@ -346,11 +349,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             else {
                 return Err(UpdateStreamGroupErrorModeled::ValidationException(
                     ValidationException {
-                        message: format!(
+                        message: crate::state::with_internal_id(format!(
                             "stream group {group_id} holds no location {}; \
                              use AddStreamGroupLocations to add a location",
                             configuration.location_name
-                        ),
+                        )),
                     },
                 )
                 .into());
@@ -383,12 +386,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     if merged.is_some() {
                         return Err(UpdateStreamGroupErrorModeled::ValidationException(
                             ValidationException {
-                                message: format!(
+                                message: crate::state::with_internal_id(format!(
                                     "LocationConfigurations[{}] would leave the location with \
                                      both OnDemandCapacity and {member}, which cannot be used \
                                      together",
                                     configuration.location_name
-                                ),
+                                )),
                             },
                         )
                         .into());
@@ -417,13 +420,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 if application.status != crate::state::APPLICATION_READY {
                     return Err(UpdateStreamGroupErrorModeled::ConflictException(
                         ConflictException {
-                            message: format!(
+                            message: crate::state::with_internal_id(format!(
                                 "application {} is in {} status; a default application must be \
                                  in {} status",
                                 application.id,
                                 application.status,
                                 crate::state::APPLICATION_READY
-                            ),
+                            )),
                         },
                     )
                     .into());
@@ -436,11 +439,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 if !associated_applications.contains(&application.arn) {
                     return Err(UpdateStreamGroupErrorModeled::ValidationException(
                         ValidationException {
-                            message: format!(
+                            message: crate::state::with_internal_id(format!(
                                 "application {} is not associated with stream group {group_id}; \
                                  use AssociateApplications to associate it first",
                                 application.id
-                            ),
+                            )),
                         },
                     )
                     .into());

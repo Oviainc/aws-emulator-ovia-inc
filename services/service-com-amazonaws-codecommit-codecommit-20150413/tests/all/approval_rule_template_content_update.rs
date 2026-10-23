@@ -7,7 +7,10 @@
 //! The rules under test:
 //!
 //! 1. A successful update REPLACES the stored template's content with the
-//!    `newRuleContent` sent, byte for byte, and changes nothing else a caller can
+//!    `newRuleContent` sent, canonicalized to minified JSON exactly as a created
+//!    template's content is (the rule
+//!    `tests/all/approval_rule_template_content_canonicalization.rs` owns), and
+//!    changes nothing else a caller can
 //!    name: the template's id, name, description and `creationDate` are the ones the
 //!    create answered, while `ruleContentSha256` is the digest of the content now
 //!    stored, `lastModifiedUser` is the ARN of the caller that made THIS change and
@@ -89,12 +92,15 @@ enum Guard {
 }
 
 /// One row of the update table: the document a template is created with, the
-/// document that replaces it, and how the precondition is supplied.
+/// document that replaces it, the text the service must store for that replacement
+/// (its canonical minified form — equal to the replacement for every row written
+/// minified already), and how the precondition is supplied.
 #[derive(Debug, Clone)]
 struct UpdateCase {
     label: &'static str,
     created: String,
     replacement: String,
+    stored: String,
     guard: Guard,
 }
 
@@ -116,17 +122,19 @@ fn update_cases() -> Vec<UpdateCase> {
         ],
     })
     .to_string();
-    let pretty = serde_json::to_string_pretty(&json!({
+    let pretty_document = json!({
         "Version": TEMPLATE_VERSION,
         "DestinationReferences": ["refs/heads/main", "refs/heads/release"],
         "Statements": [{ "Type": STATEMENT_TYPE, "NumberOfApprovalsNeeded": 3 }],
-    }))
-    .expect("the document serializes");
+    });
+    let pretty =
+        serde_json::to_string_pretty(&pretty_document).expect("the document serializes");
     vec![
         UpdateCase {
             label: "more approvals needed, no precondition",
             created: document(1, &[]),
             replacement: document(2, &[]),
+            stored: document(2, &[]),
             guard: Guard::Absent,
         },
         UpdateCase {
@@ -139,36 +147,50 @@ fn update_cases() -> Vec<UpdateCase> {
                     "arn:aws:sts::111122223333:assumed-role/Review/*",
                 ],
             ),
+            stored: document(
+                2,
+                &[
+                    "arn:aws:iam::111122223333:user/reviewer",
+                    "arn:aws:sts::111122223333:assumed-role/Review/*",
+                ],
+            ),
             guard: Guard::Stored,
         },
         UpdateCase {
             label: "an approval pool removed, guarded by the digest in upper case",
             created: document(3, &["arn:aws:iam::111122223333:user/reviewer"]),
             replacement: document(3, &[]),
+            stored: document(3, &[]),
             guard: Guard::StoredUpperCase,
         },
         UpdateCase {
             label: "one statement replaced by several",
             created: document(1, &[]),
-            replacement: several_statements,
+            replacement: several_statements.clone(),
+            stored: several_statements,
             guard: Guard::Stored,
         },
         UpdateCase {
             label: "the same document written as pretty JSON with destinations",
             created: document(3, &[]),
             replacement: pretty,
+            // Stored minified: an update canonicalizes the document just as a create
+            // does, rather than echoing the submitted indentation.
+            stored: pretty_document.to_string(),
             guard: Guard::Absent,
         },
         UpdateCase {
             label: "content at the modelled 3000-character maximum",
             created: document(1, &[]),
             replacement: padded_document(3000),
+            stored: padded_document(3000),
             guard: Guard::Stored,
         },
         UpdateCase {
             label: "the stored document unchanged",
             created: document(2, &["arn:aws:iam::111122223333:user/one"]),
             replacement: document(2, &["arn:aws:iam::111122223333:user/one"]),
+            stored: document(2, &["arn:aws:iam::111122223333:user/one"]),
             guard: Guard::Stored,
         },
     ]
@@ -233,16 +255,16 @@ async fn an_update_replaces_only_the_content_and_is_read_back_from_state() {
             .unwrap_or_else(|| panic!("case {label:?}: no approvalRuleTemplate in {answered}"))
             .clone();
 
-        // The content is what was sent, byte for byte, and the signature is its
-        // digest rather than the one the create reported.
+        // The content is the replacement in its canonical minified form, and the
+        // signature is its digest rather than the one the create reported.
         assert_eq!(
             string_at(&updated, "/approvalRuleTemplateContent"),
-            case.replacement,
+            case.stored,
             "case {label:?}: the content is the replacement, got {updated}"
         );
         assert_eq!(
             string_at(&updated, "/ruleContentSha256"),
-            content_sha256(&case.replacement),
+            content_sha256(&case.stored),
             "case {label:?}: ruleContentSha256 is the digest of the stored content, got {updated}"
         );
 

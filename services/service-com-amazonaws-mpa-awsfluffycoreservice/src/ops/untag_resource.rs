@@ -1,15 +1,26 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UntagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UntagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Removes the tags `TagKeys` names from the resource `ResourceArn` names, in
+//! [`crate::state`] — the same per-resource tag map `TagResource` writes and
+//! `ListTagsForResource` reads, so the three agree on what a resource carries.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UntagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removal is per key and IDEMPOTENT: a key the resource does not carry is not an error,
+//! and a key the request does not name is left alone, so repeating the call leaves the
+//! same tags behind.
+//!
+//! The refusals are decided in this order, as on the rest of the tag family:
+//!
+//! * a `ResourceArn` that is not a well-formed ARN (the member carries no modelled
+//!   pattern) is refused by this service's own ARN rule with the one message it states
+//!   for that class ([`crate::state::invalid_arn`]): `ValidationException` (400);
+//! * an ARN outside the caller's own account is denied BEFORE the resource is resolved
+//!   ([`crate::state::authorize_resource_arn`]): `AccessDeniedException` (403);
+//! * an ARN no stored resource carries: `ResourceNotFoundException` (404), whose message
+//!   IS that `ResourceArn` verbatim ([`crate::state::tagged_resource_not_found`]).
+//!
+//! `materialize_due` runs first, as on every handler: it applies only what the CLOCK
+//! already owed at this instant.
 //!
 //! ## Shape of an operation
 //!
@@ -146,18 +157,50 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UntagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UntagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UntagResource"))
+        let _ = ctx;
+        // `ResourceArn` is a plain `String` with `length(max: 1000)` and NO modelled
+        // pattern, so the boundary validator passes a value that is not an ARN at all:
+        // this service's own ARN rule refuses it here, with the one message it states
+        // for the malformed-ARN class (`crate::state::invalid_arn`, 400).
+        if !crate::state::is_well_formed_arn(&input.resource_arn) {
+            return Err(
+                UntagResourceErrorModeled::ValidationException(crate::state::invalid_arn()).into(),
+            );
+        }
+        // The account boundary is evaluated BEFORE the resource is resolved: an ARN
+        // outside the caller's account is refused with the modelled
+        // `AccessDeniedException` (403) whatever is stored under it, so a client can
+        // tell "not permitted" from "does not exist".
+        crate::state::authorize_resource_arn(Self::NAME, &input.resource_arn)
+            .map_err(UntagResourceErrorModeled::AccessDeniedException)?;
+        let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UntagResourceError::Modeled(UntagResourceErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the approval-team store is unavailable".to_string(),
+                },
+            ))
+        })?;
+        let mut state = store.lock();
+        state.materialize_due(::std::time::SystemTime::now());
+
+        let Some(tags) = state.resource_tags_mut(&input.resource_arn) else {
+            // The tag family's not-found message IS the `ResourceArn` that was sent,
+            // verbatim (`crate::state::tagged_resource_not_found`).
+            return Err(UntagResourceErrorModeled::ResourceNotFoundException(
+                crate::state::tagged_resource_not_found(&input.resource_arn),
+            )
+            .into());
+        };
+
+        // Per key, and idempotent: removing a key the resource does not carry removes
+        // nothing and is still a success, which is what makes a repeated call answer the
+        // same way as the first.
+        for key in &input.tag_keys {
+            tags.remove(key);
+        }
+
+        // Untagging is not a version of the resource: `UpdateApprovalTeam` is what mints
+        // a new team version, so neither `VersionId` nor `LastUpdateTime` moves here.
+        Ok(UntagResourceOutput {})
     }
 }

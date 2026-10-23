@@ -23,6 +23,8 @@ mod query_logging_configuration;
 mod rejection_codes;
 #[path = "all/resource_policy_lifecycle.rs"]
 mod resource_policy_lifecycle;
+#[path = "all/rule_group_name_bound.rs"]
+mod rule_group_name_bound;
 #[path = "all/rule_groups_namespace_lifecycle.rs"]
 mod rule_groups_namespace_lifecycle;
 #[path = "all/rule_groups_namespace_listing.rs"]

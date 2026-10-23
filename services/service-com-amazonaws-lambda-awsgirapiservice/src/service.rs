@@ -42,9 +42,57 @@
 
 use service_common::shared_path::SharedPathArn;
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, ErasedOperation, Refusal, Refused, Service, Violation, ViolationKind,
 };
 use std::sync::Arc;
+
+/// The error code AWS answers a boundary constraint refusal with on this service's
+/// protocol (restJson1), and the code the framework's own default picks there too.
+/// Restated here because `override_refusal` names the code and the message together: a
+/// message without its matching code is worse than leaving both alone.
+const VALIDATION_EXCEPTION: &str = "ValidationException";
+
+/// The order this service states one enum's value set in, one row per enum.
+///
+/// The value SET is the model's and the CHECK is the framework's; only the order the
+/// sentence lists the set in is chosen here, because no model records it: AWS states a
+/// value set in neither the model's declaration order nor ascending order, so each row
+/// is RECORDED from an AWS answer rather than computed. Source for the one row below:
+/// the answer the corpus unit `lambda.put-runtime-management-config-invalid-mode-rejected`
+/// carries for an `UpdateRuntimeOn` outside its value set.
+///
+/// A row is matched by its value SET rather than by the member the clause names (see
+/// [`reported_enum_order`]), because the order is a property of the enum SHAPE: every
+/// member targeting that enum, in any operation, is stated alike. An enum with no row —
+/// every other enum this model declares — keeps the model's declaration order, which is
+/// the only order there is evidence for.
+const REPORTED_ENUM_ORDERS: &[&[&str]] = &[
+    // com.amazonaws.lambda#UpdateRuntimeOn (`Auto | Manual | FunctionUpdate` in the
+    // model), reported by AWS as:
+    &["FunctionUpdate", "Manual", "Auto"],
+];
+
+/// `allowed` in the order this service reports that enum in, or in the order the model
+/// declares it (the order it arrived in) when there is no recorded order for it — the
+/// only order there is evidence for.
+fn reported_enum_order(allowed: &[String]) -> Vec<String> {
+    match REPORTED_ENUM_ORDERS
+        .iter()
+        .find(|reported| is_same_set(reported, allowed))
+    {
+        Some(reported) => reported.iter().map(|value| (*value).to_string()).collect(),
+        None => allowed.to_vec(),
+    }
+}
+
+/// Whether two value sets hold the same values. An enum's values are unique by
+/// definition, so equal lengths plus containment is set equality.
+fn is_same_set(reported: &[&str], allowed: &[String]) -> bool {
+    reported.len() == allowed.len()
+        && reported
+            .iter()
+            .all(|value| allowed.iter().any(|candidate| candidate == value))
+}
 
 /// The literal first URI path segments that LEAD to the `{Resource}` ARN label of the
 /// one path space this model and a peer signing as `lambda` bind IDENTICALLY:
@@ -161,16 +209,39 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // required member, or a value outside a declared bound) to let this service
+        // reword it. Everything about the envelope — the `N validation error(s)
+        // detected:` prefix, the member paths, the echoed value and every requirement
+        // sentence — is the framework's, so the two refusal paths cannot drift. The ONE
+        // rendering chosen here is the ORDER of an enum's value set (see
+        // [`reported_enum_order`]), which no model records.
+        let Refusal::Invalid(violations) = refusal else {
+            // An unauthenticated caller keeps the framework's 403 code and wording.
+            return None;
+        };
+        if !violations
+            .iter()
+            .any(|violation| matches!(violation.kind, ViolationKind::EnumValue(_)))
+        {
+            // Nothing this service states differently, so the framework's wording
+            // stands as it is.
+            return None;
+        }
+        let restated: Vec<Violation> = violations
+            .iter()
+            .map(|violation| match &violation.kind {
+                ViolationKind::EnumValue(allowed) => Violation {
+                    path: violation.path.clone(),
+                    kind: ViolationKind::EnumValue(reported_enum_order(allowed)),
+                    value: violation.value.clone(),
+                },
+                _ => violation.clone(),
+            })
+            .collect();
+        Some(Refused {
+            code: VALIDATION_EXCEPTION.to_string(),
+            message: aws_smithy_schema_server::envelope(&restated)?,
+        })
     }
 
     fn override_routing_error(

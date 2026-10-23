@@ -8,15 +8,16 @@
 //! operations read and write the SAME records: `src/ops/<op>.rs` owns an
 //! operation's behaviour, and this module owns the store those operations share.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ::aws_smithy_types::DateTime;
 
 use crate::ops::types::{
-    AppDefinition, AppDefinitionInput, Card, CardInput, CardStatus, CardValue, FileUploadCard,
-    FormInputCard, QPluginCard, QQueryCard, SessionSharingConfiguration, TextInputCard,
+    AppDefinition, AppDefinitionInput, Card, CardInput, CardStatus, CardValue, Category,
+    FileUploadCard, FormInputCard, QPluginCard, QQueryCard, SessionSharingConfiguration,
+    TextInputCard,
 };
 
 /// The version of the app-definition schema this emulator renders
@@ -118,6 +119,88 @@ pub struct QAppSession {
     pub created_at: DateTime,
 }
 
+/// The `LibraryItemStatus` of a published library item. The wire spellings are
+/// the model's `LibraryItemStatus` enum values (`PUBLISHED | DISABLED`); see
+/// `crate::ops::types::LIBRARY_ITEM_STATUS_VALUES`, which this crate's tests pin
+/// these against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LibraryItemStatus {
+    Published,
+    Disabled,
+}
+
+impl LibraryItemStatus {
+    /// The value this status serializes as.
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::Published => "PUBLISHED",
+            Self::Disabled => "DISABLED",
+        }
+    }
+}
+
+/// One category of an instance's library catalog — the records
+/// `BatchCreateCategory` will mint and `ListCategories` page once those
+/// scaffolds are implemented.
+///
+/// A library item names the categories it is filed under BY ID, and the model's
+/// `Category` carries a required `title`, so the catalog is the only place a
+/// category's title and colour live. `appCount` is NOT stored: it is how many
+/// published library items are filed under the category, which
+/// [`ComAmazonawsQappsQappsserviceState::item_categories`] derives from the
+/// items themselves.
+#[derive(Debug, Clone)]
+pub struct LibraryCategory {
+    pub id: String,
+    pub title: String,
+    pub color: Option<String>,
+}
+
+/// One published library item, as `CreateLibraryItem` minted it: the snapshot of
+/// a Q App that the instance's library offers, plus the reviews its users have
+/// associated with it.
+#[derive(Debug, Clone)]
+pub struct LibraryItem {
+    pub library_item_id: String,
+    pub app_id: String,
+    pub app_version: i32,
+    /// The ids of the categories this item is filed under, in the order the
+    /// publisher named them. Every id is a category of the SAME instance's
+    /// catalog: `CreateLibraryItem` refuses one the catalog does not hold.
+    pub categories: Vec<String>,
+    pub status: LibraryItemStatus,
+    pub created_at: DateTime,
+    pub created_by: String,
+    pub updated_at: Option<DateTime>,
+    pub updated_by: Option<String>,
+    /// The principals that have a review associated with this item — one entry
+    /// per user, because a review is "associated with the user submitting the
+    /// request". `ratingCount` is this set's SIZE, so a user who submits twice
+    /// is still counted once.
+    ///
+    /// Both dimensions of this set are BOUNDED, because both are caller-driven:
+    /// at most [`MAX_REVIEWS_PER_LIBRARY_ITEM`] entries, each at most
+    /// [`MAX_PRINCIPAL_LENGTH`] bytes ([`is_storable_principal`] refuses a
+    /// longer one), so repeated requests cannot grow the store without limit.
+    pub raters: BTreeSet<String>,
+    pub is_verified: bool,
+}
+
+impl LibraryItem {
+    /// The `ratingCount` this item reports: how many distinct users have a
+    /// review associated with it.
+    pub fn rating_count(&self) -> i32 {
+        i32::try_from(self.raters.len()).unwrap_or(i32::MAX)
+    }
+
+    /// Whether `principal` has a review associated with this item. That is
+    /// `isRatedByUser` — a statement about the CALLER, so it is decided per read
+    /// rather than stored.
+    pub fn is_rated_by(&self, principal: &str) -> bool {
+        self.raters.contains(principal)
+    }
+}
+
 /// Per-service state for com-amazonaws-qapps-qappsservice. A handler reaches it through [`service_state`].
 ///
 /// Every map is keyed by the `instance-id` request header first: an Amazon Q
@@ -135,6 +218,17 @@ pub struct ComAmazonawsQappsQappsserviceState {
     /// `(instanceId, appId) -> sessionIds`, so deleting an app can drop the
     /// sessions that ran it.
     pub sessions_by_app: HashMap<(String, String), Vec<String>>,
+    /// `(instanceId, libraryItemId) -> library item`.
+    pub library_items: HashMap<(String, String), LibraryItem>,
+    /// `(instanceId, categoryId) -> category`: the instance's library catalog,
+    /// which `BatchCreateCategory` will fill and `BatchDeleteCategory` empty. A
+    /// library item is filed under categories FROM this catalog.
+    ///
+    /// Nothing in this crate writes it yet (both of those operations are still
+    /// scaffolds), so no request can grow it; [`MAX_CATEGORIES_PER_INSTANCE`]
+    /// and [`MAX_CATEGORIES_TOTAL`] are the bounds the implementation that fills
+    /// it charges, both key components being caller-chosen.
+    pub library_categories: HashMap<(String, String), LibraryCategory>,
 }
 
 /// How many Q Apps one instance may hold at once. A guardrail on this
@@ -178,6 +272,59 @@ pub const DEFAULT_PAGE_SIZE: usize = 100;
 /// max 50000), and versions that share a definition hold one copy of it.
 pub const MAX_RETAINED_VERSIONS: usize = 10;
 
+/// How many library items one instance's library may hold at once. The same
+/// guardrail on this emulator's memory as [`MAX_APPS_PER_INSTANCE`], answered
+/// with the `ServiceQuotaExceededException` CreateLibraryItem models (HTTP 402).
+pub const MAX_LIBRARY_ITEMS_PER_INSTANCE: usize = 250;
+
+/// How many library items this emulator holds at once across every instance.
+/// `InstanceId` is an unconstrained string, so the per-instance guardrail alone
+/// would not bound `library_items`: this total is what does, for the same reason
+/// [`MAX_APPS_TOTAL`] bounds the apps.
+pub const MAX_LIBRARY_ITEMS_TOTAL: usize = 1_000;
+
+/// How many distinct users' reviews one library item retains.
+///
+/// A review's identity is the caller's principal, which nothing constrains, so
+/// without this bound repeated `AssociateLibraryItemReview` calls under
+/// different credentials would grow a library item's rater set without limit.
+/// Charged under the same store lock as the insert and answered with the
+/// `ServiceQuotaExceededException` the operation models (HTTP 402), so a client
+/// sees a quota refusal rather than an emulator that grows.
+pub const MAX_REVIEWS_PER_LIBRARY_ITEM: usize = 100;
+
+/// The longest principal this service stores against a record.
+///
+/// [`caller_principal`] reads the access key id out of the request's
+/// `Authorization` header, which is not length-constrained; an AWS access key id
+/// is at most 128 characters, so a longer value is not one. The bound is what
+/// makes each entry of a rater set a fixed size rather than a header-sized one.
+pub const MAX_PRINCIPAL_LENGTH: usize = 128;
+
+/// How many categories one instance's library catalog may hold at once — the
+/// per-instance bound on `library_categories`, whose records carry
+/// caller-supplied titles and colours.
+///
+/// NOT charged by anything yet, and nothing in this crate writes the catalog
+/// today: `BatchCreateCategory`, the operation that fills it, is still a
+/// scaffold answering 501, so no request can grow the map. The bound is declared
+/// here, beside the ones the apps, the sessions, the library items and the
+/// reviews carry, so that implementation charges it against
+/// [`ComAmazonawsQappsQappsserviceState::library_category_count`] under the same
+/// store lock as its insert, answering with the `ServiceQuotaExceededException`
+/// it models.
+pub const MAX_CATEGORIES_PER_INSTANCE: usize = 100;
+
+/// How many categories this emulator holds at once across every instance. The
+/// catalog is keyed by `(instanceId, categoryId)` and `InstanceId` is an
+/// unconstrained string, so this is the total that will bound
+/// `library_categories`, for the same reason [`MAX_APPS_TOTAL`] bounds the apps.
+/// To be charged against
+/// [`ComAmazonawsQappsQappsserviceState::total_library_category_count`] by the
+/// same `BatchCreateCategory` implementation; see
+/// [`MAX_CATEGORIES_PER_INSTANCE`].
+pub const MAX_CATEGORIES_TOTAL: usize = 1_000;
+
 impl ComAmazonawsQappsQappsserviceState {
     /// The app `app_id` of `instance_id`, if the store holds one.
     ///
@@ -208,6 +355,114 @@ impl ComAmazonawsQappsQappsserviceState {
     /// total quota check.
     pub fn total_session_count(&self) -> usize {
         self.sessions.len()
+    }
+
+    /// The library item `library_item_id` of `instance_id`, if the store holds
+    /// one. The instance is part of the key, so an item published in one
+    /// instance is invisible from another.
+    pub fn library_item(&self, instance_id: &str, library_item_id: &str) -> Option<&LibraryItem> {
+        self.library_items
+            .get(&(instance_id.to_string(), library_item_id.to_string()))
+    }
+
+    /// The same record, for an operation that revises it (associating a review,
+    /// say).
+    pub fn library_item_mut(
+        &mut self,
+        instance_id: &str,
+        library_item_id: &str,
+    ) -> Option<&mut LibraryItem> {
+        self.library_items
+            .get_mut(&(instance_id.to_string(), library_item_id.to_string()))
+    }
+
+    /// How many library items `instance_id` holds, for the quota check.
+    pub fn library_item_count(&self, instance_id: &str) -> usize {
+        self.library_items
+            .keys()
+            .filter(|(instance, _)| instance == instance_id)
+            .count()
+    }
+
+    /// How many library items this emulator holds across every instance, for
+    /// the total quota check.
+    pub fn total_library_item_count(&self) -> usize {
+        self.library_items.len()
+    }
+
+    /// The category `category_id` of `instance_id`'s catalog, if it holds one.
+    pub fn library_category(
+        &self,
+        instance_id: &str,
+        category_id: &str,
+    ) -> Option<&LibraryCategory> {
+        self.library_categories
+            .get(&(instance_id.to_string(), category_id.to_string()))
+    }
+
+    /// How many categories `instance_id`'s catalog holds, for the quota check
+    /// the operation that FILLS the catalog charges against
+    /// [`MAX_CATEGORIES_PER_INSTANCE`].
+    pub fn library_category_count(&self, instance_id: &str) -> usize {
+        self.library_categories
+            .keys()
+            .filter(|(instance, _)| instance == instance_id)
+            .count()
+    }
+
+    /// How many categories this emulator holds across every instance, for the
+    /// total quota check against [`MAX_CATEGORIES_TOTAL`].
+    pub fn total_library_category_count(&self) -> usize {
+        self.library_categories.len()
+    }
+
+    /// The `categories` a library item reports: one `Category` per stored id, in
+    /// the order the publisher named them, titled and coloured from the
+    /// instance's catalog.
+    ///
+    /// `appCount` is documented as "the number of published Amazon Q Apps
+    /// associated with a category", so it is DERIVED here rather than stored:
+    /// publishing, disabling or deleting an item moves it. One pass over the
+    /// instance's items counts every category of this item at once, so the work
+    /// is linear in the store rather than linear per reported category.
+    ///
+    /// An id the catalog no longer holds (its category was deleted after the
+    /// item was filed) is left out rather than reported with an invented title:
+    /// a deleted category files nothing.
+    pub fn item_categories(&self, instance_id: &str, item: &LibraryItem) -> Vec<Category> {
+        let mut app_counts: BTreeMap<&str, i32> = item
+            .categories
+            .iter()
+            .map(|category_id| (category_id.as_str(), 0))
+            .collect();
+        for ((instance, _), stored) in &self.library_items {
+            if instance != instance_id || stored.status != LibraryItemStatus::Published {
+                continue;
+            }
+            for category_id in &stored.categories {
+                if let Some(count) = app_counts.get_mut(category_id.as_str()) {
+                    *count = count.saturating_add(1);
+                }
+            }
+        }
+
+        item.categories
+            .iter()
+            .filter_map(|category_id| {
+                let category = self.library_category(instance_id, category_id)?;
+                Some(Category {
+                    id: category.id.clone(),
+                    title: category.title.clone(),
+                    color: category.color.clone(),
+                    app_count: Some(
+                        app_counts
+                            .get(category_id.as_str())
+                            .copied()
+                            .unwrap_or_default(),
+                    ),
+                })
+            })
+            .collect()
     }
 }
 
@@ -305,6 +560,14 @@ pub fn now() -> DateTime {
 /// is the same principal on every call.
 pub fn caller_principal(ctx: &smithy_server_runtime::OperationContext<'_>) -> String {
     ::engine::extract_akid(&ctx.parts().headers)
+}
+
+/// Whether `principal` is an access key id this service can attribute a stored
+/// record to: one no longer than [`MAX_PRINCIPAL_LENGTH`]. A longer value cannot
+/// be an AWS access key id at all, and storing it would put a caller-sized
+/// string in the store.
+pub fn is_storable_principal(principal: &str) -> bool {
+    !principal.is_empty() && principal.len() <= MAX_PRINCIPAL_LENGTH
 }
 
 /// The region this request was signed for; `us-east-1` when it carries no

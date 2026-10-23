@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ImportDocumentationParts
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ImportDocumentationParts`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ImportDocumentationParts::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reads the documentation parts an OpenAPI body declares under its
+//! `x-amazon-apigateway-documentation` extension and writes one `DocumentationPart` per
+//! entry, `merge` landing an entry on the part that already documents that entity and
+//! `overwrite` replacing the API's documentation set.
 //!
 //! ## Shape of an operation
 //!
@@ -87,6 +82,164 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::collections::BTreeSet;
+
+use ::serde_json::Value;
+
+use crate::state::DocumentationPartEntry;
+
+use super::create_documentation_part::{
+    location_key, part_at_location, validated_location, validated_properties,
+};
+use super::put_rest_api::{put_mode, PutModeKind};
+
+/// The OpenAPI extension API Gateway carries a documentation set in, and the member of
+/// it that holds the parts.
+///
+/// From `DocumentationPart$properties`: "the original documentation parts are exported in
+/// a OpenAPI extension of `x-amazon-apigateway-documentation`" — the same extension an
+/// import reads them back out of. A body that writes the list at its own top level is
+/// read too, so a caller that sends just the documentation set is not refused for the
+/// envelope it left off.
+const DOCUMENTATION_EXTENSION: &str = "x-amazon-apigateway-documentation";
+
+/// The member of [`DOCUMENTATION_EXTENSION`] holding the documentation parts.
+const DOCUMENTATION_PARTS_MEMBER: &str = "documentationParts";
+
+/// Emulator resource guard, NOT an AWS quota: the largest import body this emulator
+/// reads.
+///
+/// The same bound the sibling API-definition import uses
+/// (`super::put_rest_api`'s `MAX_DEFINITION_BYTES`), for the same reason: an API holds at
+/// most [`crate::state::MAX_DOCUMENTATION_PARTS_PER_API`] documentation parts, so a body
+/// past this cannot be imported in full anyway, and bounding the body is what bounds the
+/// work the reader does.
+const MAX_IMPORT_BYTES: usize = 1024 * 1024;
+
+/// One entry of an import: the entity it documents, and the content map to store for it.
+#[derive(Debug, Clone)]
+struct ImportedPart {
+    location: DocumentationPartLocation,
+    properties: String,
+}
+
+/// What an import reads out of a body: the entries it can store, in document order, and
+/// what it could not carry over.
+#[derive(Debug, Clone, Default)]
+struct ImportedParts {
+    parts: Vec<ImportedPart>,
+    /// Reported in the response's `warnings`, and what `failOnWarnings` rolls the import
+    /// back for.
+    warnings: Vec<String>,
+}
+
+/// One entry of the documentation set, as it will be stored.
+///
+/// The entry's `location` goes through the same rules as a `CreateDocumentationPart`
+/// location, and its `properties` object becomes the JSON text the `properties` member
+/// documents ("The map must be encoded as a JSON string"); an entry that already writes
+/// the map as a JSON string is taken as given.
+///
+/// `Err` carries what is wrong with this one entry, which the import reports as a
+/// warning.
+fn imported_part(entry: &Value) -> Result<ImportedPart, String> {
+    let entry = entry
+        .as_object()
+        .ok_or_else(|| "an entry of the documentation set must be a JSON object".to_string())?;
+    let location = entry
+        .get("location")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "location must be a JSON object naming the targeted API entity".to_string())?;
+    let member = |name: &str| -> Result<Option<String>, String> {
+        match location.get(name) {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::String(text)) => Ok(Some(text.clone())),
+            Some(_) => Err(format!("location.{name} must be a string")),
+        }
+    };
+    let declared = DocumentationPartLocation {
+        r#type: member("type")?
+            .ok_or_else(|| "location.type is required".to_string())?,
+        path: member("path")?,
+        method: member("method")?,
+        status_code: member("statusCode")?,
+        name: member("name")?,
+    };
+    let properties = match entry.get("properties") {
+        // An entry that declares no content map documents nothing yet: it is stored as
+        // the empty content map, which is what `locationStatus=UNDOCUMENTED` reports.
+        None | Some(Value::Null) => "{}".to_string(),
+        Some(value @ Value::Object(_)) => ::serde_json::to_string(value)
+            .map_err(|_| "properties could not be read as a content map".to_string())?,
+        Some(Value::String(text)) => text.clone(),
+        Some(_) => {
+            return Err("properties must be a content map of key-value pairs".to_string());
+        }
+    };
+    Ok(ImportedPart {
+        location: validated_location(&declared)?,
+        properties: validated_properties(&properties)?,
+    })
+}
+
+/// Read the documentation set out of a `body` payload.
+///
+/// The body is "a JSON object" per the member's documentation, read by `serde_json` under
+/// its own recursion limit and bounded by [`MAX_IMPORT_BYTES`] and the per-API part
+/// quota, so it cannot amplify what the body carries.
+///
+/// `Err` carries the message for a body that is not such a document: the caller has to fix
+/// it from this text alone.
+fn parse_import(body: &[u8]) -> Result<ImportedParts, String> {
+    if body.len() > MAX_IMPORT_BYTES {
+        return Err(format!(
+            "body may be at most {MAX_IMPORT_BYTES} bytes, got {}",
+            body.len()
+        ));
+    }
+    let document: Value = ::serde_json::from_slice(body).map_err(|_| {
+        "body must be a UTF-8 encoded JSON object carrying the documentation parts to import"
+            .to_string()
+    })?;
+    let object = document.as_object().ok_or_else(|| {
+        "body must be a JSON object carrying the documentation parts to import".to_string()
+    })?;
+    let declared = object
+        .get(DOCUMENTATION_EXTENSION)
+        .and_then(|extension| extension.get(DOCUMENTATION_PARTS_MEMBER))
+        .or_else(|| object.get(DOCUMENTATION_PARTS_MEMBER))
+        .ok_or_else(|| {
+            format!(
+                "body declares no {DOCUMENTATION_PARTS_MEMBER}: the documentation parts to \
+                 import are the {DOCUMENTATION_EXTENSION}.{DOCUMENTATION_PARTS_MEMBER} list"
+            )
+        })?;
+    let declared = declared.as_array().ok_or_else(|| {
+        format!("{DOCUMENTATION_PARTS_MEMBER} must be a list of documentation parts")
+    })?;
+    crate::state::bound_entries(
+        DOCUMENTATION_PARTS_MEMBER,
+        declared.len(),
+        crate::state::MAX_DOCUMENTATION_PARTS_PER_API,
+    )?;
+    let mut read = ImportedParts::default();
+    for (index, entry) in declared.iter().enumerate() {
+        match imported_part(entry) {
+            Ok(part) => read.parts.push(part),
+            // One warning per entry the import could not carry over, up to the number of
+            // entries this service reports for a caller-sized list: what the response
+            // carries stays bounded however many entries the body declares.
+            Err(message) => {
+                if read.warnings.len() < crate::state::MAX_COLLECTION_ENTRIES {
+                    read.warnings
+                        .push(format!("{DOCUMENTATION_PARTS_MEMBER}[{index}]: {message}"));
+                }
+            }
+        }
+    }
+    Ok(read)
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -160,18 +313,143 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ImportDocumentationParts` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ImportDocumentationPartsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ImportDocumentationParts"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        // Every refusal below is the modelled 400: the request's body or mode is wrong,
+        // and the message names what to fix.
+        fn bad_request(message: String) -> ImportDocumentationPartsError {
+            ImportDocumentationPartsErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message),
+            })
+            .into()
+        }
+
+        // The body is read and bounded BEFORE the store lock is taken, so a malformed or
+        // over-sized import never reaches the records at all.
+        let mode = put_mode(input.mode.as_deref()).map_err(bad_request)?;
+        let ImportedParts { parts, warnings } =
+            parse_import(&input.body).map_err(bad_request)?;
+
+        // `failOnWarnings` is "a query parameter to specify whether to rollback the
+        // documentation importation (true) or not (false) when a warning is encountered":
+        // the body is read before anything is written, so the rollback is that no record
+        // changes at all.
+        if input.fail_on_warnings && !warnings.is_empty() {
+            return Err(bad_request(format!(
+                "Errors found during import: {}",
+                warnings.join("; ")
+            )));
+        }
+
+        let mut store = state.lock();
+
+        {
+            let api = store.rest_apis.get(&input.rest_api_id).ok_or_else(|| {
+                ImportDocumentationPartsErrorModeled::NotFoundException(NotFoundException {
+                    message: Some(crate::state::no_such_rest_api(&input.rest_api_id)),
+                })
+            })?;
+            // The documentation set the import would leave behind: what survives it —
+            // nothing in `overwrite` mode — plus one part per entity the body documents.
+            // Entities are counted, not entries, so two entries for one entity count once,
+            // exactly as they will be stored.
+            let mut documented: BTreeSet<[String; 5]> = match mode {
+                PutModeKind::Overwrite => BTreeSet::new(),
+                PutModeKind::Merge => api
+                    .documentation_parts
+                    .values()
+                    .map(|part| location_key(&part.location))
+                    .collect(),
+            };
+            documented.extend(parts.iter().map(|part| location_key(&part.location)));
+            if documented.len() > crate::state::MAX_DOCUMENTATION_PARTS_PER_API {
+                return Err(ImportDocumentationPartsErrorModeled::LimitExceededException(
+                    LimitExceededException {
+                        retry_after_seconds: None,
+                        message: Some(format!(
+                            "Maximum number of documentation parts exceeded for this API: {}",
+                            crate::state::MAX_DOCUMENTATION_PARTS_PER_API
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // One id and one creation rank per entry, which is the most this import can
+        // create: an entry that lands on the part already documenting its entity keeps
+        // that part's id and rank instead, leaving its reserved id unused.
+        let ids = store.reserve_ids(parts.len());
+        let sequences: Vec<u64> = (0..parts.len()).map(|_| store.next_sequence()).collect();
+
+        let api = store.rest_apis.get_mut(&input.rest_api_id).ok_or_else(|| {
+            ImportDocumentationPartsErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::no_such_rest_api(&input.rest_api_id)),
+            })
+        })?;
+        if mode == PutModeKind::Overwrite {
+            // `overwrite` replaces "any existing DocumentationParts definition": the
+            // imported set becomes the API's documentation, so what the previous one
+            // documented is gone.
+            api.documentation_parts.clear();
+        }
+
+        let mut minted = 0usize;
+        let mut imported: Vec<String> = Vec::with_capacity(parts.len());
+        for part in parts {
+            // `merge` merges "the new definition into the existing one": an entry for an
+            // entity the API already documents replaces that part's content map under its
+            // own identifier, so a re-import does not double the documentation set.
+            let landed = part_at_location(api, &part.location)
+                .map(|existing| (existing.id.clone(), existing.sequence));
+            let (id, sequence) = match landed {
+                Some(existing) => existing,
+                None => {
+                    let id = ids
+                        .get(minted)
+                        .cloned()
+                        .ok_or_else(crate::state::state_unavailable)?;
+                    let sequence = sequences
+                        .get(minted)
+                        .copied()
+                        .ok_or_else(crate::state::state_unavailable)?;
+                    minted += 1;
+                    (id, sequence)
+                }
+            };
+            api.documentation_parts.insert(
+                id.clone(),
+                DocumentationPartEntry {
+                    id: id.clone(),
+                    location: part.location,
+                    properties: part.properties,
+                    sequence,
+                },
+            );
+            imported.push(id);
+        }
+
+        // Everything below is owned, so the store lock is released before the response is
+        // formatted: the critical section covers the state change only.
+        drop(store);
+        // The access record for a state-changing operation: who, what, and the outcome.
+        // Metadata only — never the imported content maps.
+        ::tracing::info!(
+            target: crate::state::AUDIT_TARGET,
+            operation = Self::NAME,
+            caller = ?crate::state::request_caller(ctx.parts()),
+            rest_api = ?input.rest_api_id,
+            mode = ?mode,
+            documentation_parts = imported.len(),
+            outcome = "imported",
+            "documentation parts imported",
+        );
+        Ok(ImportDocumentationPartsOutput {
+            ids: Some(imported),
+            // What THIS import could not carry over; an import that warned about nothing
+            // reports no warnings, never a value some other call left behind.
+            warnings: (!warnings.is_empty()).then_some(warnings),
+        })
     }
 }

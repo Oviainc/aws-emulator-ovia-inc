@@ -168,19 +168,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let now = ::std::time::SystemTime::now();
         let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
-        let resource =
-            crate::state::resolve_resource_arn(&input.resource_arn).map_err(lift)?;
+        let resource = crate::state::resolve_resource_arn(
+            &input.resource_arn,
+            &crate::state::request_region(ctx.parts()),
+        )
+        .map_err(lift)?;
 
         let mut store = state.lock();
         // The only write a reporting operation makes: finishing the status changes the
         // clock already made due.
         store.apply_due_transitions(now);
-        let table = store
-            .table(&resource.region, &resource.table)
-            .map_err(lift)?;
+        let table = store.table_by_arn(&resource).map_err(lift)?;
         let policy = table.resource_policy.as_ref().ok_or_else(|| {
             GetResourcePolicyError::from(
                 GetResourcePolicyErrorModeled::PolicyNotFoundException(PolicyNotFoundException {

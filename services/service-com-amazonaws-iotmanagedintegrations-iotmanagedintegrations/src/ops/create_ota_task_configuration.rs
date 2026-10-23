@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateOtaTaskConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateOtaTaskConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateOtaTaskConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Inserts the over-the-air (OTA) task configuration into `crate::state`'s
+//! `ota_task_configurations` store under a freshly generated `OtaTaskConfigurationId`,
+//! and answers with that id. A replayed `ClientToken` (`@idempotencyToken`) answers with
+//! the record the first call created instead of creating a second one.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +150,82 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateOtaTaskConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateOtaTaskConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateOtaTaskConfiguration"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateOtaTaskConfigurationErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the OTA task-configuration store is unavailable".to_string()),
+                },
+            )
+        })?;
+
+        // Every member of this request is optional and every modelled constraint on it
+        // (`@length`, `@pattern`, the nested `PushConfig` ranges and enum value sets) is
+        // refused at the boundary, so reaching here means there is nothing left to check.
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+        let created_at = ::std::time::SystemTime::now();
+
+        // Retire the idempotency records the clock already made due, before anything
+        // reads them: a token past its TTL neither replays nor occupies the map.
+        store.retire_expired_idempotency_tokens(created_at);
+
+        // A retry with the same `ClientToken` answers with what the first call created,
+        // performing no further action. The token is scoped to the region that minted the
+        // record, as the record itself is.
+        let replayed = input.client_token.as_deref().and_then(|token| {
+            store.replayed_resource_id(crate::state::OTA_TASK_CONFIGURATION_RESOURCE_TYPE, token)
+        });
+        if let Some(created) = replayed.and_then(|id| store.ota_task_configuration_in(&region, &id))
+        {
+            return Ok(CreateOtaTaskConfigurationOutput {
+                task_configuration_id: Some(created.id.clone()),
+            });
+        }
+
+        // The store is bounded: past its maximum a create is refused rather than grown
+        // into. The operation models no quota error, so the refusal is the modelled error
+        // closest to "this service will not take another one now".
+        if store.ota_task_configurations.len() >= crate::state::MAX_OTA_TASK_CONFIGURATIONS {
+            return Err(CreateOtaTaskConfigurationErrorModeled::ThrottlingException(
+                ThrottlingException {
+                    message: Some(format!(
+                        "this service holds the maximum of {} OTA task configurations; delete \
+                         one before creating another",
+                        crate::state::MAX_OTA_TASK_CONFIGURATIONS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let sequence = store.take_sequence();
+        // `OtaTaskConfigurationId` is `^[a-zA-Z0-9]*$`, len 1..64, which the lowercase-hex
+        // opaque id satisfies.
+        let id = crate::state::opaque_id(sequence);
+        let configuration = crate::state::OtaTaskConfiguration {
+            id: id.clone(),
+            region,
+            name: input.name,
+            description: input.description,
+            push_config: input.push_config,
+            created_at,
+            sequence,
+        };
+
+        if let Some(token) = input.client_token {
+            store.record_idempotency_token(
+                crate::state::OTA_TASK_CONFIGURATION_RESOURCE_TYPE,
+                &token,
+                &id,
+                created_at,
+            );
+        }
+        store
+            .ota_task_configurations
+            .insert(id.clone(), configuration);
+
+        Ok(CreateOtaTaskConfigurationOutput {
+            task_configuration_id: Some(id),
+        })
     }
 }

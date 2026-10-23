@@ -27,6 +27,8 @@ mod job_definition_registry;
 mod job_lifecycle;
 #[path = "all/job_queue_updates.rs"]
 mod job_queue_updates;
+#[path = "all/job_state_change_events.rs"]
+mod job_state_change_events;
 #[path = "all/refusal_contract.rs"]
 mod refusal_contract;
 #[path = "all/scheduling_policies.rs"]

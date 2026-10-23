@@ -18,6 +18,11 @@
 //! The `ByteMatchSet` records and bounds live at the END of this file, under "AWS WAF
 //! Classic ByteMatchSet records", so this one store carries them beside every other
 //! resource kind.
+//!
+//! The IAM policy `PutPermissionPolicy` attaches to a `RuleGroup` lives on that rule
+//! group's own record ([`RuleGroupEntry::permission_policy`]); the restrictions it must
+//! satisfy are at the end of this file, under "AWS WAF Classic RuleGroup permission
+//! policies".
 
 //! `GeoMatchSet` records live in the same store, under [`GeoMatchSetEntry`] at the end
 //! of this file: `CreateGeoMatchSet` stores one and `GetGeoMatchSet` projects it,
@@ -119,6 +124,26 @@ pub const MAX_IP_SET_DESCRIPTORS: usize = 10_000;
 /// a regex match condition refers to, and small enough that a test can reach it.
 pub const MAX_REGEX_PATTERN_SETS: usize = 10;
 
+/// The most `RegexPatternString`s one `RegexPatternSet` may hold.
+///
+/// Source: the model itself — `RegexPatternSet$RegexPatternStrings` is `length 0..10`
+/// (`smithy_query(query="shape",shape="RegexPatternSet")`), so a set holding more could
+/// not be serialized onto its own shape. `UpdateRegexPatternSet` answers its modelled
+/// `WAFLimitsExceededException` for an insert that would pass this bound.
+pub const MAX_REGEX_PATTERN_STRINGS: usize = 10;
+
+/// The most `RegexPatternSetUpdate`s one `UpdateRegexPatternSet` request may carry.
+///
+/// The model bounds `RegexPatternSetUpdates` only below (`length 1..`), so this bound is
+/// CHOSEN, not cited, on the same reasoning as
+/// [`MAX_SQL_INJECTION_MATCH_SET_UPDATES_PER_REQUEST`]: a request can at most empty a set
+/// ([`MAX_REGEX_PATTERN_STRINGS`] deletes) and then fill it again
+/// ([`MAX_REGEX_PATTERN_STRINGS`] inserts), since a delete must name a pattern the set
+/// holds and an insert one it does not, so no larger request can leave the set in a state
+/// a request of this size cannot. It caps the work one caller can ask for before the
+/// handler takes the shared store's lock.
+pub const MAX_REGEX_PATTERN_SET_UPDATES_PER_REQUEST: usize = 2 * MAX_REGEX_PATTERN_STRINGS;
+
 /// The most `SqlInjectionMatchSet`s this emulator stores for the account before
 /// `CreateSqlInjectionMatchSet` answers its modelled `WAFLimitsExceededException`.
 ///
@@ -172,6 +197,33 @@ pub const MAX_CHANGE_TOKENS: usize = 1_000;
 /// the same source as [`MAX_SQL_INJECTION_MATCH_SETS`]), which keeps the
 /// SizeConstraintSet state a caller can grow bounded.
 pub const MAX_SIZE_CONSTRAINT_SETS: usize = 100;
+
+/// The most `SizeConstraint`s one `SizeConstraintSet` may hold.
+///
+/// The model states no quota, so this bound is the one AWS WAF Classic publishes per
+/// size constraint condition (10 filters — the same source as
+/// [`MAX_SQL_INJECTION_MATCH_TUPLES`]). Together with [`MAX_SIZE_CONSTRAINT_SETS`] it
+/// bounds the constraint state a caller can grow over many `UpdateSizeConstraintSet`
+/// requests, not just the number of sets.
+pub const MAX_SIZE_CONSTRAINTS: usize = 10;
+
+/// The most `SizeConstraintSetUpdate`s one `UpdateSizeConstraintSet` request may carry.
+///
+/// The model states no per-request quota for this operation, so this bound is CHOSEN,
+/// not cited, on the same reasoning as
+/// [`MAX_SQL_INJECTION_MATCH_SET_UPDATES_PER_REQUEST`]: a request can at most empty a
+/// set ([`MAX_SIZE_CONSTRAINTS`] deletes) and then fill it again
+/// ([`MAX_SIZE_CONSTRAINTS`] inserts), since a delete must name a constraint the set
+/// holds and an insert one it does not, so no larger request can leave the set in a
+/// state a request of this size cannot. It caps the work one caller can ask for before
+/// the handler takes the shared store's lock.
+pub const MAX_SIZE_CONSTRAINT_SET_UPDATES_PER_REQUEST: usize = 2 * MAX_SIZE_CONSTRAINTS;
+
+/// The largest `Size` a `SizeConstraint` may compare against, in bytes.
+///
+/// Source: `Size`'s modelled `@range` of 0..21474836480, which its own documentation
+/// repeats — "Valid values for size are 0 - 21474836480 bytes (0 - 20 GB)".
+pub const MAX_SIZE_CONSTRAINT_SIZE: i64 = 21_474_836_480;
 
 /// The most `WebACL`s this emulator stores for the account before `CreateWebACL`
 /// answers its modelled `WAFLimitsExceededException`.
@@ -375,6 +427,11 @@ pub const MESSAGE_REFERENCED_ITEM: &str = "The referenced item is still in use."
 /// The fixed sentence for `WAFInvalidOperationException`, the refusal of an update that
 /// would leave the resource as it was — see [`MESSAGE_DISALLOWED_NAME`].
 pub const MESSAGE_INVALID_OPERATION: &str = "The operation is not valid.";
+/// The fixed sentence for `WAFInvalidPermissionPolicyException`, the refusal of a
+/// permission policy outside the restrictions `PutPermissionPolicy` documents — see
+/// [`MESSAGE_DISALLOWED_NAME`].
+pub const MESSAGE_INVALID_PERMISSION_POLICY: &str =
+    "The specific permission policy is not valid.";
 
 /// The `MatchFieldType` whose `FieldToMatch.Data` names a request header.
 pub const MATCH_FIELD_TYPE_HEADER: &str = "HEADER";
@@ -419,19 +476,19 @@ pub const TAGGABLE_ARN_TYPES: &[&str] = &[
     ARN_TYPE_RATE_BASED_RULE,
 ];
 
-/// The `(resource type, resource id)` a taggable AWS WAF Classic regional resource ARN
-/// names, or `None` when `arn` names no taggable kind.
+/// The `(resource type, resource id)` an AWS WAF Classic regional resource ARN names,
+/// or `None` when `arn` is not one.
 ///
 /// An ARN is `arn:<partition>:<service>:<region>:<account-id>:<resource-type>/<id>`, so
 /// this takes six colon-separated fields whose first is `arn`, whose service segment is
-/// [`ARN_SERVICE`], and whose resource field is `<type>/<id>` with a type in
-/// [`TAGGABLE_ARN_TYPES`] and a non-empty id.
+/// [`ARN_SERVICE`], and whose resource field is `<type>/<id>` with a non-empty type and
+/// a non-empty id.
 ///
 /// The partition, region and account fields are required to be PRESENT but their values
 /// are not matched: this emulator serves a single account and stores no region on a
 /// resource, so the resource id is the only field of an ARN that can identify a record
 /// it holds.
-pub fn parse_taggable_resource_arn(arn: &str) -> Option<(&str, &str)> {
+pub fn parse_resource_arn(arn: &str) -> Option<(&str, &str)> {
     let mut fields = arn.split(':');
     let prefix = fields.next()?;
     let _partition = fields.next()?;
@@ -443,10 +500,30 @@ pub fn parse_taggable_resource_arn(arn: &str) -> Option<(&str, &str)> {
         return None;
     }
     let (resource_type, resource_id) = resource.split_once('/')?;
-    if resource_id.is_empty() || !TAGGABLE_ARN_TYPES.contains(&resource_type) {
+    if resource_type.is_empty() || resource_id.is_empty() {
         return None;
     }
     Some((resource_type, resource_id))
+}
+
+/// The `(resource type, resource id)` a taggable AWS WAF Classic regional resource ARN
+/// names, or `None` when `arn` names no taggable kind.
+///
+/// The ARN itself is parsed by [`parse_resource_arn`]; this adds the one restriction
+/// the tagging operations carry, that the kind it names is in [`TAGGABLE_ARN_TYPES`].
+pub fn parse_taggable_resource_arn(arn: &str) -> Option<(&str, &str)> {
+    parse_resource_arn(arn).filter(|(resource_type, _)| TAGGABLE_ARN_TYPES.contains(resource_type))
+}
+
+/// The `RuleGroupId` the `ResourceArn` of a permission-policy call names, or `None`
+/// when `arn` is not a WAF `RuleGroup` ARN.
+///
+/// Source: `PutPermissionPolicy`'s own documentation — "The ARN in the request must be a
+/// valid WAF RuleGroup ARN"; the policy operations are documented for that one kind
+/// ("The only supported use for this action is to share a RuleGroup across accounts").
+pub fn parse_rule_group_arn(arn: &str) -> Option<&str> {
+    let (resource_type, resource_id) = parse_resource_arn(arn)?;
+    (resource_type == ARN_TYPE_RULE_GROUP).then_some(resource_id)
 }
 
 /// The most `XssMatchSet`s this emulator stores for the account before
@@ -629,6 +706,56 @@ impl RegexPatternSetEntry {
             regex_pattern_strings: self.patterns.clone(),
         }
     }
+
+    /// Add `pattern`, unless the set already holds it. Answers whether the set changed.
+    ///
+    /// A `RegexPatternSet` is a SET of pattern strings, so one stored twice would be one
+    /// member of it: `UpdateRegexPatternSet` answers the second insert with its modelled
+    /// `WAFInvalidOperationException` ("there was nothing to do") instead.
+    pub fn insert_pattern(&mut self, pattern: &str) -> bool {
+        if self.patterns.iter().any(|stored| stored == pattern) {
+            return false;
+        }
+        self.patterns.push(pattern.to_string());
+        true
+    }
+
+    /// Remove `pattern`, if the set holds it. Answers whether the set changed.
+    pub fn remove_pattern(&mut self, pattern: &str) -> bool {
+        let before = self.patterns.len();
+        self.patterns.retain(|stored| stored != pattern);
+        self.patterns.len() != before
+    }
+}
+
+/// One `SizeConstraint`'s identity: the part of the request it measures and the
+/// transformation applied first (the shared [`MatchFilterKey`]), plus the comparison it
+/// makes against a size.
+///
+/// `UpdateSizeConstraintSet` documents that "if you want to change a
+/// SizeConstraintSetUpdate object, you delete the existing object and add a new one", so
+/// two constraints are the same constraint exactly when every member of the modelled
+/// `SizeConstraint` agrees — which is what the derived `Eq` here means, with the `Data`
+/// name normalised the one way [`match_filter_key`] normalises it (it is "not case
+/// sensitive", and omitted for the types that name no header or query argument).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct SizeConstraintKey {
+    /// What part of the request is measured, and the text transformation applied before
+    /// measuring it.
+    pub filter: MatchFilterKey,
+    /// A `ComparisonOperator` value.
+    pub comparison_operator: String,
+    /// The `Size` the comparison is against, in bytes.
+    pub size: i64,
+}
+
+/// The identity of `constraint` — see [`SizeConstraintKey`].
+pub fn size_constraint_key(constraint: &SizeConstraint) -> SizeConstraintKey {
+    SizeConstraintKey {
+        filter: match_filter_key(&constraint.field_to_match, &constraint.text_transformation),
+        comparison_operator: constraint.comparison_operator.clone(),
+        size: constraint.size,
+    }
 }
 
 /// One stored `SizeConstraintSet`.
@@ -640,7 +767,12 @@ impl RegexPatternSetEntry {
 pub struct SizeConstraintSetEntry {
     pub size_constraint_set_id: String,
     pub name: String,
-    /// The constraints in insertion order.
+    /// The constraints in insertion order, deduplicated by [`SizeConstraintKey`]. The
+    /// modelled shape is stored as it was accepted, so a read reports the stored record
+    /// rather than a re-rendering of it. No separate membership index is kept beside it
+    /// (as `ByteMatchSetEntry` keeps one): one set holds at most
+    /// [`MAX_SIZE_CONSTRAINTS`] constraints, so a lookup over this list is a walk of a
+    /// bounded handful, and the list stays the single copy of the record.
     pub size_constraints: Vec<SizeConstraint>,
 }
 
@@ -662,6 +794,35 @@ impl SizeConstraintSetEntry {
             name: Some(self.name.clone()),
             size_constraints: self.size_constraints.clone(),
         }
+    }
+
+    /// Whether this set holds a constraint whose identity equals `key`'s.
+    fn holds(&self, key: &SizeConstraintKey) -> bool {
+        self.size_constraints
+            .iter()
+            .any(|stored| &size_constraint_key(stored) == key)
+    }
+
+    /// Add a constraint, unless one with the same identity is already stored. Answers
+    /// whether the set changed.
+    pub fn insert_constraint(&mut self, constraint: &SizeConstraint) -> bool {
+        if self.holds(&size_constraint_key(constraint)) {
+            return false;
+        }
+        self.size_constraints.push(constraint.clone());
+        true
+    }
+
+    /// Remove the constraint whose identity equals `constraint`'s, if the set holds one.
+    /// Answers whether the set changed.
+    pub fn remove_constraint(&mut self, constraint: &SizeConstraint) -> bool {
+        let key = size_constraint_key(constraint);
+        if !self.holds(&key) {
+            return false;
+        }
+        self.size_constraints
+            .retain(|stored| size_constraint_key(stored) != key);
+        true
     }
 }
 
@@ -1113,6 +1274,15 @@ pub struct RuleGroupEntry {
     /// this same set, through
     /// [`ComAmazonawsWafregionalAwswafRegional20161128State::tags_for_resource`].
     pub tags: BTreeMap<String, String>,
+    /// The IAM policy `PutPermissionPolicy` attached to this rule group, exactly as the
+    /// request gave it, or `None` while none is attached.
+    ///
+    /// It lives on the rule group's own record because the policy operations address it
+    /// by the rule group's ARN ("Attaches an IAM policy to the specified resource. The
+    /// only supported use for this action is to share a RuleGroup across accounts"), so
+    /// `PutPermissionPolicy`, `GetPermissionPolicy` and `DeletePermissionPolicy` read and
+    /// write ONE copy of it, and deleting the rule group takes its policy with it.
+    pub permission_policy: Option<String>,
 }
 
 impl RuleGroupEntry {
@@ -1123,6 +1293,7 @@ impl RuleGroupEntry {
             name,
             metric_name,
             tags: BTreeMap::new(),
+            permission_policy: None,
         }
     }
 
@@ -1318,6 +1489,22 @@ impl ComAmazonawsWafregionalAwswafRegional20161128State {
                 .rate_based_rules
                 .values()
                 .any(|rate_based| points_at(&rate_based.rule))
+    }
+
+    /// Whether any stored `WebACL` activates the rule `rule_id` names.
+    ///
+    /// A web ACL's `ActivatedRule` list is what `UpdateWebACL` writes, and each entry's
+    /// `RuleId` is "the `RuleId` for a `Rule`" that web ACL uses. The refusal this
+    /// answers is on every rule kind's delete: "You can't delete a Rule if it's still
+    /// used in any WebACL objects […] If you just want to remove a Rule from a WebACL,
+    /// use UpdateWebACL."
+    pub fn is_referenced_by_a_web_acl(&self, rule_id: &str) -> bool {
+        self.web_acls.values().any(|web_acl| {
+            web_acl
+                .rules
+                .iter()
+                .any(|activated| activated.rule_id == rule_id)
+        })
     }
 
     /// The status of `token`, or `None` when this service holds no such token.
@@ -1623,5 +1810,143 @@ impl ByteMatchSetEntry {
         }
         self.tuples.retain(|stored| stored != tuple);
         true
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AWS WAF Classic RuleGroup permission policies
+//
+// `PutPermissionPolicy` attaches an IAM policy to the rule group its `ResourceArn`
+// names and `GetPermissionPolicy` reports it; the attached document itself lives on
+// [`RuleGroupEntry::permission_policy`], so one copy serves every reader. The
+// restrictions below are the ones `PutPermissionPolicy` and
+// `WAFInvalidPermissionPolicyException` document, nothing wider.
+// ---------------------------------------------------------------------------
+
+/// The IAM policy language version a permission policy must declare.
+///
+/// Source: `PutPermissionPolicy`'s own documentation — "Your policy must be composed
+/// using IAM Policy version 2012-10-17."
+pub const PERMISSION_POLICY_VERSION: &str = "2012-10-17";
+
+/// The one `Effect` a permission policy statement may carry.
+///
+/// Source: `PutPermissionPolicy`'s own documentation — "`Effect` must specify `Allow`."
+pub const PERMISSION_POLICY_EFFECT: &str = "Allow";
+
+/// Every `Action` a permission policy may grant, and the only ones.
+///
+/// Source: `PutPermissionPolicy`'s own documentation — "The `Action` in the policy must
+/// be `waf:UpdateWebACL`, `waf-regional:UpdateWebACL`, `waf:GetRuleGroup` and
+/// `waf-regional:GetRuleGroup`. Any extra or wildcard actions in the policy will be
+/// rejected." An action outside this list — including any form carrying a `*` — is
+/// therefore refused.
+pub const PERMISSION_POLICY_ACTIONS: &[&str] = &[
+    "waf:UpdateWebACL",
+    "waf-regional:UpdateWebACL",
+    "waf:GetRuleGroup",
+    "waf-regional:GetRuleGroup",
+];
+
+/// Whether `policy` is a permission policy AWS WAF Classic accepts: a JSON object
+/// declaring IAM policy version [`PERMISSION_POLICY_VERSION`] whose `Statement` — one
+/// statement object, or a non-empty list of them — every entry of satisfies
+/// [`permission_policy_statement_is_valid`].
+///
+/// Source: the restrictions `PutPermissionPolicy` and
+/// `WAFInvalidPermissionPolicyException` document. The document is only CHECKED here:
+/// what gets stored is the caller's own text, byte for byte.
+pub fn permission_policy_is_valid(policy: &str) -> bool {
+    let Ok(document) = ::serde_json::from_str::<::serde_json::Value>(policy) else {
+        return false;
+    };
+    let Some(document) = document.as_object() else {
+        return false;
+    };
+    if document
+        .get("Version")
+        .and_then(::serde_json::Value::as_str)
+        != Some(PERMISSION_POLICY_VERSION)
+    {
+        return false;
+    }
+    let statements: Vec<&::serde_json::Value> = match document.get("Statement") {
+        Some(statement @ ::serde_json::Value::Object(_)) => vec![statement],
+        Some(::serde_json::Value::Array(list)) => list.iter().collect(),
+        // A policy with no `Statement`, or one that is neither a statement nor a list
+        // of statements, carries no `Effect`, `Action` or `Principal` at all.
+        _ => return false,
+    };
+    !statements.is_empty()
+        && statements
+            .into_iter()
+            .all(permission_policy_statement_is_valid)
+}
+
+/// Whether one `Statement` of a permission policy is within the documented
+/// restrictions: it carries an `Effect` of [`PERMISSION_POLICY_EFFECT`], a non-empty
+/// `Principal`, an `Action` naming only [`PERMISSION_POLICY_ACTIONS`], and no
+/// `Resource`.
+///
+/// `NotAction`, `NotPrincipal` and `NotResource` are refused with the member they
+/// negate: a statement carrying one names no `Action` or `Principal`, or names a
+/// resource the policy "cannot include".
+pub fn permission_policy_statement_is_valid(statement: &::serde_json::Value) -> bool {
+    let Some(statement) = statement.as_object() else {
+        return false;
+    };
+    if statement.contains_key("Resource") || statement.contains_key("NotResource") {
+        return false;
+    }
+    if statement.get("Effect").and_then(::serde_json::Value::as_str)
+        != Some(PERMISSION_POLICY_EFFECT)
+    {
+        return false;
+    }
+    if statement.contains_key("NotPrincipal") || statement.contains_key("NotAction") {
+        return false;
+    }
+    permission_policy_principal_is_present(statement.get("Principal"))
+        && permission_policy_actions_are_allowed(statement.get("Action"))
+}
+
+/// Whether a statement names a `Principal`: a non-blank string, or a map of principal
+/// kinds (`AWS`, `Service`, …) whose every entry carries a non-blank value or a
+/// non-empty list of them.
+fn permission_policy_principal_is_present(principal: Option<&::serde_json::Value>) -> bool {
+    match principal {
+        Some(::serde_json::Value::String(value)) => !value.trim().is_empty(),
+        Some(::serde_json::Value::Object(kinds)) => {
+            !kinds.is_empty() && kinds.values().all(permission_policy_principal_value)
+        }
+        _ => false,
+    }
+}
+
+/// Whether one entry of a `Principal` map names a principal.
+fn permission_policy_principal_value(value: &::serde_json::Value) -> bool {
+    match value {
+        ::serde_json::Value::String(value) => !value.trim().is_empty(),
+        ::serde_json::Value::Array(values) => {
+            !values.is_empty() && values.iter().all(permission_policy_principal_value)
+        }
+        _ => false,
+    }
+}
+
+/// Whether a statement's `Action` — one action, or a non-empty list of them — names
+/// only actions in [`PERMISSION_POLICY_ACTIONS`].
+fn permission_policy_actions_are_allowed(action: Option<&::serde_json::Value>) -> bool {
+    fn allowed(action: &::serde_json::Value) -> bool {
+        action
+            .as_str()
+            .is_some_and(|action| PERMISSION_POLICY_ACTIONS.contains(&action))
+    }
+    match action {
+        Some(action @ ::serde_json::Value::String(_)) => allowed(action),
+        Some(::serde_json::Value::Array(actions)) => {
+            !actions.is_empty() && actions.iter().all(allowed)
+        }
+        _ => false,
     }
 }

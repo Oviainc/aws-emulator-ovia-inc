@@ -20,13 +20,15 @@
 use crate::ops::types::{JobExecution, JobExecutionState, JobExecutionSummary};
 
 pub use service_common::iot_job_executions::{
-    is_pending_status, is_terminal_status, now_epoch_seconds, JobExecutionRecord,
-    JobExecutionStore, StartedCommand, CANCEL_STEP_TIMER_MINUTES, FIRST_EXECUTION_NUMBER,
-    FIRST_VERSION_NUMBER, MAX_PENDING_EXECUTIONS_PER_THING, MAX_REMEMBERED_CLIENT_TOKENS,
-    MAX_STATUS_DETAIL_NAME_LEN, MAX_STATUS_DETAIL_PAIRS, MAX_STATUS_DETAIL_VALUE_LEN,
-    MAX_STEP_TIMEOUT_MINUTES, MAX_STORED_DOCUMENT_BYTES, MAX_STORED_EXECUTIONS,
-    MAX_TERMINAL_EXECUTIONS_PER_THING, MAX_THINGS_WITH_EXECUTIONS, MIN_STEP_TIMEOUT_MINUTES,
-    NEXT_JOB_ID, PENDING_STATUSES, STATUS_IN_PROGRESS, STATUS_QUEUED,
+    check_status_details, is_pending_status, is_terminal_status, now_epoch_seconds,
+    transition_refusal, JobExecutionRecord, JobExecutionStore, StartedCommand,
+    CANCEL_STEP_TIMER_MINUTES, FIRST_EXECUTION_NUMBER, FIRST_VERSION_NUMBER,
+    MAX_CONCURRENT_COMMAND_EXECUTIONS_PER_THING, MAX_PENDING_EXECUTIONS_PER_THING,
+    MAX_REMEMBERED_CLIENT_TOKENS, MAX_STATUS_DETAIL_NAME_LEN, MAX_STATUS_DETAIL_PAIRS,
+    MAX_STATUS_DETAIL_VALUE_LEN, MAX_STEP_TIMEOUT_MINUTES, MAX_STORED_DOCUMENT_BYTES,
+    MAX_STORED_EXECUTIONS, MAX_TERMINAL_EXECUTIONS_PER_THING, MAX_THINGS_WITH_EXECUTIONS,
+    MIN_STEP_TIMEOUT_MINUTES, NEXT_JOB_ID, PENDING_STATUSES, STATUS_IN_PROGRESS, STATUS_QUEUED,
+    STATUS_REJECTED,
 };
 
 /// The shared index of which IoT COMMANDS exist, which `StartCommandExecution`
@@ -83,6 +85,14 @@ pub fn not_found_message(job_id: &str, thing_name: &str) -> String {
 /// `thingName` and the status the execution finished in.
 pub fn already_finished_message(job_id: &str, thing_name: &str, status: &str) -> String {
     format!("Job {job_id} for {thing_name} has already finished with status {status}")
+}
+
+/// The message of the `InvalidRequestException` (HTTP 400) an `expectedVersion` that
+/// does not match the stored version is refused with: it names BOTH versions — the
+/// one the request asked for and the one the service holds — so a device can re-read
+/// and retry without a separate `DescribeJobExecution`.
+pub fn version_mismatch_message(expected: i64, stored: i64) -> String {
+    format!("Expected version {expected} but found version {stored}")
 }
 
 /// A stored record as the modeled `JobExecution`. `include_job_document` carries the

@@ -3,10 +3,14 @@
 //! @op CreateCluster
 //!
 //! Inserts a new cluster into this service's store and reports it back in the
-//! `creating` status, with its connection endpoint and creation time. The admin
+//! `creating` status, with its connection endpoint and creation time, and with
+//! every `Cluster` member the service derives from the configuration the request
+//! asked for (see `crate::state::populate_derived_members`): where the cluster
+//! is, what it is, and what is scheduled for it. The admin
 //! password is stored on the record but never placed on the `Cluster` shape, so
-//! it cannot reach the wire. A second create with the same identifier is refused
-//! with `ClusterAlreadyExistsFault`.
+//! it cannot reach the wire — a password change still being applied is reported
+//! as the masked `PendingModifiedValues$MasterUserPassword`. A second create with
+//! the same identifier is refused with `ClusterAlreadyExistsFault`.
 //!
 //! The groups the request names the cluster into are resolved against the store
 //! BEFORE the cluster is allocated: an unknown `ClusterSubnetGroupName` answers
@@ -390,6 +394,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(crate::scaffolded::Scaffolded::validation(message));
         }
 
+        // Bounded BEFORE the pair is resolved and before anything is derived
+        // from the count (the node topology is one record per node), so no
+        // request can size the work this does.
+        if input
+            .number_of_nodes
+            .is_some_and(st::exceeds_nodes_per_cluster_limit)
+        {
+            return Err(
+                CreateClusterErrorModeled::NumberOfNodesPerClusterLimitExceededFault(
+                    NumberOfNodesPerClusterLimitExceededFault {
+                        message: Some(st::nodes_per_cluster_limit_message(
+                            input.number_of_nodes.unwrap_or_default(),
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
         // The node count and the cluster type describe one another, so both are
         // resolved by the one shared rule in `state.rs`.
         let (cluster_type, number_of_nodes) =
@@ -488,6 +510,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // this service does not model yet (their creates are still 501 stubs), so
         // there is no state to resolve those names against and a request naming
         // one is taken at its word.
+        // Every provisioned cluster is created in a VPC, through the subnet group
+        // the request named or the account's DEFAULT group — which exists before
+        // anybody creates one, so it is materialised here and a request naming
+        // `default` finds it too.
+        let default_subnet_group = store.ensure_default_subnet_group(&region);
         let subnet_group = match input.cluster_subnet_group_name.as_deref() {
             Some(requested) => match store.subnet_group(requested) {
                 Some(group) => Some(group.clone()),
@@ -504,10 +531,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     )
                 }
             },
-            None => None,
+            None => Some(default_subnet_group),
         };
         // "Default: The default Amazon Redshift cluster parameter group" — the
-        // default group of this engine version's family, which every account has.
+        // default group of the parameter group family this service's clusters
+        // join, which every account has.
         let parameter_group_name = match input.cluster_parameter_group_name.as_deref() {
             Some(requested) => {
                 let name = st::normalized_parameter_group_name(requested);
@@ -525,12 +553,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
                 name
             }
-            None => st::default_parameter_group(&cluster_version),
+            None => st::cluster_default_parameter_group(),
         };
 
         let hsm_requested = input.hsm_client_certificate_identifier.is_some()
             || input.hsm_configuration_identifier.is_some();
-        let cluster = Cluster {
+        let mut cluster = Cluster {
             cluster_identifier: Some(identifier.clone()),
             node_type: Some(input.node_type.clone()),
             cluster_status: Some(st::STATUS_CREATING.to_string()),
@@ -588,6 +616,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .as_ref()
                 .and_then(|group| group.cluster_subnet_group_name.clone()),
             vpc_id: subnet_group.as_ref().and_then(|group| group.vpc_id.clone()),
+            // The admin password the request carries is applied while the
+            // cluster comes up, so it is the one change this create reports as
+            // pending — as the MASK, never the password.
+            pending_modified_values: Some(st::pending_master_user_password(
+                input.master_user_password.as_deref(),
+            )),
             availability_zone: Some(
                 input
                     .availability_zone
@@ -639,12 +673,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ),
             snapshot_schedule_identifier: input.snapshot_schedule_identifier.clone(),
             availability_zone_relocation_status: Some(
-                if input.availability_zone_relocation.unwrap_or(false) {
-                    "enabled"
-                } else {
-                    "disabled"
-                }
-                .to_string(),
+                st::availability_zone_relocation_status(input.availability_zone_relocation),
             ),
             cluster_namespace_arn: Some(st::namespace_arn(&identifier, &region)),
             default_iam_role_arn: input.default_iam_role_arn.clone(),
@@ -683,6 +712,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ),
             ..Default::default()
         };
+        // Everything the service DERIVES from the configuration above — where the
+        // cluster is (subnet group, VPC, security group), what it is (nodes,
+        // public key, revision, encryption key, endpoint's VPC endpoints) and
+        // what is scheduled for it — is filled in by the one shared rule, so the
+        // create path reports exactly the member set a later read does.
+        st::populate_derived_members(&mut cluster, &cluster_type, created_at);
 
         store.clusters.push(st::StoredCluster {
             cluster: cluster.clone(),

@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateSchedule
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateSchedule`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateSchedule::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -89,9 +80,16 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-databrew-awsgluedatabre
 // here — hence the `CreateScheduleError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.databrew#CreateSchedule")]
+// `InternalServerException` (HTTP 500) is widened in: the service models it, this
+// operation does not list it, and it is the only honest answer for an engine that
+// holds no state — a mounting fault, never a client error.
+#[smithy_macros::operation_error(
+    "com.amazonaws.databrew#CreateSchedule",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum CreateScheduleErrorModeled {
+    InternalServerException(InternalServerException),
     ConflictException(ConflictException),
     ServiceQuotaExceededException(ServiceQuotaExceededException),
     ValidationException(ValidationException),
@@ -148,18 +146,87 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateSchedule` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateScheduleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateSchedule"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateScheduleErrorModeled::InternalServerException(InternalServerException {
+                message: Some("DataBrew is mounted on an engine that holds no state".to_string()),
+            })
+        })?;
+
+        // The modelled length bounds are already enforced; the documented character
+        // set for a schedule name is not.
+        if let Err(message) = crate::state::validate_resource_name("Name", &input.name) {
+            return Err(CreateScheduleErrorModeled::ValidationException(ValidationException {
+                message: Some(message),
+            })
+            .into());
+        }
+
+        // A schedule runs its jobs on the dates and times its cron expression names,
+        // so the expression has to be one DataBrew can read. The service answers one
+        // constant sentence for every way an expression can fail that form.
+        if !crate::state::cron_expression_is_valid(&input.cron_expression) {
+            return Err(CreateScheduleErrorModeled::ValidationException(ValidationException {
+                message: Some(crate::state::INVALID_CRON_EXPRESSION_MESSAGE.to_string()),
+            })
+            .into());
+        }
+
+        // `JobNames` is optional and modelled `len 0..50`, so a schedule may name no
+        // job at all; the names it does carry are stored in the order given.
+        let job_names = input.job_names.clone().unwrap_or_default();
+
+        let now = ::std::time::SystemTime::now();
+        let principal = crate::state::request_principal();
+        let record = crate::state::ScheduleRecord {
+            name: input.name.clone(),
+            cron_expression: input.cron_expression.clone(),
+            job_names: job_names.clone(),
+            tags: crate::state::stored_tags(input.tags.as_ref()),
+            resource_arn: crate::state::resource_arn(
+                &crate::state::request_region(ctx),
+                "schedule",
+                &input.name,
+            ),
+            // A schedule that has only been created has no modification to report, so
+            // the audit's last-modified pair stays unset until an update runs.
+            audit: crate::state::Audit::created(now, principal),
+        };
+
+        let mut store = state.lock();
+        // A schedule runs the jobs it names, so it can only name jobs this account
+        // holds. `ResourceNotFoundException` is not an error this operation models
+        // (model: `ConflictException`, `ServiceQuotaExceededException`,
+        // `ValidationException`), so a name that resolves to no job is a bad input.
+        if let Some(missing) = job_names
+            .iter()
+            .find(|job_name| !store.jobs.contains_key(*job_name))
+        {
+            return Err(CreateScheduleErrorModeled::ValidationException(ValidationException {
+                message: Some(format!("JobNames names a job that does not exist: {missing}")),
+            })
+            .into());
+        }
+        if store.schedules.contains_key(&input.name) {
+            return Err(CreateScheduleErrorModeled::ConflictException(ConflictException {
+                message: Some(crate::state::already_exists_message("Schedule", &input.name)),
+            })
+            .into());
+        }
+        // A create is a growth site a caller drives, so the store has a ceiling and
+        // the create past it is refused rather than inserted.
+        if store.schedules.len() >= crate::state::MAX_SCHEDULES {
+            return Err(CreateScheduleErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "A service quota is exceeded: this account already holds the maximum of {} schedules.",
+                        crate::state::MAX_SCHEDULES
+                    )),
+                },
+            )
+            .into());
+        }
+        store.schedules.insert(input.name.clone(), record);
+
+        Ok(CreateScheduleOutput { name: input.name })
     }
 }

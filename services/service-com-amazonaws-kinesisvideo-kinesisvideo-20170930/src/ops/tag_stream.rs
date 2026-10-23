@@ -225,19 +225,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// State the failure to resolve a `StreamName`/`StreamARN` pair as this operation's
 /// own modeled error: absent or contradictory identifiers are a bad argument (400),
 /// a well-formed identifier for no stored stream is a missing resource (404).
-fn lookup_error(error: crate::state::StreamLookupError) -> TagStreamError {
+fn lookup_error(error: crate::state::LookupError) -> TagStreamError {
     match error {
-        crate::state::StreamLookupError::NoIdentifier => {
+        crate::state::LookupError::NoIdentifier => {
             TagStreamErrorModeled::InvalidArgumentException(InvalidArgumentException {
                 message: Some("Either StreamName or StreamARN must be specified.".to_string()),
             })
         }
-        crate::state::StreamLookupError::Mismatch => {
+        crate::state::LookupError::Mismatch => {
             TagStreamErrorModeled::InvalidArgumentException(InvalidArgumentException {
                 message: Some("StreamName and StreamARN refer to different streams.".to_string()),
             })
         }
-        crate::state::StreamLookupError::NotFound => {
+        crate::state::LookupError::NotFound => {
             TagStreamErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
                 message: Some("The requested stream is not found or not active.".to_string()),
             })

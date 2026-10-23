@@ -200,7 +200,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(mut record) = state.rule_groups.remove(&key) else {
             return Err(DeleteRuleGroupErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!("Rule group {key} does not exist.")),
+                    message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
                 },
             )
             .into());
@@ -219,6 +219,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `DeleteFirewallPolicy` do for theirs.
         record.status = crate::state::RESOURCE_DELETING.to_string();
         record.last_modified_time = ::std::time::SystemTime::now();
+        // The response projects the removed record rather than echoing a
+        // request, so the rule group's tag collection is reported as a list —
+        // empty when it carries no tags (see `state::removed_resource_tags`).
+        record.tags = crate::state::removed_resource_tags(record.tags.take());
 
         Ok(DeleteRuleGroupOutput {
             rule_group_response: record.to_response(),
@@ -228,7 +232,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
 crate::state::impl_resolve_error!(
     delete_lookup_error -> DeleteRuleGroupError, DeleteRuleGroupErrorModeled,
-    resource = "rule group", plural = "rule groups",
+    plural = "rule groups",
     name_member = "RuleGroupName", arn_member = "RuleGroupArn"
 );
 

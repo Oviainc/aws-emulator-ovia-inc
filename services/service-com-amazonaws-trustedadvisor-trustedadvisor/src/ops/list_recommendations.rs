@@ -104,23 +104,24 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-/// A modelled `date-time` as milliseconds since the Unix epoch, so a filter
-/// bound and a stored `lastUpdatedAt` are compared on one scale. `to_millis` is
-/// the exact conversion — going through seconds as an `f64` could move an
-/// inclusive bound by a millisecond.
-fn millis_of(value: &::aws_smithy_types::DateTime) -> i64 {
-    value.to_millis().unwrap_or(i64::MAX)
-}
-
 /// The stored recommendation, as the modelled `RecommendationSummary`, with its
 /// `name` in the language the request asked for (`None` when it named none).
 ///
-/// `pillarSpecificAggregates` and `statusReason` are left absent: the store
-/// holds no cost-savings aggregate and no status-determination discrepancy, and
-/// both members are optional.
+/// The date-time conversion both bounds go through is
+/// [`crate::state::millis_of`], shared with the organization-level listing.
+///
+/// `statusReason` is left absent: the store records no discrepancy in how a
+/// status was determined, and the member is optional.
+///
+/// `pillarSpecificAggregates` is the same aggregate `GetRecommendation` reports
+/// — computed from the recommendation's own resources by
+/// [`crate::state::ComAmazonawsTrustedadvisorTrustedadvisorState::pillar_aggregates_for`],
+/// so a single read and a listing agree — and is `None` only for a
+/// recommendation that optimizes no cost.
 fn recommendation_summary(
     entry: &crate::state::RecommendationEntry,
     resources_aggregates: RecommendationResourcesAggregates,
+    pillar_specific_aggregates: Option<RecommendationPillarSpecificAggregates>,
     language: Option<&str>,
 ) -> RecommendationSummary {
     RecommendationSummary {
@@ -134,7 +135,7 @@ fn recommendation_summary(
         aws_services: Some(entry.aws_services.clone()),
         name: entry.text.text(language).name.clone(),
         resources_aggregates,
-        pillar_specific_aggregates: None,
+        pillar_specific_aggregates,
         created_at: Some(crate::state::date_time(entry.created_at_millis)),
         last_updated_at: Some(crate::state::date_time(entry.last_updated_at_millis)),
         arn: entry.arn.clone(),
@@ -234,8 +235,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `afterLastUpdatedAt` / `beforeLastUpdatedAt` are inclusive bounds on
         // the stored `lastUpdatedAt`; every other filter is an equality (or
         // membership) test. An absent filter keeps every recommendation.
-        let after = input.after_last_updated_at.as_ref().map(millis_of);
-        let before = input.before_last_updated_at.as_ref().map(millis_of);
+        let after = input
+            .after_last_updated_at
+            .as_ref()
+            .map(crate::state::millis_of);
+        let before = input
+            .before_last_updated_at
+            .as_ref()
+            .map(crate::state::millis_of);
 
         let matching: Vec<(String, RecommendationSummary)> = state
             .recommendations
@@ -264,6 +271,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     recommendation_summary(
                         entry,
                         state.aggregates_for(arn),
+                        state.pillar_aggregates_for(arn),
                         input.language.as_deref(),
                     ),
                 )

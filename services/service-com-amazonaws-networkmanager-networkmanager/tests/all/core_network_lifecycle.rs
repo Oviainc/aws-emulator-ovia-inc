@@ -694,7 +694,7 @@ async fn a_core_network_needs_a_parent_and_blocks_its_deletion() {
     );
     assert_eq!(
         body["Fields"][0]["Name"],
-        json!("GlobalNetworkId"),
+        json!("globalNetworkId"),
         "the refusal must name the offending member, got {body}"
     );
 

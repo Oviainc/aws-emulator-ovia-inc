@@ -276,7 +276,9 @@ struct UpdateCase {
 /// The update table: each row changes a different part of the rule group, with a
 /// row that changes none of the rules at all.
 fn update_cases() -> Vec<UpdateCase> {
-    let aws_owned = json!({ "Type": "AWS_OWNED_KMS_KEY" });
+    // The default key names itself in both members: see
+    // `response_projections::every_resource_reports_the_key_that_protects_it_in_both_members`.
+    let aws_owned = json!({ "Type": "AWS_OWNED_KMS_KEY", "KeyId": "AWS_OWNED_KMS_KEY" });
     let customer_key = json!({ "Type": "CUSTOMER_KMS", "KeyId": "alias/net-fw" });
     vec![
         UpdateCase {

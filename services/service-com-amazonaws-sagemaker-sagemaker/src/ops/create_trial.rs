@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateTrial
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateTrial`'s real behaviour. Implement it here — this is
+//! IMPLEMENTED: resolves the `ExperimentName` the request names in `crate::state`,
+//! refuses an experiment that does not exist with the modelled `ResourceNotFound`, and
+//! otherwise stores the trial under its `TrialName` and mints its `TrialArn`. This is
 //! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateTrial::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +153,77 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateTrial` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateTrialErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateTrial"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        let region = crate::state::request_region(ctx);
+        let arn = crate::state::resource_arn(&region, "experiment-trial", &input.trial_name);
+
+        let mut store = state.lock();
+        // The experiment is the trial's PARENT — a trial cannot exist outside one — so an
+        // experiment this account holds none of is the modelled `ResourceNotFound`, and
+        // nothing is stored. Checked before the quota and the name conflict: a caller
+        // cannot learn whether a trial name is taken under an experiment that does not
+        // exist. Resolved through `state::experiment`, the owning slice's own lookup, so
+        // the name folds case the way `ExperimentName` is documented to ("not
+        // case-sensitive") and the record's own spelling is what the trial stores.
+        let Some(experiment_name) = store
+            .experiment(&input.experiment_name)
+            .map(|experiment| experiment.name.clone())
+        else {
+            let experiment_arn =
+                crate::state::resource_arn(&region, "experiment", &input.experiment_name);
+            return Err(CreateTrialErrorModeled::ResourceNotFound(ResourceNotFound {
+                message: Some(format!("Experiment {experiment_arn} does not exist.")),
+            })
+            .into());
+        };
+        // The store is bounded, so a caller varying `TrialName` cannot grow it without
+        // end. `ResourceLimitExceeded` is the limit failure this operation models.
+        if !store.trials_below_quota() {
+            return Err(CreateTrialErrorModeled::ResourceLimitExceeded(ResourceLimitExceeded {
+                message: Some(format!(
+                    "The account-level service limit for trials is {}, with current \
+                     utilization of {} and a request delta of 1.",
+                    crate::state::TRIAL_QUOTA,
+                    store.trials.len()
+                )),
+            })
+            .into());
+        }
+        // A name already in use is refused, never overwritten: otherwise the caller reads
+        // a 200 for a trial it did not create, and the trial it did create is gone. The
+        // name is not case-sensitive, so the check and the insert go through the folded
+        // store key the reader resolves by.
+        let key = crate::state::entity_key(&input.trial_name);
+        if store.trials.contains_key(&key) {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "Cannot create already existing trial \"{arn}\"."
+            )));
+        }
+
+        let now = ::std::time::SystemTime::now();
+        store.trials.insert(
+            key,
+            crate::state::Trial {
+                name: input.trial_name.clone(),
+                arn: arn.clone(),
+                display_name: input.display_name,
+                // The experiment this trial belongs to, spelled as the experiment record
+                // holds it rather than as this request wrote it.
+                experiment_name,
+                metadata_properties: input.metadata_properties,
+                tags: input.tags.unwrap_or_default(),
+                created_by: crate::state::caller_user_context(ctx),
+                creation_time: now,
+                last_modified_time: now,
+            },
+        );
+        drop(store);
+
+        crate::state::record_state_change(Self::NAME, &arn, ctx);
+        Ok(CreateTrialOutput {
+            trial_arn: Some(arn),
+        })
     }
 }

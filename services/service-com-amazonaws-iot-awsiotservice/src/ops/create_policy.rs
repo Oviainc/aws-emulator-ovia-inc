@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreatePolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreatePolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreatePolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +151,108 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreatePolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreatePolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreatePolicy"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreatePolicyErrorModeled::InternalFailureException(InternalFailureException {
+                message: Some("the IoT emulator has no state store attached".to_string()),
+            })
+        })?;
+
+        let region = crate::state::request_region(ctx.parts());
+
+        // A policy IS its document, so a document that is not an IoT policy document
+        // is refused before anything is written: `MalformedPolicyException` ("The
+        // policy documentation is not valid", HTTP 400) is the modelled error for
+        // exactly this, and its message names the rule that was violated.
+        if let Err(rejection) = crate::state::validate_policy_document(&input.policy_document) {
+            return Err(CreatePolicyErrorModeled::MalformedPolicyException(
+                MalformedPolicyException {
+                    message: Some(rejection.message()),
+                },
+            )
+            .into());
+        }
+
+        // `Tag$Key` is `@required` and keys a resource's tag set, so the last value
+        // given for a key is the one the resource carries. How MANY tags one request
+        // may carry is bounded: `TagList` has no modelled maximum, so without the
+        // ceiling one request would choose how large a single record is. The refusal
+        // is the modelled `InvalidRequestException` ("The request is not valid",
+        // HTTP 400), naming the limit.
+        let requested_tags = input.tags.unwrap_or_default();
+        if requested_tags.len() > crate::state::MAX_POLICY_TAGS {
+            return Err(CreatePolicyErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(format!(
+                        "a policy may carry at most {} tags; this request carries {}",
+                        crate::state::MAX_POLICY_TAGS,
+                        requested_tags.len()
+                    )),
+                },
+            )
+            .into());
+        }
+        let tags: ::std::collections::BTreeMap<String, Option<String>> = requested_tags
+            .into_iter()
+            .map(|tag| (tag.key, tag.value))
+            .collect();
+
+        let mut store = state.lock();
+
+        // The name is the policy's identity, so a name already taken is a conflict:
+        // `ResourceAlreadyExistsException` (HTTP 409). Nothing this operation
+        // documents makes it idempotent — unlike `CreateThing`, which documents that
+        // a repeat create of the same configuration succeeds — so even the same
+        // document under an existing name is refused rather than re-creating the
+        // policy or adding a version to it.
+        if let Some(existing) = store.policies.get(&input.policy_name) {
+            return Err(CreatePolicyErrorModeled::ResourceAlreadyExistsException(
+                ResourceAlreadyExistsException {
+                    message: Some(format!("Policy {} already exists", existing.policy_name)),
+                    resource_id: Some(existing.policy_name.clone()),
+                    resource_arn: Some(existing.policy_arn.clone()),
+                },
+            )
+            .into());
+        }
+
+        // The store is one a CALLER grows, a policy at a time, and each record keeps
+        // the document it was created with — so the number of policies an account can
+        // hold is bounded. The ceiling is read AFTER the conflict check, because a
+        // name already taken adds no record. `CreatePolicy` models no
+        // `LimitExceededException`, so the refusal past the ceiling is the modelled
+        // `InvalidRequestException` (HTTP 400) naming the limit, never a 200 that
+        // records nothing.
+        if store.policies.len() >= crate::state::MAX_POLICIES {
+            return Err(CreatePolicyErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(format!(
+                        "the maximum of {} policies is already reached",
+                        crate::state::MAX_POLICIES
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let policy_arn = crate::state::policy_arn(&region, &input.policy_name);
+        let policy = crate::state::RegisteredPolicy::new(
+            input.policy_name,
+            policy_arn,
+            input.policy_document,
+            tags,
+            ::std::time::SystemTime::now(),
+        );
+
+        // The response is built from the record that is about to be persisted, so
+        // what this call reports and what the next `GetPolicy` reads are one value,
+        // not two that could drift.
+        let output = CreatePolicyOutput {
+            policy_name: Some(policy.policy_name.clone()),
+            policy_arn: Some(policy.policy_arn.clone()),
+            policy_document: Some(policy.default_document().to_string()),
+            policy_version_id: Some(policy.default_version_id()),
+        };
+        store.policies.insert(policy.policy_name.clone(), policy);
+        Ok(output)
     }
 }

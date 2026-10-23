@@ -346,7 +346,7 @@ async fn a_password_is_accepted_only_when_it_meets_every_documented_rule() {
             let (status, described) =
                 call(&router, "DescribeUsers", &json!({ "UserName": name })).await;
             assert_eq!(
-                status, 404,
+                status, 400,
                 "case {case:?}: a refused create must leave no user behind, got \
                  {status} with {described}"
             );
@@ -677,8 +677,8 @@ async fn a_users_name_is_unique_and_must_exist_to_be_described() {
     )
     .await;
     assert_eq!(
-        status, 404,
-        "case \"unknown user\": expected 404, got {status} with {body}"
+        status, 400,
+        "case \"unknown user\": expected 400, got {status} with {body}"
     );
     assert_eq!(
         error_code(&body),

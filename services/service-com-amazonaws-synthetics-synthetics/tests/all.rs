@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/canary_lifecycle.rs"]
 mod canary_lifecycle;
+#[path = "all/group_deletion.rs"]
+mod group_deletion;
 #[path = "all/group_lifecycle.rs"]
 mod group_lifecycle;
 #[path = "all/group_membership.rs"]

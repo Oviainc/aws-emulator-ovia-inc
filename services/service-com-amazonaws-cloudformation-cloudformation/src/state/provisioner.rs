@@ -39,18 +39,44 @@
 //! * `AWS::SQS::Queue`'s properties are the queue's ATTRIBUTES, named identically on both
 //!   sides, so its arm passes them through as `CreateQueue`'s `Attributes` map, lifting
 //!   out the two that are not attributes (the name CloudFormation decides, and the tag
-//!   list the create takes as its own member).
+//!   list the create takes as its own member);
+//! * `AWS::SNS::Topic`'s are the topic's attributes in the same way, with the three that
+//!   are not attributes lifted out (the name, the tag list and the data-protection policy,
+//!   each a `CreateTopic` member of its own), the inline `Subscription` list made by
+//!   `Subscribe` calls on the created topic, and `DeliveryStatusLogging` written as the
+//!   per-protocol feedback attributes SNS names;
+//! * `AWS::FIS::ExperimentTemplate`'s are the same members in lower camel case, but its
+//!   `Targets` and `Actions` are MAPS keyed by names the template chose (as are a target's
+//!   `ResourceTags` and `Parameters` and an action's `Parameters` and `Targets`), so its
+//!   arm maps each modelled structure member by member and passes every caller-keyed map
+//!   through as written. Its physical id is one the owning service ASSIGNS: FIS mints the
+//!   experiment template's id, so that id — not a computed name — is what the stack reports
+//!   for the resource;
+//! * `AWS::WAFRegional::IPSet`'s two properties reach AWS WAF Classic through TWO calls,
+//!   because that is how its API takes them: `CreateIPSet` takes the `Name`, each declared
+//!   `IPSetDescriptors` entry is INSERTed by an `UpdateIPSet`, and both carry a change
+//!   token of their own. Its identity is its owning service's too ("Ref returns the IPSet
+//!   ID"), so its arm answers the `IPSetId` AWS WAF returned as the resource's physical id.
 //!
 //! No arm invents a value: a property the template does not declare is absent from the
-//! request, and what the owning service answers is what the stack records.
+//! request, and what the owning service answers is what the stack records. A property an
+//! arm does not map onto the create's request at all is REFUSED rather than dropped, so a
+//! stack never reports a resource configured differently from its declaration — the FIS
+//! arm's `ExperimentReportConfiguration` is the one such property today. Inside a nested
+//! structure the member tables are the type's published members, so a member not in one is
+//! not a member of the type.
 
 use std::collections::BTreeMap;
 
 use serde_json::{Map, Value};
 
-use super::provisioning::{call_json_rpc, Refusal, AWS_JSON_1_0, AWS_JSON_1_1};
+use super::provisioning::{
+    call_json_rpc, call_query, call_rest_json, xml_element, xml_entry_map, Created, Refusal,
+    AWS_JSON_1_0, AWS_JSON_1_1,
+};
 use super::template::{
-    ECR_PUBLIC_REPOSITORY, ECS_CLUSTER, FIREHOSE_DELIVERY_STREAM, SQS_QUEUE,
+    ECR_PUBLIC_REPOSITORY, ECS_CLUSTER, FIREHOSE_DELIVERY_STREAM, FIS_EXPERIMENT_TEMPLATE,
+    SNS_TOPIC, SQS_QUEUE, WAF_REGIONAL_IP_SET,
 };
 use super::StoredResource;
 
@@ -74,6 +100,9 @@ pub(super) enum Provisioner {
     CodePipelinePipeline,
     EcsCluster,
     SqsQueue,
+    SnsTopic,
+    FisExperimentTemplate,
+    WafRegionalIpSet,
 }
 
 /// The provisioner that owns a template resource type, or `None` for a type this emulator
@@ -87,20 +116,26 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         CODEPIPELINE_PIPELINE => Some(Provisioner::CodePipelinePipeline),
         ECS_CLUSTER => Some(Provisioner::EcsCluster),
         SQS_QUEUE => Some(Provisioner::SqsQueue),
+        SNS_TOPIC => Some(Provisioner::SnsTopic),
+        FIS_EXPERIMENT_TEMPLATE => Some(Provisioner::FisExperimentTemplate),
+        WAF_REGIONAL_IP_SET => Some(Provisioner::WafRegionalIpSet),
         _ => None,
     }
 }
 
 impl Provisioner {
-    /// Create one resource in the service that owns it, and report back the attributes
-    /// that service decided (an ARN it minted, say), which replace the ones
-    /// CloudFormation's naming rules computed. `Err` is that service's own refusal.
+    /// Create one resource in the service that owns it, and report back what that service
+    /// decided about it ([`Created`]): the attributes it reported (an ARN it minted, say),
+    /// which replace the ones CloudFormation's naming rules computed, and — for a type
+    /// whose identity is that service's
+    /// ([`super::template::identity_is_service_assigned`]) — the physical id it assigned.
+    /// `Err` is that service's own refusal.
     pub(super) async fn create(
         self,
         ctx: &smithy_server_runtime::OperationContext<'_>,
         region: &str,
         resource: &StoredResource,
-    ) -> Result<BTreeMap<String, String>, Refusal> {
+    ) -> Result<Created, Refusal> {
         match self {
             Self::FirehoseDeliveryStream => create_delivery_stream(ctx, region, resource).await,
             Self::EcrPublicRepository => create_public_repository(ctx, region, resource).await,
@@ -109,6 +144,11 @@ impl Provisioner {
             Self::CodePipelinePipeline => create_pipeline(ctx, region, resource).await,
             Self::EcsCluster => create_cluster(ctx, region, resource).await,
             Self::SqsQueue => create_queue(ctx, region, resource).await,
+            Self::SnsTopic => create_topic(ctx, region, resource).await,
+            Self::FisExperimentTemplate => {
+                create_experiment_template(ctx, region, resource).await
+            }
+            Self::WafRegionalIpSet => create_ip_set(ctx, region, resource).await,
         }
     }
 
@@ -139,6 +179,11 @@ impl Provisioner {
             }
             Self::EcsCluster => delete_cluster(ctx, region, physical_resource_id).await,
             Self::SqsQueue => delete_queue(ctx, region, physical_resource_id).await,
+            Self::SnsTopic => delete_topic(ctx, region, physical_resource_id).await,
+            Self::FisExperimentTemplate => {
+                delete_experiment_template(ctx, region, physical_resource_id).await
+            }
+            Self::WafRegionalIpSet => delete_ip_set(ctx, region, physical_resource_id).await,
         }
     }
 
@@ -173,6 +218,11 @@ impl Provisioner {
             }
             Self::EcsCluster => describe_cluster(ctx, region, physical_resource_id).await,
             Self::SqsQueue => describe_queue(ctx, region, physical_resource_id).await,
+            Self::SnsTopic => describe_topic(ctx, region, physical_resource_id).await,
+            Self::FisExperimentTemplate => {
+                describe_experiment_template(ctx, region, physical_resource_id).await
+            }
+            Self::WafRegionalIpSet => describe_ip_set(ctx, region, physical_resource_id).await,
         }
     }
 }
@@ -201,7 +251,7 @@ async fn create_delivery_stream(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     resource: &StoredResource,
-) -> Result<BTreeMap<String, String>, Refusal> {
+) -> Result<Created, Refusal> {
     let mut request = match &resource.properties {
         Value::Object(object) => object.clone(),
         _ => Map::new(),
@@ -223,7 +273,7 @@ async fn create_delivery_stream(
     if let Some(arn) = reported.get("DeliveryStreamARN").and_then(Value::as_str) {
         attributes.insert("Arn".to_string(), arn.to_string());
     }
-    Ok(attributes)
+    Ok(Created::attributes(attributes))
 }
 
 /// Delete the stream a stack created. A stream Firehose no longer has
@@ -314,7 +364,7 @@ async fn create_public_repository(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     resource: &StoredResource,
-) -> Result<BTreeMap<String, String>, Refusal> {
+) -> Result<Created, Refusal> {
     let properties = match &resource.properties {
         Value::Object(object) => object.clone(),
         _ => Map::new(),
@@ -357,7 +407,7 @@ async fn create_public_repository(
     {
         attributes.insert("Arn".to_string(), arn.to_string());
     }
-    Ok(attributes)
+    Ok(Created::attributes(attributes))
 }
 
 /// Delete the repository a stack created. A repository ECR Public no longer holds
@@ -435,7 +485,7 @@ async fn create_bucket(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     resource: &StoredResource,
-) -> Result<BTreeMap<String, String>, Refusal> {
+) -> Result<Created, Refusal> {
     use ::aws_sdk_s3::types::{
         BucketLocationConstraint, BucketVersioningStatus, CreateBucketConfiguration,
         VersioningConfiguration,
@@ -484,7 +534,7 @@ async fn create_bucket(
             .await
             .map_err(|error| refusal_of(&error))?;
     }
-    Ok(BTreeMap::new())
+    Ok(Created::default())
 }
 
 /// Delete the bucket a stack created. A bucket S3 no longer has is already in the state
@@ -587,7 +637,7 @@ async fn create_role(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     resource: &StoredResource,
-) -> Result<BTreeMap<String, String>, Refusal> {
+) -> Result<Created, Refusal> {
     let Some(trust_policy) = resource
         .properties
         .get("AssumeRolePolicyDocument")
@@ -663,7 +713,7 @@ async fn create_role(
             .await
             .map_err(|error| refusal_of(&error))?;
     }
-    Ok(attributes)
+    Ok(Created::attributes(attributes))
 }
 
 /// Delete the role a stack created. "You must delete the policies that are associated
@@ -821,7 +871,7 @@ async fn create_pipeline(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     resource: &StoredResource,
-) -> Result<BTreeMap<String, String>, Refusal> {
+) -> Result<Created, Refusal> {
     let mut declaration = match camel_cased(&resource.properties) {
         Value::Object(object) => object,
         _ => Map::new(),
@@ -870,8 +920,8 @@ async fn create_pipeline(
     )
     .await
     {
-        Ok(_) => Ok(BTreeMap::new()),
-        Err(refusal) if refusal.code == PIPELINE_NAME_IN_USE => Ok(BTreeMap::new()),
+        Ok(_) => Ok(Created::default()),
+        Err(refusal) if refusal.code == PIPELINE_NAME_IN_USE => Ok(Created::default()),
         Err(refusal) => Err(refusal),
     }
 }
@@ -1154,7 +1204,7 @@ async fn create_cluster(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     resource: &StoredResource,
-) -> Result<BTreeMap<String, String>, Refusal> {
+) -> Result<Created, Refusal> {
     let mut request = Map::new();
     if let Value::Object(properties) = &resource.properties {
         for (property, member) in ECS_CLUSTER_MEMBERS {
@@ -1184,7 +1234,7 @@ async fn create_cluster(
     {
         attributes.insert("Arn".to_string(), arn.to_string());
     }
-    Ok(attributes)
+    Ok(Created::attributes(attributes))
 }
 
 /// Delete the cluster a stack created. A cluster Amazon ECS no longer holds
@@ -1300,7 +1350,7 @@ async fn create_queue(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     resource: &StoredResource,
-) -> Result<BTreeMap<String, String>, Refusal> {
+) -> Result<Created, Refusal> {
     let mut request = Map::new();
     request.insert("QueueName".to_string(), Value::String(queue_name(resource)));
     let attributes = queue_attributes(&resource.properties);
@@ -1324,7 +1374,7 @@ async fn create_queue(
     if let Some(url) = reported.get("QueueUrl").and_then(Value::as_str) {
         attributes.insert("QueueUrl".to_string(), url.to_string());
     }
-    Ok(attributes)
+    Ok(Created::attributes(attributes))
 }
 
 /// Delete the queue a stack created. A queue SQS no longer has (`QueueDoesNotExist`) is
@@ -1444,12 +1494,19 @@ fn attribute_text(value: &Value) -> String {
 /// The `tags` map an `AWS::SQS::Queue`'s `Tags` property is.
 ///
 /// CloudFormation's tag property is a LIST of `{Key, Value}` pairs and `CreateQueue`
-/// takes a map, so each pair becomes one entry; a tag with no key is not a tag and is
-/// dropped rather than sent as an empty one.
+/// takes a map, which is the conversion [`tag_map`] does.
 fn queue_tags(properties: &Value) -> Map<String, Value> {
-    properties
-        .get("Tags")
-        .and_then(Value::as_array)
+    properties.get("Tags").map(tag_map).unwrap_or_default()
+}
+
+/// CloudFormation's `[{Key, Value}]` tag spelling as the MAP of tag key to value a
+/// creating API takes.
+///
+/// A tag with no key is not a tag and is dropped rather than sent as an empty one; a value
+/// that is not a string is sent as the text it is, since a tag value is a string on every
+/// wire that takes one.
+fn tag_map(tags: &Value) -> Map<String, Value> {
+    tags.as_array()
         .map(|tags| {
             tags.iter()
                 .filter_map(|tag| {
@@ -1463,6 +1520,891 @@ fn queue_tags(properties: &Value) -> Map<String, Value> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+// ---------------------------------------------------------------------------
+// Amazon SNS: AWS::SNS::Topic
+// ---------------------------------------------------------------------------
+
+/// Amazon SNS's signing name and API version, from its model (`sigv4Name: sns`, service
+/// shape `AmazonSimpleNotificationService`, `version: 2010-03-31`), which speaks
+/// `awsQuery` — so its calls ride on [`call_query`] rather than on [`call_json_rpc`].
+const SNS_SIGNING_NAME: &str = "sns";
+const SNS_API_VERSION: &str = "2010-03-31";
+
+/// The error code SNS answers for a topic ARN no topic answers to: `NotFoundException`'s
+/// own `awsQueryError` code, which is what an awsQuery client branches on.
+const NOT_FOUND: &str = "NotFound";
+
+/// The properties of an `AWS::SNS::Topic` that are NOT topic attributes, each a member of
+/// `CreateTopic` in its own right or a call of its own:
+///
+/// * `TopicName` is the one value CloudFormation decides, and the create's `Name` member;
+/// * `Tags` is the create's own tag list;
+/// * `DataProtectionPolicy` is the create's own member ("The body of the policy document
+///   you want to use for this topic");
+/// * `Subscription` is a list of subscriptions, which are `Subscribe` calls on the topic
+///   once it exists.
+const NON_ATTRIBUTE_PROPERTIES: &[&str] =
+    &["TopicName", "Tags", "DataProtectionPolicy", "Subscription"];
+
+/// The property whose entries are the per-protocol delivery-status attributes.
+const DELIVERY_STATUS_LOGGING: &str = "DeliveryStatusLogging";
+
+/// How a `DeliveryStatusLogging` entry's `Protocol` is spelled in the delivery-status
+/// attribute names SNS documents: a `sqs` entry's role ARN is the topic's
+/// `SQSSuccessFeedbackRoleArn`, a `http/s` entry's its `HTTPSuccessFeedbackRoleArn`.
+///
+/// Source: the `Protocol` value set AWS's resource reference publishes for
+/// `AWS::SNS::Topic`'s `LoggingConfig`, against the attribute names
+/// `SetTopicAttributes` documents. A protocol outside this set is passed through as the
+/// template spells it, so SNS's own validation is what refuses it rather than a name
+/// invented here.
+const LOGGING_PROTOCOL_PREFIXES: &[(&str, &str)] = &[
+    ("http/s", "HTTP"),
+    ("sqs", "SQS"),
+    ("lambda", "Lambda"),
+    ("firehose", "Firehose"),
+    ("application", "Application"),
+];
+
+/// The members of one `LoggingConfig`, named identically on both sides once the protocol's
+/// prefix is in front of them. `Protocol` itself is the prefix, not a member.
+const LOGGING_CONFIG_MEMBERS: &[&str] = &[
+    "SuccessFeedbackRoleArn",
+    "SuccessFeedbackSampleRate",
+    "FailureFeedbackRoleArn",
+];
+
+/// Create the topic an `AWS::SNS::Topic` declares, and the subscriptions it declares on it.
+///
+/// A topic's configuration is its ATTRIBUTES, so the call is `CreateTopic` with the topic's
+/// name — the one thing CloudFormation decides, which is the last segment of the ARN its
+/// `Ref` resolves to — and the attribute map [`topic_attributes`] reads off the declared
+/// properties.
+///
+/// The ARN the create answers with is reported back as the resource's `TopicArn`
+/// attribute. It is the SAME ARN the type's published return values computed
+/// (`arn:aws:sns:<region>:<account>:<name>`), because both are built from the one account
+/// id this emulator mints and the topic's own name — and SNS keys a topic by exactly that
+/// ARN, so the handle the stack publishes addresses the topic this call created however a
+/// client reaches SNS.
+async fn create_topic(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<Created, Refusal> {
+    let mut parameters = vec![("Name".to_string(), topic_name(resource))];
+    for (index, (name, value)) in topic_attributes(&resource.properties).iter().enumerate() {
+        let entry = index + 1;
+        parameters.push((format!("Attributes.entry.{entry}.key"), name.clone()));
+        parameters.push((format!("Attributes.entry.{entry}.value"), value.clone()));
+    }
+    for (index, (key, value)) in topic_tags(&resource.properties).iter().enumerate() {
+        let member = index + 1;
+        parameters.push((format!("Tags.member.{member}.Key"), key.clone()));
+        parameters.push((format!("Tags.member.{member}.Value"), value.clone()));
+    }
+    if let Some(policy) = resource.properties.get("DataProtectionPolicy") {
+        parameters.push(("DataProtectionPolicy".to_string(), attribute_text(policy)));
+    }
+    let answered = call_query(
+        ctx,
+        SNS_SIGNING_NAME,
+        region,
+        SNS_API_VERSION,
+        "CreateTopic",
+        &parameters,
+    )
+    .await?;
+    let arn = xml_element(&answered, "TopicArn")
+        .filter(|arn| !arn.is_empty())
+        .ok_or_else(|| Refusal {
+            code: "InternalFailure".to_string(),
+            message: "Amazon SNS answered CreateTopic without a TopicArn".to_string(),
+        })?;
+
+    // "The SNS subscriptions (endpoints) for this topic" — declared inline on the topic,
+    // so they are subscriptions of the topic this call just created.
+    for subscription in declared_subscriptions(&resource.properties) {
+        let mut parameters = vec![("TopicArn".to_string(), arn.clone())];
+        parameters.extend(subscription);
+        let subscribed = call_query(
+            ctx,
+            SNS_SIGNING_NAME,
+            region,
+            SNS_API_VERSION,
+            "Subscribe",
+            &parameters,
+        )
+        .await;
+        if let Err(refusal) = subscribed {
+            // The resource the template declares is the topic AND the subscriptions on
+            // it, so a subscription SNS refuses fails the resource. The stack records no
+            // physical id for a resource whose create failed, so nothing would ever
+            // delete the topic this call already made: it is deleted here, before the
+            // refusal propagates, and what the stack reports is SNS's own refusal.
+            delete_topic(ctx, region, &arn)
+                .await
+                .map_err(|failure| Refusal {
+                    code: refusal.code.clone(),
+                    message: format!(
+                        "{refusal}; the topic it created was left behind: {failure}"
+                    ),
+                })?;
+            return Err(refusal);
+        }
+    }
+
+    let mut attributes = BTreeMap::new();
+    attributes.insert("TopicArn".to_string(), arn);
+    Ok(Created::attributes(attributes))
+}
+
+/// Delete the topic a stack created. A topic SNS no longer has (`NotFound`) is already in
+/// the state the delete asks for.
+///
+/// The topic is addressed by its ARN, which is this resource's physical id — "Ref returns
+/// the topic ARN" for this type.
+async fn delete_topic(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<(), Refusal> {
+    let parameters = vec![("TopicArn".to_string(), physical_resource_id.to_string())];
+    match call_query(
+        ctx,
+        SNS_SIGNING_NAME,
+        region,
+        SNS_API_VERSION,
+        "DeleteTopic",
+        &parameters,
+    )
+    .await
+    {
+        Ok(_) => Ok(()),
+        Err(refusal) if refusal.code == NOT_FOUND => Ok(()),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// The topic's configuration as Amazon SNS reports it, for drift detection.
+///
+/// A topic SNS no longer has (`NotFound`) was deleted. A topic's configuration IS its
+/// attribute map, named identically to this type's properties ([`topic_attributes`]), so
+/// the attributes are the actual configuration compared against the declared one and a
+/// topic whose display name was changed outside the stack is MODIFIED. The map the query
+/// protocol serializes as `<entry><key/><value/></entry>` is read back as the JSON object
+/// the comparison takes.
+async fn describe_topic(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<Option<Value>, Refusal> {
+    let parameters = vec![("TopicArn".to_string(), physical_resource_id.to_string())];
+    match call_query(
+        ctx,
+        SNS_SIGNING_NAME,
+        region,
+        SNS_API_VERSION,
+        "GetTopicAttributes",
+        &parameters,
+    )
+    .await
+    {
+        Ok(answered) => Ok(Some(Value::Object(xml_entry_map(&answered, "Attributes")))),
+        Err(refusal) if refusal.code == NOT_FOUND => Ok(None),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// The NAME of the topic a resource record describes: the `TopicName` its type's published
+/// return values carry, which is the name the template asked for or the
+/// `<stack>-<logical id>-<suffix>` name CloudFormation generated — never the physical id,
+/// which for this type is the topic's ARN.
+///
+/// A record with no such attribute (one whose attribute budget was spent) falls back to the
+/// last segment of that ARN, which is the topic's name.
+fn topic_name(resource: &StoredResource) -> String {
+    if let Some(name) = resource.attributes.get("TopicName") {
+        return name.clone();
+    }
+    resource
+        .physical_resource_id
+        .rsplit(':')
+        .next()
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// The `Attributes` map an `AWS::SNS::Topic`'s declared properties are, as `CreateTopic`
+/// takes them.
+///
+/// This type's properties ARE the topic's own attributes, named identically on both sides
+/// (`DisplayName`, `FifoTopic`, `KmsMasterKeyId`, `SignatureVersion`, `TracingConfig`,
+/// `ArchivePolicy`, `ContentBasedDeduplication`, `FifoThroughputScope`): CloudFormation's
+/// property names for the type are the attribute names
+/// `CreateTopic`/`SetTopicAttributes` document. So every property is passed through under
+/// its own name except the ones that are not attributes ([`NON_ATTRIBUTE_PROPERTIES`]) and
+/// `DeliveryStatusLogging`, whose entries are the per-protocol attributes
+/// [`delivery_status_attributes`] names.
+///
+/// An attribute value is a STRING on the wire, so a number or a boolean the template wrote
+/// as such is rendered as the text it is, and the policy attributes — documented as JSON
+/// objects — as the compact JSON of the object declared. A property SNS does not know is
+/// not filtered out here: the owning service's own validation is what judges an attribute,
+/// and its refusal leaves the stack `CREATE_FAILED` rather than a topic configured
+/// differently from the template.
+fn topic_attributes(properties: &Value) -> BTreeMap<String, String> {
+    let mut attributes = BTreeMap::new();
+    let Some(properties) = properties.as_object() else {
+        return attributes;
+    };
+    for (property, value) in properties {
+        if NON_ATTRIBUTE_PROPERTIES.contains(&property.as_str()) {
+            continue;
+        }
+        if property == DELIVERY_STATUS_LOGGING {
+            attributes.extend(delivery_status_attributes(value));
+            continue;
+        }
+        attributes.insert(property.clone(), attribute_text(value));
+    }
+    attributes
+}
+
+/// The topic attributes a `DeliveryStatusLogging` list declares: one entry per member each
+/// of its `LoggingConfig`s carries, under that config's protocol prefix
+/// ([`LOGGING_PROTOCOL_PREFIXES`]).
+///
+/// A member the config does not declare is absent. `Protocol` is required on a
+/// `LoggingConfig`, so an entry carrying none is a template error: its members go through
+/// under their BARE names, which are not topic attribute names, so SNS refuses them — the
+/// same way an unknown protocol spelling goes through as the template wrote it. Neither is
+/// dropped, which would configure the topic differently from what the template declared
+/// while the stack still completed.
+fn delivery_status_attributes(declared: &Value) -> BTreeMap<String, String> {
+    let mut attributes = BTreeMap::new();
+    for config in declared.as_array().map(Vec::as_slice).unwrap_or_default() {
+        let prefix = config
+            .get("Protocol")
+            .and_then(Value::as_str)
+            .map_or("", |protocol| {
+                LOGGING_PROTOCOL_PREFIXES
+                    .iter()
+                    .find(|(declared, _)| declared.eq_ignore_ascii_case(protocol))
+                    .map_or(protocol, |(_, prefix)| prefix)
+            });
+        for member in LOGGING_CONFIG_MEMBERS {
+            if let Some(value) = config.get(*member) {
+                attributes.insert(format!("{prefix}{member}"), attribute_text(value));
+            }
+        }
+    }
+    attributes
+}
+
+/// The `Tags` list an `AWS::SNS::Topic`'s `Tags` property is, as `CreateTopic` takes it:
+/// the same `{Key, Value}` pairs, since SNS's own `Tag` shape spells its members `Key` and
+/// `Value` too. A tag with no key is not a tag and is dropped rather than sent as an empty
+/// one.
+fn topic_tags(properties: &Value) -> Vec<(String, String)> {
+    properties
+        .get("Tags")
+        .and_then(Value::as_array)
+        .map(|tags| {
+            tags.iter()
+                .filter_map(|tag| {
+                    let key = tag.get("Key").and_then(Value::as_str)?;
+                    if key.is_empty() {
+                        return None;
+                    }
+                    Some((
+                        key.to_string(),
+                        tag.get("Value").map(attribute_text).unwrap_or_default(),
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The `Subscribe` parameters each entry of a `Subscription` property declares: its
+/// `Protocol` and its `Endpoint`, named identically on both sides. A member the entry does
+/// not declare is absent from the call, so SNS's own validation is what refuses an
+/// incomplete subscription.
+fn declared_subscriptions(properties: &Value) -> Vec<Vec<(String, String)>> {
+    properties
+        .get("Subscription")
+        .and_then(Value::as_array)
+        .map(|declared| {
+            declared
+                .iter()
+                .map(|subscription| {
+                    ["Protocol", "Endpoint"]
+                        .iter()
+                        .filter_map(|member| {
+                            let value = subscription.get(*member)?;
+                            Some(((*member).to_string(), attribute_text(value)))
+                        })
+                        .collect()
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+// ---------------------------------------------------------------------------
+// AWS Fault Injection Service: AWS::FIS::ExperimentTemplate
+// ---------------------------------------------------------------------------
+
+/// AWS FIS's signing name, from its model (`sigv4Name: fis`). FIS speaks `restJson1`, so
+/// its operations are bound to a METHOD and a URI rather than to an `X-Amz-Target` header:
+/// `CreateExperimentTemplate` is `POST /experimentTemplates` and
+/// `DeleteExperimentTemplate` is `DELETE /experimentTemplates/{id}`
+/// (`smithy_query(query="operation", operation="CreateExperimentTemplate,\
+/// DeleteExperimentTemplate")` on that service's model).
+const FIS_SIGNING_NAME: &str = "fis";
+
+/// The URI `CreateExperimentTemplate` is bound to.
+const FIS_EXPERIMENT_TEMPLATES_URI: &str = "/experimentTemplates";
+
+/// The error code FIS answers for an experiment template it does not hold
+/// (`ResourceNotFoundException`, a modelled error of `DeleteExperimentTemplate`).
+const FIS_RESOURCE_NOT_FOUND: &str = "ResourceNotFoundException";
+
+/// The `AWS::FIS::ExperimentTemplate` properties `CreateExperimentTemplate` takes whose
+/// value goes through unchanged under its lower-camel member name, as (property, member)
+/// pairs.
+///
+/// Source: AWS's CloudFormation resource reference for the type against the
+/// `CreateExperimentTemplateRequest` shape. The FIS model spells its members in lower
+/// camel case and renames nothing, so the only difference is the first character's case;
+/// `StopConditions`, `Targets`, `Actions`, `LogConfiguration` and `ExperimentOptions` are
+/// NOT here because their own members have to be re-cased one structure at a time (a map
+/// of targets or of actions is keyed by names the TEMPLATE chose, which must not be
+/// re-cased), and `Tags` is not because the type spells it as a map of tag keys the
+/// template chose.
+const FIS_SCALAR_MEMBERS: &[(&str, &str)] =
+    &[("Description", "description"), ("RoleArn", "roleArn")];
+
+/// The members of one `ExperimentTemplateStopCondition` the type declares.
+const FIS_STOP_CONDITION_MEMBERS: &[(&str, &str)] = &[("Source", "source"), ("Value", "value")];
+
+/// The members of one `ExperimentTemplateTarget` the type declares. `ResourceTags` and
+/// `Parameters` are maps keyed by DATA (tag keys, and the target parameter names the
+/// resource type publishes), so their values go through as the template wrote them.
+const FIS_TARGET_MEMBERS: &[(&str, &str)] = &[
+    ("ResourceType", "resourceType"),
+    ("SelectionMode", "selectionMode"),
+    ("ResourceArns", "resourceArns"),
+    ("ResourceTags", "resourceTags"),
+    ("Parameters", "parameters"),
+];
+
+/// The members of one `ExperimentTemplateTargetFilter`, which a target's `Filters` list
+/// carries.
+const FIS_FILTER_MEMBERS: &[(&str, &str)] = &[("Path", "path"), ("Values", "values")];
+
+/// The members of one `ExperimentTemplateAction` the type declares. `Parameters` is keyed
+/// by the action's published parameter names and `Targets` by the action's published target
+/// names, so both go through as the template wrote them.
+const FIS_ACTION_MEMBERS: &[(&str, &str)] = &[
+    ("ActionId", "actionId"),
+    ("Description", "description"),
+    ("Parameters", "parameters"),
+    ("Targets", "targets"),
+    ("StartAfter", "startAfter"),
+];
+
+/// The members of the type's `LogConfiguration` property, and of the two configurations it
+/// nests.
+const FIS_LOG_CONFIGURATION_MEMBERS: &[(&str, &str)] = &[("LogSchemaVersion", "logSchemaVersion")];
+const FIS_CLOUDWATCH_LOGS_MEMBERS: &[(&str, &str)] = &[("LogGroupArn", "logGroupArn")];
+const FIS_S3_LOG_MEMBERS: &[(&str, &str)] = &[("BucketName", "bucketName"), ("Prefix", "prefix")];
+
+/// The members of the type's `ExperimentOptions` property.
+const FIS_EXPERIMENT_OPTIONS_MEMBERS: &[(&str, &str)] = &[
+    ("AccountTargeting", "accountTargeting"),
+    ("EmptyTargetResolutionMode", "emptyTargetResolutionMode"),
+];
+
+/// The one property of the type this provisioner does not map onto the create's request.
+const FIS_REPORT_CONFIGURATION: &str = "ExperimentReportConfiguration";
+
+/// Create the experiment template an `AWS::FIS::ExperimentTemplate` declares, so a client
+/// that reads the id out of the stack's outputs can call FIS with it
+/// (`GetExperimentTemplate`, `StartExperiment`) rather than being handed an id FIS never
+/// minted.
+///
+/// FIS ASSIGNS the id — `Ref` of this type returns it, and the type has no name property —
+/// so the id this call answers with becomes the resource's physical id, replacing the
+/// stand-in the naming rules computed, and is reported back as the `Id` attribute
+/// `Fn::GetAtt` reads.
+///
+/// `clientToken` is the create's `@idempotencyToken`, required by the model: it is the
+/// computed physical id, which is a function of the stack and the resource's logical id, so
+/// the same declaration of the same stack asks for the same template rather than a second
+/// one.
+async fn create_experiment_template(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<Created, Refusal> {
+    let properties = resource
+        .properties
+        .as_object()
+        .cloned()
+        .unwrap_or_else(Map::new);
+    if properties.contains_key(FIS_REPORT_CONFIGURATION) {
+        // The property is not mapped onto `CreateExperimentTemplate`'s own
+        // `experimentReportConfiguration`, so creating the template would create one
+        // configured differently from the declaration. Refused rather than silently
+        // dropped; mapping it is its own fix.
+        return Err(Refusal {
+            code: "NotImplemented".to_string(),
+            message: format!(
+                "this emulator does not implement the {FIS_REPORT_CONFIGURATION} property of \
+                 {}",
+                resource.resource_type
+            ),
+        });
+    }
+    let mut request = Map::new();
+    request.insert(
+        "clientToken".to_string(),
+        Value::String(resource.physical_resource_id.clone()),
+    );
+    copy_members(&properties, FIS_SCALAR_MEMBERS, &mut request);
+    if let Some(Value::Array(conditions)) = properties.get("StopConditions") {
+        let conditions: Vec<Value> = conditions
+            .iter()
+            .map(|condition| mapped_members(condition, FIS_STOP_CONDITION_MEMBERS))
+            .collect();
+        request.insert("stopConditions".to_string(), Value::Array(conditions));
+    }
+    if let Some(Value::Object(targets)) = properties.get("Targets") {
+        let targets: Map<String, Value> = targets
+            .iter()
+            .map(|(name, target)| (name.clone(), experiment_target(target)))
+            .collect();
+        request.insert("targets".to_string(), Value::Object(targets));
+    }
+    if let Some(Value::Object(actions)) = properties.get("Actions") {
+        let actions: Map<String, Value> = actions
+            .iter()
+            .map(|(name, action)| (name.clone(), mapped_members(action, FIS_ACTION_MEMBERS)))
+            .collect();
+        request.insert("actions".to_string(), Value::Object(actions));
+    }
+    if let Some(configuration) = properties.get("LogConfiguration") {
+        request.insert(
+            "logConfiguration".to_string(),
+            log_configuration(configuration),
+        );
+    }
+    if let Some(options) = properties.get("ExperimentOptions") {
+        request.insert(
+            "experimentOptions".to_string(),
+            mapped_members(options, FIS_EXPERIMENT_OPTIONS_MEMBERS),
+        );
+    }
+    if let Some(tags) = experiment_template_tags(&properties) {
+        request.insert("tags".to_string(), Value::Object(tags));
+    }
+    let reported = call_rest_json(
+        ctx,
+        FIS_SIGNING_NAME,
+        region,
+        "POST",
+        FIS_EXPERIMENT_TEMPLATES_URI,
+        Some(&Value::Object(request)),
+    )
+    .await?;
+    let Some(id) = reported
+        .get("experimentTemplate")
+        .and_then(|template| template.get("id"))
+        .and_then(Value::as_str)
+    else {
+        // FIS answered a success carrying no id, so there is nothing a client could call
+        // it with: reported as a refusal rather than recorded as a created resource.
+        return Err(Refusal {
+            code: "InternalFailure".to_string(),
+            message: "CreateExperimentTemplate answered no experiment template id".to_string(),
+        });
+    };
+    let mut attributes = BTreeMap::new();
+    attributes.insert("Id".to_string(), id.to_string());
+    Ok(Created {
+        physical_resource_id: Some(id.to_string()),
+        attributes,
+    })
+}
+
+/// Delete the experiment template a stack created, by the id FIS minted for it — this
+/// resource's physical id. A template FIS no longer holds
+/// (`ResourceNotFoundException`) is already in the state the delete asks for.
+async fn delete_experiment_template(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<(), Refusal> {
+    match call_rest_json(
+        ctx,
+        FIS_SIGNING_NAME,
+        region,
+        "DELETE",
+        &format!("{FIS_EXPERIMENT_TEMPLATES_URI}/{physical_resource_id}"),
+        None,
+    )
+    .await
+    {
+        Ok(_) => Ok(()),
+        Err(refusal) if refusal.code == FIS_RESOURCE_NOT_FOUND => Ok(()),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// The experiment template's configuration as FIS reports it, for drift detection:
+/// `GetExperimentTemplate`'s own record, read by the id FIS minted.
+///
+/// A template FIS no longer holds (`ResourceNotFoundException`) was deleted. The record's
+/// members are FIS's own (lower camel), so only a declared property spelled identically on
+/// both sides takes part in the comparison — the position the Amazon ECS arm above is in
+/// too, and what [`super::drift`] documents: a name mismatch reports the resource as
+/// existing rather than as modified.
+async fn describe_experiment_template(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<Option<Value>, Refusal> {
+    match call_rest_json(
+        ctx,
+        FIS_SIGNING_NAME,
+        region,
+        "GET",
+        &format!("{FIS_EXPERIMENT_TEMPLATES_URI}/{physical_resource_id}"),
+        None,
+    )
+    .await
+    {
+        Ok(answer) => Ok(answer.get("experimentTemplate").cloned()),
+        Err(refusal) if refusal.code == FIS_RESOURCE_NOT_FOUND => Ok(None),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// One `ExperimentTemplateTarget` as `CreateExperimentTemplate` takes it: its own members
+/// re-cased, and its `Filters` list — whose entries are modelled structures of their own —
+/// mapped entry by entry.
+fn experiment_target(target: &Value) -> Value {
+    let mut mapped = mapped_members(target, FIS_TARGET_MEMBERS);
+    if let Some(Value::Array(filters)) = target.get("Filters") {
+        let filters: Vec<Value> = filters
+            .iter()
+            .map(|filter| mapped_members(filter, FIS_FILTER_MEMBERS))
+            .collect();
+        if let Value::Object(members) = &mut mapped {
+            members.insert("filters".to_string(), Value::Array(filters));
+        }
+    }
+    mapped
+}
+
+/// The type's `LogConfiguration` property as `CreateExperimentTemplate` takes it: its own
+/// member plus the two nested configurations, each mapped member by member.
+fn log_configuration(configuration: &Value) -> Value {
+    let mut mapped = mapped_members(configuration, FIS_LOG_CONFIGURATION_MEMBERS);
+    let Value::Object(members) = &mut mapped else {
+        return mapped;
+    };
+    if let Some(logs) = configuration.get("CloudWatchLogsConfiguration") {
+        members.insert(
+            "cloudWatchLogsConfiguration".to_string(),
+            mapped_members(logs, FIS_CLOUDWATCH_LOGS_MEMBERS),
+        );
+    }
+    if let Some(s3) = configuration.get("S3Configuration") {
+        members.insert(
+            "s3Configuration".to_string(),
+            mapped_members(s3, FIS_S3_LOG_MEMBERS),
+        );
+    }
+    mapped
+}
+
+/// The `tags` map an `AWS::FIS::ExperimentTemplate`'s `Tags` property is.
+///
+/// The type spells its tags as a MAP of tag key to value, which is the shape
+/// `CreateExperimentTemplate`'s own `tags` member takes, so such a declaration goes
+/// through as written. A declaration that wrote CloudFormation's other tag spelling — the
+/// `[{Key, Value}]` list most resource types use — is converted by [`tag_map`], so the tags
+/// the template asked for reach FIS either way. `None` where the template declares none.
+fn experiment_template_tags(properties: &Map<String, Value>) -> Option<Map<String, Value>> {
+    match properties.get("Tags")? {
+        Value::Object(tags) => Some(tags.clone()),
+        list @ Value::Array(_) => Some(tag_map(list)),
+        _ => None,
+    }
+}
+
+/// One declared structure with the members `pairs` names mapped onto the member names the
+/// owning service's model spells, and every value passed through as the template wrote it.
+///
+/// A property `pairs` does not name is one the create has no member for, so it is not
+/// sent: the request carries what the declaration said and nothing invented.
+fn mapped_members(declared: &Value, pairs: &[(&str, &str)]) -> Value {
+    let mut mapped = Map::new();
+    if let Some(members) = declared.as_object() {
+        copy_members(members, pairs, &mut mapped);
+    }
+    Value::Object(mapped)
+}
+
+/// Copy the members `pairs` names out of `declared` into `request`, under the member name
+/// each pair gives.
+fn copy_members(
+    declared: &Map<String, Value>,
+    pairs: &[(&str, &str)],
+    request: &mut Map<String, Value>,
+) {
+    for (property, member) in pairs {
+        if let Some(value) = declared.get(*property) {
+            request.insert((*member).to_string(), value.clone());
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AWS WAF Classic, regional: AWS::WAFRegional::IPSet
+// ---------------------------------------------------------------------------
+
+/// AWS WAF Classic Regional's signing name and `X-Amz-Target` prefix, from its model
+/// (`sigv4Name: waf-regional`, service shape `AWSWAF_Regional_20161128`), which speaks
+/// `awsJson1_1`.
+const WAF_REGIONAL_SIGNING_NAME: &str = "waf-regional";
+const WAF_REGIONAL_TARGET_PREFIX: &str = "AWSWAF_Regional_20161128";
+
+/// The error code AWS WAF Classic answers for an object it does not hold
+/// (`WAFNonexistentItemException`: "the referenced object doesn't exist"), and the one
+/// `UpdateIPSet` answers when the IPSet the updates are for is not there at all
+/// (`WAFNonexistentContainerException`: "you tried to add an IP address to or delete an IP
+/// address from an IPSet that doesn't exist").
+const WAF_NONEXISTENT_ITEM: &str = "WAFNonexistentItemException";
+const WAF_NONEXISTENT_CONTAINER: &str = "WAFNonexistentContainerException";
+
+/// The two `ChangeAction` values an `UpdateIPSet` update carries: "whether to insert or
+/// delete the IP address".
+const WAF_INSERT: &str = "INSERT";
+const WAF_DELETE: &str = "DELETE";
+
+/// Create the IPSet an `AWS::WAFRegional::IPSet` declares, and answer the `IPSetId` AWS WAF
+/// Classic minted as the resource's physical id — "Ref returns the IPSet ID", which is a
+/// value only that service produces.
+///
+/// The type's properties are `Name` and `IPSetDescriptors`, and AWS WAF Classic takes them
+/// through the two calls its own documentation sequences: "Submit a CreateIPSet request …
+/// Submit an UpdateIPSet request to specify the IP addresses that you want AWS WAF to watch
+/// for". So the create carries the name, and each declared descriptor is INSERTed by one
+/// update. Every mutating call carries its own change token ("Use GetChangeToken to get the
+/// change token that you provide in the ChangeToken parameter"), so a resource whose
+/// descriptors the template declares is created with them rather than with the name alone.
+async fn create_ip_set(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<Created, Refusal> {
+    let request = serde_json::json!({
+        "Name": ip_set_name(resource),
+        "ChangeToken": waf_regional_change_token(ctx, region).await?,
+    });
+    let reported = call_waf_regional(ctx, region, "CreateIPSet", &request).await?;
+    let Some(ip_set_id) = reported
+        .pointer("/IPSet/IPSetId")
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+    else {
+        // The create answered success and identified nothing, so there is no id to address
+        // the IPSet by: not something this stack can report as a created resource.
+        return Err(Refusal {
+            code: "InternalFailure".to_string(),
+            message: "CreateIPSet answered no IPSet.IPSetId".to_string(),
+        });
+    };
+    let descriptors = declared_ip_set_descriptors(&resource.properties);
+    if !descriptors.is_empty() {
+        let updates: Vec<Value> = descriptors
+            .into_iter()
+            .map(|descriptor| {
+                serde_json::json!({ "Action": WAF_INSERT, "IPSetDescriptor": descriptor })
+            })
+            .collect();
+        if let Err(refusal) = update_ip_set(ctx, region, &ip_set_id, updates).await {
+            // The resource the template declares is the IPSet WITH its addresses, and this
+            // create could not make it. The empty IPSet the first call left is deleted
+            // again, so a create the stack reports as failed leaves nothing behind in the
+            // owning service; the refusal reported is the one that failed.
+            let _ = delete_ip_set(ctx, region, &ip_set_id).await;
+            return Err(refusal);
+        }
+    }
+    Ok(Created {
+        physical_resource_id: Some(ip_set_id),
+        attributes: BTreeMap::new(),
+    })
+}
+
+/// Delete the IPSet a stack created.
+///
+/// "You can't delete an IPSet if it still includes any IP addresses", so the addresses go
+/// first, which is the sequence AWS WAF Classic documents for permanently deleting one:
+/// "Update the IPSet to remove IP address ranges, if any. Submit a DeleteIPSet request".
+/// The IPSet is read back, every descriptor it still holds is DELETEd by one update, and
+/// the IPSet itself is then deleted.
+///
+/// An IPSet AWS WAF Classic no longer holds is already in the state the delete asks for,
+/// judged on its own not-found CODES (`WAFNonexistentItemException` from the read and the
+/// delete, `WAFNonexistentContainerException` from the update that empties it) and never on
+/// a message, which carries the request's own id. One a Rule still references is NOT
+/// deleted (`WAFReferencedItemException`), and that refusal is what the stack reports.
+async fn delete_ip_set(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<(), Refusal> {
+    let Some(ip_set) = describe_ip_set(ctx, region, physical_resource_id).await? else {
+        return Ok(());
+    };
+    let descriptors = ip_set
+        .get("IPSetDescriptors")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if !descriptors.is_empty() {
+        let updates: Vec<Value> = descriptors
+            .into_iter()
+            .map(|descriptor| {
+                serde_json::json!({ "Action": WAF_DELETE, "IPSetDescriptor": descriptor })
+            })
+            .collect();
+        match update_ip_set(ctx, region, physical_resource_id, updates).await {
+            Ok(()) => {}
+            Err(refusal) if refusal.code == WAF_NONEXISTENT_CONTAINER => return Ok(()),
+            Err(refusal) => return Err(refusal),
+        }
+    }
+    let request = serde_json::json!({
+        "IPSetId": physical_resource_id,
+        "ChangeToken": waf_regional_change_token(ctx, region).await?,
+    });
+    match call_waf_regional(ctx, region, "DeleteIPSet", &request).await {
+        Ok(_) => Ok(()),
+        Err(refusal) if refusal.code == WAF_NONEXISTENT_ITEM => Ok(()),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// The IPSet as AWS WAF Classic reports it, for drift detection and for the delete that has
+/// to empty it first. An IPSet it no longer holds (`WAFNonexistentItemException`) was
+/// deleted.
+///
+/// The `IPSet` the read answers carries `Name` and `IPSetDescriptors` under exactly the
+/// names the type's properties have, so it is the actual configuration the declared one is
+/// compared against.
+async fn describe_ip_set(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<Option<Value>, Refusal> {
+    let request = serde_json::json!({ "IPSetId": physical_resource_id });
+    match call_waf_regional(ctx, region, "GetIPSet", &request).await {
+        Ok(answer) => Ok(Some(reported_member(&answer, "IPSet"))),
+        Err(refusal) if refusal.code == WAF_NONEXISTENT_ITEM => Ok(None),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// Apply one batch of `Updates` to an IPSet, under a change token of its own.
+async fn update_ip_set(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    ip_set_id: &str,
+    updates: Vec<Value>,
+) -> Result<(), Refusal> {
+    let request = serde_json::json!({
+        "IPSetId": ip_set_id,
+        "ChangeToken": waf_regional_change_token(ctx, region).await?,
+        "Updates": updates,
+    });
+    call_waf_regional(ctx, region, "UpdateIPSet", &request)
+        .await
+        .map(|_| ())
+}
+
+/// The `IPSetDescriptors` an `AWS::WAFRegional::IPSet` declares, as `UpdateIPSet` takes
+/// them.
+///
+/// An `IPSetDescriptor` is `{Type, Value}` on both sides — the property's members are the
+/// API shape's own — so each entry goes through as the template wrote it. A declaration
+/// AWS WAF Classic will not take is not filtered out here: that service's own validation is
+/// what judges a descriptor, and its refusal leaves the stack `CREATE_FAILED` rather than
+/// an IPSet configured differently from the template.
+fn declared_ip_set_descriptors(properties: &Value) -> Vec<Value> {
+    properties
+        .get("IPSetDescriptors")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// The NAME of the IPSet a resource record declares: the `Name` its type's property
+/// carries, which is the name the template asked for or the `<stack>-<logical id>-<suffix>`
+/// name CloudFormation generated for it — never the physical id, which for this type is the
+/// id AWS WAF Classic minted once the create went through.
+///
+/// A record with no such attribute (one whose attribute budget was spent) falls back to the
+/// physical id, which before the create IS that computed name.
+fn ip_set_name(resource: &StoredResource) -> String {
+    resource
+        .attributes
+        .get("Name")
+        .cloned()
+        .unwrap_or_else(|| resource.physical_resource_id.clone())
+}
+
+/// A change token for one mutating AWS WAF Classic call. "Each create, update, or delete
+/// request must use a unique change token", so one is fetched per call rather than reused.
+async fn waf_regional_change_token(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+) -> Result<String, Refusal> {
+    let answer = call_waf_regional(ctx, region, "GetChangeToken", &serde_json::json!({})).await?;
+    answer
+        .get("ChangeToken")
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+        .ok_or_else(|| Refusal {
+            code: "InternalFailure".to_string(),
+            message: "GetChangeToken answered no ChangeToken".to_string(),
+        })
+}
+
+/// Call one AWS WAF Classic Regional operation on the awsJson1_1 wire its model declares.
+async fn call_waf_regional(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    operation: &str,
+    request: &Value,
+) -> Result<Value, Refusal> {
+    call_json_rpc(
+        ctx,
+        WAF_REGIONAL_SIGNING_NAME,
+        region,
+        AWS_JSON_1_1,
+        &format!("{WAF_REGIONAL_TARGET_PREFIX}.{operation}"),
+        request,
+    )
+    .await
 }
 
 #[cfg(test)]

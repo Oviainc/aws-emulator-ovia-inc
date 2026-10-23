@@ -8,13 +8,20 @@
 //! `DeleteConnectionRecordingPreferences` removes it — so the whole service is the
 //! lifecycle of the one [`RecordingPrefsRecord`] held here.
 //!
-//! Besides the record this module owns the two rules both mutating operations share,
-//! so neither handler can drift from the other:
+//! Besides the record this module owns the rules the operations share, so no handler
+//! can drift from another:
 //!
 //! * [`refuse_preferences`] — the modeled constraints on
 //!   `ConnectionRecordingPreferences` that the framework's boundary validator cannot
 //!   enforce (see that function's own docs), reported in the same
 //!   `ValidationException` envelope the boundary uses.
+//! * [`constraint_message`] — how THIS service words a `@length` bound the boundary
+//!   validator refused, which is not the framework's aggregated envelope.
+//! * [`resource_not_found_message`] — the one template every path reports the absent
+//!   singleton with.
+//! * the account-level just-in-time node access gate
+//!   ([`ComAmazonawsSsmguiconnectSsmguiconnectState::just_in_time_node_access_enabled`]),
+//!   which `UpdateConnectionRecordingPreferences` is refused by.
 //! * [`mint_client_token`] — the service-provided value for an `@idempotencyToken`
 //!   member the caller left unset.
 //! * [`audit`] — the structured access record every operation emits, so a call to this
@@ -52,6 +59,19 @@ pub struct ComAmazonawsSsmguiconnectSsmguiconnectState {
     /// `None` means never configured (or deleted), which every read reports as
     /// `ResourceNotFoundException`.
     connection_recording_preferences: Option<RecordingPrefsRecord>,
+    /// Whether this account/Region is enrolled in just-in-time node access, the
+    /// account-level feature `UpdateConnectionRecordingPreferences` is gated by.
+    ///
+    /// `false` is the state of an account nobody has enrolled, which is what the
+    /// default is: enrollment is performed by SSM Quick Setup's just-in-time node
+    /// access configuration — a different API, which this service does not model and
+    /// this emulator does not implement — so no operation of THIS service turns it on.
+    /// It is state rather than a constant because the gate is a property of the
+    /// account, not of the request: whoever enrolls the account (an enrollment path
+    /// this emulator grows later, or a test standing the enrolled account up) sets it
+    /// through [`ComAmazonawsSsmguiconnectSsmguiconnectState::set_just_in_time_node_access_enabled`]
+    /// and every later Update reads it back.
+    just_in_time_node_access_enabled: bool,
     /// First outcome per `@idempotencyToken`, so replaying an `@idempotent`
     /// Update/Delete with the same `ClientToken` returns that outcome instead of
     /// mutating twice. Keyed by operation as well as token: the same token
@@ -120,6 +140,21 @@ impl ComAmazonawsSsmguiconnectSsmguiconnectState {
         self.connection_recording_preferences.as_ref()
     }
 
+    /// Whether this account/Region is enrolled in just-in-time node access. `false`
+    /// until something enrolls it, which is what the Update gate reads.
+    pub fn just_in_time_node_access_enabled(&self) -> bool {
+        self.just_in_time_node_access_enabled
+    }
+
+    /// Enroll (or un-enroll) this account/Region in just-in-time node access.
+    ///
+    /// The ONE writer of the gate's flag. No modelled operation of this service calls
+    /// it — enrollment belongs to SSM Quick Setup — so it exists for whoever stands an
+    /// enrolled account up.
+    pub fn set_just_in_time_node_access_enabled(&mut self, enabled: bool) {
+        self.just_in_time_node_access_enabled = enabled;
+    }
+
     /// Create-or-REPLACE the singleton, and record the outcome under `record`'s own
     /// `ClientToken`. The stored value is exactly `record`, never a merge with what
     /// was there before.
@@ -129,16 +164,20 @@ impl ComAmazonawsSsmguiconnectSsmguiconnectState {
         self.record_outcome(key, StoredResponse::Updated(record));
     }
 
-    /// Remove the singleton and record the outcome under `client_token`. `false` when
-    /// there was nothing to remove, in which case nothing is recorded either — a call
-    /// that failed has no outcome to replay.
+    /// Remove the singleton and record the outcome under `client_token`.
+    ///
+    /// SUCCEEDS whether or not anything was configured: Delete is `@idempotent`, and
+    /// "there are no preferences now" is the state it is asked for, not a resource it
+    /// failed to find. The outcome is therefore recorded on both paths — a replay of
+    /// the token answers the same way the first call did.
+    ///
+    /// The returned flag says whether a record was actually removed, which is what the
+    /// caller audits; it is not a success/failure signal.
     pub fn remove_preferences(&mut self, client_token: &str) -> bool {
-        if self.connection_recording_preferences.take().is_none() {
-            return false;
-        }
+        let removed = self.connection_recording_preferences.take().is_some();
         let key = (IdempotentOperation::Delete, client_token.to_string());
         self.record_outcome(key, StoredResponse::Deleted);
-        true
+        removed
     }
 
     /// The outcome a replay of `key` should answer with, or `None` when the call has
@@ -223,6 +262,148 @@ impl RecordingPrefsRecord {
         }
     }
 }
+
+/// The resource name this service reports the connection recording preferences
+/// singleton as, in [`resource_not_found_message`]. It is the resource
+/// `GetConnectionRecordingPreferences` and `DeleteConnectionRecordingPreferences`
+/// address, and the shape the model names it with
+/// (`smithy_query(query="shape", shape="ConnectionRecordingPreferences")`).
+pub const CONNECTION_RECORDING_PREFERENCES: &str = "ConnectionRecordingPreferences";
+
+/// This service's `ResourceNotFoundException` message: a fixed template naming the
+/// resource that could not be found, never free prose about the account or Region.
+///
+/// The ONE place the text is built, so Get, Delete and any later reader report an
+/// absent resource identically and a client can parse WHICH resource was missing.
+///
+/// The doubled space is the template's own: the service interpolates a resource-type
+/// qualifier before `resource` that is empty for this resource, and the recorded
+/// AWS text (`The following  resource cannot be found: '…'`) carries the gap it
+/// leaves. Reproduced rather than tidied — a client matching the template sees the
+/// service's text, not ours.
+pub fn resource_not_found_message(resource: &str) -> String {
+    format!("The following  resource cannot be found: '{resource}'")
+}
+
+/// Whether a `@length` bound on a member counts characters or collection values,
+/// which is what decides the sentence [`constraint_message`] states.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BoundedKind {
+    /// A string member: the bound is on its length.
+    Characters,
+    /// A list member: the bound is on how many values it holds.
+    Values,
+}
+
+/// Every `@length`-constrained member of this service's input shapes, keyed by the
+/// dotted lowerCamel path the framework's boundary walk reports a violation at.
+///
+/// Source: `smithy_query(query="closure",
+/// operation="UpdateConnectionRecordingPreferences,DeleteConnectionRecordingPreferences")`
+/// on this service's model — `ClientToken` `@length(1, 64)` (both operations),
+/// `ConnectionRecordingPreferences$KMSKeyArn` `@length(1, 2048)` and
+/// `RecordingDestinations$S3Buckets` `@length(1, 1)`. The BOUNDS are not repeated
+/// here: the violation the framework hands over already carries the bound it broke,
+/// so this table cannot drift from the model's numbers.
+///
+/// The paths are the framework's own spelling (`path::member` lowercases a member's
+/// first character only), which is why `KMSKeyArn` appears as `kMSKeyArn`.
+const LENGTH_BOUNDED_MEMBERS: &[(&str, BoundedKind)] = &[
+    ("clientToken", BoundedKind::Characters),
+    (
+        "connectionRecordingPreferences.kMSKeyArn",
+        BoundedKind::Characters,
+    ),
+    (
+        "connectionRecordingPreferences.recordingDestinations.s3Buckets",
+        BoundedKind::Values,
+    ),
+];
+
+/// How THIS service words a boundary `@length` refusal, or `None` when it words the
+/// refusal the way the framework does.
+///
+/// SSM GuiConnect states a constraint violation as ONE sentence naming the member
+/// path and the bound it broke — no `N validation error(s) detected` prefix, and no
+/// echo of the offending value, which it withholds. The sentence is built from the
+/// request (the member the caller sent and the bound the model declares for it), so
+/// it carries no text keyed to any particular request.
+///
+/// With several violations the first one this service words is stated, because the
+/// form is a single sentence rather than an envelope of clauses. A violation of
+/// anything other than a `@length` bound (a `@pattern`, an absent `@required` member)
+/// keeps the framework's wording: those are not the two forms recorded for this
+/// service, so inventing a third would be guessing.
+pub fn constraint_message(violations: &[Violation]) -> Option<String> {
+    violations.iter().find_map(length_bound_sentence)
+}
+
+/// The sentence for one `@length` violation, or `None` when this service does not
+/// word that violation itself.
+fn length_bound_sentence(violation: &Violation) -> Option<String> {
+    let (_, bounded) = LENGTH_BOUNDED_MEMBERS
+        .iter()
+        .find(|(path, _)| *path == violation.path)?;
+    let member = model_member_path(&violation.path);
+    match (bounded, &violation.kind) {
+        // The recorded forms: a string's upper bound and a list's lower bound. The
+        // other side of each bound is the same sentence with the other comparison,
+        // which is how the two recorded sentences already differ from each other.
+        (BoundedKind::Characters, ViolationKind::MaxLength(max)) => {
+            Some(format!("The length for {member} cannot be greater than {max}."))
+        }
+        (BoundedKind::Characters, ViolationKind::MinLength(min)) => {
+            Some(format!("The length for {member} cannot be less than {min}."))
+        }
+        (BoundedKind::Values, ViolationKind::MinLength(min)) => Some(format!(
+            "{member} must contain at least {min} {}.",
+            values(*min)
+        )),
+        (BoundedKind::Values, ViolationKind::MaxLength(max)) => Some(format!(
+            "{member} cannot contain more than {max} {}.",
+            values(*max)
+        )),
+        _ => None,
+    }
+}
+
+/// `value` / `values`, agreeing with the count the sentence states.
+fn values(count: i64) -> &'static str {
+    if count == 1 {
+        "value"
+    } else {
+        "values"
+    }
+}
+
+/// A violation path as the MODEL spells the members it names:
+/// `connectionRecordingPreferences.recordingDestinations.s3Buckets` ->
+/// `ConnectionRecordingPreferences.RecordingDestinations.S3Buckets`.
+///
+/// The framework builds a path segment by lowercasing a member name's FIRST character
+/// (`path::member`), so uppercasing it back recovers the model's own name exactly —
+/// including `S3Buckets` and `KMSKeyArn`, whose later characters it never touched.
+fn model_member_path(path: &str) -> String {
+    path.split('.')
+        .map(|segment| {
+            let mut chars = segment.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().chain(chars).collect::<String>(),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<String>>()
+        .join(".")
+}
+
+/// AWS's denial text for an account that is not enrolled in just-in-time node access.
+///
+/// It is what distinguishes the FEATURE gate from an IAM denial, which is the only
+/// reason the wording matters: the requirement is the rejection class (HTTP 403,
+/// `AccessDeniedException`), and this is the recorded example of the gate's own
+/// message.
+pub const JUST_IN_TIME_NODE_ACCESS_DISABLED: &str = "Just-in-time node access is not enabled. \
+     You must set up just-in-time node access to record RDP connections.";
 
 /// The modeled `@pattern` of `S3Bucket$BucketName`, copied verbatim from
 /// `smithy_query(query="shape", shape="S3Bucket")` on this service's model.
@@ -437,10 +618,16 @@ pub enum AuditOutcome {
     PreferencesDeleted,
     /// The singleton was reported to a reader.
     PreferencesRead,
+    /// A Delete found nothing configured, which is the state it was asked for: the
+    /// call succeeded and removed nothing.
+    PreferencesAlreadyAbsent,
     /// An `@idempotent` call replayed an earlier outcome and changed nothing.
     IdempotentReplay,
     /// The request was refused as invalid (400).
     ValidationRefused,
+    /// The caller was refused by the account-level just-in-time node access gate
+    /// (403).
+    AccessDenied,
     /// There was no configured singleton to report or remove (404).
     NotFound,
     /// The service's own store was unreachable (500).
@@ -454,8 +641,10 @@ impl AuditOutcome {
             Self::PreferencesWritten => "preferences-written",
             Self::PreferencesDeleted => "preferences-deleted",
             Self::PreferencesRead => "preferences-read",
+            Self::PreferencesAlreadyAbsent => "preferences-already-absent",
             Self::IdempotentReplay => "idempotent-replay",
             Self::ValidationRefused => "validation-refused",
+            Self::AccessDenied => "access-denied",
             Self::NotFound => "not-found",
             Self::StoreUnavailable => "store-unavailable",
         }

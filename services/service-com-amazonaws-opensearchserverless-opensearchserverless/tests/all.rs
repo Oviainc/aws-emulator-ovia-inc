@@ -17,6 +17,8 @@ mod access_policy;
 mod account_settings;
 #[path = "all/collection_group_capacity.rs"]
 mod collection_group_capacity;
+#[path = "all/collection_group_delete.rs"]
+mod collection_group_delete;
 #[path = "all/collection_group_lifecycle.rs"]
 mod collection_group_lifecycle;
 #[path = "all/collection_lifecycle.rs"]

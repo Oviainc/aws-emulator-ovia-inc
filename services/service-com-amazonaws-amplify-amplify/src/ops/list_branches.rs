@@ -181,10 +181,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let (branches, next_token) = crate::state::page(
-            app.branches.iter().map(|(branch_name, branch)| {
+            app.branches.iter().map(|(branch_name, stored)| {
                 (
                     branch_name.clone(),
-                    BranchProjection::reported(branch.clone()),
+                    BranchProjection::reported(stored.branch.clone()),
                 )
             }),
             input.next_token.as_deref(),

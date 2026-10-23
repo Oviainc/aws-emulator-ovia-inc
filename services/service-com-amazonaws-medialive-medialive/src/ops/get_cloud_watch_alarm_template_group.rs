@@ -166,10 +166,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
 /// No group in this region answers to the requested identifier, by either of the
 /// two forms `Identifier` documents (its id or its current name).
+///
+/// Worded by the service's one not-found helper, as every other operation of this
+/// crate words it: `crate::state::not_found_message` exists "so no two operations
+/// word it two ways", and this reader was the last one wording it its own way.
 fn not_found(identifier: &str) -> GetCloudWatchAlarmTemplateGroupError {
     GetCloudWatchAlarmTemplateGroupErrorModeled::NotFoundException(NotFoundException {
-        message: Some(format!(
-            "no cloudwatch alarm template group with the id or name {identifier}"
+        message: Some(crate::state::not_found_message(
+            "cloudwatch alarm template group",
+            identifier,
         )),
     })
     .into()

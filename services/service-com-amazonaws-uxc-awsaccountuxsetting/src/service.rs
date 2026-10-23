@@ -65,12 +65,50 @@
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
 use aws_smithy_schema::Schema;
 use aws_smithy_schema_server::constraints::{self, path};
-use aws_smithy_schema_server::ProtocolError;
+use aws_smithy_schema_server::{envelope, ProtocolError, ViolationKind};
 use smithy_server_runtime::{
     http, BoxFuture, DeserializableStruct, ErasedOperation, Operation, OperationContext,
     OperationRoutingTable, Refusal, Refused, ServerHttpProtocol, Service, Violation,
 };
 use std::sync::Arc;
+
+/// The error code AWS answers a constraint refusal with on the JSON protocols, and the
+/// one the framework's own default picks for this `restJson1` service — named here so
+/// the chosen message always travels with its matching code.
+const VALIDATION_EXCEPTION: &str = "ValidationException";
+
+/// `regex` without the whole-value anchors a model wraps it in.
+///
+/// The requirement a refusal states is the expression a value has to satisfy; the `^` /
+/// `$` are how Smithy turns a find into a whole-string match rather than part of the
+/// character grammar, so AWS quotes the expression without them and a client that lifts
+/// it out of the message and re-validates locally gets the one the service advertises.
+/// The CHECK always runs the model's pattern as written: only this rendering drops the
+/// pair.
+///
+/// The pair is dropped POSITIONALLY — the leading `^` and the trailing `$`, and only when
+/// BOTH ends carry one. A `^` alone, or a `$` alone, is an expression anchored at one end
+/// (a different expression, not an anchored spelling of this one), as is one whose own
+/// branches carry the anchors (`(^a$)|(^b$)`); each is emitted verbatim. An ESCAPED `$`
+/// is a literal dollar, not an anchor, so nothing is dropped.
+///
+/// THE RULE'S STAGED HOME is `services/common`'s `validation::unanchored`, which states
+/// it once for every service and is table-tested there; this crate carries the inlined
+/// copy its ~26 peers carry (`grep -rln 'fn unanchored' services/*/src`), to be deleted
+/// by the change that owns that migration. Kept byte-identical in behaviour to that one,
+/// and pinned end-to-end by `tests/all/pattern_refusal_rendering.rs`.
+fn unanchored(regex: &str) -> String {
+    let Some(body) = regex.strip_prefix('^') else {
+        return regex.to_string();
+    };
+    match body.strip_suffix('$') {
+        // An odd number of trailing backslashes escaped the `$`, so it is a literal.
+        Some(inner) if inner.chars().rev().take_while(|c| *c == '\\').count() % 2 == 0 => {
+            inner.to_string()
+        }
+        _ => regex.to_string(),
+    }
+}
 
 /// The error code this service's front door names for a request body that
 /// breaks a modelled constraint. NOT a shape in this service's model: the
@@ -304,16 +342,41 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
         // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording, which for this restJson1 service is 400 `ValidationException`
-        // — the error every operation here models for an input that is not valid,
-        // and what the service answers for a value bound to the request URI (a
-        // `maxResults` outside its `@range`, a `nextToken` outside its `@pattern`)
-        // and for a body the codec cannot read at all. The one refusal this
-        // service words differently is a body that breaks a modelled constraint,
-        // which `FrontDoor` answers before the framework's walk is reached.
-        let _ = refusal;
-        None
+        // service state it. What reaches it here is a value bound to the request
+        // URI — a `maxResults` outside its `@range`, a `nextToken` outside its
+        // `@length`/`@pattern` — since a BODY that breaks a modelled constraint is
+        // answered by `FrontDoor` before the framework's walk is reached.
+        //
+        // AWS states it as the `400 ValidationException` envelope the framework
+        // already renders — `N validation error(s) detected: Value '<value>' at
+        // '<member path>' failed to satisfy constraint: <requirement>` — with ONE
+        // difference: a `@pattern` requirement quotes the expression a value has to
+        // satisfy WITHOUT the model's anchors ([`unanchored`]). So only that one
+        // requirement kind is restated: the code, the envelope, every member path
+        // and every other requirement stay the framework's own, and cannot drift
+        // from the walk that produced these violations.
+        //
+        // `None` for anything that is not a constraint refusal — an unauthenticated
+        // caller keeps the framework's 403 code and wording — and `None` when there
+        // is nothing to state.
+        let Refusal::Invalid(violations) = refusal else {
+            return None;
+        };
+        let restated: Vec<Violation> = violations
+            .iter()
+            .map(|violation| match &violation.kind {
+                ViolationKind::Pattern(pattern) => Violation {
+                    path: violation.path.clone(),
+                    kind: ViolationKind::Pattern(unanchored(pattern)),
+                    value: violation.value.clone(),
+                },
+                _ => violation.clone(),
+            })
+            .collect();
+        Some(Refused {
+            code: VALIDATION_EXCEPTION.to_string(),
+            message: envelope(&restated)?,
+        })
     }
 
     fn override_routing_error(

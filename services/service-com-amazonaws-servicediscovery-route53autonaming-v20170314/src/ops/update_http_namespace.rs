@@ -193,16 +193,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the SOA a DNS namespace has and an HTTP namespace has not. Asking the wrong kind
         // of update of a namespace that does exist is a bad request, not a missing
         // namespace, so it is the modelled `InvalidInput`.
-        let stored_type = state
-            .namespaces
-            .get(&namespace_id)
-            .map(|namespace| namespace.namespace_type.clone())
-            .unwrap_or_default();
+        let stored_type = state.namespace_type(&namespace_id);
         if stored_type != "HTTP" {
             return Err(UpdateHttpNamespaceErrorModeled::InvalidInput(InvalidInput {
-                message: Some(format!(
-                    "The namespace {namespace_id} is a {stored_type} namespace, so it can't \
-                     be updated with UpdateHttpNamespace."
+                message: Some(crate::state::wrong_namespace_type_message(
+                    &namespace_id,
+                    &stored_type,
+                    Self::NAME,
                 )),
             })
             .into());

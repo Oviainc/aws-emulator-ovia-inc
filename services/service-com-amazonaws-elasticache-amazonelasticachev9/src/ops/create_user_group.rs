@@ -217,6 +217,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
+        // A user whose deletion has fallen due is gone, so it is no longer a
+        // member this group can be built from: materialised before the members
+        // below are resolved, so a group cannot be created holding a user that
+        // has stopped existing. See
+        // `crate::state::ComAmazonawsElasticacheAmazonelasticachev9State::settle_users`.
+        store.settle_users(now);
 
         if store.user_groups.contains_key(&input.user_group_id) {
             return Err(CreateUserGroupErrorModeled::UserGroupAlreadyExistsFault(

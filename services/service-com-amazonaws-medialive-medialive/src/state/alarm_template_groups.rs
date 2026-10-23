@@ -213,6 +213,32 @@ impl ComAmazonawsMedialiveMedialiveState {
             .find(|group| group.region == region && group.name == name)
     }
 
+    /// Apply the members an `UpdateCloudWatchAlarmTemplateGroup` request
+    /// supplied onto the group `identifier` names in `region`, and answer that
+    /// group's id — or `None` when this region holds no such group.
+    ///
+    /// "Updates the specified cloudwatch alarm template group": a member the
+    /// request carries replaces the stored one, a member it omits leaves that
+    /// value as it was, and `ModifiedAt` becomes the instant of the call, which
+    /// is when the record was last written. The identifier resolves through
+    /// [`Self::alarm_template_group`], so an update reaches its group by either
+    /// form `Identifier` documents ("Can be either be its id or current name").
+    pub fn update_alarm_template_group(
+        &mut self,
+        region: &str,
+        identifier: &str,
+        description: Option<String>,
+        now: SystemTime,
+    ) -> Option<String> {
+        let id = self.alarm_template_group(region, identifier)?.id.clone();
+        let group = self.alarm_template_groups.get_mut(&id)?;
+        if let Some(description) = description {
+            group.description = Some(description);
+        }
+        group.modified_at = now;
+        Some(id)
+    }
+
     /// Record `token`, as presented in `region`, as having created the group
     /// `group_id`, evicting the oldest token first if that would push the map
     /// past [`MAX_ALARM_TEMPLATE_GROUP_TOKENS`].
@@ -251,7 +277,8 @@ impl ComAmazonawsMedialiveMedialiveState {
 /// Project a stored [`CloudWatchAlarmTemplateGroupRecord`] onto one of the
 /// structurally identical per-operation group output shapes
 /// (`CreateCloudWatchAlarmTemplateGroupOutput`,
-/// `GetCloudWatchAlarmTemplateGroupOutput`).
+/// `GetCloudWatchAlarmTemplateGroupOutput`,
+/// `UpdateCloudWatchAlarmTemplateGroupOutput`).
 ///
 /// One macro rather than a hand-written copy per operation, so a create and the
 /// read that follows it cannot report the same stored group differently; the

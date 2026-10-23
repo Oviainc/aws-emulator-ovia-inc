@@ -20,6 +20,9 @@
 //!   request passed to the full ARN of the resource it names, and
 //!   [`resource_not_found`] / [`stream_session_not_found`] are the ONE place the
 //!   service's `ResourceNotFoundException` message is built from it.
+//! * [`with_internal_id`] appends the per-request `" (Internal ID: <uuid>)"` suffix
+//!   every message this service's HANDLERS answer with carries, so no handler words
+//!   that suffix itself.
 
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
@@ -138,6 +141,8 @@ pub const LOCATION_ACTIVE: &str = "ACTIVE";
 pub const LOCATION_REMOVING: &str = "REMOVING";
 pub const LOCATION_ERROR: &str = "ERROR";
 pub const SESSION_ACTIVATING: &str = "ACTIVATING";
+pub const SESSION_ACTIVE: &str = "ACTIVE";
+pub const SESSION_PENDING_CLIENT_RECONNECTION: &str = "PENDING_CLIENT_RECONNECTION";
 pub const SESSION_ERROR: &str = "ERROR";
 pub const SESSION_TERMINATING: &str = "TERMINATING";
 pub const SESSION_TERMINATED: &str = "TERMINATED";
@@ -150,6 +155,195 @@ pub const REPLICATION_COMPLETED: &str = "COMPLETED";
 pub const APPLICATION_RESOURCE: &str = "application";
 pub const STREAM_GROUP_RESOURCE: &str = "streamgroup";
 pub const STREAM_SESSION_RESOURCE: &str = "streamsession";
+
+/// The `StreamClass` values Amazon GameLift Streams ACCEPTS, in the order the
+/// service's own refusal enumerates them.
+///
+/// Recorded behaviour, and deliberately NOT the model's enum: the model's
+/// `com.amazonaws.gameliftstreams#StreamClass` declares two further values —
+/// `gen6n_small_win2022` and `gen6n_medium_win2022` — that the live service refuses
+/// with a `ValidationException` enumerating exactly the fifteen below. A stream
+/// class is checked against THIS set, so the emulator cannot accept a value AWS
+/// rejects.
+///
+/// The source is the recorded refusal of check
+/// `gameliftstreams.create-stream-group-invalid-stream-class-rejected`, whose message
+/// enumerates these fifteen. Re-check this list against a fresh recording before
+/// trusting it again: the day the service starts accepting a value its model already
+/// declares, this set — not the model — is what would refuse it.
+pub const SERVICE_STREAM_CLASSES: &[&str] = &[
+    "gen4n_high",
+    "gen4n_ultra",
+    "gen4n_win2022",
+    "gen5n_high",
+    "gen5n_ultra",
+    "gen5n_win2022",
+    "gen6n_small",
+    "gen6n_medium",
+    "gen6n_high",
+    "gen6n_ultra",
+    "gen6n_ultra_win2022",
+    "gen6n_pro",
+    "gen6n_pro_win2022",
+    "gen6e_pro",
+    "gen6e_pro_win2022",
+];
+
+/// Whether the service accepts `stream_class` (see [`SERVICE_STREAM_CLASSES`]).
+pub fn stream_class_accepted(stream_class: &str) -> bool {
+    SERVICE_STREAM_CLASSES.contains(&stream_class)
+}
+
+/// The refusal text for a `StreamClass` outside [`SERVICE_STREAM_CLASSES`].
+///
+/// Rendered through the framework's own constraint envelope, so a stream class the
+/// MODEL rejects (refused before any handler runs) and one only the SERVICE rejects
+/// (refused in the handler) are worded identically — the one difference a caller
+/// sees is which values the enumerated set holds.
+///
+/// Carries no internal-id suffix, unlike [`with_internal_id`]: this is the
+/// request-validation envelope, and the recorded refusal of an unknown stream class
+/// carries none either.
+pub fn stream_class_refusal(stream_class: &str) -> String {
+    // One violation always renders, so the fallback is unreachable — but it is a
+    // fallback rather than a panic, because this sits on a request path.
+    ::aws_smithy_schema_server::envelope(&[stream_class_violation(Some(stream_class))])
+        .unwrap_or_else(stream_class_fallback)
+}
+
+/// The plain sentence a stream-class refusal falls back to when the framework's
+/// constraint envelope renders nothing — one wording for the handler and for
+/// `crate::service`'s refusal override, so neither degenerates into the
+/// framework's own message, which carries the WIDER model enum.
+pub fn stream_class_fallback() -> String {
+    format!(
+        "{STREAM_CLASS_PATH} must be one of [{}]",
+        SERVICE_STREAM_CLASSES.join(", ")
+    )
+}
+
+/// The constraint violation a `StreamClass` outside [`SERVICE_STREAM_CLASSES`] is,
+/// with the enumerated set narrowed to the one the SERVICE accepts. `value` is the
+/// offending value as the request spelled it, or `None` when there was none.
+///
+/// The ONE place that set becomes a violation: both the `CreateStreamGroup` handler
+/// (through [`stream_class_refusal`]) and `crate::service`'s refusal override —
+/// which narrows the set of the refusal the framework raises for a value the MODEL
+/// does not declare — reach it here, so the two cannot drift.
+pub fn stream_class_violation(value: Option<&str>) -> ::aws_smithy_schema_server::Violation {
+    ::aws_smithy_schema_server::Violation {
+        path: STREAM_CLASS_PATH.to_string(),
+        kind: ::aws_smithy_schema_server::ViolationKind::EnumValue(
+            SERVICE_STREAM_CLASSES
+                .iter()
+                .map(|accepted| (*accepted).to_string())
+                .collect(),
+        ),
+        value: value.map(str::to_string),
+    }
+}
+
+/// How the validation envelope spells `CreateStreamGroupInput$StreamClass`
+/// (lowerCamel, as every constraint path is).
+pub const STREAM_CLASS_PATH: &str = "streamClass";
+
+/// How the validation envelope spells the `ResourceArn` label the tagging
+/// operations (`TagResource`, `UntagResource`, `ListTagsForResource`) bind — the
+/// member `crate::service`'s refusal override answers `BadRequestException` for.
+/// Beside [`STREAM_CLASS_PATH`], so the two spellings of "how the envelope names a
+/// member" cannot drift.
+pub const RESOURCE_ARN_PATH: &str = "resourceArn";
+
+/// Every error message this service's HANDLERS produce ends with a per-request
+/// internal id, which is how Amazon GameLift Streams words its errors: the body a
+/// client reads is `"<what went wrong> (Internal ID: <uuid>)"`.
+///
+/// The value is per request, so nothing may be derived from it — it identifies the
+/// call in the service's own logs and changes on every call, exactly as a request id
+/// does.
+///
+/// A request the model itself refuses (an absent member, a value outside a declared
+/// constraint) is answered by the request-validation envelope BEFORE a handler runs
+/// and carries no such suffix; [`stream_class_refusal`] is this service's one
+/// handler-side member of that class and matches it.
+pub fn with_internal_id(message: impl AsRef<str>) -> String {
+    format!("{} (Internal ID: {})", message.as_ref(), internal_id())
+}
+
+/// A fresh opaque correlation id, in the canonical 8-4-4-4-12 lowercase-hex form the
+/// service's internal ids take.
+///
+/// Minted per CALL from the wall clock and a process-local counter, mixed the way
+/// [`ComAmazonawsGameliftstreamsGameliftstreamsState::mint_id`] mixes a minted
+/// resource id — the counter is what makes two ids of the same nanosecond distinct by
+/// construction rather than by luck. It identifies one request, so it is never stored
+/// and never read back, and it is not part of this service's state: a refused call
+/// writes nothing. Minted here rather than by a UUID crate so this service's error
+/// wording needs no dependency of its own.
+fn internal_id() -> String {
+    static NEXT: ::std::sync::atomic::AtomicU64 = ::std::sync::atomic::AtomicU64::new(0);
+    let counter = NEXT.fetch_add(1, ::std::sync::atomic::Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |since| since.as_nanos() as u64);
+    let mut hash = nanos ^ counter.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    let mut digits = String::with_capacity(32);
+    for _ in 0..2 {
+        hash = hash
+            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            .wrapping_add(0xBF58_476D_1CE4_E5B9);
+        let mixed = (hash >> 29) ^ hash;
+        digits.push_str(&format!("{mixed:016x}"));
+    }
+    format!(
+        "{}-{}-{}-{}-{}",
+        &digits[0..8],
+        &digits[8..12],
+        &digits[12..16],
+        &digits[16..20],
+        &digits[20..32]
+    )
+}
+
+/// The refusal text for a `ClientToken` replayed with different request parameters.
+pub fn client_token_conflict() -> String {
+    with_internal_id("'ClientToken' value has already been used with different request parameters")
+}
+
+/// The refusal text for a member documented as an Amazon S3 location whose value is
+/// not an S3 URI. Built from the offending member, so every such member words it
+/// alike.
+pub fn not_an_s3_uri(member: &str) -> String {
+    with_internal_id(format!(
+        "'{member}' must be a valid S3 URI starting with 's3://'"
+    ))
+}
+
+/// Whether `uri` names an Amazon S3 location: the `s3://` scheme followed by a
+/// bucket name.
+///
+/// The SCHEME and the BUCKET are what this enforces, and nothing beyond them. The
+/// bucket rule is the one this service's model already states for its OTHER S3
+/// member, `ApplicationLogOutputUri`
+/// (`^s3://([a-zA-Z0-9][a-zA-Z0-9._-]{1,61}[a-zA-Z0-9])(/[a-zA-Z0-9._-]+)*/?$`): a
+/// 3-to-63-character bucket that starts and ends alphanumeric, over
+/// `[a-zA-Z0-9._-]`. The key portion is deliberately NOT checked against that
+/// pattern's `(/[a-zA-Z0-9._-]+)*` tail: an S3 object key admits characters the
+/// pattern does not (a space, say), and the member this guards
+/// (`ApplicationSourceUri`, `@length 1..1024` and no `@pattern`) is a content
+/// location, so refusing a legal key would refuse a request AWS accepts.
+pub fn is_s3_uri(uri: &str) -> bool {
+    let Some(rest) = uri.strip_prefix("s3://") else {
+        return false;
+    };
+    let bucket = rest.split('/').next().unwrap_or_default();
+    (3..=63).contains(&bucket.len())
+        && bucket.starts_with(|first: char| first.is_ascii_alphanumeric())
+        && bucket.ends_with(|last: char| last.is_ascii_alphanumeric())
+        && bucket.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-')
+        })
+}
 
 /// The characters a minted `Id` is built from. The model's `Id` shape is
 /// `length 1..32, pattern ^[a-zA-Z0-9-]+$`.
@@ -641,14 +835,119 @@ pub struct ComAmazonawsGameliftstreamsGameliftstreamsState {
     pub applications: HashMap<String, Application>,
     /// Stream groups by stream group id; each one owns its stream sessions.
     pub stream_groups: HashMap<String, StreamGroup>,
-    /// `"<operation>:<ClientToken>"` -> the id of the resource that token created,
-    /// so a replayed `@idempotencyToken` answers with the first result instead of
-    /// creating a second resource. The operation name is part of the key because
-    /// one client may reuse a token value across unrelated creates.
-    pub idempotency: HashMap<String, String>,
+    /// `"<operation>:<ClientToken>"` -> what that token already created, so a
+    /// replayed `@idempotencyToken` answers with the first result instead of
+    /// creating a second resource, and the same token sent with DIFFERENT
+    /// parameters is refused instead of quietly creating one. The operation name is
+    /// part of the key because one client may reuse a token value across unrelated
+    /// creates.
+    pub idempotency: HashMap<String, TokenRecord>,
     /// Monotonic counter mixed into every minted id, which is what makes two
     /// minted ids distinct by construction rather than by luck.
     mint_counter: u64,
+}
+
+/// What one `ClientToken` has already done: which resource it created, and a
+/// [`Fingerprint`] of the parameters it created that resource with.
+#[derive(Debug, Clone)]
+pub struct TokenRecord {
+    /// Id of the resource this token created.
+    pub resource_id: String,
+    /// Canonical rendering of the request parameters of the call that created it.
+    pub fingerprint: String,
+}
+
+/// What a request's `ClientToken` means for the call carrying it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TokenUse {
+    /// No token, or a token this operation has not served before: do the work.
+    Fresh,
+    /// This token already created a resource with these very parameters: answer
+    /// with that resource (the id), and create nothing.
+    Replay(String),
+    /// This token already created a resource with DIFFERENT parameters, which is
+    /// the one case an idempotency token refuses rather than serves.
+    Conflict,
+}
+
+/// A canonical rendering of the request parameters an `@idempotencyToken` covers,
+/// used to tell a genuine retry (same parameters) from a token reused with
+/// different ones.
+///
+/// Every value is length-prefixed, so no sequence of values can render as another
+/// sequence, and a map's entries are sorted by key, so two requests carrying the
+/// same tags in a different order fingerprint alike — a `HashMap`'s iteration order
+/// is not a request parameter. The `ClientToken` itself is never part of it: it is
+/// the key the fingerprint is stored under.
+#[derive(Debug, Default)]
+pub struct Fingerprint {
+    rendered: String,
+}
+
+impl Fingerprint {
+    /// An empty fingerprint.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Add a present text member.
+    pub fn text(&mut self, member: &str, value: &str) {
+        // The member NAME is length-prefixed too, so a synthetic key a collection
+        // builds (`"<member>.<position>"`) can never render as a differently-named
+        // member: the canonical form is collision-free by construction.
+        self.rendered.push_str(&member.len().to_string());
+        self.rendered.push(':');
+        self.rendered.push_str(member);
+        self.rendered.push('=');
+        self.rendered.push_str(&value.len().to_string());
+        self.rendered.push(':');
+        self.rendered.push_str(value);
+        self.rendered.push(';');
+    }
+
+    /// Add a member that may be absent. An absent member renders differently from
+    /// any present value, including the empty string.
+    pub fn optional(&mut self, member: &str, value: Option<&str>) {
+        match value {
+            Some(value) => self.text(member, value),
+            None => {
+                self.rendered.push_str(&member.len().to_string());
+                self.rendered.push(':');
+                self.rendered.push_str(member);
+                self.rendered.push_str("=-;");
+            }
+        }
+    }
+
+    /// Add a numeric member that may be absent.
+    pub fn number(&mut self, member: &str, value: Option<i32>) {
+        self.optional(member, value.map(|value| value.to_string()).as_deref());
+    }
+
+    /// Add a list member, in the order the request sent it: a list's order is part
+    /// of the request.
+    pub fn list(&mut self, member: &str, values: &[String]) {
+        self.text(member, &values.len().to_string());
+        for (position, value) in values.iter().enumerate() {
+            self.text(&format!("{member}.{position}"), value);
+        }
+    }
+
+    /// Add a map member, sorted by key.
+    pub fn map(&mut self, member: &str, values: &HashMap<String, String>) {
+        let mut entries: Vec<(&String, &String)> = values.iter().collect();
+        entries.sort();
+        self.text(member, &entries.len().to_string());
+        for (key, value) in entries {
+            self.text(&format!("{member}.{key}"), value);
+        }
+    }
+
+    /// The rendered fingerprint. Takes the builder: a fingerprint is built once
+    /// per request and read once.
+    pub fn finish(self) -> String {
+        self.rendered
+    }
 }
 
 impl ComAmazonawsGameliftstreamsGameliftstreamsState {
@@ -713,12 +1012,12 @@ impl ComAmazonawsGameliftstreamsGameliftstreamsState {
         let applications = &self.applications;
         let stream_groups = &self.stream_groups;
         self.idempotency
-            .retain(|key, id| match key.split_once(':').map(|(name, _)| name) {
-                Some("CreateApplication") => applications.contains_key(id),
-                Some("CreateStreamGroup") => stream_groups.contains_key(id),
+            .retain(|key, record| match key.split_once(':').map(|(name, _)| name) {
+                Some("CreateApplication") => applications.contains_key(&record.resource_id),
+                Some("CreateStreamGroup") => stream_groups.contains_key(&record.resource_id),
                 Some("StartStreamSession") => stream_groups
                     .values()
-                    .any(|group| group.sessions.contains_key(id)),
+                    .any(|group| group.sessions.contains_key(&record.resource_id)),
                 // An operation this slice records nothing for: there is nothing to
                 // judge the entry by, so leave it rather than drop it blindly.
                 _ => true,
@@ -747,6 +1046,31 @@ impl ComAmazonawsGameliftstreamsGameliftstreamsState {
     pub fn stream_group_mut(&mut self, identifier: &str) -> Option<&mut StreamGroup> {
         let id = identifier_id(identifier, STREAM_GROUP_RESOURCE)?;
         self.stream_groups.get_mut(&id)
+    }
+
+    /// What this call's `ClientToken` means: a token no previous call of
+    /// `operation` carried is [`TokenUse::Fresh`], one that created a resource with
+    /// the same `fingerprint` is a [`TokenUse::Replay`] of that resource, and one
+    /// that created a resource with a different fingerprint is a
+    /// [`TokenUse::Conflict`] — "the request is idempotent, which ensures that an
+    /// API request completes only once" (`ClientToken` documentation), so the same
+    /// token cannot stand for two different requests.
+    pub fn client_token_use(
+        &self,
+        operation: &str,
+        client_token: Option<&str>,
+        fingerprint: &str,
+    ) -> TokenUse {
+        let Some(token) = client_token else {
+            return TokenUse::Fresh;
+        };
+        match self.idempotency.get(&idempotency_key(operation, token)) {
+            Some(record) if record.fingerprint == fingerprint => {
+                TokenUse::Replay(record.resource_id.clone())
+            }
+            Some(_) => TokenUse::Conflict,
+            None => TokenUse::Fresh,
+        }
     }
 
     /// The tags of the taggable resource an `Arn` names.
@@ -788,19 +1112,23 @@ impl ComAmazonawsGameliftstreamsGameliftstreamsState {
             .map(|group| &mut group.tags)
     }
 
-    /// The id of the resource a replayed `ClientToken` already created, if the
-    /// resource is still there.
-    pub fn replayed(&self, operation: &str, client_token: Option<&str>) -> Option<String> {
-        self.idempotency
-            .get(&idempotency_key(operation, client_token?))
-            .cloned()
-    }
-
-    /// Record which resource a `ClientToken` created.
-    pub fn remember(&mut self, operation: &str, client_token: Option<&str>, id: &str) {
+    /// Record which resource a `ClientToken` created, and the fingerprint of the
+    /// request that created it.
+    pub fn remember(
+        &mut self,
+        operation: &str,
+        client_token: Option<&str>,
+        id: &str,
+        fingerprint: &str,
+    ) {
         if let Some(token) = client_token {
-            self.idempotency
-                .insert(idempotency_key(operation, token), id.to_string());
+            self.idempotency.insert(
+                idempotency_key(operation, token),
+                TokenRecord {
+                    resource_id: id.to_string(),
+                    fingerprint: fingerprint.to_string(),
+                },
+            );
         }
     }
 }
@@ -952,58 +1280,19 @@ pub fn resource_not_found(arn: &str) -> ResourceNotFoundException {
 }
 
 /// The service's `ResourceNotFoundException` for the session-scoped operations
-/// (`GetStreamSession`, `TerminateStreamSession`), which name the stream session —
-/// the resource the caller addressed — even when it is the enclosing stream group
-/// that is absent.
+/// (`GetStreamSession`, `TerminateStreamSession`, `CreateStreamSessionConnection`),
+/// which name the stream session — the resource the caller addressed — even when it
+/// is the enclosing stream group that is absent.
 pub fn stream_session_not_found(arn: &str) -> ResourceNotFoundException {
     not_found("Stream session", arn)
 }
 
-/// `<subject> '<arn>' does not exist (Internal ID: <uuid>)`.
-///
-/// The correlation id is minted per call and is not stored: it identifies ONE
-/// request, so no two responses carry the same one and nothing reads it back.
+/// `<subject> '<arn>' does not exist (Internal ID: <uuid>)`, through the one
+/// [`with_internal_id`] every handler-side message of this service is worded by.
 fn not_found(subject: &str, arn: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
-        message: format!(
-            "{subject} '{arn}' does not exist (Internal ID: {})",
-            internal_id()
-        ),
+        message: with_internal_id(format!("{subject} '{arn}' does not exist")),
     }
-}
-
-/// A fresh opaque correlation id, in the canonical 8-4-4-4-12 lowercase-hex form the
-/// service's internal ids take.
-///
-/// Minted per CALL from the wall clock and a process-local counter, mixed the way
-/// [`ComAmazonawsGameliftstreamsGameliftstreamsState::mint_id`] mixes a minted
-/// resource id — the counter is what makes two ids of the same nanosecond distinct by
-/// construction rather than by luck. It identifies one request, so it is never stored
-/// and never read back, and it is not part of this service's state: a refused call
-/// writes nothing.
-fn internal_id() -> String {
-    static NEXT: ::std::sync::atomic::AtomicU64 = ::std::sync::atomic::AtomicU64::new(0);
-    let counter = NEXT.fetch_add(1, ::std::sync::atomic::Ordering::Relaxed);
-    let nanos = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map_or(0, |since| since.as_nanos() as u64);
-    let mut hash = nanos ^ counter.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    let mut digits = String::with_capacity(32);
-    for _ in 0..2 {
-        hash = hash
-            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
-            .wrapping_add(0xBF58_476D_1CE4_E5B9);
-        let mixed = (hash >> 29) ^ hash;
-        digits.push_str(&format!("{mixed:016x}"));
-    }
-    format!(
-        "{}-{}-{}-{}-{}",
-        &digits[0..8],
-        &digits[8..12],
-        &digits[12..16],
-        &digits[16..20],
-        &digits[20..32]
-    )
 }
 
 /// The region a request is answered in: the region of its SigV4 credential scope,

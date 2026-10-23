@@ -179,7 +179,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // without a lookup is also what keeps the answer from reporting on a resource AWS
         // never looks up. The resource segment is NOT judged here: an ARN of this account
         // whose resource names no export is a resource this service looked for and did
-        // not find, which is the 404 below.
+        // not find, which is the modelled not-found below.
         crate::state::validate_taggable_resource_arn(&input.resource_arn)
             .map_err(ListTagsForResourceErrorModeled::ValidationException)?;
 

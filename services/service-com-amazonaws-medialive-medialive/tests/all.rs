@@ -38,11 +38,17 @@ mod error_envelope;
 #[path = "all/event_bridge_rule_template_groups.rs"]
 mod event_bridge_rule_template_groups;
 
+#[path = "all/event_bridge_rule_template_listing.rs"]
+mod event_bridge_rule_template_listing;
+
 #[path = "all/event_bridge_rule_templates.rs"]
 mod event_bridge_rule_templates;
 
 #[path = "all/input_deletion.rs"]
 mod input_deletion;
+
+#[path = "all/input_endpoint_release.rs"]
+mod input_endpoint_release;
 
 #[path = "all/input_lifecycle.rs"]
 mod input_lifecycle;
@@ -103,6 +109,9 @@ mod state_roundtrip;
 
 #[path = "all/template_deletion.rs"]
 mod template_deletion;
+
+#[path = "all/template_updates.rs"]
+mod template_updates;
 
 // Not a suite of its own: the cloudwatch alarm template group request helpers
 // the group suites share, layered on `wire`. Declared because every file under

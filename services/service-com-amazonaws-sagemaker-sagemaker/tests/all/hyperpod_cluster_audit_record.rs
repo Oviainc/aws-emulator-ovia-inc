@@ -42,14 +42,18 @@ const FAR_FROM_DUE: Duration = Duration::from_secs(3_600);
 const PRESENTED_AKID: &str = "AKIDEXAMPLE";
 
 /// One captured event: its target and its fields, rendered as strings.
+///
+/// `pub(crate)` because the one capture below serves every suite in this test binary
+/// (see [`audit_capture`]), so a sibling suite reads its records back through this type
+/// rather than installing a second global subscriber.
 #[derive(Clone, Debug)]
-struct CapturedEvent {
+pub(crate) struct CapturedEvent {
     target: String,
-    fields: BTreeMap<String, String>,
+    pub(crate) fields: BTreeMap<String, String>,
 }
 
 impl CapturedEvent {
-    fn field(&self, name: &str) -> Option<&str> {
+    pub(crate) fn field(&self, name: &str) -> Option<&str> {
         self.fields.get(name).map(String::as_str)
     }
 }
@@ -82,7 +86,7 @@ impl Visit for FieldCollector<'_> {
 /// A `tracing` subscriber that keeps every event it is handed, so a test can read the
 /// audit records back.
 #[derive(Clone, Default)]
-struct Capture {
+pub(crate) struct Capture {
     events: Arc<Mutex<Vec<CapturedEvent>>>,
 }
 
@@ -95,7 +99,7 @@ impl Capture {
     /// whole process (see [`audit_capture`]) and this crate's other suites emit their own
     /// records into it. A cluster ARN carries a freshly minted 12-character id, so no two
     /// tests can claim the same one.
-    fn records_for(&self, operation: &str, resources: &[String]) -> Vec<CapturedEvent> {
+    pub(crate) fn records_for(&self, operation: &str, resources: &[String]) -> Vec<CapturedEvent> {
         self.events
             .lock()
             .expect("the capture buffer")
@@ -168,13 +172,18 @@ impl Subscriber for Capture {
 /// capture plus an interest-cache rebuild removes that ordering dependency; each test
 /// then reads back only the records naming the clusters IT created
 /// ([`Capture::records_for`]). Nothing is written to disk.
-fn audit_capture() -> &'static Capture {
+///
+/// `pub(crate)` so a sibling suite that needs the audit records shares THIS capture — a
+/// second global subscriber cannot be installed, and the loser would silently see nothing
+/// (`hyperparameter_tuning_job` reads its own records back through it).
+pub(crate) fn audit_capture() -> &'static Capture {
     static CAPTURE: std::sync::OnceLock<Capture> = std::sync::OnceLock::new();
     CAPTURE.get_or_init(|| {
         let capture = Capture::default();
-        // No sibling suite in this crate installs a global subscriber. If one ever does,
-        // say so here: the symptom would otherwise be "missing audit records", which
-        // diagnoses the wrong file.
+        // Every suite in this binary that needs the records goes through this one
+        // function, so nothing else installs a global subscriber. If one ever does, say so
+        // here: the symptom would otherwise be "missing audit records", which diagnoses
+        // the wrong file.
         assert!(
             tracing::subscriber::set_global_default(capture.clone()).is_ok(),
             "another global tracing subscriber was installed first, so this suite cannot \
@@ -241,6 +250,10 @@ fn seed_not_due(emulator: &Emulator, name: &str) -> String {
             tags: Vec::new(),
             creation_time: now,
             in_service_at: now + FAR_FROM_DUE,
+            // A cluster holds the nodes `BatchAddClusterNodes` added to it; a seeded one
+            // has none, the same as one `CreateCluster` just made.
+            nodes: std::collections::BTreeMap::new(),
+            node_additions: std::collections::BTreeMap::new(),
         },
     );
     arn

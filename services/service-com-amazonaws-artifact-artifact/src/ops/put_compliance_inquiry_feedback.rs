@@ -4,7 +4,7 @@
 //! Records the caller's rating of a compliance inquiry's response and answers the instant
 //! the feedback was submitted.
 //!
-//! Three rules shape the handler:
+//! Four rules shape the handler:
 //!
 //! * it writes onto a PERSISTED inquiry: an id the store does not hold names no inquiry
 //!   this account may give feedback on, which the front door answers with its 401 — the
@@ -14,21 +14,29 @@
 //!   identifier that names no query of that inquiry is refused with the modelled
 //!   `ValidationException` naming the member and the requirement it failed — the same
 //!   refusal `ExportComplianceInquiry` gives its own `queryIdentifiers`; naming none
-//!   records the feedback on the inquiry's response as a whole. A `Put` REPLACES the
-//!   feedback the inquiry already held for that key, which is what makes the stored record
-//!   the caller's current rating rather than an append-only log;
-//! * `clientToken` is this operation's `@idempotencyToken`: "If this token matches a
-//!   previous request, the service ignores the request, but does not return an error" — so
-//!   a repeat of one request records nothing further and answers the `submittedAt` the
-//!   first call answered, while the same token on a DIFFERENT request is refused with the
-//!   modelled `ConflictException`, exactly as `CreateComplianceInquiry` refuses it.
+//!   records the feedback on the inquiry's response as a whole;
+//! * the feedback RECORD is unique per response revision: `queryIdentifier` together with
+//!   `responseRevisionId` names the response version being rated
+//!   ([`crate::state::FeedbackTarget`]), that version accepts exactly ONE submitted
+//!   feedback, and a later submission against a version that already carries feedback is
+//!   refused with the modelled `ConflictException` — whatever `clientToken` it carries.
+//!   That is the guard `responseRevisionId` advertises ("use this value to prevent
+//!   submitting feedback on a stale response"): the refusal is a property of the targeted
+//!   version's STATE, not of a token. Feedback on another version of the same query, or on
+//!   another query, targets a version of its own and is recorded;
+//! * `clientToken` is this operation's `@idempotencyToken`, the replay layer ON TOP of that
+//!   rule: "If this token matches a previous request, the service ignores the request, but
+//!   does not return an error" — so a repeat of one request records nothing further and
+//!   answers the `submittedAt` the first call answered, and the same token on a request
+//!   targeting something else is refused with the modelled `ConflictException`, exactly as
+//!   `CreateComplianceInquiry` refuses it.
 //!
-//! `responseRevisionId` ("use this value to prevent submitting feedback on a stale
-//!  response") is persisted with the feedback and absorbed into what the token identifies,
-//! but nothing is refused on it: no response and no edit to one is ever generated here (see
-//! [`crate::state::InquiryQuery::response`]), so there is no stored revision a request's
-//! value could be stale against, and a staleness refusal would be a comparison against a
-//! revision nothing produced.
+//! `responseRevisionId` is not compared against a GENERATED revision: nothing here
+//! produces a response or an edit to one (see [`crate::state::InquiryQuery::response`]), so
+//! there is no stored revision a request's value could be stale against, and a staleness
+//! refusal would be a comparison against a revision nothing produced. The value is what
+//! identifies the rated version, and that is what the one-feedback-per-version rule is keyed
+//! on.
 //!
 //! What the call records is observable: the document `ExportComplianceInquiry` renders
 //! reports the feedback held for the queries it covers.
@@ -234,28 +242,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The only clock-owed write: the transition this inquiry was already due.
         inquiry.materialise(now);
 
-        if let Some(record) = remembered {
-            if record.fingerprint != fingerprint {
-                ::tracing::info!(
-                    operation = "PutComplianceInquiryFeedback",
-                    compliance_inquiry_id = %input.compliance_inquiry_id,
-                    outcome = "refused",
-                    reason = "the clientToken was replayed on a different request",
-                    "refused a compliance inquiry feedback submission"
-                );
-                return Err(PutComplianceInquiryFeedbackErrorModeled::ConflictException(
-                    crate::state::feedback_token_mismatch(&record.inquiry_id),
-                )
-                .into());
-            }
-            // "If this token matches a previous request, the service ignores the request,
-            // but does not return an error": nothing further is recorded and the answer is
-            // the one the first call gave, read off the remembered record.
-            return Ok(PutComplianceInquiryFeedbackOutput {
-                submitted_at: ::aws_smithy_types::DateTime::from(record.submitted_at),
-            });
-        }
-
         // "The sequential identifier of the query to provide feedback on": a query of THIS
         // inquiry, so an identifier it does not own is refused with the modelled
         // `ValidationException` naming the member.
@@ -279,21 +265,88 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // A `Put`: the feedback held for this query — or for the inquiry as a whole, when
-        // the request named no query — is REPLACED, so the record is the caller's current
-        // rating of that response.
+        if let Some(record) = &remembered {
+            if record.fingerprint == fingerprint {
+                // "If this token matches a previous request, the service ignores the
+                // request, but does not return an error": nothing further is recorded and
+                // the answer is the one the first call gave, read off the remembered
+                // record. The replay is checked BEFORE the state rule below, because the
+                // record the repeat would conflict with is the one it already made.
+                return Ok(PutComplianceInquiryFeedbackOutput {
+                    submitted_at: ::aws_smithy_types::DateTime::from(record.submitted_at),
+                });
+            }
+        }
+
+        // The RULE: the response version this request rates — the query it names together
+        // with the revision of that query's response — accepts exactly one submitted
+        // feedback, so a version this inquiry already holds feedback for is refused with the
+        // modelled `ConflictException`. The refusal is keyed on the targeted version's
+        // state, so a fresh `clientToken` does not get past it.
+        let target: crate::state::FeedbackTarget =
+            (input.query_identifier, input.response_revision_id);
+        if inquiry.feedback_for(target).is_some() {
+            ::tracing::info!(
+                operation = "PutComplianceInquiryFeedback",
+                compliance_inquiry_id = %input.compliance_inquiry_id,
+                query_identifier = input.query_identifier,
+                response_revision_id = input.response_revision_id,
+                outcome = "refused",
+                reason = "the response version already carries feedback",
+                "refused a compliance inquiry feedback submission"
+            );
+            return Err(PutComplianceInquiryFeedbackErrorModeled::ConflictException(
+                crate::state::feedback_already_submitted(&input.compliance_inquiry_id),
+            )
+            .into());
+        }
+
+        // The idempotency layer on top of it: this token identifies ONE call, and this
+        // request is not that call, so honouring it would either hide this submission or
+        // answer with another one's timestamp.
+        if let Some(record) = &remembered {
+            ::tracing::info!(
+                operation = "PutComplianceInquiryFeedback",
+                compliance_inquiry_id = %input.compliance_inquiry_id,
+                outcome = "refused",
+                reason = "the clientToken was replayed on a different request",
+                "refused a compliance inquiry feedback submission"
+            );
+            return Err(PutComplianceInquiryFeedbackErrorModeled::ConflictException(
+                crate::state::feedback_token_mismatch(&record.inquiry_id),
+            )
+            .into());
+        }
+
+        // Residency bound: one inquiry holds at most `FEEDBACK_PER_INQUIRY_CAPACITY`
+        // records, and a request may name any revision an `Integer` carries, so repeated
+        // submissions cannot grow the emulator's memory without end. Nothing is evicted — a
+        // forgotten record would let a rated response version be rated again.
+        if !inquiry.accepts_another_feedback() {
+            return Err(PutComplianceInquiryFeedbackErrorModeled::ThrottlingException(
+                ThrottlingException {
+                    message: format!(
+                        "this emulator stores at most {} feedback records per compliance inquiry",
+                        crate::state::FEEDBACK_PER_INQUIRY_CAPACITY
+                    ),
+                    service_code: Some("artifact".to_string()),
+                    quota_code: Some("FeedbackPerComplianceInquiry".to_string()),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        }
+
+        // The first and only feedback this response version carries.
         let reason_code_count = reason_codes.len();
-        inquiry.feedback.insert(
-            input.query_identifier,
-            crate::state::InquiryFeedback {
-                query_identifier: input.query_identifier,
-                rating: input.rating.clone(),
-                reason_codes,
-                comment: input.comment.clone(),
-                response_revision_id: input.response_revision_id,
-                submitted_at: now,
-            },
-        );
+        inquiry.record_feedback(crate::state::InquiryFeedback {
+            query_identifier: input.query_identifier,
+            rating: input.rating.clone(),
+            reason_codes,
+            comment: input.comment.clone(),
+            response_revision_id: input.response_revision_id,
+            submitted_at: now,
+        });
 
         if let Some(token) = input.client_token {
             store.record_inquiry_feedback_token(
@@ -310,6 +363,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             operation = "PutComplianceInquiryFeedback",
             compliance_inquiry_id = %input.compliance_inquiry_id,
             query_identifier = input.query_identifier,
+            response_revision_id = input.response_revision_id,
             rating = %input.rating,
             reason_code_count,
             outcome = "recorded",
