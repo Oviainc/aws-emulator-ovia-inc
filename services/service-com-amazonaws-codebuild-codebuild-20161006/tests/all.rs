@@ -21,6 +21,8 @@ mod list_builds;
 mod list_sandboxes;
 #[path = "all/list_sandboxes_for_project.rs"]
 mod list_sandboxes_for_project;
+#[path = "all/list_sandboxes_for_project_paging.rs"]
+mod list_sandboxes_for_project_paging;
 #[path = "all/project_build_batch_lifecycle.rs"]
 mod project_build_batch_lifecycle;
 #[path = "all/project_build_lifecycle.rs"]
