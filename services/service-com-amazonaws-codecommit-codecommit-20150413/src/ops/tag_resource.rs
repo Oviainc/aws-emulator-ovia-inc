@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -177,18 +168,141 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        let _ = ctx;
+        let repository_name = repository_name_of(&input.resource_arn)?;
+
+        // `tags` is required, so the boundary refused a request that omitted it;
+        // an EMPTY map still reaches here, and a tagging request that names no tag
+        // asks for no change. "A map of tags is required."
+        if input.tags.is_empty() {
+            return Err(TagResourceErrorModeled::TagsMapRequiredException(
+                TagsMapRequiredException {
+                    message: Some("A map of tags is required.".to_string()),
+                },
+            )
+            .into());
+        }
+
+        // "The specified tag is not valid. Key names cannot be prefixed with aws:."
+        // Keys are compared in sorted order so the same request always names the
+        // same offending key.
+        let tags: std::collections::BTreeMap<&String, &String> = input.tags.iter().collect();
+        if let Some(key) = tags
+            .keys()
+            .find(|key| crate::state::is_system_tag_key(key))
+        {
+            return Err(TagResourceErrorModeled::InvalidSystemTagUsageException(
+                InvalidSystemTagUsageException {
+                    message: Some(format!(
+                        "the tag key {key} is not valid: key names cannot be prefixed with {}",
+                        crate::state::SYSTEM_TAG_PREFIX
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Every key and value must satisfy `TagKey` / `TagValue`'s modelled
+        // length; the boundary validator applies a `length` to the `tags` MEMBER
+        // rather than to the pairs inside the map, so the map is checked here.
+        // "The map of tags is not valid."
+        if let Some((key, value)) = tags
+            .iter()
+            .find(|(key, value)| !crate::state::is_tag_key(key) || !crate::state::is_tag_value(value))
+        {
+            return Err(TagResourceErrorModeled::InvalidTagsMapException(
+                InvalidTagsMapException {
+                    message: Some(format!(
+                        "the map of tags is not valid: the key must be {}-{} characters and its value at most {} characters, got a key of {} and a value of {}",
+                        crate::state::TAG_KEY_MIN_LENGTH,
+                        crate::state::TAG_KEY_MAX_LENGTH,
+                        crate::state::TAG_VALUE_MAX_LENGTH,
+                        key.chars().count(),
+                        value.chars().count()
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // An unreachable store is an internal mounting fault, not a modelled
+            // CodeCommit failure; every handler in this crate refuses it this way.
+            crate::scaffolded::Scaffolded::validation("the repository store is unavailable")
+        })?;
+        let mut store = state.lock();
+        let repository = store.repositories.get_mut(repository_name).ok_or_else(|| {
+            TagResourceError::from(TagResourceErrorModeled::RepositoryDoesNotExistException(
+                RepositoryDoesNotExistException {
+                    message: Some(crate::state::repository_does_not_exist_message(
+                        repository_name,
+                    )),
+                },
+            ))
+        })?;
+
+        // Tagging adds the request's pairs to the tags the resource already
+        // carries and overwrites the value of a key it already had, so the limit
+        // applies to the RESULT rather than to the request. The result is built
+        // first and stored only once it is within the limit, so a refused request
+        // persists nothing.
+        let mut tagged = repository.tags.clone();
+        for (key, value) in &tags {
+            tagged.insert((*key).clone(), (*value).clone());
+        }
+        if tagged.len() > crate::state::MAX_TAGS_PER_RESOURCE {
+            return Err(TagResourceErrorModeled::TooManyTagsException(
+                TooManyTagsException {
+                    message: Some(format!(
+                        "the maximum number of tags for a CodeCommit resource ({}) has been exceeded: the request would leave {} tags",
+                        crate::state::MAX_TAGS_PER_RESOURCE,
+                        tagged.len()
+                    )),
+                },
+            )
+            .into());
+        }
+        repository.tags = tagged;
+        // `lastModifiedDate` is deliberately left alone: it reports when the
+        // repository itself last changed, which `GetRepository` serves, and tags
+        // are not part of that metadata.
+
+        Ok(TagResourceOutput)
     }
+}
+
+/// The repository the request's `resourceArn` names, or the modelled error for
+/// why that ARN addresses no CodeCommit resource.
+fn repository_name_of(resource_arn: &str) -> Result<&str, TagResourceError> {
+    crate::state::repository_name_of_resource_arn(resource_arn).map_err(|problem| {
+        match problem {
+            crate::state::ResourceArnProblem::Missing => {
+                TagResourceErrorModeled::ResourceArnRequiredException(
+                    ResourceArnRequiredException {
+                        message: Some(
+                            "A valid Amazon Resource Name (ARN) for an CodeCommit resource is required."
+                                .to_string(),
+                        ),
+                    },
+                )
+            }
+            crate::state::ResourceArnProblem::Invalid => {
+                TagResourceErrorModeled::InvalidResourceArnException(InvalidResourceArnException {
+                    message: Some(format!(
+                        "the value for the resource ARN {resource_arn} is not valid"
+                    )),
+                })
+            }
+            crate::state::ResourceArnProblem::RepositoryName => {
+                TagResourceErrorModeled::InvalidRepositoryNameException(
+                    InvalidRepositoryNameException {
+                        message: Some(format!(
+                            "the repository name in the resource ARN {resource_arn} is not valid"
+                        )),
+                    },
+                )
+            }
+        }
+        .into()
+    })
 }
