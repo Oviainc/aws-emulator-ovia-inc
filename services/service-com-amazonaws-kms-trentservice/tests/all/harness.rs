@@ -191,3 +191,50 @@ pub(crate) fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 pub(crate) async fn enabled_key(router: &MultiServiceRouter) -> Value {
     create_key(router, &json!({"Description": "round trip"})).await
 }
+
+/// The alias ARN of `alias` (`alias/<name>`) as the endpoint of `region` names it:
+/// `arn:aws:kms:<region>:<account>:alias/<name>`.
+pub(crate) fn alias_arn(region: &str, alias: &str) -> String {
+    format!(
+        "arn:aws:kms:{region}:{account}:{alias}",
+        account = engine::emulator_account_id()
+    )
+}
+
+/// Assert an operation answered the empty 200 AWS documents for it ("this operation
+/// does not return a response"), so a success carries no members at all.
+pub(crate) fn assert_empty(case: &str, operation: &str, answer: &Value) {
+    let empty = answer.is_null() || answer.as_object().is_some_and(|members| members.is_empty());
+    assert!(
+        empty,
+        "case {case}: {operation} must answer an empty 200 body, got {answer}"
+    );
+}
+
+/// Create an alias for `target` in [`REGION`], requiring the empty 200.
+pub(crate) async fn create_alias(
+    router: &MultiServiceRouter,
+    case: &str,
+    alias: &str,
+    target: &str,
+) {
+    create_alias_in(router, REGION, case, alias, target).await;
+}
+
+/// [`create_alias`], in `region`.
+pub(crate) async fn create_alias_in(
+    router: &MultiServiceRouter,
+    region: &str,
+    case: &str,
+    alias: &str,
+    target: &str,
+) {
+    let answer = ok_in(
+        router,
+        region,
+        "CreateAlias",
+        &json!({"AliasName": alias, "TargetKeyId": target}),
+    )
+    .await;
+    assert_empty(case, "CreateAlias", &answer);
+}

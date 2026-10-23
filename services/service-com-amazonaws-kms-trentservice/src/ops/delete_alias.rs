@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteAlias
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteAlias`'s real behaviour. Implement it here — this is
+//! IMPLEMENTED: forgets one alias, so the name stops resolving to anything. This is
 //! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteAlias::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removal is from the alias store itself — the one index every `KeyId` resolution
+//! consults — so from the next request on, `alias/<name>` and the alias ARN resolve to
+//! NOTHING rather than to the key the alias used to target: an operation that models
+//! `NotFoundException` answers it, which is what lets a caller tell a removed alias
+//! from a live one. The key is untouched: "because an alias is not a property of a KMS
+//! key, you can delete and change the aliases of a KMS key without affecting the KMS
+//! key".
 //!
 //! ## Shape of an operation
 //!
@@ -180,18 +181,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteAlias` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteAliasErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteAliasErrorModeled::KMSInternalException(KMSInternalException {
+                message: Some("the KMS state store is unavailable".to_string()),
+            })
+            .into());
+        };
+
+        let region = crate::state::request_region(ctx);
+        let mut state = state.lock();
+
+        // An alias is identified by its name in one Region of one account, so a name
+        // this endpoint holds no alias for — one never created, one already deleted, or
+        // one created through another Region's endpoint — is a `NotFoundException`, and
+        // nothing is removed. A name outside the `alias/` prefix rules cannot have been
+        // created either, so it lands here too: this operation models no
+        // `InvalidAliasNameException`, and the lookup already answers for it.
+        if state.remove_alias(&region, &input.alias_name).is_none() {
+            return Err(DeleteAliasErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::alias_not_found_message(
+                    &region,
+                    &input.alias_name,
+                )),
+            })
+            .into());
+        }
+
+        // No key-state check, and hence no `KMSInvalidStateException`: "because an
+        // alias is not a property of a KMS key, you can delete and change the aliases
+        // of a KMS key without affecting the KMS key", so the target key's key state
+        // does not gate the removal of a name that points at it.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteAlias"))
+        // "This operation does not return a response."
+        Ok(DeleteAliasOutput)
     }
 }
