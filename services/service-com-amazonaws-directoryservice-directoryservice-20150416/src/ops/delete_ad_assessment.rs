@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteADAssessment
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteADAssessment`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteADAssessment::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Deletes one stored directory assessment: resolves the `AssessmentId` against
+//! [`crate::state`], removes the record — "all associated data", so the configuration
+//! and status go with it — and answers with the id it removed, freeing one slot of the
+//! account's CUSTOMER assessment quota.
+//!
+//! Two rules from this operation's own documentation: "You cannot delete
+//! system-initiated assessments", which is refused with the modelled
+//! `UnsupportedOperationException`, and "you can delete customer-created assessments
+//! even if they are in progress", so a record whose clock-owed status transition has
+//! not fallen due yet is deleted like any other.
 //!
 //! ## Shape of an operation
 //!
@@ -147,18 +149,52 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteADAssessment` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteADAssessmentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteADAssessment"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        let mut store = state.lock();
+        store.advance_clock(::std::time::SystemTime::now());
+
+        let assessment = store.assessments.get(&input.assessment_id).ok_or_else(|| {
+            DeleteADAssessmentErrorModeled::EntityDoesNotExistException(
+                EntityDoesNotExistException {
+                    message: Some(crate::state::no_such_assessment(&input.assessment_id)),
+                    request_id: None,
+                },
+            )
+        })?;
+
+        // "You cannot delete system-initiated assessments" — decided from the stored
+        // record's own `ReportType`, so it holds for every assessment the service ever
+        // creates for itself, not only for the ones this operation was called with.
+        if assessment.report_type != crate::state::ASSESSMENT_REPORT_TYPE_CUSTOMER {
+            return Err(
+                DeleteADAssessmentErrorModeled::UnsupportedOperationException(
+                    UnsupportedOperationException {
+                        message: Some(format!(
+                            "Directory assessment {id} is {report_type}-initiated and cannot be \
+                             deleted",
+                            id = assessment.assessment_id,
+                            report_type = assessment.report_type
+                        )),
+                        request_id: None,
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "You can delete customer-created assessments even if they are in progress",
+        // so a record whose status transition is still owed needs no further check. The
+        // id is taken from the REMOVED record, so the answer cannot name an assessment
+        // the store still holds.
+        let removed = store
+            .assessments
+            .remove(&input.assessment_id)
+            .ok_or_else(crate::state::state_unavailable)?;
+        Ok(DeleteADAssessmentOutput {
+            assessment_id: Some(removed.assessment_id),
+        })
     }
 }

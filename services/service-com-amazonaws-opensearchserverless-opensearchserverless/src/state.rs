@@ -3,12 +3,12 @@
 //! Engine state for the com-amazonaws-opensearchserverless-opensearchserverless service.
 //!
 //! This holds the resources this slice serves — the OpenSearch Serverless
-//! **collection**, the **collection group** and the **security policy** — plus everything
-//! more than one handler of those resources needs: the server-derived fields (the minted
-//! ids, the ARNs, the endpoints derived from a collection id, the epoch-millisecond
-//! timestamps), the clock-owed `CREATING -> ACTIVE` transition a just-created collection
-//! settles through, the opaque page token `ListCollections` hands out, and the
-//! `clientToken` replay index the `@idempotent` creates read.
+//! **collection**, the **collection group**, the **security policy** and the **data access
+//! policy** — plus everything more than one handler of those resources needs: the
+//! server-derived fields (the minted ids, the ARNs, the endpoints derived from a collection
+//! id, the epoch-millisecond timestamps), the clock-owed `CREATING -> ACTIVE` transition a
+//! just-created collection settles through, the opaque page token `ListCollections` hands
+//! out, and the `clientToken` replay index the `@idempotent` creates read.
 //!
 //! `src/ops/mod.rs` is generated, so a helper more than one operation reaches lives here
 //! rather than in a second module under `src/ops/`.
@@ -17,10 +17,10 @@ use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::{
-    CapacityDetails, CollectionDetail, CollectionErrorDetail, CollectionGroupCapacityLimits,
-    CollectionGroupDetail, CollectionGroupErrorDetail, CollectionSummary, CreateCollectionDetail,
-    CreateCollectionGroupDetail, CurrentCapacity, DeleteCollectionDetail, FipsEndpoints,
-    SecurityPolicyDetail, Tag, VectorOptions,
+    AccessPolicyDetail, CapacityDetails, CollectionDetail, CollectionErrorDetail,
+    CollectionGroupCapacityLimits, CollectionGroupDetail, CollectionGroupErrorDetail,
+    CollectionSummary, CreateCollectionDetail, CreateCollectionGroupDetail, CurrentCapacity,
+    DeleteCollectionDetail, FipsEndpoints, SecurityPolicyDetail, Tag, VectorOptions,
 };
 
 /// This service's ARN namespace, from the model's `aws.api#service` trait
@@ -132,6 +132,12 @@ pub const MAX_COLLECTIONS: usize = 50;
 /// The account's quota for security policies of ONE type in one Region, from the same
 /// quota page: 20 encryption policies and 20 network policies per account.
 pub const MAX_SECURITY_POLICIES_PER_TYPE: usize = 20;
+
+/// The account's data-access-policy quota in one Region, from the same "Quotas for Amazon
+/// OpenSearch Serverless" page: 100 data access policies per account (adjustable on
+/// request, so this is the DEFAULT quota). `AccessPolicyType` has the single value `data`,
+/// so this bounds the whole map.
+pub const MAX_ACCESS_POLICIES: usize = 100;
 
 /// The most collection groups this emulator stores for one account in one Region.
 ///
@@ -561,6 +567,45 @@ impl SecurityPolicyRecord {
     }
 }
 
+/// One stored data access policy, keyed by its `(type, name)` pair.
+///
+/// Held beside [`SecurityPolicyRecord`] rather than sharing it: the two are different
+/// resources with their own modelled detail shape, their own `type` value list and their
+/// own quota, and `GetAccessPolicy` must not be able to read a security policy (or the
+/// other way round) just because the names coincide.
+#[derive(Debug, Clone)]
+pub struct AccessPolicyRecord {
+    /// The `AccessPolicyType` wire value; named `kind` because `type` is a keyword.
+    pub kind: String,
+    pub name: String,
+    /// The `PolicyVersion` token, re-minted on every write; see
+    /// [`ComAmazonawsOpensearchserverlessOpensearchserverlessState::next_policy_version`].
+    pub policy_version: String,
+    pub description: Option<String>,
+    /// The policy document, held PARSED so a read answers "the JSON policy document
+    /// without any whitespaces" (`AccessPolicyDetail$policy`) rather than the caller's own
+    /// formatting.
+    pub policy: ::aws_smithy_types::Document,
+    pub created_date: i64,
+    pub last_modified_date: i64,
+}
+
+impl AccessPolicyRecord {
+    /// The `AccessPolicyDetail` body for this record — the one place this crate renders
+    /// that shape, so a create cannot report a record differently from a later read.
+    pub fn detail(&self) -> AccessPolicyDetail {
+        AccessPolicyDetail {
+            r#type: Some(self.kind.clone()),
+            name: Some(self.name.clone()),
+            policy_version: Some(self.policy_version.clone()),
+            description: self.description.clone(),
+            policy: Some(self.policy.clone()),
+            created_date: Some(self.created_date),
+            last_modified_date: Some(self.last_modified_date),
+        }
+    }
+}
+
 /// A `CollectionErrorDetail` for an `ids` entry that names no stored collection.
 pub fn collection_error_for_id(id: &str) -> CollectionErrorDetail {
     CollectionErrorDetail {
@@ -629,6 +674,9 @@ pub struct ComAmazonawsOpensearchserverlessOpensearchserverlessState {
     /// Security policies by `(SecurityPolicyType, PolicyName)`: the pair that identifies
     /// one, since the same name may be used once per type.
     pub security_policies: BTreeMap<(String, String), SecurityPolicyRecord>,
+    /// Data access policies by `(AccessPolicyType, PolicyName)`, the pair that identifies
+    /// one, exactly as `security_policies` is keyed.
+    pub access_policies: BTreeMap<(String, String), AccessPolicyRecord>,
     /// `<operation>:<clientToken>` -> the key of the record that token's first call
     /// created, so a replayed `clientToken` on an `@idempotent` create answers the
     /// original record instead of creating a second one.
@@ -763,7 +811,7 @@ impl ComAmazonawsOpensearchserverlessOpensearchserverlessState {
         let record = self
             .security_policies
             .remove(&(kind.to_string(), name.to_string()))?;
-        self.forget_tokens_for(&security_policy_token_value(kind, name));
+        self.forget_tokens_for(&policy_token_value(kind, name));
         Some(record)
     }
 
@@ -804,6 +852,21 @@ impl ComAmazonawsOpensearchserverlessOpensearchserverlessState {
             .get(&idempotency_key(operation, token))?;
         let (kind, name) = key.split_once('/')?;
         self.security_policies
+            .get(&(kind.to_string(), name.to_string()))
+    }
+
+    /// The data access policy a replayed `clientToken` on `operation` already created, if
+    /// any; see [`Self::replayed_collection`] for why a stale token answers `None`.
+    pub fn replayed_access_policy(
+        &self,
+        operation: &str,
+        token: &str,
+    ) -> Option<&AccessPolicyRecord> {
+        let key = self
+            .idempotency_tokens
+            .get(&idempotency_key(operation, token))?;
+        let (kind, name) = key.split_once('/')?;
+        self.access_policies
             .get(&(kind.to_string(), name.to_string()))
     }
 
@@ -858,6 +921,11 @@ impl ComAmazonawsOpensearchserverlessOpensearchserverlessState {
             .filter(|(policy_kind, _)| policy_kind == kind)
             .count()
     }
+
+    /// The number of stored data access policies, which [`MAX_ACCESS_POLICIES`] bounds.
+    pub fn access_policy_count(&self) -> usize {
+        self.access_policies.len()
+    }
 }
 
 /// The `idempotency_tokens` key for `token` replayed against `operation`. The operation
@@ -867,10 +935,12 @@ fn idempotency_key(operation: &str, token: &str) -> String {
     format!("{operation}:{token}")
 }
 
-/// The `idempotency_tokens` VALUE that names one stored security policy. `SecurityPolicyType`
-/// is `encryption` or `network` and `PolicyName` matches `^[a-z][a-z0-9-]+$`, so neither
-/// half can contain the separator and the pair round-trips unambiguously.
-pub fn security_policy_token_value(kind: &str, name: &str) -> String {
+/// The `idempotency_tokens` VALUE that names one stored policy by its `(type, name)`
+/// pair. Every policy type value (`encryption`, `network`, `data`) and every `PolicyName`
+/// (`^[a-z][a-z0-9-]+$`) is free of the separator, so the pair round-trips unambiguously;
+/// the map is keyed by operation name as well, so a token is only ever read back by the
+/// create that wrote it.
+pub fn policy_token_value(kind: &str, name: &str) -> String {
     format!("{kind}/{name}")
 }
 
@@ -934,11 +1004,37 @@ pub fn page<'a>(
     Ok(Page { items, next_token })
 }
 
+/// The deepest JSON nesting this emulator converts into an `aws_smithy_types::Document`.
+///
+/// EMULATOR RESOURCE GUARD, not an AWS limit: [`document_from_json`] recurses once per
+/// nesting level over a CALLER-SUPPLIED document, and so does the resulting `Document`
+/// tree's own drop, while a Rust stack overflow aborts the whole process instead of
+/// failing one request. 64 levels is far past any real policy document — a data access
+/// policy nests about four — so a document past it is refused with the modelled
+/// `ValidationException` rather than converted. The bound is enforced HERE and does not
+/// rely on `serde_json`'s own parse-time recursion limit.
+pub const MAX_DOCUMENT_DEPTH: usize = 64;
+
 /// The `aws_smithy_types::Document` a parsed JSON value is, so a policy document read
 /// back is the document the caller supplied rather than its text.
-pub fn document_from_json(value: &serde_json::Value) -> ::aws_smithy_types::Document {
+///
+/// `None` when the value nests deeper than [`MAX_DOCUMENT_DEPTH`]: the caller answers that
+/// with the modelled `ValidationException`.
+pub fn document_from_json(value: &serde_json::Value) -> Option<::aws_smithy_types::Document> {
+    document_from_json_at(value, 1)
+}
+
+/// [`document_from_json`] at `depth`, where the top-level value is depth 1 and a
+/// container's members are one deeper. The depth check is what bounds the recursion.
+fn document_from_json_at(
+    value: &serde_json::Value,
+    depth: usize,
+) -> Option<::aws_smithy_types::Document> {
     use ::aws_smithy_types::{Document, Number};
-    match value {
+    if depth > MAX_DOCUMENT_DEPTH {
+        return None;
+    }
+    Some(match value {
         serde_json::Value::Null => Document::Null,
         serde_json::Value::Bool(value) => Document::Bool(*value),
         serde_json::Value::Number(value) => {
@@ -951,16 +1047,121 @@ pub fn document_from_json(value: &serde_json::Value) -> ::aws_smithy_types::Docu
             }
         }
         serde_json::Value::String(value) => Document::String(value.clone()),
-        serde_json::Value::Array(items) => {
-            Document::Array(items.iter().map(document_from_json).collect())
-        }
+        serde_json::Value::Array(items) => Document::Array(
+            items
+                .iter()
+                .map(|item| document_from_json_at(item, depth + 1))
+                .collect::<Option<Vec<_>>>()?,
+        ),
         serde_json::Value::Object(members) => Document::Object(
             members
                 .iter()
-                .map(|(name, member)| (name.clone(), document_from_json(member)))
-                .collect(),
+                .map(|(name, member)| {
+                    document_from_json_at(member, depth + 1).map(|member| (name.clone(), member))
+                })
+                .collect::<Option<_>>()?,
         ),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// The audit record a call emits
+// ---------------------------------------------------------------------------
+
+/// Longest request-derived value one audit field carries.
+///
+/// A SigV4 access key id, a request path and a policy name are all caller-controlled, so
+/// an unbounded echo would let one request emit an arbitrarily long log line.
+const MAX_AUDIT_FIELD: usize = 256;
+
+/// What the `resource` field reads as when the call resolved no resource.
+pub const AUDIT_NO_RESOURCE: &str = "-";
+
+/// A request-derived value as it may appear in an audit record: control characters (above
+/// all CR and LF, which would forge a second record) replaced, and the whole value bounded
+/// by [`MAX_AUDIT_FIELD`] on a character boundary.
+fn audit_field(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| if character.is_control() { '.' } else { character })
+        .take(MAX_AUDIT_FIELD)
+        .collect()
+}
+
+/// What a call answered, as the one closed set [`audit`] records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuditOutcome {
+    /// A policy was minted and stored.
+    PolicyCreated,
+    /// A replayed `clientToken` answered the record its first call created; nothing was
+    /// written.
+    IdempotentReplay,
+    /// A stored policy was reported to a reader.
+    PolicyRead,
+    /// The request was refused as invalid (400 `ValidationException`).
+    ValidationRefused,
+    /// A policy with that `(type, name)` pair already exists (409 `ConflictException`).
+    AlreadyExists,
+    /// An account quota was met (402 `ServiceQuotaExceededException`).
+    QuotaExceeded,
+    /// The `(type, name)` pair names no stored policy (404 `ResourceNotFoundException`).
+    NotFound,
+    /// This service's store could not be reached (500 `InternalServerException`).
+    StoreUnreachable,
+}
+
+impl AuditOutcome {
+    /// The stable token this outcome is logged as.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PolicyCreated => "policy-created",
+            Self::IdempotentReplay => "idempotent-replay",
+            Self::PolicyRead => "policy-read",
+            Self::ValidationRefused => "validation-refused",
+            Self::AlreadyExists => "already-exists",
+            Self::QuotaExceeded => "quota-exceeded",
+            Self::NotFound => "not-found",
+            Self::StoreUnreachable => "store-unreachable",
+        }
     }
+}
+
+/// One structured audit record for a call: which operation, the identity the request
+/// presented, what it was addressed to, the resource it resolved and the outcome. The
+/// `tracing` subscriber supplies the timestamp.
+///
+/// There is no network peer in the record because a Smithy handler is not given one: the
+/// request's parts carry its method, URI, headers and extensions, and nothing in this
+/// framework puts a peer address in them, so the presented credential is what identifies
+/// the caller — the access key id only, never the credential itself. Deliberately metadata
+/// only: no policy document or description is logged, so a caller's own data never reaches
+/// the log. Every interpolated value is request-derived, so [`audit_field`] bounds it and
+/// replaces the control characters that would otherwise let one request forge a second
+/// record.
+pub fn audit(
+    operation: &str,
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    outcome: AuditOutcome,
+    resource: Option<&str>,
+) {
+    let parts = ctx.parts();
+    ::tracing::info!(
+        target: "emulator::audit",
+        service = ARN_NAMESPACE,
+        operation = %audit_field(operation),
+        access_key_id = %audit_field(&::emulator_server::extract_akid(&parts.headers)),
+        request_target = %audit_field(&format!("{} {}", parts.method, parts.uri.path())),
+        resource = %audit_field(resource.unwrap_or(AUDIT_NO_RESOURCE)),
+        outcome = outcome.as_str(),
+        "opensearchserverless api call"
+    );
+}
+
+/// The `resource` field naming one data access policy: its type and name, which is its
+/// identity in this API. Named for the access policy because the prefix is fixed: another
+/// resource's records name their own.
+pub fn audit_access_policy_resource(kind: &str, name: &str) -> String {
+    format!("access-policy/{kind}/{name}")
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
