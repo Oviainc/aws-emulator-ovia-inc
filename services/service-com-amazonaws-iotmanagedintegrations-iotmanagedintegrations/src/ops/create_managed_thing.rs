@@ -245,8 +245,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let replayed = input
             .client_token
             .as_deref()
-            .and_then(|token| store.idempotency_tokens.get(token))
-            .map(|record| record.managed_thing_id.clone());
+            .and_then(|token| {
+                store.replayed_resource_id(crate::state::MANAGED_THING_RESOURCE_TYPE, token)
+            });
         if let Some(created) = replayed.and_then(|id| store.managed_thing_in(&region, &id)) {
             return Ok(CreateManagedThingOutput {
                 id: Some(created.id.clone()),
@@ -321,14 +322,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         if let Some(token) = input.client_token {
-            // Keep the map under its cap before minting one more record.
-            store.make_room_for_idempotency_token();
-            store.idempotency_tokens.insert(
-                token,
-                crate::state::IdempotencyRecord {
-                    managed_thing_id: id.clone(),
-                    minted_at: created_at,
-                },
+            store.record_idempotency_token(
+                crate::state::MANAGED_THING_RESOURCE_TYPE,
+                &token,
+                &id,
+                created_at,
             );
         }
         store.managed_thing_order.push(id.clone());

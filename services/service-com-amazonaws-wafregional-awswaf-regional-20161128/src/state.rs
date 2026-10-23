@@ -124,6 +124,26 @@ pub const MAX_IP_SET_DESCRIPTORS: usize = 10_000;
 /// a regex match condition refers to, and small enough that a test can reach it.
 pub const MAX_REGEX_PATTERN_SETS: usize = 10;
 
+/// The most `RegexPatternString`s one `RegexPatternSet` may hold.
+///
+/// Source: the model itself — `RegexPatternSet$RegexPatternStrings` is `length 0..10`
+/// (`smithy_query(query="shape",shape="RegexPatternSet")`), so a set holding more could
+/// not be serialized onto its own shape. `UpdateRegexPatternSet` answers its modelled
+/// `WAFLimitsExceededException` for an insert that would pass this bound.
+pub const MAX_REGEX_PATTERN_STRINGS: usize = 10;
+
+/// The most `RegexPatternSetUpdate`s one `UpdateRegexPatternSet` request may carry.
+///
+/// The model bounds `RegexPatternSetUpdates` only below (`length 1..`), so this bound is
+/// CHOSEN, not cited, on the same reasoning as
+/// [`MAX_SQL_INJECTION_MATCH_SET_UPDATES_PER_REQUEST`]: a request can at most empty a set
+/// ([`MAX_REGEX_PATTERN_STRINGS`] deletes) and then fill it again
+/// ([`MAX_REGEX_PATTERN_STRINGS`] inserts), since a delete must name a pattern the set
+/// holds and an insert one it does not, so no larger request can leave the set in a state
+/// a request of this size cannot. It caps the work one caller can ask for before the
+/// handler takes the shared store's lock.
+pub const MAX_REGEX_PATTERN_SET_UPDATES_PER_REQUEST: usize = 2 * MAX_REGEX_PATTERN_STRINGS;
+
 /// The most `SqlInjectionMatchSet`s this emulator stores for the account before
 /// `CreateSqlInjectionMatchSet` answers its modelled `WAFLimitsExceededException`.
 ///
@@ -685,6 +705,26 @@ impl RegexPatternSetEntry {
             name: Some(self.name.clone()),
             regex_pattern_strings: self.patterns.clone(),
         }
+    }
+
+    /// Add `pattern`, unless the set already holds it. Answers whether the set changed.
+    ///
+    /// A `RegexPatternSet` is a SET of pattern strings, so one stored twice would be one
+    /// member of it: `UpdateRegexPatternSet` answers the second insert with its modelled
+    /// `WAFInvalidOperationException` ("there was nothing to do") instead.
+    pub fn insert_pattern(&mut self, pattern: &str) -> bool {
+        if self.patterns.iter().any(|stored| stored == pattern) {
+            return false;
+        }
+        self.patterns.push(pattern.to_string());
+        true
+    }
+
+    /// Remove `pattern`, if the set holds it. Answers whether the set changed.
+    pub fn remove_pattern(&mut self, pattern: &str) -> bool {
+        let before = self.patterns.len();
+        self.patterns.retain(|stored| stored != pattern);
+        self.patterns.len() != before
     }
 }
 

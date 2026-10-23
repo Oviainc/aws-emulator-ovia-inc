@@ -51,5 +51,7 @@ mod stage_lifecycle;
 mod state_roundtrip;
 #[path = "all/tag_reads_by_arn.rs"]
 mod tag_reads_by_arn;
+#[path = "all/update_method_response.rs"]
+mod update_method_response;
 #[path = "all/validation_message_rules.rs"]
 mod validation_message_rules;

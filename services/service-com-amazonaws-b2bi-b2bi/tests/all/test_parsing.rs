@@ -1533,3 +1533,311 @@ async fn parsing_a_document_changes_nothing_a_later_caller_sees() {
         "parsing must leave the stored object byte for byte"
     );
 }
+
+/// Element 11 of the interchange control header before X12 release 004020, and from it on.
+///
+/// Source: the element table of the ASC X12 interchange control header — position 11 is
+/// the Interchange Control Standards Identifier until release 004020, where the Repetition
+/// Separator takes it.
+const ISA11_PRE_4020: &str = "ISA_11_InterchangeControlStandardsIdentifier";
+const ISA11_FROM_4020: &str = "ISA_11_RepetitionSeparator";
+
+#[tokio::test]
+async fn isa11_follows_the_release_the_interchange_declares_when_the_request_names_none() {
+    let router = parsing_router();
+    create_bucket(&router).await;
+
+    // `X12Details.version` is OPTIONAL (`smithy_query` query=shape shape=X12Details), so a
+    // request may name no release at all; then the interchange's own ISA12 Interchange
+    // Control Version Number is what names ISA11. `X12Version` cannot even express release
+    // 004020 — its values are VERSION_4010, 4030, 4050, 4060, 5010, 5010_HIPAA — so an
+    // interchange AT the release where the Repetition Separator appears is reachable only
+    // this way. The rows span below the bound, the bound itself and past it.
+    let cases: Vec<(&str, &str, &str)> = vec![
+        ("release 003020, below the bound", "00302", ISA11_PRE_4020),
+        ("release 004010, below the bound", "00401", ISA11_PRE_4020),
+        ("release 004020, the bound", "00402", ISA11_FROM_4020),
+        ("release 004030, one past the bound", "00403", ISA11_FROM_4020),
+        ("release 005010, past the bound", "00501", ISA11_FROM_4020),
+    ];
+
+    for (case, isa12, expected) in cases {
+        let document = interchange(
+            STANDARD,
+            "SENDERID",
+            "RECEIVERID",
+            isa12,
+            &[("PO", vec![purchase_order("0001", "PO-11")])],
+        );
+        let key = format!("declared-release/{isa12}.edi");
+        let input_file = stage(&router, &key, document.as_bytes()).await;
+
+        // The request names the transaction set and NO version, which is why the parse has
+        // only the interchange itself to take the release from.
+        let body = json!({
+            "inputFile": input_file,
+            "fileFormat": "JSON",
+            "ediType": { "x12Details": { "transactionSet": "X12_850" } }
+        });
+        let (status, response) = call(&router, "TestParsing", body).await;
+        let parsed = parsed_json(case, status, &response);
+        let reported = &parsed["interchanges"][0];
+
+        // ISA11's value is what the interchange carries at position 11 either way; it is
+        // the member's NAME that follows the release.
+        assert_eq!(
+            reported[expected].as_str(),
+            Some("U"),
+            "case {case:?}: ISA11 must be reported as <{expected}> carrying the \
+             interchange's own value, got {reported}"
+        );
+        let other = if expected == ISA11_PRE_4020 {
+            ISA11_FROM_4020
+        } else {
+            ISA11_PRE_4020
+        };
+        assert!(
+            reported.get(other).is_none(),
+            "case {case:?}: ISA11 must be reported once, not also as <{other}>, got {reported}"
+        );
+        assert_eq!(
+            reported["ISA_12_InterchangeControlVersionNumber"].as_str(),
+            Some(isa12),
+            "case {case:?}: ISA12 must be the release the interchange declares, got {reported}"
+        );
+    }
+
+    // ... and a request that DOES name a version is what the release follows, which is the
+    // other half of the handler's documented rule ("the one the request names, else the one
+    // the interchange declares in ISA12"): the same document, read at the release the
+    // request names, reports ISA11 by that release's name.
+    let document = interchange(
+        STANDARD,
+        "SENDERID",
+        "RECEIVERID",
+        "00401",
+        &[("PO", vec![purchase_order("0001", "PO-11")])],
+    );
+    let input_file = stage(&router, "declared-release/named.edi", document.as_bytes()).await;
+    for (case, version, expected) in [
+        ("the request names 4010", "VERSION_4010", ISA11_PRE_4020),
+        ("the request names 5010", "VERSION_5010", ISA11_FROM_4020),
+    ] {
+        let (status, response) = call(
+            &router,
+            "TestParsing",
+            request(input_file.clone(), "JSON", "X12_850", version),
+        )
+        .await;
+        let parsed = parsed_json(case, status, &response);
+        let reported = &parsed["interchanges"][0];
+        assert_eq!(
+            reported[expected].as_str(),
+            Some("U"),
+            "case {case:?}: the release the request names must name ISA11 <{expected}>, got \
+             {reported}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn every_interchange_a_file_holds_is_parsed_in_file_order() {
+    let router = parsing_router();
+    create_bucket(&router).await;
+
+    // A parsed document's `interchanges` is a LIST, so the rule generalises over how many
+    // interchanges a file holds: each one is reported, in file order, with its own
+    // envelope and its own control counts. Each row is one file, with one entry per
+    // interchange in it — the sender that identifies it, its ISA12 and its functional
+    // groups — and the rows differ along the number of interchanges and along how many
+    // groups and transaction sets each of them holds.
+    #[allow(clippy::type_complexity)]
+    let cases: Vec<(&str, Vec<(&str, &str, Vec<GroupRow<'_>>)>)> = vec![
+        (
+            "one interchange",
+            vec![(
+                "SENDERONE",
+                "00401",
+                vec![("PO", vec![purchase_order("0001", "PO-1")])],
+            )],
+        ),
+        (
+            "two interchanges",
+            vec![
+                (
+                    "SENDERONE",
+                    "00401",
+                    vec![("PO", vec![purchase_order("0001", "PO-1")])],
+                ),
+                (
+                    "SENDERTWO",
+                    "00501",
+                    vec![("HC", vec![health_care_claim("0002")])],
+                ),
+            ],
+        ),
+        (
+            "three interchanges, the middle one holding two groups",
+            vec![
+                (
+                    "SENDERONE",
+                    "00401",
+                    vec![("PO", vec![purchase_order("0001", "PO-1")])],
+                ),
+                (
+                    "SENDERTWO",
+                    "00401",
+                    vec![
+                        (
+                            "PO",
+                            vec![
+                                purchase_order("0002", "PO-2"),
+                                purchase_order("0003", "PO-3"),
+                            ],
+                        ),
+                        ("HC", vec![health_care_claim("0004")]),
+                    ],
+                ),
+                (
+                    "SENDERTHREE",
+                    "00401",
+                    vec![("PO", vec![purchase_order("0005", "PO-5")])],
+                ),
+            ],
+        ),
+    ];
+
+    for (case, file) in cases {
+        let mut document = String::new();
+        for (sender, isa12, groups) in &file {
+            document.push_str(&interchange(STANDARD, sender, "RECEIVERID", isa12, groups));
+        }
+        let key = format!("multi/{}.edi", case.replace([' ', ','], "-"));
+        let input_file = stage(&router, &key, document.as_bytes()).await;
+
+        let (status, response) = call(
+            &router,
+            "TestParsing",
+            request(input_file.clone(), "JSON", "X12_850", "VERSION_4010"),
+        )
+        .await;
+        let parsed = parsed_json(case, status, &response);
+        let interchanges = parsed["interchanges"]
+            .as_array()
+            .unwrap_or_else(|| panic!("case {case:?}: expected interchanges, got {parsed}"));
+        assert_eq!(
+            interchanges.len(),
+            file.len(),
+            "case {case:?}: expected {} interchanges, got {}",
+            file.len(),
+            interchanges.len()
+        );
+
+        for (index, (sender, isa12, groups)) in file.iter().enumerate() {
+            let reported = &interchanges[index];
+            assert_eq!(
+                reported["ISA_06_InterchangeSenderId"].as_str(),
+                Some(*sender),
+                "case {case:?}: interchange {index} must be the one {sender:?} sent, got \
+                 {reported}"
+            );
+            assert_eq!(
+                reported["ISA_12_InterchangeControlVersionNumber"].as_str(),
+                Some(*isa12),
+                "case {case:?}: interchange {index} must carry its own ISA12, got {reported}"
+            );
+            let reported_groups = reported["functional_groups"]
+                .as_array()
+                .unwrap_or_else(|| panic!("case {case:?}: expected groups, got {reported}"));
+            assert_eq!(
+                reported_groups.len(),
+                groups.len(),
+                "case {case:?}: interchange {index} must hold {} functional groups, got {}",
+                groups.len(),
+                reported_groups.len()
+            );
+            let count = groups.len().to_string();
+            assert_eq!(
+                reported["IEA_01_NumberOfIncludedFunctionalGroups"].as_str(),
+                Some(count.as_str()),
+                "case {case:?}: interchange {index} must report IEA01 as its own group \
+                 count, got {reported}"
+            );
+        }
+
+        // Splitting spans every interchange: one file per transaction set the WHOLE input
+        // file holds, each carrying the envelope of the interchange ITS transaction set
+        // sits in and reporting the one group and the one transaction set it really holds.
+        let expected: Vec<(&str, &str)> = file
+            .iter()
+            .flat_map(|(sender, _, groups)| {
+                groups.iter().flat_map(move |(_, transactions)| {
+                    transactions
+                        .iter()
+                        .map(move |transaction| (*sender, transaction.control))
+                })
+            })
+            .collect();
+        let mut body = request(input_file, "JSON", "X12_850", "VERSION_4010");
+        body["advancedOptions"] = json!({ "x12": { "splitOptions": { "splitBy": "TRANSACTION" } } });
+        let (status, response) = call(&router, "TestParsing", body).await;
+        assert_eq!(
+            status, 201,
+            "case {case:?}: expected HTTP 201 for a split parse, got {status} with body \
+             {response:?}"
+        );
+        let contents = response["parsedSplitFileContents"]
+            .as_array()
+            .unwrap_or_else(|| {
+                panic!("case {case:?}: expected parsedSplitFileContents, got {response:?}")
+            });
+        assert_eq!(
+            contents.len(),
+            expected.len(),
+            "case {case:?}: expected {} split files, got {}",
+            expected.len(),
+            contents.len()
+        );
+
+        for (index, (sender, control)) in expected.iter().enumerate() {
+            let text = contents[index].as_str().unwrap_or_default();
+            let split: Value = serde_json::from_str(text).unwrap_or_else(|error| {
+                panic!("case {case:?}: each split file must be a JSON document, got {error}: {text}")
+            });
+            let split_interchanges = split["interchanges"]
+                .as_array()
+                .unwrap_or_else(|| panic!("case {case:?}: expected interchanges, got {split}"));
+            assert_eq!(
+                split_interchanges.len(),
+                1,
+                "case {case:?}: split file {index} must hold one interchange, got {}",
+                split_interchanges.len()
+            );
+            let only = &split_interchanges[0];
+            assert_eq!(
+                only["ISA_06_InterchangeSenderId"].as_str(),
+                Some(*sender),
+                "case {case:?}: split file {index} must carry the envelope of the \
+                 interchange it came from, got {split}"
+            );
+            assert_eq!(
+                only["IEA_01_NumberOfIncludedFunctionalGroups"].as_str(),
+                Some("1"),
+                "case {case:?}: split file {index} must report IEA01 as 1, got {split}"
+            );
+            assert_eq!(
+                only["functional_groups"][0]["GE_01_NumberOfTransactionSetsIncluded"].as_str(),
+                Some("1"),
+                "case {case:?}: split file {index} must report GE01 as 1, got {split}"
+            );
+            assert_eq!(
+                only["functional_groups"][0]["transactions"][0]
+                    ["ST_02_TransactionSetControlNumber"]
+                    .as_str(),
+                Some(*control),
+                "case {case:?}: split file {index} must hold transaction set {control:?}, \
+                 got {split}"
+            );
+        }
+    }
+}

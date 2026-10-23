@@ -1,0 +1,338 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! What a job worker REPORTS: `AcknowledgeJob`, `PutJobSuccessResult` and
+//! `PutJobFailureResult`, and what reporting it does to the action the job belongs to.
+//!
+//! # The rule this module implements
+//!
+//! `PollForJobs` hands a worker the job of a `Custom`-owned action and
+//! [`super::JobRecord`] is that job; this is the other half of the same lifecycle. The
+//! worker CLAIMS the job with the nonce its poll published ("a system-generated random
+//! number that CodePipeline uses to ensure that the job is being worked on by only one
+//! job worker"), and the outcome it then reports IS the action's outcome: a success
+//! finishes the action — unless it carries a `continuationToken`, which
+//! `PutJobSuccessResult` documents as identifying "a custom action in progress", so the
+//! same job goes back to waiting for the worker's next report — and a failure fails the
+//! action, which the engine ([`super::driver`]) then rolls up into its stage and its
+//! execution.
+//!
+//! Nothing here invents an outcome: the status an action reaches is the one its worker
+//! reported, and the only call that moves a job is one from the worker holding it.
+//!
+//! # What a job will not take
+//!
+//! * a job no worker has claimed, or one already completed, takes no result
+//!   (`InvalidJobStateException`): there is no worker whose outcome it is;
+//! * a nonce that is not the one the job's newest poll published does not claim it
+//!   (`InvalidNonceException`), which is what makes the claim exclusive;
+//! * a job whose ACTION is no longer running — abandoned by a stop, or already finished
+//!   — is not work any more, so it is swept away ([`super::ComAmazonawsCodepipelineCodepipeline20150709State::retire_finished_jobs`])
+//!   and a call naming it is answered `JobNotFoundException`, exactly as `PollForJobs`
+//!   and `GetJobDetails` answer it.
+
+use std::collections::HashMap;
+use std::time::SystemTime;
+
+use crate::ops::types::{CurrentRevision, ExecutionDetails, FailureDetails};
+
+use super::{
+    ComAmazonawsCodepipelineCodepipeline20150709State as State, JOB_STATUS_FAILED,
+    JOB_STATUS_IN_PROGRESS, JOB_STATUS_QUEUED, JOB_STATUS_SUCCEEDED,
+};
+
+/// The `ActionExecutionStatus` an action reaches when its worker reports success, from
+/// the model's enum (`smithy_query query="shape" shape="ActionExecutionStatus"` ->
+/// `InProgress`, `Abandoned`, `Succeeded`, `Failed`).
+const ACTION_SUCCEEDED: &str = "Succeeded";
+
+/// The `ActionExecutionStatus` an action reaches when its worker reports failure.
+const ACTION_FAILED: &str = "Failed";
+
+/// The most bytes of `outputVariables` one job result may report.
+///
+/// A bound is required: the variables are kept on the execution and read by its later
+/// actions, so without one a worker could grow the store per request. The refusal past it
+/// is the error `PutJobSuccessResult` models for exactly this condition —
+/// `OutputVariablesSizeExceededException`, "Exceeded the total size limit for all
+/// variables in the pipeline". AWS publishes its own variable-size quota per account and
+/// adjusts it, so the FIGURE here is this emulator's bound; what is not chosen is that a
+/// result past it is refused with that error rather than accepted.
+pub const MAX_OUTPUT_VARIABLES_BYTES: usize = 120 * 1024;
+
+/// The most bytes ONE output variable's value may carry.
+///
+/// A per-variable bound is required as well as the per-result one: an output variable
+/// becomes the replacement text of every `#{namespace.key}` placeholder a later action's
+/// configuration carries, so without it one 120 KB variable would multiply by the
+/// placeholder count of every configuration value the engine and the worker resolve.
+/// `ActionConfigurationValue` is modelled `@length(min: 1, max: 1000)`, so a replacement
+/// longer than that could not fit a configuration value in the first place: this is that
+/// figure, and a result reporting a longer value is refused with the same modelled error.
+pub const MAX_OUTPUT_VARIABLE_VALUE_BYTES: usize = 1_000;
+
+/// A job-worker call this service refuses, and the modelled error that states it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JobProblem {
+    /// Refused as `JobNotFoundException`: no job of that id is queued for any action
+    /// still waiting for a worker.
+    NotFound(String),
+    /// Refused as `InvalidNonceException`: the job exists, but the nonce presented is not
+    /// the one its newest poll published.
+    InvalidNonce(String),
+    /// Refused as `InvalidJobStateException`: the job is not one this worker may report a
+    /// result for — it has not been claimed, or it has already been completed.
+    InvalidState(String),
+    /// Refused as `OutputVariablesSizeExceededException`.
+    OutputVariablesTooLarge(String),
+}
+
+/// Claim the job `job_id` for the worker presenting `nonce`, and answer the status it now
+/// carries.
+///
+/// `AcknowledgeJob` "confirms a job worker has received the specified job", which is what
+/// makes that worker the one whose result the job accepts: the job moves to `InProgress`
+/// and its claim is no longer open to another worker. A job that is not waiting to be
+/// claimed takes no acknowledgement — the nonce that claimed it is the only one that ever
+/// reached it, so presenting one for a job already claimed or completed is refused.
+pub fn acknowledge(
+    state: &mut State,
+    job_id: &str,
+    nonce: &str,
+    now: SystemTime,
+) -> Result<String, JobProblem> {
+    // A job whose action is no longer waiting for a worker is not a job any more, which
+    // is the sweep every job-worker operation performs first.
+    state.retire_finished_jobs();
+    let job = job_mut(state, job_id)?;
+    if job.nonce.as_deref() != Some(nonce) {
+        return Err(JobProblem::InvalidNonce(format!(
+            "Nonce {nonce} is not the nonce the newest poll published for job {job_id}"
+        )));
+    }
+    if job.status != JOB_STATUS_QUEUED {
+        return Err(JobProblem::InvalidNonce(format!(
+            "Nonce {nonce} no longer claims job {job_id}, which is in status {}: a job is \
+             worked on by only one job worker",
+            job.status
+        )));
+    }
+    job.status = JOB_STATUS_IN_PROGRESS.to_string();
+    job.last_status_change = now;
+    Ok(job.status.clone())
+}
+
+/// Record a worker's successful result for `job_id`.
+///
+/// A result carrying a `continuationToken` identifies an action that is still running —
+/// "future jobs use this token to identify the running instance of the action", and "when
+/// the action is complete, no continuation token should be supplied" — so the JOB goes
+/// back to waiting (carrying that token, for the worker's next report) and the action
+/// stays `InProgress`. Without one the action itself succeeds, with the summary and the
+/// output variables the worker reported, and the next advance rolls that up into the
+/// stage and the execution.
+pub fn record_success(
+    state: &mut State,
+    job_id: &str,
+    continuation_token: Option<String>,
+    current_revision: Option<CurrentRevision>,
+    execution_details: Option<ExecutionDetails>,
+    output_variables: Option<HashMap<String, String>>,
+    now: SystemTime,
+) -> Result<(), JobProblem> {
+    if let Some(variables) = &output_variables {
+        let size: usize = variables
+            .iter()
+            .map(|(name, value)| name.len() + value.len())
+            .sum();
+        if size > MAX_OUTPUT_VARIABLES_BYTES {
+            return Err(JobProblem::OutputVariablesTooLarge(format!(
+                "Exceeded the total size limit for all variables in the pipeline: {size} bytes \
+                 reported, at most {MAX_OUTPUT_VARIABLES_BYTES} allowed"
+            )));
+        }
+        // And one variable on its own: it becomes the replacement text of every
+        // placeholder a later action's configuration carries, so its length is bounded at
+        // the figure a configuration value can hold at all.
+        if let Some((name, value)) = variables
+            .iter()
+            .find(|(_, value)| value.len() > MAX_OUTPUT_VARIABLE_VALUE_BYTES)
+        {
+            return Err(JobProblem::OutputVariablesTooLarge(format!(
+                "Exceeded the size limit for the variable {name}: {} bytes reported, at most \
+                 {MAX_OUTPUT_VARIABLE_VALUE_BYTES} allowed for one variable",
+                value.len()
+            )));
+        }
+    }
+
+    state.retire_finished_jobs();
+    let (execution_id, stage, action, pipeline_name, stage_name, action_name) = {
+        let job = job_mut(state, job_id)?;
+        if job.status != JOB_STATUS_IN_PROGRESS {
+            return Err(JobProblem::InvalidState(invalid_state_message(
+                job_id,
+                &job.status,
+            )));
+        }
+        if let Some(token) = continuation_token {
+            // The action continues on the SAME job: it goes back to waiting, carrying the
+            // token, so the worker's next poll is handed the continuing work rather than
+            // a second record accumulating for one action.
+            job.status = JOB_STATUS_QUEUED.to_string();
+            job.nonce = None;
+            job.leased_until = None;
+            job.continuation_token = Some(token);
+            job.last_status_change = now;
+            return Ok(());
+        }
+        job.status = JOB_STATUS_SUCCEEDED.to_string();
+        job.last_status_change = now;
+        (
+            job.pipeline_execution_id.clone(),
+            job.stage,
+            job.action,
+            job.pipeline_name.clone(),
+            job.stage_name.clone(),
+            job.action_name.clone(),
+        )
+    };
+
+    // What the worker reported as the revision it worked on, filed where
+    // `GetPipelineState` reports an action's current revision from.
+    if let Some(revision) = current_revision {
+        state.action_revisions.insert(
+            (pipeline_name, stage_name, action_name),
+            crate::ops::types::ActionRevision {
+                revision_id: revision.revision,
+                revision_change_id: revision.change_identifier,
+                created: revision
+                    .created
+                    .unwrap_or_else(|| super::to_date_time(now)),
+            },
+        );
+    }
+
+    let namespace = state
+        .pipelines
+        .get(&pipeline_name_of(state, &execution_id))
+        .and_then(|pipeline| {
+            let version = state
+                .executions
+                .get(&execution_id)
+                .map(|record| record.pipeline_version)?;
+            pipeline
+                .declaration_at(Some(version))?
+                .stages
+                .get(stage)?
+                .actions
+                .get(action)?
+                .namespace
+                .clone()
+        });
+
+    let Some(record) = state.executions.get_mut(&execution_id) else {
+        return Err(JobProblem::NotFound(super::job_not_found_message(job_id)));
+    };
+    let Some(run) = record
+        .stages
+        .get_mut(stage)
+        .and_then(|stage| stage.actions.get_mut(action))
+    else {
+        return Err(JobProblem::NotFound(super::job_not_found_message(job_id)));
+    };
+    run.status = Some(ACTION_SUCCEEDED.to_string());
+    run.summary = execution_details
+        .as_ref()
+        .and_then(|details| details.summary.clone());
+    run.claimed = None;
+    run.last_status_change = now;
+    record.last_update_time = now;
+
+    // An action's output variables are read by the later actions of the same execution
+    // through the namespace that action declares, which is the namespace the engine
+    // resolves `#{namespace.key}` placeholders against.
+    if let (Some(namespace), Some(variables)) = (namespace, output_variables) {
+        for (name, value) in variables {
+            record
+                .variables_map
+                .insert(format!("{namespace}.{name}"), value);
+        }
+    }
+    Ok(())
+}
+
+/// Record a worker's failure for `job_id`: the job and the ACTION it reports on both
+/// fail, carrying the `failureDetails` the worker gave, and the next advance fails the
+/// action's stage and the execution with it.
+pub fn record_failure(
+    state: &mut State,
+    job_id: &str,
+    failure: &FailureDetails,
+    now: SystemTime,
+) -> Result<(), JobProblem> {
+    state.retire_finished_jobs();
+    let (execution_id, stage, action) = {
+        let job = job_mut(state, job_id)?;
+        if job.status != JOB_STATUS_IN_PROGRESS {
+            return Err(JobProblem::InvalidState(invalid_state_message(
+                job_id,
+                &job.status,
+            )));
+        }
+        job.status = JOB_STATUS_FAILED.to_string();
+        job.last_status_change = now;
+        (job.pipeline_execution_id.clone(), job.stage, job.action)
+    };
+
+    let Some(record) = state.executions.get_mut(&execution_id) else {
+        return Err(JobProblem::NotFound(super::job_not_found_message(job_id)));
+    };
+    let Some(run) = record
+        .stages
+        .get_mut(stage)
+        .and_then(|stage| stage.actions.get_mut(action))
+    else {
+        return Err(JobProblem::NotFound(super::job_not_found_message(job_id)));
+    };
+    run.status = Some(ACTION_FAILED.to_string());
+    run.summary = Some(failure.message.clone());
+    // `FailureDetails$type` is the `FailureType` the worker chose for this failure, so it
+    // is reported as the action's error code rather than replaced by one of ours.
+    run.error = Some((failure.r#type.clone(), failure.message.clone()));
+    run.claimed = None;
+    run.last_status_change = now;
+    record.last_update_time = now;
+    Ok(())
+}
+
+/// The job queued under `job_id`, or the refusal a call naming no job answers.
+fn job_mut<'a>(
+    state: &'a mut State,
+    job_id: &str,
+) -> Result<&'a mut super::JobRecord, JobProblem> {
+    state
+        .jobs
+        .values_mut()
+        .flatten()
+        .find(|job| job.job_id == job_id)
+        .ok_or_else(|| JobProblem::NotFound(super::job_not_found_message(job_id)))
+}
+
+/// The pipeline the execution `execution_id` belongs to, or an empty name when the store
+/// no longer holds it.
+fn pipeline_name_of(state: &State, execution_id: &str) -> String {
+    state
+        .executions
+        .get(execution_id)
+        .map(|record| record.pipeline_name.clone())
+        .unwrap_or_default()
+}
+
+/// Why a job cannot take a result: it is not one a worker holds and has still to
+/// complete. Built from the request and the job's own status.
+fn invalid_state_message(job_id: &str, status: &str) -> String {
+    format!(
+        "Job with id {job_id} is in status {status}, so no result can be reported for it; only a \
+         job a worker has acknowledged and not yet completed accepts one"
+    )
+}
