@@ -26,9 +26,12 @@ use crate::comprehend_client::{error_code, Comprehend};
 /// service publishes for real-time analysis where the model states none: 100,000
 /// bytes for `DetectDominantLanguage` and for PII analysis (whose `Text` member
 /// documents "The maximum string size is 100 KB"), and 5,000 bytes for a
-/// single-document inference call whose model states no maximum. Comprehend's other
-/// real-time `Detect*` operations are still scaffolded (they answer HTTP 501), so
-/// they have no row here yet.
+/// single-document inference call whose model states no maximum. `DetectToxicContent`
+/// takes a LIST of text strings rather than one `Text` document, so its own per-string
+/// entry of that table (`crate::state::TOXIC_CONTENT_SEGMENT_QUOTA_BYTES`) is asserted
+/// over the same shared refusal in `toxic_content.rs` instead of as a row here;
+/// Comprehend's remaining real-time `Detect*` operations are still scaffolded (they
+/// answer HTTP 501), so they have no row here yet.
 const QUOTAS: &[(&str, usize)] = &[
     ("ContainsPiiEntities", 100_000),
     ("DetectSentiment", 5_000),

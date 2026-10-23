@@ -169,3 +169,17 @@ pub fn error_message(body: &Value) -> String {
     }
     "<no message>".to_string()
 }
+
+/// The ONE size-report sentence every real-time inference operation refuses an
+/// oversized document with (`crate::state::text_size_refusal`), as a suite expects to
+/// read it back: built from the request, so it names the quota that applies and the
+/// submitted document's UTF-8 byte length.
+///
+/// Lives here rather than in one suite so no two suites can drift apart on the
+/// sentence they assert.
+pub fn expected_text_size_message(quota_bytes: usize, actual_bytes: usize) -> String {
+    format!(
+        "Input text size exceeds limit. Max length of request text allowed is \
+         {quota_bytes} bytes while in this request the text size is {actual_bytes} bytes"
+    )
+}
