@@ -10,6 +10,11 @@
 //! omits the token gets a service-provided one
 //! ([`crate::state::mint_client_token`]).
 //!
+//! GATED on the account: configuring RDP connection recording requires the account to
+//! be enrolled in just-in-time node access, so an account that is not enrolled is
+//! refused with the modeled `AccessDeniedException` (403) — after the request-shape
+//! validation AWS performs first, and before anything the request names is looked up.
+//!
 //! ## Reaching this service's state
 //!
 //! The engine is held on `self` (constructor-injected), NOT passed per request.
@@ -156,10 +161,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Modeled constraints the boundary validator cannot compile (see
         // `crate::state::refuse_preferences`); everything else it declares was
         // already refused before this handler ran.
+        //
+        // REQUEST-SHAPE VALIDATION COMES FIRST, ahead of the account-level gate
+        // below: a request whose members are outside their modeled constraints is
+        // refused as invalid whatever the account is enrolled in.
         if let Some(message) = crate::state::refuse_preferences(&input.connection_recording_preferences) {
             audit(Self::NAME, ctx, AuditOutcome::ValidationRefused);
             return Err(UpdateConnectionRecordingPreferencesErrorModeled::ValidationException(
                 ValidationException { message },
+            )
+            .into());
+        }
+
+        let mut store = state.lock();
+
+        // THE ACCOUNT-LEVEL GATE: configuring RDP connection recording requires the
+        // account to be enrolled in just-in-time node access, so an account that is
+        // not enrolled is refused outright — before any lookup of the resources the
+        // request names (a bucket, a key), and before the idempotency record, so the
+        // denial is the same for a fresh token and for a replayed one. The enrollment
+        // is persisted account state (`crate::state`), not a property of the request.
+        if !store.just_in_time_node_access_enabled() {
+            drop(store);
+            audit(Self::NAME, ctx, AuditOutcome::AccessDenied);
+            return Err(UpdateConnectionRecordingPreferencesErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: crate::state::JUST_IN_TIME_NODE_ACCESS_DISABLED.to_string(),
+                },
             )
             .into());
         }
@@ -179,7 +207,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .client_token
             .unwrap_or_else(crate::state::mint_client_token);
 
-        let mut store = state.lock();
         let key = (IdempotentOperation::Update, client_token.clone());
 
         // This operation is `@idempotent`: a replayed token answers with the record

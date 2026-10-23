@@ -10,6 +10,12 @@
 //! omits the token gets a service-provided one
 //! ([`crate::state::mint_client_token`]).
 //!
+//! Idempotent in the full sense: "nothing configured" is the state this operation is
+//! asked for, so a Delete on an account with no preferences SUCCEEDS (200, echoing the
+//! effective `ClientToken`) rather than reporting a resource it did not find. It is
+//! also not gated by just-in-time node access — unlike
+//! `UpdateConnectionRecordingPreferences`.
+//!
 //! ## Reaching this service's state
 //!
 //! The engine is held on `self` (constructor-injected), NOT passed per request.
@@ -178,21 +184,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             });
         }
 
-        // Deleting with nothing configured has no resource to remove.
-        if !store.remove_preferences(&client_token) {
-            drop(store);
-            audit(Self::NAME, ctx, AuditOutcome::NotFound);
-            return Err(DeleteConnectionRecordingPreferencesErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: "no connection recording preferences are configured for this account \
-                              and Region"
-                        .to_string(),
-                },
-            )
-            .into());
-        }
+        // Deleting with nothing configured removes nothing and still succeeds: the
+        // caller asked for a state the store is already in. The flag distinguishes the
+        // two for the audit record only — both answer 200 with the effective token.
+        let removed = store.remove_preferences(&client_token);
         drop(store);
-        audit(Self::NAME, ctx, AuditOutcome::PreferencesDeleted);
+        audit(
+            Self::NAME,
+            ctx,
+            if removed {
+                AuditOutcome::PreferencesDeleted
+            } else {
+                AuditOutcome::PreferencesAlreadyAbsent
+            },
+        );
 
         Ok(DeleteConnectionRecordingPreferencesOutput {
             client_token: Some(client_token),
