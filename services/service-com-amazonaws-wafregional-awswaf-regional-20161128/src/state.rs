@@ -18,6 +18,11 @@
 //! The `ByteMatchSet` records and bounds live at the END of this file, under "AWS WAF
 //! Classic ByteMatchSet records", so this one store carries them beside every other
 //! resource kind.
+//!
+//! The IAM policy `PutPermissionPolicy` attaches to a `RuleGroup` lives on that rule
+//! group's own record ([`RuleGroupEntry::permission_policy`]); the restrictions it must
+//! satisfy are at the end of this file, under "AWS WAF Classic RuleGroup permission
+//! policies".
 
 //! `GeoMatchSet` records live in the same store, under [`GeoMatchSetEntry`] at the end
 //! of this file: `CreateGeoMatchSet` stores one and `GetGeoMatchSet` projects it,
@@ -375,6 +380,11 @@ pub const MESSAGE_REFERENCED_ITEM: &str = "The referenced item is still in use."
 /// The fixed sentence for `WAFInvalidOperationException`, the refusal of an update that
 /// would leave the resource as it was — see [`MESSAGE_DISALLOWED_NAME`].
 pub const MESSAGE_INVALID_OPERATION: &str = "The operation is not valid.";
+/// The fixed sentence for `WAFInvalidPermissionPolicyException`, the refusal of a
+/// permission policy outside the restrictions `PutPermissionPolicy` documents — see
+/// [`MESSAGE_DISALLOWED_NAME`].
+pub const MESSAGE_INVALID_PERMISSION_POLICY: &str =
+    "The specific permission policy is not valid.";
 
 /// The `MatchFieldType` whose `FieldToMatch.Data` names a request header.
 pub const MATCH_FIELD_TYPE_HEADER: &str = "HEADER";
@@ -419,19 +429,19 @@ pub const TAGGABLE_ARN_TYPES: &[&str] = &[
     ARN_TYPE_RATE_BASED_RULE,
 ];
 
-/// The `(resource type, resource id)` a taggable AWS WAF Classic regional resource ARN
-/// names, or `None` when `arn` names no taggable kind.
+/// The `(resource type, resource id)` an AWS WAF Classic regional resource ARN names,
+/// or `None` when `arn` is not one.
 ///
 /// An ARN is `arn:<partition>:<service>:<region>:<account-id>:<resource-type>/<id>`, so
 /// this takes six colon-separated fields whose first is `arn`, whose service segment is
-/// [`ARN_SERVICE`], and whose resource field is `<type>/<id>` with a type in
-/// [`TAGGABLE_ARN_TYPES`] and a non-empty id.
+/// [`ARN_SERVICE`], and whose resource field is `<type>/<id>` with a non-empty type and
+/// a non-empty id.
 ///
 /// The partition, region and account fields are required to be PRESENT but their values
 /// are not matched: this emulator serves a single account and stores no region on a
 /// resource, so the resource id is the only field of an ARN that can identify a record
 /// it holds.
-pub fn parse_taggable_resource_arn(arn: &str) -> Option<(&str, &str)> {
+pub fn parse_resource_arn(arn: &str) -> Option<(&str, &str)> {
     let mut fields = arn.split(':');
     let prefix = fields.next()?;
     let _partition = fields.next()?;
@@ -443,10 +453,30 @@ pub fn parse_taggable_resource_arn(arn: &str) -> Option<(&str, &str)> {
         return None;
     }
     let (resource_type, resource_id) = resource.split_once('/')?;
-    if resource_id.is_empty() || !TAGGABLE_ARN_TYPES.contains(&resource_type) {
+    if resource_type.is_empty() || resource_id.is_empty() {
         return None;
     }
     Some((resource_type, resource_id))
+}
+
+/// The `(resource type, resource id)` a taggable AWS WAF Classic regional resource ARN
+/// names, or `None` when `arn` names no taggable kind.
+///
+/// The ARN itself is parsed by [`parse_resource_arn`]; this adds the one restriction
+/// the tagging operations carry, that the kind it names is in [`TAGGABLE_ARN_TYPES`].
+pub fn parse_taggable_resource_arn(arn: &str) -> Option<(&str, &str)> {
+    parse_resource_arn(arn).filter(|(resource_type, _)| TAGGABLE_ARN_TYPES.contains(resource_type))
+}
+
+/// The `RuleGroupId` the `ResourceArn` of a permission-policy call names, or `None`
+/// when `arn` is not a WAF `RuleGroup` ARN.
+///
+/// Source: `PutPermissionPolicy`'s own documentation — "The ARN in the request must be a
+/// valid WAF RuleGroup ARN"; the policy operations are documented for that one kind
+/// ("The only supported use for this action is to share a RuleGroup across accounts").
+pub fn parse_rule_group_arn(arn: &str) -> Option<&str> {
+    let (resource_type, resource_id) = parse_resource_arn(arn)?;
+    (resource_type == ARN_TYPE_RULE_GROUP).then_some(resource_id)
 }
 
 /// The most `XssMatchSet`s this emulator stores for the account before
@@ -1113,6 +1143,15 @@ pub struct RuleGroupEntry {
     /// this same set, through
     /// [`ComAmazonawsWafregionalAwswafRegional20161128State::tags_for_resource`].
     pub tags: BTreeMap<String, String>,
+    /// The IAM policy `PutPermissionPolicy` attached to this rule group, exactly as the
+    /// request gave it, or `None` while none is attached.
+    ///
+    /// It lives on the rule group's own record because the policy operations address it
+    /// by the rule group's ARN ("Attaches an IAM policy to the specified resource. The
+    /// only supported use for this action is to share a RuleGroup across accounts"), so
+    /// `PutPermissionPolicy`, `GetPermissionPolicy` and `DeletePermissionPolicy` read and
+    /// write ONE copy of it, and deleting the rule group takes its policy with it.
+    pub permission_policy: Option<String>,
 }
 
 impl RuleGroupEntry {
@@ -1123,6 +1162,7 @@ impl RuleGroupEntry {
             name,
             metric_name,
             tags: BTreeMap::new(),
+            permission_policy: None,
         }
     }
 
@@ -1623,5 +1663,143 @@ impl ByteMatchSetEntry {
         }
         self.tuples.retain(|stored| stored != tuple);
         true
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AWS WAF Classic RuleGroup permission policies
+//
+// `PutPermissionPolicy` attaches an IAM policy to the rule group its `ResourceArn`
+// names and `GetPermissionPolicy` reports it; the attached document itself lives on
+// [`RuleGroupEntry::permission_policy`], so one copy serves every reader. The
+// restrictions below are the ones `PutPermissionPolicy` and
+// `WAFInvalidPermissionPolicyException` document, nothing wider.
+// ---------------------------------------------------------------------------
+
+/// The IAM policy language version a permission policy must declare.
+///
+/// Source: `PutPermissionPolicy`'s own documentation — "Your policy must be composed
+/// using IAM Policy version 2012-10-17."
+pub const PERMISSION_POLICY_VERSION: &str = "2012-10-17";
+
+/// The one `Effect` a permission policy statement may carry.
+///
+/// Source: `PutPermissionPolicy`'s own documentation — "`Effect` must specify `Allow`."
+pub const PERMISSION_POLICY_EFFECT: &str = "Allow";
+
+/// Every `Action` a permission policy may grant, and the only ones.
+///
+/// Source: `PutPermissionPolicy`'s own documentation — "The `Action` in the policy must
+/// be `waf:UpdateWebACL`, `waf-regional:UpdateWebACL`, `waf:GetRuleGroup` and
+/// `waf-regional:GetRuleGroup`. Any extra or wildcard actions in the policy will be
+/// rejected." An action outside this list — including any form carrying a `*` — is
+/// therefore refused.
+pub const PERMISSION_POLICY_ACTIONS: &[&str] = &[
+    "waf:UpdateWebACL",
+    "waf-regional:UpdateWebACL",
+    "waf:GetRuleGroup",
+    "waf-regional:GetRuleGroup",
+];
+
+/// Whether `policy` is a permission policy AWS WAF Classic accepts: a JSON object
+/// declaring IAM policy version [`PERMISSION_POLICY_VERSION`] whose `Statement` — one
+/// statement object, or a non-empty list of them — every entry of satisfies
+/// [`permission_policy_statement_is_valid`].
+///
+/// Source: the restrictions `PutPermissionPolicy` and
+/// `WAFInvalidPermissionPolicyException` document. The document is only CHECKED here:
+/// what gets stored is the caller's own text, byte for byte.
+pub fn permission_policy_is_valid(policy: &str) -> bool {
+    let Ok(document) = ::serde_json::from_str::<::serde_json::Value>(policy) else {
+        return false;
+    };
+    let Some(document) = document.as_object() else {
+        return false;
+    };
+    if document
+        .get("Version")
+        .and_then(::serde_json::Value::as_str)
+        != Some(PERMISSION_POLICY_VERSION)
+    {
+        return false;
+    }
+    let statements: Vec<&::serde_json::Value> = match document.get("Statement") {
+        Some(statement @ ::serde_json::Value::Object(_)) => vec![statement],
+        Some(::serde_json::Value::Array(list)) => list.iter().collect(),
+        // A policy with no `Statement`, or one that is neither a statement nor a list
+        // of statements, carries no `Effect`, `Action` or `Principal` at all.
+        _ => return false,
+    };
+    !statements.is_empty()
+        && statements
+            .into_iter()
+            .all(permission_policy_statement_is_valid)
+}
+
+/// Whether one `Statement` of a permission policy is within the documented
+/// restrictions: it carries an `Effect` of [`PERMISSION_POLICY_EFFECT`], a non-empty
+/// `Principal`, an `Action` naming only [`PERMISSION_POLICY_ACTIONS`], and no
+/// `Resource`.
+///
+/// `NotAction`, `NotPrincipal` and `NotResource` are refused with the member they
+/// negate: a statement carrying one names no `Action` or `Principal`, or names a
+/// resource the policy "cannot include".
+pub fn permission_policy_statement_is_valid(statement: &::serde_json::Value) -> bool {
+    let Some(statement) = statement.as_object() else {
+        return false;
+    };
+    if statement.contains_key("Resource") || statement.contains_key("NotResource") {
+        return false;
+    }
+    if statement.get("Effect").and_then(::serde_json::Value::as_str)
+        != Some(PERMISSION_POLICY_EFFECT)
+    {
+        return false;
+    }
+    if statement.contains_key("NotPrincipal") || statement.contains_key("NotAction") {
+        return false;
+    }
+    permission_policy_principal_is_present(statement.get("Principal"))
+        && permission_policy_actions_are_allowed(statement.get("Action"))
+}
+
+/// Whether a statement names a `Principal`: a non-blank string, or a map of principal
+/// kinds (`AWS`, `Service`, …) whose every entry carries a non-blank value or a
+/// non-empty list of them.
+fn permission_policy_principal_is_present(principal: Option<&::serde_json::Value>) -> bool {
+    match principal {
+        Some(::serde_json::Value::String(value)) => !value.trim().is_empty(),
+        Some(::serde_json::Value::Object(kinds)) => {
+            !kinds.is_empty() && kinds.values().all(permission_policy_principal_value)
+        }
+        _ => false,
+    }
+}
+
+/// Whether one entry of a `Principal` map names a principal.
+fn permission_policy_principal_value(value: &::serde_json::Value) -> bool {
+    match value {
+        ::serde_json::Value::String(value) => !value.trim().is_empty(),
+        ::serde_json::Value::Array(values) => {
+            !values.is_empty() && values.iter().all(permission_policy_principal_value)
+        }
+        _ => false,
+    }
+}
+
+/// Whether a statement's `Action` — one action, or a non-empty list of them — names
+/// only actions in [`PERMISSION_POLICY_ACTIONS`].
+fn permission_policy_actions_are_allowed(action: Option<&::serde_json::Value>) -> bool {
+    fn allowed(action: &::serde_json::Value) -> bool {
+        action
+            .as_str()
+            .is_some_and(|action| PERMISSION_POLICY_ACTIONS.contains(&action))
+    }
+    match action {
+        Some(action @ ::serde_json::Value::String(_)) => allowed(action),
+        Some(::serde_json::Value::Array(actions)) => {
+            !actions.is_empty() && actions.iter().all(allowed)
+        }
+        _ => false,
     }
 }

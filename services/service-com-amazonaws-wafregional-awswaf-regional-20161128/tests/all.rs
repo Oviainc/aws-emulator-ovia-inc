@@ -20,6 +20,8 @@ mod geo_match_set_lifecycle;
 mod harness;
 #[path = "all/ip_set_lifecycle.rs"]
 mod ip_set_lifecycle;
+#[path = "all/permission_policy.rs"]
+mod permission_policy;
 #[path = "all/rate_based_rule_lifecycle.rs"]
 mod rate_based_rule_lifecycle;
 #[path = "all/regex_pattern_set.rs"]
