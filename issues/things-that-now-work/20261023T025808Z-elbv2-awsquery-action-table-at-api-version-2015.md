@@ -30,6 +30,49 @@ Issue-Commit: 1b15cfcf83a9fafcaa69f938ed17066b612a8ba0
 
 > _Note: this issue was identified against the code base at commit `1b15cfcf83a9fafcaa69f938ed17066b612a8ba0`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
+## Resolution (what was fixed here, and which keys this record no longer owns)
+
+**Cause 1 — FIXED.** The shared `elasticloadbalancing` awsQuery front door (the Classic
+model, which owns the signing name both models declare) now resolves the
+`(Action, Version)` PAIR and serves `Version=2015-12-01` out of the ELBv2 model's own
+service — its routing table, handlers, protocol (2015-12-01 XML namespace) and error
+renderers — over the one shared engine, leaving `InvalidAction` only for a pair no mounted
+model declares. See
+`services/service-com-amazonaws-elasticloadbalancing-elasticloadbalancing-v7/src/service.rs`
+and `src/service/api_version.rs` (`serving_model` is the whole rule), pinned by that
+crate's `tests/all/shared_endpoint_api_versions.rs` (which model serves which pair) and
+`tests/all/shared_endpoint_api_version_dispatch.rs` (what a resolved pair then reaches:
+the ELBv2 model's own validation, state and scaffolds), and by
+`core/router/tests/all/elb_classic_and_v2_signing_name_routing.rs` with both services
+mounted. The front-door implementation landed from the sibling record
+`20261022T220446Z-elbv2-elastic-load-balancing-v2-is-unreachable-every-request.md` while
+this one's own equivalent fix was in review; this change keeps the resolution of that
+merge and the dispatch-consequence coverage, which is what these replay keys are about.
+Every one of this service's 51 operations is reachable; an operation whose handler is
+still a scaffold now answers its own `501 NotImplemented` instead of `InvalidAction`,
+which is that operation's own stub issue (e.g.
+`20261023T025808Z-elastic-load-balancing-v2-describesslpolicies-stub.md`,
+`20261023T025808Z-elastic-load-balancing-v2-describetruststores-stub.md`) and not this
+one.
+
+**Cause 2 — DECLINED, and owned elsewhere.** The CloudFormation symptoms (a stack `Output`
+with no `OutputValue`, and a stack whose ELBv2 resource cannot be created reaching
+`CREATE_COMPLETE` instead of rolling back) have no ELBv2 code path:
+`services/service-com-amazonaws-cloudformation-cloudformation` never calls the ELBv2
+service — it synthesizes each resource's physical id and ARN from the template
+(`src/state/template.rs`) — so the defect is that service's output-identifier fidelity and
+its missing resource-failure/rollback state machine. These three `Issue-Key` lines are
+therefore still live and are owned by the CloudFormation issues, NOT by this record:
+
+* `elbv2.deploy-cfn-alb-nonexistent-subnet-rejected` and
+  `elbv2.deploy-elbv2-2-rule-priority-collision-update-rejected` →
+  `20261023T025808Z-cloudformation-elbv2-a-cloudformation-stack-whose-elbv2-listener-rules-collide.md`
+  (resource failure → `ROLLBACK_COMPLETE`).
+* `elbv2.deploy-elbv2-1-rule-update-tg-replace-deletion-protection` →
+  `20261022T235108Z-cloudformation-stack-outputs-carry-no-outputvalue-failing-resources.md`
+  and `20261022T154846Z-…-stack-outputs-return-synthesized-logical-names-instead`
+  (`Outputs` resolved from the real resource).
+
 ## Operation
 CreateTargetGroup
 

@@ -75,6 +75,9 @@ pub(crate) fn form_encode(value: &str) -> String {
 
 /// POST one awsQuery action, signed for `region` so the service resolves that region
 /// from the request's SigV4 credential scope.
+///
+/// The envelope names this model's own API version; a suite that drives the shared
+/// endpoint's OTHER version uses [`call_at_version`].
 pub(crate) async fn call(
     router: &MultiServiceRouter,
     region: &str,

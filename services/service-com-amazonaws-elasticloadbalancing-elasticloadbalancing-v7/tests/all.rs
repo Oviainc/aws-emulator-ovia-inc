@@ -15,6 +15,8 @@
 mod listeners_health_check_and_attributes;
 #[path = "all/load_balancer_lifecycle.rs"]
 mod load_balancer_lifecycle;
+#[path = "all/shared_endpoint_api_version_dispatch.rs"]
+mod shared_endpoint_api_version_dispatch;
 #[path = "all/shared_endpoint_api_versions.rs"]
 mod shared_endpoint_api_versions;
 #[path = "all/state_roundtrip.rs"]

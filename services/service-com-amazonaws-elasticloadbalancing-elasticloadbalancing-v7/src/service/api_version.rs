@@ -11,10 +11,11 @@
 //! (`Elastic Load Balancing` vs `Elastic Load Balancing v2`) and in the API version they
 //! declare: [`CLASSIC_API_VERSION`] here and [`V2_API_VERSION`] in
 //! `services/service-com-amazonaws-elasticloadbalancingv2-elasticloadbalancing-v10`.
-//! Nothing in a request's headers or URI tells the two apart, and the router requires
-//! EXACTLY ONE claimant, answering `500 AmbiguousService` — a code no AWS model carries,
-//! in a JSON body an awsQuery client cannot parse — when two services claim one key. So
-//! the shared key resolves to the ONE service whose own identity is that name: this one.
+//! Nothing in a request's headers or URI tells the two apart — an AWS SDK ELBv2 client
+//! signs `elasticloadbalancing` exactly as a Classic client does — and the router
+//! requires EXACTLY ONE claimant, answering `500 AmbiguousService` when two services
+//! claim one key. So the shared key resolves to the ONE service whose own identity is
+//! that name: this one.
 //!
 //! # The version half of the routing key
 //!
@@ -65,13 +66,20 @@
 //! failure the router detects up front. Both models leave that second seam at the
 //! framework default, so the two cannot answer such a failure differently today; a service
 //! that reworded it would have to reword it on this side.
-
-use std::sync::Arc;
+//!
+//! The `OperationContext` an ELBv2 operation runs with is still the router's, built from
+//! the CLAIMING service's identity: the framework builds it before an operation is named
+//! and hands it in by reference, so there is no seam here to rebuild it for the serving
+//! model. It is accurate for what it is read for — the two models share the signing name,
+//! and the ELBv2 handlers read `ctx.parts()` (the request's SigV4 region) rather than the
+//! identity — but a handler there that ever needs its own model's shape id must take it
+//! from its own crate rather than from `ctx`.
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse, StatusCode};
 use aws_smithy_types::body::SdkBody;
 use service_com_amazonaws_elasticloadbalancingv2_elasticloadbalancing_v10 as elbv2;
 use smithy_server_runtime::{BoxFuture, ErasedOperation, OperationContext, Service};
+use std::sync::Arc;
 
 /// The API version THIS model declares, from `smithy_query(query="service_info")` on this
 /// crate's model: `version: 2012-06-01`.
@@ -232,9 +240,9 @@ impl ErasedOperation for UnsupportedApiVersionOperation {
     }
 
     fn auth_schemes(&self) -> Option<&'static [&'static str]> {
-        // `None` defers to the modelled operation the request's routing key names, so
-        // this refusal is reached under exactly the auth the model declares for the
-        // action asked for, and cannot weaken it.
+        // `None` defers to the modelled operation the request's routing key names, so this
+        // refusal is reached under exactly the auth the model declares for the action
+        // asked for, and cannot weaken it.
         None
     }
 }

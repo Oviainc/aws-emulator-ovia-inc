@@ -405,9 +405,9 @@ fn classic_elb_and_elbv2_route_apart_under_one_signing_name() {
                     expected_body_contains: &["<ErrorResponse", CLASSIC_VERSION],
                 },
                 Call {
-                    // A Classic action asked for at the ELBv2 version: refused on the
-                    // version, naming the pair, rather than served as if it had named
-                    // this model's.
+                    // A Classic action asked for at the ELBv2 version: the version names
+                    // the ELBv2 model, which declares no such action, so the pair names no
+                    // operation at all — refused by that model, in its own envelope.
                     case: "a Classic-only action at the ELBv2 version",
                     addressed: Addressed::Signed("elasticloadbalancing"),
                     action: "ConfigureHealthCheck",
