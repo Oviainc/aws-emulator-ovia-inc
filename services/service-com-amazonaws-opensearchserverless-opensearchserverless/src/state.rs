@@ -106,6 +106,29 @@ pub const DELETABLE_STATUSES: [&str; 3] =
 /// model's.
 pub const SERVERLESS_GENERATION_CLASSIC: &str = "CLASSIC";
 
+// The single policy/configuration type values the account-wide statistics counters are
+// keyed by. `GetPoliciesStatsResponse` reports ONE counter per type
+// (`AccessPolicyStats$DataPolicyCount`, `SecurityPolicyStats$EncryptionPolicyCount` and
+// `$NetworkPolicyCount`, `SecurityConfigStats$SamlConfigCount`,
+// `LifecyclePolicyStats$RetentionPolicyCount`), so each counter names the type it counts
+// rather than repeating the wire string.
+
+/// `AccessPolicyType$data` — the only value that enum carries
+/// (`smithy_query(query="shape", shape="AccessPolicyType")`).
+pub const ACCESS_POLICY_DATA: &str = "data";
+
+/// `SecurityPolicyType$encryption` — "Encryption at rest policy type".
+pub const SECURITY_POLICY_ENCRYPTION: &str = "encryption";
+
+/// `SecurityPolicyType$network` — "Network policy type".
+pub const SECURITY_POLICY_NETWORK: &str = "network";
+
+/// `SecurityConfigType$saml` — the SAML federation configuration type.
+pub const SECURITY_CONFIG_SAML: &str = "saml";
+
+// `LifecyclePolicyStats$RetentionPolicyCount`'s own type value is
+// [`LIFECYCLE_POLICY_RETENTION`], declared with the retention-rule validation it keys.
+
 /// `AutoscalingStatus$NO_ACTION`, the status a capacity report carries while no scaling
 /// action is in progress — the other two members are `ACTION_SCALING_UP` and
 /// `ACTION_SCALING_DOWN` (`smithy_query(query="shape", shape="AutoscalingStatus")`).
@@ -1349,6 +1372,17 @@ impl ComAmazonawsOpensearchserverlessOpensearchserverlessState {
         self.access_policies.len()
     }
 
+    /// The number of stored access policies of `kind`, which is the per-type counter
+    /// `AccessPolicyStats` reports. `AccessPolicyType` carries the single value `data`, so
+    /// it equals [`Self::access_policy_count`] — the account-wide total the quota bounds —
+    /// for [`ACCESS_POLICY_DATA`] today, and stays per-type if the enum ever grows.
+    pub fn access_policy_count_of(&self, kind: &str) -> usize {
+        self.access_policies
+            .keys()
+            .filter(|(policy_kind, _)| policy_kind == kind)
+            .count()
+    }
+
     /// The lifecycle policy a replayed `clientToken` on `operation` already created, if
     /// any; see [`Self::replayed_collection`] for why a stale token answers `None`.
     pub fn replayed_lifecycle_policy(
@@ -1367,6 +1401,18 @@ impl ComAmazonawsOpensearchserverlessOpensearchserverlessState {
     /// The number of stored lifecycle policies, which [`MAX_LIFECYCLE_POLICIES`] bounds.
     pub fn lifecycle_policy_count(&self) -> usize {
         self.lifecycle_policies.len()
+    }
+
+    /// The number of stored lifecycle policies of `kind`, which is the per-type counter
+    /// `LifecyclePolicyStats` reports. `LifecyclePolicyType` carries the single value
+    /// `retention`, so it equals [`Self::lifecycle_policy_count`] — the account-wide total
+    /// the quota bounds — for [`LIFECYCLE_POLICY_RETENTION`] today, and stays per-type if
+    /// the enum ever grows.
+    pub fn lifecycle_policy_count_of(&self, kind: &str) -> usize {
+        self.lifecycle_policies
+            .keys()
+            .filter(|(policy_kind, _)| policy_kind == kind)
+            .count()
     }
 }
 
