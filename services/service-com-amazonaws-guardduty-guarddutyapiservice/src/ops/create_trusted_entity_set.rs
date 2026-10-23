@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateTrustedEntitySet
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateTrustedEntitySet`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: mints a trusted entity set under the detector and persists it in
+//! [`crate::state`], so `GetTrustedEntitySet` reports what this call stored. GuardDuty
+//! allows only one trusted entity set at a time, so a second create is refused with HTTP
+//! 400 under the `InvalidInputException` class, and a replayed `ClientToken` returns the
+//! set the first call minted.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateTrustedEntitySet::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -165,18 +163,127 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateTrustedEntitySet` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateTrustedEntitySetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateTrustedEntitySet"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                CreateTrustedEntitySetErrorModeled::InternalServerErrorException(
+                    crate::state::state_unavailable(),
+                )
+                .into(),
+            );
+        };
+
+        // Both documented input rules the model cannot express are checked BEFORE
+        // anything is written, so a refused request leaves no entity set behind.
+        if !crate::state::is_entity_set_name(&input.name) {
+            return Err(bad_request(crate::state::invalid_parameter_message(
+                crate::state::ENTITY_SET_NAME_MEMBER,
+            )));
+        }
+        // "Invalid URL formats will result in an error, regardless of whether you
+        // activate the entity set or not"
+        // (`smithy_query(query="doc",shape="CreateTrustedEntitySetRequest",member="Location")`),
+        // so the check does not depend on `Activate`.
+        if !crate::state::is_s3_location(&input.location) {
+            return Err(bad_request(crate::state::invalid_parameter_message(
+                crate::state::ENTITY_SET_LOCATION_MEMBER,
+            )));
+        }
+
+        let region = crate::state::request_region(ctx);
+        let mut state = state.lock();
+
+        // `ClientToken` is `@idempotencyToken`: a replayed create returns the set
+        // the first call minted rather than refusing it as a second set.
+        let token = input
+            .client_token
+            .as_deref()
+            .filter(|token| !token.is_empty())
+            .map(str::to_string);
+
+        // Everything that can refuse the request is decided over an IMMUTABLE
+        // borrow, so a refused create neither mints an id nor advances the clock.
+        let Some(detector) = state.detector_in(&region, &input.detector_id) else {
+            return Err(bad_request(crate::state::detector_id_rejection(
+                &input.detector_id,
+            )));
+        };
+        if let Some(token) = token.as_deref() {
+            if let Some(existing) = detector.trusted_entity_set_for_token(token) {
+                return Ok(CreateTrustedEntitySetOutput {
+                    trusted_entity_set_id: existing.id.clone(),
+                });
+            }
+        }
+        // "At any given time, you can have only one trusted entity set"
+        // (`smithy_query(query="doc",shape="CreateTrustedEntitySet")`).
+        if !detector.trusted_entity_sets.is_empty() {
+            return Err(bad_request(
+                crate::state::TRUSTED_ENTITY_SET_ALREADY_EXISTS_MESSAGE,
+            ));
+        }
+
+        let now = state.tick_millis();
+        let id = state.mint_id();
+
+        // A set the caller asked to activate is not in use yet: it starts
+        // `ACTIVATING` and the clock owes it `ACTIVE`. One the caller did not ask to
+        // activate is `INACTIVE`, which is where it stays until an update activates
+        // it, so nothing is owed on it.
+        let (status, status_due_millis) = if input.activate {
+            (
+                crate::state::ENTITY_SET_ACTIVATING,
+                Some(now.saturating_add(crate::state::ENTITY_SET_TRANSITION_MILLIS)),
+            )
+        } else {
+            (crate::state::ENTITY_SET_INACTIVE, None)
+        };
+        let record = crate::state::EntitySetRecord {
+            id: id.clone(),
+            name: input.name.clone(),
+            format: input.format.clone(),
+            location: input.location.clone(),
+            expected_bucket_owner: input.expected_bucket_owner.clone(),
+            tags: input
+                .tags
+                .as_ref()
+                .map(|tags| {
+                    tags.iter()
+                        .map(|(key, value)| (key.clone(), value.clone()))
+                        .collect::<std::collections::BTreeMap<_, _>>()
+                })
+                .unwrap_or_default(),
+            client_token: token,
+            status: status.to_string(),
+            status_due_millis,
+            created_at_millis: now,
+            updated_at_millis: now,
+            // Nothing failed, so there are no error details to report.
+            error_details: None,
+        };
+
+        let Some(detector) = state.detector_in_mut(&region, &input.detector_id) else {
+            // Unreachable: the same detector resolved above under the same lock.
+            return Err(
+                CreateTrustedEntitySetErrorModeled::InternalServerErrorException(
+                    crate::state::state_unavailable(),
+                )
+                .into(),
+            );
+        };
+        detector.trusted_entity_sets.insert(id.clone(), record);
+        // The detector itself changed: it holds one more sub-resource than before
+        // — the same rule `CreateIPSet` follows for its own sub-resource.
+        detector.updated_at_millis = now;
+
+        Ok(CreateTrustedEntitySetOutput {
+            trusted_entity_set_id: id,
+        })
     }
+}
+
+/// Refuse the request the way GuardDuty does: HTTP 400 under the
+/// `InvalidInputException` class, in both the body's `__type` and its `type`
+/// member.
+fn bad_request(message: impl Into<String>) -> CreateTrustedEntitySetError {
+    crate::scaffolded::Scaffolded::invalid_input(message)
 }

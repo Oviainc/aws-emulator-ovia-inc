@@ -878,9 +878,12 @@ async fn deploying_a_revision_registers_it_and_names_the_group() {
             json!({"applicationName": "deployed-from", "revision": revision}),
         )
         .await;
-    assert!(
-        superseded["revisionInfo"]["deploymentGroups"].is_null(),
-        "case a superseded revision: expected no deployment group to target it, got {:?}",
+    // The member is still REPORTED, as the empty list: the revision has a set of
+    // groups targeting it and that set is now empty.
+    assert_eq!(
+        superseded["revisionInfo"]["deploymentGroups"],
+        json!([]),
+        "case a superseded revision: expected deploymentGroups [], got {:?}",
         superseded["revisionInfo"]
     );
 }

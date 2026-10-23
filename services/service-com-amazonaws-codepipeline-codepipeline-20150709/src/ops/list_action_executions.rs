@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListActionExecutions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListActionExecutions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the action executions of a stored pipeline, from this service's state.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListActionExecutions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! An action execution comes into being when a pipeline execution REACHES the action,
+//!
+//! which in this emulator is when the execution starts: what an execution begins with
+//! are the actions of the executed pipeline version's first stage at that stage's
+//! lowest `runOrder`, so starting one records an `InProgress`
+//! `crate::state::ActionExecutionRecord` for each of them. They are minted by
+//! `record_execution` in `crate::state`, the one way an execution enters the store, so
+//! every call that starts an execution records the same thing. Nothing here RUNS an
+//! action, so no record ever moves to an outcome and no later `runOrder` or stage
+//! starts — this listing reports exactly what started, never an outcome nothing
+//! produced.
+//!
+//! Everything else is computed from the store: the pipeline the required
+//! `pipelineName` names must exist, an execution id the filter names must name an
+//! execution of THAT pipeline (the rule `ListRuleExecutions` applies to the same two
+//! filter members), the page runs most recently started first, and the cursor is the
+//! id of the first record that did not fit on it.
 //!
 //! ## Shape of an operation
 //!
@@ -123,6 +133,71 @@ impl From<ListActionExecutionsErrorModeled> for ListActionExecutionsError {
     }
 }
 
+/// The page size this listing uses when the request asks for none.
+///
+/// `ListActionExecutionsInput$maxResults` documents "Default value is 100", which is
+/// also `MaxResults`'s modelled maximum (`@range(min: 1, max: 100)`), so it doubles as
+/// the bound every page is clamped to.
+const DEFAULT_ACTION_EXECUTIONS_PER_PAGE: usize = 100;
+
+/// Every pipeline execution id the filter names: `pipelineExecutionId` and the one
+/// `latestInPipelineExecution` requires. Both members name a pipeline execution, so
+/// both are checked against the store the same way — the rule `ListRuleExecutions`
+/// applies to the same two members of its own filter.
+fn filtered_execution_ids(filter: Option<&ActionExecutionFilter>) -> Vec<&str> {
+    let Some(filter) = filter else {
+        return Vec::new();
+    };
+    filter
+        .pipeline_execution_id
+        .as_deref()
+        .into_iter()
+        .chain(
+            filter
+                .latest_in_pipeline_execution
+                .as_ref()
+                .map(|latest| latest.pipeline_execution_id.as_str()),
+        )
+        .collect()
+}
+
+/// Whether `record` is one the filter selects: every execution id the filter names
+/// has to be the one the record belongs to, so naming two different executions
+/// selects nothing rather than quietly dropping one of the members.
+fn selected_by(
+    filter: Option<&ActionExecutionFilter>,
+    record: &crate::state::ActionExecutionRecord,
+) -> bool {
+    filtered_execution_ids(filter)
+        .iter()
+        .all(|execution_id| record.pipeline_execution_id == *execution_id)
+}
+
+/// Whether the filter asks for only the LATEST execution of each action.
+///
+/// `LatestInPipelineExecutionFilter$startTimeRange` selects between the `All` and
+/// `Latest` start times of the execution it names (`crate::state::START_TIME_RANGES`),
+/// so `Latest` keeps one record per action — the most recently started one — and `All`
+/// keeps every record of it.
+fn latest_only(filter: Option<&ActionExecutionFilter>) -> bool {
+    filter
+        .and_then(|filter| filter.latest_in_pipeline_execution.as_ref())
+        .is_some_and(|latest| latest.start_time_range == crate::state::START_TIME_RANGE_LATEST)
+}
+
+/// `records` reduced to the most recently started execution of each action, keeping
+/// the listing's order (which is newest first, so the first record seen for an action
+/// is its latest).
+fn latest_per_action(
+    records: Vec<&crate::state::ActionExecutionRecord>,
+) -> Vec<&crate::state::ActionExecutionRecord> {
+    let mut seen: ::std::collections::BTreeSet<(&str, &str)> = ::std::collections::BTreeSet::new();
+    records
+        .into_iter()
+        .filter(|record| seen.insert((record.stage_name.as_str(), record.action_name.as_str())))
+        .collect()
+}
+
 /// The `ListActionExecutions` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -159,18 +234,116 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListActionExecutions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListActionExecutionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListActionExecutions"))
+        let _ = ctx;
+        let state = crate::state::require_state(&*self.engine)?;
+        let state = state.lock();
+
+        // The pipeline the required member names is resolved first: there is nothing
+        // to list for a pipeline the store does not hold.
+        if !state.pipelines.contains_key(&input.pipeline_name) {
+            return Err(ListActionExecutionsErrorModeled::PipelineNotFoundException(
+                PipelineNotFoundException {
+                    message: Some(format!("pipeline {} does not exist", input.pipeline_name)),
+                },
+            )
+            .into());
+        }
+
+        // `PipelineExecutionNotFoundException` is documented for exactly this: an
+        // execution that "cannot be found, or an execution ID does not belong to the
+        // specified pipeline".
+        for execution_id in filtered_execution_ids(input.filter.as_ref()) {
+            let belongs = state
+                .executions
+                .get(execution_id)
+                .is_some_and(|record| record.pipeline_name == input.pipeline_name);
+            if !belongs {
+                return Err(
+                    ListActionExecutionsErrorModeled::PipelineExecutionNotFoundException(
+                        PipelineExecutionNotFoundException {
+                            message: Some(format!(
+                                "pipeline {} has no execution {execution_id}",
+                                input.pipeline_name
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // The order this listing pages through is the store's: the pipeline's action
+        // executions, most recently started first.
+        let selected: Vec<&crate::state::ActionExecutionRecord> = state
+            .action_executions_for_pipeline(&input.pipeline_name)
+            .into_iter()
+            .filter(|record| selected_by(input.filter.as_ref(), record))
+            .collect();
+        let selected = if latest_only(input.filter.as_ref()) {
+            latest_per_action(selected)
+        } else {
+            selected
+        };
+
+        // A cursor names the position the next page resumes at in THIS listing's
+        // order, so it is resolved against the selected records. A token this listing
+        // did not issue, or one naming a record no longer in that order (its execution
+        // has fallen out of the retained history), has no position at all and is
+        // refused — the condition the model's `InvalidNextTokenException` states.
+        let start = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => {
+                crate::state::decode_page_token(crate::state::CURSOR_ACTION_EXECUTION, token)
+                    .and_then(|key| {
+                        selected
+                            .iter()
+                            .position(|record| record.action_execution_id == key)
+                    })
+                    .ok_or_else(|| {
+                        ListActionExecutionsError::from(
+                            ListActionExecutionsErrorModeled::InvalidNextTokenException(
+                                InvalidNextTokenException {
+                                    message: Some(
+                                        "nextToken was not issued by ListActionExecutions for \
+                                         this pipeline"
+                                            .to_string(),
+                                    ),
+                                },
+                            ),
+                        )
+                    })?
+            }
+        };
+
+        // `MaxResults` is modelled `@range(min: 1, max: 100)`, so the boundary
+        // validator refuses anything outside it before this handler runs; the clamp
+        // keeps the page bound local to the growth site, as `ListPipelineExecutions`
+        // keeps its own.
+        let limit = input
+            .max_results
+            .and_then(|requested| usize::try_from(requested).ok())
+            .unwrap_or(DEFAULT_ACTION_EXECUTIONS_PER_PAGE)
+            .clamp(1, DEFAULT_ACTION_EXECUTIONS_PER_PAGE);
+
+        // The cursor is the id of the first record that did NOT fit on this page, so
+        // the page and the cursor stay consistent by construction.
+        let mut action_execution_details: Vec<ActionExecutionDetail> =
+            Vec::with_capacity(limit.min(selected.len().saturating_sub(start)));
+        let mut next_token = None;
+        for record in &selected[start..] {
+            if action_execution_details.len() == limit {
+                next_token = Some(crate::state::encode_page_token(
+                    crate::state::CURSOR_ACTION_EXECUTION,
+                    &record.action_execution_id,
+                ));
+                break;
+            }
+            action_execution_details.push(record.to_detail());
+        }
+
+        Ok(ListActionExecutionsOutput {
+            action_execution_details: Some(action_execution_details),
+            next_token,
+        })
     }
 }

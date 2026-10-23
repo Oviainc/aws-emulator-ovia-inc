@@ -175,14 +175,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "Before you can delete a gateway, you must deregister its instances and delete
         // its bridges": a gateway in this store holds no instances (the instance
-        // operations are still scaffolded), and the bridge a request places on a gateway
-        // carries its placement ARN unresolved while DeleteBridge is still scaffolded — so
-        // gating on bridges would make such a gateway undeletable for the life of the
-        // process. That leaves the gateway's own record as the only thing to retire.
-        let Some(gateway) = store.gateways.get_mut(&input.gateway_arn) else {
+        // operations are still scaffolded), so its BRIDGES are the whole precondition
+        // here. A bridge names the gateway it is placed on by its placement ARN
+        // (`ListedBridge$PlacementArn`: "the ARN of the gateway associated with the
+        // bridge"), which is how a bridge still placed on this gateway is found.
+        let Some(gateway) = store.gateways.get(&input.gateway_arn) else {
             return Err(DeleteGatewayErrorModeled::NotFoundException(
                 NotFoundException {
                     message: crate::state::not_found_message(&input.gateway_arn),
+                },
+            )
+            .into());
+        };
+        let gateway_arn = gateway.gateway_arn.clone();
+        let retired = gateway.is_retired();
+
+        // A gateway already on its way out is past this precondition: the repeat of an
+        // `@idempotent` delete answers the same ARN rather than refusing (see below).
+        if !retired {
+            let placed = store
+                .bridges
+                .values()
+                .filter(|bridge| bridge.placement_arn == gateway_arn)
+                .count();
+            if placed > 0 {
+                return Err(DeleteGatewayErrorModeled::BadRequestException(
+                    BadRequestException {
+                        message: crate::state::bad_request_message(&format!(
+                            "Gateway {gateway_arn} still has {placed} bridge(s) placed on \
+                             it. Delete the bridges of a gateway before deleting the \
+                             gateway."
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let Some(gateway) = store.gateways.get_mut(&input.gateway_arn) else {
+            return Err(DeleteGatewayErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: "the gateway could not be read back after it was read"
+                        .to_string(),
                 },
             )
             .into());
@@ -200,7 +234,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 now,
             );
         }
-        let gateway_arn = gateway.gateway_arn.clone();
 
         // The retired records the store keeps are bounded: see
         // `crate::state::MAX_RETIRED_GATEWAYS`.

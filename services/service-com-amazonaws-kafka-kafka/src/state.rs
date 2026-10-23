@@ -48,7 +48,9 @@
 //! The multi-VPC (PrivateLink) connection registry lives here too:
 //! `CreateVpcConnection` mints a [`VpcConnection`] with
 //! [`VpcConnection::requested`] and `DescribeVpcConnection` reports that same
-//! stored record.
+//! stored record, while `ListVpcConnections` pages the region's connections and
+//! renders each one with [`VpcConnection::to_vpc_connection`] — so a listed
+//! connection and a described one are two views of one record.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Bound;
@@ -2204,6 +2206,21 @@ impl VpcConnection {
             .iter()
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect()
+    }
+
+    /// The connection as the `VpcConnection` shape `ListVpcConnections`
+    /// reports: the subset of this record that listing carries. Every member is
+    /// read off the stored record, which is what keeps a listed connection and
+    /// a described one from ever disagreeing.
+    pub fn to_vpc_connection(&self) -> crate::ops::types::VpcConnection {
+        crate::ops::types::VpcConnection {
+            vpc_connection_arn: self.arn.clone(),
+            target_cluster_arn: self.target_cluster_arn.clone(),
+            creation_time: Some(::aws_smithy_types::DateTime::from(self.creation_time)),
+            authentication: Some(self.authentication.clone()),
+            vpc_id: Some(self.vpc_id.clone()),
+            state: Some(self.state.clone()),
+        }
     }
 }
 

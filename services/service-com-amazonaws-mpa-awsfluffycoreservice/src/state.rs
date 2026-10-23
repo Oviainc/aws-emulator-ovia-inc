@@ -21,6 +21,13 @@
 //!   elapses the team is gone, so `GetApprovalTeam` answers 404 and
 //!   `ListApprovalTeams` omits it.
 //!
+//! # The policy catalog
+//!
+//! Policies are AWS's, not the caller's: no operation in this model creates, updates or
+//! deletes one, so the catalog is SEEDED when this store is first touched
+//! ([`Default`]) and `ListPolicies` reports whatever it then holds. See
+//! [`seeded_policy_catalog`].
+//!
 //! # Authorization
 //!
 //! This module also owns this service's authorization rules, so every handler states
@@ -94,8 +101,9 @@ pub const MAX_PENDING_WINDOW_DAYS: i32 = 36_500;
 /// both when the team goes.
 pub const MAX_APPROVAL_TEAMS: usize = 1_000;
 
-/// Largest page `ListApprovalTeams` returns, from `MaxResults`' modelled
-/// `range(min: 1, max: 20)` / `default: 20`.
+/// Largest page a paginated list operation of this service returns, from `MaxResults`'
+/// modelled `range(min: 1, max: 20)` / `default: 20` — the same shape every one of them
+/// binds (`ListApprovalTeams`, `ListPolicies`, …).
 pub const MAX_LIST_PAGE: i32 = 20;
 
 /// The pending deletion window `days` names, or `None` when `days` is not a day count
@@ -303,8 +311,87 @@ impl ApprovalTeam {
     }
 }
 
+/// Type of a policy, in the tokens `PolicyType` declares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicyType {
+    AwsManaged,
+    AwsRam,
+}
+
+impl PolicyType {
+    /// The wire token, as `PolicyType` spells it.
+    #[must_use]
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::AwsManaged => "AWS_MANAGED",
+            Self::AwsRam => "AWS_RAM",
+        }
+    }
+}
+
+/// One policy in the catalog: everything `ListPolicies` reports for it.
+#[derive(Debug, Clone)]
+pub struct CatalogPolicy {
+    /// The policy's unqualified ARN, in the form [`policy_arn`] mints.
+    pub arn: String,
+    pub name: String,
+    pub policy_type: PolicyType,
+    /// Version id that is this policy's default, as `Policy$DefaultVersion` reports it.
+    pub default_version: i32,
+}
+
+/// Version id a policy's first version carries, from `PolicyVersionId`'s modelled
+/// `range(min: 1)`.
+pub const FIRST_POLICY_VERSION: i32 = 1;
+
+/// ARN of a policy, in the form `UnqualifiedPolicyArn`'s pattern fixes:
+/// `arn:aws:mpa:::aws:policy/<category>/<name>`.
+///
+/// A policy is an AWS-owned resource, so the ARN's region and account fields are EMPTY —
+/// which is why `engine::emulator_arn`, which stamps this emulator's region and account
+/// into both, cannot mint one and this builds the ARN itself.
+#[must_use]
+pub fn policy_arn(category: &str, name: &str) -> String {
+    format!("arn:aws:mpa:::aws:policy/{category}/{name}")
+}
+
+/// The policies this store holds when it is first touched, as
+/// `(category, name, type, default version)`.
+///
+/// The model fixes the SHAPE of an entry, and that is what this emulator computes its
+/// answers from: the ARN form comes from `UnqualifiedPolicyArn`'s pattern (whose two
+/// `[a-zA-Z0-9_\.-]` segments are the category and the name), the token from
+/// `PolicyType`'s enum, and the version from `PolicyVersionId`'s `range(min: 1)`. The
+/// entries themselves are AWS's own catalog, which no request can change and no model
+/// member enumerates: this seeds the AWS-managed approval-team policy and invents no
+/// others. Nothing is keyed to a particular entry — `ListPolicies` pages over whatever
+/// the store holds, so an entry recorded later is reported exactly like a seeded one.
+const SEEDED_POLICY_CATALOG: &[(&str, &str, PolicyType, i32)] = &[(
+    "IdentityCenter",
+    "MPAApprovalTeamPolicy",
+    PolicyType::AwsManaged,
+    FIRST_POLICY_VERSION,
+)];
+
+/// The catalog a fresh store starts with, keyed by ARN.
+#[must_use]
+pub fn seeded_policy_catalog() -> BTreeMap<String, CatalogPolicy> {
+    SEEDED_POLICY_CATALOG
+        .iter()
+        .map(|&(category, name, policy_type, default_version)| {
+            let policy = CatalogPolicy {
+                arn: policy_arn(category, name),
+                name: name.to_string(),
+                policy_type,
+                default_version,
+            };
+            (policy.arn.clone(), policy)
+        })
+        .collect()
+}
+
 /// Per-service state for com-amazonaws-mpa-awsfluffycoreservice. A handler reaches it through [`service_state`].
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ComAmazonawsMpaAwsfluffycoreserviceState {
     /// Every live team, keyed by its ARN.
     pub approval_teams: BTreeMap<String, ApprovalTeam>,
@@ -325,10 +412,34 @@ pub struct ComAmazonawsMpaAwsfluffycoreserviceState {
     /// [`ComAmazonawsMpaAwsfluffycoreserviceState::is_management_account`], which
     /// therefore answers `false` for every caller until something records one.
     pub organization_management_account_id: Option<String>,
+    /// The policy catalog, keyed by each policy's ARN — the stable ordering
+    /// `ListPolicies` pages over.
+    ///
+    /// Seeded by [`Default`] from [`seeded_policy_catalog`]: a policy is AWS's, so no
+    /// operation in this model mints or removes one, and every reader answers out of
+    /// this one map.
+    pub policies: BTreeMap<String, CatalogPolicy>,
     /// Source of [`ApprovalTeam::seq`].
     next_team_seq: u64,
     /// Source of [`Approver::approver_id`].
     next_approver_seq: u64,
+}
+
+impl Default for ComAmazonawsMpaAwsfluffycoreserviceState {
+    /// A fresh store: no team, no organization, and the policy catalog seeded — the
+    /// engine builds this service's state with `Default` on first touch, so this is the
+    /// only place the catalog comes into being.
+    fn default() -> Self {
+        Self {
+            approval_teams: BTreeMap::new(),
+            name_index: BTreeMap::new(),
+            idempotency_tokens: BTreeMap::new(),
+            organization_management_account_id: None,
+            policies: seeded_policy_catalog(),
+            next_team_seq: 0,
+            next_approver_seq: 0,
+        }
+    }
 }
 
 impl ComAmazonawsMpaAwsfluffycoreserviceState {
@@ -425,6 +536,17 @@ impl ComAmazonawsMpaAwsfluffycoreserviceState {
         let mut teams: Vec<&ApprovalTeam> = self.approval_teams.values().collect();
         teams.sort_by_key(|team| team.seq);
         teams
+    }
+
+    /// The catalog policy with this ARN.
+    #[must_use]
+    pub fn policy(&self, arn: &str) -> Option<&CatalogPolicy> {
+        self.policies.get(arn)
+    }
+
+    /// Record a policy in the catalog, replacing any entry under the same ARN.
+    pub fn insert_policy(&mut self, policy: CatalogPolicy) {
+        self.policies.insert(policy.arn.clone(), policy);
     }
 
     /// Store a team and index it by name.

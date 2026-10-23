@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListPolicies
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListPolicies`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the policy catalog held in [`crate::state`], in ARN order.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListPolicies::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A policy is AWS's, not the caller's: nothing in this model creates, updates or
+//! deletes one, so the catalog is seeded when the store is first touched and this
+//! handler only reads it — `@readonly`, and unlike `ListApprovalTeams` it has no
+//! clock-owed change to materialise, because no catalog entry changes with time.
+//!
+//! `NextToken` is the ARN of the last policy the previous page returned, so the next
+//! page is every catalog entry ordered after it: a client paging with any `MaxResults`
+//! sees each policy exactly once. A token that is not one this service issued — an ARN
+//! the catalog does not hold, or anything that is not an ARN at all — earns
+//! `ValidationException` (400).
 //!
 //! ## Shape of an operation
 //!
@@ -80,6 +83,8 @@
 //! * `ThrottlingException` (HTTP 429) — The request was denied due to request throttling.
 //! * `ValidationException` (HTTP 400) — The input fails to satisfy the constraints specified
 //!   by an Amazon Web Services service.
+
+use std::ops::Bound;
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -155,18 +160,69 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListPolicies` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListPoliciesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListPolicies"))
+        // The catalog is the same for every caller and names no account, so there is no
+        // per-resource authorization to decide here; `ctx` carries nothing this answer
+        // depends on.
+        let _ = ctx;
+        let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListPoliciesError::Modeled(ListPoliciesErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the policy catalog is unavailable".to_string(),
+                },
+            ))
+        })?;
+
+        // `MaxResults` is modelled `range(1..20)` with `default: 20`, so the boundary
+        // validator has already closed it; the clamp only keeps the slice width sane.
+        let page_size =
+            usize::try_from(input.max_results.clamp(1, crate::state::MAX_LIST_PAGE)).unwrap_or(1);
+
+        let state = store.lock();
+
+        // The token is this service's own: the ARN of the last policy the previous page
+        // returned. Anything the catalog does not hold never came from here.
+        let after = match input.next_token.as_deref().filter(|token| !token.is_empty()) {
+            None => None,
+            Some(token) if state.policy(token).is_some() => Some(token),
+            Some(_) => {
+                return Err(ListPoliciesErrorModeled::ValidationException(ValidationException {
+                    message: "NextToken is not a token this service issued.".to_string(),
+                })
+                .into())
+            }
+        };
+
+        // At most one entry past the page is read: enough to know whether more remain,
+        // without materialising the whole tail of a catalog that has no fixed size.
+        let mut window: Vec<&crate::state::CatalogPolicy> = match after {
+            None => state.policies.values().take(page_size + 1).collect(),
+            Some(token) => state
+                .policies
+                .range::<str, _>((Bound::Excluded(token), Bound::Unbounded))
+                .map(|(_, policy)| policy)
+                .take(page_size + 1)
+                .collect(),
+        };
+        let more_remain = window.len() > page_size;
+        window.truncate(page_size);
+        let next_token = window
+            .last()
+            .filter(|_| more_remain)
+            .map(|policy| policy.arn.clone());
+
+        Ok(ListPoliciesOutput {
+            policies: Some(window.iter().copied().map(entry).collect()),
+            next_token,
+        })
+    }
+}
+
+/// One `ListPolicies` entry for a catalog policy.
+fn entry(policy: &crate::state::CatalogPolicy) -> Policy {
+    Policy {
+        arn: policy.arn.clone(),
+        default_version: policy.default_version,
+        policy_type: policy.policy_type.as_wire().to_string(),
+        name: policy.name.clone(),
     }
 }

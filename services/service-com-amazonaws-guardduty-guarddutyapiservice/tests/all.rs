@@ -49,3 +49,5 @@ mod sample_finding_catalog;
 mod state_roundtrip;
 #[path = "all/threat_intel_sets.rs"]
 mod threat_intel_sets;
+#[path = "all/trusted_entity_set_lifecycle.rs"]
+mod trusted_entity_set_lifecycle;

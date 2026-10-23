@@ -18,7 +18,8 @@ use crate::ops::types::{
     Bridge, BridgeFlowSource, BridgeNetworkOutput, BridgeNetworkSource, BridgeOutput, BridgeSource,
     DestinationConfiguration, EgressGatewayBridge, EncodingConfig, EncodingParameters, Encryption,
     Entitlement, FailoverConfig, Flow, FlowTransitEncryption, Gateway, GatewayNetwork,
-    GrantEntitlementRequest, IngressGatewayBridge, Interface, ListedFlow, ListedGateway,
+    GrantEntitlementRequest, IngressGatewayBridge, Interface, ListedBridge, ListedFlow,
+    ListedGateway,
     Maintenance, MediaStream, MediaStreamAttributes, MediaStreamAttributesRequest,
     MediaStreamOutputConfiguration, MediaStreamOutputConfigurationRequest, MonitoringConfig,
     NdiConfig, Output, SetSourceRequest, Source, Transport, VpcInterface, VpcInterfaceAttachment,
@@ -58,13 +59,66 @@ pub const GATEWAY_STATE_DELETED: &str = "DELETED";
 /// The `BridgeState` enum the model declares for a bridge
 /// (`smithy_query(query="shape",shape="BridgeState")`: CREATING | STANDBY | STARTING |
 /// DEPLOYING | ACTIVE | STOPPING | DELETING | DELETED | START_FAILED | START_PENDING |
-/// STOP_FAILED | UPDATING). Only the two a bridge's creation reaches are named here; the
-/// rest belong to operations that are still scaffolded (UpdateBridgeState, DeleteBridge).
+/// STOP_FAILED | UPDATING). The two a bridge's creation reaches are named first; the
+/// states a STARTED bridge moves through follow, because DeleteBridge's documented
+/// precondition is stated against them (see [`is_stopped_bridge_state`]). Reaching any of
+/// them is UpdateBridgeState's business, which is still scaffolded.
 pub const BRIDGE_STATE_CREATING: &str = "CREATING";
 /// See [`BRIDGE_STATE_CREATING`]. A bridge that finished being created is not running
 /// yet: it waits in `STANDBY` until UpdateBridgeState asks for a desired state
 /// (`DesiredState`: ACTIVE | DELETED | STANDBY).
 pub const BRIDGE_STATE_STANDBY: &str = "STANDBY";
+/// See [`BRIDGE_STATE_CREATING`].
+pub const BRIDGE_STATE_STARTING: &str = "STARTING";
+/// See [`BRIDGE_STATE_CREATING`].
+pub const BRIDGE_STATE_START_PENDING: &str = "START_PENDING";
+/// See [`BRIDGE_STATE_CREATING`].
+pub const BRIDGE_STATE_DEPLOYING: &str = "DEPLOYING";
+/// See [`BRIDGE_STATE_CREATING`].
+pub const BRIDGE_STATE_ACTIVE: &str = "ACTIVE";
+/// See [`BRIDGE_STATE_CREATING`].
+pub const BRIDGE_STATE_STOPPING: &str = "STOPPING";
+/// See [`BRIDGE_STATE_CREATING`]. A bridge whose stop did not take effect is not a
+/// stopped bridge.
+pub const BRIDGE_STATE_STOP_FAILED: &str = "STOP_FAILED";
+/// See [`BRIDGE_STATE_CREATING`]. A bridge whose start did not take effect never ran, so
+/// it needs no stop.
+pub const BRIDGE_STATE_START_FAILED: &str = "START_FAILED";
+/// See [`BRIDGE_STATE_CREATING`].
+pub const BRIDGE_STATE_UPDATING: &str = "UPDATING";
+
+/// Whether a bridge in `bridge_state` is STOPPED — the precondition DeleteBridge
+/// documents ("before you can delete a bridge, you must stop the bridge").
+///
+/// A bridge needs stopping exactly while it is started or moving to or from being
+/// started: [`BRIDGE_STATE_STARTING`], [`BRIDGE_STATE_START_PENDING`],
+/// [`BRIDGE_STATE_DEPLOYING`], [`BRIDGE_STATE_ACTIVE`], [`BRIDGE_STATE_STOPPING`],
+/// [`BRIDGE_STATE_STOP_FAILED`] and [`BRIDGE_STATE_UPDATING`]. Every other state of the
+/// modelled enum is one in which nothing is running — a bridge still being created, one
+/// waiting in `STANDBY`, one whose start failed, or one already on its way out — so the
+/// documented precondition is met.
+pub fn is_stopped_bridge_state(bridge_state: &str) -> bool {
+    !matches!(
+        bridge_state,
+        BRIDGE_STATE_STARTING
+            | BRIDGE_STATE_START_PENDING
+            | BRIDGE_STATE_DEPLOYING
+            | BRIDGE_STATE_ACTIVE
+            | BRIDGE_STATE_STOPPING
+            | BRIDGE_STATE_STOP_FAILED
+            | BRIDGE_STATE_UPDATING
+    )
+}
+
+/// `ListedBridge$BridgeType` ("the type of the bridge") for a cloud-to-ground bridge —
+/// the kind `Bridge$EgressGatewayBridge` makes it ("an egress bridge is a cloud-to-ground
+/// bridge"). The two bridge-type members are exclusive, so a bridge reports exactly one of
+/// these two.
+pub const BRIDGE_TYPE_EGRESS: &str = "egress";
+/// See [`BRIDGE_TYPE_EGRESS`]: a ground-to-cloud bridge, the kind
+/// `Bridge$IngressGatewayBridge` makes it ("an ingress bridge is a ground-to-cloud
+/// bridge").
+pub const BRIDGE_TYPE_INGRESS: &str = "ingress";
 
 /// `SourceType` (`smithy_query(query="shape",shape="SourceType")`): a source that
 /// originated in this account is `OWNED`; one reached through another account's
@@ -1336,6 +1390,70 @@ impl StoredBridge {
             sources: (!self.sources.is_empty()).then(|| self.sources.clone()),
         }
     }
+
+    /// `ListedBridge$BridgeType` for this record: the kind of bridge the create named,
+    /// read off the bridge-type member it set (see [`BRIDGE_TYPE_EGRESS`]).
+    ///
+    /// The two members are exclusive, so the egress member decides and the ingress member
+    /// is the only other possibility a stored bridge has.
+    pub fn bridge_type(&self) -> &'static str {
+        if self.egress_gateway_bridge.is_some() {
+            BRIDGE_TYPE_EGRESS
+        } else {
+            BRIDGE_TYPE_INGRESS
+        }
+    }
+
+    /// The modelled `ListedBridge` summary for this record — what ListBridges reports.
+    ///
+    /// Every member of the summary is required, and each one is the stored bridge's own:
+    /// no summary member is computed any differently from the full [`Self::to_bridge`]
+    /// projection, so a listing and a describe cannot disagree about one bridge.
+    pub fn to_listed_bridge(&self) -> ListedBridge {
+        ListedBridge {
+            bridge_arn: self.bridge_arn.clone(),
+            bridge_state: self.bridge_state.clone(),
+            bridge_type: self.bridge_type().to_string(),
+            name: self.name.clone(),
+            placement_arn: self.placement_arn.clone(),
+        }
+    }
+
+    /// The position of the source this bridge addresses by `name`
+    /// (`AddBridgeNetworkSourceRequest$Name`: "used to reference the source"), or `None`
+    /// when the bridge holds no such source.
+    pub fn source_position(&self, name: &str) -> Option<usize> {
+        self.sources
+            .iter()
+            .position(|source| bridge_source_name(source) == name)
+    }
+
+    /// The position of the output this bridge addresses by `name`
+    /// (`AddBridgeNetworkOutputRequest$Name`: "used to reference the output"), or `None`
+    /// when the bridge holds no such output.
+    pub fn output_position(&self, name: &str) -> Option<usize> {
+        self.outputs
+            .iter()
+            .position(|output| bridge_output_name(output) == name)
+    }
+
+    /// The names of this bridge's sources — what a source name added to the bridge must
+    /// be unique among ("must be unique among sources in this bridge").
+    pub fn source_names(&self) -> BTreeSet<String> {
+        self.sources
+            .iter()
+            .map(|source| bridge_source_name(source).to_string())
+            .collect()
+    }
+
+    /// The names of this bridge's outputs — what an output name added to the bridge must
+    /// be unique among ("must be unique among outputs in this bridge").
+    pub fn output_names(&self) -> BTreeSet<String> {
+        self.outputs
+            .iter()
+            .map(|output| bridge_output_name(output).to_string())
+            .collect()
+    }
 }
 
 /// Per-service state for com-amazonaws-mediaconnect-mediaconnect. A handler reaches it through [`service_state`].
@@ -1812,7 +1930,7 @@ pub fn is_mintable_gateway_arn(arn: &str) -> bool {
 ///
 /// The model puts no pattern on `BridgeArn`, so this is the crate's own encoding of the
 /// form CreateBridge mints — the integration test asserts minted ARNs through it, and
-/// ListBridges' `NextToken` (still scaffolded) will resume from one.
+/// ListBridges resumes a page from one (its `NextToken`).
 pub fn is_mintable_bridge_arn(arn: &str) -> bool {
     let segments: Vec<&str> = arn.split(':').collect();
     let [.., bridge_id, bridge_name] = segments.as_slice() else {

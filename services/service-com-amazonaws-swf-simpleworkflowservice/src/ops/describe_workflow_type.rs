@@ -140,11 +140,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let guard = state.lock();
+        // An `UnknownResourceFault` message names the requested resource and nothing
+        // else, in the `WorkflowType=[name=.., version=..]` form every operation of this
+        // service that reports a missing workflow type uses.
         let unknown = || {
             DescribeWorkflowTypeErrorModeled::UnknownResourceFault(UnknownResourceFault {
                 message: Some(format!(
-                    "Unknown type: WorkflowType=[name={}, version={}] in domain {}",
-                    input.workflow_type.name, input.workflow_type.version, input.domain
+                    "Unknown type: WorkflowType=[name={}, version={}]",
+                    input.workflow_type.name, input.workflow_type.version
                 )),
             })
         };

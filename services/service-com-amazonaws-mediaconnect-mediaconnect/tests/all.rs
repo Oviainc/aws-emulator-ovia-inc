@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/bridge_lifecycle.rs"]
 mod bridge_lifecycle;
+#[path = "all/bridge_members_and_deletion.rs"]
+mod bridge_members_and_deletion;
 #[path = "all/error_envelopes.rs"]
 mod error_envelopes;
 #[path = "all/flow_entitlements.rs"]

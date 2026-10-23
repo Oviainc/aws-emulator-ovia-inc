@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RemoveBridgeOutput
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RemoveBridgeOutput`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RemoveBridgeOutput::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes one output from a bridge the store holds and answers with what it removed,
+//! read back out of [`crate::state`]: the output DescribeBridge reported before this call
+//! is gone from the bridge afterwards.
 //!
 //! ## Shape of an operation
 //!
@@ -83,6 +78,17 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// Refuse the request with `NotFoundException` (HTTP 404): "one or more of the resources
+/// in the request does not exist in the system" — the bridge or the output `identifier`
+/// addressed, in this service's not-found envelope
+/// ([`crate::state::not_found_message`]).
+fn not_found(identifier: &str) -> RemoveBridgeOutputError {
+    RemoveBridgeOutputErrorModeled::NotFoundException(NotFoundException {
+        message: crate::state::not_found_message(identifier),
+    })
+    .into()
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -158,18 +164,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RemoveBridgeOutput` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RemoveBridgeOutputErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RemoveBridgeOutput"))
+        // Nothing in this operation's answer depends on request metadata: both the bridge
+        // ARN and the output name are `@httpLabel`s the deserializer already put on
+        // `input`, and the response is read back out of the stored bridge.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(RemoveBridgeOutputErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: "the mediaconnect bridge store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+        // The bridge state change the clock already owes is materialised before the bridge
+        // is read, exactly as AddBridgeOutputs and the reporting operations do it.
+        store.settle_due_transitions(::std::time::SystemTime::now());
+
+        // This operation removes an output from "a bridge", addressed by the bridge's own
+        // ARN.
+        let Some(bridge) = store.bridges.get_mut(&input.bridge_arn) else {
+            return Err(not_found(&input.bridge_arn));
+        };
+
+        // The output removed is the one of THIS bridge's outputs the bridge addresses by
+        // the requested name ("this name is used to reference the output and must be
+        // unique among outputs in this bridge"), so at most one position matches; a name
+        // of some other bridge's output, or of an output already removed, resolves nothing
+        // here.
+        let Some(position) = bridge.output_position(&input.output_name) else {
+            return Err(not_found(&input.output_name));
+        };
+        let removed = bridge.outputs.remove(position);
+
+        // "The ARN of the bridge from which the output was removed" and "the name of the
+        // bridge output that was removed" — both read out of the STORE rather than echoed
+        // from the request, so the response can only name what this call actually removed.
+        // Removing an output moves nothing else about the bridge: its state is left as it
+        // was, because no clock owes a change for a removed output.
+        Ok(RemoveBridgeOutputOutput {
+            bridge_arn: Some(bridge.bridge_arn.clone()),
+            output_name: Some(crate::state::bridge_output_name(&removed).to_string()),
+        })
     }
 }

@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RemoveBridgeSource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RemoveBridgeSource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RemoveBridgeSource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes one source from a bridge the store holds and answers with what it removed,
+//! read back out of [`crate::state`]: the source DescribeBridge reported before this call
+//! is gone from the bridge afterwards.
 //!
 //! ## Shape of an operation
 //!
@@ -83,6 +78,17 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// Refuse the request with `NotFoundException` (HTTP 404): "one or more of the resources
+/// in the request does not exist in the system" — the bridge or the source `identifier`
+/// addressed, in this service's not-found envelope
+/// ([`crate::state::not_found_message`]).
+fn not_found(identifier: &str) -> RemoveBridgeSourceError {
+    RemoveBridgeSourceErrorModeled::NotFoundException(NotFoundException {
+        message: crate::state::not_found_message(identifier),
+    })
+    .into()
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -158,18 +164,52 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RemoveBridgeSource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RemoveBridgeSourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // Nothing in this operation's answer depends on request metadata: both the bridge
+        // ARN and the source name are `@httpLabel`s the deserializer already put on
+        // `input`, and the response is read back out of the stored bridge.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(RemoveBridgeSourceErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: "the mediaconnect bridge store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+        // The bridge state change the clock already owes is materialised before the bridge
+        // is read, exactly as AddBridgeSources and the reporting operations do it.
+        store.settle_due_transitions(::std::time::SystemTime::now());
+
+        // This operation removes a source from "a bridge", addressed by the bridge's own
+        // ARN.
+        let Some(bridge) = store.bridges.get_mut(&input.bridge_arn) else {
+            return Err(not_found(&input.bridge_arn));
+        };
+
+        // The source removed is the one of THIS bridge's sources the bridge addresses by
+        // the requested name ("this name is used to reference the source and must be
+        // unique among sources in this bridge"), so at most one position matches; a name
+        // of some other bridge's source, or of a source already removed, resolves nothing
+        // here.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RemoveBridgeSource"))
+        // Nothing in the model puts a lower bound on a STORED bridge's sources — "the
+        // request must include one source" is CreateBridge's rule about a create REQUEST —
+        // so removing the last source is not refused here.
+        let Some(position) = bridge.source_position(&input.source_name) else {
+            return Err(not_found(&input.source_name));
+        };
+        let removed = bridge.sources.remove(position);
+
+        // "The ARN of the bridge from which the source was removed" and "the name of the
+        // bridge source that was removed" — both read out of the STORE rather than echoed
+        // from the request, so the response can only name what this call actually removed.
+        // Removing a source moves nothing else about the bridge: its state is left as it
+        // was, because no clock owes a change for a removed source.
+        Ok(RemoveBridgeSourceOutput {
+            bridge_arn: Some(bridge.bridge_arn.clone()),
+            source_name: Some(crate::state::bridge_source_name(&removed).to_string()),
+        })
     }
 }

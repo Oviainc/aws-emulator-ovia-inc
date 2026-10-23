@@ -11,6 +11,10 @@
 // `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` resolves to a SIBLING
 // (`tests/state_roundtrip.rs`) — which the layout check refuses. The `#[path]` is what
 // points it into `tests/all/`.
+#[path = "all/channel_deletion.rs"]
+mod channel_deletion;
+#[path = "all/channel_error_envelope.rs"]
+mod channel_error_envelope;
 #[path = "all/dashboard_enumeration.rs"]
 mod dashboard_enumeration;
 #[path = "all/dashboard_lifecycle.rs"]
@@ -53,3 +57,8 @@ mod trail_lifecycle;
 mod trail_refusals;
 #[path = "all/trail_update.rs"]
 mod trail_update;
+// Declared only because the build's layout check requires every file under `tests/all/`
+// to be declared: this one is an empty leftover (see its own doc comment), and the suite
+// it used to hold now lives in `all/channel_error_envelope.rs`.
+#[path = "all/zz_diagnostic.rs"]
+mod zz_diagnostic;

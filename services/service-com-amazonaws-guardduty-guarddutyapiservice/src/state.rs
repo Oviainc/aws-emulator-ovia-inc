@@ -1322,6 +1322,12 @@ pub struct Detector {
     /// detector like its findings and filters, so `DeleteDetector` drops them with
     /// it.
     pub investigations: BTreeMap<String, InvestigationRecord>,
+    /// This detector's trusted entity sets, keyed by the minted entity-set id.
+    /// They hang off the detector — every operation on one is reached through
+    /// `/detector/{DetectorId}/trustedentityset`
+    /// (`smithy_query(operation="CreateTrustedEntitySet")`) — so
+    /// `DeleteDetector` drops them with it.
+    pub trusted_entity_sets: BTreeMap<String, EntitySetRecord>,
     /// This detector's IPSets (trusted IP lists), keyed by the minted `IpSetId`.
     /// They are sub-resources of the detector — every IPSet operation is bound
     /// under `/detector/{DetectorId}/ipset`
@@ -1531,6 +1537,15 @@ impl Detector {
             .values()
             .filter(|investigation| investigation.started_at_millis >= since)
             .count()
+    }
+
+    /// The trusted entity set a create already minted for `token`, if any — the
+    /// seam that makes `CreateTrustedEntitySet` idempotent under a replayed
+    /// `ClientToken`.
+    pub fn trusted_entity_set_for_token(&self, token: &str) -> Option<&EntitySetRecord> {
+        self.trusted_entity_sets
+            .values()
+            .find(|set| set.client_token.as_deref() == Some(token))
     }
 
     /// The IPSet a create already minted for `token`, if any — the seam that makes
@@ -2028,6 +2043,184 @@ impl InvestigationRecord {
         self.status = INVESTIGATION_FAILED.to_string();
         self.ended_at_millis = Some(self.terminal_due_millis);
         self.error = Some(INVESTIGATION_ENGINE_UNAVAILABLE.to_string());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Entity sets
+//
+// A trusted entity set is an uploaded list of IP addresses and domains, held in
+// S3 and taken into use by GuardDuty. The record below carries what the create
+// stored plus the status the set is in; the status moves only when the CLOCK
+// owes it, through [`EntitySetRecord::settle`].
+// ---------------------------------------------------------------------------
+
+/// `TrustedEntitySetStatus`: the status a set the caller did NOT ask to activate
+/// stays in. The enum is `INACTIVE | ACTIVATING | ACTIVE | DEACTIVATING | ERROR
+/// | DELETE_PENDING | DELETED` (`smithy_query(shape="TrustedEntitySetStatus")`).
+pub const ENTITY_SET_INACTIVE: &str = "INACTIVE";
+
+/// The `TrustedEntitySetStatus` a set the caller asked to activate starts in: the
+/// uploaded list is being taken into use. See [`ENTITY_SET_INACTIVE`] for the
+/// enum.
+pub const ENTITY_SET_ACTIVATING: &str = "ACTIVATING";
+
+/// The `TrustedEntitySetStatus` an activating set reaches once the clock owes it:
+/// GuardDuty is using the list. See [`ENTITY_SET_INACTIVE`] for the enum.
+pub const ENTITY_SET_ACTIVE: &str = "ACTIVE";
+
+/// How long a set the caller asked to activate stays [`ENTITY_SET_ACTIVATING`]
+/// before the clock owes it [`ENTITY_SET_ACTIVE`].
+///
+/// AWS documents no duration for taking an uploaded list into use, so this span
+/// is CHOSEN — the same one [`INVESTIGATION_TRANSITION_MILLIS`] uses, and for the
+/// same reason: non-zero, so a caller reading straight after the create still
+/// observes the transient status, and short enough that nothing has to wait long
+/// for the settled one.
+pub const ENTITY_SET_TRANSITION_MILLIS: i64 = 500;
+
+/// The wire name of the `TrustedEntitySetId` member, as the request carries it in
+/// its URI label and the create reports it
+/// (`smithy_query(operation="GetTrustedEntitySet")` renders the `jsonName`
+/// `trustedEntitySetId`). It is what a rejection names.
+pub const TRUSTED_ENTITY_SET_ID_MEMBER: &str = "trustedEntitySetId";
+
+/// The wire name of the `Name` member an entity-set create carries
+/// (`jsonName` `name`), for the same reason.
+pub const ENTITY_SET_NAME_MEMBER: &str = "name";
+
+/// The wire name of the `Location` member an entity-set create carries
+/// (`jsonName` `location`), for the same reason.
+pub const ENTITY_SET_LOCATION_MEMBER: &str = "location";
+
+/// The message a second `CreateTrustedEntitySet` is refused with. "At any given
+/// time, you can have only one trusted entity set"
+/// (`smithy_query(query="doc",shape="CreateTrustedEntitySet")`), and the set hangs
+/// off the detector, which is the account/Region-level resource.
+pub const TRUSTED_ENTITY_SET_ALREADY_EXISTS_MESSAGE: &str =
+    "The request is rejected because a trusted entity set already exists for the input detectorId.";
+
+/// Does `name` hold only the characters an entity-set `Name` may contain?
+///
+/// "The name of your list can include lowercase letters, uppercase letters,
+/// numbers, dash (-), and underscore (_)"
+/// (`smithy_query(query="doc",shape="CreateTrustedEntitySetRequest",member="Name")`)
+/// — a documented constraint the model's `len 1..300` does not express, so it is
+/// enforced here.
+pub fn is_entity_set_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// Is `location` a valid Amazon S3 URL for an uploaded entity-set list?
+///
+/// "The format of the Location URL must be a valid Amazon S3 URL format. Invalid
+/// URL formats will result in an error, regardless of whether you activate the
+/// entity set or not"
+/// (`smithy_query(query="doc",shape="CreateTrustedEntitySetRequest",member="Location")`).
+/// The accepted forms are the S3 URL forms: the `s3://bucket/key` scheme, the
+/// path-style HTTPS endpoint (`https://s3[.-]<region>.amazonaws.com/bucket/key`)
+/// and the virtual-hosted-style one
+/// (`https://bucket.s3[.-]<region>.amazonaws.com/key`). Each needs BOTH a bucket
+/// and a non-empty object key: a URL naming only a bucket does not name a list.
+pub fn is_s3_location(location: &str) -> bool {
+    let Ok(url) = ::url::Url::parse(location) else {
+        return false;
+    };
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    let key = url.path().trim_start_matches('/');
+    match url.scheme() {
+        // `s3://bucket/key`: the authority IS the bucket and the path the key.
+        "s3" => !host.is_empty() && !key.is_empty(),
+        "https" => match s3_endpoint_prefix(host) {
+            // Path-style: the first path segment is the bucket, the rest the key.
+            Some("") => key.split_once('/').is_some_and(|(bucket, object_key)| {
+                !bucket.is_empty() && !object_key.is_empty()
+            }),
+            // Virtual-hosted style: the host carries the bucket, the path the key.
+            Some(bucket) => !bucket.is_empty() && !key.is_empty(),
+            None => false,
+        },
+        _ => false,
+    }
+}
+
+/// What precedes the `s3` label in an S3 endpoint `host`, if `host` is one: the
+/// empty string for a path-style endpoint, and the bucket for a virtual-hosted
+/// one. `None` when the host is not an S3 endpoint at all.
+///
+/// Both the dotted (`s3.us-east-1.amazonaws.com`) and the dashed
+/// (`s3-us-east-1.amazonaws.com`) regional spellings are S3 endpoints, as is the
+/// Region-less `s3.amazonaws.com`.
+fn s3_endpoint_prefix(host: &str) -> Option<&str> {
+    let domain = host.strip_suffix(".amazonaws.com")?;
+    for (index, _) in domain.match_indices("s3") {
+        let (prefix, rest) = domain.split_at(index);
+        // The `s3` label must start a label of its own, and must be the whole
+        // label or be followed by a `-<region>` suffix within it.
+        if !(prefix.is_empty() || prefix.ends_with('.')) {
+            continue;
+        }
+        let rest = &rest["s3".len()..];
+        if rest.is_empty() || rest.starts_with('.') || rest.starts_with('-') {
+            return Some(prefix.trim_end_matches('.'));
+        }
+    }
+    None
+}
+
+/// One stored entity set. Timestamps are epoch milliseconds, the single source for
+/// the instants the wire carries.
+#[derive(Debug, Clone)]
+pub struct EntitySetRecord {
+    pub id: String,
+    pub name: String,
+    /// `TrustedEntitySetFormat`, stored as the create gave it.
+    pub format: String,
+    /// The S3 URL the list was uploaded to, stored verbatim.
+    pub location: String,
+    pub expected_bucket_owner: Option<String>,
+    pub tags: BTreeMap<String, String>,
+    /// The `ClientToken` the create carried, so a replay returns this same set
+    /// instead of minting a second one.
+    pub client_token: Option<String>,
+    /// `TrustedEntitySetStatus`.
+    pub status: String,
+    /// When the clock owes this set its next status, while one is owed. See
+    /// [`ENTITY_SET_TRANSITION_MILLIS`].
+    pub status_due_millis: Option<i64>,
+    pub created_at_millis: i64,
+    pub updated_at_millis: i64,
+    /// `ErrorDetails`: only an `ERROR` set carries one.
+    pub error_details: Option<String>,
+}
+
+impl EntitySetRecord {
+    /// Apply the status change the CLOCK already made due, if any.
+    ///
+    /// The move out of [`ENTITY_SET_ACTIVATING`] was owed at
+    /// [`Self::status_due_millis`] whether or not anybody called, which is why a
+    /// reporting operation may apply it. `UpdatedAt` records the instant it was
+    /// OWED, not the instant somebody looked, so two reads of a settled set agree.
+    pub fn settle(&mut self, now: i64) {
+        let Some(due) = self.status_due_millis else {
+            return;
+        };
+        if now < due {
+            return;
+        }
+        // Only a transitional status is owed a move, and each one settles to its
+        // own status, so a status this function does not know stays where it is.
+        self.status = match self.status.as_str() {
+            ENTITY_SET_ACTIVATING => ENTITY_SET_ACTIVE.to_string(),
+            other => other.to_string(),
+        };
+        self.status_due_millis = None;
+        self.updated_at_millis = due;
     }
 }
 

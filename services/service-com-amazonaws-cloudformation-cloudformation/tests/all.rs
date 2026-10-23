@@ -33,6 +33,8 @@ mod stack_output_resolution;
 mod stack_outputs;
 #[path = "all/stack_reported_members.rs"]
 mod stack_reported_members;
+#[path = "all/stack_resource_detail.rs"]
+mod stack_resource_detail;
 #[path = "all/stack_resources.rs"]
 mod stack_resources;
 #[path = "all/state_roundtrip.rs"]

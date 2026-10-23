@@ -168,11 +168,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let guard = state.lock();
+        // An `UnknownResourceFault` message names the requested resource and nothing
+        // else, in the `ActivityType=[name=.., version=..]` form every operation of this
+        // service that reports a missing activity type uses.
         let unknown = || {
             DescribeActivityTypeErrorModeled::UnknownResourceFault(UnknownResourceFault {
                 message: Some(format!(
-                    "Unknown type: ActivityType=[name={}, version={}] in domain {}",
-                    input.activity_type.name, input.activity_type.version, input.domain
+                    "Unknown type: ActivityType=[name={}, version={}]",
+                    input.activity_type.name, input.activity_type.version
                 )),
             })
         };
