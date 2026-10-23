@@ -7,6 +7,11 @@
 //! `TagResource`, `ListTagsForResource` and `DeleteCluster` all compute their
 //! responses from it. Nothing in `src/ops/` keeps a second copy of a cluster.
 //!
+//! It also holds the managed node group slice: `CreateNodegroup` writes a
+//! [`NodegroupRecord`] here and `DescribeNodegroup` computes its whole response
+//! from that record, so a node group's server-generated parts (its ARN,
+//! `createdAt`, defaults) are written once and read back unchanged.
+//!
 //! One record covers both kinds of cluster this API knows: an Amazon EKS cluster
 //! `CreateCluster` provisions a control plane for, and an external Kubernetes
 //! cluster `RegisterCluster` connects. The members only a provisioned control
@@ -68,16 +73,23 @@ use crate::ops::types::{
     ConnectorConfigResponse,
     ControlPlaneScalingConfig, EncryptionConfig, Identity, KubeApiServerConfigResponse,
     KubeControllerManagerConfigResponse, KubeSchedulerConfigResponse,
-    KubernetesNetworkConfigResponse, Logging, OidcIdentityProviderConfig, OutpostConfigResponse,
-    PodIdentityAssociation, PodIdentityAssociationSummary, RemoteNetworkConfigResponse,
-    StorageConfigResponse, Update, UpdateParam, UpgradePolicyResponse, VpcConfigResponse,
-    ZonalShiftConfigResponse,
+    KubernetesNetworkConfigResponse, LaunchTemplateSpecification, Logging, NodeRepairConfig,
+    Nodegroup, NodegroupHealth, NodegroupScalingConfig, NodegroupUpdateConfig,
+    OidcIdentityProviderConfig, OutpostConfigResponse, PodIdentityAssociation,
+    PodIdentityAssociationSummary, RemoteAccessConfig, RemoteNetworkConfigResponse,
+    StorageConfigResponse, Taint, Update, UpdateParam, UpgradePolicyResponse, VpcConfigResponse,
+    WarmPoolConfig, ZonalShiftConfigResponse,
 };
 
 /// The `ClusterStatus` members this slice uses. The model's enum
 /// (`smithy_query query="shape" shape="ClusterStatus"`) is
 /// `CREATING | ACTIVE | DELETING | FAILED | UPDATING | PENDING`; `Cluster$status`
 /// is a plain string member, so the status is stored as the wire token.
+///
+/// `NodegroupStatus` (`CREATING | ACTIVE | UPDATING | DELETING | CREATE_FAILED |
+/// DELETE_FAILED | DEGRADED`) spells its first two members with the same tokens,
+/// so the node group slice reuses [`STATUS_CREATING`] and [`STATUS_ACTIVE`]
+/// rather than declaring a second pair of identical constants.
 pub const STATUS_CREATING: &str = "CREATING";
 /// See [`STATUS_CREATING`].
 pub const STATUS_ACTIVE: &str = "ACTIVE";
@@ -297,6 +309,124 @@ pub const VERSION_ROLLBACK_NODE_PHASE: Duration = Duration::from_millis(250);
 /// natural default. `ListCapabilities` bounds `maxResults` the same way and shares
 /// this default.
 pub const DEFAULT_LIST_PAGE_SIZE: i32 = 100;
+
+/// How long a newly created node group reports `CREATING` before the clock owes
+/// it `ACTIVE`.
+///
+/// `CreateNodegroup` publishes no duration for the transition, so this span is
+/// CHOSEN rather than cited, on the same grounds as
+/// [`CLUSTER_ACTIVATION_DELAY`]: a caller that describes the node group straight
+/// after creating it still observes `CREATING`. The due instant is stored on the
+/// record; nothing sleeps for it.
+pub const NODEGROUP_ACTIVATION_DELAY: Duration = Duration::from_millis(500);
+
+/// The instance type a node group gets when neither `instanceTypes` nor a launch
+/// template names one: "If you don't specify an instance type in a launch
+/// template or for `instanceTypes`, then `t3.medium` is used, by default"
+/// (`CreateNodegroupRequest$instanceTypes`).
+pub const DEFAULT_INSTANCE_TYPE: &str = "t3.medium";
+
+/// The number of `instanceTypes` one node group may name: "you can specify 0-20
+/// instance types for `instanceTypes`" (`CreateNodegroupRequest$instanceTypes`).
+pub const MAX_INSTANCE_TYPES: usize = 20;
+
+/// The root device disk size a Linux or Bottlerocket node group gets when
+/// `diskSize` is absent: "The default disk size is 20 GiB for Linux and
+/// Bottlerocket" (`CreateNodegroupRequest$diskSize`).
+pub const DEFAULT_DISK_SIZE_GIB: i32 = 20;
+
+/// The smallest `diskSize` a node group may ask for. "The root device disk size
+/// (in GiB) for your node group instances"
+/// (`CreateNodegroupRequest$diskSize`) — a disk is at least one GiB. The member
+/// is a `BoxedInteger` with no modelled range, so `CreateNodegroup` is what
+/// refuses a zero or negative size.
+pub const MIN_DISK_SIZE_GIB: i32 = 1;
+
+/// The root device disk size a Windows node group gets when `diskSize` is
+/// absent: "The default disk size is 50 GiB for Windows"
+/// (`CreateNodegroupRequest$diskSize`). Which of the two applies is decided by
+/// the node group's `amiType` — see [`default_disk_size_gib`].
+pub const DEFAULT_WINDOWS_DISK_SIZE_GIB: i32 = 50;
+
+/// The `amiType` prefix that marks a Windows AMI family. The `AMITypes` enum
+/// (`smithy_query query="shape" shape="AMITypes"`) spells every Windows member
+/// `WINDOWS_<edition>_<year>_x86_64`, so the family is the prefix rather than a
+/// hand-kept list of the six members.
+pub const WINDOWS_AMI_TYPE_PREFIX: &str = "WINDOWS_";
+
+/// The `amiType` a node group gets when the request names none and uses no
+/// launch template.
+///
+/// The model documents no default for `CreateNodegroupRequest$amiType`, so this
+/// emulator pins one member of the modelled `AMITypes` enum — the current
+/// Amazon Linux 2023 x86-64 standard family — instead of inventing a value per
+/// request, exactly as [`DEFAULT_KUBERNETES_VERSION`] pins a version.
+pub const DEFAULT_AMI_TYPE: &str = "AL2023_x86_64_STANDARD";
+
+/// The `amiType` a node group reports when it was deployed with a launch
+/// template and named no `amiType`: "If the node group was deployed using a
+/// launch template with a custom AMI, then this is `CUSTOM`"
+/// (`Nodegroup$amiType`). This emulator holds no launch templates, so a launch
+/// template the caller did not pair with an `amiType` is taken to carry a custom
+/// AMI.
+pub const CUSTOM_AMI_TYPE: &str = "CUSTOM";
+
+/// The `capacityType` a node group gets when the request names none.
+///
+/// The model documents no default for `CreateNodegroupRequest$capacityType`, so
+/// this emulator pins the on-demand member of the modelled `CapacityTypes` enum
+/// (`ON_DEMAND | SPOT | CAPACITY_BLOCK`) rather than leaving the member unset on
+/// a resource AWS always reports one for.
+pub const DEFAULT_CAPACITY_TYPE: &str = "ON_DEMAND";
+
+/// The `scalingConfig` a node group gets when the request carries none.
+///
+/// `NodegroupScalingConfig` documents no defaults ("When creating a node group,
+/// you must specify all or none of the properties"), so this emulator pins one
+/// triple that satisfies `minSize <= desiredSize <= maxSize` instead of
+/// inventing one per request.
+pub const DEFAULT_SCALING_MIN_SIZE: i32 = 1;
+/// See [`DEFAULT_SCALING_MIN_SIZE`].
+pub const DEFAULT_SCALING_MAX_SIZE: i32 = 2;
+/// See [`DEFAULT_SCALING_MIN_SIZE`].
+pub const DEFAULT_SCALING_DESIRED_SIZE: i32 = 2;
+
+/// The `maxUnavailable` a node group's `updateConfig` gets when the request
+/// carries none.
+///
+/// `NodegroupUpdateConfig$maxUnavailable` states the shape of the rule — "This
+/// value or `maxUnavailablePercentage` is required to have a value" — but no
+/// default, so this emulator pins the most conservative count the member allows
+/// (its modelled range is 1..): one node at a time.
+pub const DEFAULT_MAX_UNAVAILABLE: i32 = 1;
+
+/// The number of managed node groups one cluster holds before `CreateNodegroup`
+/// answers `ResourceLimitExceededException`.
+///
+/// AWS publishes an adjustable EKS service quota of 30 managed node groups per
+/// cluster, and exceeding a service limit is exactly what that error reports.
+pub const MAX_NODEGROUPS_PER_CLUSTER: usize = 30;
+
+/// The number of node groups this store holds ACROSS EVERY CLUSTER AND REGION
+/// before `CreateNodegroup` answers `ResourceLimitExceededException`.
+///
+/// [`MAX_NODEGROUPS_PER_CLUSTER`] is the published per-cluster quota, but the
+/// caller decides how many clusters and regions exist, so a per-cluster cap
+/// alone does not bound the store. This ceiling does: it is the per-cluster
+/// quota times a realistic number of clusters, and a hard stop on how much
+/// repeated creates can retain.
+pub const MAX_STORED_NODEGROUPS: usize = MAX_NODEGROUPS_PER_CLUSTER * 100;
+
+/// The root device disk size a node group with `ami_type` gets when `diskSize`
+/// is absent — [`DEFAULT_WINDOWS_DISK_SIZE_GIB`] for the Windows AMI families,
+/// [`DEFAULT_DISK_SIZE_GIB`] for every other member.
+pub fn default_disk_size_gib(ami_type: &str) -> i32 {
+    if ami_type.starts_with(WINDOWS_AMI_TYPE_PREFIX) {
+        DEFAULT_WINDOWS_DISK_SIZE_GIB
+    } else {
+        DEFAULT_DISK_SIZE_GIB
+    }
+}
 
 /// The number of capabilities one cluster can hold.
 ///
@@ -1105,6 +1235,116 @@ impl ClusterRecord {
     }
 }
 
+/// One managed node group, as this service stores it.
+///
+/// Everything a `Nodegroup` reports is held here — including the
+/// server-generated `nodegroupArn`, `createdAt`/`modifiedAt` and every default
+/// `CreateNodegroup` filled in — so `DescribeNodegroup` returns exactly what the
+/// create wrote rather than recomputing anything per request.
+#[derive(Debug, Clone)]
+pub struct NodegroupRecord {
+    pub nodegroup_name: String,
+    pub cluster_name: String,
+    pub arn: String,
+    pub created_at: SystemTime,
+    pub modified_at: SystemTime,
+    pub version: String,
+    /// Set only when the caller named a `releaseVersion`: this emulator
+    /// publishes no EKS-optimized AMI catalog, so for a node group that named
+    /// none it reports no AMI version rather than inventing one.
+    pub release_version: Option<String>,
+    pub status: String,
+    /// When set, the instant at which the clock owes this node group the move
+    /// from `CREATING` to `ACTIVE`. Cleared once the move is materialised.
+    pub active_at: Option<SystemTime>,
+    pub capacity_type: String,
+    pub scaling_config: NodegroupScalingConfig,
+    /// `None` when the node group was deployed with a launch template: "If the
+    /// node group was deployed with a launch template, then this is `null`"
+    /// (`Nodegroup$instanceTypes`).
+    pub instance_types: Option<Vec<String>>,
+    pub subnets: Vec<String>,
+    /// `None` when the node group was deployed with a launch template, for the
+    /// same reason as [`NodegroupRecord::instance_types`]
+    /// (`Nodegroup$remoteAccess`).
+    pub remote_access: Option<RemoteAccessConfig>,
+    pub ami_type: String,
+    pub node_role: String,
+    pub labels: BTreeMap<String, String>,
+    pub taints: Vec<Taint>,
+    /// `None` when the node group was deployed with a launch template, for the
+    /// same reason as [`NodegroupRecord::instance_types`] (`Nodegroup$diskSize`).
+    pub disk_size: Option<i32>,
+    pub update_config: NodegroupUpdateConfig,
+    pub node_repair_config: Option<NodeRepairConfig>,
+    pub launch_template: Option<LaunchTemplateSpecification>,
+    pub tags: BTreeMap<String, String>,
+    pub warm_pool_config: Option<WarmPoolConfig>,
+    pub client_request_token: Option<String>,
+}
+
+impl NodegroupRecord {
+    /// Materialise the status move the clock already owes at `now`. See
+    /// [`ClusterRecord::materialize_due_transitions`].
+    pub fn materialize_due_transitions(&mut self, now: SystemTime) {
+        if self.active_at.is_some_and(|due| now >= due) {
+            self.status = STATUS_ACTIVE.to_string();
+            self.active_at = None;
+        }
+    }
+
+    /// This record as the modelled `Nodegroup` shape.
+    pub fn to_nodegroup(&self) -> Nodegroup {
+        Nodegroup {
+            nodegroup_name: Some(self.nodegroup_name.clone()),
+            nodegroup_arn: Some(self.arn.clone()),
+            cluster_name: Some(self.cluster_name.clone()),
+            version: Some(self.version.clone()),
+            release_version: self.release_version.clone(),
+            created_at: Some(::aws_smithy_types::DateTime::from(self.created_at)),
+            modified_at: Some(::aws_smithy_types::DateTime::from(self.modified_at)),
+            status: Some(self.status.clone()),
+            capacity_type: Some(self.capacity_type.clone()),
+            scaling_config: Some(self.scaling_config.clone()),
+            instance_types: self.instance_types.clone(),
+            subnets: Some(self.subnets.clone()),
+            remote_access: self.remote_access.clone(),
+            ami_type: Some(self.ami_type.clone()),
+            node_role: Some(self.node_role.clone()),
+            labels: Some(
+                self.labels
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect(),
+            ),
+            taints: Some(self.taints.clone()),
+            disk_size: self.disk_size,
+            // Nothing in this emulator reports a node group issue, so the
+            // health block is present and empty rather than absent: "Any issues
+            // that are associated with the node group" (`NodegroupHealth$issues`).
+            health: Some(NodegroupHealth {
+                issues: Some(Vec::new()),
+            }),
+            update_config: Some(self.update_config.clone()),
+            node_repair_config: self.node_repair_config.clone(),
+            launch_template: self.launch_template.clone(),
+            tags: Some(
+                self.tags
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect(),
+            ),
+            warm_pool_config: self.warm_pool_config.clone(),
+            // `resources` names the Auto Scaling groups and the remote-access
+            // security group EKS creates for the node group. This emulator
+            // creates no EC2 resources, so it reports none rather than
+            // inventing ids for resources no EC2 store holds — the same choice
+            // the cluster slice makes for `clusterSecurityGroupId` and `vpcId`.
+            resources: None,
+        }
+    }
+}
+
 /// The `AddonStatus` members this slice uses. The model's enum
 /// (`smithy_query query="shape" shape="AddonStatus"`) is
 /// `CREATING | ACTIVE | CREATE_FAILED | UPDATING | DELETING | DELETE_FAILED |
@@ -1881,6 +2121,20 @@ pub struct ComAmazonawsEksAwswesleyfrontendState {
     /// call name a cluster in any region. It holds exactly one entry per stored
     /// cluster, so [`MAX_STORED_CLUSTERS`] bounds it too.
     pub arn_index: BTreeMap<String, (String, String)>,
+    /// Managed node groups by `(region, cluster name, nodegroup name)`.
+    ///
+    /// A node group name identifies a node group only WITHIN one cluster, and a
+    /// cluster name only within one region (see [`Self::clusters`]), so the key
+    /// is the whole triple: the same node group name may exist in another
+    /// cluster or another region. A `BTreeMap` so a listing walks a stable,
+    /// sorted order within a cluster. Its size is bounded by
+    /// [`MAX_STORED_NODEGROUPS`], which `CreateNodegroup` enforces.
+    ///
+    /// Node group ARNs are deliberately NOT added to [`Self::arn_index`]: that
+    /// index answers "which CLUSTER does this ARN name" for the tag operations,
+    /// and tagging a node group through `TagResource` belongs to the tag slice's
+    /// own gap issue.
+    pub nodegroups: BTreeMap<(String, String, String), NodegroupRecord>,
     /// Add-ons by `(region, cluster name, add-on name)`.
     ///
     /// An add-on is a resource INSIDE one cluster — `CreateAddon`'s `clusterName`
@@ -1932,11 +2186,7 @@ pub struct ComAmazonawsEksAwswesleyfrontendState {
     /// [`new_update_id`]) so two updates minted in the same nanosecond cannot
     /// collide.
     pub minted_updates: u64,
-    // The nodegroup map the next slice needs is deliberately NOT declared yet: a
-    // field no operation reads is dead weight that every `Debug`/`Default` and
-    // every reviewer has to account for. It is added by the slice that first
-    // writes it (`CreateNodegroup`, still 501 with its own gap issue). An
-    // asynchronous update is not here either — it lives on the cluster it
+    // An asynchronous update is not a field here — it lives on the cluster it
     // updates ([`ClusterRecord::updates`]).
 }
 
@@ -1947,6 +2197,7 @@ impl Default for ComAmazonawsEksAwswesleyfrontendState {
         Self {
             clusters: BTreeMap::new(),
             arn_index: BTreeMap::new(),
+            nodegroups: BTreeMap::new(),
             addons: BTreeMap::new(),
             capabilities: BTreeMap::new(),
             pod_identity_associations: BTreeMap::new(),
@@ -1973,6 +2224,9 @@ impl ComAmazonawsEksAwswesleyfrontendState {
     pub fn materialize_due_transitions(&mut self, now: SystemTime) {
         for cluster in self.clusters.values_mut() {
             cluster.materialize_due_transitions(now);
+        }
+        for nodegroup in self.nodegroups.values_mut() {
+            nodegroup.materialize_due_transitions(now);
         }
         for addon in self.addons.values_mut() {
             addon.materialize_due_transitions(now);
@@ -2036,6 +2290,25 @@ impl ComAmazonawsEksAwswesleyfrontendState {
             .keys()
             .filter(move |(key_region, _)| key_region == region)
             .map(|(_, name)| name.as_str())
+    }
+
+    /// The names of the node groups this store holds in `cluster_name` in
+    /// `region`, in sorted order.
+    ///
+    /// The map is keyed `(region, cluster, nodegroup)`, so its iteration order
+    /// already sorts each cluster's node group names; this only drops the other
+    /// clusters and regions.
+    pub fn nodegroup_names_in<'a>(
+        &'a self,
+        region: &'a str,
+        cluster_name: &'a str,
+    ) -> impl Iterator<Item = &'a str> + 'a {
+        self.nodegroups
+            .keys()
+            .filter(move |(key_region, key_cluster, _)| {
+                key_region == region && key_cluster == cluster_name
+            })
+            .map(|(_, _, name)| name.as_str())
     }
 
     /// The capabilities one cluster holds, in capability-name order.
@@ -2158,6 +2431,19 @@ impl ComAmazonawsEksAwswesleyfrontendState {
         cluster_name: &str,
     ) {
         self.pod_identity_associations
+            .retain(|(key_region, key_cluster, _), _| {
+                key_region != region || key_cluster != cluster_name
+            });
+    }
+
+    /// Drop every managed node group of one cluster.
+    ///
+    /// A node group is a child of its cluster — it is addressed as
+    /// `/clusters/{clusterName}/node-groups/{nodegroupName}` — so once the
+    /// cluster is gone its node groups are gone with it, and a cluster later
+    /// created with the same name in the same Region does not inherit them.
+    pub fn remove_nodegroups_for_cluster(&mut self, region: &str, cluster_name: &str) {
+        self.nodegroups
             .retain(|(key_region, key_cluster, _), _| {
                 key_region != region || key_cluster != cluster_name
             });
@@ -2327,6 +2613,30 @@ pub fn derive_certificate_authority_data(subject: &str) -> String {
          -----END CERTIFICATE-----\n"
     );
     ::aws_smithy_types::base64::encode(placeholder)
+}
+
+/// The node group's own identifier, the last segment of its `nodegroupArn`.
+///
+/// An EKS node group ARN is
+/// `arn:aws:eks:<region>:<account>:nodegroup/<cluster>/<nodegroup>/<id>`, where
+/// the trailing id distinguishes two node groups that carried the same name at
+/// different times. It is derived from the region, the two names and the
+/// creation instant — so it is distinct per creation and stable for the
+/// renderer for this service's UUID-shaped identifiers, through
+/// [`derive_uuid_from_seed`]. It is computed once, when the node group is
+/// created, and stored on the record; no read recomputes it.
+pub fn derive_nodegroup_id(
+    region: &str,
+    cluster_name: &str,
+    nodegroup_name: &str,
+    created_at: SystemTime,
+) -> String {
+    let created_nanos = created_at
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |since_epoch| since_epoch.as_nanos());
+    derive_uuid_from_seed(&format!(
+        "{region}/{cluster_name}/{nodegroup_name}/{created_nanos}"
+    ))
 }
 
 /// The identifier EKS puts in the last segment of an add-on's ARN

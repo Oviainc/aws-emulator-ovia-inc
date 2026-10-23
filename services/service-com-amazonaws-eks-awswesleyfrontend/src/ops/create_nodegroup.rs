@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateNodegroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateNodegroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Creates a managed node group for an Amazon EKS cluster and persists it in this
+//! service's state, so `DescribeNodegroup` reads back exactly what was written.
+//! This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateNodegroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! One documented rule is deliberately NOT enforced: "don't specify `amiType` /
+//! `releaseVersion` / `version` [beside] a launch template [that] uses a custom
+//! AMI". This emulator holds no launch templates, so it cannot tell a custom-AMI
+//! template from one that names no AMI at all, and refusing those members beside
+//! any launch template would reject requests AWS accepts. The rules it CAN decide
+//! from the request alone (`diskSize`, `remoteAccess`, id-versus-name) are
+//! enforced below.
 //!
 //! ## Shape of an operation
 //!
@@ -175,6 +177,15 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::{
+    self, NodegroupRecord, CUSTOM_AMI_TYPE, DEFAULT_AMI_TYPE, DEFAULT_CAPACITY_TYPE,
+    DEFAULT_INSTANCE_TYPE, DEFAULT_MAX_UNAVAILABLE, DEFAULT_SCALING_DESIRED_SIZE,
+    DEFAULT_SCALING_MAX_SIZE, DEFAULT_SCALING_MIN_SIZE, MAX_INSTANCE_TYPES,
+    MAX_NODEGROUPS_PER_CLUSTER, MAX_STORED_NODEGROUPS, MIN_DISK_SIZE_GIB,
+    NODEGROUP_ACTIVATION_DELAY, STATUS_CREATING,
+};
+use std::collections::BTreeMap;
+use std::time::SystemTime;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -233,6 +244,27 @@ impl<Eng> CreateNodegroup<Eng> {
     }
 }
 
+/// A 400 `InvalidParameterException` naming the cluster, the node group and the
+/// constraint the request broke.
+///
+/// Every rule below is one `CreateNodegroup`'s own documentation states but the
+/// model does not express as a constraint, so none of them is refused before
+/// this handler runs: "The specified parameter is invalid. Review the available
+/// parameters for the API request" is exactly what reports them.
+fn invalid_parameter(
+    cluster_name: &str,
+    nodegroup_name: &str,
+    message: String,
+) -> CreateNodegroupError {
+    CreateNodegroupErrorModeled::InvalidParameterException(InvalidParameterException {
+        cluster_name: Some(cluster_name.to_string()),
+        nodegroup_name: Some(nodegroup_name.to_string()),
+        message: Some(message),
+        ..Default::default()
+    })
+    .into()
+}
+
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for CreateNodegroup<Eng>
 {
@@ -250,18 +282,443 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateNodegroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateNodegroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateNodegroup"))
+        let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateNodegroupError::from(CreateNodegroupErrorModeled::ServerException(
+                ServerException {
+                    cluster_name: Some(input.cluster_name.clone()),
+                    nodegroup_name: Some(input.nodegroup_name.clone()),
+                    message: Some("the eks emulator store is unavailable".to_string()),
+                    ..Default::default()
+                },
+            ))
+        })?;
+
+        let region = state::request_region(ctx.parts());
+        let now = SystemTime::now();
+        let mut guard = store.lock();
+        guard.materialize_due_transitions(now);
+
+        // A node group belongs to one cluster, and a cluster name identifies a
+        // cluster only within one region, so the cluster is resolved in the
+        // region the request is signed for. "Amazon EKS clusters and node groups
+        // are Amazon Web Services Region specific"
+        // (`ResourceNotFoundException`).
+        let cluster_key = (region.clone(), input.cluster_name.clone());
+        let Some(cluster) = guard.clusters.get(&cluster_key) else {
+            // `CreateNodegroup` models no `ResourceNotFoundException` (see the
+            // error list in this file's header), so a cluster name that names
+            // nothing is reported with the modelled error whose documentation
+            // covers it: `ClientException`, "Actions can include ... specifying
+            // an identifier that is not valid."
+            return Err(CreateNodegroupErrorModeled::ClientException(ClientException {
+                cluster_name: Some(input.cluster_name.clone()),
+                nodegroup_name: Some(input.nodegroup_name.clone()),
+                message: Some(format!("No cluster found for name: {}.", input.cluster_name)),
+                ..Default::default()
+            })
+            .into());
+        };
+        // "You can only create a node group for your cluster that is equal to
+        // the current Kubernetes version for the cluster" — which an EXTERNAL
+        // cluster `RegisterCluster` connected does not have: it has no
+        // EKS-provisioned control plane, so it reports no `version` and cannot
+        // carry an EKS-managed node group. That is exactly what
+        // `InvalidRequestException` reports: "The request is invalid given the
+        // state of the cluster."
+        let Some(cluster_version) = cluster.version.clone() else {
+            return Err(CreateNodegroupErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    cluster_name: Some(input.cluster_name.clone()),
+                    nodegroup_name: Some(input.nodegroup_name.clone()),
+                    message: Some(format!(
+                        "Cluster {} is a connected cluster and cannot have a managed node group",
+                        input.cluster_name
+                    )),
+                    ..Default::default()
+                },
+            )
+            .into());
+        };
+
+        let cluster_name = input.cluster_name.as_str();
+        let nodegroup_name = input.nodegroup_name.as_str();
+
+        // `subnets` is a required member, but the model bounds no length: an
+        // empty list names no subnet for "the Auto Scaling group that is created
+        // for your node group" (`CreateNodegroupRequest$subnets`).
+        if input.subnets.is_empty() {
+            return Err(invalid_parameter(
+                cluster_name,
+                nodegroup_name,
+                "subnets must name at least 1 subnet, got 0".to_string(),
+            ));
+        }
+
+        // "The root device disk size (in GiB) for your node group instances"
+        // (`CreateNodegroupRequest$diskSize`) — a disk is at least one GiB. The
+        // member is a `BoxedInteger` with no modelled range, so a zero or
+        // negative size reaches this handler.
+        if let Some(disk_size) = input.disk_size {
+            if disk_size < MIN_DISK_SIZE_GIB {
+                return Err(invalid_parameter(
+                    cluster_name,
+                    nodegroup_name,
+                    format!(
+                        "diskSize must be at least {MIN_DISK_SIZE_GIB} GiB, got {disk_size}"
+                    ),
+                ));
+            }
+        }
+
+        // "you can specify 0-20 instance types for instanceTypes."
+        let instance_type_count = input.instance_types.as_ref().map_or(0, Vec::len);
+        if instance_type_count > MAX_INSTANCE_TYPES {
+            return Err(invalid_parameter(
+                cluster_name,
+                nodegroup_name,
+                format!(
+                    "instanceTypes must name at most {MAX_INSTANCE_TYPES} instance types, got \
+                     {instance_type_count}"
+                ),
+            ));
+        }
+
+        if let Some(template) = input.launch_template.as_ref() {
+            // "You must specify either the launch template ID or the launch
+            // template name in the request, but not both."
+            let names_id = template.id.as_deref().is_some_and(|id| !id.trim().is_empty());
+            let names_name = template
+                .name
+                .as_deref()
+                .is_some_and(|name| !name.trim().is_empty());
+            if names_id == names_name {
+                return Err(invalid_parameter(
+                    cluster_name,
+                    nodegroup_name,
+                    "launchTemplate must specify exactly one of id and name".to_string(),
+                ));
+            }
+
+            // "When using this object, don't directly specify instanceTypes,
+            // diskSize, or remoteAccess" (`CreateNodegroupRequest$launchTemplate`).
+            // `instanceTypes` is NOT refused here: the same documentation allows
+            // "0-20 instance types for instanceTypes" beside a launch template
+            // that names none, and this emulator holds no launch templates, so
+            // it cannot tell which case the caller is in.
+            if input.disk_size.is_some() {
+                return Err(invalid_parameter(
+                    cluster_name,
+                    nodegroup_name,
+                    "diskSize must not be specified with launchTemplate".to_string(),
+                ));
+            }
+            if input.remote_access.is_some() {
+                return Err(invalid_parameter(
+                    cluster_name,
+                    nodegroup_name,
+                    "remoteAccess must not be specified with launchTemplate".to_string(),
+                ));
+            }
+        }
+
+        // "When creating a node group, you must specify all or none of the
+        // properties" (`NodegroupScalingConfig`).
+        let requested_scaling = input.scaling_config.clone().unwrap_or_default();
+        let supplied_sizes = [
+            requested_scaling.min_size,
+            requested_scaling.max_size,
+            requested_scaling.desired_size,
+        ];
+        let supplied_count = supplied_sizes.iter().filter(|size| size.is_some()).count();
+        if supplied_count != 0 && supplied_count != supplied_sizes.len() {
+            return Err(invalid_parameter(
+                cluster_name,
+                nodegroup_name,
+                format!(
+                    "scalingConfig must specify all of minSize, maxSize and desiredSize, or none \
+                     of them, got {supplied_count} of {}",
+                    supplied_sizes.len()
+                ),
+            ));
+        }
+        let scaling_config = if supplied_count == 0 {
+            NodegroupScalingConfig {
+                min_size: Some(DEFAULT_SCALING_MIN_SIZE),
+                max_size: Some(DEFAULT_SCALING_MAX_SIZE),
+                desired_size: Some(DEFAULT_SCALING_DESIRED_SIZE),
+            }
+        } else {
+            requested_scaling
+        };
+
+        // "the Cluster Autoscaler doesn't scale a managed node group lower than
+        // minSize or higher than maxSize" (`NodegroupScalingConfig$desiredSize`),
+        // so the three sizes must be ordered for the node group to be scalable
+        // at all. Each member's own lower bound is modelled and already refused.
+        let min_size = scaling_config.min_size.unwrap_or(DEFAULT_SCALING_MIN_SIZE);
+        let max_size = scaling_config.max_size.unwrap_or(DEFAULT_SCALING_MAX_SIZE);
+        let desired_size = scaling_config
+            .desired_size
+            .unwrap_or(DEFAULT_SCALING_DESIRED_SIZE);
+        if min_size > max_size || desired_size < min_size || desired_size > max_size {
+            return Err(invalid_parameter(
+                cluster_name,
+                nodegroup_name,
+                format!(
+                    "scalingConfig must satisfy minSize <= desiredSize <= maxSize, got minSize \
+                     {min_size}, desiredSize {desired_size}, maxSize {max_size}"
+                ),
+            ));
+        }
+
+        // "This value or maxUnavailablePercentage is required to have a value"
+        // (`NodegroupUpdateConfig$maxUnavailable`), and the percentage member
+        // says the same of the count — so exactly one of the pair carries a
+        // value.
+        let update_config = match input.update_config.clone() {
+            Some(requested) => {
+                let by_count = requested.max_unavailable.is_some();
+                let by_percentage = requested.max_unavailable_percentage.is_some();
+                if by_count == by_percentage {
+                    return Err(invalid_parameter(
+                        cluster_name,
+                        nodegroup_name,
+                        "updateConfig must specify exactly one of maxUnavailable and \
+                         maxUnavailablePercentage"
+                            .to_string(),
+                    ));
+                }
+                requested
+            }
+            None => NodegroupUpdateConfig {
+                max_unavailable: Some(DEFAULT_MAX_UNAVAILABLE),
+                ..Default::default()
+            },
+        };
+
+        // Each `nodeRepairConfig` threshold is a count OR a percentage: "When
+        // using this, you cannot also set <the other> at the same time"
+        // (`NodeRepairConfig$maxUnhealthyNodeThresholdCount` and
+        // `NodeRepairConfig$maxParallelNodesRepairedCount`).
+        if let Some(repair) = input.node_repair_config.as_ref() {
+            for (count, percentage, member) in [
+                (
+                    repair.max_unhealthy_node_threshold_count,
+                    repair.max_unhealthy_node_threshold_percentage,
+                    "maxUnhealthyNodeThreshold",
+                ),
+                (
+                    repair.max_parallel_nodes_repaired_count,
+                    repair.max_parallel_nodes_repaired_percentage,
+                    "maxParallelNodesRepaired",
+                ),
+            ] {
+                if count.is_some() && percentage.is_some() {
+                    return Err(invalid_parameter(
+                        cluster_name,
+                        nodegroup_name,
+                        format!(
+                            "nodeRepairConfig must not specify both {member}Count and \
+                             {member}Percentage"
+                        ),
+                    ));
+                }
+            }
+        }
+
+        // "The Kubernetes version to use for your managed nodes. By default, the
+        // Kubernetes version of the cluster is used, and this is the only
+        // accepted specified value" (`CreateNodegroupRequest$version`).
+        if let Some(requested_version) = input.version.as_deref() {
+            if requested_version != cluster_version {
+                return Err(invalid_parameter(
+                    cluster_name,
+                    nodegroup_name,
+                    format!(
+                        "version must match the cluster's Kubernetes version {cluster_version}, \
+                         got {requested_version}"
+                    ),
+                ));
+            }
+        }
+
+        // Every rule above is about the REQUEST's own shape, so it is checked
+        // before the store is consulted: a malformed request is
+        // `InvalidParameterException` whether or not the name is already taken.
+        let nodegroup_key = (
+            region.clone(),
+            input.cluster_name.clone(),
+            input.nodegroup_name.clone(),
+        );
+
+        // "The unique name to give your node group"
+        // (`CreateNodegroupRequest$nodegroupName`) — unique within the cluster,
+        // which is what the key above spells, so the same name in another
+        // cluster or another region is a different node group.
+        if let Some(existing) = guard.nodegroups.get(&nodegroup_key) {
+            // `clientRequestToken` is `@idempotencyToken`: an SDK generates it
+            // once per call and RESENDS the same value when it retries, so a
+            // retry of the call that created this node group must be absorbed
+            // and answered with that node group rather than with a conflict. A
+            // blank token identifies nothing, so it never matches. As in
+            // `CreateCluster`, the comparison is on the token alone.
+            let replayed_token = input
+                .client_request_token
+                .as_deref()
+                .filter(|token| !token.trim().is_empty());
+            if let Some(token) = replayed_token {
+                if existing.client_request_token.as_deref() == Some(token) {
+                    return Ok(CreateNodegroupOutput {
+                        nodegroup: Some(existing.to_nodegroup()),
+                    });
+                }
+            }
+            return Err(CreateNodegroupErrorModeled::ResourceInUseException(
+                ResourceInUseException {
+                    cluster_name: Some(input.cluster_name.clone()),
+                    nodegroup_name: Some(input.nodegroup_name.clone()),
+                    message: Some(format!(
+                        "NodeGroup already exists with name: {} and cluster name: {}",
+                        input.nodegroup_name, input.cluster_name
+                    )),
+                    ..Default::default()
+                },
+            )
+            .into());
+        }
+
+        // The EKS "Managed node groups per cluster" service quota. Exceeding a
+        // service limit is what `ResourceLimitExceededException` reports.
+        if guard
+            .nodegroup_names_in(&region, &input.cluster_name)
+            .count()
+            >= MAX_NODEGROUPS_PER_CLUSTER
+        {
+            return Err(CreateNodegroupErrorModeled::ResourceLimitExceededException(
+                ResourceLimitExceededException {
+                    cluster_name: Some(input.cluster_name.clone()),
+                    nodegroup_name: Some(input.nodegroup_name.clone()),
+                    message: Some(format!(
+                        "You have reached the limit of {MAX_NODEGROUPS_PER_CLUSTER} managed node \
+                         groups for this cluster"
+                    )),
+                    ..Default::default()
+                },
+            )
+            .into());
+        }
+
+        // What BOUNDS THE STORE is this ceiling, not the per-cluster quota
+        // above: the caller decides how many clusters and regions exist, so the
+        // per-cluster quota alone would let repeated creates retain an
+        // unbounded number of records.
+        if guard.nodegroups.len() >= MAX_STORED_NODEGROUPS {
+            return Err(CreateNodegroupErrorModeled::ResourceLimitExceededException(
+                ResourceLimitExceededException {
+                    cluster_name: Some(input.cluster_name.clone()),
+                    nodegroup_name: Some(input.nodegroup_name.clone()),
+                    message: Some(format!(
+                        "You have reached the limit of {MAX_STORED_NODEGROUPS} managed node \
+                         groups for this account"
+                    )),
+                    ..Default::default()
+                },
+            )
+            .into());
+        }
+
+        // "If the node group was deployed using a launch template with a custom
+        // AMI, then this is CUSTOM" (`Nodegroup$amiType`). This emulator holds
+        // no launch templates, so a launch template the caller did not pair with
+        // an `amiType` is taken to carry a custom AMI.
+        let ami_type = input.ami_type.clone().unwrap_or_else(|| {
+            if input.launch_template.is_some() {
+                CUSTOM_AMI_TYPE.to_string()
+            } else {
+                DEFAULT_AMI_TYPE.to_string()
+            }
+        });
+
+        // `diskSize`, `instanceTypes` and `remoteAccess` are each reported as
+        // `null` for a node group deployed with a launch template, because the
+        // launch template is what carries them (`Nodegroup$diskSize`,
+        // `Nodegroup$instanceTypes`, `Nodegroup$remoteAccess`); this emulator
+        // holds no launch templates, so it reports nothing for them rather than
+        // inventing the template's contents.
+        let deployed_with_launch_template = input.launch_template.is_some();
+        let disk_size = if deployed_with_launch_template {
+            None
+        } else {
+            Some(
+                input
+                    .disk_size
+                    .unwrap_or_else(|| state::default_disk_size_gib(&ami_type)),
+            )
+        };
+        let instance_types = match input.instance_types.clone() {
+            Some(types) if !types.is_empty() => Some(types),
+            // "If you don't specify an instance type in a launch template or for
+            // instanceTypes, then t3.medium is used, by default."
+            _ if !deployed_with_launch_template => Some(vec![DEFAULT_INSTANCE_TYPE.to_string()]),
+            _ => None,
+        };
+
+        let nodegroup_id =
+            state::derive_nodegroup_id(&region, cluster_name, nodegroup_name, now);
+        let arn = ::engine::emulator_arn(
+            "eks",
+            &region,
+            &format!("nodegroup/{cluster_name}/{nodegroup_name}/{nodegroup_id}"),
+        );
+
+        let record = NodegroupRecord {
+            nodegroup_name: input.nodegroup_name.clone(),
+            cluster_name: input.cluster_name.clone(),
+            arn,
+            created_at: now,
+            // Nothing has modified the node group yet, so its last
+            // modification is its creation.
+            modified_at: now,
+            version: input.version.clone().unwrap_or(cluster_version),
+            release_version: input.release_version.clone(),
+            status: STATUS_CREATING.to_string(),
+            active_at: Some(now + NODEGROUP_ACTIVATION_DELAY),
+            capacity_type: input
+                .capacity_type
+                .clone()
+                .unwrap_or_else(|| DEFAULT_CAPACITY_TYPE.to_string()),
+            scaling_config,
+            instance_types,
+            subnets: input.subnets.clone(),
+            remote_access: input.remote_access.clone(),
+            ami_type,
+            node_role: input.node_role.clone(),
+            labels: input
+                .labels
+                .clone()
+                .unwrap_or_default()
+                .into_iter()
+                .collect::<BTreeMap<_, _>>(),
+            taints: input.taints.clone().unwrap_or_default(),
+            disk_size,
+            update_config,
+            node_repair_config: input.node_repair_config.clone(),
+            launch_template: input.launch_template.clone(),
+            tags: input
+                .tags
+                .clone()
+                .unwrap_or_default()
+                .into_iter()
+                .collect::<BTreeMap<_, _>>(),
+            warm_pool_config: input.warm_pool_config.clone(),
+            client_request_token: input.client_request_token.clone(),
+        };
+
+        let nodegroup = record.to_nodegroup();
+        guard.nodegroups.insert(nodegroup_key, record);
+
+        Ok(CreateNodegroupOutput {
+            nodegroup: Some(nodegroup),
+        })
     }
 }
