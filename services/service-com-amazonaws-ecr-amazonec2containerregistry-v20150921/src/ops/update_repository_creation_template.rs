@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateRepositoryCreationTemplate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateRepositoryCreationTemplate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateRepositoryCreationTemplate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -146,6 +137,17 @@ impl From<UpdateRepositoryCreationTemplateErrorModeled> for UpdateRepositoryCrea
     }
 }
 
+/// A request this operation cannot honour, as the only client-input error it models for
+/// a value the boundary validator already let through — the same channel
+/// `CreateRepositoryCreationTemplate` refuses those values on.
+fn invalid_parameter(message: String) -> UpdateRepositoryCreationTemplateErrorModeled {
+    UpdateRepositoryCreationTemplateErrorModeled::InvalidParameterException(
+        InvalidParameterException {
+            message: Some(message),
+        },
+    )
+}
+
 /// The `UpdateRepositoryCreationTemplate` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -182,18 +184,112 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateRepositoryCreationTemplate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateRepositoryCreationTemplateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateRepositoryCreationTemplate"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateRepositoryCreationTemplateErrorModeled::ServerException(
+                ServerException {
+                    message: Some("the ecr registry store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        // This operation names no registry: a template belongs to the registry the
+        // request is served by, which is this emulator's own.
+        let _ = ctx;
+
+        // The prefix is the key ECR addresses a template by, resolved the way every
+        // other template operation resolves it, so the assumed trailing slash does not
+        // hide the stored template.
+        let prefix = crate::state::normalize_prefix(&input.prefix);
+
+        // Only the KMS encryption types take a key of the caller's: AES256 encrypts with
+        // Amazon S3-managed keys, so a `kmsKey` beside it cannot be honoured. The model
+        // cannot express the pairing, so it is checked here — as the create does.
+        if let Some(encryption) = input.encryption_configuration.as_ref() {
+            if encryption
+                .kms_key
+                .as_ref()
+                .is_some_and(|key| !key.is_empty())
+                && encryption.encryption_type == crate::state::S3_MANAGED_ENCRYPTION_TYPE
+            {
+                return Err(invalid_parameter(
+                    "encryptionConfiguration.kmsKey cannot be specified with the AES256 \
+                     encryption type"
+                        .to_string(),
+                )
+                .into());
+            }
+        }
+
+        // `resourceTags` names the metadata a repository created from this template is to
+        // be given, so an updated list goes through the same shared repository-tag checks
+        // the create's list does. The list replaces the stored one rather than adding to
+        // it, so the count is checked against the incoming list alone. This operation
+        // models neither `TooManyTagsException` nor `InvalidTagParameterException`, so
+        // each of those rules is refused with its `InvalidParameterException`.
+        if let Some(resource_tags) = input.resource_tags.as_ref() {
+            crate::state::check_tags(resource_tags)
+                .and_then(|()| crate::state::check_tag_count(&[], resource_tags))
+                .map_err(|fault| invalid_parameter(fault.message().to_string()))?;
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // An update names a template that must already exist: a prefix no template
+        // answers to — never created, or already deleted — is refused with
+        // `TemplateNotFoundException` rather than created here.
+        let Some(template) = store.creation_templates.get_mut(&prefix) else {
+            return Err(
+                UpdateRepositoryCreationTemplateErrorModeled::TemplateNotFoundException(
+                    TemplateNotFoundException {
+                        message: Some(crate::state::template_not_found_message(&input.prefix)),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // Every member bar the prefix is optional here while the create requires
+        // `appliedFor`: an update carries only what it changes, so a member the request
+        // omits keeps the value the template already holds and an update never silently
+        // drops a setting. A member that is present replaces that value outright — a
+        // list member is a whole list, not an addition to the stored one.
+        if let Some(description) = input.description {
+            template.description = Some(description);
+        }
+        if let Some(encryption_configuration) = input.encryption_configuration {
+            template.encryption_config = Some(encryption_configuration);
+        }
+        if let Some(resource_tags) = input.resource_tags {
+            template.resource_tags = resource_tags;
+        }
+        if let Some(image_tag_mutability) = input.image_tag_mutability {
+            template.image_tag_mutability = image_tag_mutability;
+        }
+        if let Some(filters) = input.image_tag_mutability_exclusion_filters {
+            template.image_tag_mutability_exclusion_filters = filters;
+        }
+        if let Some(repository_policy) = input.repository_policy {
+            template.repository_policy = Some(repository_policy);
+        }
+        if let Some(lifecycle_policy) = input.lifecycle_policy {
+            template.lifecycle_policy = Some(lifecycle_policy);
+        }
+        if let Some(applied_for) = input.applied_for {
+            template.applied_for = applied_for;
+        }
+        if let Some(custom_role_arn) = input.custom_role_arn {
+            template.custom_role_arn = Some(custom_role_arn);
+        }
+        // The template was last changed now; `createdAt` stays the instant it was
+        // created, so the two timestamps part once an update lands.
+        template.updated_at = now;
+
+        // Everything reported back is read off the stored record, so the answer is what a
+        // later `DescribeRepositoryCreationTemplates` of the same prefix reports.
+        Ok(UpdateRepositoryCreationTemplateOutput {
+            registry_id: Some(crate::state::registry_id().to_string()),
+            repository_creation_template: Some(template.to_template()),
+        })
     }
 }
