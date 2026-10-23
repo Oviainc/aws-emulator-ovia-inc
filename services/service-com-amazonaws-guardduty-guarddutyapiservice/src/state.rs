@@ -1739,6 +1739,27 @@ impl Detector {
             .find(|ip_set| ip_set.client_token.as_deref() == Some(token) && !ip_set.is_deleting())
     }
 
+    /// The ids of the LIVE IPSets this detector holds, in `IpSetId` order.
+    ///
+    /// The order is TOTAL — the id is the key the IPSets are stored under, so it is
+    /// unique within a detector — which is what makes a page token mean the same
+    /// thing on the call that hands it back.
+    ///
+    /// LIVE is the same set [`Self::live_ip_set_count`] counts: a list whose delete
+    /// has been accepted is no longer one of the detector's IPSets, so `ListIPSets`
+    /// stops naming it. Its record is still retained
+    /// ([`DELETED_IP_SETS_RETAINED`]) so `GetIPSet` can report the
+    /// [`IP_SET_DELETE_PENDING`] / [`IP_SET_DELETED`] status the delete moved it
+    /// to — being readable on its own id is not the same as being part of the
+    /// collection a list enumerates.
+    pub fn live_ip_set_ids(&self) -> Vec<String> {
+        self.ip_sets
+            .values()
+            .filter(|ip_set| !ip_set.is_deleting())
+            .map(|ip_set| ip_set.id.clone())
+            .collect()
+    }
+
     /// How many of this detector's IPSets are LIVE — held and not being deleted.
     ///
     /// This is the count [`IP_SETS_PER_DETECTOR`] bounds: a list whose delete has
