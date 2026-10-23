@@ -264,8 +264,9 @@ async fn detect_dominant_language_is_deterministic() {
 ///
 /// The rows differ along what the rule generalises over: one-sided praise, one-sided
 /// complaint, a document with no sentiment at all, and one carrying both polarities
-/// in balance.
-const SENTIMENTS: &[(&str, &str, &str)] = &[
+/// in balance. Shared with the `batch_sentiment` suite, which asserts that batching
+/// these same documents answers the same verdict for each one.
+pub(crate) const SENTIMENTS: &[(&str, &str, &str)] = &[
     (
         "praise",
         "POSITIVE",
