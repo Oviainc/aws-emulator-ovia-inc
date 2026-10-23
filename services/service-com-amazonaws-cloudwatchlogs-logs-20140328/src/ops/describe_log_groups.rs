@@ -397,7 +397,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         log_group_arn: (!pattern_search).then(|| group.log_group_arn.clone()),
                         deletion_protection_enabled: (!pattern_search)
                             .then_some(group.deletion_protection_enabled),
-                        bearer_token_authentication_enabled: None,
+                        bearer_token_authentication_enabled: (!pattern_search)
+                            .then_some(group.bearer_token_authentication_enabled),
                     })
                     .collect(),
             ),

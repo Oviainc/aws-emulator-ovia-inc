@@ -40,10 +40,12 @@
 //! rule template group, each keyed by its minted `Id` and carrying the region it
 //! was created in, so a group's name is unique "within the scope of a resource
 //! type in a specific region" (the `Name` member's own documentation). The
-//! eventbridge rule TEMPLATES those groups hold live here too: one
-//! [`EventBridgeRuleTemplateRecord`] per created template, carrying the id of
-//! the group its `GroupIdentifier` resolved to, so a template reports the group
-//! it belongs to out of state rather than out of the request.
+//! TEMPLATES those groups hold live here too: one
+//! [`CloudWatchAlarmTemplateRecord`] per created cloudwatch alarm template and
+//! one [`EventBridgeRuleTemplateRecord`] per created eventbridge rule template,
+//! each carrying the id of the group its `GroupIdentifier` resolved to, so a
+//! template reports the group it belongs to out of state rather than out of the
+//! request.
 //!
 //! Every value a channel-, input-, input-security-group-, SdiSource-,
 //! signal-map- or template-group-shaped response carries is either stored
@@ -53,6 +55,7 @@
 //! [`ComAmazonawsMedialiveMedialiveState::sdi_source_description`],
 //! [`ComAmazonawsMedialiveMedialiveState::signal_map_description`],
 //! [`alarm_template_group_output`],
+//! [`alarm_template_output`],
 //! [`event_bridge_rule_template_group_output`]) - no operation builds a response
 //! out of its own request.
 //!
@@ -114,6 +117,22 @@ pub use schedules::{
 };
 
 pub(crate) use alarm_template_groups::alarm_template_group_output;
+
+/// The cloudwatch alarm TEMPLATE slice: its record, its bounds, its refusal, the
+/// store's methods and its output projection, in one module of its own for the
+/// same reason as [`alarm_template_groups`]. What stays in this file is the part
+/// the rest of the state needs: the store members on
+/// [`ComAmazonawsMedialiveMedialiveState`] and the per-region token key every
+/// monitor template resource shares.
+pub mod alarm_templates;
+
+pub use alarm_templates::{
+    AlarmTemplateRefusal, CloudWatchAlarmTemplateRecord, NewCloudWatchAlarmTemplate,
+    MAX_ALARM_PERIOD_SECONDS, MAX_ALARM_TEMPLATES, MAX_ALARM_TEMPLATE_TOKENS, MAX_METRIC_NAME_LEN,
+    MIN_ALARM_DATAPOINTS, MIN_ALARM_PERIOD_SECONDS,
+};
+
+pub(crate) use alarm_templates::alarm_template_output;
 
 /// The multiplex slice: its record, its bounds, its refusals, the store's
 /// methods and its output projection, in one module of its own for the same
@@ -1067,6 +1086,20 @@ pub struct ComAmazonawsMedialiveMedialiveState {
     /// keyed per region by [`template_group_token_key`] -> the group it
     /// created. PRIVATE for the same reason as [`Self::channel_tokens`].
     alarm_template_group_tokens: IdempotencyTokens,
+    /// Every cloudwatch alarm template that exists, keyed by its minted `Id`. A
+    /// `BTreeMap` so a later `ListCloudWatchAlarmTemplates` walks it in id order
+    /// on every call.
+    ///
+    /// PRIVATE, so the group resolution, the name-uniqueness rule, the cap and
+    /// the mint stay invariants of [`Self::insert_alarm_template`] rather than of
+    /// each handler.
+    alarm_templates: BTreeMap<String, CloudWatchAlarmTemplateRecord>,
+    /// Mint counter behind [`Self::mint_alarm_template_id`].
+    next_alarm_template_id: u64,
+    /// `CreateCloudWatchAlarmTemplate`'s `RequestId` (`@idempotencyToken`), keyed
+    /// per region by [`template_group_token_key`] -> the template it created.
+    /// PRIVATE for the same reason as [`Self::channel_tokens`].
+    alarm_template_tokens: IdempotencyTokens,
     /// Every SdiSource that exists, keyed by its minted `Id`, in a `BTreeMap`
     /// for the same reason as [`Self::channels`].
     pub sdi_sources: BTreeMap<String, SdiSourceRecord>,

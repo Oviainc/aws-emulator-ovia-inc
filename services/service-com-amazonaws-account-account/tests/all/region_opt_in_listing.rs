@@ -21,9 +21,9 @@
 //! caller's own and a named one), and the recorded per-account statuses.
 //!
 //! `EnableRegion` and `DisableRegion` are the operations that record a status
-//! against a Region; both are still scaffolded (each with its own stub issue), so
-//! the cases that need a recorded status write it into the same shared store those
-//! handlers will write, through the engine the router was built on.
+//! against a Region; the cases that need a recorded status write it into the same
+//! shared store those handlers write, through the engine the router was built on,
+//! so this suite pins the listing rule independently of how a status got there.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -31,7 +31,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use serde_json::{json, Value};
 use service_com_amazonaws_account_account::state::{
-    default_account_id, ComAmazonawsAccountAccountState,
+    default_account_id, ComAmazonawsAccountAccountState, RegionOptState,
 };
 use service_com_amazonaws_account_account::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
@@ -99,14 +99,21 @@ fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
 }
 
 /// Record `status` against `region_name` for `account_id`, the way `EnableRegion`
-/// and `DisableRegion` will once they are implemented: one write to the shared
-/// store the router's handlers read.
+/// and `DisableRegion` do: one write to the shared store the router's handlers
+/// read.
+///
+/// A transient status (`ENABLING`, `DISABLING`) carries the instant it settles;
+/// a seeded one is given an instant far beyond the end of this test, so the
+/// status a case recorded is the status it then reads back.
 fn record_region_status(
     engine: &engine::InMemoryEngine,
     account_id: &str,
     region_name: &str,
     status: &str,
 ) {
+    let settles_at = std::time::SystemTime::now() + std::time::Duration::from_secs(3_600);
+    let recorded = RegionOptState::from_wire(status, settles_at)
+        .unwrap_or_else(|| panic!("{status:?} is a RegionOptStatus this service admits"));
     let state = engine.state::<ComAmazonawsAccountAccountState>();
     let mut store = state.lock();
     let account = store
@@ -114,7 +121,7 @@ fn record_region_status(
         .expect("the store admits the account this test writes");
     account
         .region_opt_status
-        .insert(region_name.to_string(), status.to_string());
+        .insert(region_name.to_string(), recorded);
 }
 
 /// What the emulator answered: the HTTP status and the JSON body.
