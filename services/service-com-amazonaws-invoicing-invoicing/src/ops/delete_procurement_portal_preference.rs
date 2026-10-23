@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteProcurementPortalPreference
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteProcurementPortalPreference`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteProcurementPortalPreference::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the procurement portal preference [`crate::state`] holds for the ARN the
+//! request names and answers with that ARN. The model documents the delete as an action
+//! that "cannot be undone", and no operation of this plane takes a point-in-time
+//! parameter, so nothing owes a deleted preference's history: the entry is erased, with
+//! the validation state and the tags that were on it, and every reader of the plane
+//! answers its modelled `ResourceNotFoundException` for the ARN afterwards.
+//!
+//! An ARN this service does not hold is that same 404 — a delete of a preference that is
+//! not there removes nothing and reports it missing, except on an idempotent replay of
+//! the call that removed it.
 //!
 //! ## Shape of an operation
 //!
@@ -166,18 +168,59 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteProcurementPortalPreference` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteProcurementPortalPreferenceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteProcurementPortalPreference"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteProcurementPortalPreferenceErrorModeled::InternalServerException(
+                crate::state::state_unavailable(),
+            )
+        })?;
+        let mut store = state.lock();
+        let client_token = input.client_token.as_deref();
+
+        // `@idempotent`: a replay of the delete (the same `ClientToken` against the same
+        // preference) answers with the ARN the first call removed rather than reporting it
+        // missing. The same token against a DIFFERENT preference deletes that one.
+        if let Some(arn) = store.replayed_result(
+            Self::NAME,
+            &input.procurement_portal_preference_arn,
+            client_token,
+        ) {
+            return Ok(DeleteProcurementPortalPreferenceOutput {
+                procurement_portal_preference_arn: arn,
+            });
+        }
+
+        // The delete "cannot be undone" and this plane has no point-in-time read, so the
+        // preference is ERASED rather than tombstoned: the registry is the one copy every
+        // operation of the plane resolves an ARN against, so removing the entry is what
+        // makes each reader's not-found branch fire and frees the portal and
+        // buyer/supplier identity for a later create.
+        if store
+            .procurement_portal_preferences
+            .remove(&input.procurement_portal_preference_arn)
+            .is_none()
+        {
+            return Err(
+                DeleteProcurementPortalPreferenceErrorModeled::ResourceNotFoundException(
+                    crate::state::no_such_resource(&input.procurement_portal_preference_arn),
+                )
+                .into(),
+            );
+        }
+        // The tags went with the resource: the tag plane answers for resources that
+        // exist, and this ARN names none now.
+        store
+            .resource_tags
+            .remove(&input.procurement_portal_preference_arn);
+
+        store.record_result(
+            Self::NAME,
+            &input.procurement_portal_preference_arn,
+            client_token,
+            &input.procurement_portal_preference_arn,
+        );
+        Ok(DeleteProcurementPortalPreferenceOutput {
+            procurement_portal_preference_arn: input.procurement_portal_preference_arn,
+        })
     }
 }

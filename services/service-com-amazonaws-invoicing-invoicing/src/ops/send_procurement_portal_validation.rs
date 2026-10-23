@@ -2,16 +2,34 @@
 
 //! @op SendProcurementPortalValidation
 //!
-//! Starts the validation of a procurement portal preference: resolves the
-//! `ProcurementPortalPreferenceArn` against the preference registry in
-//! [`crate::state`], issues a validation code for it and returns the ARN. An ARN that
-//! names no stored preference is the modelled `ResourceNotFoundException` (HTTP 404) —
-//! there is nothing to validate, and no validation state is created for it.
+//! Starts the validation of a procurement portal preference by DELIVERING a test
+//! e-invoice carrying a validation code to the procurement portal the preference
+//! configures: the operation "initiates the validation process by issuing a validation
+//! code that confirms ownership and connectivity of the configured procurement portal
+//! endpoint", so a code exists only once that delivery is confirmed.
 //!
-//! The issued code is kept in state and never put on the wire: the modelled response
-//! carries only the ARN, because the real service delivers the code OUT OF BAND through
-//! the configured portal. `VerifyProcurementPortalValidation` checks a submitted code
-//! against the one issued here.
+//! An ARN that names no stored preference is the modelled `ResourceNotFoundException`
+//! (HTTP 404) — there is nothing to validate, and no validation state is created for it.
+//!
+//! Delivery CANNOT be confirmed here. The portal instance endpoint is caller-configured
+//! and lives outside this emulator, which performs no outbound delivery and hosts no
+//! procurement portal, so no stored preference names a portal a test e-invoice can reach:
+//! every request is refused with the modelled `ValidationException` (HTTP 400) stating
+//! that delivery of the test e-invoice could not be confirmed, and no code is issued.
+//! Minting a code and answering 200 would claim a delivery that did not happen and hand a
+//! caller an OTP the real service only ever delivers through the portal.
+//!
+//! The ATTEMPT is still recorded against the preference
+//! ([`crate::state::StoredProcurementPortalPreference::unconfirmed_validation_attempts`]),
+//! because this call did act on the resource: starting a validation is a write of the
+//! preference, so `Version` — "the version number of the procurement portal preference
+//! configuration" — and `LastUpdateDate` advance, while the plane's verification status
+//! does not move (nothing verified it). None of the attempt record reaches the wire: the
+//! modelled response carries only the ARN.
+//!
+//! `VerifyProcurementPortalValidation` checks a submitted code against the one issued for
+//! the preference ([`crate::state::IssuedPortalValidation`]), and refuses every
+//! submission while no code is outstanding.
 //!
 //! ## Shape of an operation
 //!
@@ -125,6 +143,53 @@ impl From<SendProcurementPortalValidationErrorModeled> for SendProcurementPortal
     }
 }
 
+/// The endpoint a test e-invoice would have to be delivered to for `preference`: the
+/// portal instance endpoint its TEST environment configures when it configures one, and
+/// otherwise the preference's own portal instance endpoint. `None` when the preference
+/// configures no portal endpoint at all.
+///
+/// Both are optional members of the stored `ProcurementPortalPreference`
+/// (`smithy_query(query="shape", shape="ProcurementPortalPreference")`), so the answer is
+/// read from the preference rather than assumed.
+fn test_einvoice_delivery_endpoint(preference: &ProcurementPortalPreference) -> Option<&str> {
+    preference
+        .test_env_preference
+        .as_ref()
+        .and_then(|test| test.procurement_portal_instance_endpoint.as_deref())
+        .or(preference.procurement_portal_instance_endpoint.as_deref())
+}
+
+/// The modelled 400 this operation answers when delivery of the test e-invoice to the
+/// preference's portal cannot be confirmed.
+///
+/// The sentence is built from the preference the request named — it reports the endpoint
+/// the delivery was owed to, or that the preference configures none — and it tells a
+/// caller where the code would have arrived, because the real service delivers it through
+/// the portal and never on the wire.
+fn test_einvoice_delivery_not_confirmed(endpoint: Option<&str>) -> ValidationException {
+    let message = match endpoint {
+        Some(endpoint) => format!(
+            "We could not confirm delivery of the test e-invoice to {endpoint}. The \
+             validation code may have been delivered and then rejected by your procurement \
+             portal's business-rule validation: check that portal's rejected-invoice log \
+             for the code, and verify the portal configuration of this preference."
+        ),
+        None => "We could not confirm delivery of the test e-invoice: this procurement \
+                 portal preference configures no procurement portal instance endpoint to \
+                 deliver it to."
+            .to_string(),
+    };
+    ValidationException {
+        message: Some(message),
+        // `other` is one of the model's `ValidationExceptionReason` values
+        // ([`VALIDATION_EXCEPTION_REASON_VALUES`]): the refusal is not about the form of
+        // the input, which satisfies every modelled constraint, but about the delivery
+        // this call could not confirm.
+        reason: Some("other".to_string()),
+        ..Default::default()
+    }
+}
+
 /// The `SendProcurementPortalValidation` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -168,63 +233,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
         let mut store = state.lock();
-        let client_token = input.client_token.as_deref();
+        let attempted_at = crate::state::now();
 
         // The ARN has to name a preference this emulator holds: validation is state
         // ABOUT a preference, so there is nothing to start for one that does not exist.
         // The model declares `ResourceNotFoundException` (HTTP 404) for exactly this.
-        // Checked BEFORE the idempotency replay, so a replay against a preference that
-        // is gone reports it gone rather than answering for it.
-        if !store
+        let stored = store
             .procurement_portal_preferences
-            .contains_key(&input.procurement_portal_preference_arn)
-        {
-            return Err(
+            .get_mut(&input.procurement_portal_preference_arn)
+            .ok_or_else(|| {
                 SendProcurementPortalValidationErrorModeled::ResourceNotFoundException(
                     crate::state::no_such_resource(&input.procurement_portal_preference_arn),
                 )
-                .into(),
-            );
-        }
+            })?;
 
-        // `@idempotent`: a replay (the same `ClientToken` against the same preference)
-        // answers with the ARN the first call returned and issues no second code.
-        if let Some(arn) = store.replayed_result(
-            Self::NAME,
-            &input.procurement_portal_preference_arn,
-            client_token,
-        ) {
-            return Ok(SendProcurementPortalValidationOutput {
-                procurement_portal_preference_arn: arn,
-            });
-        }
+        // Starting the validation is what this call DOES, so it writes: the attempt is
+        // recorded against the preference, and `Version` and `LastUpdateDate` advance with
+        // it, the way every write of this resource reports them. The plane's verification
+        // status is NOT moved: nothing verified the portal connection.
+        stored.unconfirmed_validation_attempts = stored.unconfirmed_validation_attempts.saturating_add(1);
+        stored.preference.version = stored.preference.version.saturating_add(1);
+        stored.preference.last_update_date = attempted_at;
 
-        // Issuing the code is what this operation DOES ("initiates the validation
-        // process by issuing a validation code"), so it writes: the code and the instant
-        // it was issued at are recorded against the preference, replacing any code an
-        // earlier send issued, and the code itself stays in state because the model's
-        // response carries only the ARN.
-        let code = store.issue_portal_validation_code();
-        let issued_at = crate::state::now();
-        if let Some(stored) = store
-            .procurement_portal_preferences
-            .get_mut(&input.procurement_portal_preference_arn)
-        {
-            stored.validation = Some(crate::state::IssuedPortalValidation {
-                code,
-                issued_at,
-                verified_at: None,
-            });
-        }
-
-        store.record_result(
-            Self::NAME,
-            &input.procurement_portal_preference_arn,
-            client_token,
-            &input.procurement_portal_preference_arn,
-        );
-        Ok(SendProcurementPortalValidationOutput {
-            procurement_portal_preference_arn: input.procurement_portal_preference_arn,
-        })
+        // A code exists only once the test e-invoice carrying it has been delivered to
+        // the preference's procurement portal. That portal is outside this emulator,
+        // which performs no outbound delivery and hosts no procurement portal, so the
+        // delivery is never confirmed and the call is refused with the modelled 400 —
+        // it issues no code, so no `VerifyProcurementPortalValidation` can complete a
+        // connection nothing tested.
+        Err(
+            SendProcurementPortalValidationErrorModeled::ValidationException(
+                test_einvoice_delivery_not_confirmed(test_einvoice_delivery_endpoint(
+                    &stored.preference,
+                )),
+            )
+            .into(),
+        )
     }
 }
