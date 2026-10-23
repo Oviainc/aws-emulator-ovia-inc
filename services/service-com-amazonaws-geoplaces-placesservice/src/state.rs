@@ -6,7 +6,8 @@
 //! every operation it models is `@readonly` and reports over AWS's own place data.
 //! That data therefore lives in this service's state, seeded once (the engine builds
 //! the state through `Default` on first touch, atomically) with a deterministic
-//! catalog of places in a handful of cities.
+//! catalog of places across several countries and regions — see [`seed_catalog`] for
+//! what that catalog has to cover and why.
 //!
 //! Every handler PROJECTS its response out of these records, so the results of
 //! different operations agree: a `PlaceId` handed out by Geocode, SearchText or
@@ -562,6 +563,13 @@ impl MatchExplanation {
 pub struct Scored {
     pub index: usize,
     pub score: f64,
+    /// How much of the query named the place's OWN name (its title or one of its
+    /// alternate names), as [`PlaceRecord::name_score`] measures it. It is NOT
+    /// the reported `MatchScore` — it only ranks two places the query matched
+    /// equally well (see [`order_by_relevance`]).
+    ///
+    /// [`order_by_relevance`]: ComAmazonawsGeoplacesPlacesserviceState::order_by_relevance
+    pub name_score: f64,
     pub distance: i64,
 }
 
@@ -837,7 +845,18 @@ pub struct PlaceRecord {
     /// A `PlaceType` enum value.
     pub place_type: String,
     pub title: String,
+    /// The place's other names — a name in another language, or the name it is
+    /// commonly searched by. A place is findable by ANY of its names, so a query
+    /// in one language answers with the record written in another.
+    pub alternate_names: Vec<String>,
     pub address: AddressRecord,
+    /// The attribution this place carries under a political view, keyed by the
+    /// view's alpha-3 country code: "the political view applies to the results of
+    /// the request to represent unresolved territorial claims through the point of
+    /// view of the specified country" (`CountryCode`). A place over which no
+    /// claim is unresolved carries none of these, so every view reports the same
+    /// [`Self::address`].
+    pub political_attributions: BTreeMap<String, AddressRecord>,
     /// `[longitude, latitude]`, WGS 84, as the modeled `Position` orders them.
     pub position: [f64; 2],
     /// `[west, south, east, north]`, as the modeled `BoundingBox` orders them.
@@ -854,6 +873,16 @@ pub struct PlaceRecord {
     /// The normalized tokens free-form text queries match against, derived from the
     /// record's own text by [`index_terms`].
     pub search_terms: Vec<String>,
+    /// How many OTHER records of the catalog this place's extent covers, computed
+    /// once when the catalog is seeded.
+    ///
+    /// It is a measure of how much this place anchors: a well-known city holds
+    /// landmarks, addresses and districts, while its lesser-known homonym holds
+    /// nothing. Used ONLY to order two places a query matched equally well and
+    /// that are equally near the request's reference position — the order in which
+    /// a client expects the better-known of two same-named places first. Never
+    /// reported.
+    pub places_covered: usize,
 }
 
 impl PlaceRecord {
@@ -870,7 +899,9 @@ impl PlaceRecord {
             place_id: synthesize_place_id(title, position),
             place_type: place_type.to_string(),
             title: title.to_string(),
+            alternate_names: Vec::new(),
             address,
+            political_attributions: BTreeMap::new(),
             position,
             map_view: map_view_around(position, extent_metres),
             categories: Vec::new(),
@@ -882,7 +913,21 @@ impl PlaceRecord {
             access_points: Vec::new(),
             time_zone: None,
             search_terms: Vec::new(),
+            places_covered: 0,
         }
+    }
+
+    /// The place's other names: see [`PlaceRecord::alternate_names`].
+    fn with_alternate_names(mut self, names: &[&str]) -> Self {
+        self.alternate_names = names.iter().map(|name| (*name).to_string()).collect();
+        self
+    }
+
+    /// The attribution this place carries under one political view, named by that
+    /// view's alpha-3 country code: see [`PlaceRecord::political_attributions`].
+    fn with_political_attribution(mut self, view: &str, address: AddressRecord) -> Self {
+        self.political_attributions.insert(view.to_string(), address);
+        self
     }
 
     /// Categories, the first of which is the place's primary one.
@@ -934,6 +979,12 @@ impl PlaceRecord {
         self
     }
 
+    /// The place's time zone, named as one of this module's `(name, offset,
+    /// offset seconds)` zone constants.
+    fn in_time_zone(self, zone: (&str, &str, i64)) -> Self {
+        self.with_time_zone(zone.0, zone.1, zone.2)
+    }
+
     /// The place's OWN name, for a place that has one: a point of interest is a
     /// named business or landmark. An address or an administrative area has no
     /// name of its own — what names it is its assembled address label.
@@ -941,9 +992,49 @@ impl PlaceRecord {
         (self.place_type == PLACE_TYPE_POINT_OF_INTEREST).then_some(self.title.as_str())
     }
 
+    /// Every name this place is KNOWN by: its own title and its alternate names.
+    ///
+    /// Unlike [`PlaceRecord::name`], which is the name that LEADS a postal label
+    /// and so belongs to a point of interest alone, these are the names a query
+    /// may call the place by — a locality's name is its own name too, even though
+    /// its label does not repeat it.
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        std::iter::once(self.title.as_str())
+            .chain(self.alternate_names.iter().map(String::as_str))
+    }
+
+    /// The names a postal label may lead with: a point of interest's own name and
+    /// its alternates.
+    fn label_names(&self) -> Vec<&str> {
+        match self.name() {
+            Some(name) => std::iter::once(name)
+                .chain(self.alternate_names.iter().map(String::as_str))
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// This place's address under a political view: the attribution that view
+    /// gives it, or its default attribution when that view leaves it unchanged
+    /// (which is every view, for a place no claim is unresolved over).
+    pub fn address_in(&self, political_view: Option<&str>) -> &AddressRecord {
+        political_view
+            .and_then(|view| self.political_attributions.get(view))
+            .unwrap_or(&self.address)
+    }
+
     /// This place's assembled address label: see [`assemble_label`].
     pub fn assembled_label(&self) -> String {
-        assemble_label(&self.address, self.name(), &self.place_type)
+        self.assembled_label_in(None)
+    }
+
+    /// This place's assembled address label under a political view.
+    pub fn assembled_label_in(&self, political_view: Option<&str>) -> String {
+        assemble_label(
+            self.address_in(political_view),
+            self.name(),
+            &self.place_type,
+        )
     }
 
     /// `Title`: "The localized display name of this result item"
@@ -952,13 +1043,31 @@ impl PlaceRecord {
     /// shows this as the single display line for the place, so a bare address
     /// component is not one.
     pub fn title_modeled(&self) -> String {
+        self.title_modeled_in(None)
+    }
+
+    /// `Title` under a political view: a label that names a country names the one
+    /// that view attributes the place to.
+    pub fn title_modeled_in(&self, political_view: Option<&str>) -> String {
         self.name()
-            .map_or_else(|| self.assembled_label(), str::to_string)
+            .map_or_else(|| self.assembled_label_in(political_view), str::to_string)
     }
 
     /// `Address`, with the assembled `Label` this place renders.
     pub fn address_modeled(&self) -> Address {
-        self.address.to_modeled(self.assembled_label())
+        self.address_modeled_in(None)
+    }
+
+    /// `Address` under a political view.
+    pub fn address_modeled_in(&self, political_view: Option<&str>) -> Address {
+        self.address_in(political_view)
+            .to_modeled(self.assembled_label_in(political_view))
+    }
+
+    /// Does this place COVER `position` — does the point fall inside the place's
+    /// own extent, the `MapView` "bounding box of the place" a result reports?
+    pub fn covers(&self, position: [f64; 2]) -> bool {
+        box_contains(self.map_view, position)
     }
 
     /// `Position`, as a modeled `Position` list.
@@ -1124,6 +1233,34 @@ impl PlaceRecord {
         Some(matched / query_tokens.len() as f64)
     }
 
+    /// The share of a free-form query that named this place's OWN name — its title
+    /// or one of its alternate names — counting an abbreviated word as half.
+    ///
+    /// This is NOT the reported `MatchScore`: it ranks a place the query NAMED
+    /// above a place that merely sits in an area the query named ("Washington" the
+    /// city and the state, rather than every address inside them), which is the
+    /// order a client asking for a place expects. A query that names none of the
+    /// place's names scores 0 here and is still a match on the other terms.
+    pub fn name_score(&self, query_tokens: &[String]) -> f64 {
+        if query_tokens.is_empty() {
+            return 0.0;
+        }
+        let name_terms: Vec<String> = self
+            .names()
+            .flat_map(normalize_tokens)
+            .collect();
+        let matched: f64 = query_tokens
+            .iter()
+            .map(|token| {
+                name_terms
+                    .iter()
+                    .filter_map(|term| affinity(term, token))
+                    .fold(0.0, f64::max)
+            })
+            .sum();
+        matched / query_tokens.len() as f64
+    }
+
     /// How well a structured query matches this record, or `None` when any supplied
     /// component does not match the corresponding address component. Scored like
     /// [`PlaceRecord::text_score`]: a component matched in full counts 1, an
@@ -1164,7 +1301,12 @@ impl PlaceRecord {
             ..MatchExplanation::default()
         };
         if !query.is_empty() {
-            if let Some(found) = self.name().and_then(|name| locate(query, name)) {
+            let located_name = self
+                .label_names()
+                .into_iter()
+                .filter_map(|name| locate(query, name))
+                .max_by(|left, right| left.score.total_cmp(&right.score));
+            if let Some(found) = located_name {
                 explanation.title = Some(ComponentMatch {
                     component: TITLE_COMPONENT,
                     score: found.score,
@@ -1255,15 +1397,25 @@ impl PlaceRecord {
     /// Is this place's position inside `[west, south, east, north]`? A box whose
     /// west edge is east of its east edge crosses the antimeridian.
     pub fn within_bounding_box(&self, box_: [f64; 4]) -> bool {
-        let [west, south, east, north] = box_;
-        let [longitude, latitude] = self.position;
-        let within_longitude = if west <= east {
-            longitude >= west && longitude <= east
-        } else {
-            longitude >= west || longitude <= east
-        };
-        within_longitude && latitude >= south && latitude <= north
+        box_contains(box_, self.position)
     }
+}
+
+/// Is `position` inside `[west, south, east, north]`? A box whose west edge is
+/// east of its east edge crosses the antimeridian.
+///
+/// The ONE containment test: a place's position inside a filter's box, and a
+/// queried position inside a place's own extent, are the same question asked of
+/// different boxes.
+pub fn box_contains(box_: [f64; 4], position: [f64; 2]) -> bool {
+    let [west, south, east, north] = box_;
+    let [longitude, latitude] = position;
+    let within_longitude = if west <= east {
+        longitude >= west && longitude <= east
+    } else {
+        longitude >= west || longitude <= east
+    };
+    within_longitude && latitude >= south && latitude <= north
 }
 
 /// The opaque `PlaceId` of a record: an uppercase hex digest of what the record IS
@@ -1280,12 +1432,21 @@ fn synthesize_place_id(title: &str, position: [f64; 2]) -> String {
     hex::encode_upper(digest)[..PLACE_ID_LEN].to_string()
 }
 
-/// The normalized tokens a record is found by: its title, its address, its
-/// categories, its food types and its business chains.
+/// The normalized tokens a record is found by: every name it is known by, its
+/// address, its categories, its food types and its business chains.
+///
+/// The CATEGORIES and FOOD TYPES are indexed because a category word is a query
+/// term: a large part of what a text search is asked is "find me a coffee shop",
+/// which names what the place IS rather than what it is called.
+///
+/// A political view's alternative attribution is NOT indexed: a result is reported
+/// under the attribution the request's view selects, and a query answered with an
+/// attribution it did not ask for would name a country the response then
+/// contradicts.
 fn index_terms(place: &PlaceRecord) -> Vec<String> {
     let label = place.assembled_label();
-    let mut sources: Vec<&str> = vec![
-        place.title.as_str(),
+    let mut sources: Vec<&str> = place.names().collect();
+    sources.extend([
         label.as_str(),
         place.address.locality.as_str(),
         place.address.region_code.as_str(),
@@ -1295,7 +1456,7 @@ fn index_terms(place: &PlaceRecord) -> Vec<String> {
         place.address.country_code2.as_str(),
         place.address.country_code3.as_str(),
         place.address.postal_code.as_str(),
-    ];
+    ]);
     sources.extend(place.address.street.as_deref());
     sources.extend(place.address.district.as_deref());
     sources.extend(
@@ -1327,15 +1488,199 @@ pub fn validation_exception(
     field: &str,
     message: impl Into<String>,
 ) -> ValidationException {
+    validation_exception_for(reason, &[field], message)
+}
+
+/// As [`validation_exception`], for a rule that spans SEVERAL members — an
+/// alternative one of which had to be set, say: each one is named in the
+/// `FieldList`, because each one is a place the caller could have satisfied it.
+pub fn validation_exception_for(
+    reason: &str,
+    fields: &[&str],
+    message: impl Into<String>,
+) -> ValidationException {
     let message = message.into();
     ValidationException {
         message: message.clone(),
         reason: reason.to_string(),
-        field_list: vec![ValidationExceptionField {
-            name: field.to_string(),
-            message,
-        }],
+        field_list: fields
+            .iter()
+            .map(|field| ValidationExceptionField {
+                name: (*field).to_string(),
+                message: message.clone(),
+            })
+            .collect(),
     }
+}
+
+// ---------------------------------------------------------------------------
+// How a refusal is WORDED
+// ---------------------------------------------------------------------------
+//
+// geo-places states an input-validation failure as a short sentence naming the
+// member at fault and the rule it broke, derived from the request and the
+// member's modeled constraint — never as prose written at the call site. Every
+// message this service produces, from a handler or from the boundary validator
+// (see `crate::service::EmulatedService::override_refusal`), is built by the
+// helpers below, so one rule cannot drift into a second phrasing.
+
+/// `'{member}' {rule}` — the shape of every member-named refusal this service
+/// words. The member name is single-quoted and spelled as the MODEL spells it.
+pub fn member_rule(member: &str, rule: &str) -> String {
+    format!("'{member}' {rule}")
+}
+
+/// A value that fails a `@pattern`, naming the modeled pattern itself.
+pub fn must_match_regex(member: &str, pattern: &str) -> String {
+    member_rule(member, &format!("must match regex {pattern}"))
+}
+
+/// A value below a `@range` minimum.
+pub fn must_not_be_less_than(member: &str, minimum: &str) -> String {
+    member_rule(member, &format!("must not be less than {minimum}"))
+}
+
+/// A value above a `@range` maximum.
+pub fn must_not_be_greater_than(member: &str, maximum: &str) -> String {
+    member_rule(member, &format!("must not be greater than {maximum}"))
+}
+
+/// A value shorter than a `@length` minimum. Worded as a LENGTH rather than in
+/// characters or entries, because `@length` applies to both a string and a list.
+pub fn must_be_at_least_long(member: &str, minimum: i64) -> String {
+    member_rule(member, &format!("must have a length of at least {minimum}"))
+}
+
+/// A value longer than a `@length` maximum.
+pub fn must_be_at_most_long(member: &str, maximum: i64) -> String {
+    member_rule(member, &format!("must have a length of at most {maximum}"))
+}
+
+/// A value whose `@length` pins one exact size (`Position` is `len 2..2`), worded
+/// by the bound it actually broke — the same wording the boundary validator gives
+/// that member, so one rule reads alike wherever it is caught.
+pub fn must_be_length(member: &str, length: usize, required: usize) -> String {
+    if length < required {
+        must_be_at_least_long(member, required as i64)
+    } else {
+        must_be_at_most_long(member, required as i64)
+    }
+}
+
+/// An opaque identifier this service never issued, so it names nothing.
+pub fn must_be_valid_id(member: &str) -> String {
+    member_rule(member, "must be a valid ID.")
+}
+
+/// A cursor this service cannot resume from.
+pub fn must_be_valid_token(member: &str) -> String {
+    member_rule(member, "must be a valid token.")
+}
+
+/// A `@required` member the request left out.
+pub fn must_not_be_null(member: &str) -> String {
+    member_rule(member, "must not be null.")
+}
+
+/// A value outside an enumerated type's value set.
+pub fn must_be_one_of(member: &str, allowed: &[String]) -> String {
+    member_rule(member, &format!("must be one of: {}", allowed.join(", ")))
+}
+
+/// Members quoted the way a message naming several of them quotes each.
+fn quoted(members: &[&str]) -> String {
+    members
+        .iter()
+        .map(|member| format!("'{member}'"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// A rule the request could have satisfied through any one of several members,
+/// and satisfied through none.
+pub fn at_least_one_of(members: &[&str]) -> String {
+    format!(
+        "At least one of the following fields must be set: {}.",
+        quoted(members)
+    )
+}
+
+/// Alternative members, more than one of which the request set.
+pub fn only_one_of(members: &[&str]) -> String {
+    format!(
+        "Only one of the following fields must be set: {}.",
+        quoted(members)
+    )
+}
+
+/// The member name a dotted request path names, spelled as the MODEL spells it.
+///
+/// The boundary validator reports the path in lowerCamel (`politicalView`,
+/// `filter.includeCountries.1.member`), while a geo-places message names the
+/// member (`PoliticalView`, `Filter.IncludeCountries`): the collection steps a
+/// path takes to reach an element are not part of the member's name.
+///
+/// Capitalising each segment recovers the model's spelling because every member
+/// this service declares is PascalCase in the model and lowerCamel on the wire —
+/// the regular mapping the path builder applies. A member whose model spelling is
+/// not a plain capitalisation of its wire name would need the input schema rather
+/// than this rule.
+pub fn member_of_path(path: &str) -> String {
+    let named: Vec<String> = path
+        .split('.')
+        .filter(|segment| {
+            *segment != "member" && !segment.chars().all(|character| character.is_ascii_digit())
+        })
+        .map(|segment| {
+            let mut characters = segment.chars();
+            characters.next().map_or_else(String::new, |first| {
+                first.to_ascii_uppercase().to_string() + characters.as_str()
+            })
+        })
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    if named.is_empty() {
+        path.to_string()
+    } else {
+        named.join(".")
+    }
+}
+
+/// This service's wording for ONE constraint the framework found violated before
+/// any handler ran: the member it names, and the modeled rule it broke.
+pub fn violation_message(violation: &::smithy_server_runtime::Violation) -> String {
+    use ::smithy_server_runtime::ViolationKind;
+
+    let member = member_of_path(&violation.path);
+    match &violation.kind {
+        ViolationKind::MissingRequiredMember => must_not_be_null(&member),
+        ViolationKind::MinLength(minimum) => must_be_at_least_long(&member, *minimum),
+        ViolationKind::MaxLength(maximum) => must_be_at_most_long(&member, *maximum),
+        ViolationKind::MinValue(minimum) => must_not_be_less_than(&member, minimum),
+        ViolationKind::MaxValue(maximum) => must_not_be_greater_than(&member, maximum),
+        ViolationKind::Pattern(pattern) => must_match_regex(&member, pattern),
+        ViolationKind::EnumValue(allowed) => must_be_one_of(&member, allowed),
+        ViolationKind::UniqueItems => member_rule(&member, "must not contain duplicate values"),
+        // `ViolationKind` is `#[non_exhaustive]`: a kind this service does not
+        // word yet still names its member rather than falling back to the
+        // generic constraint-validator sentence.
+        _ => member_rule(&member, "must satisfy the constraints the model declares"),
+    }
+}
+
+/// This service's wording for every constraint one refused request violated.
+///
+/// Each violation is stated in full and the sentences are joined, rather than
+/// summarised behind a count: the recorded wording states the member and the rule
+/// for the one violation it carries, and a request that broke two rules has broken
+/// both of them — a caller fixing its request needs each member named, and no
+/// recorded geo-places message introduces a count envelope.
+pub fn violations_message(violations: &[::smithy_server_runtime::Violation]) -> String {
+    violations
+        .iter()
+        .map(violation_message)
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 /// A filter list the caller set and left non-empty, or `None` — an absent filter
@@ -1352,36 +1697,55 @@ pub fn non_empty(values: Option<&[String]>) -> Option<&[String]> {
 /// refusing here means an in-process caller gets the same answer as a client,
 /// rather than a page quietly sized differently from the one it asked for.
 pub fn check_max_results(max_results: Option<i32>) -> Result<(), ValidationException> {
-    match max_results {
-        Some(requested) if !(1..=MAX_RESULTS_CEILING).contains(&requested) => {
-            Err(validation_exception(
-                REASON_FIELD_VALIDATION_FAILED,
-                "MaxResults",
-                format!(
-                    "MaxResults must be between 1 and {MAX_RESULTS_CEILING}; \
-                     {requested} was supplied"
-                ),
-            ))
-        }
-        _ => Ok(()),
+    let Some(requested) = max_results else {
+        return Ok(());
+    };
+    let broken = if requested < 1 {
+        Some(must_not_be_less_than("MaxResults", "1"))
+    } else if requested > MAX_RESULTS_CEILING {
+        Some(must_not_be_greater_than(
+            "MaxResults",
+            &MAX_RESULTS_CEILING.to_string(),
+        ))
+    } else {
+        None
+    };
+    match broken {
+        Some(message) => Err(validation_exception(
+            REASON_FIELD_VALIDATION_FAILED,
+            "MaxResults",
+            message,
+        )),
+        None => Ok(()),
     }
 }
 
 /// Refuse a `QueryRadius` outside the modeled `DistanceMeters` range
 /// (`range 1..21000000`).
 pub fn check_query_radius(radius: Option<i64>) -> Result<(), ValidationException> {
-    match radius {
-        Some(requested) if !(QUERY_RADIUS_MIN..=QUERY_RADIUS_MAX).contains(&requested) => {
-            Err(validation_exception(
-                REASON_FIELD_VALIDATION_FAILED,
-                "QueryRadius",
-                format!(
-                    "QueryRadius must be between {QUERY_RADIUS_MIN} and {QUERY_RADIUS_MAX} \
-                     metres; {requested} was supplied"
-                ),
-            ))
-        }
-        _ => Ok(()),
+    let Some(requested) = radius else {
+        return Ok(());
+    };
+    let broken = if requested < QUERY_RADIUS_MIN {
+        Some(must_not_be_less_than(
+            "QueryRadius",
+            &QUERY_RADIUS_MIN.to_string(),
+        ))
+    } else if requested > QUERY_RADIUS_MAX {
+        Some(must_not_be_greater_than(
+            "QueryRadius",
+            &QUERY_RADIUS_MAX.to_string(),
+        ))
+    } else {
+        None
+    };
+    match broken {
+        Some(message) => Err(validation_exception(
+            REASON_FIELD_VALIDATION_FAILED,
+            "QueryRadius",
+            message,
+        )),
+        None => Ok(()),
     }
 }
 
@@ -1405,7 +1769,7 @@ pub fn check_query_text(
         Some(text) if text.chars().count() > QUERY_TEXT_MAX => Err(validation_exception(
             REASON_FIELD_VALIDATION_FAILED,
             member,
-            format!("{member} must be at most {QUERY_TEXT_MAX} characters"),
+            must_be_at_most_long(member, QUERY_TEXT_MAX as i64),
         )),
         _ => Ok(()),
     }
@@ -1413,20 +1777,42 @@ pub fn check_query_text(
 
 /// Refuse a `Language` outside the modeled `LanguageTag` length (`len 2..35`).
 pub fn check_language(language: Option<&str>) -> Result<(), ValidationException> {
-    match language {
-        Some(requested) if !(2..=35).contains(&requested.chars().count()) => {
-            Err(validation_exception(
-                REASON_FIELD_VALIDATION_FAILED,
-                "Language",
-                "Language must be a BCP 47 language code of 2 to 35 characters",
-            ))
-        }
-        _ => Ok(()),
+    /// `LanguageTag` is modeled `len 2..35`.
+    const LANGUAGE_TAG_LENGTH: std::ops::RangeInclusive<usize> = 2..=35;
+
+    let Some(requested) = language else {
+        return Ok(());
+    };
+    let length = requested.chars().count();
+    let broken = if length < *LANGUAGE_TAG_LENGTH.start() {
+        Some(must_be_at_least_long(
+            "Language",
+            *LANGUAGE_TAG_LENGTH.start() as i64,
+        ))
+    } else if length > *LANGUAGE_TAG_LENGTH.end() {
+        Some(must_be_at_most_long(
+            "Language",
+            *LANGUAGE_TAG_LENGTH.end() as i64,
+        ))
+    } else {
+        None
+    };
+    match broken {
+        Some(message) => Err(validation_exception(
+            REASON_FIELD_VALIDATION_FAILED,
+            "Language",
+            message,
+        )),
+        None => Ok(()),
     }
 }
 
+/// The modeled `CountryCode` pattern a `PoliticalView` must satisfy, as the model
+/// writes it (`CountryCode`, `@pattern`).
+pub const COUNTRY_CODE_PATTERN: &str = "^([A-Z]{2}|[A-Z]{3})$";
+
 /// Refuse a `PoliticalView` that does not satisfy the modeled `CountryCode`
-/// pattern `^([A-Z]{2}|[A-Z]{3})$`.
+/// pattern [`COUNTRY_CODE_PATTERN`].
 pub fn check_political_view(political_view: Option<&str>) -> Result<(), ValidationException> {
     let Some(requested) = political_view else {
         return Ok(());
@@ -1439,10 +1825,116 @@ pub fn check_political_view(political_view: Option<&str>) -> Result<(), Validati
         Err(validation_exception(
             REASON_FIELD_VALIDATION_FAILED,
             "PoliticalView",
-            "PoliticalView must be an alpha-2 or alpha-3 country code matching \
-             ^([A-Z]{2}|[A-Z]{3})$",
+            must_match_regex("PoliticalView", COUNTRY_CODE_PATTERN),
         ))
     }
+}
+
+/// The ISO 3166-1 officially assigned country codes, as `(alpha-2, alpha-3)`
+/// pairs — the register the modeled `CountryCode` ("the alpha-2 or alpha-3
+/// character code for the political view of a country") draws from, and the only
+/// mapping that can report a caller's alpha-2 view as the alpha-3 `CountryCode3`
+/// the result items model.
+///
+/// SOURCE: ISO 3166-1, the officially assigned entries (249 of them); the
+/// user-assigned and reserved ranges are deliberately absent, because no country
+/// is assigned to them and so no alpha-3 form of one exists to report. Written out
+/// here rather than taken from a crate so this service adds no entry to the
+/// workspace's dependency lock, which the serialized landing step cannot merge
+/// while other fixes land in parallel.
+const ISO_3166_1_COUNTRIES: [(&str, &str); 249] = [
+    ("AD", "AND"), ("AE", "ARE"), ("AF", "AFG"), ("AG", "ATG"), ("AI", "AIA"),
+    ("AL", "ALB"), ("AM", "ARM"), ("AO", "AGO"), ("AQ", "ATA"), ("AR", "ARG"),
+    ("AS", "ASM"), ("AT", "AUT"), ("AU", "AUS"), ("AW", "ABW"), ("AX", "ALA"),
+    ("AZ", "AZE"), ("BA", "BIH"), ("BB", "BRB"), ("BD", "BGD"), ("BE", "BEL"),
+    ("BF", "BFA"), ("BG", "BGR"), ("BH", "BHR"), ("BI", "BDI"), ("BJ", "BEN"),
+    ("BL", "BLM"), ("BM", "BMU"), ("BN", "BRN"), ("BO", "BOL"), ("BQ", "BES"),
+    ("BR", "BRA"), ("BS", "BHS"), ("BT", "BTN"), ("BV", "BVT"), ("BW", "BWA"),
+    ("BY", "BLR"), ("BZ", "BLZ"), ("CA", "CAN"), ("CC", "CCK"), ("CD", "COD"),
+    ("CF", "CAF"), ("CG", "COG"), ("CH", "CHE"), ("CI", "CIV"), ("CK", "COK"),
+    ("CL", "CHL"), ("CM", "CMR"), ("CN", "CHN"), ("CO", "COL"), ("CR", "CRI"),
+    ("CU", "CUB"), ("CV", "CPV"), ("CW", "CUW"), ("CX", "CXR"), ("CY", "CYP"),
+    ("CZ", "CZE"), ("DE", "DEU"), ("DJ", "DJI"), ("DK", "DNK"), ("DM", "DMA"),
+    ("DO", "DOM"), ("DZ", "DZA"), ("EC", "ECU"), ("EE", "EST"), ("EG", "EGY"),
+    ("EH", "ESH"), ("ER", "ERI"), ("ES", "ESP"), ("ET", "ETH"), ("FI", "FIN"),
+    ("FJ", "FJI"), ("FK", "FLK"), ("FM", "FSM"), ("FO", "FRO"), ("FR", "FRA"),
+    ("GA", "GAB"), ("GB", "GBR"), ("GD", "GRD"), ("GE", "GEO"), ("GF", "GUF"),
+    ("GG", "GGY"), ("GH", "GHA"), ("GI", "GIB"), ("GL", "GRL"), ("GM", "GMB"),
+    ("GN", "GIN"), ("GP", "GLP"), ("GQ", "GNQ"), ("GR", "GRC"), ("GS", "SGS"),
+    ("GT", "GTM"), ("GU", "GUM"), ("GW", "GNB"), ("GY", "GUY"), ("HK", "HKG"),
+    ("HM", "HMD"), ("HN", "HND"), ("HR", "HRV"), ("HT", "HTI"), ("HU", "HUN"),
+    ("ID", "IDN"), ("IE", "IRL"), ("IL", "ISR"), ("IM", "IMN"), ("IN", "IND"),
+    ("IO", "IOT"), ("IQ", "IRQ"), ("IR", "IRN"), ("IS", "ISL"), ("IT", "ITA"),
+    ("JE", "JEY"), ("JM", "JAM"), ("JO", "JOR"), ("JP", "JPN"), ("KE", "KEN"),
+    ("KG", "KGZ"), ("KH", "KHM"), ("KI", "KIR"), ("KM", "COM"), ("KN", "KNA"),
+    ("KP", "PRK"), ("KR", "KOR"), ("KW", "KWT"), ("KY", "CYM"), ("KZ", "KAZ"),
+    ("LA", "LAO"), ("LB", "LBN"), ("LC", "LCA"), ("LI", "LIE"), ("LK", "LKA"),
+    ("LR", "LBR"), ("LS", "LSO"), ("LT", "LTU"), ("LU", "LUX"), ("LV", "LVA"),
+    ("LY", "LBY"), ("MA", "MAR"), ("MC", "MCO"), ("MD", "MDA"), ("ME", "MNE"),
+    ("MF", "MAF"), ("MG", "MDG"), ("MH", "MHL"), ("MK", "MKD"), ("ML", "MLI"),
+    ("MM", "MMR"), ("MN", "MNG"), ("MO", "MAC"), ("MP", "MNP"), ("MQ", "MTQ"),
+    ("MR", "MRT"), ("MS", "MSR"), ("MT", "MLT"), ("MU", "MUS"), ("MV", "MDV"),
+    ("MW", "MWI"), ("MX", "MEX"), ("MY", "MYS"), ("MZ", "MOZ"), ("NA", "NAM"),
+    ("NC", "NCL"), ("NE", "NER"), ("NF", "NFK"), ("NG", "NGA"), ("NI", "NIC"),
+    ("NL", "NLD"), ("NO", "NOR"), ("NP", "NPL"), ("NR", "NRU"), ("NU", "NIU"),
+    ("NZ", "NZL"), ("OM", "OMN"), ("PA", "PAN"), ("PE", "PER"), ("PF", "PYF"),
+    ("PG", "PNG"), ("PH", "PHL"), ("PK", "PAK"), ("PL", "POL"), ("PM", "SPM"),
+    ("PN", "PCN"), ("PR", "PRI"), ("PS", "PSE"), ("PT", "PRT"), ("PW", "PLW"),
+    ("PY", "PRY"), ("QA", "QAT"), ("RE", "REU"), ("RO", "ROU"), ("RS", "SRB"),
+    ("RU", "RUS"), ("RW", "RWA"), ("SA", "SAU"), ("SB", "SLB"), ("SC", "SYC"),
+    ("SD", "SDN"), ("SE", "SWE"), ("SG", "SGP"), ("SH", "SHN"), ("SI", "SVN"),
+    ("SJ", "SJM"), ("SK", "SVK"), ("SL", "SLE"), ("SM", "SMR"), ("SN", "SEN"),
+    ("SO", "SOM"), ("SR", "SUR"), ("SS", "SSD"), ("ST", "STP"), ("SV", "SLV"),
+    ("SX", "SXM"), ("SY", "SYR"), ("SZ", "SWZ"), ("TC", "TCA"), ("TD", "TCD"),
+    ("TF", "ATF"), ("TG", "TGO"), ("TH", "THA"), ("TJ", "TJK"), ("TK", "TKL"),
+    ("TL", "TLS"), ("TM", "TKM"), ("TN", "TUN"), ("TO", "TON"), ("TR", "TUR"),
+    ("TT", "TTO"), ("TV", "TUV"), ("TW", "TWN"), ("TZ", "TZA"), ("UA", "UKR"),
+    ("UG", "UGA"), ("UM", "UMI"), ("US", "USA"), ("UY", "URY"), ("UZ", "UZB"),
+    ("VA", "VAT"), ("VC", "VCT"), ("VE", "VEN"), ("VG", "VGB"), ("VI", "VIR"),
+    ("VN", "VNM"), ("VU", "VUT"), ("WF", "WLF"), ("WS", "WSM"), ("YE", "YEM"),
+    ("YT", "MYT"), ("ZA", "ZAF"), ("ZM", "ZMB"), ("ZW", "ZWE"),
+];
+
+/// The alpha-3 code of the country an alpha-2 or alpha-3 `CountryCode` names, or
+/// `None` when [`ISO_3166_1_COUNTRIES`] assigns no country to it.
+pub fn country_alpha3(code: &str) -> Option<&'static str> {
+    ISO_3166_1_COUNTRIES
+        .iter()
+        .find(|(alpha2, alpha3)| *alpha2 == code || *alpha3 == code)
+        .map(|(_, alpha3)| *alpha3)
+}
+
+/// The `PoliticalView` to report, in the alpha-3 form the result items model
+/// (`CountryCode3`, `pattern ^[A-Z]{3}$`), for the alpha-2 or alpha-3 code the
+/// caller asked with; `Ok(None)` when the caller asked for no political view.
+///
+/// A political view names a COUNTRY — "the alpha-2 or alpha-3 character code for
+/// the political view of a country" (`CountryCode`) — so the view is resolved
+/// against ISO 3166-1, the register that code set comes from, and NOT against the
+/// places this service happens to hold: a view is a point of view on the whole
+/// result set, not a place in it. A code that satisfies the modeled pattern but
+/// names no country (the ISO user-assigned range, say) cannot be reported in
+/// alpha-3 form at all, so it is refused; the code is `@sensitive`, so the
+/// refusal names the member, not the value.
+pub fn resolve_political_view(
+    requested: Option<&str>,
+) -> Result<Option<String>, ValidationException> {
+    let Some(requested) = requested else {
+        return Ok(None);
+    };
+    check_political_view(Some(requested))?;
+    country_alpha3(requested)
+        .map(|alpha3| Some(alpha3.to_string()))
+        .ok_or_else(|| {
+            validation_exception(
+                REASON_FIELD_VALIDATION_FAILED,
+                "PoliticalView",
+                member_rule(
+                    "PoliticalView",
+                    "must be an ISO 3166-1 alpha-2 or alpha-3 country code.",
+                ),
+            )
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -1571,36 +2063,6 @@ impl ComAmazonawsGeoplacesPlacesserviceState {
         })
     }
 
-    /// The `PoliticalView` to report, in the alpha-3 form the result items model
-    /// (`pattern ^[A-Z]{3}$`), for the alpha-2 or alpha-3 code the caller asked
-    /// with; `Ok(None)` when the caller asked for no political view.
-    ///
-    /// A view this service cannot resolve is REFUSED rather than dropped: a caller
-    /// whose political view was not applied must not be answered as if it had been.
-    /// The code is `@sensitive`, so the refusal names the member, not the value.
-    pub fn political_view(
-        &self,
-        requested: Option<&str>,
-    ) -> Result<Option<String>, ValidationException> {
-        let Some(requested) = requested else {
-            return Ok(None);
-        };
-        self.places
-            .iter()
-            .find(|place| {
-                place.address.country_code2.eq_ignore_ascii_case(requested)
-                    || place.address.country_code3.eq_ignore_ascii_case(requested)
-            })
-            .map(|place| Some(place.address.country_code3.clone()))
-            .ok_or_else(|| {
-                validation_exception(
-                    REASON_FIELD_VALIDATION_FAILED,
-                    "PoliticalView",
-                    "PoliticalView must name a country this service holds place data for",
-                )
-            })
-    }
-
     /// Every record a free-form query matches, in no particular order.
     pub fn text_candidates(&self, query: &str) -> Vec<Scored> {
         let tokens = normalize_tokens(query);
@@ -1611,6 +2073,7 @@ impl ComAmazonawsGeoplacesPlacesserviceState {
                 place.text_score(&tokens).map(|score| Scored {
                     index,
                     score,
+                    name_score: place.name_score(&tokens),
                     distance: 0,
                 })
             })
@@ -1626,6 +2089,7 @@ impl ComAmazonawsGeoplacesPlacesserviceState {
                 place.component_score(components).map(|score| Scored {
                     index,
                     score,
+                    name_score: 0.0,
                     distance: 0,
                 })
             })
@@ -1642,9 +2106,43 @@ impl ComAmazonawsGeoplacesPlacesserviceState {
             .map(|(index, place)| Scored {
                 index,
                 score: 1.0,
+                name_score: 0.0,
                 distance: distance_metres(position, place.position),
             })
             .filter(|candidate| radius.is_none_or(|radius| candidate.distance <= radius))
+            .collect();
+        self.order_by_distance(&mut candidates);
+        candidates
+    }
+
+    /// The records AT `position`: the places that cover it, nearest first.
+    ///
+    /// Resolving a position is positional by definition, so a candidate has to
+    /// contain the position rather than merely be the closest record the catalog
+    /// happens to hold: a place covers `position` when the point falls inside the
+    /// place's own extent (its `MapView`, which scales with the place's
+    /// granularity — a country covers a region of the world, a point of interest
+    /// covers its own block). A position no place covers resolves to NO records,
+    /// which is an empty `ResultItems` list rather than an address somewhere else.
+    ///
+    /// An explicit radius is the caller's own bound and replaces the extent test:
+    /// "the maximum distance in meters from the QueryPosition from which a result
+    /// will be returned" (`ReverseGeocodeRequest$QueryRadius`).
+    pub fn at_position(&self, position: [f64; 2], radius: Option<i64>) -> Vec<Scored> {
+        if radius.is_some() {
+            return self.nearby(position, radius);
+        }
+        let mut candidates: Vec<Scored> = self
+            .places
+            .iter()
+            .enumerate()
+            .filter(|(_, place)| place.covers(position))
+            .map(|(index, place)| Scored {
+                index,
+                score: 1.0,
+                name_score: 0.0,
+                distance: distance_metres(position, place.position),
+            })
             .collect();
         self.order_by_distance(&mut candidates);
         candidates
@@ -1660,14 +2158,22 @@ impl ComAmazonawsGeoplacesPlacesserviceState {
         });
     }
 
-    /// Order candidates by relevance first, then nearest first, then by title and
-    /// `PlaceId`.
+    /// Order candidates by relevance: the share of the query each one answered
+    /// first, then nearest first, then the one the query NAMED ahead of the one
+    /// that merely sits in an area the query named, then by title and `PlaceId`.
+    ///
+    /// The name is a tie-break BELOW distance, not above it: a request that supplies
+    /// a reference position asked for the places around it, so proximity decides
+    /// between equally matching results, and the name only decides between results
+    /// that are also equally near (every result of a request with no reference
+    /// position is at the modeled default distance of 0, so there the name decides).
     pub fn order_by_relevance(&self, candidates: &mut [Scored]) {
         candidates.sort_by(|left, right| {
             right
                 .score
                 .total_cmp(&left.score)
                 .then(left.distance.cmp(&right.distance))
+                .then(right.name_score.total_cmp(&left.name_score))
                 .then_with(|| self.tie_break(left, right))
         });
     }
@@ -1675,8 +2181,10 @@ impl ComAmazonawsGeoplacesPlacesserviceState {
     fn tie_break(&self, left: &Scored, right: &Scored) -> std::cmp::Ordering {
         let left = &self.places[left.index];
         let right = &self.places[right.index];
-        left.title
-            .cmp(&right.title)
+        right
+            .places_covered
+            .cmp(&left.places_covered)
+            .then_with(|| left.title.cmp(&right.title))
             .then_with(|| left.place_id.cmp(&right.place_id))
     }
 
@@ -1692,6 +2200,7 @@ impl ComAmazonawsGeoplacesPlacesserviceState {
                     .map(|other| Scored {
                         index: candidate.index,
                         score: (candidate.score + other.score) / 2.0,
+                        name_score: candidate.name_score.max(other.name_score),
                         distance: candidate.distance,
                     })
             })
@@ -1744,44 +2253,119 @@ const PRICED_OPERATIONS: [&str; 7] = [
     "Suggest",
 ];
 
-/// Build the catalog: a deterministic set of places in Washington DC, Seattle and
-/// Paris, spanning the administrative hierarchy (country, region, sub-region,
-/// locality, district) down to points of interest and point addresses, in two
-/// countries, with and without categories, food types, business chains, contacts,
-/// opening hours, access points and time zones.
+/// A time zone as `(name, offset, offset in seconds)`: the three members the
+/// modeled `TimeZone` carries.
+const EASTERN: (&str, &str, i64) = ("America/New_York", "-05:00", -18_000);
+/// See [`EASTERN`].
+const CENTRAL: (&str, &str, i64) = ("America/Chicago", "-06:00", -21_600);
+/// See [`EASTERN`].
+const PACIFIC: (&str, &str, i64) = ("America/Los_Angeles", "-08:00", -28_800);
+/// See [`EASTERN`].
+const CENTRAL_EUROPEAN: (&str, &str, i64) = ("Europe/Paris", "+01:00", 3_600);
+/// See [`EASTERN`].
+const EASTERN_EUROPEAN: (&str, &str, i64) = ("Europe/Kyiv", "+02:00", 7_200);
+
+/// A US administrative area, down to the locality: the country is the same for
+/// every US record, so only the levels below it are named here.
+fn us_area(
+    region_code: &str,
+    region_name: &str,
+    sub_region_name: &str,
+    locality: &str,
+    postal_code: &str,
+) -> AddressRecord {
+    AddressRecord {
+        country_code2: "US".to_string(),
+        country_code3: "USA".to_string(),
+        country_name: "United States".to_string(),
+        region_code: region_code.to_string(),
+        region_name: region_name.to_string(),
+        sub_region_name: sub_region_name.to_string(),
+        locality: locality.to_string(),
+        district: None,
+        // A locality's own postal code is the central one of the settlement; a
+        // street address inside it carries the code of that street
+        // (see [`street_in`]).
+        postal_code: postal_code.to_string(),
+        street: None,
+        address_number: None,
+        language: "en".to_string(),
+    }
+}
+
+/// A street address inside an administrative `area`: the same administrative
+/// levels, plus the street line, the district it sits in and the postal code of
+/// that street. An empty `number` is a street with no address number on it.
+fn street_in(
+    area: &AddressRecord,
+    number: &str,
+    street: &str,
+    postal_code: &str,
+    district: Option<&str>,
+) -> AddressRecord {
+    AddressRecord {
+        address_number: (!number.is_empty()).then(|| number.to_string()),
+        street: Some(street.to_string()),
+        postal_code: postal_code.to_string(),
+        district: district.map(str::to_string),
+        ..area.clone()
+    }
+}
+
+/// Build the catalog: a deterministic set of places spanning the administrative
+/// hierarchy (country, region, sub-region, locality, district) down to points of
+/// interest and point addresses, across several countries and regions, with and
+/// without categories, food types, business chains, contacts, opening hours,
+/// access points and time zones.
 ///
-/// The administrative levels are seeded because a structured query resolves at the
-/// granularity of the component it supplies ([`COMPONENT_GRANULARITY`]): a query
-/// for a country must be able to answer with that country. The catalog holds no
-/// place at postal-code granularity, so a structured postal-code query answers with
-/// no items rather than with a place of the wrong granularity.
+/// What the catalog has to COVER follows from what the operations are asked:
+///
+/// * Landmarks and addresses in more than one country and region, because Geocode
+///   "converts a textual address or place into geographic coordinates" over AWS's
+///   own global place data, and a query for a landmark is answered from it.
+/// * HOMONYMOUS names in different countries (Paris, France and Paris, Texas), so
+///   `Filter.IncludeCountries` — documented as the way to disambiguate — has an
+///   in-country match to SELECT and not only matches to exclude.
+/// * A record at every level the model's `PlaceType` enum names, because
+///   `Filter.IncludePlaceTypes` selects among them and a structured query resolves
+///   at the granularity of the component it supplies ([`COMPONENT_GRANULARITY`]).
+/// * SEVERAL places per business chain and per category inside one area, so a page
+///   of N results and a category search have something to fill them with.
+/// * Places at VARIED distances around each anchor position, so a `QueryRadius`
+///   selects between them rather than returning the same handful at every radius.
+/// * The positions the operations are expected to resolve, because ReverseGeocode
+///   answers out of the places that COVER the queried point and nothing else.
+/// * A disputed territory, whose attribution a `PoliticalView` changes.
+///
+/// The catalog holds no place at postal-code granularity, so a structured
+/// postal-code query answers with no items rather than with a place of the wrong
+/// granularity.
 ///
 /// The category ids and names are this catalog's own: the model carries no
 /// enumeration of AWS's place categories, only the `Category` structure shape.
 fn seed_catalog() -> ComAmazonawsGeoplacesPlacesserviceState {
-    let washington = AddressRecord {
-        country_code2: "US".to_string(),
-        country_code3: "USA".to_string(),
-        country_name: "United States".to_string(),
-        region_code: "DC".to_string(),
-        region_name: "District of Columbia".to_string(),
-        sub_region_name: "District of Columbia".to_string(),
-        locality: "Washington".to_string(),
-        district: None,
-        // The locality's primary postal code: the central ZIP of the city.
-        postal_code: "20001".to_string(),
-        street: None,
-        address_number: None,
-        language: "en".to_string(),
-    };
-    let seattle = AddressRecord {
-        region_code: "WA".to_string(),
-        region_name: "Washington".to_string(),
-        sub_region_name: "King County".to_string(),
-        locality: "Seattle".to_string(),
-        postal_code: "98104".to_string(),
-        ..washington.clone()
-    };
+    // --- United States ------------------------------------------------------
+    let washington = us_area(
+        "DC",
+        "District of Columbia",
+        "District of Columbia",
+        "Washington",
+        "20001",
+    );
+    let seattle = us_area("WA", "Washington", "King County", "Seattle", "98104");
+    let san_francisco = us_area(
+        "CA",
+        "California",
+        "San Francisco County",
+        "San Francisco",
+        "94103",
+    );
+    let new_york = us_area("NY", "New York", "New York County", "New York", "10007");
+    // The US homonym of Paris, France: a different country's place of the same
+    // name, which is what an `IncludeCountries` filter is documented to pick out.
+    let paris_texas = us_area("TX", "Texas", "Lamar County", "Paris", "75460");
+
+    // --- France -------------------------------------------------------------
     let paris = AddressRecord {
         country_code2: "FR".to_string(),
         country_code3: "FRA".to_string(),
@@ -1794,27 +2378,72 @@ fn seed_catalog() -> ComAmazonawsGeoplacesPlacesserviceState {
         language: "fr".to_string(),
         ..washington.clone()
     };
-    // The administrative levels above a locality name no settlement of their own.
-    let united_states = AddressRecord {
+
+    // --- Ukraine, and the territory a political view reattributes ------------
+    let ukraine = AddressRecord {
+        country_code2: "UA".to_string(),
+        country_code3: "UKR".to_string(),
+        country_name: "Ukraine".to_string(),
         region_code: String::new(),
         region_name: String::new(),
         sub_region_name: String::new(),
         locality: String::new(),
         postal_code: String::new(),
+        language: "uk".to_string(),
         ..washington.clone()
     };
-    let france = AddressRecord {
-        region_code: String::new(),
-        region_name: String::new(),
-        sub_region_name: String::new(),
-        locality: String::new(),
-        postal_code: String::new(),
-        ..paris.clone()
+    // Crimea as the default (Ukrainian) view attributes it, and as the Russian
+    // political view does: "the political view applies to the results of the
+    // request to represent unresolved territorial claims through the point of
+    // view of the specified country" (`CountryCode`).
+    let crimea_ukraine = AddressRecord {
+        region_code: "43".to_string(),
+        region_name: "Crimea".to_string(),
+        ..ukraine.clone()
+    };
+    let crimea_russia = AddressRecord {
+        country_code2: "RU".to_string(),
+        country_code3: "RUS".to_string(),
+        country_name: "Russia".to_string(),
+        region_code: "CR".to_string(),
+        region_name: "Crimea".to_string(),
+        language: "ru".to_string(),
+        ..crimea_ukraine.clone()
+    };
+    let simferopol_ukraine = AddressRecord {
+        sub_region_name: "Simferopol".to_string(),
+        locality: "Simferopol".to_string(),
+        postal_code: "95000".to_string(),
+        ..crimea_ukraine.clone()
+    };
+    let simferopol_russia = AddressRecord {
+        sub_region_name: "Simferopol".to_string(),
+        locality: "Simferopol".to_string(),
+        postal_code: "95000".to_string(),
+        ..crimea_russia.clone()
     };
 
-    let eastern = ("America/New_York", "-05:00", -18_000);
-    let pacific = ("America/Los_Angeles", "-08:00", -28_800);
-    let central_european = ("Europe/Paris", "+01:00", 3_600);
+    // The administrative levels above a locality name no settlement of their own.
+    let sub_region_of = |area: &AddressRecord| AddressRecord {
+        locality: String::new(),
+        postal_code: String::new(),
+        ..area.clone()
+    };
+    let above_locality = |area: &AddressRecord| AddressRecord {
+        sub_region_name: String::new(),
+        ..sub_region_of(area)
+    };
+    let above_region = |area: &AddressRecord| AddressRecord {
+        region_code: String::new(),
+        region_name: String::new(),
+        ..above_locality(area)
+    };
+    let united_states = above_region(&washington);
+    let france = above_region(&paris);
+
+    let eastern = EASTERN;
+    let pacific = PACIFIC;
+    let central_european = CENTRAL_EUROPEAN;
 
     let mut places = vec![
         PlaceRecord::new(
@@ -1998,6 +2627,7 @@ fn seed_catalog() -> ComAmazonawsGeoplacesPlacesserviceState {
             },
             POINT_EXTENT_M,
         )
+        .with_alternate_names(&["Eiffel Tower"])
         .with_categories(&[
             ("tourist_attraction", "Tourist Attraction"),
             ("monument", "Monument"),
@@ -2095,8 +2725,391 @@ fn seed_catalog() -> ComAmazonawsGeoplacesPlacesserviceState {
         ),
     ];
 
-    for place in &mut places {
+    // --- Washington DC: a second city with a coffee shop, so a category search
+    // --- is not answered out of one city alone.
+    places.push(
+        PlaceRecord::new(
+            "Compass Coffee",
+            PLACE_TYPE_POINT_OF_INTEREST,
+            [-77.021_100, 38.902_500],
+            street_in(&washington, "1535", "7th St NW", "20001", Some("Shaw")),
+            POINT_EXTENT_M,
+        )
+        .with_categories(&[("coffee_shop", "Coffee Shop")])
+        .with_food_types(&["Coffee"])
+        .with_business_chains(&["Compass Coffee"])
+        .with_contacts(&["+1 202-838-3139"], &["https://www.compasscoffee.com"])
+        .with_opening_hours(&["Mon-Sun: 07:00 - 19:00"])
+        .in_time_zone(eastern),
+    );
+
+    // --- Seattle: density. Three records sit within 40 m of the Space Needle and
+    // --- two more between 40 m and 85 m, so widening a `QueryRadius` selects
+    // --- between them; four coffee shops sit inside downtown and two outside it,
+    // --- so a `BoundingBox` does too; and the chain has several stores, so a page
+    // --- of N results can hold N.
+    places.extend([
+        PlaceRecord::new(
+            "Seattle Center Monorail",
+            PLACE_TYPE_POINT_OF_INTEREST,
+            [-122.349_780, 47.620_600],
+            street_in(
+                &seattle,
+                "370",
+                "Thomas St",
+                "98109",
+                Some("Lower Queen Anne"),
+            ),
+            POINT_EXTENT_M,
+        )
+        .with_alternate_names(&["Seattle Center Monorail Station"])
+        .with_categories(&[("transit_station", "Transit Station")])
+        .with_opening_hours(&["Mon-Sun: 07:30 - 23:00"])
+        .in_time_zone(pacific),
+        PlaceRecord::new(
+            "Chihuly Garden and Glass",
+            PLACE_TYPE_POINT_OF_INTEREST,
+            [-122.350_245, 47.620_400],
+            street_in(
+                &seattle,
+                "305",
+                "Harrison St",
+                "98109",
+                Some("Lower Queen Anne"),
+            ),
+            POINT_EXTENT_M,
+        )
+        .with_categories(&[("museum", "Museum"), ("tourist_attraction", "Tourist Attraction")])
+        .with_contacts(&["+1 206-753-4940"], &["https://www.chihulygardenandglass.com"])
+        .with_opening_hours(&["Mon-Sun: 10:00 - 19:00"])
+        .in_time_zone(pacific),
+        PlaceRecord::new(
+            "Seattle Center Armory",
+            PLACE_TYPE_POINT_OF_INTEREST,
+            [-122.349_600, 47.621_200],
+            street_in(
+                &seattle,
+                "305",
+                "Harrison St",
+                "98109",
+                Some("Lower Queen Anne"),
+            ),
+            POINT_EXTENT_M,
+        )
+        .with_categories(&[("food_court", "Food Court")])
+        .with_opening_hours(&["Mon-Sun: 07:00 - 21:00"])
+        .in_time_zone(pacific),
+        PlaceRecord::new(
+            "Starbucks",
+            PLACE_TYPE_POINT_OF_INTEREST,
+            [-122.340_622, 47.610_100],
+            street_in(&seattle, "1912", "Pike Pl", "98101", Some("Downtown")),
+            POINT_EXTENT_M,
+        )
+        .with_categories(&[("coffee_shop", "Coffee Shop")])
+        .with_food_types(&["Coffee"])
+        .with_business_chains(&["Starbucks"])
+        .with_contacts(&["+1 206-448-8762"], &["https://www.starbucks.com"])
+        .with_opening_hours(&["Mon-Sun: 06:00 - 21:00"])
+        .in_time_zone(pacific),
+        PlaceRecord::new(
+            "Starbucks",
+            PLACE_TYPE_POINT_OF_INTEREST,
+            [-122.339_500, 47.608_200],
+            street_in(&seattle, "102", "Pike St", "98101", Some("Downtown")),
+            POINT_EXTENT_M,
+        )
+        .with_categories(&[("coffee_shop", "Coffee Shop")])
+        .with_food_types(&["Coffee"])
+        .with_business_chains(&["Starbucks"])
+        .with_opening_hours(&["Mon-Sun: 05:30 - 20:00"])
+        .in_time_zone(pacific),
+        PlaceRecord::new(
+            "Starbucks",
+            PLACE_TYPE_POINT_OF_INTEREST,
+            [-122.330_600, 47.604_400],
+            street_in(&seattle, "701", "5th Ave", "98104", Some("Downtown")),
+            POINT_EXTENT_M,
+        )
+        .with_categories(&[("coffee_shop", "Coffee Shop")])
+        .with_food_types(&["Coffee"])
+        .with_business_chains(&["Starbucks"])
+        .with_opening_hours(&["Mon-Fri: 05:00 - 18:00"])
+        .in_time_zone(pacific),
+        PlaceRecord::new(
+            "Seattle Coffee Works",
+            PLACE_TYPE_POINT_OF_INTEREST,
+            [-122.341_900, 47.609_600],
+            street_in(&seattle, "107", "Pike St", "98101", Some("Downtown")),
+            POINT_EXTENT_M,
+        )
+        .with_categories(&[("coffee_shop", "Coffee Shop")])
+        .with_food_types(&["Coffee"])
+        .with_contacts(&["+1 206-340-8867"], &["https://seattlecoffeeworks.com"])
+        .with_opening_hours(&["Mon-Sun: 07:00 - 18:00"])
+        .in_time_zone(pacific),
+        PlaceRecord::new(
+            "Victrola Coffee Roasters",
+            PLACE_TYPE_POINT_OF_INTEREST,
+            [-122.312_900, 47.614_900],
+            street_in(&seattle, "310", "E Pike St", "98122", Some("Capitol Hill")),
+            POINT_EXTENT_M,
+        )
+        .with_categories(&[("coffee_shop", "Coffee Shop")])
+        .with_food_types(&["Coffee"])
+        .with_opening_hours(&["Mon-Sun: 06:30 - 19:00"])
+        .in_time_zone(pacific),
+    ]);
+
+    // --- San Francisco, California: a landmark, its city and the levels above it.
+    places.extend([
+        PlaceRecord::new(
+            "Golden Gate Bridge",
+            PLACE_TYPE_POINT_OF_INTEREST,
+            [-122.478_255, 37.819_929],
+            street_in(
+                &san_francisco,
+                "",
+                "Golden Gate Brg",
+                "94129",
+                Some("Presidio"),
+            ),
+            POINT_EXTENT_M,
+        )
+        .with_categories(&[("tourist_attraction", "Tourist Attraction"), ("bridge", "Bridge")])
+        .with_contacts(&["+1 415-921-5858"], &["https://www.goldengate.org"])
+        .with_access_points(&[[-122.477_700, 37.807_700]])
+        .in_time_zone(pacific),
+        PlaceRecord::new(
+            "Pier 39",
+            PLACE_TYPE_POINT_OF_INTEREST,
+            [-122.409_600, 37.808_600],
+            street_in(
+                &san_francisco,
+                "",
+                "The Embarcadero",
+                "94133",
+                Some("Fisherman's Wharf"),
+            ),
+            POINT_EXTENT_M,
+        )
+        .with_categories(&[("tourist_attraction", "Tourist Attraction"), ("market", "Market")])
+        .with_opening_hours(&["Mon-Sun: 10:00 - 21:00"])
+        .in_time_zone(pacific),
+        PlaceRecord::new(
+            "Blue Bottle Coffee",
+            PLACE_TYPE_POINT_OF_INTEREST,
+            [-122.402_000, 37.776_400],
+            street_in(
+                &san_francisco,
+                "66",
+                "Mint St",
+                "94103",
+                Some("South of Market"),
+            ),
+            POINT_EXTENT_M,
+        )
+        .with_categories(&[("coffee_shop", "Coffee Shop")])
+        .with_food_types(&["Coffee"])
+        .with_business_chains(&["Blue Bottle Coffee"])
+        .with_opening_hours(&["Mon-Sun: 07:00 - 17:00"])
+        .in_time_zone(pacific),
+        PlaceRecord::new(
+            "San Francisco",
+            PLACE_TYPE_LOCALITY,
+            [-122.419_416, 37.774_929],
+            san_francisco.clone(),
+            LOCALITY_EXTENT_M,
+        )
+        .in_time_zone(pacific),
+        PlaceRecord::new(
+            "San Francisco County",
+            PLACE_TYPE_SUB_REGION,
+            [-122.431_297, 37.773_972],
+            sub_region_of(&san_francisco),
+            SUB_REGION_EXTENT_M,
+        )
+        .in_time_zone(pacific),
+        PlaceRecord::new(
+            "California",
+            PLACE_TYPE_REGION,
+            [-119.681_564, 36.116_203],
+            above_locality(&san_francisco),
+            REGION_EXTENT_M,
+        )
+        .in_time_zone(pacific),
+    ]);
+
+    // --- New York: the positions a reverse geocode of this coast resolves to.
+    places.extend([
+        PlaceRecord::new(
+            "Statue of Liberty",
+            PLACE_TYPE_POINT_OF_INTEREST,
+            [-74.044_500, 40.689_200],
+            street_in(&new_york, "", "Liberty Island", "10004", None),
+            POINT_EXTENT_M,
+        )
+        .with_categories(&[("monument", "Monument"), ("tourist_attraction", "Tourist Attraction")])
+        .with_contacts(&["+1 212-363-3200"], &["https://www.nps.gov/stli"])
+        .with_opening_hours(&["Mon-Sun: 09:00 - 17:00"])
+        .with_access_points(&[[-74.044_300, 40.690_200]])
+        .in_time_zone(eastern),
+        PlaceRecord::new(
+            "Empire State Building",
+            PLACE_TYPE_POINT_OF_INTEREST,
+            [-73.985_664, 40.748_817],
+            street_in(&new_york, "20", "W 34th St", "10001", Some("Manhattan")),
+            POINT_EXTENT_M,
+        )
+        .with_categories(&[
+            ("tourist_attraction", "Tourist Attraction"),
+            ("observation_deck", "Observation Deck"),
+        ])
+        .with_contacts(&["+1 212-736-3100"], &["https://www.esbnyc.com"])
+        .with_opening_hours(&["Mon-Sun: 09:00 - 24:00"])
+        .in_time_zone(eastern),
+        PlaceRecord::new(
+            "Manhattan",
+            PLACE_TYPE_DISTRICT,
+            [-73.971_200, 40.783_100],
+            AddressRecord {
+                district: Some("Manhattan".to_string()),
+                postal_code: "10024".to_string(),
+                ..new_york.clone()
+            },
+            DISTRICT_EXTENT_M,
+        )
+        .in_time_zone(eastern),
+        PlaceRecord::new(
+            "New York",
+            PLACE_TYPE_LOCALITY,
+            [-74.006_000, 40.712_800],
+            new_york.clone(),
+            LOCALITY_EXTENT_M,
+        )
+        .in_time_zone(eastern),
+        PlaceRecord::new(
+            "New York County",
+            PLACE_TYPE_SUB_REGION,
+            [-73.971_200, 40.776_700],
+            sub_region_of(&new_york),
+            SUB_REGION_EXTENT_M,
+        )
+        .in_time_zone(eastern),
+        PlaceRecord::new(
+            "New York",
+            PLACE_TYPE_REGION,
+            [-75.421_000, 42.945_900],
+            above_locality(&new_york),
+            REGION_EXTENT_M,
+        )
+        .in_time_zone(eastern),
+    ]);
+
+    // --- Paris, Texas: the US homonym of Paris, France, and the levels above it.
+    places.extend([
+        PlaceRecord::new(
+            "Paris",
+            PLACE_TYPE_LOCALITY,
+            [-95.555_513, 33.660_942],
+            paris_texas.clone(),
+            LOCALITY_EXTENT_M,
+        )
+        .in_time_zone(CENTRAL),
+        PlaceRecord::new(
+            "Lamar County",
+            PLACE_TYPE_SUB_REGION,
+            [-95.571_000, 33.666_000],
+            sub_region_of(&paris_texas),
+            SUB_REGION_EXTENT_M,
+        )
+        .in_time_zone(CENTRAL),
+        PlaceRecord::new(
+            "Texas",
+            PLACE_TYPE_REGION,
+            [-99.901_813, 31.968_599],
+            above_locality(&paris_texas),
+            REGION_EXTENT_M,
+        )
+        .in_time_zone(CENTRAL),
+    ]);
+
+    // --- France: a landmark known by another name, and a category in a second
+    // --- country.
+    places.extend([
+        PlaceRecord::new(
+            "Musee du Louvre",
+            PLACE_TYPE_POINT_OF_INTEREST,
+            [2.337_644, 48.860_611],
+            street_in(&paris, "", "Rue de Rivoli", "75001", Some("1er Arrondissement")),
+            POINT_EXTENT_M,
+        )
+        .with_alternate_names(&["Louvre Museum", "The Louvre"])
+        .with_categories(&[("museum", "Museum"), ("tourist_attraction", "Tourist Attraction")])
+        .with_contacts(&["+33 1 40 20 53 17"], &["https://www.louvre.fr"])
+        .with_opening_hours(&["Wed-Mon: 09:00 - 18:00"])
+        .in_time_zone(central_european),
+        PlaceRecord::new(
+            "Cafe de Flore",
+            PLACE_TYPE_POINT_OF_INTEREST,
+            [2.332_900, 48.854_100],
+            street_in(
+                &paris,
+                "172",
+                "Bd Saint-Germain",
+                "75006",
+                Some("6e Arrondissement"),
+            ),
+            POINT_EXTENT_M,
+        )
+        .with_categories(&[("coffee_shop", "Coffee Shop"), ("restaurant", "Restaurant")])
+        .with_food_types(&["Coffee", "French"])
+        .with_contacts(&["+33 1 45 48 55 26"], &["https://cafedeflore.fr"])
+        .with_opening_hours(&["Mon-Sun: 07:30 - 01:30"])
+        .in_time_zone(central_european),
+    ]);
+
+    // --- A disputed territory: the records whose attribution a `PoliticalView`
+    // --- changes, plus the country the default view attributes them to.
+    places.extend([
+        PlaceRecord::new(
+            "Crimea",
+            PLACE_TYPE_REGION,
+            [34.100_000, 45.300_000],
+            crimea_ukraine,
+            REGION_EXTENT_M,
+        )
+        .with_political_attribution("RUS", crimea_russia)
+        .in_time_zone(EASTERN_EUROPEAN),
+        PlaceRecord::new(
+            "Simferopol",
+            PLACE_TYPE_LOCALITY,
+            [34.102_417, 44.952_117],
+            simferopol_ukraine,
+            LOCALITY_EXTENT_M,
+        )
+        .with_political_attribution("RUS", simferopol_russia)
+        .in_time_zone(EASTERN_EUROPEAN),
+        PlaceRecord::new(
+            "Ukraine",
+            PLACE_TYPE_COUNTRY,
+            [31.165_581, 48.379_433],
+            ukraine,
+            COUNTRY_EXTENT_M,
+        )
+        .in_time_zone(EASTERN_EUROPEAN),
+    ]);
+
+    // The derived fields: what each record is FOUND by, and how much of the
+    // catalog it covers (both computed once, from the records themselves).
+    let positions: Vec<[f64; 2]> = places.iter().map(|place| place.position).collect();
+    for (index, place) in places.iter_mut().enumerate() {
         place.search_terms = index_terms(place);
+        place.places_covered = positions
+            .iter()
+            .enumerate()
+            .filter(|(other, position)| *other != index && place.covers(**position))
+            .count();
     }
 
     let place_index = places
@@ -2171,6 +3184,53 @@ mod tests {
             (111_000..=111_400).contains(&degree),
             "case one-degree-of-latitude: expected ~111.2 km, got {degree} m"
         );
+    }
+
+    /// Every entry of the hand-carried ISO 3166-1 register is well formed, listed
+    /// once, and resolvable from either of its forms; a code the register assigns
+    /// to no country resolves to nothing.
+    ///
+    /// The checked entries are ones no request in this service's issues names, so
+    /// the table is a register and not a list fitted to a recorded value.
+    #[test]
+    fn the_country_code_register_is_well_formed() {
+        let mut alpha2: Vec<&str> = ISO_3166_1_COUNTRIES.iter().map(|(code, _)| *code).collect();
+        let mut alpha3: Vec<&str> = ISO_3166_1_COUNTRIES.iter().map(|(_, code)| *code).collect();
+        for (code, length) in [(&mut alpha2, 2_usize), (&mut alpha3, 3)] {
+            for entry in code.iter() {
+                assert!(
+                    entry.len() == length
+                        && entry.chars().all(|character| character.is_ascii_uppercase()),
+                    "case {entry}: every code is {length} uppercase ASCII letters"
+                );
+            }
+            let listed = code.len();
+            code.sort_unstable();
+            code.dedup();
+            assert_eq!(
+                code.len(),
+                listed,
+                "case duplicates: a country is listed once, got {listed} entries and \
+                 {} distinct codes",
+                code.len()
+            );
+        }
+
+        for (alpha2, alpha3) in [("NZ", "NZL"), ("MA", "MAR"), ("IN", "IND"), ("KM", "COM")] {
+            assert_eq!(
+                (country_alpha3(alpha2), country_alpha3(alpha3)),
+                (Some(alpha3), Some(alpha3)),
+                "case {alpha2}: both forms of a country resolve to its alpha-3 code"
+            );
+        }
+        for unassigned in ["ZZ", "ZZZ", "XX", "QQQ"] {
+            assert!(
+                country_alpha3(unassigned).is_none(),
+                "case {unassigned}: a code the register assigns to no country resolves \
+                 to nothing, got {:?}",
+                country_alpha3(unassigned)
+            );
+        }
     }
 
     /// A page token resumes only the operation and query that issued it.

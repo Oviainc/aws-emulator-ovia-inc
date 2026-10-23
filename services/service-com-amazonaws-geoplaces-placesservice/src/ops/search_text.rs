@@ -228,20 +228,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             (Some(text), None) => text,
             (None, None) => {
                 return Err(SearchTextErrorModeled::ValidationException(
-                    crate::state::validation_exception(
+                    crate::state::validation_exception_for(
                         crate::state::REASON_MISSING,
-                        "QueryText",
-                        "exactly one of QueryText or QueryId must be set",
+                        &["QueryText", "QueryId"],
+                        crate::state::at_least_one_of(&["QueryText", "QueryId"]),
                     ),
                 )
                 .into())
             }
             (Some(_), Some(_)) => {
                 return Err(SearchTextErrorModeled::ValidationException(
-                    crate::state::validation_exception(
+                    crate::state::validation_exception_for(
                         crate::state::REASON_OTHER,
-                        "QueryId",
-                        "QueryText and QueryId are mutually exclusive; set exactly one",
+                        &["QueryText", "QueryId"],
+                        crate::state::only_one_of(&["QueryText", "QueryId"]),
                     ),
                 )
                 .into())
@@ -251,7 +251,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     crate::state::validation_exception(
                         crate::state::REASON_CANNOT_PARSE,
                         "QueryId",
-                        "QueryId is not a query identifier issued by this service",
+                        crate::state::must_be_valid_id("QueryId"),
                     ),
                 )
                 .into())
@@ -271,7 +271,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         crate::state::validation_exception(
                             crate::state::REASON_FIELD_VALIDATION_FAILED,
                             "BiasPosition",
-                            "BiasPosition must hold exactly two values, [longitude, latitude]",
+                            crate::state::must_be_length("BiasPosition", values.len(), 2),
                         ),
                     )
                     .into())
@@ -287,11 +287,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             + usize::from(circle.is_some());
         if areas > 1 {
             return Err(SearchTextErrorModeled::ValidationException(
-                crate::state::validation_exception(
+                crate::state::validation_exception_for(
                     crate::state::REASON_OTHER,
-                    "BiasPosition",
-                    "BiasPosition, Filter.BoundingBox and Filter.Circle are mutually \
-                     exclusive; set at most one",
+                    &["BiasPosition", "Filter.BoundingBox", "Filter.Circle"],
+                    crate::state::only_one_of(&[
+                        "BiasPosition",
+                        "Filter.BoundingBox",
+                        "Filter.Circle",
+                    ]),
                 ),
             )
             .into());
@@ -310,8 +313,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     crate::state::validation_exception(
                         crate::state::REASON_FIELD_VALIDATION_FAILED,
                         "Filter.BoundingBox",
-                        "BoundingBox must hold exactly four values, \
-                         [west, south, east, north]",
+                        crate::state::must_be_length(
+                            "Filter.BoundingBox",
+                            values.len(),
+                            4,
+                        ),
                     ),
                 )
                 .into());
@@ -324,7 +330,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     crate::state::validation_exception(
                         crate::state::REASON_FIELD_VALIDATION_FAILED,
                         "Filter.Circle.Center",
-                        "Center must hold exactly two values, [longitude, latitude]",
+                        crate::state::must_be_length(
+                            "Filter.Circle.Center",
+                            circle.center.len(),
+                            2,
+                        ),
                     ),
                 )
                 .into());
@@ -397,8 +407,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             crate::state::validation_exception(
                                 crate::state::REASON_CANNOT_PARSE,
                                 "NextToken",
-                                "NextToken is not a pagination token issued by a previous \
-                                 SearchText call with the same parameters",
+                                crate::state::must_be_valid_token("NextToken"),
                             ),
                         )
                         .into())
@@ -421,12 +430,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let features = input.additional_features.as_deref().unwrap_or_default();
         let wants = |feature: &str| features.iter().any(|asked| asked == feature);
-        let political_view = match state.political_view(input.political_view.as_deref()) {
+        let political_view = match crate::state::resolve_political_view(
+            input.political_view.as_deref(),
+        ) {
             Ok(political_view) => political_view,
             Err(invalid) => {
                 return Err(SearchTextErrorModeled::ValidationException(invalid).into())
             }
         };
+        let view = political_view.as_deref();
 
         let result_items = page
             .items
@@ -436,8 +448,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 SearchTextResultItem {
                     place_id: place.place_id.clone(),
                     place_type: place.place_type.clone(),
-                    title: place.title_modeled(),
-                    address: Some(place.address_modeled()),
+                    title: place.title_modeled_in(view),
+                    address: Some(place.address_modeled_in(view)),
                     position: Some(place.position_modeled()),
                     distance: candidate.distance,
                     map_view: Some(place.map_view_modeled()),

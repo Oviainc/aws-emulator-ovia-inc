@@ -261,7 +261,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::validation_exception(
                     crate::state::REASON_CANNOT_PARSE,
                     "PlaceId",
-                    "PlaceId is not a place identifier issued by this service",
+                    crate::state::must_be_valid_id("PlaceId"),
                 ),
             )
             .into());
@@ -269,19 +269,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let features = input.additional_features.as_deref().unwrap_or_default();
         let wants = |feature: &str| features.iter().any(|asked| asked == feature);
-        let political_view = match state.political_view(input.political_view.as_deref()) {
+        let political_view = match crate::state::resolve_political_view(
+            input.political_view.as_deref(),
+        ) {
             Ok(political_view) => political_view,
             Err(invalid) => {
                 return Err(GetPlaceErrorModeled::ValidationException(invalid).into())
             }
         };
+        let view = political_view.as_deref();
 
         Ok(GetPlaceOutput {
             place_id: place.place_id.clone(),
             place_type: place.place_type.clone(),
-            title: place.title_modeled(),
+            title: place.title_modeled_in(view),
             pricing_bucket: state.pricing_bucket(Self::NAME, input.intended_use.as_deref()),
-            address: Some(place.address_modeled()),
+            address: Some(place.address_modeled_in(view)),
             position: Some(place.position_modeled()),
             map_view: Some(place.map_view_modeled()),
             categories: place.categories_modeled(),

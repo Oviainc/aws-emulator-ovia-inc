@@ -221,16 +221,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::validation_exception(
                     crate::state::REASON_FIELD_VALIDATION_FAILED,
                     "QueryPosition",
-                    "QueryPosition must hold exactly two values, [longitude, latitude]",
+                    crate::state::must_be_length(
+                        "QueryPosition",
+                        input.query_position.len(),
+                        2,
+                    ),
                 ),
             )
             .into());
         };
 
-        // With a radius, every place within it; without one, no distance bound — so
-        // the nearest places, which with the modeled default of one result is the
-        // single nearest place.
-        let mut candidates = state.nearby(query_position, input.query_radius);
+        // With a radius, every place within it; without one, the places that
+        // COVER the queried position — resolving a position answers out of the
+        // places at that point, and out of nothing else.
+        let mut candidates = state.at_position(query_position, input.query_radius);
 
         if let Some(filter) = input.filter.as_ref() {
             if let Some(place_types) =
@@ -249,12 +253,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let features = input.additional_features.as_deref().unwrap_or_default();
         let wants = |feature: &str| features.iter().any(|asked| asked == feature);
-        let political_view = match state.political_view(input.political_view.as_deref()) {
+        let political_view = match crate::state::resolve_political_view(
+            input.political_view.as_deref(),
+        ) {
             Ok(political_view) => political_view,
             Err(invalid) => {
                 return Err(ReverseGeocodeErrorModeled::ValidationException(invalid).into())
             }
         };
+        let view = political_view.as_deref();
 
         let result_items = candidates
             .iter()
@@ -263,8 +270,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ReverseGeocodeResultItem {
                     place_id: place.place_id.clone(),
                     place_type: place.place_type.clone(),
-                    title: place.title_modeled(),
-                    address: Some(place.address_modeled()),
+                    title: place.title_modeled_in(view),
+                    address: Some(place.address_modeled_in(view)),
                     position: Some(place.position_modeled()),
                     distance: candidate.distance,
                     map_view: Some(place.map_view_modeled()),

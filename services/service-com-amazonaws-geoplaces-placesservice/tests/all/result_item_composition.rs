@@ -36,7 +36,7 @@ fn place(emulator: &Emulator, name: &str, place_type: &str) -> Place {
 }
 
 /// One result item's `Address`, or `Value::Null` when it carries none.
-fn address(item: &Value) -> Value {
+pub(crate) fn address(item: &Value) -> Value {
     item.get("Address").cloned().unwrap_or(Value::Null)
 }
 
@@ -73,7 +73,7 @@ fn parsed_address(item: &Value) -> Value {
 }
 
 /// The titles a response returned, in order.
-fn titles(body: &Value) -> Vec<String> {
+pub(crate) fn titles(body: &Value) -> Vec<String> {
     items(body)
         .iter()
         .map(|item| text(item, "Title"))
@@ -693,14 +693,47 @@ async fn a_structured_query_resolves_at_its_finest_components_granularity() {
 async fn search_text_answers_only_the_places_its_query_names() {
     let emulator = Emulator::new();
     let rows: Vec<(&str, &str, Vec<&str>)> = vec![
-        ("brand", "Starbucks", vec!["Starbucks Reserve Roastery"]),
+        (
+            // The chain has several stores, and the query names the chain: every
+            // store it names, and no neighbour of one.
+            "brand",
+            "Starbucks",
+            vec![
+                "Starbucks",
+                "Starbucks",
+                "Starbucks",
+                "Starbucks Reserve Roastery",
+            ],
+        ),
         ("name", "Space Needle", vec!["Space Needle"]),
-        ("category", "Coffee", vec!["Starbucks Reserve Roastery"]),
+        (
+            // A category word is a query term: every place that IS a coffee shop,
+            // in every city the catalog holds one in.
+            "category",
+            "Coffee",
+            vec![
+                "Blue Bottle Coffee",
+                "Cafe de Flore",
+                "Compass Coffee",
+                "Seattle Coffee Works",
+                "Starbucks",
+                "Starbucks",
+                "Starbucks",
+                "Starbucks Reserve Roastery",
+                "Victrola Coffee Roasters",
+            ],
+        ),
         (
             // "Street" is the written-out form of the catalog's "St".
             "street-spelled-out",
             "Pike Street Seattle",
-            vec!["Pike Place Market", "Starbucks Reserve Roastery"],
+            vec![
+                "Pike Place Market",
+                "Seattle Coffee Works",
+                "Starbucks",
+                "Starbucks Reserve Roastery",
+                "Victrola Coffee Roasters",
+            ],
         ),
         (
             "street-and-number",

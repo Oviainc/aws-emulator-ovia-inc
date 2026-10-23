@@ -211,7 +211,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::validation_exception(
                     crate::state::REASON_FIELD_VALIDATION_FAILED,
                     "QueryPosition",
-                    "QueryPosition must hold exactly two values, [longitude, latitude]",
+                    crate::state::must_be_length(
+                        "QueryPosition",
+                        input.query_position.len(),
+                        2,
+                    ),
                 ),
             )
             .into());
@@ -228,8 +232,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     crate::state::validation_exception(
                         crate::state::REASON_FIELD_VALIDATION_FAILED,
                         "Filter.BoundingBox",
-                        "BoundingBox must hold exactly four values, \
-                         [west, south, east, north]",
+                        crate::state::must_be_length(
+                            "Filter.BoundingBox",
+                            values.len(),
+                            4,
+                        ),
                     ),
                 )
                 .into());
@@ -311,8 +318,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             crate::state::validation_exception(
                                 crate::state::REASON_CANNOT_PARSE,
                                 "NextToken",
-                                "NextToken is not a pagination token issued by a previous \
-                                 SearchNearby call with the same parameters",
+                                crate::state::must_be_valid_token("NextToken"),
                             ),
                         )
                         .into())
@@ -335,12 +341,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let features = input.additional_features.as_deref().unwrap_or_default();
         let wants = |feature: &str| features.iter().any(|asked| asked == feature);
-        let political_view = match state.political_view(input.political_view.as_deref()) {
+        let political_view = match crate::state::resolve_political_view(
+            input.political_view.as_deref(),
+        ) {
             Ok(political_view) => political_view,
             Err(invalid) => {
                 return Err(SearchNearbyErrorModeled::ValidationException(invalid).into())
             }
         };
+        let view = political_view.as_deref();
 
         let result_items = page
             .items
@@ -350,8 +359,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 SearchNearbyResultItem {
                     place_id: place.place_id.clone(),
                     place_type: place.place_type.clone(),
-                    title: place.title_modeled(),
-                    address: Some(place.address_modeled()),
+                    title: place.title_modeled_in(view),
+                    address: Some(place.address_modeled_in(view)),
                     position: Some(place.position_modeled()),
                     distance: candidate.distance,
                     map_view: Some(place.map_view_modeled()),

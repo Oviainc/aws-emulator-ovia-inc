@@ -228,10 +228,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let components = supplied_components(input.query_components.as_ref());
         if query_text.is_empty() && components.is_empty() {
             return Err(GeocodeErrorModeled::ValidationException(
-                crate::state::validation_exception(
+                crate::state::validation_exception_for(
                     crate::state::REASON_MISSING,
-                    "QueryText",
-                    "either QueryText or QueryComponents must be provided",
+                    &["QueryText", "QueryComponents"],
+                    crate::state::at_least_one_of(&["QueryText", "QueryComponents"]),
                 ),
             )
             .into());
@@ -295,7 +295,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         crate::state::validation_exception(
                             crate::state::REASON_FIELD_VALIDATION_FAILED,
                             "BiasPosition",
-                            "BiasPosition must hold exactly two values, [longitude, latitude]",
+                            crate::state::must_be_length("BiasPosition", values.len(), 2),
                         ),
                     )
                     .into())
@@ -319,7 +319,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let features = input.additional_features.as_deref().unwrap_or_default();
         let wants = |feature: &str| features.iter().any(|asked| asked == feature);
-        let political_view = match state.political_view(input.political_view.as_deref()) {
+        let political_view = match crate::state::resolve_political_view(
+            input.political_view.as_deref(),
+        ) {
             Ok(political_view) => political_view,
             Err(invalid) => {
                 return Err(GeocodeErrorModeled::ValidationException(invalid).into())
@@ -352,8 +354,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 GeocodeResultItem {
                     place_id: place.place_id.clone(),
                     place_type: place.place_type.clone(),
-                    title: place.title_modeled(),
-                    address: Some(place.address_modeled()),
+                    title: place.title_modeled_in(political_view.as_deref()),
+                    address: Some(place.address_modeled_in(political_view.as_deref())),
                     position: Some(place.position_modeled()),
                     distance: candidate.distance,
                     map_view: Some(place.map_view_modeled()),

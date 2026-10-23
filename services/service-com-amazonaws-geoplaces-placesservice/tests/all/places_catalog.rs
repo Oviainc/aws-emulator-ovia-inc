@@ -224,7 +224,7 @@ pub(crate) fn distance(item: &Value) -> i64 {
 }
 
 /// `Position`, as `[longitude, latitude]`.
-fn position(item: &Value) -> Vec<f64> {
+pub(crate) fn position(item: &Value) -> Vec<f64> {
     item.get("Position")
         .and_then(Value::as_array)
         .map(|values| values.iter().filter_map(Value::as_f64).collect())
@@ -232,7 +232,7 @@ fn position(item: &Value) -> Vec<f64> {
 }
 
 /// The `PlaceId`s of a response's items, in order.
-fn place_ids(body: &Value) -> Vec<String> {
+pub(crate) fn place_ids(body: &Value) -> Vec<String> {
     items(body)
         .iter()
         .map(|item| text(item, "PlaceId"))
@@ -1377,12 +1377,19 @@ async fn requests_outside_the_contract_are_refused_with_validation_exception() {
             body: Some(json!({"QueryText": "Seattle", "Language": "e"})),
         },
         RefusalRow {
-            // Well formed against the modeled pattern, but no country this service
-            // holds place data for: refused rather than accepted and ignored.
-            case: "geocode-political-view-unresolvable",
+            // Well formed against the modeled pattern, but not a country code ISO
+            // 3166-1 assigns, so it cannot be reported in the alpha-3 form the
+            // result items model: refused rather than accepted and ignored.
+            case: "geocode-political-view-not-a-country-alpha2",
             method: "POST",
             path: "/v2/geocode".to_string(),
-            body: Some(json!({"QueryText": "Seattle", "PoliticalView": "JPN"})),
+            body: Some(json!({"QueryText": "Seattle", "PoliticalView": "ZZ"})),
+        },
+        RefusalRow {
+            case: "geocode-political-view-not-a-country-alpha3",
+            method: "POST",
+            path: "/v2/geocode".to_string(),
+            body: Some(json!({"QueryText": "Seattle", "PoliticalView": "ZZZ"})),
         },
         RefusalRow {
             // `BiasPosition` is `len 2..2`.
