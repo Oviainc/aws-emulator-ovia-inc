@@ -14,9 +14,10 @@
 //!    refusal is stated at the request boundary, where `crate::service::validation`
 //!    words it with that code rather than the generic `ValidationException` this
 //!    operation does not even model.
-//! 2. EXISTENCE — an ARN addressing no resource of this account is refused with HTTP 400
-//!    `NotFoundException` ([`crate::scaffolded::NOT_FOUND_CODE`]), the same code and
-//!    text as the other tag APIs.
+//! 2. EXISTENCE — an ARN addressing no resource of this account is refused with HTTP 404
+//!    `NotFoundException` ([`crate::scaffolded::NOT_FOUND_CODE`] /
+//!    [`crate::scaffolded::NOT_FOUND_STATUS`]), the same status, code and text as the
+//!    other tag APIs: an absent resource is reported as absent, not as a bad request.
 //!
 //! Neither code is in this operation's modelled error set (`ResourceNotFoundException`,
 //! `InternalServerException`), so both travel through `crate::scaffolded::Scaffolded`'s
