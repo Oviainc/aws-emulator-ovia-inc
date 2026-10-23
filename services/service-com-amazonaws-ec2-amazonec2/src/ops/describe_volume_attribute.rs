@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeVolumeAttribute
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeVolumeAttribute`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeVolumeAttribute::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports ONE `VolumeAttributeName` attribute of one EBS volume, read off the stored
+//! volume record: `autoEnableIO` is the boolean `ModifyVolumeAttribute` sets
+//! ([`crate::state::VolumeRecord::auto_enable_io`]), and `productCodes` the Marketplace
+//! codes propagated from the volume's source snapshot
+//! ([`crate::state::VolumeRecord::product_codes`]). A pure read: it writes nothing, so
+//! two calls in a row report the same thing.
 //!
 //! ## Shape of an operation
 //!
@@ -137,20 +135,61 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeVolumeAttribute` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeVolumeAttributeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeVolumeAttribute"))
+        use crate::state;
+
+        // "You can specify only one attribute at a time" — `Attribute` is one
+        // `VolumeAttributeName`, and the response carries only the member it names. The
+        // modelled enum constraint is already refused by the request walk before this
+        // handler runs, so this is the same belt-and-braces check `DescribeVpcAttribute`
+        // keeps: without it an attribute no result member corresponds to would be
+        // answered with a response carrying no attribute at all.
+        let attribute = input.attribute.as_str();
+        if !VOLUME_ATTRIBUTE_NAME_VALUES.contains(&attribute) {
+            return Err(state::invalid_parameter_value(format!(
+                "Value ({attribute}) for parameter attribute is invalid. \
+                 Unknown attribute."
+            )));
+        }
+
+        // Something that is not a volume id at all is refused before anything else looks
+        // at it, the way `EnableVolumeIO` orders the same rule.
+        if !state::volume_id_is_well_formed(&input.volume_id) {
+            return Err(state::invalid_volume_id_malformed(&input.volume_id));
+        }
+
+        // `DryRun` asks the PERMISSION question, so it is answered between the two halves
+        // of the volume-id rule — after a request this service cannot read at all, before
+        // the account's volumes are looked at: "If you have the required permissions, the
+        // error response is DryRunOperation" (`DryRun`). This is the ordering
+        // `EnableVolumeIO` keeps, so the crate answers a dry run one way.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        let store = state::require_service_state(&*self.engine)?;
+        let store = store.lock();
+        // "Describes the specified attribute of the specified volume": the second half of
+        // the rule, through the one definition of how this service resolves a volume id,
+        // which hands back the volume it resolved.
+        let record = state::require_volume(&store, &input.volume_id)?;
+
+        // Each member of the result reports the attribute of the same name, so only the
+        // one the request named is filled in; both are read off the stored record, so
+        // this answers what the volume holds rather than recomputing it here.
+        Ok(DescribeVolumeAttributeOutput {
+            volume_id: Some(input.volume_id.clone()),
+            auto_enable_io: (attribute == state::VOLUME_ATTRIBUTE_AUTO_ENABLE_IO).then_some(
+                AttributeBooleanValue {
+                    value: Some(record.auto_enable_io),
+                },
+            ),
+            // Reported as the list the volume carries, empty or not, rather than omitted:
+            // `productCodes` is an attribute every volume has.
+            product_codes: (attribute == state::VOLUME_ATTRIBUTE_PRODUCT_CODES)
+                .then(|| record.product_codes()),
+        })
     }
 }
+

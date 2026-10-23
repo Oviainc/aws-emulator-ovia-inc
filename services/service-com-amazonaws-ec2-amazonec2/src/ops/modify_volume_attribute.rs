@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyVolumeAttribute
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyVolumeAttribute`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifyVolumeAttribute::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Sets the `autoEnableIO` attribute of one EBS volume — the only attribute member this
+//! request carries — on the stored volume record
+//! ([`crate::state::VolumeRecord::auto_enable_io`]), which `DescribeVolumeAttribute`
+//! reports back. The volume's other members are untouched.
 //!
 //! ## Shape of an operation
 //!
@@ -153,20 +149,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyVolumeAttribute` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyVolumeAttributeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyVolumeAttribute"))
+        use crate::state;
+
+        // `AutoEnableIO` is the one attribute member of this request, so the request
+        // itself is the modification to apply — and a request that carries no attribute
+        // names nothing to modify.
+        let Some(requested) = input.auto_enable_io.as_ref() else {
+            return Err(state::missing_parameter(format!(
+                "The request must name an attribute to modify: {}",
+                state::VOLUME_ATTRIBUTE_AUTO_ENABLE_IO
+            )));
+        };
+        // An `AttributeBooleanValue` carries one optional `Value`: the attribute named
+        // without one says nothing about what to set it to. Defensive — over ec2Query a
+        // `Value`-less `AutoEnableIO` cannot be expressed (an empty field is refused as
+        // malformed input by the request walk) — but this is the refusal that belongs to
+        // the case, not a 501 or a silent no-op.
+        let Some(value) = requested.value else {
+            return Err(state::missing_parameter(format!(
+                "The parameter {} must have a value",
+                state::VOLUME_ATTRIBUTE_AUTO_ENABLE_IO
+            )));
+        };
+
+        // Something that is not a volume id at all is refused before anything else looks
+        // at it, the way `EnableVolumeIO` orders the same rule.
+        if !state::volume_id_is_well_formed(&input.volume_id) {
+            return Err(state::invalid_volume_id_malformed(&input.volume_id));
+        }
+
+        // `DryRun` asks the PERMISSION question, so it sits between the two halves of the
+        // volume-id rule and before the write: a request that would have succeeded writes
+        // nothing. The same ordering `EnableVolumeIO` and `DescribeVolumeAttribute` keep.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        let store = state::require_service_state(&*self.engine)?;
+        let mut store = store.lock();
+        // "Modifies a volume attribute": the second half of the volume-id rule, through
+        // the one definition of how this service resolves a volume id, in ONE lookup.
+        let record = state::require_volume_mut(&mut store, &input.volume_id)?;
+
+        // One write, after every refusal, touching only the attribute this request names.
+        record.auto_enable_io = value;
+        Ok(ModifyVolumeAttributeOutput)
     }
 }
+

@@ -600,7 +600,7 @@ use crate::ops::types::{
     NetworkInsightsAccessScopeAnalysis, OperatorResponse, PeeringAttachmentStatus, Placement,
     PlacementGroup,
     PrivateDnsNameOptionsOnLaunch,
-    DnsEntry, PayerResponsibilityEntry,
+    DnsEntry, PayerResponsibilityEntry, ProductCode,
     Region, RequestLaunchTemplateData, RouteServer, RunInstancesOutput, SecondaryNetwork,
     SecondaryNetworkIpv4CidrBlockAssociation, SecondarySubnet,
     SecondarySubnetIpv4CidrBlockAssociation, SecurityGroup, ServiceConfiguration,
@@ -4861,6 +4861,26 @@ pub const GP3_THROUGHPUT_RANGE: (i32, i32) = (125, 2_000);
 /// [`GP3_THROUGHPUT_RANGE`], which is what AWS provisions by default.
 pub const DEFAULT_GP3_THROUGHPUT: i32 = GP3_THROUGHPUT_RANGE.0;
 
+/// The `VolumeAttributeName` enum's `autoEnableIO` member.
+///
+/// Named here so the handlers and [`VolumeRecord`] spell one attribute one way; the
+/// generated catalog of every member is
+/// `crate::ops::types::VOLUME_ATTRIBUTE_NAME_VALUES`, which `DescribeVolumeAttribute`
+/// validates its `Attribute` against and the crate's tests pin these two constants to.
+pub const VOLUME_ATTRIBUTE_AUTO_ENABLE_IO: &str = "autoEnableIO";
+
+/// The `VolumeAttributeName` enum's `productCodes` member (see
+/// [`VOLUME_ATTRIBUTE_AUTO_ENABLE_IO`] for the generated catalog these come from).
+pub const VOLUME_ATTRIBUTE_PRODUCT_CODES: &str = "productCodes";
+
+/// The `autoEnableIO` a volume is created with.
+///
+/// "By default, all I/O operations for the volume are suspended when the data on the
+/// volume is determined to be potentially inconsistent […] You can change the default
+/// behavior to resume I/O operations" (`ModifyVolumeAttribute`) — so I/O is NOT
+/// auto-enabled until a caller says so.
+pub const AUTO_ENABLE_IO_AT_CREATION: bool = false;
+
 /// One stored EBS volume: the modelled [`VolumeView`] every operation that reports
 /// one answers with, plus the instant the clock owes it its `creating` ->
 /// `available` move.
@@ -4877,6 +4897,17 @@ pub struct VolumeRecord {
     /// and never reported, so a wall-clock adjustment cannot move a volume back to
     /// `creating`.
     pub available_at: Instant,
+    /// `autoEnableIO`: "whether the volume should be auto-enabled for I/O operations"
+    /// (`ModifyVolumeAttributeRequest$AutoEnableIO`), which `ModifyVolumeAttribute`
+    /// sets and `DescribeVolumeAttribute` reports.
+    ///
+    /// The modelled [`VolumeView`] carries no member for it — no describe of a volume
+    /// reports it — so it lives beside the view the way [`VpcAttributes`] lives beside
+    /// the [`Vpc`] shape, but ON this record rather than in a second map, so the delete
+    /// that removes a volume removes its attributes with it. Starts at
+    /// [`AUTO_ENABLE_IO_AT_CREATION`], so a describe never has to invent a default for a
+    /// volume nobody has modified.
+    pub auto_enable_io: bool,
     /// Whether this volume's I/O operations are enabled.
     ///
     /// Amazon EBS disables I/O for a volume "because the data on the volume was
@@ -4911,6 +4942,10 @@ impl VolumeRecord {
         Self {
             view,
             available_at,
+            // Every path that MINTS a volume starts its `autoEnableIO` here, so no
+            // creator can invent a different default and `ModifyVolumeAttribute` is the
+            // one operation that moves it.
+            auto_enable_io: AUTO_ENABLE_IO_AT_CREATION,
             io_enabled: true,
             detaching_at: BTreeMap::new(),
         }
@@ -5003,6 +5038,21 @@ impl VolumeRecord {
             ..self.view_at(now)
         }
     }
+
+    /// This volume's `productCodes` attribute: the Amazon Web Services Marketplace
+    /// product codes it carries.
+    ///
+    /// "Any Amazon Web Services Marketplace product codes from the snapshot are
+    /// propagated to the volume" (`CreateVolume`) — a volume's product codes are the ones
+    /// the snapshot it was restored from carries, so a volume created empty has none.
+    /// Every volume this emulator stores IS created empty: it holds no snapshots (every
+    /// EBS snapshot operation is still a stub, and `CreateVolume` refuses any `SnapshotId`
+    /// through [`unresolvable_snapshot_id`]), so no record has a source snapshot and there
+    /// is nothing to propagate. This is the one place that derivation lives: when a
+    /// snapshot store lands, look the record's own `SnapshotId` up here.
+    pub fn product_codes(&self) -> Vec<ProductCode> {
+        Vec::new()
+    }
 }
 
 /// The caller-chosen bytes one stored volume holds: its tags, the KMS key the request
@@ -5038,25 +5088,65 @@ pub fn volume_id_is_well_formed(id: &str) -> bool {
 
 /// Refuse a volume id the request named that this service cannot resolve: a malformed
 /// one before an unknown one, the way the service orders the two.
+///
+/// For an operation that goes on to report or modify the volume, use [`require_volume`]
+/// or [`require_volume_mut`] instead: they make the same refusal and hand the record back,
+/// so the handler needs no second lookup and no unreachable branch for an id that resolved
+/// and then could not be read.
 pub fn require_known_volume<E>(
     store: &ComAmazonawsEc2Amazonec2State,
     volume_id: &str,
 ) -> Result<(), crate::scaffolded::Scaffolded<E>> {
-    if !volume_id_is_well_formed(volume_id) {
-        return Err(invalid_volume_id_malformed(volume_id));
-    }
-    if !store.volumes.contains_key(volume_id) {
-        return Err(invalid_volume_id_not_found(volume_id));
-    }
+    require_volume(store, volume_id)?;
     Ok(())
+}
+
+/// The ONE definition of how this service resolves a volume id a request named: an id that
+/// is not shaped like one is answered as malformed, and a well-formed one this account
+/// holds no volume for as not found — the way the service orders the two.
+pub fn require_volume<'store, E>(
+    store: &'store ComAmazonawsEc2Amazonec2State,
+    volume_id: &str,
+) -> Result<&'store VolumeRecord, crate::scaffolded::Scaffolded<E>> {
+    require_well_formed_volume_id(volume_id)?;
+    store
+        .volumes
+        .get(volume_id)
+        .ok_or_else(|| invalid_volume_id_not_found(volume_id))
+}
+
+/// [`require_volume`] for an operation that WRITES the volume it resolved.
+pub fn require_volume_mut<'store, E>(
+    store: &'store mut ComAmazonawsEc2Amazonec2State,
+    volume_id: &str,
+) -> Result<&'store mut VolumeRecord, crate::scaffolded::Scaffolded<E>> {
+    // The malformed half of the rule first, shared with `require_volume` rather than
+    // repeated, because the mutable borrow of the store cannot be taken before it.
+    require_well_formed_volume_id(volume_id)?;
+    store
+        .volumes
+        .get_mut(volume_id)
+        .ok_or_else(|| invalid_volume_id_not_found(volume_id))
+}
+
+/// The first half of that rule on its own: a volume id that is not shaped like one is
+/// refused BEFORE it is looked up, so both halves of [`require_volume`] exist once each.
+fn require_well_formed_volume_id<E>(
+    volume_id: &str,
+) -> Result<(), crate::scaffolded::Scaffolded<E>> {
+    if volume_id_is_well_formed(volume_id) {
+        Ok(())
+    } else {
+        Err(invalid_volume_id_malformed(volume_id))
+    }
 }
 
 /// Refuse a request that named something that is not a volume id at all: HTTP 400
 /// `InvalidVolumeID.Malformed`, which EC2 answers BEFORE it looks the id up.
 ///
-/// The ONE wording of that refusal: [`require_known_volume`] answers it for an operation
-/// that resolves the volume straight away, and an operation that answers its `DryRun`
-/// probe between the two halves of the rule calls this and
+/// The ONE wording of that refusal: [`require_known_volume`] and [`require_volume`] answer
+/// it for an operation that resolves the volume straight away, and an operation that
+/// answers its `DryRun` probe between the two halves of the rule calls this and
 /// [`invalid_volume_id_not_found`] itself.
 pub fn invalid_volume_id_malformed<E>(volume_id: &str) -> crate::scaffolded::Scaffolded<E> {
     crate::scaffolded::Scaffolded::service_error(

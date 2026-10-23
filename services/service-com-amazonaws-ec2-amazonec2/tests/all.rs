@@ -131,6 +131,9 @@ mod transit_gateway_route_table_propagation;
 // The Verified Access trust provider slice: create, then read it back.
 #[path = "all/verified_access_trust_providers.rs"]
 mod verified_access_trust_providers;
+// The volume attribute slice: modify one attribute of a volume, then describe it back.
+#[path = "all/volume_attributes.rs"]
+mod volume_attributes;
 #[path = "all/volume_lifecycle.rs"]
 mod volume_lifecycle;
 #[path = "all/volume_modifications.rs"]
