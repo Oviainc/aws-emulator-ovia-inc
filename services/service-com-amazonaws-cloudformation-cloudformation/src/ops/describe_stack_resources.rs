@@ -78,9 +78,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
-use crate::state::{
-    DeployedResource, StoredStack, DRIFT_STATUS_NOT_CHECKED, MAX_DESCRIBED_STACK_RESOURCES,
-};
+use crate::state::{DeployedResource, StoredStack, MAX_DESCRIBED_STACK_RESOURCES};
 
 /// The refusal for a request that names BOTH members that select the stack.
 ///
@@ -113,9 +111,9 @@ const NO_SELECTOR: &str = "Either StackName or PhysicalResourceId must be specif
 /// * `ModuleInfo` — "the module from which the resource was created, if the resource was
 ///   created from a module": modules are not implemented, so no resource came from one.
 ///
-/// `DriftInformation` is `NOT_CHECKED`, for the same reason `DescribeStacks` reports it at
-/// the stack level: `DetectStackResourceDrift` answers 501 here rather than reporting a
-/// check nothing ran, so no resource of this emulator has ever been checked for drift.
+/// `DriftInformation` is this resource's own drift result, as the last drift detection
+/// that COMPLETED over it left it: `NOT_CHECKED` with no timestamp for a resource no
+/// detection has covered, and for one whose type does not support drift detection here.
 fn stack_resource_view(stack: &StoredStack, deployed: &DeployedResource) -> StackResource {
     StackResource {
         stack_name: Some(stack.stack_name.clone()),
@@ -127,10 +125,7 @@ fn stack_resource_view(stack: &StoredStack, deployed: &DeployedResource) -> Stac
         resource_status: deployed.status.clone(),
         resource_status_reason: None,
         description: None,
-        drift_information: Some(StackResourceDriftInformation {
-            stack_resource_drift_status: DRIFT_STATUS_NOT_CHECKED.to_string(),
-            last_check_timestamp: None,
-        }),
+        drift_information: crate::state::resource_drift_information(deployed),
         module_info: None,
     }
 }

@@ -779,7 +779,46 @@ impl EventDataStoreState {
     pub fn is_queryable(self) -> bool {
         !matches!(self, Self::PendingDeletion)
     }
+
+    /// The status an in-flight ingestion transition settles into once the clock
+    /// has run, or `None` for a status the clock owes nothing on.
+    ///
+    /// The model's `EventDataStoreStatus` enum carries `STARTING_INGESTION` and
+    /// `STOPPING_INGESTION` precisely because the Start/Stop ingestion pair is
+    /// asynchronous: a store told to stop reads `STOPPING_INGESTION` until
+    /// ingestion has stopped, and `STOPPED_INGESTION` after. Every other value
+    /// is terminal — the clock moves none of them on its own.
+    pub fn settled(self) -> Option<Self> {
+        match self {
+            Self::StartingIngestion => Some(Self::Enabled),
+            Self::StoppingIngestion => Some(Self::StoppedIngestion),
+            Self::Created | Self::Enabled | Self::PendingDeletion | Self::StoppedIngestion => None,
+        }
+    }
 }
+
+/// The event categories whose ingestion can be stopped and started.
+///
+/// From the model doc for `StopEventDataStoreIngestion` (and, in the same words,
+/// `StartEventDataStoreIngestion`): "To stop ingestion, the event data store
+/// `Status` must be `ENABLED` and the `eventCategory` must be `Management`,
+/// `Data`, `NetworkActivity`, or `ConfigurationItem`." A store collecting any
+/// other category (CloudTrail Insights events, Audit Manager evidence, events
+/// from outside Amazon Web Services) ingests nothing a caller can pause, which is
+/// what the modelled `InvalidEventDataStoreCategoryException` reports.
+pub const INGESTION_CONTROLLABLE_EVENT_CATEGORIES: &[&str] =
+    &["Management", "Data", "NetworkActivity", "ConfigurationItem"];
+
+/// How long an event data store reads `STARTING_INGESTION` / `STOPPING_INGESTION`
+/// before the clock settles it into `ENABLED` / `STOPPED_INGESTION`.
+///
+/// The model's `EventDataStoreStatus` enum carries both in-flight values, so the
+/// Start/Stop ingestion pair IS asynchronous. CloudTrail publishes no duration
+/// for either, so this span is the emulator's own: short enough not to stall a
+/// workflow, non-zero so a caller that reads the store straight after the call
+/// still sees the transient status — and so the state errors that transient
+/// status carries are reachable.
+pub const INGESTION_SETTLE_AFTER: Duration = Duration::from_millis(500);
 
 /// The billing mode of an event data store: one variant per value of the model's
 /// `BillingMode` enum.
@@ -911,6 +950,10 @@ pub struct EventDataStoreRecord {
     /// The Region the store lives in; it is reachable only from there.
     pub region: String,
     pub status: EventDataStoreState,
+    /// When an in-flight ingestion `status` (`STARTING_INGESTION` /
+    /// `STOPPING_INGESTION`) is due to settle into the status it is heading for;
+    /// `None` once it has, and for a store whose ingestion is not moving.
+    pub ingestion_settles_at: Option<SystemTime>,
     /// The account the store belongs to, or `None` for the emulator's own
     /// account. A cross-account query echoes it back as
     /// `EventDataStoreOwnerAccountId`.
@@ -1020,6 +1063,57 @@ impl EventDataStoreRecord {
                 self.federation_role_arn = None;
             }
         }
+    }
+
+    /// Materialise the ingestion transition the clock already owes:
+    /// `STARTING_INGESTION` into `ENABLED`, `STOPPING_INGESTION` into
+    /// `STOPPED_INGESTION`.
+    ///
+    /// A reporting operation may call this: the transition was due at
+    /// `ingestion_settles_at` whether or not anybody read the store, so applying
+    /// it changes nothing a later caller would otherwise have seen.
+    pub fn settle_ingestion(&mut self, now: SystemTime) {
+        let Some(due) = self.ingestion_settles_at else {
+            return;
+        };
+        if now < due {
+            return;
+        }
+        self.ingestion_settles_at = None;
+        if let Some(settled) = self.status.settled() {
+            self.status = settled;
+        }
+    }
+
+    /// Whether ingestion can be stopped or started on this store at all: it
+    /// collects one of the [`INGESTION_CONTROLLABLE_EVENT_CATEGORIES`].
+    ///
+    /// Decided from the store's OWN advanced event selectors — the only place an
+    /// event data store states which category of events it collects — so the
+    /// answer is the same for every caller that addresses it.
+    pub fn ingestion_is_controllable(&self) -> bool {
+        INGESTION_CONTROLLABLE_EVENT_CATEGORIES
+            .iter()
+            .any(|category| self.logs_event_category(category))
+    }
+
+    /// The event categories this store collects, in the order its selectors state
+    /// them — what a refusal about the store's category names.
+    pub fn event_categories(&self) -> Vec<String> {
+        let mut categories: Vec<String> = Vec::new();
+        for selector in &self.advanced_event_selectors {
+            for field_selector in &selector.field_selectors {
+                if field_selector.field != EVENT_CATEGORY_FIELD {
+                    continue;
+                }
+                for value in field_selector.equals.iter().flatten() {
+                    if !categories.contains(value) {
+                        categories.push(value.clone());
+                    }
+                }
+            }
+        }
+        categories
     }
 }
 

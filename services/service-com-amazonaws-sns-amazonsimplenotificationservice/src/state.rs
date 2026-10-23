@@ -778,6 +778,119 @@ pub struct SubscriptionRecord {
     pub created_at: SystemTime,
 }
 
+/// The subscription attribute a caller-set message filter lives under.
+pub const FILTER_POLICY_ATTRIBUTE: &str = "FilterPolicy";
+
+/// The subscription attribute that says WHICH part of a message the filter policy is
+/// applied to.
+pub const FILTER_POLICY_SCOPE_ATTRIBUTE: &str = "FilterPolicyScope";
+
+/// The filtering scope a subscription with a filter policy and no explicit scope is
+/// filtered under: "FilterPolicyScope – ... MessageAttributes (default) – The filter
+/// is applied on the message attributes"
+/// (`GetSubscriptionAttributesResponse$Attributes` doc).
+pub const DEFAULT_FILTER_POLICY_SCOPE: &str = "MessageAttributes";
+
+/// The subscription attribute that says whether SNS delivers the message body alone.
+pub const RAW_MESSAGE_DELIVERY_ATTRIBUTE: &str = "RawMessageDelivery";
+
+/// What `RawMessageDelivery` is for a subscription whose owner has not set it: SNS
+/// wraps a notification in its JSON envelope unless raw delivery is asked for
+/// ("RawMessageDelivery – true if raw message delivery is enabled for the
+/// subscription", `GetSubscriptionAttributesResponse$Attributes` doc).
+pub const RAW_MESSAGE_DELIVERY_DISABLED: &str = "false";
+
+/// The attributes SNS COMPUTES for a subscription rather than storing: its own ARN,
+/// the topic it is a subscription of, how and where it delivers, the account that owns
+/// it, and its confirmation state. None of them is settable, so none is in
+/// [`SUBSCRIPTION_ATTRIBUTE_NAMES`].
+pub const SUBSCRIPTION_ARN_ATTRIBUTE: &str = "SubscriptionArn";
+pub const PROTOCOL_ATTRIBUTE: &str = "Protocol";
+pub const ENDPOINT_ATTRIBUTE: &str = "Endpoint";
+pub const PENDING_CONFIRMATION_ATTRIBUTE: &str = "PendingConfirmation";
+pub const CONFIRMATION_WAS_AUTHENTICATED_ATTRIBUTE: &str = "ConfirmationWasAuthenticated";
+
+/// How a boolean-valued attribute is written on the wire: SNS carries every attribute
+/// value as a string, so a flag is the word, not a JSON literal.
+pub fn attribute_flag(value: bool) -> String {
+    if value { "true" } else { "false" }.to_string()
+}
+
+/// The protocols a DELIVERY POLICY governs: "DeliveryPolicy – The policy that defines
+/// how Amazon SNS retries failed deliveries to HTTP/S endpoints"
+/// (`SetSubscriptionAttributesInput$AttributeName` doc). A subscription over any other
+/// protocol has no retry policy to report, so none is reported for it.
+pub const DELIVERY_POLICY_PROTOCOLS: &[&str] = &["http", "https"];
+
+/// Whether a delivery policy governs delivery to `protocol`'s endpoints.
+pub fn protocol_has_delivery_policy(protocol: &str) -> bool {
+    DELIVERY_POLICY_PROTOCOLS.contains(&protocol)
+}
+
+/// The effective delivery policy of one SUBSCRIPTION: the system defaults, the
+/// `DeliveryPolicy` of the topic laid over them, and then the subscription's own
+/// `DeliveryPolicy` — "the effective delivery policy that takes into account the topic
+/// delivery policy and account system defaults"
+/// (`GetSubscriptionAttributesResponse$Attributes` doc).
+///
+/// A topic whose policy sets `disableSubscriptionOverrides` keeps its own policy: that
+/// is what the member disables, so the subscription's policy is not laid over it.
+pub fn effective_subscription_delivery_policy(
+    topic: Option<&TopicRecord>,
+    subscription: &SubscriptionRecord,
+) -> String {
+    let mut effective = DeliveryPolicy::system_default();
+    if let Some(configured) = topic
+        .and_then(|topic| topic.attributes.get(DELIVERY_POLICY_ATTRIBUTE))
+        .and_then(|raw| serde_json::from_str::<ConfiguredDeliveryPolicy>(raw).ok())
+    {
+        configured.overlay(&mut effective);
+    }
+    if !effective.http.disable_subscription_overrides {
+        if let Some(configured) = subscription
+            .attributes
+            .get(DELIVERY_POLICY_ATTRIBUTE)
+            .and_then(|raw| serde_json::from_str::<ConfiguredDeliveryPolicy>(raw).ok())
+        {
+            configured.overlay(&mut effective);
+        }
+    }
+    serde_json::to_string(&effective).unwrap_or_default()
+}
+
+/// The fields a SUBSCRIPTION's ARN holds: an ARN whose resource is a topic name
+/// followed by the subscription's own id segment
+/// (`arn:aws:sns:<region>:<account>:<topic>:<id>`, as `Subscribe` mints it).
+pub const SUBSCRIPTION_ARN_FIELDS: usize = ARN_ELEMENTS + 1;
+
+/// Why `arn` is not a subscription ARN, or `None` when it is one.
+///
+/// The reason names the member's constraint and is built from the request, the way
+/// SNS's own argument validation reports one ("An ARN must have at least 6 elements,
+/// not 1"); nothing of the recorded wire text is required beyond that. The generic
+/// ARN shape comes from [`arn_shape_reason`], the one place this crate judges it, so
+/// every ARN-typed member of this service states that part alike; what is added here
+/// is what makes an ARN a SUBSCRIPTION's.
+///
+/// Shared, because every operation that takes a `SubscriptionArn` asks the same
+/// question of it — a subscription ARN one call accepts cannot be one another refuses.
+pub fn malformed_subscription_arn(arn: &str) -> Option<String> {
+    if let Some(reason) = arn_shape_reason(arn) {
+        return Some(reason);
+    }
+    let fields: Vec<&str> = arn.split(':').collect();
+    let well_formed = fields.len() == SUBSCRIPTION_ARN_FIELDS
+        && fields[2] == "sns"
+        && fields[1..].iter().all(|field| !field.is_empty())
+        && topic_name_is_valid(fields[5]);
+    (!well_formed).then(|| {
+        format!(
+            "A subscription ARN names a topic and the subscription's id, so it has \
+             {SUBSCRIPTION_ARN_FIELDS} elements: {arn}"
+        )
+    })
+}
+
 /// One message `Publish` delivered to one subscription.
 #[derive(Debug, Clone)]
 pub struct PublishedMessage {
@@ -1173,6 +1286,13 @@ pub fn tag_map_refusal(tags: &HashMap<String, String>) -> Option<TagRefusal> {
 /// back at it. Recorded evidence: `GetTopicAttributes` on a deleted topic answers
 /// `404 NotFound` with exactly `Topic does not exist`.
 pub const TOPIC_DOES_NOT_EXIST: &str = "Topic does not exist";
+
+/// The sentence SNS states for a subscription this emulator holds no record of — the
+/// subscription counterpart of [`TOPIC_DOES_NOT_EXIST`], worded the same way: the
+/// resource kind that is missing, with none of the caller's identifier echoed back.
+/// The HTTP 404 and the `NotFound` code are the requirement; this is SNS's wording of
+/// the reason.
+pub const SUBSCRIPTION_DOES_NOT_EXIST: &str = "Subscription does not exist";
 
 /// The sentence SNS refuses an unacceptable topic name with.
 ///

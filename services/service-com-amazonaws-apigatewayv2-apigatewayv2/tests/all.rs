@@ -15,6 +15,8 @@
 mod api_lifecycle;
 #[path = "all/integration_lifecycle.rs"]
 mod integration_lifecycle;
+#[path = "all/route_request_parameter.rs"]
+mod route_request_parameter;
 #[path = "all/service_claim.rs"]
 mod service_claim;
 #[path = "all/state_roundtrip.rs"]

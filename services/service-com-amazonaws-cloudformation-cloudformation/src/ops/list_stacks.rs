@@ -66,16 +66,17 @@
 
 #[allow(unused_imports)]
 use super::types::*;
-use crate::state::{StoredStack, DRIFT_STATUS_NOT_CHECKED};
+use crate::state::StoredStack;
 
 /// One stored stack as the modelled `StackSummary` shape.
 ///
 /// `TemplateDescription` is the template's own `Description`, `DeletionTime` is set only
 /// once the stack's deletion has completed, and `ParentId`/`RootId` are absent because
 /// nested stacks are not implemented. `LastOperations` is the operation the stack last
-/// opened, which `StackSummary` reports alongside `Stack`; `DriftInformation` is
-/// `NOT_CHECKED` because `DetectStackDrift` answers 501 rather than reporting a check
-/// nothing ran.
+/// opened, which `StackSummary` reports alongside `Stack`; `DriftInformation` is the
+/// result of the last drift detection that ran against the stack — the same stored result
+/// `DescribeStacks` reports, in the SUMMARY spelling of the same two members, so the two
+/// reads of one stack cannot disagree about it.
 fn stack_summary(stored: &StoredStack) -> StackSummary {
     StackSummary {
         stack_id: Some(stored.stack_id.clone()),
@@ -88,10 +89,7 @@ fn stack_summary(stored: &StoredStack) -> StackSummary {
         stack_status_reason: stored.status_reason.clone(),
         parent_id: None,
         root_id: None,
-        drift_information: Some(StackDriftInformationSummary {
-            stack_drift_status: DRIFT_STATUS_NOT_CHECKED.to_string(),
-            last_check_timestamp: None,
-        }),
+        drift_information: crate::state::stack_drift_information_summary(stored),
         last_operations: crate::state::last_operation_views(stored.last_operation.as_ref()),
     }
 }

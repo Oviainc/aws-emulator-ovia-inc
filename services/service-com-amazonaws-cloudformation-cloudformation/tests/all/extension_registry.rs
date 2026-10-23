@@ -616,13 +616,11 @@ async fn every_implemented_resource_type_is_an_aws_published_public_extension() 
             ),
             ("IsDefaultVersion", present("true")),
             // Not known for a published extension, so not reported: no schema, no
-            // publisher, no registration instants, no private-extension members.
+            // publisher, no private-extension members.
             ("Schema", None),
             ("DefaultVersionId", None),
             ("PublisherId", None),
             ("IsActivated", None),
-            ("TimeCreated", None),
-            ("LastUpdated", None),
             ("ExecutionRoleArn", None),
             ("TypeTestsStatus", None),
         ] {
@@ -632,6 +630,17 @@ async fn every_implemented_resource_type_is_an_aws_published_public_extension() 
                 expected.as_deref(),
                 "case {type_name:?}: expected <{tag}> to be {expected:?}, got {actual:?} \
                  from {body:?}"
+            );
+        }
+        // Every registry record reports when its version entered the registry and where
+        // the extension's source lives; `drift_and_resource_reads.rs` is what pins the
+        // VALUES those two carry for a published extension.
+        for tag in ["TimeCreated", "LastUpdated", "SourceUrl"] {
+            let actual = xml_text(&body, tag);
+            assert!(
+                actual.is_some(),
+                "case {type_name:?}: expected a <{tag}> on a published extension, got \
+                 {actual:?} from {body:?}"
             );
         }
     }
