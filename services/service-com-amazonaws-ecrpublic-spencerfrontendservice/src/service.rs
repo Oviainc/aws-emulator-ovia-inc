@@ -175,20 +175,21 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // framework refuses before a handler runs (an absent `repositoryName`, a name
         // outside 2..205 or `^(?:[a-z0-9]+(?:[._-][a-z0-9]+)*/)*[a-z0-9]+(?:[._-][a-z0-9]+)*$`,
         // a `catalogData.description` over 1024, a `policyText` over 10240, a
-        // `maxResults` outside 1..1000, an `imageIds` list longer than 100) is reworded
-        // to that code, and its message to the `Invalid parameter at '<member>' failed to
-        // satisfy constraint: '<rule>'` template ECR fills from the request — NOT the
-        // framework's `N validation errors detected: Value '<the value>' …` envelope,
-        // which states a count ECR does not state and quotes the rejected value back.
-        // The status stays with the protocol: awsJson1_1 renders a refusal as HTTP 400,
-        // which is `InvalidParameterException`'s modelled status.
+        // `maxResults` outside 1..1000, an `imageIds` list longer than 100, a
+        // `displayName` longer than 100) is reworded to that code, and its message to the
+        // `Invalid parameter at '<member>' failed to satisfy constraint: '<rule>'`
+        // template ECR Public fills from the request (see [`clause`]) — NOT the
+        // framework's `N validation error(s) detected: Value '<the value>' …` envelope,
+        // which states a count ECR Public does not state and quotes the rejected value
+        // back. The status stays with the protocol: awsJson1_1 renders a refusal as HTTP
+        // 400, which is `InvalidParameterException`'s modelled status.
         match refusal {
             Refusal::Invalid(violations) => Some(Refused {
                 code: "InvalidParameterException".to_string(),
                 // Every member at fault, so a caller fixes the request from the message
                 // alone; one refused member is the single-clause case of the same rule.
-                // A refusal that named no violation still answers the modelled code, with
-                // the error shape's own documented sentence.
+                // A refusal that named no violation has no member to name, so it answers
+                // the modelled code with the error shape's own documented sentence.
                 message: if violations.is_empty() {
                     "The specified parameter is invalid. Review the available parameters \
                      for the API request."

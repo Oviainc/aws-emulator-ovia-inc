@@ -156,6 +156,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // ECR Public serves its API from ONE Region, so a call signed for any other is
+        // refused with the service-common `UnsupportedCommandException` before this
+        // handler reads or changes anything — see `crate::state::unsupported_in_region`.
+        if let Some(unsupported) = crate::state::unsupported_in_region(ctx.parts(), Self::NAME) {
+            return Err(
+                PutRepositoryCatalogDataErrorModeled::UnsupportedCommandException(unsupported)
+                    .into(),
+            );
+        }
         // Request metadata is used for the audit record only: which repository's catalog
         // record this call replaces comes from the request body.
         let caller_akid = ::engine::extract_akid(&ctx.parts().headers);

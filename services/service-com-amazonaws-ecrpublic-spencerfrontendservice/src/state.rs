@@ -33,12 +33,51 @@ use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
     ImageDetail, ImageIdentifier, RegistryCatalogData, Repository, RepositoryCatalogData,
-    RepositoryCatalogDataInput, Tag,
+    RepositoryCatalogDataInput, Tag, UnsupportedCommandException,
 };
 
 /// The `ecr-public` ARN namespace, as the Smithy model's `awsService` trait declares it
 /// (`OPERATIONS.md`, "Wire protocol": ARN namespace `ecr-public`).
 pub const ARN_NAMESPACE: &str = "ecr-public";
+
+/// The one Region this API is served from.
+///
+/// `UnsupportedCommandException` ("The action isn't supported in this Region", client,
+/// HTTP 400) is a SERVICE-level error in this model: it is bound to every one of the 23
+/// operations rather than declared per operation (`smithy_query(query="digest")` reports
+/// it under `common_errors`), so any ECR Public call can be refused for the Region it was
+/// signed for. ECR Public publishes endpoints in more than one Region but serves its API
+/// from this one, which is also the Region AWS documents a caller of a public registry
+/// must name.
+pub const API_REGION: &str = "us-east-1";
+
+/// The `UnsupportedCommandException` an ECR Public call signed for any Region other than
+/// [`API_REGION`] is refused with, or `None` when the request addressed the Region this
+/// API is served from: the Region gate every implemented handler runs before it reads or
+/// writes anything.
+///
+/// The Region a request carries is the one in its SigV4 credential scope, parsed by
+/// `emulator_server::sigv4_credential_scope` (the single source of SigV4-scope parsing),
+/// compared without ASCII case because a Region name is case-insensitive. A request that
+/// carries no well-formed SigV4 `Authorization` names no Region at all, so there is
+/// nothing to refuse it for and it is served.
+///
+/// The message is a deterministic function of the request: the operation the caller named,
+/// then the one Region that operation is served from.
+pub fn unsupported_in_region(
+    parts: &::http::request::Parts,
+    operation: &str,
+) -> Option<UnsupportedCommandException> {
+    let region = ::emulator_server::sigv4_credential_scope(&parts.headers)?.region;
+    if region.eq_ignore_ascii_case(API_REGION) {
+        return None;
+    }
+    Some(UnsupportedCommandException {
+        message: Some(format!(
+            "{operation} command is only supported in {API_REGION}."
+        )),
+    })
+}
 
 /// The universal host prefix every ECR Public repository URI carries, as
 /// `Registry$registryUri` documents it ("The URI of a public registry. The URI contains
@@ -144,6 +183,17 @@ pub const MAX_LAYER_UPLOAD_BYTES: usize = 64 * 1024 * 1024;
 /// refused with the same `LimitExceededException`. The emulator's own bound, for the same
 /// reason as [`MAX_LAYER_UPLOAD_BYTES`].
 pub const MAX_IN_FLIGHT_LAYER_BYTES: usize = 256 * 1024 * 1024;
+
+/// The most layer blobs ONE repository records as held.
+///
+/// `CompleteLayerUpload` is the only operation that adds one, and a completed layer is
+/// recorded for the life of the process (no read may stop answering what was stored), so
+/// the count needs a ceiling for the same reason [`MAX_REPOSITORIES`] does. Only the
+/// digest and the layer's size are kept per entry, so this is set far above the layer
+/// count of any image a client pushes; past it the completion is refused with the
+/// `ServerException` `CompleteLayerUpload` models — reaching the ceiling is this
+/// registry's own capacity, not a fault in the caller's request.
+pub const MAX_LAYERS_PER_REPOSITORY: usize = 10_000;
 
 /// One in-flight layer upload: what `InitiateLayerUpload` opened, addressed by the
 /// upload id it handed the client.
@@ -266,6 +316,18 @@ pub struct StoredRepository {
     /// `imageTag` -> `imageDigest`, so a tag-keyed `ImageIdentifier` resolves to a
     /// stored image in one probe and re-pushing a tag moves it between digests.
     pub tag_index: BTreeMap<String, String>,
+    /// The image layers this repository holds, keyed by the `sha256:<hex>` digest
+    /// `CompleteLayerUpload` finalised, each carrying the size in bytes of the layer the
+    /// upload's parts made up.
+    ///
+    /// A layer enters the registry only when an upload is completed ("informs Amazon ECR
+    /// that the image layer upload is complete"), and `BatchCheckLayerAvailability`
+    /// reports exactly this set — a digest in it is `AVAILABLE` with its size, one that is
+    /// not is a `MissingLayerDigest` failure. The layer BYTES are not kept: nothing in
+    /// this model serves layer content back (there is no `GetDownloadUrlForLayer` here),
+    /// so the registry records what it can report — the digest it computed over the
+    /// uploaded bytes and how many there were.
+    pub layers: BTreeMap<String, i64>,
 }
 
 impl StoredRepository {
@@ -720,6 +782,54 @@ pub fn service_state<Eng: Send + Sync + 'static>(
 /// manifest", so it is computed over the manifest bytes exactly as pushed.
 pub fn manifest_digest(manifest: &str) -> String {
     format!("sha256:{:x}", Sha256::digest(manifest.as_bytes()))
+}
+
+/// The `sha256:<hex>` digest of the bytes a layer upload carried, which is a layer's
+/// identity in a registry.
+///
+/// `CompleteLayerUpload$layerDigest` and `Layer$layerDigest` are both "the `sha256`
+/// digest of the image layer", so it is computed over the uploaded bytes themselves —
+/// the same derivation [`manifest_digest`] makes over a manifest document, over a blob
+/// rather than text.
+pub fn layer_digest(layer: &[u8]) -> String {
+    format!("sha256:{:x}", Sha256::digest(layer))
+}
+
+/// `candidate` under the spelling a layer digest is stored and compared by: the hex half
+/// lower-cased, the algorithm half verbatim.
+///
+/// Hex is a case-insensitive rendering of the same bytes — the modelled `LayerDigest`
+/// pattern admits either case for the digits (`^[a-zA-Z0-9-_+.]+:[a-fA-F0-9]+$`) — so two
+/// spellings of one digest resolve to one layer. The algorithm half is NOT case-folded: an
+/// OCI digest's algorithm is a token, so a differently cased token names a different
+/// algorithm rather than the same one.
+pub fn canonical_layer_digest(candidate: &str) -> String {
+    match candidate.split_once(':') {
+        Some((algorithm, hex)) => format!("{algorithm}:{}", hex.to_ascii_lowercase()),
+        None => candidate.to_string(),
+    }
+}
+
+/// Whether `candidate` has the form the model gives a layer digest: `<algorithm>:<hex>`,
+/// as `LayerDigest`'s pattern `^[a-zA-Z0-9-_+.]+:[a-fA-F0-9]+$` spells it
+/// (`smithy_query(query="shape", shape="LayerDigest")`).
+///
+/// `BatchCheckLayerAvailability` takes its digests as `BatchedOperationLayerDigest`,
+/// which carries a length bound and NO pattern, so a digest that is not of this form
+/// reaches the handler and is what the modelled `InvalidLayerDigest` failure code is
+/// for. Both halves are checked here rather than with a regular expression: the
+/// expression has no alternation or repetition beyond one split, so the split is the
+/// rule.
+pub fn is_layer_digest_form(candidate: &str) -> bool {
+    let Some((algorithm, hex)) = candidate.split_once(':') else {
+        return false;
+    };
+    !algorithm.is_empty()
+        && algorithm
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '+' | '.'))
+        && !hex.is_empty()
+        && hex.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 /// The document a member whose content the model documents as JSON carries — an image

@@ -17,12 +17,18 @@ mod client_error_message_templates;
 mod harness;
 #[path = "all/invalid_parameter_messages.rs"]
 mod invalid_parameter_messages;
+#[path = "all/invalid_parameter_template.rs"]
+mod invalid_parameter_template;
 #[path = "all/json_document_members.rs"]
 mod json_document_members;
 #[path = "all/layer_part_uploads.rs"]
 mod layer_part_uploads;
+#[path = "all/layer_upload_completion.rs"]
+mod layer_upload_completion;
 #[path = "all/layer_upload_sessions.rs"]
 mod layer_upload_sessions;
+#[path = "all/region_gate.rs"]
+mod region_gate;
 #[path = "all/registry_catalog_data.rs"]
 mod registry_catalog_data;
 #[path = "all/registry_describe.rs"]
