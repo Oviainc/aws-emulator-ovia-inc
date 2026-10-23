@@ -92,6 +92,26 @@ pub fn emulator_size_cap(subject: &str, size: usize, max_allowed: usize) -> Stri
     )
 }
 
+/// The member of an update document carrying the caller's correlation token, which the
+/// accepted reply echoes and the stored document never keeps — see
+/// [`reply_with_client_token`].
+pub const CLIENT_TOKEN: &str = "clientToken";
+
+/// The reply document for an accepted update: the document the merge produced, plus the
+/// request's own [`CLIENT_TOKEN`] where it carried one.
+///
+/// `clientToken` is the caller's correlation key, not shadow state: the acknowledgement
+/// carries it back so a client that multiplexes updates can match this reply to the
+/// request that produced it, while the STORED document — what [`Shadow::document`]
+/// renders for every later reader — never holds it. A request that named no token gets a
+/// reply with no `clientToken` member, so the absence still means "you sent none".
+pub fn reply_with_client_token(mut document: Value, client_token: Option<&Value>) -> Value {
+    if let (Some(token), Some(members)) = (client_token, document.as_object_mut()) {
+        members.insert(CLIENT_TOKEN.to_string(), token.clone());
+    }
+    document
+}
+
 /// The service's fixed rejection for a payload that is not a JSON document.
 pub const PAYLOAD_INVALID_JSON: &str = "Payload contains invalid json";
 
@@ -165,15 +185,17 @@ pub const CLASSIC_SHADOW: &str = "";
 /// modelled `RequestEntityTooLargeException` and changes nothing.
 pub const MAX_SHADOW_DOCUMENT_BYTES: usize = 8 * 1024;
 
-/// The largest request entity this emulator will READ as a state document, in bytes.
-///
-/// Emulator-chosen, and deliberately far above [`MAX_SHADOW_DOCUMENT_BYTES`]: the
-/// service's published quota bounds the STATE a document carries, which can only be
-/// weighed once the document has been parsed, while this bounds the work one request
-/// can ask for BEFORE that — the payload is parsed only once it is known to be within
-/// it. Eight times the state quota leaves ample room for the framing and the
-/// insignificant whitespace an 8 KB state document can arrive wrapped in.
-pub const MAX_SHADOW_REQUEST_ENTITY_BYTES: usize = 8 * MAX_SHADOW_DOCUMENT_BYTES;
+// There is deliberately NO emulator-chosen ceiling on the request entity an update may
+// carry, weighed before the document is parsed. The size verdict on a state document is
+// the SERVICE's, built from the state the document carries and the published quota
+// ([`json_document_too_large`]), and a second ceiling of the emulator's own would answer
+// a document AWS refuses with that message in the emulator's own words instead — the
+// caller would be told the limit is the emulator's ceiling rather than 8 KB. The entity
+// is bounded where it is read instead: the transport buffers at most
+// `vendor/server`'s `MAX_PRODUCTION_BODY_BYTES` (16 MiB) per request and answers a
+// larger one 413 itself, and the payload is already wholly in memory by the time this
+// handler runs, so parsing it to weigh its state costs a constant factor of a request
+// that is already bounded.
 
 /// The largest stored shadow document this service keeps, in bytes, counting the
 /// `metadata` mirror and the version/timestamp alongside the `state` node that

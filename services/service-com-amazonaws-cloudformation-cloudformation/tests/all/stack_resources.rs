@@ -119,10 +119,6 @@ fn sns_arn(name: &str) -> String {
     format!("arn:aws:sns:{REGION}:{ACCOUNT_ID}:{name}")
 }
 
-fn queue_url(name: &str) -> String {
-    format!("https://sqs.{REGION}.amazonaws.com/{ACCOUNT_ID}/{name}")
-}
-
 /// Whether `value` is the ISO-8601 instant the query protocol renders a timestamp as
 /// (`2026-01-01T00:00:00Z`, with optional fractional seconds).
 fn is_iso8601_instant(value: &str) -> bool {
@@ -215,17 +211,21 @@ fn resource_cases() -> Vec<ResourceCase> {
             )],
         },
         ResourceCase {
-            // The ORDER dimension: declared Queue, Bucket, Alpha and reported by logical
+            // The ORDER dimension: declared Topic, Bucket, Alpha and reported by logical
             // id. Alpha is also a type the return-value catalogue does not carry, which
-            // reports its physical NAME as its physical resource id.
+            // reports its physical NAME as its physical resource id, while the topic's
+            // documented `Ref` is its ARN rather than its name. Every type here is one
+            // this emulator does not provision, so the stack completes with CloudFormation
+            // alone mounted; a type it DOES provision is created in its owning service
+            // (`core/router/tests/all/cloudformation_provisions_sqs_queues.rs`).
             case: "three resources of three types, declared out of logical-id order",
             stack_name: "mixed",
             template: concat!(
                 "Resources:\n",
-                "  Queue:\n",
-                "    Type: AWS::SQS::Queue\n",
+                "  Topic:\n",
+                "    Type: AWS::SNS::Topic\n",
                 "    Properties:\n",
-                "      QueueName: probe-queue\n",
+                "      TopicName: probe-topic\n",
                 "  Bucket:\n",
                 "    Type: AWS::S3::Bucket\n",
                 "    Properties:\n",
@@ -246,9 +246,9 @@ fn resource_cases() -> Vec<ResourceCase> {
                     PhysicalId::Exact("probe-bucket".to_string()),
                 ),
                 expect(
-                    "Queue",
-                    "AWS::SQS::Queue",
-                    PhysicalId::Exact(queue_url("probe-queue")),
+                    "Topic",
+                    "AWS::SNS::Topic",
+                    PhysicalId::Exact(sns_arn("probe-topic")),
                 ),
             ],
         },

@@ -1622,7 +1622,7 @@ pub const IMPLEMENTED_RESOURCE_TYPES: &[&str] = &[
     "AWS::RUM::AppMonitor",
     "AWS::S3::Bucket",
     "AWS::SNS::Topic",
-    "AWS::SQS::Queue",
+    SQS_QUEUE,
     "AWS::SecretsManager::Secret",
     "AWS::Transfer::Server",
     "AWS::Transfer::Workflow",
@@ -1666,8 +1666,11 @@ fn return_values(
             attributes.insert("TopicName".to_string(), name.to_string());
             (arn, attributes)
         }
-        // "Ref returns the queue URL"; Fn::GetAtt: Arn, QueueName, QueueUrl.
-        "AWS::SQS::Queue" => {
+        // "Ref returns the queue URL"; Fn::GetAtt: Arn, QueueName, QueueUrl. This is the
+        // type `super::provisioning` creates in Amazon SQS itself, which then reports the
+        // queue's own url back over the `QueueUrl` attribute — the same url this computes,
+        // since both are built from the one account id and the queue's name.
+        SQS_QUEUE => {
             let url = format!(
                 "https://sqs.{region}.{URL_SUFFIX}/{}/{name}",
                 ::emulator_server::emulator_account_id()
@@ -2007,6 +2010,10 @@ fn return_values(
 /// The middle segment is the Firehose model's own `awsService.cloudFormationName`
 /// (`smithy_query(query="service_info")` on that service's model).
 pub const FIREHOSE_DELIVERY_STREAM: &str = "AWS::KinesisFirehose::DeliveryStream";
+
+/// The same for an Amazon SQS queue: the SQS model carries
+/// `awsService.cloudFormationName: SQS`.
+pub const SQS_QUEUE: &str = "AWS::SQS::Queue";
 
 /// The `AWS::ECR::PublicRepository` resource type: an Amazon ECR Public repository.
 ///

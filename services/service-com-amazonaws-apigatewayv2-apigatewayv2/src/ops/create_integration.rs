@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateIntegration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateIntegration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateIntegration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: mints an `IntegrationId` and persists a [`crate::state::Integration`]
+//! record under its parent api, resolving the connection type and the timeout the
+//! request left to their documented defaults. This is the ONLY file to touch for this
+//! operation.
 //!
 //! ## Shape of an operation
 //!
@@ -330,18 +325,170 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateIntegration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateIntegrationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateIntegration"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in the assembled emulator — see the note in `create_api`.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "CreateIntegration",
+            ));
+        };
+        let mut store = state.lock();
+
+        let Some(api) = store.apis.get_mut(&input.api_id) else {
+            return Err(CreateIntegrationErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(format!(
+                        "Invalid API identifier specified {}:{}",
+                        ::engine::emulator_account_id(),
+                        input.api_id
+                    )),
+                    resource_type: ::std::option::Option::None,
+                },
+            )
+            .into());
+        };
+        let is_http = api.protocol_type == HTTP_PROTOCOL_TYPE;
+
+        // "For a Lambda integration, specify the URI of a Lambda function. For an HTTP
+        // integration, specify a fully-qualified URL" (`CreateIntegration$IntegrationUri`):
+        // every integration type names an endpoint except `MOCK`, which "lets API Gateway
+        // return a response without sending the request further to the backend".
+        if input.integration_uri.is_none() && input.integration_type != MOCK_INTEGRATION_TYPE {
+            return Err(bad_request(&format!(
+                "IntegrationUri is required for an integration of type {}.",
+                input.integration_type
+            )));
+        }
+        // "Specifies the format of the payload sent to an integration. Required for HTTP
+        // APIs" (`CreateIntegration$PayloadFormatVersion`).
+        if is_http && input.payload_format_version.is_none() {
+            return Err(bad_request(
+                "PayloadFormatVersion is required for HTTP APIs.",
+            ));
+        }
+        // "The ID of the VPC link for a private integration" is what a `VPC_LINK`
+        // connection connects through, and it means nothing without one.
+        if input.connection_type.as_deref() == Some(VPC_LINK_CONNECTION_TYPE)
+            && input.connection_id.is_none()
+        {
+            return Err(bad_request(&format!(
+                "ConnectionId is required for a connection of type {VPC_LINK_CONNECTION_TYPE}."
+            )));
+        }
+
+        // Bound the growth a caller drives: AWS's published quota is 300 integrations per
+        // API, and `TooManyRequestsException` is the modelled error for "a limit has been
+        // exceeded" (it carries the limit's name in `LimitType`).
+        if api.integrations.len() >= crate::state::MAX_INTEGRATIONS_PER_API {
+            return Err(CreateIntegrationErrorModeled::TooManyRequestsException(
+                TooManyRequestsException {
+                    limit_type: Some("Integration".to_string()),
+                    message: Some(format!(
+                        "The maximum number of integrations ({}) for this API has been reached.",
+                        crate::state::MAX_INTEGRATIONS_PER_API
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let integration_id = api.mint_integration_id();
+        let record = crate::state::Integration {
+            integration_id: integration_id.clone(),
+            integration_type: input.integration_type,
+            integration_uri: input.integration_uri,
+            integration_method: input.integration_method,
+            integration_subtype: input.integration_subtype,
+            // "The default value is INTERNET" (`Integration$ConnectionType`).
+            connection_type: input
+                .connection_type
+                .unwrap_or_else(|| crate::state::DEFAULT_CONNECTION_TYPE.to_string()),
+            connection_id: input.connection_id,
+            content_handling_strategy: input.content_handling_strategy,
+            credentials_arn: input.credentials_arn,
+            description: input.description,
+            passthrough_behavior: input.passthrough_behavior,
+            payload_format_version: input.payload_format_version,
+            request_parameters: input.request_parameters.unwrap_or_default().into_iter().collect(),
+            request_templates: input.request_templates.unwrap_or_default().into_iter().collect(),
+            response_parameters: input
+                .response_parameters
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(selection, parameters)| (selection, parameters.into_iter().collect()))
+                .collect(),
+            template_selection_expression: input.template_selection_expression,
+            // "The default timeout is 29 seconds for WebSocket APIs and 30 seconds for
+            // HTTP APIs" (`CreateIntegration$TimeoutInMillis`), so the default is the
+            // parent api's protocol's.
+            timeout_in_millis: input.timeout_in_millis.unwrap_or(if is_http {
+                crate::state::DEFAULT_HTTP_TIMEOUT_MILLIS
+            } else {
+                crate::state::DEFAULT_WEBSOCKET_TIMEOUT_MILLIS
+            }),
+            // `TlsConfigInput` carries exactly the one member `TlsConfig` reports.
+            tls_config: input.tls_config.map(|config| TlsConfig {
+                server_name_to_verify: config.server_name_to_verify,
+            }),
+            // Only an integration API Gateway created on the caller's behalf is managed;
+            // one the caller asked for is its own.
+            api_gateway_managed: false,
+        };
+
+        // Read the response back out of the STORE, so what the caller gets is what a
+        // later GetIntegration will report. `integration_id` comes from this api's own id
+        // bijection, so it names no existing integration and this inserts.
+        let stored = api
+            .integrations
+            .entry(integration_id)
+            .or_insert(record)
+            .to_wire();
+        Ok(CreateIntegrationOutput {
+            api_gateway_managed: stored.api_gateway_managed,
+            connection_id: stored.connection_id,
+            connection_type: stored.connection_type,
+            content_handling_strategy: stored.content_handling_strategy,
+            credentials_arn: stored.credentials_arn,
+            description: stored.description,
+            integration_id: stored.integration_id,
+            integration_method: stored.integration_method,
+            integration_response_selection_expression: stored
+                .integration_response_selection_expression,
+            integration_subtype: stored.integration_subtype,
+            integration_type: stored.integration_type,
+            integration_uri: stored.integration_uri,
+            passthrough_behavior: stored.passthrough_behavior,
+            payload_format_version: stored.payload_format_version,
+            request_parameters: stored.request_parameters,
+            request_templates: stored.request_templates,
+            response_parameters: stored.response_parameters,
+            template_selection_expression: stored.template_selection_expression,
+            timeout_in_millis: stored.timeout_in_millis,
+            tls_config: stored.tls_config,
+        })
     }
+}
+
+/// The `ProtocolType` value that selects an HTTP API, from `PROTOCOL_TYPE_VALUES`
+/// (`HTTP | WEBSOCKET`) — which of the two documented defaults an absent
+/// `TimeoutInMillis` takes, and whether `PayloadFormatVersion` is required.
+const HTTP_PROTOCOL_TYPE: &str = "HTTP";
+
+/// The one `IntegrationType` that names no endpoint, from `INTEGRATION_TYPE_VALUES`:
+/// "MOCK: for integrating the route or method request with API Gateway as a ‘loopback'
+/// endpoint without invoking any backend."
+const MOCK_INTEGRATION_TYPE: &str = "MOCK";
+
+/// The `ConnectionType` of a private integration, from `CONNECTION_TYPE_VALUES`: the
+/// one that connects through a VPC link and so needs the link's id.
+const VPC_LINK_CONNECTION_TYPE: &str = "VPC_LINK";
+
+/// This operation's refusal of a request it models no more specific error for: the
+/// modelled `BadRequestException` ("The request is not valid, for example, the input is
+/// incomplete or incorrect"), whose message names the member and the constraint.
+fn bad_request(message: &str) -> CreateIntegrationError {
+    CreateIntegrationErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message.to_string()),
+    })
+    .into()
 }

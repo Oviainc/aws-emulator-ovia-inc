@@ -4,7 +4,8 @@
 //! Merges one update into the stored shadow document and answers with the document
 //! that merge produced: `state.desired` / `state.reported` as merged, a derived
 //! `state.delta`, the per-leaf `metadata`, the incremented `version` and the accepted
-//! `timestamp`. Never the request echoed back.
+//! `timestamp` — plus the request's own `clientToken`, the caller's correlation key,
+//! which is echoed into the reply and never stored. Never the request echoed back.
 //!
 //! The document is the whole response body (the `@httpPayload` `JsonDocument` blob)
 //! and is announced `content-type: application/json` — see the media-type note in
@@ -170,21 +171,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
 
-        // This emulator's own ceiling on the entity it will read, weighed BEFORE the
-        // payload is parsed so the work one request can ask for is bounded. It is the
-        // emulator's cap, not the service's quota, so it says so; the service's quota
-        // is weighed on the state the document carries, once it can be read.
-        if input.payload.len() > crate::state::MAX_SHADOW_REQUEST_ENTITY_BYTES {
-            return Err(UpdateThingShadowErrorModeled::RequestEntityTooLargeException(
-                RequestEntityTooLargeException::new(crate::state::emulator_size_cap(
-                    "reads a state document",
-                    input.payload.len(),
-                    crate::state::MAX_SHADOW_REQUEST_ENTITY_BYTES,
-                )),
-            )
-            .into());
-        }
-
         // A shadow document is UTF-8 JSON: bytes that are not UTF-8 at all are an
         // encoding this service does not support (415), and UTF-8 that is not a JSON
         // document is an invalid request (400). Either way the message is the
@@ -321,7 +307,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         merged.apply(desired, reported, timestamp_secs);
         merged.version = stored_version + 1;
         merged.timestamp_secs = timestamp_secs;
-        let accepted = merged.document();
+        let stored_document = merged.document();
         // The same measure again, on the state the merge would leave STORED: the
         // quota bounds the accumulated state, not one request's document.
         let state_bytes = merged.state_bytes();
@@ -334,15 +320,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
-        let serialized =
-            ::serde_json::to_vec(&accepted).expect("a shadow document serializes to JSON");
-        if serialized.len() > crate::state::MAX_STORED_SHADOW_BYTES {
+        let stored =
+            ::serde_json::to_vec(&stored_document).expect("a shadow document serializes to JSON");
+        if stored.len() > crate::state::MAX_STORED_SHADOW_BYTES {
             // Another cap of this emulator's own, on the whole stored record rather
             // than the state the quota bounds, so it names itself as the emulator's.
             return Err(UpdateThingShadowErrorModeled::RequestEntityTooLargeException(
                 RequestEntityTooLargeException::new(crate::state::emulator_size_cap(
                     "stores a shadow document",
-                    serialized.len(),
+                    stored.len(),
                     crate::state::MAX_STORED_SHADOW_BYTES,
                 )),
             )
@@ -350,8 +336,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         guard.shadows.insert(key, merged);
 
+        // The reply is the stored document plus the request's own correlation token; the
+        // token is not state, so what was just stored — and therefore what every later
+        // reader answers with — does not carry it.
+        let accepted = crate::state::reply_with_client_token(
+            stored_document,
+            document.get(crate::state::CLIENT_TOKEN),
+        );
         Ok(UpdateThingShadowOutput {
-            payload: Some(serialized),
+            payload: Some(
+                ::serde_json::to_vec(&accepted).expect("a shadow document serializes to JSON"),
+            ),
         })
     }
 }

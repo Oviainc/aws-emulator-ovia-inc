@@ -17,6 +17,8 @@ mod reserved_topic_namespace;
 mod response_envelope;
 #[path = "all/shadow_and_retained_message.rs"]
 mod shadow_and_retained_message;
+#[path = "all/shadow_client_token.rs"]
+mod shadow_client_token;
 #[path = "all/shadow_document_media_type.rs"]
 mod shadow_document_media_type;
 #[path = "all/state_roundtrip.rs"]

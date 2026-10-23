@@ -27,7 +27,7 @@ const REGION: &str = "eu-west-1";
 const ID_LEN: usize = 10;
 
 /// A fresh emulator holding only this service, with request authentication off.
-fn emulator() -> MultiServiceRouter {
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -39,7 +39,7 @@ fn emulator() -> MultiServiceRouter {
 
 /// Send one request and return `(status, parsed body)`. An empty body parses to
 /// `Value::Null`, which is how a 204 is asserted.
-async fn call(
+pub(crate) async fn call(
     emulator: &MultiServiceRouter,
     method: &str,
     uri: &str,
@@ -78,7 +78,7 @@ async fn call(
 }
 
 /// The `__type` / error code a failure response carries.
-fn error_code(body: &Value) -> String {
+pub(crate) fn error_code(body: &Value) -> String {
     body.get("__type")
         .and_then(Value::as_str)
         .unwrap_or_default()
@@ -88,7 +88,7 @@ fn error_code(body: &Value) -> String {
         .to_string()
 }
 
-fn as_str(body: &Value, member: &str) -> String {
+pub(crate) fn as_str(body: &Value, member: &str) -> String {
     body.get(member)
         .and_then(Value::as_str)
         .unwrap_or_default()
@@ -206,7 +206,7 @@ fn assert_created_now(case: &str, body: &Value) {
 }
 
 /// A minted id is ten lowercase alphanumerics.
-fn assert_minted_id(case: &str, member: &str, id: &str) {
+pub(crate) fn assert_minted_id(case: &str, member: &str, id: &str) {
     assert_eq!(
         id.len(),
         ID_LEN,

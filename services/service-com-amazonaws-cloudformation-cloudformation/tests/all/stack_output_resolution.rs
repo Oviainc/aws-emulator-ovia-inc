@@ -289,24 +289,24 @@ Outputs:
             stack_name: "catalogued",
             template: r#"{"Resources":{
                    "T":{"Type":"AWS::SNS::Topic","Properties":{"TopicName":"probe-topic"}},
-                   "Q":{"Type":"AWS::SQS::Queue","Properties":{"QueueName":"probe-queue"}}},
+                   "D":{"Type":"AWS::DynamoDB::Table","Properties":{"TableName":"probe-table"}}},
                  "Outputs":{
                    "TopicPublished":{"Value":{"Fn::GetAtt":["T","TopicArn"]}},
                    "TopicConventional":{"Value":{"Fn::GetAtt":["T","Arn"]}},
-                   "QueuePublished":{"Value":{"Fn::GetAtt":["Q","Arn"]}},
-                   "QueueConventional":{"Value":{"Fn::GetAtt":["Q","QueueArn"]}}}}"#
+                   "TablePublished":{"Value":{"Fn::GetAtt":["D","Arn"]}},
+                   "TableConventional":{"Value":{"Fn::GetAtt":["D","TableArn"]}}}}"#
                 .to_string(),
             parameters: vec![],
             expected: vec![
                 value("TopicPublished", sns_arn("probe-topic")),
                 value("TopicConventional", sns_arn("probe-topic")),
                 value(
-                    "QueuePublished",
-                    format!("arn:aws:sqs:{REGION}:{ACCOUNT_ID}:probe-queue"),
+                    "TablePublished",
+                    format!("arn:aws:dynamodb:{REGION}:{ACCOUNT_ID}:table/probe-table"),
                 ),
                 value(
-                    "QueueConventional",
-                    format!("arn:aws:sqs:{REGION}:{ACCOUNT_ID}:probe-queue"),
+                    "TableConventional",
+                    format!("arn:aws:dynamodb:{REGION}:{ACCOUNT_ID}:table/probe-table"),
                 ),
             ],
         },
