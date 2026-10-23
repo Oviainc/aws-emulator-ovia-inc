@@ -13,6 +13,10 @@
 //! `ConflictException`; a create past the documented account quota is refused with the
 //! modelled `ServiceQuotaExceededException`.
 //!
+//! `DeleteGroup`'s own rules — what a delete removes, and the home-Region restriction it
+//! documents — are asserted in `tests/all/group_deletion.rs`, which also carries the
+//! recorded evidence for the missing-group MESSAGE this suite asserts on reads.
+//!
 //! Every assertion goes over the wire through the same `MultiServiceRouter` the emulator
 //! boots, through the harness the lifecycle suite already defines.
 
@@ -34,9 +38,17 @@ const MAX_TAGS: usize = 50;
 /// (`smithy_query(query="shape",shape="GroupName")`).
 const MAX_GROUP_NAME_LEN: usize = 64;
 
-/// The fixed sentence a group lookup that misses answers with, by this service's
-/// missing-resource rule (see `tests/all/missing_resource_errors.rs`).
-const GROUP_NOT_FOUND: &str = "Group not found.";
+/// How a group lookup that misses is worded (`state::group_not_found`): the recorded
+/// service builds the message FROM THE REQUEST, naming the `GroupIdentifier` it was asked
+/// about (recorded unit `synthetics.delete-group-nonexistent-resource-not-found`, whose
+/// later step reads a deleted group back through `GetGroup`). Unlike the canary lookups,
+/// whose miss is one fixed sentence.
+///
+/// `pub(crate)` because every suite in this target that asserts a group miss
+/// (`group_deletion`, `group_membership`) asserts this one construction.
+pub(crate) fn group_not_found_message(identifier: &str) -> String {
+    format!("Group does not exist: {identifier}")
+}
 
 /// Whether `value` is a legal `Group$Id`.
 ///
@@ -324,10 +336,10 @@ async fn a_duplicate_group_name_is_refused_and_leaves_the_live_group_alone() {
     }
 }
 
-/// A `GroupIdentifier` the store does not hold is answered with the fixed, identifier-free
-/// missing-group sentence — whatever form the identifier takes.
+/// A `GroupIdentifier` the store does not hold is answered with the missing-group message
+/// built from that identifier — whatever form the identifier takes.
 #[tokio::test]
-async fn a_missing_group_answers_one_fixed_identifier_free_message() {
+async fn a_missing_group_names_the_requested_identifier() {
     let aws = Synthetics::new("ap-southeast-2");
     let live = aws
         .call("POST", "/group", Some(json!({ "Name": "live-group" })))
@@ -376,6 +388,7 @@ async fn a_missing_group_answers_one_fixed_identifier_free_message() {
         ("max-length-identifier", "z".repeat(128)),
     ];
     let mut messages: BTreeSet<String> = BTreeSet::new();
+    let rows = identifiers.len();
     for (case, identifier) in identifiers {
         let answer = aws
             .call("GET", &format!("/group/{identifier}"), None)
@@ -396,22 +409,21 @@ async fn a_missing_group_answers_one_fixed_identifier_free_message() {
             .as_str()
             .unwrap_or_else(|| panic!("case {case}: expected a Message, got {:?}", answer.body))
             .to_string();
-        assert!(
-            !message.to_lowercase().contains(&identifier.to_lowercase()),
-            "case {case}: expected a Message that does not name the requested group \
-             {identifier:?}, got {message:?}"
-        );
         assert_eq!(
-            message, GROUP_NOT_FOUND,
-            "case {case}: expected the fixed missing-group sentence, got {message:?}"
+            message,
+            group_not_found_message(&identifier),
+            "case {case}: expected the missing-group message built from the requested \
+             identifier {identifier:?}, got {message:?}"
         );
         messages.insert(message);
     }
+    // The message is request-derived, so every identifier gets its own: one fixed sentence
+    // across the table would be the canary rule, not this one.
     assert_eq!(
         messages.len(),
-        1,
-        "case request-independence: expected one fixed message across every identifier \
-         form, got {messages:?}"
+        rows,
+        "case request-derived: expected one message per requested identifier, got \
+         {messages:?}"
     );
 
     // The misses resolved to nothing: the live group is still there.
@@ -493,12 +505,23 @@ async fn a_create_past_the_account_quota_is_refused() {
 /// it stays per-crate because an integration test target cannot import another crate's
 /// test module.
 #[derive(Clone, Default)]
-struct CapturedRecords(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+pub(crate) struct CapturedRecords {
+    /// The buffer a draining reader empties.
+    drained: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    /// Every record ever captured, never cleared, so a sibling suite can count its own
+    /// records as a delta without a draining reader stealing them.
+    all: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+}
 
 impl CapturedRecords {
     /// Every record captured since the last drain, clearing the buffer.
     fn drain(&self) -> Vec<String> {
-        std::mem::take(&mut *self.0.lock().expect("the audit capture lock"))
+        std::mem::take(&mut *self.drained.lock().expect("the audit capture lock"))
+    }
+
+    /// Every record captured so far, leaving the capture untouched.
+    pub(crate) fn all(&self) -> Vec<String> {
+        self.all.lock().expect("the audit capture lock").clone()
     }
 }
 
@@ -534,7 +557,14 @@ impl tracing::Subscriber for CapturedRecords {
     fn event(&self, event: &tracing::Event<'_>) {
         let mut line = RecordLine(format!("{} ", event.metadata().target()));
         event.record(&mut line);
-        self.0.lock().expect("the audit capture lock").push(line.0);
+        self.drained
+            .lock()
+            .expect("the audit capture lock")
+            .push(line.0.clone());
+        self.all
+            .lock()
+            .expect("the audit capture lock")
+            .push(line.0);
     }
 
     fn enter(&self, _span: &tracing::span::Id) {}
@@ -551,7 +581,7 @@ impl tracing::Subscriber for CapturedRecords {
 /// re-evaluates a handler's callsite with no subscriber of its own.
 static AUDIT_CAPTURE: std::sync::OnceLock<CapturedRecords> = std::sync::OnceLock::new();
 
-fn audit_capture() -> &'static CapturedRecords {
+pub(crate) fn audit_capture() -> &'static CapturedRecords {
     AUDIT_CAPTURE.get_or_init(|| {
         let captured = CapturedRecords::default();
         tracing::subscriber::set_global_default(captured.clone())

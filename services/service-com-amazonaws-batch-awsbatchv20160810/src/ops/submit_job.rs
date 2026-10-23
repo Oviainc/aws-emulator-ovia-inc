@@ -18,7 +18,10 @@
 //! members, so `DescribeJobs` reports exactly what was submitted.
 //!
 //! The job is returned in the non-terminal `SUBMITTED` status; the clock owns every move
-//! out of it (see [`crate::state`]).
+//! out of it (see [`crate::state`]). Entering `SUBMITTED` is a job state change like any
+//! other, so this call also publishes a `Batch Job State Change` event for it onto the
+//! account's default EventBridge bus, together with any transition the clock had already
+//! made due (`state::publish_job_state_changes`).
 //!
 //! Parts of the surface this slice does NOT implement answer 501 rather than accept a
 //! request they would then answer wrongly: `arrayProperties` and `nodeOverrides` (an
@@ -246,149 +249,163 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let region = batch::request_region(ctx);
         let now = batch::now_millis();
-        let mut state = state.lock();
-        state.materialize_due(now);
+        // The store's lock lives in THIS block and no longer, so nothing holds it while
+        // the state changes below are published (that call reaches another service
+        // in-process).
+        let (arn, job_id, job_name) = {
+            let mut state = state.lock();
+            state.materialize_due(now);
 
-        if input
-            .array_properties
-            .as_ref()
-            .and_then(|properties| properties.size)
-            .is_some()
-        {
-            return Err(crate::scaffolded::Scaffolded::not_implemented(
-                "SubmitJob with arrayProperties",
-            ));
-        }
-        if input.node_overrides.is_some() {
-            return Err(crate::scaffolded::Scaffolded::not_implemented(
-                "SubmitJob with nodeOverrides",
-            ));
-        }
-        if input.ecs_properties_override.is_some() || input.eks_properties_override.is_some() {
-            return Err(crate::scaffolded::Scaffolded::not_implemented(
-                "SubmitJob with ecsPropertiesOverride or eksPropertiesOverride",
-            ));
-        }
+            if input
+                .array_properties
+                .as_ref()
+                .and_then(|properties| properties.size)
+                .is_some()
+            {
+                return Err(crate::scaffolded::Scaffolded::not_implemented(
+                    "SubmitJob with arrayProperties",
+                ));
+            }
+            if input.node_overrides.is_some() {
+                return Err(crate::scaffolded::Scaffolded::not_implemented(
+                    "SubmitJob with nodeOverrides",
+                ));
+            }
+            if input.ecs_properties_override.is_some() || input.eks_properties_override.is_some() {
+                return Err(crate::scaffolded::Scaffolded::not_implemented(
+                    "SubmitJob with ecsPropertiesOverride or eksPropertiesOverride",
+                ));
+            }
 
-        // AWS resolves the JOB DEFINITION before the job queue: a submit naming neither is
-        // refused on the definition. The two ways a reference fails to name a runnable
-        // revision — nothing stored for it, and a stored revision that is not ACTIVE —
-        // are ONE refusal, worded from the reference the request gave.
-        let definition = state
-            .job_definition(&input.job_definition)
-            .filter(|definition| definition.status.as_deref() == Some(batch::STATUS_ACTIVE))
-            .cloned();
-        let Some(definition) = definition else {
-            return Err(SubmitJobErrorModeled::ClientException(batch::client_exception(
-                format!(
-                    "JobDefinition name {} does not exist or is not in ACTIVE status.",
-                    input.job_definition
-                ),
-            ))
-            .into());
-        };
-        if definition.container_properties.is_none() && definition.node_properties.is_none() {
-            return Err(crate::scaffolded::Scaffolded::not_implemented(
-                "SubmitJob against an ecsProperties or eksProperties job definition",
-            ));
-        }
-
-        let Some(queue) = state.job_queue(&input.job_queue) else {
-            return Err(SubmitJobErrorModeled::ClientException(batch::client_exception(
-                format!("Job queue {} does not exist", input.job_queue),
-            ))
-            .into());
-        };
-        let queue_arn = queue.arn.clone();
-        // `JQState`: "If the job queue state is DISABLED, new jobs can't be added to the
-        // queue, but jobs already in the queue can finish." So a submit to a disabled
-        // queue is refused, and the jobs already stored for it keep advancing.
-        if queue.state == batch::STATE_DISABLED {
-            return Err(SubmitJobErrorModeled::ClientException(batch::client_exception(
-                format!("Job queue {queue_arn} is DISABLED and can't accept new jobs"),
-            ))
-            .into());
-        }
-
-        // AWS documents the bound on `SubmitJob$dependsOn`: "A job can depend upon a
-        // maximum of 20 jobs." Checked before the ids are resolved, so one request can
-        // never add an unbounded number of dependency edges to the store.
-        let dependency_count = input.depends_on.as_ref().map_or(0, Vec::len);
-        if dependency_count > batch::limits::MAX_JOB_DEPENDENCIES {
-            return Err(SubmitJobErrorModeled::ClientException(batch::client_exception(
-                batch::quota_message(
-                    "dependsOn entries for one job",
-                    batch::limits::MAX_JOB_DEPENDENCIES,
-                ),
-            ))
-            .into());
-        }
-        for dependency in input.depends_on.iter().flatten() {
-            let Some(dependency_id) = dependency.job_id.as_deref() else {
-                continue;
-            };
-            if !state.jobs.contains_key(dependency_id) {
+            // AWS resolves the JOB DEFINITION before the job queue: a submit naming
+            // neither is refused on the definition. The two ways a reference fails to name
+            // a runnable revision — nothing stored for it, and a stored revision that is
+            // not ACTIVE — are ONE refusal, worded from the reference the request gave.
+            let definition = state
+                .job_definition(&input.job_definition)
+                .filter(|definition| definition.status.as_deref() == Some(batch::STATUS_ACTIVE))
+                .cloned();
+            let Some(definition) = definition else {
                 return Err(SubmitJobErrorModeled::ClientException(batch::client_exception(
-                    format!("Dependent job {dependency_id} does not exist"),
+                    format!(
+                        "JobDefinition name {} does not exist or is not in ACTIVE status.",
+                        input.job_definition
+                    ),
+                ))
+                .into());
+            };
+            if definition.container_properties.is_none() && definition.node_properties.is_none() {
+                return Err(crate::scaffolded::Scaffolded::not_implemented(
+                    "SubmitJob against an ecsProperties or eksProperties job definition",
+                ));
+            }
+
+            let Some(queue) = state.job_queue(&input.job_queue) else {
+                return Err(SubmitJobErrorModeled::ClientException(batch::client_exception(
+                    format!("Job queue {} does not exist", input.job_queue),
+                ))
+                .into());
+            };
+            let queue_arn = queue.arn.clone();
+            // `JQState`: "If the job queue state is DISABLED, new jobs can't be added to
+            // the queue, but jobs already in the queue can finish." So a submit to a
+            // disabled queue is refused, and the jobs already stored for it keep
+            // advancing.
+            if queue.state == batch::STATE_DISABLED {
+                return Err(SubmitJobErrorModeled::ClientException(batch::client_exception(
+                    format!("Job queue {queue_arn} is DISABLED and can't accept new jobs"),
                 ))
                 .into());
             }
-        }
 
-        let job_id = state.new_uuid();
-        let arn = batch::job_arn(&region, &job_id);
-        let job = batch::Job {
-            job_id: job_id.clone(),
-            job_arn: arn.clone(),
-            job_name: input.job_name.clone(),
-            job_queue_arn: queue_arn,
-            job_definition_arn: definition.job_definition_arn.clone(),
-            status: batch::JOB_SUBMITTED.to_string(),
-            status_reason: None,
-            created_at: now,
-            started_at: None,
-            stopped_at: None,
-            next_phase_due_at: Some(now + batch::JOB_PHASE_MILLIS),
-            is_cancelled: false,
-            is_terminated: false,
-            // Nothing has asked for this job to be cancelled yet (`CancelJob` records a
-            // cancel here when the job is PENDING on its dependencies).
-            cancel_requested: None,
-            parameters: batch::merged_parameters(
-                definition.parameters.as_ref(),
-                input.parameters.as_ref(),
-            ),
-            container: batch::effective_container(
-                definition.container_properties.as_ref(),
-                input.container_overrides.as_ref(),
-            ),
-            node_properties: definition.node_properties.clone(),
-            retry_strategy: input.retry_strategy.or(definition.retry_strategy),
-            timeout: input.timeout.or(definition.timeout),
-            depends_on: input.depends_on,
-            share_identifier: input.share_identifier,
-            scheduling_priority: input
-                .scheduling_priority_override
-                .or(definition.scheduling_priority),
-            propagate_tags: input.propagate_tags.or(definition.propagate_tags),
-            platform_capabilities: definition.platform_capabilities.clone(),
-            consumable_resource_properties: input
-                .consumable_resource_properties_override
-                .or(definition.consumable_resource_properties),
-            tags: input.tags,
+            // AWS documents the bound on `SubmitJob$dependsOn`: "A job can depend upon a
+            // maximum of 20 jobs." Checked before the ids are resolved, so one request can
+            // never add an unbounded number of dependency edges to the store.
+            let dependency_count = input.depends_on.as_ref().map_or(0, Vec::len);
+            if dependency_count > batch::limits::MAX_JOB_DEPENDENCIES {
+                return Err(SubmitJobErrorModeled::ClientException(batch::client_exception(
+                    batch::quota_message(
+                        "dependsOn entries for one job",
+                        batch::limits::MAX_JOB_DEPENDENCIES,
+                    ),
+                ))
+                .into());
+            }
+            for dependency in input.depends_on.iter().flatten() {
+                let Some(dependency_id) = dependency.job_id.as_deref() else {
+                    continue;
+                };
+                if !state.jobs.contains_key(dependency_id) {
+                    return Err(SubmitJobErrorModeled::ClientException(
+                        batch::client_exception(format!(
+                            "Dependent job {dependency_id} does not exist"
+                        )),
+                    )
+                    .into());
+                }
+            }
+
+            let job_id = state.new_uuid();
+            let arn = batch::job_arn(&region, &job_id);
+            let job = batch::Job {
+                job_id: job_id.clone(),
+                job_arn: arn.clone(),
+                job_name: input.job_name.clone(),
+                job_queue_arn: queue_arn,
+                job_definition_arn: definition.job_definition_arn.clone(),
+                status: batch::JOB_SUBMITTED.to_string(),
+                status_reason: None,
+                created_at: now,
+                started_at: None,
+                stopped_at: None,
+                next_phase_due_at: Some(now + batch::JOB_PHASE_MILLIS),
+                is_cancelled: false,
+                is_terminated: false,
+                // Nothing has asked for this job to be cancelled yet (`CancelJob` records
+                // a cancel here when the job is PENDING on its dependencies).
+                cancel_requested: None,
+                parameters: batch::merged_parameters(
+                    definition.parameters.as_ref(),
+                    input.parameters.as_ref(),
+                ),
+                container: batch::effective_container(
+                    definition.container_properties.as_ref(),
+                    input.container_overrides.as_ref(),
+                ),
+                node_properties: definition.node_properties.clone(),
+                retry_strategy: input.retry_strategy.or(definition.retry_strategy),
+                timeout: input.timeout.or(definition.timeout),
+                depends_on: input.depends_on,
+                share_identifier: input.share_identifier,
+                scheduling_priority: input
+                    .scheduling_priority_override
+                    .or(definition.scheduling_priority),
+                propagate_tags: input.propagate_tags.or(definition.propagate_tags),
+                platform_capabilities: definition.platform_capabilities.clone(),
+                consumable_resource_properties: input
+                    .consumable_resource_properties_override
+                    .or(definition.consumable_resource_properties),
+                tags: input.tags,
+            };
+            // The jobs store is bounded (`state::limits::MAX_JOBS`): room is made by
+            // evicting the jobs that have been terminal longest, and a store full of live
+            // jobs refuses the submit with the modelled 400 rather than growing.
+            state.insert_job(job).map_err(|message| {
+                SubmitJobError::from(SubmitJobErrorModeled::ClientException(
+                    batch::client_exception(message),
+                ))
+            })?;
+            (arn, job_id, input.job_name)
         };
-        // The jobs store is bounded (`state::limits::MAX_JOBS`): room is made by
-        // evicting the jobs that have been terminal longest, and a store full of live
-        // jobs refuses the submit with the modelled 400 rather than growing.
-        state.insert_job(job).map_err(|message| {
-            SubmitJobError::from(SubmitJobErrorModeled::ClientException(
-                batch::client_exception(message),
-            ))
-        })?;
+        batch::publish_job_state_changes(ctx, &*self.engine, &region).await;
+        // The moves this job still owes are the clock's, and a client watching through
+        // EventBridge makes no further Batch call: one in-process pump waits for them
+        // and publishes each as it falls due (`state::drive_job_clock`).
+        batch::drive_job_clock(ctx, &self.engine, &region);
 
         Ok(SubmitJobOutput {
             job_arn: Some(arn),
-            job_name: input.job_name,
+            job_name,
             job_id,
         })
     }

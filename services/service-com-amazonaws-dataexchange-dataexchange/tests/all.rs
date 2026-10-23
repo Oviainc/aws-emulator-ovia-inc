@@ -15,5 +15,7 @@
 mod data_sets;
 #[path = "all/jobs.rs"]
 mod jobs;
+#[path = "all/revisions.rs"]
+mod revisions;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

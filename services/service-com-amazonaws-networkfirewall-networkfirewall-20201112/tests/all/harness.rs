@@ -137,18 +137,27 @@ pub fn minimal_policy_document() -> Value {
 }
 
 /// A resource-policy document granting exactly `actions` on `resource` to this
-/// account, in the form the AWS `PutResourcePolicy` documentation shows.
+/// account, in the form the AWS `PutResourcePolicy` documentation shows: one
+/// `Allow` statement carrying all of them.
 pub fn resource_policy_document(actions: &[&str], resource: &str) -> String {
-    json!({
-        "Version": "2012-10-17",
-        "Statement": [{
-            "Effect": "Allow",
-            "Principal": { "AWS": ACCOUNT },
-            "Action": actions,
-            "Resource": resource,
-        }],
-    })
-    .to_string()
+    split_resource_policy_document(&[actions], resource)
+}
+
+/// The same document with its grants SPLIT across one `Allow` statement per entry
+/// of `statements`, so the policy's granted set is their union.
+pub fn split_resource_policy_document(statements: &[&[&str]], resource: &str) -> String {
+    let statements: Vec<Value> = statements
+        .iter()
+        .map(|actions| {
+            json!({
+                "Effect": "Allow",
+                "Principal": { "AWS": ACCOUNT },
+                "Action": actions,
+                "Resource": resource,
+            })
+        })
+        .collect();
+    json!({ "Version": "2012-10-17", "Statement": statements }).to_string()
 }
 
 /// The awsJson error code (`__type`) of an error body.

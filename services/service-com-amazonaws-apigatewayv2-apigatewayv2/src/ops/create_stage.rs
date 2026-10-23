@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateStage
+//! IMPLEMENTED: mints a `Stage` under the api that owns it, keyed by its `StageName`,
+//! and reports the stored record back; `GetStage` reads that same record.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -194,6 +197,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into_iter()
             .collect();
         crate::state::validate_stage_variables(stage_variables.iter()).map_err(bad_request)?;
+        if let Some(settings) = input.access_log_settings.as_ref() {
+            crate::state::validate_access_log_settings(settings).map_err(bad_request)?;
+        }
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // Unreachable in the assembled emulator — see the note in `create_api`.

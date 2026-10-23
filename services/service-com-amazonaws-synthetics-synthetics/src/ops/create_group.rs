@@ -81,7 +81,9 @@ use super::types::*;
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::SystemTime;
 
-use crate::state::{new_group_id, request_caller, StoredGroup, AUDIT_TARGET, MAX_GROUPS, STORE_UNAVAILABLE};
+use crate::state::{
+    new_group_id, request_caller, StoredGroup, AUDIT_TARGET, MAX_GROUPS, STORE_UNAVAILABLE,
+};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -158,7 +160,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = SystemTime::now();
         // "Although the group ARN format reflects the Region name where it was created, a
         // group is not constrained to any Region": the Region the create was signed for is
-        // the one that goes into the ARN.
+        // the one that goes into the ARN, and is the group's home Region for `DeleteGroup`.
         let region = crate::state::request_region(&ctx.parts().headers);
 
         let stored = StoredGroup {

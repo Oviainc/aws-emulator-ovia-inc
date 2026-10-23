@@ -405,6 +405,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .cluster
             .number_of_nodes
             .unwrap_or(1);
+        // Bounded BEFORE the pair is resolved and before anything is derived
+        // from the count, exactly as `CreateCluster` bounds it.
+        if input
+            .number_of_nodes
+            .is_some_and(st::exceeds_nodes_per_cluster_limit)
+        {
+            return Err(
+                ModifyClusterErrorModeled::NumberOfNodesPerClusterLimitExceededFault(
+                    NumberOfNodesPerClusterLimitExceededFault {
+                        message: Some(st::nodes_per_cluster_limit_message(
+                            input.number_of_nodes.unwrap_or_default(),
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
         let (cluster_type, number_of_nodes) = match st::resolve_cluster_shape(
             input.cluster_type.as_deref(),
             input.number_of_nodes,
@@ -413,7 +430,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Ok(shape) => shape,
             Err(message) => return Err(crate::scaffolded::Scaffolded::validation(message)),
         };
-
         if let Some(automated_retention) = input.automated_snapshot_retention_period {
             if !(st::AUTOMATED_RETENTION_BOUNDS.0..=st::AUTOMATED_RETENTION_BOUNDS.1)
                 .contains(&automated_retention)
@@ -504,9 +520,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(value) = input.extra_compute_for_automatic_optimization {
             stored.cluster.extra_compute_for_automatic_optimization = Some(value.to_string());
         }
-        if let Some(value) = input.availability_zone_relocation {
-            stored.cluster.availability_zone_relocation_status =
-                Some(if value { "enabled" } else { "disabled" }.to_string());
+        if input.availability_zone_relocation.is_some() {
+            stored.cluster.availability_zone_relocation_status = Some(
+                st::availability_zone_relocation_status(input.availability_zone_relocation),
+            );
         }
         if let Some(groups) = input.cluster_security_groups.clone() {
             stored.cluster.cluster_security_groups = Some(
@@ -530,11 +547,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
         if let Some(name) = input.cluster_parameter_group_name.clone() {
-            stored.cluster.cluster_parameter_groups = Some(vec![ClusterParameterGroupStatus {
-                parameter_group_name: Some(name),
-                parameter_apply_status: Some(st::PARAMETER_APPLY_STATUS_IN_SYNC.to_string()),
-                cluster_parameter_status_list: None,
-            }]);
+            stored.cluster.cluster_parameter_groups =
+                Some(st::cluster_parameter_group_status(Some(name)));
         }
         if input.hsm_client_certificate_identifier.is_some()
             || input.hsm_configuration_identifier.is_some()
@@ -565,7 +579,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 input.master_password_secret_kms_key_id.clone();
             stored.master_user_password = None;
         } else if let Some(password) = input.master_user_password.clone() {
-            // Stored only; the `Cluster` shape models no password member.
+            // Stored only; the `Cluster` shape models no password member. The
+            // change is reported as pending, as the MASK, until it falls due a
+            // `PROVISIONING_SPAN` from now — every other member this call
+            // changes is applied to the record here, so nothing else is pending.
+            stored.cluster.pending_modified_values =
+                Some(st::pending_master_user_password(Some(password.as_str())));
+            stored.available_at = ::std::time::Instant::now() + st::PROVISIONING_SPAN;
             stored.master_user_password = Some(password);
         }
         // A port change moves the endpoint the caller connects to.
@@ -581,6 +601,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let endpoint = stored.cluster.endpoint.get_or_insert_with(Endpoint::default);
             endpoint.address = Some(st::endpoint_address(&new_identifier, &region));
         }
+
+        // Re-derive every member the service computes from the configuration
+        // this call just changed — the node topology, the revision, the public
+        // key, the VPC and its endpoints, the next maintenance window — through
+        // the same rule `CreateCluster` used, so a modified cluster reports the
+        // same member set a created one does.
+        let cluster_type = stored.cluster_type.clone();
+        st::populate_derived_members(
+            &mut stored.cluster,
+            &cluster_type,
+            ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now()),
+        );
 
         Ok(ModifyClusterOutput {
             cluster: Some(stored.cluster.clone()),

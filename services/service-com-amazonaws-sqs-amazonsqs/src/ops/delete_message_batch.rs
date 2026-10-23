@@ -1,15 +1,26 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteMessageBatch
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteMessageBatch`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Deletes up to ten messages from one queue, reporting the outcome per entry.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteMessageBatch::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The batch-shaped refusals come first and persist nothing, because they are about the
+//! REQUEST rather than about any one message: a request with no entries
+//! (`EmptyBatchRequest`), one carrying more than [`crate::state::MAX_BATCH_ENTRIES`]
+//! (`TooManyEntriesInBatchRequest`), an entry whose `Id` is not one the specification
+//! admits (`InvalidBatchEntryId`) and two entries sharing an `Id`
+//! (`BatchEntryIdsNotDistinct`). An unknown `QueueUrl` is `QueueDoesNotExist`, as it is
+//! for every other message operation.
+//!
+//! Past those, each entry is resolved on its own against the queue's live receipt
+//! handles — the same rule `DeleteMessage` applies — so one bad handle does not fail the
+//! others: "the result of the action on each message is reported individually in the
+//! response. Because the batch request can result in a combination of successful and
+//! unsuccessful actions, you should check for batch errors even when the call returns an
+//! HTTP status code of 200." A deleted message's id is reported in `Successful`; an entry
+//! whose handle this queue does not hold is reported in `Failed` with the sender's fault
+//! and the `ReceiptHandleIsInvalid` code.
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -92,6 +103,8 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state as sqs;
+use std::time::SystemTime;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -169,18 +182,101 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteMessageBatch` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteMessageBatchErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteMessageBatch"))
+        let _ = ctx;
+        let store = sqs::service_state(&*self.engine).ok_or_else(|| {
+            DeleteMessageBatchErrorModeled::UnsupportedOperation(sqs::store_unavailable())
+        })?;
+
+        // The whole-request refusals, before anything is deleted: a batch that is not
+        // one AWS would act on changes nothing at all.
+        if input.entries.is_empty() {
+            return Err(DeleteMessageBatchErrorModeled::EmptyBatchRequest(
+                EmptyBatchRequest {
+                    message: Some("The batch request doesn't contain any entries.".to_string()),
+                },
+            )
+            .into());
+        }
+        if input.entries.len() > sqs::MAX_BATCH_ENTRIES {
+            return Err(
+                DeleteMessageBatchErrorModeled::TooManyEntriesInBatchRequest(
+                    TooManyEntriesInBatchRequest {
+                        message: Some(format!(
+                            "Maximum number of entries per request are {}. You have sent {}.",
+                            sqs::MAX_BATCH_ENTRIES,
+                            input.entries.len()
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        let mut seen: ::std::collections::BTreeSet<&str> = ::std::collections::BTreeSet::new();
+        for entry in &input.entries {
+            if !sqs::is_valid_batch_entry_id(&entry.id) {
+                return Err(DeleteMessageBatchErrorModeled::InvalidBatchEntryId(
+                    InvalidBatchEntryId {
+                        message: Some(format!(
+                            "A batch entry id can only contain alphanumeric characters, hyphens \
+                             and underscores. It can be at most {} letters long.",
+                            sqs::MAX_BATCH_ENTRY_ID_LEN
+                        )),
+                    },
+                )
+                .into());
+            }
+            if !seen.insert(entry.id.as_str()) {
+                return Err(DeleteMessageBatchErrorModeled::BatchEntryIdsNotDistinct(
+                    BatchEntryIdsNotDistinct {
+                        message: Some(format!("Id {} repeated.", entry.id)),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let mut state = store.lock();
+        let now = SystemTime::now();
+        let Some(queue) = state.queue_by_url_mut(&input.queue_url) else {
+            return Err(DeleteMessageBatchErrorModeled::QueueDoesNotExist(
+                sqs::queue_does_not_exist(&input.queue_url),
+            )
+            .into());
+        };
+        queue.materialise_due(now);
+
+        let mut successful = Vec::with_capacity(input.entries.len());
+        let mut failed = Vec::new();
+        for entry in &input.entries {
+            // Only a handle this queue currently holds names a message; anything else —
+            // a superseded handle, or one for an already-deleted message — is invalid,
+            // and invalid for THAT ENTRY alone.
+            match queue.handles.get(&entry.receipt_handle).cloned() {
+                Some(message_id) => {
+                    // The message goes for good, so the lapsing visibility timeout
+                    // cannot bring it back; every other handle minted for it goes with
+                    // it.
+                    queue.remove_message(&message_id);
+                    successful.push(DeleteMessageBatchResultEntry {
+                        id: entry.id.clone(),
+                    });
+                }
+                None => failed.push(BatchResultErrorEntry {
+                    id: entry.id.clone(),
+                    // The caller supplied the handle, so the fault is the sender's.
+                    sender_fault: true,
+                    code: RECEIPT_HANDLE_IS_INVALID.to_string(),
+                    message: sqs::receipt_handle_is_invalid(&entry.receipt_handle).message,
+                }),
+            }
+        }
+
+        Ok(DeleteMessageBatchOutput { successful, failed })
     }
 }
+
+/// The per-entry error code for a receipt handle this queue does not hold: the name of
+/// the modelled error `DeleteMessage` answers for the same condition
+/// (`com.amazonaws.sqs#ReceiptHandleIsInvalid`), which is what AWS reports in a batch
+/// result entry's `Code`.
+const RECEIPT_HANDLE_IS_INVALID: &str = "ReceiptHandleIsInvalid";

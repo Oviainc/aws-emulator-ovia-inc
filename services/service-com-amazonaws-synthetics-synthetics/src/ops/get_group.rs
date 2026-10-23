@@ -64,7 +64,7 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use crate::state::{GROUP_NOT_FOUND, STORE_UNAVAILABLE};
+use crate::state::{group_not_found, STORE_UNAVAILABLE};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -148,9 +148,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| {
                 GetGroupError::from(GetGroupErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        // The missing-group message is a fixed sentence, not built from
-                        // the lookup key: see `state::GROUP_NOT_FOUND`.
-                        message: Some(GROUP_NOT_FOUND.to_string()),
+                        // Built from the request, which is what the recorded service does
+                        // for a group lookup that misses: see
+                        // `state::group_not_found`.
+                        message: Some(group_not_found(&input.group_identifier)),
                     },
                 ))
             })?

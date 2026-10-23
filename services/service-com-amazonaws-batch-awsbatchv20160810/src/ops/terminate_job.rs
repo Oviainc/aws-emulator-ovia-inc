@@ -148,24 +148,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::state as batch;
 
-        let _ = ctx;
         let Some(state) = batch::service_state(&*self.engine) else {
             return Err(
                 TerminateJobErrorModeled::ServerException(batch::unreachable_state()).into(),
             );
         };
         let now = batch::now_millis();
-        let mut state = state.lock();
-        // Materialise what the clock owed BEFORE terminating, so a job that already
-        // reached a terminal status is not dragged back out of it.
-        state.materialize_due(now);
+        // The store's lock lives in THIS block and no longer, so nothing holds it while
+        // the state changes below are published (that call reaches another service
+        // in-process).
+        {
+            let mut state = state.lock();
+            // Materialise what the clock owed BEFORE terminating, so a job that already
+            // reached a terminal status is not dragged back out of it.
+            state.materialize_due(now);
 
-        // `state::terminate_job` keeps the documented SUBMITTED/PENDING/RUNNABLE ->
-        // cancelled, STARTING/RUNNING -> terminated distinction, leaves a job that is
-        // already terminal alone, and keeps the clock index in step. It answers whether
-        // the store held the job at all, which this operation does not report: an id it
-        // holds no job for leaves nothing to end, and nothing is created for it.
-        let _ = state.terminate_job(&input.job_id, &input.reason, now);
+            // `state::terminate_job` keeps the documented SUBMITTED/PENDING/RUNNABLE ->
+            // cancelled, STARTING/RUNNING -> terminated distinction, leaves a job that is
+            // already terminal alone, and keeps the clock index in step. It answers
+            // whether the store held the job at all, which this operation does not
+            // report: an id it holds no job for leaves nothing to end, and nothing is
+            // created for it.
+            let _ = state.terminate_job(&input.job_id, &input.reason, now);
+        }
+        batch::publish_job_state_changes(ctx, &*self.engine, &batch::request_region(ctx)).await;
 
         Ok(TerminateJobOutput {})
     }

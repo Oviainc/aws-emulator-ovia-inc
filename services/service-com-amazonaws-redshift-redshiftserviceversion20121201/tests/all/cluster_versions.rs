@@ -163,7 +163,7 @@ async fn each_filter_selects_exactly_the_versions_it_names() {
             vec![offered_version],
         ),
         (
-            "a family nobody offers",
+            "a parameter group family no engine version is in",
             vec![("ClusterParameterGroupFamily", "redshift-2.0")],
             vec![],
         ),
@@ -340,8 +340,9 @@ async fn a_created_cluster_runs_a_version_the_catalog_offers() {
         );
 
         // Read it back through `DescribeClusters`: the version it reports is one
-        // the catalog offers, and the parameter group it joined is that version's
-        // default group.
+        // the catalog offers, and the parameter group it joined is the default
+        // group of the family new clusters join — which is a service-level
+        // default, not one derived from the cluster's engine version.
         let described = emulator
             .call("DescribeClusters", &[("ClusterIdentifier", identifier)])
             .await;
@@ -355,8 +356,8 @@ async fn a_created_cluster_runs_a_version_the_catalog_offers() {
             .unwrap_or_else(|| panic!("case describe with {case}: expected a ClusterVersion"));
         assert_eq!(
             all_text(&described.body, "ParameterGroupName"),
-            vec![state::default_parameter_group(&version)],
-            "case describe with {case}: expected the default group of {version}, got {:?}",
+            vec![state::cluster_default_parameter_group()],
+            "case describe with {case}: expected the default group of the service's parameter group family, got {:?}",
             all_text(&described.body, "ParameterGroupName")
         );
 

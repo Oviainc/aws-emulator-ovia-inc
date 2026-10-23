@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutResourcePolicy
-//! IMPLEMENTED: validates the policy document against the fixed action set the
-//! shared resource's type admits, then attaches it to that resource in
-//! `crate::state` for `DescribeResourcePolicy` to report.
+//! IMPLEMENTED: validates the policy document against the actions the shared
+//! resource's type PERMITS — every granted action must be one of them, and a
+//! document that grants only some of them is a narrower grant, not a breach —
+//! then attaches it to that resource in `crate::state` for
+//! `DescribeResourcePolicy` to report.
 //!
 //! ## Shape of an operation
 //!

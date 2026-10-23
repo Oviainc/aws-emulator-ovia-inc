@@ -12,7 +12,11 @@
 //!
 //! It is a REPORTING operation: it materialises only the job transitions the clock
 //! already owed (see [`crate::state`]), so repeated describes report a status that only
-//! moves forward with time and never because somebody looked.
+//! moves forward with time and never because somebody looked. A transition it
+//! materialises is a job state change, so this call publishes the `Batch Job State
+//! Change` events those transitions owe to the default EventBridge bus
+//! (`state::publish_job_state_changes`); nothing is published for a job that did not
+//! move.
 //!
 //! No attempt, `startedAt` or `exitCode` is reported: this emulator has no container
 //! runtime, nothing ran, and the engine contract forbids inventing a result for work
@@ -158,7 +162,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::state as batch;
 
-        let _ = ctx;
         let Some(state) = batch::service_state(&*self.engine) else {
             return Err(
                 DescribeJobsErrorModeled::ServerException(batch::unreachable_state()).into(),
@@ -174,51 +177,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
         let now = batch::now_millis();
-        let mut state = state.lock();
-        state.materialize_due(now);
+        // The store's lock lives in THIS block and no longer, so nothing holds it while
+        // the transitions it materialised are published (that call reaches another
+        // service in-process).
+        let details: Vec<JobDetail> = {
+            let mut state = state.lock();
+            state.materialize_due(now);
 
-        let mut seen = ::std::collections::HashSet::new();
-        let details: Vec<JobDetail> = input
-            .jobs
-            .iter()
-            .filter_map(|id| state.jobs.get(id))
-            .filter(|job| seen.insert(job.job_id.clone()))
-            .map(|job| JobDetail {
-                job_arn: Some(job.job_arn.clone()),
-                job_name: job.job_name.clone(),
-                job_id: job.job_id.clone(),
-                job_queue: job.job_queue_arn.clone(),
-                status: job.status.clone(),
-                share_identifier: job.share_identifier.clone(),
-                scheduling_priority: job.scheduling_priority,
-                // Nothing ran, so there is no attempt to report.
-                attempts: None,
-                status_reason: job.status_reason.clone(),
-                created_at: Some(job.created_at),
-                retry_strategy: job.retry_strategy.clone(),
-                // Modelled as required, so it is always serialized; 0 until the job
-                // starts, which a job whose container never ran never does.
-                started_at: job.started_at.unwrap_or_default(),
-                stopped_at: job.stopped_at,
-                depends_on: job.depends_on.clone(),
-                job_definition: job.job_definition_arn.clone(),
-                parameters: job.parameters.clone(),
-                container: job.container.clone(),
-                node_details: None,
-                node_properties: job.node_properties.clone(),
-                array_properties: None,
-                timeout: job.timeout.clone(),
-                tags: job.tags.clone(),
-                propagate_tags: job.propagate_tags,
-                platform_capabilities: job.platform_capabilities.clone(),
-                eks_properties: None,
-                eks_attempts: None,
-                ecs_properties: None,
-                is_cancelled: Some(job.is_cancelled),
-                is_terminated: Some(job.is_terminated),
-                consumable_resource_properties: job.consumable_resource_properties.clone(),
-            })
-            .collect();
+            let mut seen = ::std::collections::HashSet::new();
+            input
+                .jobs
+                .iter()
+                .filter_map(|id| state.jobs.get(id))
+                .filter(|job| seen.insert(job.job_id.clone()))
+                .map(|job| JobDetail {
+                    job_arn: Some(job.job_arn.clone()),
+                    job_name: job.job_name.clone(),
+                    job_id: job.job_id.clone(),
+                    job_queue: job.job_queue_arn.clone(),
+                    status: job.status.clone(),
+                    share_identifier: job.share_identifier.clone(),
+                    scheduling_priority: job.scheduling_priority,
+                    // Nothing ran, so there is no attempt to report.
+                    attempts: None,
+                    status_reason: job.status_reason.clone(),
+                    created_at: Some(job.created_at),
+                    retry_strategy: job.retry_strategy.clone(),
+                    // Modelled as required, so it is always serialized; 0 until the job
+                    // starts, which a job whose container never ran never does.
+                    started_at: job.started_at.unwrap_or_default(),
+                    stopped_at: job.stopped_at,
+                    depends_on: job.depends_on.clone(),
+                    job_definition: job.job_definition_arn.clone(),
+                    parameters: job.parameters.clone(),
+                    container: job.container.clone(),
+                    node_details: None,
+                    node_properties: job.node_properties.clone(),
+                    array_properties: None,
+                    timeout: job.timeout.clone(),
+                    tags: job.tags.clone(),
+                    propagate_tags: job.propagate_tags,
+                    platform_capabilities: job.platform_capabilities.clone(),
+                    eks_properties: None,
+                    eks_attempts: None,
+                    ecs_properties: None,
+                    is_cancelled: Some(job.is_cancelled),
+                    is_terminated: Some(job.is_terminated),
+                    consumable_resource_properties: job.consumable_resource_properties.clone(),
+                })
+                .collect()
+        };
+        batch::publish_job_state_changes(ctx, &*self.engine, &batch::request_region(ctx)).await;
 
         Ok(DescribeJobsOutput {
             jobs: Some(details),

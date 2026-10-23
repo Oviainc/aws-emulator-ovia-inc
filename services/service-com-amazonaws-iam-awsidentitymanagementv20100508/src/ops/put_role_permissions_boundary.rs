@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutRolePermissionsBoundary
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutRolePermissionsBoundary`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutRolePermissionsBoundary::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -180,20 +171,155 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        // `ctx` carries request metadata only: nothing about a boundary depends on
+        // it — IAM is global, and both the role and the policy are named by the
+        // request.
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutRolePermissionsBoundary` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutRolePermissionsBoundaryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(PutRolePermissionsBoundaryErrorModeled::ServiceFailureException(
+                ServiceFailureException {
+                    message: Some("the IAM store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // The boundary is "the ARN of the managed POLICY that is used to set the
+        // permissions boundary", and `arnType` asks only for a 20..2048 character
+        // string — so the ARN still has to BE a managed policy's,
+        // `arn:<partition>:iam::<account>:policy/<path><name>`. Anything else is an
+        // "invalid … value … supplied for an input parameter", read through the one
+        // definition of that grammar in `crate::state`, as `AttachRolePolicy` does.
+        let Some(policy) = crate::state::parse_policy_arn(&input.permissions_boundary) else {
+            return Err(PutRolePermissionsBoundaryErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(format!(
+                        "ARN {} is not valid: PermissionsBoundary must be an IAM managed \
+                         policy ARN",
+                        input.permissions_boundary
+                    )),
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+
+        // The role is named (friendly name, not ARN) and IAM entity names "are not
+        // distinguished by case", so the case-folded name is the identity.
+        let role_key = crate::state::name_key(&input.role_name);
+        // The role's PATH is what tells this operation whether the role is
+        // service-linked. The account's own record answers first; failing that, a role
+        // name AWS PUBLISHES for a service still names a role — the one that service
+        // keeps provisioned, which `GetRole` reports — so its path is read from there
+        // rather than the name being called unknown. A name neither the account nor any
+        // service holds "referenced a resource entity that does not exist".
+        let Some(path) = store
+            .roles
+            .get(&role_key)
+            .map(|role| role.path.clone())
+            .or_else(|| {
+                crate::state::service_provisioned_role(&input.role_name).map(|role| role.path)
+            })
+        else {
+            return Err(PutRolePermissionsBoundaryErrorModeled::NoSuchEntityException(
+                NoSuchEntityException {
+                    message: Some(format!(
+                        "The role with name {} cannot be found.",
+                        input.role_name
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // "You cannot set the boundary for a service-linked role"
+        // (`PutRolePermissionsBoundary`): such a role is a protected resource only the
+        // service that depends on it may change, and `UnmodifiableEntityException`'s
+        // documentation says the message "includes the name of the service that depends
+        // on this service-linked role".
+        if let Some(linked_service) = crate::state::service_linked_role_principal(&path) {
+            return Err(
+                PutRolePermissionsBoundaryErrorModeled::UnmodifiableEntityException(
+                    UnmodifiableEntityException {
+                        message: Some(format!(
+                            "Service role {} cannot be modified: a permissions boundary may \
+                             not be set for a service-linked role, and only {linked_service} \
+                             can modify the role it is linked to",
+                            input.role_name
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // A policy can set a boundary only if it exists. An AWS-managed policy
+        // (account segment `aws`) belongs to AWS rather than to this account, so it is
+        // not account state and is taken as present — this emulator carries no catalog
+        // of AWS's managed policies, and an entry invented for one would not be
+        // knowledge it has. A customer-managed policy exists exactly when this account
+        // holds it, which is what `CreatePolicy` records. The same rule
+        // `AttachRolePolicy` applies to the policy it attaches.
+        let aws_managed = policy.account == crate::state::AWS_MANAGED_POLICY_ACCOUNT;
+        if !aws_managed && store.policy_by_arn(&input.permissions_boundary).is_none() {
+            return Err(PutRolePermissionsBoundaryErrorModeled::NoSuchEntityException(
+                NoSuchEntityException {
+                    message: Some(format!(
+                        "Policy {} does not exist or is not attachable.",
+                        input.permissions_boundary
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "Amazon Web Services service role policies can only be attached to the
+        // service-linked role for that service" (`PolicyNotAttachableException`): such
+        // a policy is one AWS files under the reserved service-linked role path, and
+        // the role being bounded here is not service-linked — that was refused above.
+        if crate::state::is_service_linked_role_path(&policy.path) {
+            return Err(
+                PutRolePermissionsBoundaryErrorModeled::PolicyNotAttachableException(
+                    PolicyNotAttachableException {
+                        message: Some(format!(
+                            "Policy {} is not attachable: a service role policy can only be \
+                             attached to the service-linked role for that service",
+                            input.permissions_boundary
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "Adds or UPDATES the policy that is specified as the IAM role's permissions
+        // boundary": one boundary at a time, so a second put replaces the first. The
+        // attachment is reported with the one type the model's
+        // `PermissionsBoundaryAttachmentType` enum declares, exactly as `CreateRole`
+        // records the boundary its own request carried — so a role is indistinguishable
+        // whichever operation set its boundary.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutRolePermissionsBoundary"))
+        // The boundary is written to the account's OWN record of the role: a name that
+        // resolved only to a role a service keeps provisioned is service-linked, so it
+        // was already refused above and cannot reach here.
+        let Some(role) = store.roles.get_mut(&role_key) else {
+            return Err(PutRolePermissionsBoundaryErrorModeled::NoSuchEntityException(
+                NoSuchEntityException {
+                    message: Some(format!(
+                        "The role with name {} cannot be found.",
+                        input.role_name
+                    )),
+                },
+            )
+            .into());
+        };
+        role.permissions_boundary = Some(AttachedPermissionsBoundary {
+            permissions_boundary_type: Some(crate::state::PERMISSIONS_BOUNDARY_TYPE.to_string()),
+            permissions_boundary_arn: Some(input.permissions_boundary),
+        });
+
+        Ok(PutRolePermissionsBoundaryOutput)
     }
 }

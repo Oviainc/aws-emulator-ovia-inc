@@ -901,6 +901,37 @@ fn is_stage_variable_value_character(character: char) -> bool {
         )
 }
 
+/// The `$context` variable an access log format must select, so an access log entry can
+/// be tied to the request that produced it: "The format must include at least
+/// $context.requestId" (`AccessLogSettings$Format`).
+pub const REQUIRED_ACCESS_LOG_CONTEXT_VARIABLE: &str = "$context.requestId";
+
+/// Refuse `AccessLogSettings` whose `Format` could not identify the request it logged.
+///
+/// "The format must include at least $context.requestId"
+/// (`AccessLogSettings$Format`), so a format selecting no request id is one no access
+/// log entry could be traced back to a request with. A settings block that names no
+/// format at all configures no access logging, so there is no format to require
+/// anything of.
+///
+/// Every operation that stores access log settings routes through here: the requirement
+/// is a property of the settings, so it cannot differ between them.
+///
+/// `Ok(())` or the message for the operation's `BadRequestException`: it names the
+/// member and the rule it broke.
+pub fn validate_access_log_settings(settings: &wire::AccessLogSettings) -> Result<(), String> {
+    let Some(format) = settings.format.as_ref() else {
+        return Ok(());
+    };
+    if format.contains(REQUIRED_ACCESS_LOG_CONTEXT_VARIABLE) {
+        return Ok(());
+    }
+    Err(format!(
+        "Invalid value for AccessLogSettings: the Format must include at least \
+         {REQUIRED_ACCESS_LOG_CONTEXT_VARIABLE}, got '{format}'."
+    ))
+}
+
 /// A persisted `Deployment` resource, owned by its parent [`Api`].
 ///
 /// "An immutable representation of an API that can be called by users" (the

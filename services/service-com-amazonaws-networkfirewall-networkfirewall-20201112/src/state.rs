@@ -292,9 +292,13 @@ pub fn rule_group_document_breach(group_type: &str, group: &RuleGroup) -> Option
     None
 }
 
-/// The actions a resource policy on a shared RULE GROUP may grant, from the AWS
+/// The actions a resource policy on a shared RULE GROUP MAY grant, from the AWS
 /// `PutResourcePolicy` documentation's list of operations that may appear in the
-/// statement for a rule group resource.
+/// statement for a rule group resource ("For a rule group resource, you can
+/// specify the following operations in the Actions section of the statement").
+///
+/// It is a PERMITTED set, not a required one: a statement may grant any non-empty
+/// subset of it (see [`resource_policy_breach`]).
 pub const RULE_GROUP_POLICY_ACTIONS: [&str; 3] = [
     "network-firewall:ListRuleGroups",
     "network-firewall:CreateFirewallPolicy",
@@ -318,7 +322,8 @@ pub enum SharedResource {
 }
 
 impl SharedResource {
-    /// The fixed action set a policy on this kind of resource may grant.
+    /// The actions a policy on this kind of resource may grant — the set its
+    /// statements' actions must be drawn FROM, not a set they must all name.
     pub fn permitted_actions(self) -> &'static [&'static str] {
         match self {
             Self::RuleGroup => &RULE_GROUP_POLICY_ACTIONS,
@@ -344,17 +349,17 @@ pub fn shared_resource_kind(arn: &str) -> Option<SharedResource> {
 /// Why `document` is not a resource policy this service accepts for a resource of
 /// `kind`, or `None` when it validates.
 ///
-/// A Network Firewall resource policy is validated against the RAM managed
-/// permission for the shared resource's type, so the actions it grants must be
-/// exactly that type's fixed set ([`SharedResource::permitted_actions`]): an
-/// action outside the set and a missing one are the same failure, which is what
-/// the service's "The supplied policy does not match RAM managed permissions."
-/// rejection says. SET EQUALITY, not containment, is the rule here because the
-/// document is compared with a managed permission rather than merely checked for
-/// the permissions it carries: a subset does not match that permission, and an
-/// action outside the set is one the documentation does not allow the statement
-/// to name. The document itself must also be a policy: a JSON object with
-/// at least one `Allow` statement that names a principal and an action.
+/// A Network Firewall resource policy is validated against the actions the shared
+/// resource's TYPE admits ([`SharedResource::permitted_actions`]), and the rule is
+/// CONTAINMENT, not set equality: the documentation lists the operations a
+/// statement "can specify" for each resource type, so every action the policy
+/// grants must come from that type's set, while the actions it omits are simply
+/// not granted — a caller that shares a resource with the least privilege it needs
+/// grants a SUBSET and is accepted. An action outside the set is one the
+/// documentation does not allow the statement to name, so it fails validation
+/// (`InvalidResourcePolicyException`, "The policy statement failed validation.").
+/// The document itself must also be a policy: a JSON object with at least one
+/// `Allow` statement that names a principal and an action.
 pub fn resource_policy_breach(document: &str, kind: SharedResource) -> Option<String> {
     let parsed: ::serde_json::Value = match ::serde_json::from_str(document) {
         Ok(parsed) => parsed,
@@ -413,19 +418,14 @@ pub fn resource_policy_breach(document: &str, kind: SharedResource) -> Option<St
         .map(String::as_str)
         .filter(|action| !permitted.contains(action))
         .collect();
-    let missing: Vec<&str> = permitted
-        .iter()
-        .copied()
-        .filter(|action| !granted.contains(*action))
-        .collect();
-    if unexpected.is_empty() && missing.is_empty() {
+    if unexpected.is_empty() {
         return None;
     }
     Some(format!(
-        "The supplied policy does not match RAM managed permissions. \
-         Unexpected actions: [{}]; missing actions: [{}].",
+        "The policy statement failed validation. These actions cannot be granted on this \
+         resource: [{}]; a statement for this resource may grant only [{}].",
         unexpected.join(", "),
-        missing.join(", ")
+        permitted.join(", ")
     ))
 }
 
