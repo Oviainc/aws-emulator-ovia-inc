@@ -9,8 +9,9 @@
 //! The rules this handler enforces, all from the modelled contract reproduced below:
 //!
 //! * a feed takes an association only from a status that admits one — `AVAILABLE` (no
-//!   resource yet), or `ACTIVE` for the resource that already holds it; from every
-//!   other status the association is refused with the modelled `ValidationException`;
+//!   resource yet, which is what a freshly created feed is), or `ACTIVE` for the
+//!   resource that already holds it; from every other status the association is refused
+//!   with the modelled `ValidationException`;
 //! * "You can associate only one resource with each feed": a different resource name on
 //!   an already-claimed feed is refused;
 //! * a refusal decided from the STORED feed carries that rule's invariant sentence
@@ -264,9 +265,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The feed's status is the precondition: only a feed with no resource yet
         // (AVAILABLE), or the resource that already holds it (ACTIVE), may associate.
-        // A transient feed (CREATING / DELETING) and a released one
+        // A feed whose deletion has been accepted (DELETING) and a released one
         // (ARCHIVED) take no association, and "you can associate only one resource with
-        // each feed" rules out a second, different resource on an ACTIVE feed.
+        // each feed" rules out a second, different resource on an ACTIVE feed. A freshly
+        // created feed is AVAILABLE, so the association a caller makes in the request
+        // right after CreateFeed is accepted — there is no window it has to wait out.
         //
         // A failed precondition is a ValidationException (400) rather than a
         // ConflictException: this service classifies "already associated" as a

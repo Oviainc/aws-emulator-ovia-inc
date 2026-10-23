@@ -3,13 +3,19 @@
 //! How this service WORDS a 4xx refusal, end to end over the wire.
 //!
 //! THE RULE under test: a refusal's message is determined by the RULE that refused the
-//! request, never by the values the request or the record happened to carry. So:
+//! request, never by the values the request happened to carry. So:
 //!
 //! * a refusal decided from STORED STATE (the feed already holds an association, the
-//!   feed's status admits no association, the feed holds no resource to release, the
-//!   feed is being deleted, an append would pass the output quota) carries that rule's
-//!   INVARIANT sentence — byte-identical across requests and across records, and
-//!   interpolating no value the handler read out of state;
+//!   feed's status admits no association, the feed is being deleted, an append would
+//!   pass the output quota) carries that rule's INVARIANT sentence — byte-identical
+//!   across requests and across records, and interpolating no value the handler read out
+//!   of state;
+//! * EXCEPT where the refusal's point is to report the state it was decided from: the
+//!   service's own refusals state the status it observed (`DisassociateFeed` on a feed
+//!   that holds no resource) and how many records held the request back
+//!   (`DeleteDictionary` on a referenced dictionary), so those messages are BUILT from
+//!   the store and move with it — the status and the count are the information the
+//!   refusal exists to give;
 //! * a refusal decided from a RELATION between two members (`endDate` before
 //!   `startDate`) likewise carries the rule's invariant sentence, naming the members
 //!   rather than the dates they carried;
@@ -18,16 +24,18 @@
 //!   a `fixtureId` the data source does not have).
 //!
 //! Every case below is a TABLE: the rows differ along what the rule generalises over
-//! (the resource names, the feed's status, how many outputs are held and added, the
-//! dates and the distance between them, the form and length of the identifier), so an
-//! implementation that rebuilt a message from the request or the record would answer
-//! rows that differ where the rule says they must not.
+//! (the resource names, the feed's status, how many outputs are held and added, how many
+//! feeds reference a dictionary, the dates and the distance between them, the form and
+//! length of the identifier), so an implementation that rebuilt a message from the
+//! request, or that fixed a message the service derives from state, would answer rows
+//! that differ where the rule says they must not — or answer rows alike where it says
+//! they must differ.
 
-use crate::harness::{call, output_config, past_the_transition_span, router};
+use crate::harness::{call, output_config, router};
 use serde_json::{json, Value};
 use service_com_amazonaws_elementalinference_elementalinference::state::{
-    END_DATE_BEFORE_START_DATE_MESSAGE, FEED_ALREADY_ASSOCIATED_MESSAGE,
-    FEED_BEING_DELETED_MESSAGE, FEED_NOT_ASSOCIABLE_MESSAGE, FEED_NOT_ASSOCIATED_MESSAGE,
+    feed_not_associated_message, FeedStatus, END_DATE_BEFORE_START_DATE_MESSAGE,
+    FEED_ALREADY_ASSOCIATED_MESSAGE, FEED_BEING_DELETED_MESSAGE, FEED_NOT_ASSOCIABLE_MESSAGE,
     MAX_OUTPUTS_PER_FEED, WRONG_ASSOCIATED_RESOURCE_MESSAGE,
 };
 use smithy_server_runtime::MultiServiceRouter;
@@ -46,7 +54,7 @@ fn outputs(prefix: &str, count: usize) -> Value {
     )
 }
 
-/// Create a feed carrying `count` outputs, leaving it in `CREATING`.
+/// Create a feed carrying `count` outputs; a created feed is settled and `AVAILABLE`.
 async fn create_feed(router: &MultiServiceRouter, name: &str, count: usize) -> String {
     let (status, created) = call(
         router,
@@ -65,16 +73,15 @@ async fn create_feed(router: &MultiServiceRouter, name: &str, count: usize) -> S
         .to_string()
 }
 
-/// Create a feed carrying `count` outputs and let the clock settle it to `AVAILABLE` —
-/// the status from which a never-associated feed takes an association.
+/// Create a feed carrying `count` outputs and assert it is `AVAILABLE` — the status from
+/// which a never-associated feed takes an association, and the one a create leaves it in.
 async fn available_feed(router: &MultiServiceRouter, name: &str, count: usize) -> String {
     let id = create_feed(router, name, count).await;
-    past_the_transition_span();
     let (status, feed) = call(router, "GET", &format!("/v1/feed/{id}"), None).await;
     assert_eq!(
         (status, &feed["status"]),
         (200, &json!("AVAILABLE")),
-        "case {name:?}: the feed settles to AVAILABLE first, got {feed}"
+        "case {name:?}: a created feed is AVAILABLE without any wait, got {feed}"
     );
     id
 }
@@ -202,12 +209,12 @@ async fn associate_from_a_non_associable_status_answers_one_invariant_sentence()
     let router = router();
     let mut seen: Vec<String> = Vec::new();
 
-    // One row per non-associable status this service produces (`FeedStatus`: CREATING,
-    // DELETING, ARCHIVED; AVAILABLE and ACTIVE are the associable ones, and UPDATING is
-    // never reported because UpdateFeed answers 200 and so leaves the feed settled).
-    for status_under_test in ["CREATING", "DELETING", "ARCHIVED"] {
+    // One row per non-associable status this service produces (`FeedStatus`: DELETING,
+    // ARCHIVED; AVAILABLE and ACTIVE are the associable ones, and neither CREATING nor
+    // UPDATING is ever reported — a created feed is AVAILABLE at once, and UpdateFeed
+    // answers 200 and so leaves the feed settled).
+    for status_under_test in ["DELETING", "ARCHIVED"] {
         let id = match status_under_test {
-            "CREATING" => create_feed(&router, "transient-feed", 1).await,
             "DELETING" => {
                 let id = available_feed(&router, "deleting-feed", 1).await;
                 let (status, body) = call(&router, "DELETE", &format!("/v1/feed/{id}"), None).await;
@@ -321,23 +328,43 @@ async fn disassociate_under_the_wrong_name_answers_one_invariant_sentence() {
     );
 }
 
-/// `DisassociateFeed` on a feed that holds no resource at all: one invariant sentence,
-/// with no status in it.
+/// `DisassociateFeed` on a feed that holds no resource at all: the refusal REPORTS the
+/// status it was decided from, so each status answers its own sentence — one a client
+/// can read that status out of.
 #[tokio::test]
-async fn disassociate_with_nothing_to_release_answers_one_invariant_sentence() {
+async fn disassociate_with_nothing_to_release_reports_the_status_it_was_decided_from() {
     let router = router();
     let mut seen: Vec<String> = Vec::new();
 
-    for status_under_test in ["CREATING", "AVAILABLE", "DELETING"] {
+    // One row per status that holds no resource: a created feed, one whose deletion has
+    // been accepted, and one already released.
+    for (status_under_test, status) in [
+        ("AVAILABLE", FeedStatus::Available),
+        ("DELETING", FeedStatus::Deleting),
+        ("ARCHIVED", FeedStatus::Archived),
+    ] {
         let id = match status_under_test {
-            "CREATING" => create_feed(&router, "never-associated", 1).await,
             "AVAILABLE" => available_feed(&router, "never-associated", 1).await,
             "DELETING" => {
                 let id = available_feed(&router, "never-associated", 1).await;
-                let (status, body) = call(&router, "DELETE", &format!("/v1/feed/{id}"), None).await;
+                let (code, body) = call(&router, "DELETE", &format!("/v1/feed/{id}"), None).await;
                 assert_eq!(
-                    status, 202,
+                    code, 202,
                     "case {status_under_test:?}: DeleteFeed answers 202, got {body}"
+                );
+                id
+            }
+            "ARCHIVED" => {
+                let id = available_feed(&router, "released-feed", 1).await;
+                let (code, body) = associate(&router, &id, "released-media", json!([])).await;
+                assert_eq!(
+                    code, 200,
+                    "case {status_under_test:?}: the claim is accepted, got {body}"
+                );
+                let (code, body) = disassociate(&router, &id, "released-media").await;
+                assert_eq!(
+                    code, 200,
+                    "case {status_under_test:?}: the release is accepted, got {body}"
                 );
                 id
             }
@@ -351,23 +378,30 @@ async fn disassociate_with_nothing_to_release_answers_one_invariant_sentence() {
             "ValidationException",
         );
         assert_eq!(
-            message, FEED_NOT_ASSOCIATED_MESSAGE,
-            "case {status_under_test:?}: expected the invariant sentence \
-             {FEED_NOT_ASSOCIATED_MESSAGE:?}, got {message:?}"
+            message,
+            feed_not_associated_message(status),
+            "case {status_under_test:?}: expected the refusal built from the stored feed, \
+             got {message:?}"
         );
         assert!(
-            !message.contains(status_under_test),
-            "case {status_under_test:?}: the refusal must not report the feed's internal \
-             status, got {message:?}"
+            message.contains(status_under_test),
+            "case {status_under_test:?}: the refusal reports the status it was decided \
+             from, got {message:?}"
+        );
+        assert!(
+            !message.contains("never-associated-media"),
+            "case {status_under_test:?}: and it echoes no value the request carried, got \
+             {message:?}"
         );
         seen.push(message);
     }
 
+    seen.sort();
     seen.dedup();
     assert_eq!(
         seen.len(),
-        1,
-        "the sentence is invariant across every status, got {seen:?}"
+        3,
+        "each status answers its own sentence, got {seen:?}"
     );
 }
 

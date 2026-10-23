@@ -25,12 +25,18 @@ mod error_message_rule;
 mod feed_association;
 #[path = "all/feed_lifecycle.rs"]
 mod feed_lifecycle;
+#[path = "all/feed_usable_on_create.rs"]
+mod feed_usable_on_create;
 #[path = "all/fixture_catalog.rs"]
 mod fixture_catalog;
+#[path = "all/fixture_data_source.rs"]
+mod fixture_data_source;
 #[path = "all/fixture_search.rs"]
 mod fixture_search;
 #[path = "all/harness.rs"]
 mod harness;
+#[path = "all/refusals_from_state.rs"]
+mod refusals_from_state;
 #[path = "all/response_members.rs"]
 mod response_members;
 #[path = "all/state_roundtrip.rs"]

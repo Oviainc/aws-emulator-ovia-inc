@@ -33,6 +33,8 @@ mod import_stop;
 mod insights_metric_data;
 #[path = "all/lake_queries.rs"]
 mod lake_queries;
+#[path = "all/resource_tagging.rs"]
+mod resource_tagging;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/target_prefix_dispatch.rs"]

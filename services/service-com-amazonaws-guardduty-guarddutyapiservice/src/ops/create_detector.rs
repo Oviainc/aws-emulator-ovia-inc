@@ -202,6 +202,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(bad_request(crate::state::DETECTOR_ALREADY_EXISTS_MESSAGE));
         }
 
+        // The one-per-Region rule above bounds one PARTITION of the detector store,
+        // but the Region comes from the request's credential scope, so the caller
+        // chooses the partition key as well as what goes in it: this bounds how many
+        // Regions the store partitions into, which is what keeps the detector map —
+        // and the members, filters and IPSets each detector owns — finite whatever a
+        // caller sends. A Region the store already holds a detector for is refused
+        // by the rule above, never by this one.
+        if state.detector_regions_exhausted(&region) {
+            return Err(bad_request(crate::state::DETECTOR_REGION_LIMIT_MESSAGE));
+        }
+
         let now = state.tick_millis();
         let id = state.mint_id();
         let mut detector = crate::state::Detector {
