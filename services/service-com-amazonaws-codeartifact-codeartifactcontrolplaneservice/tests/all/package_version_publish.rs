@@ -47,12 +47,11 @@ use service_com_amazonaws_codeartifact_codeartifactcontrolplaneservice::ops::typ
     ALLOW_PUBLISH_VALUES, PACKAGE_FORMAT_VALUES,
 };
 
-// The HTTP harness the crate's suites share, from the suite that owns it: one emulator
-// construction, one request/`Answer` reduction, one domain/repository setup for every
-// CodeArtifact test in this crate.
-use crate::domain_repository_lifecycle::{
-    auth_for, call, create_domain, create_repository, emulator, Answer, REGION,
-};
+// The HTTP harness the crate's suites share: one emulator construction, one
+// request/`Answer` reduction and one domain setup in `crate::harness`, plus the
+// repository setup from the suite that owns it.
+use crate::domain_repository_lifecycle::create_repository;
+use crate::harness::{auth_for, call, create_domain, emulator, Answer, REGION};
 
 /// The domain and repository every case publishes into.
 const DOMAIN: &str = "pkg-domain";

@@ -38,10 +38,8 @@ use service_com_amazonaws_codeartifact_codeartifactcontrolplaneservice::ops::typ
     ENDPOINT_TYPE_VALUES, PACKAGE_FORMAT_VALUES,
 };
 
-use crate::domain_repository_lifecycle::{
-    call, call_in_region, create_domain, create_repository, describe_repository, emulator, Answer,
-    ACCOUNT, REGION,
-};
+use crate::domain_repository_lifecycle::{create_repository, describe_repository};
+use crate::harness::{call, call_in_region, create_domain, emulator, Answer, ACCOUNT, REGION};
 
 /// `GetRepositoryEndpoint`, signed for `region`.
 async fn get_endpoint_in_region(
