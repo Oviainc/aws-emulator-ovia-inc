@@ -212,10 +212,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(bucket) = store.bucket(&input.bucket) else {
             return Err(GetBucketEncryptionErrorModeled::NoSuchBucket(NoSuchBucket {}).into());
         };
-        let rules: Vec<crate::state::BucketEncryptionRule> = match bucket.encryption() {
-            Some(configured) => configured.to_vec(),
-            None => vec![crate::state::default_encryption_rule()],
-        };
+        // One accessor for the rules IN FORCE, shared with the write path that resolves a
+        // `PutObject`'s inherited encryption from them, so what this reports and what an
+        // object inherits can never disagree.
+        let rules = bucket.effective_encryption_rules();
 
         Ok(GetBucketEncryptionOutput {
             server_side_encryption_configuration: Some(ServerSideEncryptionConfiguration {

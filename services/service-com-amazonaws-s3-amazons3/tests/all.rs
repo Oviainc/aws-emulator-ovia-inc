@@ -53,6 +53,8 @@ mod multipart_upload_initiation;
 mod object_and_policy;
 #[path = "all/object_and_tagging_roundtrip.rs"]
 mod object_and_tagging_roundtrip;
+#[path = "all/object_default_encryption.rs"]
+mod object_default_encryption;
 #[path = "all/object_encryption.rs"]
 mod object_encryption;
 #[path = "all/object_listing_and_deletion.rs"]
