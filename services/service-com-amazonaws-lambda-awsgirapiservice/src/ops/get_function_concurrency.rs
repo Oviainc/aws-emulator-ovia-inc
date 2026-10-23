@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetFunctionConcurrency
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetFunctionConcurrency`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetFunctionConcurrency::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the reserved concurrency the function record [`crate::state`] holds —
+//! "Returns details about the reserved concurrency configuration for a function" — so a
+//! function nobody has called `PutFunctionConcurrency` on reports no
+//! `ReservedConcurrentExecutions` at all, and one that has been configured reports
+//! exactly the value that call persisted.
+//!
+//! The reservation is FUNCTION-LEVEL ("Concurrency settings apply to the function as a
+//! whole, including all published versions and the unpublished version"), and the
+//! documented `FunctionName` forms for this operation are the name, the function ARN and
+//! the partial ARN — none of them qualified — so a name that qualifies a version or an
+//! alias names no resource this setting lives on and is refused with the modelled 400,
+//! exactly as `PutFunctionConcurrency` refuses it.
+//!
+//! This is a REPORTING operation (`@readonly`): it writes nothing but the lifecycle
+//! transitions the clock already made due, which [`crate::state::resolve_function`]
+//! materialises for every caller alike.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +159,79 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetFunctionConcurrency` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetFunctionConcurrencyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetFunctionConcurrency"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetFunctionConcurrencyErrorModeled::ServiceException(
+                ServiceException {
+                    r#type: None,
+                    message: Some("Lambda state is not reachable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let reference =
+            crate::state::parse_function_reference(&input.function_name).ok_or_else(|| {
+                invalid_parameter(format!(
+                    "1 validation error detected: Value '{}' at 'functionName' failed to \
+                     satisfy constraint: Member must satisfy one of the documented name \
+                     formats (name, partial ARN or function ARN)",
+                    input.function_name
+                ))
+            })?;
+
+        // The reservation belongs to the function as a whole, so a qualified name names
+        // no resource that carries one.
+        if let Some(qualifier) = reference
+            .qualifier
+            .as_deref()
+            .filter(|qualifier| *qualifier != crate::state::VERSION_LATEST)
+        {
+            return Err(invalid_parameter(format!(
+                "The qualifier '{qualifier}' in 'functionName' names a version or alias, and \
+                 reserved concurrency applies to the function as a whole, including all \
+                 published versions and the unpublished version"
+            )));
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx);
+        let mut store = state.lock();
+        let (record, _version) = crate::state::resolve_function(
+            &mut store,
+            &input.function_name,
+            None,
+            &region,
+            now,
+        )
+        .map_err(|failure| match failure {
+            crate::state::ResolveFailure::Malformed(message) => invalid_parameter(message),
+            crate::state::ResolveFailure::NotFound(message) => {
+                GetFunctionConcurrencyErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        r#type: None,
+                        message: Some(message),
+                    },
+                )
+                .into()
+            }
+        })?;
+
+        // Absent until something reserved capacity for this function: the member is
+        // "The number of simultaneous executions that are reserved for the function",
+        // and an unconfigured function reserves none.
+        Ok(GetFunctionConcurrencyOutput {
+            reserved_concurrent_executions: record.reserved_concurrent_executions,
+        })
     }
+}
+
+/// The modelled 400 this operation refuses a request it cannot satisfy with.
+fn invalid_parameter(message: String) -> GetFunctionConcurrencyError {
+    GetFunctionConcurrencyErrorModeled::InvalidParameterValueException(
+        InvalidParameterValueException {
+            r#type: None,
+            message: Some(message),
+        },
+    )
+    .into()
 }

@@ -25,6 +25,8 @@ mod event_source_mappings;
 mod function_aliases;
 #[path = "all/function_code_update.rs"]
 mod function_code_update;
+#[path = "all/function_concurrency.rs"]
+mod function_concurrency;
 #[path = "all/function_configuration.rs"]
 mod function_configuration;
 #[path = "all/function_lifecycle.rs"]

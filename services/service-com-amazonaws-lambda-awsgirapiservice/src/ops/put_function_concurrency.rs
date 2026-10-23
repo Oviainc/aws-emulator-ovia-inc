@@ -1,15 +1,26 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutFunctionConcurrency
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutFunctionConcurrency`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutFunctionConcurrency::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Stores the function's reserved concurrency on the function record [`crate::state`]
+//! holds, so `GetFunctionConcurrency`, `GetFunction` and `GetAccountSettings` all answer
+//! from the one value this call persisted and nothing is echoed back out of the request
+//! without being stored first.
+//!
+//! The reservation is FUNCTION-LEVEL: the operation "Sets the maximum number of
+//! simultaneous executions for a function" and "Concurrency settings apply to the
+//! function as a whole, including all published versions and the unpublished version",
+//! so one function holds one reservation and setting it again replaces it. The documented
+//! `FunctionName` forms for this operation are the name, the function ARN and the partial
+//! ARN — none of them qualified — so a name that qualifies a version or an alias names a
+//! resource this setting does not live on and is refused with the modelled 400.
+//!
+//! The account-wide rule the operation documents is enforced here: "You can reserve
+//! concurrency for as many functions as you like, as long as you leave at least 100
+//! simultaneous executions unreserved for functions that aren't configured with a
+//! per-function limit" — see [`crate::state::MIN_UNRESERVED_CONCURRENT_EXECUTIONS`]. A
+//! request that would push the account's unreserved capacity below that floor is refused
+//! and stores nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -165,18 +176,108 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutFunctionConcurrency` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutFunctionConcurrencyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutFunctionConcurrency"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(PutFunctionConcurrencyErrorModeled::ServiceException(
+                ServiceException {
+                    r#type: None,
+                    message: Some("Lambda state is not reachable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let reference =
+            crate::state::parse_function_reference(&input.function_name).ok_or_else(|| {
+                invalid_parameter(format!(
+                    "1 validation error detected: Value '{}' at 'functionName' failed to \
+                     satisfy constraint: Member must satisfy one of the documented name \
+                     formats (name, partial ARN or function ARN)",
+                    input.function_name
+                ))
+            })?;
+
+        // "Concurrency settings apply to the function as a whole, including all published
+        // versions and the unpublished version", so the reservation is held by the
+        // function and a name qualifying a version or an alias names no resource it can
+        // be set on.
+        if let Some(qualifier) = reference
+            .qualifier
+            .as_deref()
+            .filter(|qualifier| *qualifier != crate::state::VERSION_LATEST)
+        {
+            return Err(invalid_parameter(format!(
+                "The qualifier '{qualifier}' in 'functionName' names a version or alias, and \
+                 reserved concurrency applies to the function as a whole, including all \
+                 published versions and the unpublished version"
+            )));
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx);
+        let mut store = state.lock();
+
+        // The function has to exist before any of its capacity can be reserved, and
+        // resolution is what brings the record up to whatever the clock already made due.
+        crate::state::resolve_function(&mut store, &input.function_name, None, &region, now)
+            .map_err(|failure| match failure {
+                crate::state::ResolveFailure::Malformed(message) => invalid_parameter(message),
+                crate::state::ResolveFailure::NotFound(message) => {
+                    PutFunctionConcurrencyErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            r#type: None,
+                            message: Some(message),
+                        },
+                    )
+                    .into()
+                }
+            })?;
+
+        // "You can reserve concurrency for as many functions as you like, as long as you
+        // leave at least 100 simultaneous executions unreserved for functions that aren't
+        // configured with a per-function limit." This call REPLACES whatever this
+        // function reserves, so only the other functions' reservations stand beside the
+        // requested one.
+        let requested = input.reserved_concurrent_executions;
+        let reserved_elsewhere = store.reserved_concurrency_except(Some(&reference.name));
+        let unreserved = crate::state::CONCURRENT_EXECUTIONS_LIMIT
+            .saturating_sub(reserved_elsewhere.saturating_add(requested));
+        if unreserved < crate::state::MIN_UNRESERVED_CONCURRENT_EXECUTIONS {
+            return Err(invalid_parameter(format!(
+                "Specified ReservedConcurrentExecutions for function decreases account's \
+                 UnreservedConcurrentExecution below its minimum value of [{floor}]",
+                floor = crate::state::MIN_UNRESERVED_CONCURRENT_EXECUTIONS
+            )));
+        }
+
+        let Some(record) = store.functions.get_mut(&reference.name) else {
+            return Err(PutFunctionConcurrencyErrorModeled::ServiceException(
+                ServiceException {
+                    r#type: None,
+                    message: Some(
+                        "Lambda lost the function record between resolving and reserving it"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+        record.reserved_concurrent_executions = Some(requested);
+
+        // Answered by reading the record back, so the response reports what is stored
+        // rather than what the request carried.
+        Ok(PutFunctionConcurrencyOutput {
+            reserved_concurrent_executions: record.reserved_concurrent_executions,
+        })
     }
+}
+
+/// The modelled 400 this operation refuses a request it cannot satisfy with.
+fn invalid_parameter(message: String) -> PutFunctionConcurrencyError {
+    PutFunctionConcurrencyErrorModeled::InvalidParameterValueException(
+        InvalidParameterValueException {
+            r#type: None,
+            message: Some(message),
+        },
+    )
+    .into()
 }

@@ -57,6 +57,17 @@
 //! owed by the CLOCK (see [`CapacityProviderRecord::materialize`]) — and every member
 //! reported for it comes out of the record.
 //!
+//! The reserved-concurrency slice is one value on the same record:
+//! `PutFunctionConcurrency` "Sets the maximum number of simultaneous executions for a
+//! function, and reserves capacity for that concurrency level", and "Concurrency settings
+//! apply to the function as a whole, including all published versions and the unpublished
+//! version", so what it persists is the single
+//! [`FunctionRecord::reserved_concurrent_executions`] of the function it addressed.
+//! `GetFunctionConcurrency` and `GetFunction` report exactly that value, and the account's
+//! unreserved capacity is what every such value leaves (see
+//! [`ComAmazonawsLambdaAwsgirapiserviceState::reserved_concurrency_except`] and
+//! [`MIN_UNRESERVED_CONCURRENT_EXECUTIONS`]).
+//!
 //! `GetAccountSettings` reports on the same records at the account level:
 //! "Retrieves details about your account's limits and usage in an Amazon Web Services
 //! Region", so its usage is what the store holds and its unreserved concurrency is what
@@ -286,6 +297,15 @@ pub const CODE_SIZE_ZIPPED_LIMIT: i64 = 52_428_800;
 /// adjustable on a real account; this emulator reports the default for the same reason
 /// as [`TOTAL_CODE_SIZE_LIMIT`].
 pub const CONCURRENT_EXECUTIONS_LIMIT: i32 = 1_000;
+
+/// The simultaneous executions an account must leave unreserved.
+///
+/// `PutFunctionConcurrency`'s own documentation states the rule: "You can reserve
+/// concurrency for as many functions as you like, as long as you leave at least 100
+/// simultaneous executions unreserved for functions that aren't configured with a
+/// per-function limit." So a reservation that would push
+/// `AccountLimit$UnreservedConcurrentExecutions` below this floor is refused.
+pub const MIN_UNRESERVED_CONCURRENT_EXECUTIONS: i32 = 100;
 
 /// The IAM policy language version a resource-based policy document carries.
 /// `2012-10-17` is the current version of the language every AWS policy document is
@@ -2250,6 +2270,21 @@ impl ComAmazonawsLambdaAwsgirapiserviceState {
         }
     }
 
+    /// The concurrency the stored functions reserve, leaving out the one function
+    /// `exclude` names when it names one.
+    ///
+    /// `PutFunctionConcurrency` REPLACES the reservation of the function it addresses, so
+    /// a caller checking what a new reservation would leave the account asks for the sum
+    /// without that function's current one.
+    #[must_use]
+    pub fn reserved_concurrency_except(&self, exclude: Option<&str>) -> i32 {
+        self.functions
+            .iter()
+            .filter(|(name, _)| exclude.is_none_or(|excluded| name.as_str() != excluded))
+            .filter_map(|(_, function)| function.reserved_concurrent_executions)
+            .fold(0i32, i32::saturating_add)
+    }
+
     /// `AccountLimit`: the account's quotas, with the one limit that is not a constant
     /// computed from the store.
     ///
@@ -2260,11 +2295,7 @@ impl ComAmazonawsLambdaAwsgirapiserviceState {
     /// `@range(min: 0)`, so the subtraction is floored at zero.
     #[must_use]
     pub fn account_limit(&self) -> AccountLimit {
-        let reserved = self
-            .functions
-            .values()
-            .filter_map(|function| function.reserved_concurrent_executions)
-            .fold(0i32, i32::saturating_add);
+        let reserved = self.reserved_concurrency_except(None);
         AccountLimit {
             total_code_size: TOTAL_CODE_SIZE_LIMIT,
             code_size_unzipped: CODE_SIZE_UNZIPPED_LIMIT,

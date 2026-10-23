@@ -225,8 +225,13 @@ async fn account_settings_report_the_stored_functions_and_their_reserved_concurr
             );
 
             if let Some(reserved) = function.reserved {
-                // `PutFunctionConcurrency` is still a stub, so the reservation is
-                // written onto the record that handler will write.
+                // Written straight onto the record `PutFunctionConcurrency` writes:
+                // these rows reserve more than that operation's documented
+                // minimum-unreserved rule admits, on purpose, because what is under
+                // test here is how `GetAccountSettings` reports a store holding them
+                // (including the `@range(min: 0)` floor) rather than how a reservation
+                // is accepted. `tests/all/function_concurrency.rs` covers the
+                // operation itself end to end.
                 let state = engine.state::<ComAmazonawsLambdaAwsgirapiserviceState>();
                 let mut store = state.lock();
                 let stored = store
