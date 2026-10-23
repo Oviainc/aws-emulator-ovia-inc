@@ -36,8 +36,8 @@
 use crate::harness::{call, output_config, past_the_transition_span, router, REGION, SIGNING_NAME};
 use serde_json::{json, Value};
 use service_com_amazonaws_elementalinference_elementalinference::state::{
-    FEED_ALREADY_ASSOCIATED_MESSAGE, FEED_NOT_ASSOCIABLE_MESSAGE, FEED_NOT_ASSOCIATED_MESSAGE,
-    MAX_OUTPUTS_PER_FEED,
+    feed_not_associated_message, FeedStatus, FEED_ALREADY_ASSOCIATED_MESSAGE,
+    FEED_NOT_ASSOCIABLE_MESSAGE, MAX_OUTPUTS_PER_FEED,
 };
 use smithy_server_runtime::MultiServiceRouter;
 use std::sync::Arc;
@@ -47,7 +47,8 @@ fn output(name: &str, kind: &str, status: &str) -> Value {
     json!({"name": name, "outputConfig": output_config(kind), "status": status})
 }
 
-/// Create a feed carrying `outputs` and return its id, leaving it in `CREATING`.
+/// Create a feed carrying `outputs` and return its id. A created feed is settled and
+/// `AVAILABLE` at once, so the caller can associate it in the very next request.
 async fn create_feed(router: &MultiServiceRouter, name: &str, outputs: Value) -> String {
     let (status, created) = call(
         router,
@@ -66,16 +67,15 @@ async fn create_feed(router: &MultiServiceRouter, name: &str, outputs: Value) ->
         .to_string()
 }
 
-/// Create a feed and let the clock settle it to `AVAILABLE` — the only status from
-/// which a never-associated feed takes an association.
+/// Create a feed and assert it is `AVAILABLE` — the only status from which a
+/// never-associated feed takes an association, and the one a create leaves it in.
 async fn available_feed(router: &MultiServiceRouter, name: &str, outputs: Value) -> String {
     let id = create_feed(router, name, outputs).await;
-    past_the_transition_span();
     let (status, feed) = call(router, "GET", &format!("/v1/feed/{id}"), None).await;
     assert_eq!(
         (status, &feed["status"]),
         (200, &json!("AVAILABLE")),
-        "case {name:?}: the feed settles to AVAILABLE before the association, got {feed}"
+        "case {name:?}: a created feed is AVAILABLE without any wait, got {feed}"
     );
     id
 }
@@ -392,14 +392,13 @@ async fn associate_is_refused_from_every_status_that_takes_no_association() {
     let router = router();
     let feed_outputs = json!([output("crop1", "cropping", "ENABLED")]);
 
-    // One row per non-associable status the service produces (`FeedStatus`: CREATING,
-    // DELETING, ARCHIVED — AVAILABLE and ACTIVE are the associable ones, covered
-    // above; UPDATING is never reported, because UpdateFeed answers 200 and so leaves
-    // the feed settled).
-    for status_under_test in ["CREATING", "DELETING", "ARCHIVED"] {
+    // One row per non-associable status the service produces (`FeedStatus`: DELETING,
+    // ARCHIVED — AVAILABLE and ACTIVE are the associable ones, covered above; CREATING
+    // is never reported, because a created feed is AVAILABLE at once, and UPDATING is
+    // never reported either, because UpdateFeed answers 200 and so leaves the feed
+    // settled).
+    for status_under_test in ["DELETING", "ARCHIVED"] {
         let id = match status_under_test {
-            // Read straight after the create, before the clock settles it.
-            "CREATING" => create_feed(&router, "transient-feed", feed_outputs.clone()).await,
             "DELETING" => {
                 let id = available_feed(&router, "deleting-feed", feed_outputs.clone()).await;
                 let (status, _) = call(&router, "DELETE", &format!("/v1/feed/{id}"), None).await;
@@ -881,21 +880,37 @@ async fn disassociate_with_a_name_that_is_not_the_associated_resource_is_refused
 }
 
 /// A feed that is not currently associated has nothing to release, so DisassociateFeed
-/// is refused with the modelled `ValidationException` carrying that rule's invariant
-/// sentence.
+/// is refused with the modelled `ValidationException` — whose message reports the status
+/// the feed was found in (how a refusal is WORDED is `error_message_rule.rs`).
 #[tokio::test]
 async fn disassociate_is_refused_from_every_status_that_holds_no_resource() {
     let router = router();
     let feed_outputs = json!([output("crop1", "cropping", "ENABLED")]);
 
-    for status_under_test in ["CREATING", "AVAILABLE", "DELETING"] {
+    // One row per status that holds no resource: a created feed, one whose deletion has
+    // been accepted, and one already released.
+    for (status_under_test, feed_status) in [
+        ("AVAILABLE", FeedStatus::Available),
+        ("DELETING", FeedStatus::Deleting),
+        ("ARCHIVED", FeedStatus::Archived),
+    ] {
         let id = match status_under_test {
-            "CREATING" => create_feed(&router, "never-associated", feed_outputs.clone()).await,
             "AVAILABLE" => available_feed(&router, "never-associated", feed_outputs.clone()).await,
             "DELETING" => {
                 let id = available_feed(&router, "never-associated", feed_outputs.clone()).await;
                 let (status, _) = call(&router, "DELETE", &format!("/v1/feed/{id}"), None).await;
                 assert_eq!(status, 202, "case {status_under_test:?}: DeleteFeed answers 202");
+                id
+            }
+            "ARCHIVED" => {
+                let id = available_feed(&router, "released-feed", feed_outputs.clone()).await;
+                let (status, _) = associate(&router, &id, "released-media", json!([])).await;
+                assert_eq!(status, 200, "case {status_under_test:?}: the claim is accepted");
+                let (status, _) = disassociate(&router, &id, "released-media").await;
+                assert_eq!(
+                    status, 200,
+                    "case {status_under_test:?}: DisassociateFeed answers 200"
+                );
                 id
             }
             other => panic!("no such status row: {other}"),
@@ -913,9 +928,9 @@ async fn disassociate_is_refused_from_every_status_that_holds_no_resource() {
         );
         assert_eq!(
             error["message"],
-            json!(FEED_NOT_ASSOCIATED_MESSAGE),
-            "case {status_under_test:?}: the refusal carries the rule's invariant sentence, \
-             got {}",
+            json!(feed_not_associated_message(feed_status)),
+            "case {status_under_test:?}: the refusal reports the status the feed was found \
+             in, got {}",
             error["message"]
         );
     }

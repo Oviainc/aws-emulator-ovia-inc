@@ -2,9 +2,11 @@
 
 //! @op CreateFeed
 //! IMPLEMENTED: mints a feed, persists it in `crate::state` and builds the response
-//! from the stored record. The feed is accepted asynchronously (HTTP 202), so it is
-//! stored in the transient `CREATING` status with the instant its move to `AVAILABLE`
-//! falls due; the feed readers materialise that move. A supplied `accessRoleArn` is a
+//! from the stored record. The feed is USABLE as soon as this call answers — the
+//! recorded service reports `AVAILABLE` for a `GetFeed` taken immediately afterwards
+//! and accepts the `AssociateFeed` the caller makes in its very next request — so it is
+//! stored in the settled `AVAILABLE` status, owing the clock nothing, even though the
+//! accept is modelled as HTTP 202. A supplied `accessRoleArn` is a
 //! role this service is asked to PASS, so it is evaluated first: a role that names
 //! another account is denied (`AccessDeniedException`, HTTP 403).
 //!
@@ -242,8 +244,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let id = state.mint_feed_id();
-        // 202: the feed is accepted in CREATING and reaches AVAILABLE on the clock.
-        let due = now + crate::state::TRANSITION_SPAN;
         let feed = crate::state::Feed {
             arn: crate::state::feed_arn(&region, &id),
             data_endpoints: crate::state::feed_data_endpoints(&region, &id),
@@ -265,12 +265,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 })
                 .collect(),
             access_role_arn: input.access_role_arn,
-            status: crate::state::FeedStatus::Creating,
+            // "After creation of the feed has succeeded, the status will be AVAILABLE"
+            // (`CreateFeedResponse$status`), and creation HAS succeeded by the time this
+            // call answers: the recorded service hands back a feed that the caller's
+            // next request can associate, and reports AVAILABLE for a GetFeed taken
+            // immediately after. So there is no CREATING window to wait out and no
+            // transition owed — the 202 records that the feed was ACCEPTED, not that it
+            // is still being built.
+            status: crate::state::FeedStatus::Available,
             // "When you create the feed, this property is empty": a resource is
             // associated later, with AssociateFeed or UpdateFeed.
             association: None,
             tags: input.tags.unwrap_or_default().into_iter().collect(),
-            transition_due_at: Some(due),
+            transition_due_at: None,
         };
 
         // Built from the record that is about to be stored, so GetFeed answers with
@@ -287,7 +294,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             tags: Some(feed.tag_map()),
         };
         state.feeds.insert(feed.id.clone(), feed);
-        state.note_due(due);
         Ok(output)
     }
 }
