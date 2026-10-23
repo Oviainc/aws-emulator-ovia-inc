@@ -14,8 +14,13 @@
 //! The registry itself is a field of [`super::ComAmazonawsCloudtrailCloudtrail20131101State`],
 //! the one store this service keeps; this module is where its rules are written, the way
 //! `src/service/rpc_target.rs` holds the target reading `src/service.rs` applies.
+//!
+//! The rules a channel is CREATED under live here too, beside the registry they write
+//! into: the one `Source` this emulator can ingest, how a `Destinations` entry is
+//! resolved to an event data store the channel may log to, the registry's own bound, and
+//! the name and source a Region holds at most one channel for.
 
-use super::{ComAmazonawsCloudtrailCloudtrail20131101State, SERVICE_NAMESPACE};
+use super::{ComAmazonawsCloudtrailCloudtrail20131101State, EventDataStoreRecord, SERVICE_NAMESPACE};
 use crate::ops::types::{Destination, Tag};
 
 /// The resource prefix of a channel ARN:
@@ -33,15 +38,104 @@ const CHANNEL_RESOURCE_TYPE: &str = "channel";
 /// partition names a resource no call here can reference.
 const AWS_PARTITION: &str = "aws";
 
-/// The group lengths of the UUID CloudTrail mints a channel id as (`8-4-4-4-12` hex
-/// digits), which is the `<uuid>` of `DeleteChannelRequest$Channel` ("The ARN or the
-/// UUID value of the channel").
+/// Whether `value` is written the way this service's model writes a `UUID`
+/// (`com.amazonaws.cloudtrail#UUID`: `@length 36`, `@pattern ^[a-f0-9\-]+$`) — five
+/// lowercase-hex groups of 8-4-4-4-12 digits, the canonical form AWS mints a channel
+/// id and an event data store id in.
 ///
-/// It is what a MINTED id looks like, not a rule a caller-supplied id is checked
-/// against: an id CloudTrail never minted names no channel, which is an absent channel
-/// and not a malformed identifier. Only the ARN FORM is checked, because only an ARN
-/// has a format to get wrong.
-pub const CHANNEL_ID_GROUP_LENGTHS: [usize; 5] = [8, 4, 4, 4, 12];
+/// It lives in this module because the channel path is what reads it: a minted channel
+/// id, and the `<uuid>` of a `Destination$Location`. (`widget_query::is_event_data_store_id`
+/// and `ops::list_imports::is_import_id` read the same form for their own ids; folding the
+/// three into one reader belongs with whichever of those operations is worked next.)
+fn is_uuid(value: &str) -> bool {
+    /// The 8-4-4-4-12 group lengths that make up the 36 characters of a `UUID`.
+    const GROUP_LENGTHS: [usize; 5] = [8, 4, 4, 4, 12];
+
+    let mut groups = value.split('-');
+    let grouped_as_a_uuid = GROUP_LENGTHS.iter().all(|length| {
+        groups.next().is_some_and(|group| {
+            group.len() == *length
+                && group
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b.is_ascii_lowercase() && b.is_ascii_hexdigit()))
+        })
+    });
+    grouped_as_a_uuid && groups.next().is_none()
+}
+
+/// A fresh channel id in the modelled `UUID` form — "the `UUID` value of the channel"
+/// (`GetChannelRequest$Channel`), written as a version-4 UUID (the `4` and the `8` in the
+/// third and fourth groups).
+///
+/// Minted off a process-local counter, so it carries NOTHING from the request and no two
+/// channels this process creates share an id — the low group alone is the counter, which
+/// makes the whole value unique, and the registry is this process's. The service's other
+/// minted ids are counted off the store the same way (`refreshes_started`), which is why
+/// this needs no randomness and no dependency of its own.
+pub fn new_channel_id() -> String {
+    static MINTED: ::std::sync::atomic::AtomicU64 = ::std::sync::atomic::AtomicU64::new(0);
+
+    let minted = MINTED.fetch_add(1, ::std::sync::atomic::Ordering::Relaxed);
+    format!(
+        "{:08x}-{:04x}-4{:03x}-8{:03x}-{:012x}",
+        (minted >> 32) as u32,
+        ((minted >> 16) & 0xffff) as u16,
+        (minted >> 4) & 0x0fff,
+        minted & 0x0fff,
+        minted & 0xffff_ffff_ffff,
+    )
+}
+
+/// The HTTP status a channel operation answers `ChannelNotFoundException` with.
+///
+/// The model annotates the shape `@httpError(404)`, and CloudTrail answers **400** for it
+/// on the wire: every recorded channel refusal in the corpus carries HTTP 400 with
+/// `__type: ChannelNotFoundException` (`DeleteChannel`, `GetChannel`, `UpdateChannel`,
+/// `ListTags`, `RemoveTags` on an unknown channel). It is stated here, beside
+/// [`channel_not_found_message`], so every channel operation answers the same status — the
+/// error CODE is still the model's, and the status is applied through
+/// [`crate::scaffolded::Scaffolded::modeled_with_status`].
+pub const CHANNEL_NOT_FOUND_HTTP_STATUS: u16 = 400;
+
+/// The HTTP status a channel operation answers `EventDataStoreNotFoundException` with
+/// for a destination that names no store.
+///
+/// The model annotates the shape `@httpError(404)`, and the recorded CloudTrail response
+/// carries HTTP **400** with `__type: EventDataStoreNotFoundException` (recorded:
+/// `CreateChannel` against a well-formed event data store ARN that names no store). As
+/// with [`super::IMPORT_NOT_FOUND_HTTP_STATUS`], the status a client's retry classifier
+/// sees is the service's, not the model's, and a handler answers it through
+/// [`crate::scaffolded::Scaffolded::modeled_with_status`], which keeps the modelled
+/// shape's body and changes only the status line.
+pub const EVENT_DATA_STORE_NOT_FOUND_HTTP_STATUS: u16 = 400;
+
+/// Read a `Destination$Location`: `arn:aws:cloudtrail:<region>:<account>:eventdatastore/<uuid>`,
+/// answering the Region and the store id it carries — or `None` when `value` is not one.
+///
+/// The six fields come from the tree's ONE ARN parse (`service_common::arn`), and this
+/// reader adds what a `Destination$Location` needs on top of it: the Region and account
+/// fields that parse allows to be EMPTY (a partition-global ARN) must be a Region label
+/// and a 12-digit account, because an event data store is a Regional, account-owned
+/// resource, and the resource must be an `eventdatastore` carrying an id in the modelled
+/// `UUID` form. Stricter than [`super::parse_event_data_store_identifier`], which also
+/// accepts the bare id the query operations' members document — a `Destination$Location`
+/// is documented as an ARN, so only the ARN form is read here; expressing this as a
+/// narrowing of that one grammar belongs with the store operations that own it.
+fn parse_destination_event_data_store_arn(value: &str) -> Option<(&str, &str)> {
+    let arn = ::service_common::arn::parse_of(value, SERVICE_NAMESPACE)?;
+    let region = ::service_common::arn::region_of(value, SERVICE_NAMESPACE)?;
+    if arn.account.len() != 12 || !arn.account.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let id = ::service_common::arn::resource_id_of_type(
+        value,
+        super::EVENT_DATA_STORE_RESOURCE_PREFIX.trim_end_matches('/'),
+    )?;
+    if !is_uuid(id) {
+        return None;
+    }
+    Some((region, id))
+}
 
 /// The registry key: a channel id and the Region the channel lives in.
 ///
@@ -63,6 +157,104 @@ pub struct ChannelRecord {
     pub destinations: Vec<Destination>,
     pub tags: Vec<Tag>,
     pub home_region: String,
+}
+
+impl ChannelRecord {
+    /// A channel `CreateChannel` just accepted: a freshly minted id, the ARN that id
+    /// makes in `home_region`, and the values the request carried.
+    pub fn created(
+        home_region: &str,
+        name: &str,
+        source: &str,
+        destinations: Vec<Destination>,
+        tags: Vec<Tag>,
+    ) -> Self {
+        let channel_id = new_channel_id();
+        Self {
+            channel_arn: channel_arn(home_region, &channel_id),
+            channel_id,
+            name: name.to_string(),
+            source: source.to_string(),
+            destinations,
+            tags,
+            home_region: home_region.to_string(),
+        }
+    }
+
+    /// This channel's registry key: its id and the Region it lives in.
+    pub fn key(&self) -> ChannelKey {
+        (self.channel_id.clone(), self.home_region.clone())
+    }
+}
+
+/// The `Source` value `CreateChannel` documents for events that are not an Amazon
+/// Web Services service's: "A source can be either `Custom` for all valid
+/// non-Amazon Web Services events, or the name of a partner event source."
+pub const CUSTOM_CHANNEL_SOURCE: &str = "Custom";
+
+/// `Destination$Type` for a CloudTrail Lake integration channel, from the model's
+/// `DestinationType` enum: "For channels used for a CloudTrail Lake integration, the
+/// value is `EVENT_DATA_STORE`."
+pub const DESTINATION_TYPE_EVENT_DATA_STORE: &str = "EVENT_DATA_STORE";
+
+/// `Destination$Type` for a service-linked channel, from the same enum: "For
+/// service-linked channels, the value is `AWS_SERVICE`."
+pub const DESTINATION_TYPE_AWS_SERVICE: &str = "AWS_SERVICE";
+
+/// How many channels the registry holds before `CreateChannel` refuses with the
+/// modelled `ChannelMaxLimitExceededException`.
+///
+/// Like [`super::TRAIL_QUOTA`], this is the emulator's OWN bound on a store that
+/// lives for the life of the process rather than a claim about any account's
+/// published channel quota, and it bounds the WHOLE registry rather than one
+/// Region's share of it: the Region a channel is created in comes from the request,
+/// so a per-Region bound would still let a caller grow the store without end by
+/// varying the Region it signs for. It sits far above any workflow an emulator
+/// serves, and a record is released by `DeleteChannel`.
+pub const CHANNEL_QUOTA: usize = 1_000;
+
+/// Check `CreateChannel$Source` / the source of a channel.
+///
+/// `Source` is documented as "either `Custom` for all valid non-Amazon Web Services
+/// events, or the name of a partner event source … For information about the source
+/// names for available partners, see Additional information about integration
+/// partners". A partner source name therefore names a partner integration that must
+/// be AVAILABLE, and this emulator carries no partner integrations — so
+/// [`CUSTOM_CHANNEL_SOURCE`] is the one source a channel can be created for, and
+/// every other value is refused the way the service refuses a source it does not
+/// have: `InvalidSourceException`. A partner-integration registry, if one ever
+/// lands, is what this rule would check a partner name against; until then,
+/// accepting an arbitrary name would promise a channel that can ingest nothing.
+pub fn validate_channel_source(source: &str) -> Result<(), String> {
+    if source == CUSTOM_CHANNEL_SOURCE {
+        Ok(())
+    } else {
+        // Request-derived: it names the value it refused, so the caller can fix the
+        // request from it alone.
+        Err(format!("The source {source} is not valid."))
+    }
+}
+
+/// Why a channel destination could not be accepted.
+///
+/// Each variant names the modelled error the handler answers with, so every
+/// operation that takes a `Destinations` list refuses the same destination the same
+/// way.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DestinationRejection {
+    /// Not an event data store ARN at all ⇒ `EventDataStoreARNInvalidException`
+    /// (HTTP 400).
+    ArnInvalid(String),
+    /// A well-formed event data store ARN naming no store the caller's Region can
+    /// log to ⇒ `EventDataStoreNotFoundException`, answered with
+    /// [`EVENT_DATA_STORE_NOT_FOUND_HTTP_STATUS`].
+    NotFound(String),
+    /// The store exists but is not usable ⇒ `InactiveEventDataStoreException`
+    /// (HTTP 400).
+    Inactive(String),
+    /// A destination this operation cannot create ⇒ `InvalidParameterException`
+    /// (HTTP 400).
+    InvalidParameter(String),
 }
 
 /// A caller-supplied channel identifier, in either of the two forms the model
@@ -131,21 +323,22 @@ pub fn channel_arn(region: &str, channel_id: &str) -> String {
     )
 }
 
-/// Whether `value` has the shape of an id CloudTrail minted: the UUID of
-/// [`CHANNEL_ID_GROUP_LENGTHS`] groups of hex digits.
+/// Whether `value` has the shape of an id CloudTrail minted: the modelled `UUID`
+/// (`com.amazonaws.cloudtrail#UUID`, `@length 36` of `^[a-f0-9\-]+$` in `8-4-4-4-12`
+/// groups), which is the `<uuid>` of `DeleteChannelRequest$Channel` ("The ARN or the
+/// UUID value of the channel"). It is the ONE reading of that form in this crate
+/// ([`is_uuid`]), shared with the service's other `UUID`-shaped ids.
+///
+/// It is what a MINTED id looks like, not a rule a caller-supplied id is checked
+/// against: an id CloudTrail never minted names no channel, which is an absent channel
+/// and not a malformed identifier. Only the ARN FORM is checked, because only an ARN
+/// has a format to get wrong.
 ///
 /// Only a MINTER needs this (`CreateChannel`, to mint one, and a caller that wants to
 /// know whether an id could be one): resolving an identifier does not, because an id of
 /// any other shape simply names no channel.
 pub fn is_minted_channel_id(value: &str) -> bool {
-    let groups: Vec<&str> = value.split('-').collect();
-    groups.len() == CHANNEL_ID_GROUP_LENGTHS.len()
-        && groups
-            .iter()
-            .zip(CHANNEL_ID_GROUP_LENGTHS)
-            .all(|(group, length)| {
-                group.len() == length && group.chars().all(|c| c.is_ascii_hexdigit())
-            })
+    is_uuid(value)
 }
 
 /// Read a caller-supplied channel identifier as either a channel ARN or a bare channel
@@ -224,5 +417,91 @@ impl ComAmazonawsCloudtrailCloudtrail20131101State {
             parsed.id().to_string(),
             parsed.region().unwrap_or(request_region).to_string(),
         )))
+    }
+
+    /// The channel called `name` in `region`, if the account holds one.
+    ///
+    /// A channel name is taken within the Region it was created in, which is what
+    /// makes `ChannelAlreadyExistsException` reachable: the registry is keyed by
+    /// `(channel id, Region)`, so the name is not a key and is checked here.
+    pub fn channel_named(&self, region: &str, name: &str) -> Option<&ChannelRecord> {
+        self.channels
+            .values()
+            .find(|channel| channel.home_region == region && channel.name == name)
+    }
+
+    /// The channel in `region` that already logs `source`, if the account holds one.
+    ///
+    /// `CreateChannelRequest$Source` documents the rule: "A maximum of one channel
+    /// is allowed per source." A channel is a Regional resource, so the bound is per
+    /// Region, like the name.
+    pub fn channel_sourced_from(&self, region: &str, source: &str) -> Option<&ChannelRecord> {
+        self.channels
+            .values()
+            .find(|channel| channel.home_region == region && channel.source == source)
+    }
+
+    /// How many channels `region` holds — the registry spans every Region, so one
+    /// Region's share of it is a filtered count.
+    pub fn channels_in(&self, region: &str) -> usize {
+        self.channels
+            .values()
+            .filter(|channel| channel.home_region == region)
+            .count()
+    }
+
+    /// Check one `Destination` of a channel, for a call made in `request_region`.
+    ///
+    /// A channel created through `CreateChannel` logs to event data stores, so a
+    /// destination must be typed `EVENT_DATA_STORE` and its `Location` must be the
+    /// ARN of a store that exists in the SAME Region as the channel — a store lives
+    /// in one Region and a channel can only log to one it shares a Region with — and
+    /// be usable. The refusals are distinct: not an event data store ARN at all, a
+    /// well-formed ARN naming no store this Region can log to, and a store that is
+    /// inactive.
+    pub fn resolve_channel_destination(
+        &self,
+        destination: &Destination,
+        request_region: &str,
+    ) -> Result<&EventDataStoreRecord, DestinationRejection> {
+        let location = destination.location.as_str();
+        if destination.r#type != DESTINATION_TYPE_EVENT_DATA_STORE {
+            return Err(DestinationRejection::InvalidParameter(format!(
+                "Destination type '{}' is not valid for a channel that logs to an event \
+                 data store: the type must be {DESTINATION_TYPE_EVENT_DATA_STORE} \
+                 ({DESTINATION_TYPE_AWS_SERVICE} is reserved for the service-linked \
+                 channels Amazon Web Services services create)",
+                destination.r#type
+            )));
+        }
+        // A `Location` is documented as "the ARN of an event data store", so only
+        // the ARN form is read here; the refusal wording is the store module's
+        // shared one, which every operation that reads a store identifier answers
+        // with.
+        let Some((arn_region, id)) = parse_destination_event_data_store_arn(location) else {
+            return Err(DestinationRejection::ArnInvalid(
+                super::event_data_store_arn_invalid_message(location, request_region),
+            ));
+        };
+        // The store has to be the one this ARN names AND be in the Region the call
+        // was made in; a store of another Region names no store this channel can
+        // log to.
+        let store = self
+            .event_data_stores
+            .get(id)
+            .filter(|store| store.region == arn_region && store.region == request_region);
+        let Some(store) = store else {
+            return Err(DestinationRejection::NotFound(
+                super::event_data_store_not_found_message(location),
+            ));
+        };
+        // A store awaiting deletion is the one status the modelled
+        // `InactiveEventDataStoreException` reports, for ingestion as for queries.
+        if !store.status.is_queryable() {
+            return Err(DestinationRejection::Inactive(format!(
+                "The event data store {location} is inactive."
+            )));
+        }
+        Ok(store)
     }
 }

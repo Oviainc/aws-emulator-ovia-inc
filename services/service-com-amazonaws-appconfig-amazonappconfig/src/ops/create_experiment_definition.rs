@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateExperimentDefinition
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateExperimentDefinition`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateExperimentDefinition::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: creates an experiment definition under an application and persists it.
 //!
 //! ## Shape of an operation
 //!
@@ -201,20 +193,242 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateExperimentDefinition` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateExperimentDefinitionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateExperimentDefinition"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateExperimentDefinitionErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("AppConfig state is not reachable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+        // Every tag key this request would store is checked through the same function
+        // `TagResource` refuses through, and before anything is written.
+        if let Some(reason) = input
+            .tags
+            .as_ref()
+            .and_then(crate::state::first_tag_key_rejection)
+        {
+            return Err(CreateExperimentDefinitionErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(reason),
+                    reason: None,
+                    details: None,
+                },
+            )
+            .into());
+        }
+
+        let now = std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // Each of the three identifiers this request carries is an `Identifier`, which
+        // the model documents as the resource's "ID or name", so each is resolved either
+        // way and the record stores the resolved ID — the output reports `ApplicationId`,
+        // `EnvironmentId` and `ConfigurationProfileId`, never the identifier as written.
+        let Some(application_id) = store.resolve_application_id(&input.application_identifier)
+        else {
+            return Err(CreateExperimentDefinitionErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "No application with id or name {} exists.",
+                        input.application_identifier
+                    )),
+                    resource_name: Some(input.application_identifier),
+                },
+            )
+            .into());
+        };
+        let Some(application) = store.applications.get(&application_id) else {
+            return Err(CreateExperimentDefinitionErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "The application could not be read while creating the experiment \
+                         definition"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // An experiment runs one environment's feature flag, so both the environment and
+        // the configuration profile that stores the flag are resolved under the SAME
+        // application before an id is minted for the definition.
+        let Some(environment_id) = application
+            .resolve_environment(&input.environment_identifier)
+            .map(|environment| environment.id.clone())
+        else {
+            return Err(CreateExperimentDefinitionErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "No environment with id or name {} exists in application {}.",
+                        input.environment_identifier, application.id
+                    )),
+                    resource_name: Some(input.environment_identifier),
+                },
+            )
+            .into());
+        };
+        let Some(configuration_profile_id) = application
+            .resolve_profile(&input.configuration_profile_identifier)
+            .map(|profile| profile.id.clone())
+        else {
+            return Err(CreateExperimentDefinitionErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "No configuration profile with id or name {} exists in application {}.",
+                        input.configuration_profile_identifier, application.id
+                    )),
+                    resource_name: Some(input.configuration_profile_identifier),
+                },
+            )
+            .into());
+        };
+
+        // A definition's name ADDRESSES it: every `ExperimentDefinitionIdentifier` in
+        // this service resolves "ID or name", so two definitions under one application
+        // cannot share a name — a second create under a name already in use conflicts
+        // with the state of the resource that holds it and writes nothing.
+        if let Some(existing) = application
+            .experiment_definitions
+            .values()
+            .find(|definition| definition.name == input.name)
+        {
+            return Err(CreateExperimentDefinitionErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(format!(
+                        "An experiment definition named {} already exists in application {} \
+                         with id {}.",
+                        input.name, application.id, existing.id
+                    )),
+                },
+            )
+            .into());
+        }
+        // Bounded so a loop of create calls cannot grow this emulator's heap without
+        // limit; see `state::MAX_EXPERIMENT_DEFINITIONS_PER_APPLICATION`.
+        if application.experiment_definitions.len()
+            >= crate::state::MAX_EXPERIMENT_DEFINITIONS_PER_APPLICATION
+        {
+            return Err(
+                CreateExperimentDefinitionErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(format!(
+                            "Cannot create another experiment definition: application {} already \
+                             holds the maximum of {} experiment definitions.",
+                            application.id,
+                            crate::state::MAX_EXPERIMENT_DEFINITIONS_PER_APPLICATION
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let id = store.mint_id();
+        // `TreatmentInput` carries no key and `Treatment` does, so the key is minted
+        // here, from each treatment's place in the definition.
+        let control = keyed(
+            crate::state::CONTROL_TREATMENT_KEY.to_string(),
+            &input.control,
+        );
+        let treatments: Vec<Treatment> = input
+            .treatments
+            .iter()
+            .enumerate()
+            .map(|(index, treatment)| keyed(crate::state::treatment_key(index), treatment))
+            .collect();
+
+        let definition = crate::state::ExperimentDefinition {
+            id: id.clone(),
+            application_id: application_id.clone(),
+            configuration_profile_id,
+            environment_id,
+            name: input.name,
+            flag_key: input.flag_key,
+            audience_rule: input.audience_rule,
+            audience_description: input.audience_description,
+            hypothesis: input.hypothesis,
+            launch_criteria: input.launch_criteria,
+            // Nothing has run this definition yet, and `ExperimentDefinitionStatus`'s own
+            // documentation on this output calls out IDLE, ACTIVE and ARCHIVED: a run is
+            // what makes it ACTIVE and an archiving delete what makes it ARCHIVED, so a
+            // definition that was only just created is IDLE. Nothing about that is owed
+            // by the clock, so no transition is scheduled.
+            status: crate::state::EXPERIMENT_DEFINITION_IDLE.to_string(),
+            control,
+            treatments,
+            // The create request carries no `KmsKeyIdentifier`; `StartExperimentRun` is
+            // what supplies one, so there is none to report yet and none is invented.
+            kms_key_identifier: None,
+            created_at: now,
+            // Nothing has updated the definition since it was written, so it was last
+            // updated when it was created.
+            updated_at: now,
+            tags: input.tags.unwrap_or_default(),
+        };
+
+        let Some(application) = store.applications.get_mut(&application_id) else {
+            return Err(CreateExperimentDefinitionErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "The application could not be re-read while creating the experiment \
+                         definition"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+        // `mint_id` rejects every id any resource already holds, so the slot is vacant.
+        // An occupied one is refused rather than answered from: reporting 201 with
+        // another definition's record would describe a resource this call never made.
+        let stored = match application.experiment_definitions.entry(id) {
+            std::collections::hash_map::Entry::Vacant(slot) => slot.insert(definition),
+            std::collections::hash_map::Entry::Occupied(_) => {
+                return Err(CreateExperimentDefinitionErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(
+                            "The minted experiment definition id was already in use".to_string(),
+                        ),
+                    },
+                )
+                .into())
+            }
+        };
+
+        // Answered from the stored record, so `GetExperimentDefinition` reports the same
+        // values this call did.
+        Ok(CreateExperimentDefinitionOutput {
+            application_id: Some(stored.application_id.clone()),
+            id: Some(stored.id.clone()),
+            name: Some(stored.name.clone()),
+            hypothesis: stored.hypothesis.clone(),
+            status: Some(stored.status.clone()),
+            configuration_profile_id: Some(stored.configuration_profile_id.clone()),
+            environment_id: Some(stored.environment_id.clone()),
+            flag_key: Some(stored.flag_key.clone()),
+            audience_rule: Some(stored.audience_rule.clone()),
+            audience_description: stored.audience_description.clone(),
+            launch_criteria: stored.launch_criteria.clone(),
+            treatments: Some(stored.treatments.clone()),
+            control: Some(stored.control.clone()),
+            created_at: Some(crate::state::to_date_time(stored.created_at)),
+            updated_at: Some(crate::state::to_date_time(stored.updated_at)),
+            kms_key_identifier: stored.kms_key_identifier.clone(),
+        })
+    }
+}
+
+/// The treatment a request wrote, under the key this service minted for it. Every other
+/// member is the caller's, byte for byte.
+fn keyed(key: String, treatment: &TreatmentInput) -> Treatment {
+    Treatment {
+        key: Some(key),
+        weight: treatment.weight,
+        description: treatment.description.clone(),
+        flag_value: treatment.flag_value.clone(),
     }
 }

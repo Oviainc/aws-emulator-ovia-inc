@@ -37,6 +37,12 @@
 //! hands back, so `GetTopicRule` after `CreateTopicRule` returns the created rule
 //! member-for-member.
 //!
+//! It also holds the account's CUSTOM AUTHORIZERS, keyed by `authorizerName` for the
+//! same reason: the name is the authorizer's identity and the `@httpLabel` of
+//! `/authorizer/{authorizerName}`. One record carries everything a reader hands back,
+//! so `DescribeAuthorizer` after `CreateAuthorizer` returns the created authorizer
+//! member-for-member.
+//!
 //! It also holds the account's FLEET INDEXING configuration — one record, not a map,
 //! because `GetIndexingConfiguration` / `UpdateIndexingConfiguration` name no
 //! resource: there is one indexing configuration per account. An account that has
@@ -58,9 +64,9 @@ use service_common::iot_job_executions::{
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    Action, CommandParameter, CommandPayload, CommandPreprocessor, GetCommandOutput, JobExecution,
-    JobExecutionStatusDetails, ThingGroupIndexingConfiguration, ThingIndexingConfiguration,
-    TopicRule, TopicRulePayload,
+    Action, AuthorizerDescription, CommandParameter, CommandPayload, CommandPreprocessor,
+    GetCommandOutput, JobExecution, JobExecutionStatusDetails, ThingGroupIndexingConfiguration,
+    ThingIndexingConfiguration, TopicRule, TopicRulePayload,
 };
 
 /// The shared index of which IoT COMMANDS exist, which the IoT Jobs data plane's
@@ -371,6 +377,17 @@ pub struct ComAmazonawsIotAwsiotserviceState {
     /// A caller grows this store, so it is bounded: [`MAX_TOPIC_RULES`] is the
     /// ceiling `CreateTopicRule` refuses past.
     pub topic_rules: BTreeMap<String, RegisteredTopicRule>,
+    /// Every custom authorizer that exists, keyed by `authorizerName`.
+    ///
+    /// The name is the authorizer's identity — the model binds it as the
+    /// `@httpLabel` of `/authorizer/{authorizerName}` on every single-authorizer
+    /// operation — so a `BTreeMap` keyed by name is the authorizer store itself.
+    /// `BTreeMap` (not `HashMap`) because `ListAuthorizers` is `@paginated` and a page
+    /// boundary is only meaningful over a stable order.
+    ///
+    /// A caller grows this store, so it is bounded: [`MAX_AUTHORIZERS`] is the ceiling
+    /// `CreateAuthorizer` refuses past.
+    pub authorizers: BTreeMap<String, RegisteredAuthorizer>,
     /// Every command that exists, keyed by `commandId`.
     ///
     /// The id is the command's identity — `CreateCommand$commandId` is "A unique
@@ -913,6 +930,150 @@ impl RegisteredPolicy {
     /// The default version's id in the modelled `PolicyVersionId` form (`^[0-9]+$`).
     pub fn default_version_id(&self) -> String {
         self.default_version_id.to_string()
+    }
+}
+
+/// The ARN of a custom authorizer:
+/// `arn:aws:iot:<region>:<account>:authorizer/<authorizerName>`.
+///
+/// `authorizer/` is the resource type AWS IoT's authorizer ARNs use — it is what
+/// `CreateAuthorizer$authorizerArn` / `AuthorizerDescription$authorizerArn` report
+/// and what an `iot:DescribeAuthorizer` policy statement names; the namespace and
+/// account segments are the ones [`thing_arn`] documents.
+pub fn authorizer_arn(region: &str, authorizer_name: &str) -> String {
+    ::emulator_server::emulator_arn("iot", region, &format!("authorizer/{authorizer_name}"))
+}
+
+/// How many custom authorizers this emulator keeps for the account.
+///
+/// AWS publishes a service quota on an account's custom authorizers; the exact figure
+/// is not in the model, so this is the emulator's own ceiling on a store a caller can
+/// grow — the same reason [`MAX_TOPIC_RULES`] exists — and `CreateAuthorizer` past it
+/// refuses with the modelled `LimitExceededException` rather than growing without
+/// bound.
+pub const MAX_AUTHORIZERS: usize = 100;
+
+/// How many tags one authorizer may carry: the same documented IoT tagging limit
+/// [`MAX_POLICY_TAGS`] records, for the same reason — `TagList` has no modelled
+/// maximum, so without a ceiling one request would choose how large a record is.
+pub const MAX_AUTHORIZER_TAGS: usize = MAX_POLICY_TAGS;
+
+/// The `status` an authorizer created without one carries.
+///
+/// `AuthorizerStatus` is `ACTIVE | INACTIVE`
+/// (`smithy_query(query="shape",shape="AuthorizerStatus")`) and AWS IoT's custom
+/// authentication documentation describes INACTIVE as the status you move an
+/// authorizer to in order to stop it being used — so a create that does not ask for
+/// INACTIVE yields an authorizer that is in use, which is `ACTIVE`. The record keeps
+/// it, and every later read reports it.
+pub const DEFAULT_AUTHORIZER_STATUS: &str = "ACTIVE";
+
+/// One custom authorizer in the authorizer store, as this service persists it.
+///
+/// An authorizer is a NAME plus the Lambda function that authorizes for it and how
+/// its token is validated: the name is its identity — the model binds it as the
+/// `@httpLabel` of `/authorizer/{authorizerName}` on every single-authorizer
+/// operation — and the rest is what `AuthorizerDescription` reports member for
+/// member, so a reader clones this record and the writer and the reader cannot
+/// drift.
+///
+/// The optional members are kept as `Option` where ABSENT is distinguishable from a
+/// value (`tokenKeyName`, `tokenSigningPublicKeys`: an authorizer that validates no
+/// token signature has neither) and resolved to their documented value where it is
+/// not (`status`, `signingDisabled`, `enableCachingForHttp`), because a resource that
+/// exists has one of each whether the create named it or not.
+#[derive(Debug, Clone)]
+pub struct RegisteredAuthorizer {
+    /// The name the authorizer was created under; also its key in the store.
+    pub authorizer_name: String,
+    /// `arn:aws:iot:<region>:<account>:authorizer/<authorizerName>`, minted on
+    /// create.
+    pub authorizer_arn: String,
+    /// "The ARN of the authorizer's Lambda function" — `@required` on the create, so
+    /// every record has one.
+    pub authorizer_function_arn: String,
+    /// "The name of the token key used to extract the token from the HTTP headers",
+    /// when the create named one.
+    pub token_key_name: Option<String>,
+    /// "The public keys used to verify the digital signature returned by your custom
+    /// authentication service", keyed by key name, when the create carried any.
+    /// `BTreeMap` so a reader reports them in one stable order.
+    pub token_signing_public_keys: Option<BTreeMap<String, String>>,
+    /// The authorizer's status: one of [`DEFAULT_AUTHORIZER_STATUS`]'s enum, resolved
+    /// on the write.
+    pub status: String,
+    /// When the authorizer was created — `AuthorizerDescription$creationDate`, "The
+    /// UNIX timestamp of when the authorizer was created".
+    pub creation_date: SystemTime,
+    /// When the authorizer last changed — `AuthorizerDescription$lastModifiedDate`.
+    /// Equal to [`RegisteredAuthorizer::creation_date`] until a later write moves it.
+    pub last_modified_date: SystemTime,
+    /// "Specifies whether IoT validates the token signature in an authorization
+    /// request": a create that does not disable it leaves validation on, so an absent
+    /// member is recorded as `false`.
+    pub signing_disabled: bool,
+    /// "When true, the result from the authorizer's Lambda function is cached for
+    /// clients that use persistent HTTP connections. … The default value is false"
+    /// (`CreateAuthorizer$enableCachingForHttp`), so an absent member is recorded as
+    /// `false`.
+    pub enable_caching_for_http: bool,
+    /// `Tag$Key` -> `Tag$Value` for the tags the create request carried. Tags "can be
+    /// used to manage the custom authorizer" rather than describe it, so they are not
+    /// part of `AuthorizerDescription` and not part of its identity.
+    pub tags: BTreeMap<String, Option<String>>,
+}
+
+impl RegisteredAuthorizer {
+    /// A newly created authorizer: the minted identity plus the create request's
+    /// members, with each optional one resolved as its field documents.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        authorizer_name: String,
+        authorizer_arn: String,
+        authorizer_function_arn: String,
+        token_key_name: Option<String>,
+        token_signing_public_keys: Option<BTreeMap<String, String>>,
+        status: Option<String>,
+        signing_disabled: Option<bool>,
+        enable_caching_for_http: Option<bool>,
+        tags: BTreeMap<String, Option<String>>,
+        created_at: SystemTime,
+    ) -> Self {
+        Self {
+            authorizer_name,
+            authorizer_arn,
+            authorizer_function_arn,
+            token_key_name,
+            token_signing_public_keys,
+            status: status.unwrap_or_else(|| DEFAULT_AUTHORIZER_STATUS.to_string()),
+            creation_date: created_at,
+            last_modified_date: created_at,
+            signing_disabled: signing_disabled.unwrap_or(false),
+            enable_caching_for_http: enable_caching_for_http.unwrap_or(false),
+            tags,
+        }
+    }
+
+    /// This record as the `AuthorizerDescription` every reader of one authorizer
+    /// reports: one function, so two readers cannot describe the same record
+    /// differently.
+    pub fn description(&self) -> AuthorizerDescription {
+        AuthorizerDescription {
+            authorizer_name: Some(self.authorizer_name.clone()),
+            authorizer_arn: Some(self.authorizer_arn.clone()),
+            authorizer_function_arn: Some(self.authorizer_function_arn.clone()),
+            token_key_name: self.token_key_name.clone(),
+            token_signing_public_keys: self.token_signing_public_keys.as_ref().map(|keys| {
+                keys.iter()
+                    .map(|(name, value)| (name.clone(), value.clone()))
+                    .collect()
+            }),
+            status: Some(self.status.clone()),
+            creation_date: Some(::aws_smithy_types::DateTime::from(self.creation_date)),
+            last_modified_date: Some(::aws_smithy_types::DateTime::from(self.last_modified_date)),
+            signing_disabled: Some(self.signing_disabled),
+            enable_caching_for_http: Some(self.enable_caching_for_http),
+        }
     }
 }
 

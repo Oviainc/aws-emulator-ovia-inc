@@ -431,9 +431,9 @@ async fn update_merges_only_the_supplied_members() {
 /// Walk every page of `ListDataSets` with `maxResults=page_size`, returning the
 /// ids in the order they were served.
 ///
-/// `maxResults` is always sent: the model gives `MaxResults` `@default: 0` and
-/// `@range(min: 1)`, so an omitted query parameter materialises to 0 and the
-/// boundary validator refuses it before any handler runs.
+/// `maxResults` is sent on every page here because the page SIZE is what this walk
+/// varies; a request that omits it is its own case, in
+/// `optional_page_size::an_absent_page_size_is_absent_not_the_modelled_default`.
 async fn list_all_data_sets(
     router: &MultiServiceRouter,
     page_size: i64,
@@ -555,13 +555,9 @@ async fn list_data_sets_enforces_the_modelled_max_results_range() {
         );
     }
 
-    // NOTE on an omitted `maxResults`: the model gives `MaxResults` `@default: 0`,
-    // and the framework materialises that default and then checks it against this
-    // same `@range(min: 1)`, so a request that omits the parameter is refused before
-    // any handler runs. That is an artefact of the vendored codegen, not behaviour
-    // this service has, so it is deliberately NOT asserted here; `page_window`
-    // already treats a non-positive `maxResults` as "no caller bound" for when the
-    // framework exempts defaulted members.
+    // An OMITTED `maxResults` is not a value and is not range-checked at all: see
+    // `optional_page_size::an_absent_page_size_is_absent_not_the_modelled_default`,
+    // which pins that case across every list operation of this service.
 }
 
 /// RULE: `origin` filters the listing to the data sets carrying that `Origin`, and
@@ -630,6 +626,20 @@ async fn list_data_sets_filters_by_origin() {
         "case origin=NOT_AN_ORIGIN: expected ValidationException, got {:?}",
         answer.error
     );
+    // The refusal states WHICH parameter is not valid and the set the model admits for
+    // it, in the model's own order - so a client can fix the request from the message
+    // alone, and the refusal cannot be mistaken for one about another parameter.
+    assert_eq!(
+        answer.string("Message"),
+        format!(
+            "The following parameter(s) are not valid: \"origin\" must be one of [{}].",
+            service_com_amazonaws_dataexchange_dataexchange::state::ORIGIN_VALUES_IN_MODEL_ORDER
+                .join(", ")
+        ),
+        "case origin=NOT_AN_ORIGIN: expected the parameter refusal to name the admitted \
+         set, got {:?}",
+        answer.body
+    );
 }
 
 /// RULE: a `NextToken` the service did not issue is refused as a 400
@@ -648,16 +658,26 @@ async fn an_unparsable_next_token_is_refused() {
     .await;
 
     // Rows differ along HOW the token is wrong: not hex, hex of the wrong layout,
-    // hex of an unknown scheme version, hex with a non-numeric offset, and a token
-    // longer than any this service can issue.
+    // hex of an unknown scheme version, hex with a non-numeric offset, hex naming
+    // another account, and a token longer than any this service can issue.
     let tokens = [
         ("not hex at all", "zzzz".to_string()),
         ("hex of a bare word", hex_of("nonsense")),
-        ("hex of an unknown version", hex_of("9|0|abc")),
-        ("hex with a non-numeric offset", hex_of("1|x|abc")),
+        (
+            "hex of an unknown version",
+            hex_of(&format!("9|{ACCOUNT}|0|abc")),
+        ),
+        (
+            "hex with a non-numeric offset",
+            hex_of(&format!("1|{ACCOUNT}|x|abc")),
+        ),
+        (
+            "hex naming another account",
+            hex_of("1|210987654321|0|abc"),
+        ),
         (
             "longer than any issued token",
-            hex_of(&format!("1|0|{}", "a".repeat(4096))),
+            hex_of(&format!("1|{ACCOUNT}|0|{}", "a".repeat(4096))),
         ),
     ];
 
@@ -677,6 +697,14 @@ async fn an_unparsable_next_token_is_refused() {
                 Some("ValidationException"),
                 "case {case} on {uri}: expected ValidationException, got {:?}",
                 answer.error
+            );
+            // Every token this service issues carries the account it was issued to, so
+            // the refusal of one that does not is about exactly that.
+            assert_eq!(
+                answer.string("Message"),
+                "Invalid NextToken. Account Id does not match Caller's Account Id.",
+                "case {case} on {uri}: expected the NextToken refusal, got {:?}",
+                answer.body
             );
         }
     }
@@ -705,10 +733,12 @@ async fn a_stale_cursor_past_the_end_serves_an_empty_final_page() {
     )
     .await;
 
-    // A cursor the service's own encoder would produce, whose anchor is gone and
-    // whose offset is past the end of the collection.
+    // A cursor the service's own encoder would produce for this account, whose
+    // anchor is gone and whose offset is past the end of the collection.
     for offset in [1_usize, 2, 9_999, usize::MAX] {
-        let token = hex_of(&format!("1|{offset}|00000000000000000000000000000000"));
+        let token = hex_of(&format!(
+            "1|{ACCOUNT}|{offset}|00000000000000000000000000000000"
+        ));
         for (case, uri) in [
             (
                 "data sets",
@@ -947,7 +977,9 @@ async fn the_counted_resources_are_capped() {
 #[test]
 fn the_owned_origin_constant_is_a_modelled_origin_value() {
     use service_com_amazonaws_dataexchange_dataexchange::ops::types::ORIGIN_VALUES;
-    use service_com_amazonaws_dataexchange_dataexchange::state::ORIGIN_OWNED;
+    use service_com_amazonaws_dataexchange_dataexchange::state::{
+        ORIGIN_OWNED, ORIGIN_VALUES_IN_MODEL_ORDER,
+    };
 
     assert!(
         ORIGIN_VALUES.contains(&ORIGIN_OWNED),
@@ -961,6 +993,22 @@ fn the_owned_origin_constant_is_a_modelled_origin_value() {
         ORIGINS.len(),
         ORIGIN_VALUES.len()
     );
+    // The order a refusal quotes the set in is the model's, which the generated catalog
+    // (sorted) cannot state - so the two are kept from drifting here: same count, same
+    // members.
+    assert_eq!(
+        ORIGIN_VALUES_IN_MODEL_ORDER.len(),
+        ORIGIN_VALUES.len(),
+        "case Origin order: the model-order list {ORIGIN_VALUES_IN_MODEL_ORDER:?} and the \
+         generated catalog {ORIGIN_VALUES:?} must hold the same values"
+    );
+    for origin in ORIGIN_VALUES_IN_MODEL_ORDER {
+        assert!(
+            ORIGIN_VALUES.contains(origin),
+            "case Origin order: {origin:?} is not one of the modelled Origin values \
+             {ORIGIN_VALUES:?}"
+        );
+    }
 }
 
 /// RULE: `CreateRevision` attaches a revision to an existing data set and

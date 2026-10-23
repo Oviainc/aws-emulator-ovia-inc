@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateS3TableIntegration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateS3TableIntegration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateS3TableIntegration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -163,18 +154,136 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateS3TableIntegration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateS3TableIntegrationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // `Encryption`'s presence with its required `SseAlgorithm`, `RoleArn`'s
+        // presence with `ResourceArn`'s 1..1011 length and `^arn:aws…` pattern, and
+        // the `Tags` map's 1..50 length are modelled, so the centralized request walk
+        // has already refused anything outside them with a 400 `ValidationException`
+        // before this body runs. What is left — `SseAlgorithm`'s value set, and which
+        // service's resource each ARN member names — is in
+        // `s3_table_integration_rejection`.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateS3TableIntegration"))
+        // The operation takes no caller-supplied identifier, so there is no name a
+        // second create could collide on: each create mints a fresh id, stores one
+        // record under it and answers that record's ARN, which is the only handle
+        // `GetS3TableIntegration` / `DeleteS3TableIntegration` accept. The modelled
+        // `ConflictException` therefore has no create-time case to report here.
+        //
+        // `AccessDeniedException` has none either: this emulator verifies the request
+        // signature centrally and models no IAM, so there is no policy evaluation here
+        // to refuse a permitted-looking call — a deliberate scope boundary, the same
+        // one every implemented operation in this crate sits behind.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateS3TableIntegrationErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the S3 Table integration store is unavailable".to_string()),
+                    ..Default::default()
+                },
+            )
+        })?;
+
+        let region = crate::state::request_region(ctx.parts());
+        // The presented access-key id is an identifier, never a secret: it is what the
+        // audit record below attributes this state-changing call to.
+        let principal = ::emulator_server::extract_akid(&ctx.parts().headers);
+
+        if let Some(why) =
+            crate::state::s3_table_integration_rejection(&input.encryption, &input.role_arn)
+        {
+            ::tracing::info!(
+                target: "audit",
+                operation = Self::NAME,
+                outcome = "rejected-invalid-request",
+                principal = %principal,
+                region = %region,
+                "refused an S3 Table integration create"
+            );
+            return Err(CreateS3TableIntegrationErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(why),
+                    ..Default::default()
+                },
+            )
+            .into());
+        }
+
+        let created_at = crate::state::now_epoch_millis();
+        let id = crate::state::new_s3_table_integration_id();
+        let arn = crate::state::s3_table_integration_arn(&region, &id);
+        let destination_table_bucket_arn = crate::state::table_bucket_arn(&region, &id);
+
+        let mut store = state.lock();
+
+        // The store is finite, and the cap that dominates is store-WIDE: a record is
+        // keyed by the region of the caller's own credential scope, so the per-region
+        // budget alone would reset for every scope a caller signs with. Each cap is
+        // asked separately so the refusal names the one that actually refused, and a
+        // create past either is refused BEFORE a record is allocated.
+        let over_cap = if store.s3_table_integration_count(&region)
+            >= crate::state::MAX_S3_TABLE_INTEGRATIONS
+        {
+            Some(format!(
+                "this account already holds the maximum of {} S3 Table integrations in \
+                 {region}",
+                crate::state::MAX_S3_TABLE_INTEGRATIONS
+            ))
+        } else if store.would_exceed_s3_table_integration_store(1) {
+            Some(format!(
+                "this create would take the store past its {} S3 Table integration records",
+                crate::state::MAX_STORED_S3_TABLE_INTEGRATION_RECORDS
+            ))
+        } else {
+            None
+        };
+        if let Some(why) = over_cap {
+            drop(store);
+            ::tracing::info!(
+                target: "audit",
+                operation = Self::NAME,
+                outcome = "rejected-quota-exceeded",
+                principal = %principal,
+                region = %region,
+                "refused an S3 Table integration create"
+            );
+            return Err(
+                CreateS3TableIntegrationErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(why),
+                        resource_type: Some(
+                            crate::state::S3_TABLE_INTEGRATION_RESOURCE_TYPE.to_string(),
+                        ),
+                        service_code: Some(crate::state::ARN_SERVICE.to_string()),
+                        ..Default::default()
+                    },
+                )
+                .into(),
+            );
+        }
+
+        store.insert_s3_table_integration(crate::state::StoredS3TableIntegration {
+            id,
+            region: region.clone(),
+            arn: arn.clone(),
+            role_arn: input.role_arn,
+            sse_algorithm: input.encryption.sse_algorithm,
+            kms_key_arn: input.encryption.kms_key_arn,
+            destination_table_bucket_arn,
+            created_timestamp_ms: created_at,
+            tags: input.tags.unwrap_or_default().into_iter().collect(),
+        });
+        drop(store);
+
+        // Audit record for a state-changing call: who asked, what changed, and how it
+        // ended. The KMS key and the role are deliberately not in it.
+        ::tracing::info!(
+            target: "audit",
+            operation = Self::NAME,
+            outcome = "created",
+            principal = %principal,
+            region = %region,
+            resource_arn = %arn,
+            "created an S3 Table integration"
+        );
+
+        Ok(CreateS3TableIntegrationOutput { arn: Some(arn) })
     }
 }

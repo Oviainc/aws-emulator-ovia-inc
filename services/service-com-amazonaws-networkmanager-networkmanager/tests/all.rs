@@ -23,6 +23,8 @@ mod list_tags_for_resource;
 mod network_resource_counts;
 #[path = "all/resource_not_found_message.rs"]
 mod resource_not_found_message;
+#[path = "all/resource_policy_lifecycle.rs"]
+mod resource_policy_lifecycle;
 #[path = "all/resource_tagging.rs"]
 mod resource_tagging;
 #[path = "all/state_roundtrip.rs"]

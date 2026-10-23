@@ -14,7 +14,9 @@ use ::sha2::{Digest, Sha256};
 
 use crate::ops::types::{
     ActivityTaskScheduledEventAttributes, ActivityType, ActivityTypeConfiguration, ActivityTypeInfo,
-    DecisionTaskScheduledEventAttributes, DomainConfiguration, DomainInfo, ExecutionTimeFilter,
+    DecisionTaskCompletedEventAttributes, DecisionTaskScheduledEventAttributes,
+    DecisionTaskStartedEventAttributes, DecisionTaskTimedOutEventAttributes, DomainConfiguration,
+    DomainInfo, ExecutionTimeFilter,
     HistoryEvent, ResourceTag, TagFilter, TaskList, WorkflowExecution,
     WorkflowExecutionCancelRequestedEventAttributes,
     WorkflowExecutionConfiguration, WorkflowExecutionFilter, WorkflowExecutionInfo,
@@ -103,6 +105,24 @@ pub const MAX_HISTORY_PAGE_SIZE: usize = 1_000;
 /// cannot materialise a response that grows without bound. It is the modelled
 /// `PageSize` maximum (range 0..1000).
 pub const MAX_EXECUTION_PAGE_SIZE: usize = 1_000;
+
+/// The `timeoutType` of a decision task that was handed to a decider and not completed
+/// within its `startToCloseTimeout` ("The maximum duration for this decision task. The
+/// task is considered timed out if it doesn't completed within this duration."). One of
+/// [`crate::ops::types::DECISION_TASK_TIMEOUT_TYPE_VALUES`].
+pub const DECISION_TASK_TIMEOUT_START_TO_CLOSE: &str = "START_TO_CLOSE";
+
+/// The duration value every SWF timeout member accepts for "unlimited": `NONE`, as
+/// `startToCloseTimeout`'s own doc puts it ("You can use NONE to specify unlimited
+/// duration"). A task scheduled with it never times out.
+pub const DURATION_NONE: &str = "NONE";
+
+/// The `taskPriority` a decision task scheduled without one is dispatched at. The
+/// member's doc: "A task priority that, if set, specifies the priority for this decision
+/// task. Valid values are integers that range from Java's Integer.MIN_VALUE
+/// (-2147483648) to Integer.MAX_VALUE (2147483647). Higher numbers indicate higher
+/// priority." Amazon SWF documents 0 as the default priority.
+pub const DEFAULT_TASK_PRIORITY: i64 = 0;
 
 /// A registered workflow type, as `RegisterWorkflowType` left it. The `default_*`
 /// members are what `StartWorkflowExecution` falls back to when the start request
@@ -325,6 +345,9 @@ pub enum EventAttributes {
     /// the other variants, and every stored history event pays for the largest one.
     WorkflowExecutionStarted(Box<WorkflowExecutionStartedEventAttributes>),
     DecisionTaskScheduled(DecisionTaskScheduledEventAttributes),
+    DecisionTaskStarted(DecisionTaskStartedEventAttributes),
+    DecisionTaskCompleted(DecisionTaskCompletedEventAttributes),
+    DecisionTaskTimedOut(DecisionTaskTimedOutEventAttributes),
     /// Boxed for the same reason as the started attributes above:
     /// `ActivityTaskScheduledEventAttributes` carries eleven members, several times the
     /// size of the other variants.
@@ -340,6 +363,9 @@ impl EventAttributes {
         match self {
             Self::WorkflowExecutionStarted(_) => "WorkflowExecutionStarted",
             Self::DecisionTaskScheduled(_) => "DecisionTaskScheduled",
+            Self::DecisionTaskStarted(_) => "DecisionTaskStarted",
+            Self::DecisionTaskCompleted(_) => "DecisionTaskCompleted",
+            Self::DecisionTaskTimedOut(_) => "DecisionTaskTimedOut",
             Self::ActivityTaskScheduled(_) => "ActivityTaskScheduled",
             Self::WorkflowExecutionTerminated(_) => "WorkflowExecutionTerminated",
             Self::WorkflowExecutionCancelRequested(_) => "WorkflowExecutionCancelRequested",
@@ -351,17 +377,34 @@ impl EventAttributes {
     ///
     /// A scheduled decision task waits in its task list until a decider is handed it
     /// (`DecisionTaskStarted`, whose `scheduledEventId` names the task it started) or
-    /// it times out there first (`DecisionTaskTimedOut`, same member). No stored
-    /// variant records either event yet — the operations that would write them
-    /// (`PollForDecisionTask` and the start-to-close sweep behind it) are still
-    /// scaffolds tracked by their own gap issues — so every event answers `None`
-    /// today. This exhaustive match is the single place that enumerates them, so a
-    /// variant added later cannot be forgotten by
-    /// [`Execution::pending_decision_tasks_on`].
+    /// it times out there first (`DecisionTaskTimedOut`, same member). This exhaustive
+    /// match is the single place that enumerates them, so a variant added later cannot
+    /// be forgotten by [`Execution::pending_decision_tasks_on`].
     pub fn decision_task_left_task_list(&self) -> Option<i64> {
         match self {
+            Self::DecisionTaskStarted(started) => Some(started.scheduled_event_id),
+            Self::DecisionTaskTimedOut(timed_out) => Some(timed_out.scheduled_event_id),
             Self::WorkflowExecutionStarted(_)
             | Self::DecisionTaskScheduled(_)
+            | Self::DecisionTaskCompleted(_)
+            | Self::ActivityTaskScheduled(_)
+            | Self::WorkflowExecutionTerminated(_)
+            | Self::WorkflowExecutionCancelRequested(_) => None,
+        }
+    }
+
+    /// The `startedEventId` of the decision task these attributes CLOSE: a decider
+    /// completed it (`DecisionTaskCompleted`) or it timed out after being handed over
+    /// (`DecisionTaskTimedOut`). Both members are modelled on exactly those two events,
+    /// so this is what tells a started decision task that is still outstanding from one
+    /// that has already been answered.
+    pub fn decision_task_closed(&self) -> Option<i64> {
+        match self {
+            Self::DecisionTaskCompleted(completed) => Some(completed.started_event_id),
+            Self::DecisionTaskTimedOut(timed_out) => Some(timed_out.started_event_id),
+            Self::WorkflowExecutionStarted(_)
+            | Self::DecisionTaskScheduled(_)
+            | Self::DecisionTaskStarted(_)
             | Self::ActivityTaskScheduled(_)
             | Self::WorkflowExecutionTerminated(_)
             | Self::WorkflowExecutionCancelRequested(_) => None,
@@ -384,6 +427,9 @@ impl EventAttributes {
         match self {
             Self::WorkflowExecutionStarted(_)
             | Self::DecisionTaskScheduled(_)
+            | Self::DecisionTaskStarted(_)
+            | Self::DecisionTaskCompleted(_)
+            | Self::DecisionTaskTimedOut(_)
             | Self::ActivityTaskScheduled(_)
             | Self::WorkflowExecutionTerminated(_)
             | Self::WorkflowExecutionCancelRequested(_) => None,
@@ -416,6 +462,15 @@ impl HistoryEventRecord {
             }
             EventAttributes::DecisionTaskScheduled(attributes) => {
                 event.decision_task_scheduled_event_attributes = Some(attributes.clone());
+            }
+            EventAttributes::DecisionTaskStarted(attributes) => {
+                event.decision_task_started_event_attributes = Some(attributes.clone());
+            }
+            EventAttributes::DecisionTaskCompleted(attributes) => {
+                event.decision_task_completed_event_attributes = Some(attributes.clone());
+            }
+            EventAttributes::DecisionTaskTimedOut(attributes) => {
+                event.decision_task_timed_out_event_attributes = Some(attributes.clone());
             }
             EventAttributes::ActivityTaskScheduled(attributes) => {
                 event.activity_task_scheduled_event_attributes = Some(attributes.as_ref().clone());
@@ -645,6 +700,203 @@ impl Execution {
             })
             .count()
     }
+
+    /// The decision tasks of this run still WAITING in `task_list`, as the
+    /// `DecisionTaskScheduled` events that put them there — the same record
+    /// [`Execution::pending_decision_tasks_on`] counts, in the order the events were
+    /// recorded.
+    pub fn waiting_decision_tasks_on(&self, task_list: &str) -> Vec<&HistoryEventRecord> {
+        let taken: HashSet<i64> = self
+            .history
+            .iter()
+            .filter_map(|event| event.attributes.decision_task_left_task_list())
+            .collect();
+        self.history
+            .iter()
+            .filter(|event| match &event.attributes {
+                EventAttributes::DecisionTaskScheduled(scheduled) => {
+                    scheduled.task_list.name == task_list && !taken.contains(&event.event_id)
+                }
+                _ => false,
+            })
+            .collect()
+    }
+
+    /// The `DecisionTaskScheduled` attributes of the task scheduled by event
+    /// `scheduled_event_id`, when this run's history holds one.
+    pub fn scheduled_decision_task(
+        &self,
+        scheduled_event_id: i64,
+    ) -> Option<&DecisionTaskScheduledEventAttributes> {
+        self.history
+            .iter()
+            .filter(|event| event.event_id == scheduled_event_id)
+            .find_map(|event| match &event.attributes {
+                EventAttributes::DecisionTaskScheduled(scheduled) => Some(scheduled),
+                _ => None,
+            })
+    }
+
+    /// The decision tasks of this run that were handed to a decider and are still
+    /// OUTSTANDING: one `(scheduledEventId, startedEventId, startedAt)` per
+    /// `DecisionTaskStarted` event that no later `DecisionTaskCompleted` or
+    /// `DecisionTaskTimedOut` event names.
+    pub fn outstanding_decision_tasks(&self) -> Vec<(i64, i64, DateTime)> {
+        let closed: HashSet<i64> = self
+            .history
+            .iter()
+            .filter_map(|event| event.attributes.decision_task_closed())
+            .collect();
+        self.history
+            .iter()
+            .filter_map(|event| match &event.attributes {
+                EventAttributes::DecisionTaskStarted(started)
+                    if !closed.contains(&event.event_id) =>
+                {
+                    Some((
+                        started.scheduled_event_id,
+                        event.event_id,
+                        event.event_timestamp,
+                    ))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Whether the decision task recorded by `DecisionTaskStarted` event
+    /// `started_event_id` is still outstanding — what makes a task token a live handle
+    /// rather than a stale one.
+    pub fn decision_task_is_outstanding(&self, started_event_id: i64) -> bool {
+        self.outstanding_decision_tasks()
+            .iter()
+            .any(|(_, started, _)| *started == started_event_id)
+    }
+
+    /// Record every start-to-close timeout of this run's outstanding decision tasks
+    /// that `now` has already made due, and return how many were recorded.
+    ///
+    /// A decision task's own `startToCloseTimeout` is "The maximum duration for this
+    /// decision task. The task is considered timed out if it doesn't completed within
+    /// this duration", with [`DURATION_NONE`] meaning unlimited — so the deadline is
+    /// the instant the task was STARTED plus that duration, and it is the caller's own
+    /// `taskStartToCloseTimeout`, never a span this emulator picks. Timing one out
+    /// appends `DecisionTaskTimedOut` and then schedules a replacement decision task on
+    /// the same list with the same attributes, so the run keeps exactly one decision
+    /// task to hand out and a decider that lost its task is given a new one.
+    pub fn expire_due_decision_tasks(&mut self, now: DateTime) -> usize {
+        let due: Vec<(i64, i64)> = self
+            .outstanding_decision_tasks()
+            .into_iter()
+            .filter(|(scheduled_event_id, _, started_at)| {
+                self.scheduled_decision_task(*scheduled_event_id)
+                    .and_then(|scheduled| {
+                        start_to_close_deadline(*started_at, &scheduled.start_to_close_timeout)
+                    })
+                    .is_some_and(|deadline| instant_key(now) >= deadline)
+            })
+            .map(|(scheduled_event_id, started_event_id, _)| {
+                (scheduled_event_id, started_event_id)
+            })
+            .collect();
+
+        for (scheduled_event_id, started_event_id) in &due {
+            let Some(replacement) = self.scheduled_decision_task(*scheduled_event_id).cloned()
+            else {
+                continue;
+            };
+            self.append_event(
+                now,
+                EventAttributes::DecisionTaskTimedOut(DecisionTaskTimedOutEventAttributes {
+                    timeout_type: DECISION_TASK_TIMEOUT_START_TO_CLOSE.to_string(),
+                    scheduled_event_id: *scheduled_event_id,
+                    started_event_id: *started_event_id,
+                }),
+            );
+            self.append_event(now, EventAttributes::DecisionTaskScheduled(replacement));
+        }
+        due.len()
+    }
+
+    /// The `startedEventId` of the last decision task of this run a decider actually
+    /// PROCESSED before `before_started_event_id` — `previousStartedEventId`, "The ID
+    /// of the DecisionTaskStarted event of the previous decision task of this workflow
+    /// execution that was processed by the decider". A task that timed out was not
+    /// processed, so it does not count; the modelled default `0` is the answer when no
+    /// decision task of this run has been completed yet.
+    pub fn previous_started_event_id(&self, before_started_event_id: i64) -> i64 {
+        self.history
+            .iter()
+            .filter_map(|event| match &event.attributes {
+                EventAttributes::DecisionTaskCompleted(completed)
+                    if completed.started_event_id < before_started_event_id =>
+                {
+                    Some(completed.started_event_id)
+                }
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// The most recent `DecisionTaskStarted` event this run recorded BEFORE
+    /// `before_started_event_id` — the previous decision task's own started event,
+    /// which is where `startAtPreviousStartedEvent` makes a returned history begin.
+    pub fn previous_decision_task_started(
+        &self,
+        before_started_event_id: i64,
+    ) -> Option<&HistoryEventRecord> {
+        self.history.iter().rfind(|event| {
+            event.event_id < before_started_event_id
+                && matches!(event.attributes, EventAttributes::DecisionTaskStarted(_))
+        })
+    }
+}
+
+/// The instant a decision task started at `started_at` is timed out at under
+/// `start_to_close_timeout`, or `None` when that duration is unlimited
+/// ([`DURATION_NONE`], or absent) and the task therefore never times out.
+fn start_to_close_deadline(
+    started_at: DateTime,
+    start_to_close_timeout: &Option<String>,
+) -> Option<(i64, u32)> {
+    let seconds = start_to_close_timeout
+        .as_deref()
+        .filter(|timeout| *timeout != DURATION_NONE)
+        .and_then(decimal)?;
+    let seconds = i64::try_from(seconds).ok()?;
+    Some((started_at.secs().checked_add(seconds)?, started_at.subsec_nanos()))
+}
+
+/// One decision task waiting in a task list, as the dispatcher sees it: which run it
+/// belongs to, the `DecisionTaskScheduled` event that scheduled it, and what orders it
+/// against the other tasks waiting in the same list.
+#[derive(Debug, Clone)]
+pub struct WaitingDecisionTask {
+    pub workflow_id: String,
+    pub run_id: String,
+    pub scheduled_event_id: i64,
+    /// The task's own `taskPriority` as a number, defaulting to
+    /// [`DEFAULT_TASK_PRIORITY`] when the task carries none.
+    pub priority: i64,
+    pub scheduled_at: (i64, u32),
+}
+
+impl WaitingDecisionTask {
+    /// The order a poll hands the waiting tasks of one list out in: higher
+    /// `taskPriority` first ("Higher numbers indicate higher priority"), then
+    /// first-scheduled first. The run identity and the scheduling event id break a tie
+    /// so that two tasks scheduled in the same instant still have one defined position
+    /// — the store holds runs in a map with no order of its own.
+    fn dispatch_key(&self) -> (i128, (i64, u32), String, String, i64) {
+        (
+            -i128::from(self.priority),
+            self.scheduled_at,
+            self.workflow_id.clone(),
+            self.run_id.clone(),
+            self.scheduled_event_id,
+        )
+    }
 }
 
 /// One registered domain and everything scoped to it.
@@ -767,6 +1019,52 @@ impl Domain {
             .filter(|execution| execution.is_open())
             .map(|execution| execution.pending_activity_tasks_on(task_list))
             .sum()
+    }
+
+    /// Record every decision-task start-to-close timeout this domain's OPEN runs have
+    /// already fallen due for at `now`, and return how many were recorded.
+    ///
+    /// The timeout is the SERVER's, not the poller's: it falls due at the instant the
+    /// task's own `startToCloseTimeout` names, whether or not anybody calls. Any
+    /// operation that reports or hands out decision tasks materialises it first, so
+    /// every caller sees the same history at the same instant; a closed run has no
+    /// outstanding task to time out. See [`Execution::expire_due_decision_tasks`].
+    pub fn expire_due_decision_tasks(&mut self, now: DateTime) -> usize {
+        self.executions
+            .values_mut()
+            .filter(|execution| execution.is_open())
+            .map(|execution| execution.expire_due_decision_tasks(now))
+            .sum()
+    }
+
+    /// The decision task a poll of `task_list` is handed: the one waiting task of this
+    /// domain's OPEN runs that comes first under
+    /// [`WaitingDecisionTask::dispatch_key`], or `None` when the list holds none.
+    pub fn next_decision_task_on(&self, task_list: &str) -> Option<WaitingDecisionTask> {
+        self.executions
+            .values()
+            .filter(|execution| execution.is_open())
+            .flat_map(|execution| {
+                execution
+                    .waiting_decision_tasks_on(task_list)
+                    .into_iter()
+                    .map(|event| WaitingDecisionTask {
+                        workflow_id: execution.workflow_id.clone(),
+                        run_id: execution.run_id.clone(),
+                        scheduled_event_id: event.event_id,
+                        priority: match &event.attributes {
+                            EventAttributes::DecisionTaskScheduled(scheduled) => scheduled
+                                .task_priority
+                                .as_deref()
+                                .and_then(|priority| priority.parse::<i64>().ok())
+                                .unwrap_or(DEFAULT_TASK_PRIORITY),
+                            _ => DEFAULT_TASK_PRIORITY,
+                        },
+                        scheduled_at: instant_key(event.event_timestamp),
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .min_by_key(WaitingDecisionTask::dispatch_key)
     }
 
     /// The `runId` a call naming `workflow_id` addresses: the one it gave, when a run
@@ -927,6 +1225,120 @@ pub fn new_run_id(domain: &str, workflow_id: &str, sequence: u64, at: DateTime) 
     digest.update(at.secs().to_be_bytes());
     digest.update(at.subsec_nanos().to_be_bytes());
     ::hex::encode(digest.finalize())
+}
+
+/// The opaque `taskToken` a `DecisionTask` carries: a handle on ONE decision task of
+/// one run, derived from the task's identity.
+///
+/// `TaskToken`'s doc calls it "The opaque string used as a handle on the task", and the
+/// task it handles is exactly `(domain, workflowId, runId, startedEventId)` — the
+/// `DecisionTaskStarted` event that handed the task over. Deriving the token from that
+/// identity (and not from a counter) means it addresses the task itself: the responder
+/// resolves it back to the run, and whether the token is still LIVE is a property of
+/// the stored history ([`Execution::decision_task_is_outstanding`]) rather than of a
+/// second record that could disagree with it. The SHA-256 hex digest is 64 characters,
+/// inside the modelled `TaskToken` length (1..1024), and keeps the handle opaque.
+pub fn decision_task_token(
+    domain: &str,
+    workflow_id: &str,
+    run_id: &str,
+    started_event_id: i64,
+) -> String {
+    let mut digest = Sha256::new();
+    digest.update(domain.as_bytes());
+    digest.update([0u8]);
+    digest.update(workflow_id.as_bytes());
+    digest.update([0u8]);
+    digest.update(run_id.as_bytes());
+    digest.update([0u8]);
+    digest.update(started_event_id.to_be_bytes());
+    ::hex::encode(digest.finalize())
+}
+
+/// Which page of which decision task's history a `PollForDecisionTask` `nextPageToken`
+/// resumes: the run the task belongs to, the `DecisionTaskStarted` event that handed it
+/// over, and the `eventId` the previous page ended on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecisionTaskPage {
+    pub workflow_id: String,
+    pub run_id: String,
+    pub started_event_id: i64,
+    pub resume_after_event_id: i64,
+}
+
+/// `PollForDecisionTask`'s own `nextPageToken`.
+///
+/// The operation's doc is explicit that this token is not a history token: "The
+/// nextPageToken returned by this action cannot be used with
+/// GetWorkflowExecutionHistory to get the next page. You must call
+/// PollForDecisionTask again (with the nextPageToken)". A poll names only a domain and
+/// a task list, so the token has to carry WHICH task's history is being paged —
+/// otherwise the second call could not tell a further page from a request for a new
+/// task. It therefore carries the run, the started event that identifies the task, and
+/// the event the page ended on, plus the ordering tag every token of this service
+/// carries so a token replayed under the other `reverseOrder` is refused instead of
+/// silently skipping or repeating events.
+pub fn encode_decision_task_page_token(reverse_order: bool, page: &DecisionTaskPage) -> String {
+    // Hex-encoded for the same reason as [`encode_execution_page_token`]: the token is
+    // a plain response member and a `workflowId` may hold any character SWF's naming
+    // rule allows.
+    let payload = format!(
+        "{}\u{0}{}\u{0}{}\u{0}{}",
+        page.started_event_id, page.resume_after_event_id, page.workflow_id, page.run_id
+    );
+    format!(
+        "{}{}",
+        decision_task_order_tag(reverse_order),
+        ::hex::encode(payload)
+    )
+}
+
+/// The [`DecisionTaskPage`] a `PollForDecisionTask` `nextPageToken` resumes, for a poll
+/// reading in `reverse_order`.
+pub fn decode_decision_task_page_token(
+    token: &str,
+    reverse_order: bool,
+) -> Result<DecisionTaskPage, String> {
+    let rejected = || {
+        format!(
+            "nextPageToken {token:?} was not issued for a reverseOrder={reverse_order} \
+             PollForDecisionTask; pass the token back unchanged, with every other argument \
+             unchanged"
+        )
+    };
+    let payload = token
+        .strip_prefix(decision_task_order_tag(reverse_order))
+        .and_then(|encoded| ::hex::decode(encoded).ok())
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .ok_or_else(rejected)?;
+    let mut parts = payload.split('\u{0}');
+    let (Some(started), Some(resume_after), Some(workflow_id), Some(run_id), None) = (
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+    ) else {
+        return Err(rejected());
+    };
+    Ok(DecisionTaskPage {
+        workflow_id: workflow_id.to_string(),
+        run_id: run_id.to_string(),
+        started_event_id: started.parse::<i64>().map_err(|_| rejected())?,
+        resume_after_event_id: resume_after.parse::<i64>().map_err(|_| rejected())?,
+    })
+}
+
+/// The ordering tag [`encode_decision_task_page_token`] stamps into a page token. It
+/// differs from [`history_order_tag`] so that a `GetWorkflowExecutionHistory` token and
+/// a `PollForDecisionTask` token cannot be mistaken for one another — the operation's
+/// doc says they are not interchangeable.
+fn decision_task_order_tag(reverse_order: bool) -> &'static str {
+    if reverse_order {
+        "dr"
+    } else {
+        "df"
+    }
 }
 
 /// An optional string member, with an empty string read as "no value given".

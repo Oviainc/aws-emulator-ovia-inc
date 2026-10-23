@@ -2,10 +2,13 @@
 
 //! @op CreateCustomPlugin
 //! Stores a custom plugin under a freshly minted `customPluginArn` and answers with the
-//! identity the service assigned it. A name identifies at most one plugin, so a repeat of
-//! a stored name is a `ConflictException`. The plugin is answered `CREATING` and becomes
-//! `ACTIVE` once the clock says so (`crate::state::TRANSITION_SPAN`), which every later
-//! read materialises.
+//! identity the service assigned it. The plugin's artifact is taken on at create time, so
+//! the file `location` names has to resolve first: it is read through the framework's
+//! IN-PROCESS callback into the Amazon S3 service mounted beside this one (no socket is
+//! opened), and a location that store reports as unreadable is a `BadRequestException` with
+//! nothing stored. A name identifies at most one plugin, so a repeat of a stored name is a
+//! `ConflictException`. The plugin is answered `CREATING` and becomes `ACTIVE` once the
+//! clock says so (`crate::state::TRANSITION_SPAN`), which every later read materialises.
 //!
 //! ## Shape of an operation
 //!
@@ -173,8 +176,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         let region = crate::state::request_region(ctx.parts());
-        let mut state = store.lock();
-        state.settle_due();
 
         // The plugin's file is named by an S3 bucket ARN plus a key; a
         // `bucketArn` that is not an ARN at all names no bucket, so the request
@@ -192,6 +193,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .into());
         }
+
+        // The service takes the plugin's artifact on when the plugin is created,
+        // so the file has to resolve BEFORE anything is minted: a location
+        // naming an object the emulator's own Amazon S3 reports as absent (or as
+        // one this account may not read) is a bad request, and the store is left
+        // untouched — no ARN, no `CREATING` plugin, nothing for a later list or
+        // describe to report.
+        //
+        // The resolution is an IN-PROCESS call through the framework's callback
+        // seam (see `crate::state::s3_client`): the request is dispatched to the
+        // S3 service mounted beside this one, so no socket is opened, nothing
+        // leaves the host, and the caller cannot steer where it goes. It is a
+        // METADATA read (`HeadObject`), so the artifact's bytes are never copied
+        // into this service, and it carries ONE awaited call with no retry loop.
+        // No state lock is held across it: the store is taken afterwards, so the
+        // shared mutex is never held over the call and the await point is where
+        // a cancelled request stops.
+        //
+        // It runs before the name-conflict and quota checks below. Both refusals
+        // are modelled client errors and the recording pins no precedence
+        // between them, so the order chosen here is the one that answers the
+        // question the caller can act on first — the artifact — and either way
+        // nothing is persisted.
+        if crate::state::custom_plugin_file_is_unreadable(
+            ctx,
+            &region,
+            &input.location.s3_location,
+        )
+        .await
+        {
+            return Err(CreateCustomPluginErrorModeled::BadRequestException(BadRequestException {
+                message: Some(crate::state::invalid_parameter_because(
+                    crate::state::S3_LOCATION_MEMBER,
+                    crate::state::CUSTOM_PLUGIN_FILE_UNREADABLE,
+                )),
+            })
+            .into());
+        }
+
+        let mut state = store.lock();
+        state.settle_due();
 
         if let Some(existing) = state.custom_plugin_named(&input.name) {
             return Err(CreateCustomPluginErrorModeled::ConflictException(ConflictException {

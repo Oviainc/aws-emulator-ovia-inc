@@ -666,11 +666,39 @@ pub fn date_time(at: SystemTime) -> ::aws_smithy_types::DateTime {
     ::aws_smithy_types::DateTime::from(at)
 }
 
-/// The region every ARN this request mints carries: the one the caller signed
-/// for, or [`DEFAULT_REGION`] when the request carries no credential scope.
+/// The longest Region LABEL this service will read out of a credential scope.
+///
+/// Every `*Arn` pattern in the AWS models bounds the Region field at
+/// `[a-z0-9-]{1,20}`, so a longer value is not a Region any AWS endpoint has.
+/// The same bound `service_common::arn` reads an ARN's Region under.
+const MAX_REGION_LABEL: usize = 20;
+
+/// Whether `value` is a Region LABEL rather than arbitrary text: non-empty, at
+/// most [`MAX_REGION_LABEL`] characters, and composed only of `[a-z0-9-]`.
+///
+/// The region a request is read with is not just data: it is embedded in every
+/// ARN this service mints AND in the authority of the endpoint URL the
+/// in-process S3 resolution is addressed to, so a value carrying `/`, `@`, `:`,
+/// `?` or `#` — which would re-point or truncate an authority — is not a Region
+/// this service will use for either.
+fn is_region_label(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_REGION_LABEL
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
+/// The region every ARN this request mints carries, and the region its
+/// in-process calls to other emulated services are addressed in: the one the
+/// caller signed for, or [`DEFAULT_REGION`] when the request carries no
+/// credential scope — or one whose region field is not a Region label at all
+/// ([`is_region_label`]), which names no AWS endpoint and must never reach an
+/// ARN or a URL authority.
 pub fn request_region(parts: &::http::request::Parts) -> String {
     ::emulator_server::sigv4_credential_scope(&parts.headers)
         .map(|scope| scope.region)
+        .filter(|region| is_region_label(region))
         .unwrap_or_else(|| DEFAULT_REGION.to_string())
 }
 
@@ -718,20 +746,194 @@ pub fn invalid_parameter_because(member: &str, reason: &str) -> String {
 /// Whether `value` is a well-formed ARN naming `service`.
 ///
 /// The grammar is the one AWS publishes for every ARN,
-/// `arn:<partition>:<service>:<region>:<account-id>:<resource>`: six
-/// `:`-separated fields, the first literally `arn`, a non-empty partition, the
-/// service field the one asked for, and a non-empty resource. `region` and
-/// `account-id` are deliberately unconstrained — an S3 bucket ARN leaves both
-/// empty (`arn:aws:s3:::bucket`) while most other ARNs fill them — and the
-/// resource may itself contain `:` or `/`, so only the first five fields are
-/// split off.
+/// `arn:<partition>:<service>:<region>:<account-id>:<resource>`, read through
+/// the ONE caller-supplied-ARN parse this emulator shares
+/// (`service_common::arn`): six `:`-separated fields, the first literally `arn`,
+/// a non-empty partition, the service field the one asked for, and a non-empty
+/// resource. `region` and `account-id` are deliberately unconstrained there — an
+/// S3 bucket ARN leaves both empty (`arn:aws:s3:::bucket`) while most other ARNs
+/// fill them — and the resource keeps every `:` and `/` it carries.
 pub fn is_arn_for(value: &str, service: &str) -> bool {
-    let fields: Vec<&str> = value.splitn(6, ':').collect();
-    fields.len() == 6
-        && fields[0] == "arn"
-        && !fields[1].is_empty()
-        && fields[2] == service
-        && !fields[5].is_empty()
+    ::service_common::arn::is_resource_arn_of(value, service)
+}
+
+/// The name of the bucket the ARN `value` names, or `None` when `value` is not
+/// an S3 bucket ARN.
+///
+/// An S3 bucket ARN is partition-global and account-less
+/// (`arn:aws:s3:::my-bucket`), so the bucket name is the whole resource field —
+/// read through the one shared ARN parse. A value naming an object
+/// (`…:::bucket/key`) or an access point (`…:accesspoint/name`) is not a bucket
+/// ARN this emulator addresses a bucket by, so neither is reported.
+pub fn s3_bucket_name(value: &str) -> Option<&str> {
+    let bucket = ::service_common::arn::parse_of(value, S3_ARN_SERVICE)?.resource;
+    (!bucket.is_empty() && !bucket.contains(['/', ':'])).then_some(bucket)
+}
+
+/// The member a refusal of the custom plugin's file blames: the request's
+/// `location.s3Location`, the only member naming an object this service has to
+/// read (`CustomPluginLocation$s3Location`, "The S3 bucket Amazon Resource Name
+/// (ARN), file key, and object version of the plugin file stored in Amazon S3").
+pub const S3_LOCATION_MEMBER: &str = "s3Location";
+
+/// The reason a custom plugin file this account cannot read is rejected with.
+///
+/// The service takes the plugin's bytes on at create time, so a file it cannot
+/// read is a bad REQUEST (400) rather than a resource that is missing: the
+/// wording names the three things that make a file unreadable, as the service
+/// words it.
+pub const CUSTOM_PLUGIN_FILE_UNREADABLE: &str =
+    "Could not access the specified custom plugin file. Make sure the bucket is in the same \
+     region, the file exists and you have access to it.";
+
+/// The Amazon S3 error codes in which S3 reports that the object a request
+/// names cannot be READ: it is not there (`NoSuchBucket`, `NoSuchKey`,
+/// `NoSuchVersion`) or reading it is not permitted (`AccessDenied`,
+/// `AllAccessDisabled`, a bucket policy or an ownership check refusing the
+/// read).
+///
+/// Keyed on S3's OWN code rather than on the HTTP status, because a status is
+/// not evidence that S3 answered at all: a request that reached no S3 is a 404
+/// too, and that is this emulator failing to ask rather than a verdict about the
+/// object. The credential refusals (`InvalidAccessKeyId`,
+/// `SignatureDoesNotMatch`) are left out for the same reason — they say the call
+/// was made wrong, not that the caller may not read the file.
+///
+/// The list is deliberately CLOSED: a refusal code S3 adds later (an ownership
+/// or a KMS refusal, say) falls into the warn-and-accept branch of
+/// [`custom_plugin_file_is_unreadable`] rather than refusing the create, because
+/// a code this service does not recognise is not evidence about the object.
+const UNREADABLE_CODES: &[&str] = &[
+    "NoSuchBucket",
+    "NoSuchKey",
+    "NoSuchVersion",
+    "AccessDenied",
+    "AllAccessDisabled",
+];
+
+/// An Amazon S3 client over the IN-PROCESS callback into this same emulator.
+///
+/// NOTHING here opens a socket or leaves the host: `ctx.callback()` is the
+/// framework's documented seam for calling another emulated service, and the
+/// `http_client` it hands over dispatches the request inside this process to
+/// whichever mounted service claims it (the S3 emulator, on the request's own
+/// `s3` credential scope). The `endpoint_url` below is therefore an ADDRESS the
+/// in-process router reads, never a host any resolver looks up — and `region` is
+/// the request's own signing region, already narrowed to a Region label by
+/// [`request_region`], so the caller cannot steer that authority.
+///
+/// The credentials are the emulator's own root credentials, which only sign this
+/// operation's in-process calls; they are never put in a response or a log.
+fn s3_client(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+) -> ::aws_sdk_s3::Client {
+    // The one value that reaches the endpoint's authority is narrowed HERE, in
+    // every build: `request_region` already answers only a Region label, and
+    // this is the guarantee the authority rests on, so it is re-established
+    // rather than asserted (a `debug_assert!` is compiled out of the build that
+    // ships). A value outside the grammar falls back to the default Region,
+    // exactly as a request carrying no credential scope does.
+    let region = if is_region_label(region) {
+        region
+    } else {
+        DEFAULT_REGION
+    };
+    let config = ::aws_sdk_s3::Config::builder()
+        .behavior_version(::aws_sdk_s3::config::BehaviorVersion::latest())
+        .region(::aws_sdk_s3::config::Region::new(region.to_string()))
+        .endpoint_url(format!("https://s3.{region}.amazonaws.com"))
+        // The in-process transport routes on the request's own path, and a
+        // virtual-host bucket name is not a host this emulator resolves, so the
+        // bucket is addressed in the path.
+        .force_path_style(true)
+        .credentials_provider(ctx.callback().aws_credentials_provider())
+        .http_client(ctx.callback().http_client())
+        // The transport is in-process: there is nothing to retry, time out or
+        // watch for a stalled stream, and each of those would need a sleep
+        // implementation this client is not given. The same goes for caching the
+        // identity: the credentials are handed over directly.
+        .retry_config(::aws_sdk_s3::config::retry::RetryConfig::disabled())
+        .timeout_config(::aws_sdk_s3::config::timeout::TimeoutConfig::disabled())
+        .identity_cache(::aws_sdk_s3::config::IdentityCache::no_cache())
+        .stalled_stream_protection(
+            ::aws_sdk_s3::config::StalledStreamProtectionConfig::disabled(),
+        )
+        .build();
+    ::aws_sdk_s3::Client::from_conf(config)
+}
+
+/// Whether Amazon S3 reports that the custom plugin file `location` names
+/// cannot be read.
+///
+/// A custom plugin's file is resolved when the plugin is CREATED — the service
+/// takes the artifact on at that point — so a location naming an object that is
+/// not there, or one this account may not read, is refused with the operation's
+/// modelled `BadRequestException` and nothing is persisted. S3 is reached the
+/// way any emulated service reaches another: through the in-process callback
+/// ([`smithy_server_runtime::OperationContext::callback`], which dispatches
+/// inside this process — see [`s3_client`]: no socket, no outbound request, no
+/// host resolution), with `HeadObject` — a METADATA read, so the artifact's
+/// bytes are never copied into this service to answer a create, however large
+/// the plugin file is — and with the caller's `objectVersion` when it named one,
+/// so the version the plugin pins is the version that has to resolve.
+///
+/// The verdict is read from S3's own error CODE and never from the HTTP status:
+/// a request that reached no S3 at all is a 404 too, so a status cannot tell S3
+/// reporting an unreadable object from this emulator failing to ask. (A ranged
+/// read is not an option: `GetObject` with a `Range` is answered 501 by the S3
+/// emulator, which would make every create unverifiable.)
+///
+/// `false` means the plugin may be stored. That includes the case where this
+/// emulator has no S3 to ask (a router with only this service mounted, say):
+/// nothing is then known about the object, and a refusal has to be grounded in
+/// what S3 answered, never assumed.
+pub async fn custom_plugin_file_is_unreadable(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    location: &S3Location,
+) -> bool {
+    use ::aws_smithy_types::error::metadata::ProvideErrorMetadata;
+
+    // The caller has already refused a `bucketArn` that is not a bucket ARN with
+    // its own message, so a value that names no bucket is not re-judged here.
+    let Some(bucket) = s3_bucket_name(&location.bucket_arn) else {
+        return false;
+    };
+    let mut read = s3_client(ctx, region)
+        .head_object()
+        .bucket(bucket)
+        .key(&location.file_key);
+    if let Some(object_version) = location.object_version.as_deref() {
+        read = read.version_id(object_version);
+    }
+    match read.send().await {
+        // Only that the read RESOLVED is in question, so this is a METADATA read:
+        // the artifact's bytes are the caller's and are never copied into this
+        // service to answer a create.
+        Ok(_) => false,
+        Err(error) => {
+            if UNREADABLE_CODES.contains(&error.code().unwrap_or_default()) {
+                // S3 says the object is not there, or not readable by this
+                // account: the refusal is grounded.
+                return true;
+            }
+            // Any other answer is this emulator failing to ask its own S3, not
+            // S3 reporting an unreadable object, so it refuses nothing — and it
+            // is worth a warning, because a deployment with no S3 mounted to ask
+            // is one where this check does not run. The caller's own values are
+            // rendered with their escaped `Debug` form, so a key carrying a
+            // newline cannot forge a log line.
+            ::tracing::warn!(
+                bucket_arn = ?location.bucket_arn,
+                file_key = ?location.file_key,
+                error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
+                code = ?error.code(),
+                "the custom plugin file could not be resolved against the emulator's Amazon S3"
+            );
+            false
+        }
+    }
 }
 
 /// One page of a list operation: the items to answer with, and the `nextToken`

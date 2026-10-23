@@ -23,7 +23,7 @@ use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     Action, AppliedExtension, DeletionProtectionSettings, DeploymentEvent, Monitor, Parameter,
-    Validator, VendedMetricsSettings,
+    Treatment, Validator, VendedMetricsSettings,
 };
 
 pub mod feature_flags;
@@ -64,6 +64,19 @@ pub const ENVIRONMENT_ROLLING_BACK: &str = "RollingBack";
 pub const ENVIRONMENT_ROLLED_BACK: &str = "RolledBack";
 /// See [`ENVIRONMENT_ROLLING_BACK`].
 pub const ENVIRONMENT_REVERTED: &str = "Reverted";
+
+/// `ExperimentDefinitionStatus` values this service reports, from
+/// `EXPERIMENT_DEFINITION_STATUS_VALUES` in `crate::ops::types` (the model's
+/// `ExperimentDefinitionStatus` enum: `ACTIVE` | `IDLE` | `ARCHIVED`).
+///
+/// A definition that was just created has no run behind it, so it is `IDLE`; `ACTIVE`
+/// is what a started experiment run makes it, and `ARCHIVED` what an archiving delete
+/// leaves behind.
+pub const EXPERIMENT_DEFINITION_IDLE: &str = "IDLE";
+/// See [`EXPERIMENT_DEFINITION_IDLE`].
+pub const EXPERIMENT_DEFINITION_ACTIVE: &str = "ACTIVE";
+/// See [`EXPERIMENT_DEFINITION_IDLE`].
+pub const EXPERIMENT_DEFINITION_ARCHIVED: &str = "ARCHIVED";
 
 /// `GrowthType` values, from `GROWTH_TYPE_VALUES` in `crate::ops::types`.
 pub const GROWTH_LINEAR: &str = "LINEAR";
@@ -111,6 +124,8 @@ pub const MAX_ENVIRONMENTS_PER_APPLICATION: usize = 100;
 pub const MAX_CONFIGURATION_PROFILES_PER_APPLICATION: usize = 100;
 /// See [`MAX_ENVIRONMENTS_PER_APPLICATION`].
 pub const MAX_HOSTED_CONFIGURATION_VERSIONS_PER_PROFILE: usize = 100;
+/// See [`MAX_ENVIRONMENTS_PER_APPLICATION`].
+pub const MAX_EXPERIMENT_DEFINITIONS_PER_APPLICATION: usize = 100;
 /// See [`MAX_ENVIRONMENTS_PER_APPLICATION`]. Enforced by
 /// [`ComAmazonawsAppconfigAmazonappconfigState::try_insert_strategy`], which is the only
 /// way into the created-strategy map.
@@ -611,8 +626,8 @@ impl From<&PredefinedStrategy> for DeploymentStrategy {
     }
 }
 
-/// An AppConfig application: the organisational root that owns environments and
-/// configuration profiles.
+/// An AppConfig application: the organisational root that owns environments,
+/// configuration profiles and the experiment definitions written under it.
 #[derive(Debug, Clone)]
 pub struct Application {
     pub id: String,
@@ -621,6 +636,8 @@ pub struct Application {
     pub tags: HashMap<String, String>,
     pub environments: HashMap<String, Environment>,
     pub profiles: HashMap<String, ConfigurationProfile>,
+    /// Experiment definitions created under this application, by definition id.
+    pub experiment_definitions: HashMap<String, ExperimentDefinition>,
 }
 
 impl Application {
@@ -637,8 +654,127 @@ impl Application {
             tags,
             environments: HashMap::new(),
             profiles: HashMap::new(),
+            experiment_definitions: HashMap::new(),
         }
     }
+
+    /// The environment `identifier` names, by id or by name.
+    ///
+    /// The model's `Identifier` members documented as "the environment ID or name"
+    /// accept either, so an id lookup is tried first and the name scan only answers
+    /// when no environment holds that id. See [`resolve_by_name`] for how a name
+    /// several resources share resolves.
+    pub fn resolve_environment(&self, identifier: &str) -> Option<&Environment> {
+        if let Some(environment) = self.environments.get(identifier) {
+            return Some(environment);
+        }
+        resolve_by_name(self.environments.values(), identifier, |environment| {
+            (&environment.name, &environment.id)
+        })
+    }
+
+    /// The configuration profile `identifier` names, by id or by name. See
+    /// [`Application::resolve_environment`].
+    pub fn resolve_profile(&self, identifier: &str) -> Option<&ConfigurationProfile> {
+        if let Some(profile) = self.profiles.get(identifier) {
+            return Some(profile);
+        }
+        resolve_by_name(self.profiles.values(), identifier, |profile| {
+            (&profile.name, &profile.id)
+        })
+    }
+
+    /// The experiment definition `identifier` names, by id or by name. See
+    /// [`Application::resolve_environment`].
+    pub fn resolve_experiment_definition(&self, identifier: &str) -> Option<&ExperimentDefinition> {
+        self.resolve_experiment_definition_id(identifier)
+            .and_then(|id| self.experiment_definitions.get(&id))
+    }
+
+    /// The id of the experiment definition `identifier` names, so a caller that must
+    /// MUTATE the record can look it up again mutably without re-running the name scan
+    /// against a borrowed record.
+    pub fn resolve_experiment_definition_id(&self, identifier: &str) -> Option<String> {
+        if self.experiment_definitions.contains_key(identifier) {
+            return Some(identifier.to_string());
+        }
+        resolve_by_name(
+            self.experiment_definitions.values(),
+            identifier,
+            |definition| (&definition.name, &definition.id),
+        )
+        .map(|definition| definition.id.clone())
+    }
+}
+
+/// The one resource of `candidates` whose name is `name`.
+///
+/// AWS documents no behaviour for a name several resources of one kind share — nothing
+/// in this service makes a name unique except an experiment definition's, which
+/// `CreateExperimentDefinition` refuses to duplicate — so the match with the
+/// lexicographically smallest id is answered, which makes resolution deterministic
+/// rather than dependent on the order a `HashMap` happens to iterate in.
+fn resolve_by_name<'store, T: 'store>(
+    candidates: impl Iterator<Item = &'store T>,
+    name: &str,
+    name_and_id: impl Fn(&T) -> (&String, &String),
+) -> Option<&'store T> {
+    candidates
+        .filter(|candidate| name_and_id(candidate).0 == name)
+        .min_by(|left, right| name_and_id(left).1.cmp(name_and_id(right).1))
+}
+
+/// The key the control treatment carries. See [`treatment_key`].
+pub const CONTROL_TREATMENT_KEY: &str = "C";
+
+/// The key this service gives the `index`-th treatment of a definition, counting from
+/// `0`.
+///
+/// The model's `TreatmentKey` is `^[a-zA-Z0-9]{1,8}$` and the `Treatment` shape carries
+/// it while `TreatmentInput` does not, so the key is the SERVICE's to mint; AWS
+/// documents no composition for it. It is derived from the treatment's place in the
+/// definition — the control is [`CONTROL_TREATMENT_KEY`] and the treatments compared
+/// against it are `T1`, `T2`, … in the order the request listed them — so it is unique
+/// within a definition, stays within the modelled pattern for every list the model
+/// allows (`TreatmentInputList` holds at most 5), and is stable across every read.
+pub fn treatment_key(index: usize) -> String {
+    format!("T{}", index + 1)
+}
+
+/// An experiment definition: the purpose, scope and treatments of an experiment over
+/// one feature flag in one environment.
+///
+/// `created_at` and `updated_at` are the instants this service wrote the record, and
+/// `status` is the definition's own lifecycle: a definition nothing has run yet is
+/// [`EXPERIMENT_DEFINITION_IDLE`], a started run makes it
+/// [`EXPERIMENT_DEFINITION_ACTIVE`] and an archiving delete makes it
+/// [`EXPERIMENT_DEFINITION_ARCHIVED`]. No part of it is owed by the clock, so there is
+/// nothing to materialize: a definition sits in its status until a call moves it.
+#[derive(Debug, Clone)]
+pub struct ExperimentDefinition {
+    pub id: String,
+    pub application_id: String,
+    pub configuration_profile_id: String,
+    pub environment_id: String,
+    pub name: String,
+    pub flag_key: String,
+    pub audience_rule: String,
+    pub audience_description: Option<String>,
+    pub hypothesis: Option<String>,
+    pub launch_criteria: Option<String>,
+    pub status: String,
+    /// The baseline treatment, keyed like every other treatment.
+    pub control: Treatment,
+    /// The treatments compared against the control, in the order the request listed
+    /// them: the model's `TreatmentList` is ordered, so the order a caller wrote is the
+    /// order every reader reports.
+    pub treatments: Vec<Treatment>,
+    /// The KMS key an experiment RUN of this definition encrypts its data with; set by
+    /// the run, not by the definition's own create, which carries no such member.
+    pub kms_key_identifier: Option<String>,
+    pub created_at: SystemTime,
+    pub updated_at: SystemTime,
+    pub tags: HashMap<String, String>,
 }
 
 /// A deployment group within an application, and the deployments made into it.
@@ -1432,8 +1568,31 @@ impl ComAmazonawsAppconfigAmazonappconfigState {
             || self.applications.contains_key(id)
             || self.extensions.contains_key(id)
             || self.applications.values().any(|application| {
-                application.environments.contains_key(id) || application.profiles.contains_key(id)
+                application.environments.contains_key(id)
+                    || application.profiles.contains_key(id)
+                    || application.experiment_definitions.contains_key(id)
             })
+    }
+
+    /// The application `identifier` names, by id or by name: the model's
+    /// `ApplicationIdentifier` members are documented as "the application ID or name",
+    /// so either resolves, an id first. See [`resolve_by_name`] for how a name several
+    /// applications share resolves.
+    pub fn resolve_application(&self, identifier: &str) -> Option<&Application> {
+        self.resolve_application_id(identifier)
+            .and_then(|id| self.applications.get(&id))
+    }
+
+    /// The id of the application `identifier` names, for a caller that goes on to
+    /// mutate the record. See [`Self::resolve_application`].
+    pub fn resolve_application_id(&self, identifier: &str) -> Option<String> {
+        if self.applications.contains_key(identifier) {
+            return Some(identifier.to_string());
+        }
+        resolve_by_name(self.applications.values(), identifier, |application| {
+            (&application.name, &application.id)
+        })
+        .map(|application| application.id.clone())
     }
 
     /// The extension `identifier` names, and the version number the identifier itself

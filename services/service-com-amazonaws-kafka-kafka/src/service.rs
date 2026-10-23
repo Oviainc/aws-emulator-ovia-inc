@@ -40,10 +40,46 @@
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
 
-use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
-};
+use smithy_server_runtime::{http, ErasedOperation, Refusal, Refused, Service, Violation};
 use std::sync::Arc;
+
+/// The error code this service answers an input-constraint violation with.
+///
+/// MSK models NO `ValidationException` — the framework's default code for a
+/// refusal — at all: `BadRequestException` (`@httpError 400`) is the client-input
+/// error every operation of this service declares
+/// (`smithy_query(query="operation",operation="ListConfigurations")` -> errors),
+/// and the real service answers it for a value outside a modelled bound or an
+/// absent required member. A client branches on the code, so the emulator must
+/// name the one this service declares rather than a shape its model never
+/// mentions.
+const BAD_REQUEST_EXCEPTION: &str = "BadRequestException";
+
+/// The message this service answers an input-constraint refusal with: the AWS
+/// constraint-validation envelope, built from the REQUEST and the model —
+/// `N validation error(s) detected: Value '<submitted>' at '<member path>'
+/// failed to satisfy constraint: <requirement>`, one clause per violation in the
+/// order the walk found them.
+///
+/// That envelope is the wording of AWS's own input-validation layer, which runs
+/// in front of a service's business logic and words a bound violation from the
+/// request whatever error SHAPE the service then reports it under. So only the
+/// CODE is this service's own ([`BAD_REQUEST_EXCEPTION`], which the model
+/// declares); the sentence is not, and is rendered by the framework
+/// ([`aws_smithy_schema_server::envelope`]) — the one place every violation
+/// class is already worded, so a class added upstream cannot drift here.
+///
+/// The two facts a caller acts on are the value it submitted and the constraint
+/// that value failed, and the envelope states both. A per-service paraphrase
+/// would state neither any better and would be prose no rule produces, so the
+/// exact sentence a particular AWS service happens to log is not something this
+/// emulator reproduces.
+///
+/// `None` (no violations at all) declines the override, since there is nothing
+/// to state and the framework's own wording is then the better answer.
+fn refusal_message(violations: &[Violation]) -> Option<String> {
+    ::aws_smithy_schema_server::envelope(violations)
+}
 
 /// The `com-amazonaws-kafka-kafka` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -98,15 +134,27 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
         // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // service reword it.
+        //
+        // This service answers such a refusal with the error code it models for a
+        // bad request, [`BAD_REQUEST_EXCEPTION`], instead of the framework's
+        // default `ValidationException`, which this model does not declare
+        // anywhere. Only the CODE changes: the sentence stays the AWS
+        // constraint-validation envelope [`refusal_message`] renders, which is
+        // the text AWS's input-validation layer emits whatever shape carries it.
+        // The HTTP status stays with the protocol (400), which is the status this
+        // error models.
+        //
+        // An authentication refusal keeps the framework's wording: it is not an
+        // input-constraint failure, and this service's 401/403 errors are raised
+        // by the request-authentication path.
+        match refusal {
+            Refusal::Invalid(violations) => Some(Refused {
+                code: BAD_REQUEST_EXCEPTION.to_string(),
+                message: refusal_message(violations)?,
+            }),
+            _ => None,
+        }
     }
 
     fn override_routing_error(

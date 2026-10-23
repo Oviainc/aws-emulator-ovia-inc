@@ -2427,6 +2427,69 @@ pub fn subtree(files: &BTreeMap<String, FileEntry>, folder: &str) -> BTreeMap<St
         .collect()
 }
 
+/// Every folder a path lives under, from its immediate parent outwards:
+/// `"a/b/c.txt"` lives under `"a/b"` and `"a"`. Empty for a path at the root of
+/// the tree, which is not a folder a deletion can empty.
+pub fn ancestor_folders(path: &str) -> Vec<&str> {
+    let mut folders = Vec::new();
+    let mut rest = path;
+    while let Some((folder, _)) = rest.rsplit_once('/') {
+        folders.push(folder);
+        rest = folder;
+    }
+    folders
+}
+
+/// The tree entry the kept-folder placeholder is stored as: the EMPTY blob, in
+/// `NORMAL` mode. The caller stores that blob ([`Repository::insert_blob`]) so the
+/// snapshot's entry names an object the store holds.
+pub fn keep_empty_folders_entry() -> FileEntry {
+    FileEntry {
+        blob_id: blob_id(&[]),
+        file_mode: FILE_MODE_NORMAL.to_string(),
+        size: 0,
+    }
+}
+
+/// Keep the folder structure a commit's deletions emptied, as `keepEmptyFolders`
+/// asks: "If a file is the only object in the folder or directory, specifies
+/// whether to delete the folder or directory that contains the file. By default,
+/// empty folders are deleted" — and, for `CreateCommit`, "If true, a .gitkeep file
+/// is created for empty folders."
+///
+/// Nothing else recreates a folder: a git tree holds no empty subtree. A deletion
+/// can empty a whole chain of folders (`"a/b/c.txt"` empties `"a/b"` and then
+/// `"a"`), so every ANCESTOR folder of a deleted path is considered, deepest
+/// first: the placeholder written in the deepest emptied folder is what keeps each
+/// folder above it non-empty, so the whole structure is kept with one placeholder.
+///
+/// Shared by every operation that takes `keepEmptyFolders` over a tree snapshot,
+/// so no two of them can disagree about which folders a deletion keeps. Returns
+/// the placeholder paths written, each stored as [`keep_empty_folders_entry`].
+pub fn keep_empty_folders<'a>(
+    files: &mut BTreeMap<String, FileEntry>,
+    deleted_paths: impl IntoIterator<Item = &'a str>,
+) -> Vec<String> {
+    let mut candidates: Vec<&str> = deleted_paths
+        .into_iter()
+        .flat_map(ancestor_folders)
+        .collect();
+    candidates
+        .sort_unstable_by_key(|folder| (std::cmp::Reverse(folder.matches('/').count()), *folder));
+    candidates.dedup();
+    let mut written: Vec<String> = Vec::new();
+    for folder in candidates {
+        let prefix = format!("{folder}/");
+        if files.keys().any(|path| path.starts_with(&prefix)) {
+            continue;
+        }
+        let path = format!("{prefix}{KEEP_EMPTY_FOLDERS_PLACEHOLDER}");
+        files.insert(path.clone(), keep_empty_folders_entry());
+        written.push(path);
+    }
+    written
+}
+
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
 ///
 /// Answer `None` with a modelled server error, never with a fresh engine.

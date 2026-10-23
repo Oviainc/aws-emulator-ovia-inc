@@ -80,6 +80,8 @@ mod import_image_tasks;
 mod instance_lifecycle;
 #[path = "all/instance_type_offerings.rs"]
 mod instance_type_offerings;
+#[path = "all/ipam_routing_policy_registrations.rs"]
+mod ipam_routing_policy_registrations;
 #[path = "all/launch_templates.rs"]
 mod launch_templates;
 #[path = "all/local_gateway_route_table_virtual_interface_group_associations.rs"]

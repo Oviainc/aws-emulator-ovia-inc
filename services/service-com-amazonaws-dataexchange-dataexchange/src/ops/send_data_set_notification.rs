@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SendDataSetNotification
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SendDataSetNotification`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SendDataSetNotification::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: notifies the subscribers of a data set's AWS Marketplace data product
+//! about an event on that data set. It resolves the data set from state (404 when the
+//! id names none), refuses `Details` that do not describe the `Type` the request
+//! declares, refuses a data set that is not part of a Marketplace data product (the
+//! modelled 400), and otherwise records the acceptance against the data set and
+//! answers 202. Idempotent on `ClientToken`. This is the ONLY file to touch for this
+//! operation.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +152,151 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SendDataSetNotification` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SendDataSetNotificationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SendDataSetNotification"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(SendDataSetNotificationErrorModeled::InternalServerException(
+                crate::state::store_unavailable(),
+            )
+            .into());
+        };
+
+        // `Type` is a modelled enum and `DataSetId` carries the `Id` pattern, so the
+        // boundary walk has already refused anything outside them; `Comment` and
+        // `ClientToken` are bounded by their own modelled `@length`. What the model
+        // cannot express is which `Details` member belongs with which `Type`, and how
+        // many schema changes one notification may carry.
+        let accepted_at = crate::state::now();
+        let mut store = state.lock();
+
+        // The resource is resolved first, so an id that names no data set answers 404
+        // even when the body would also have been refused.
+        let Some(data_set) = store.data_sets.get_mut(&input.data_set_id) else {
+            return Err(SendDataSetNotificationErrorModeled::ResourceNotFoundException(
+                crate::state::data_set_not_found(&input.data_set_id),
+            )
+            .into());
+        };
+
+        if let Err(message) = notified_details(&input.r#type, input.details.as_ref()) {
+            return Err(SendDataSetNotificationErrorModeled::ValidationException(
+                crate::state::invalid_request(message),
+            )
+            .into());
+        }
+
+        // A notification goes to the subscribers of the data set's AWS Marketplace
+        // data product, so a data set that is not part of one has nobody to notify.
+        // `OriginDetails.ProductId` is where state records that product.
+        if data_set
+            .origin_details
+            .as_ref()
+            .and_then(|details| details.product_id.as_deref())
+            .is_none_or(str::is_empty)
+        {
+            return Err(SendDataSetNotificationErrorModeled::ValidationException(
+                crate::state::data_set_not_configured_for_marketplace(),
+            )
+            .into());
+        }
+
+        // `ClientToken` is `@idempotencyToken`: a repeat under a token this data set
+        // has already accepted is the SAME acceptance, so it records nothing further
+        // and still answers 202.
+        let already_accepted = input.client_token.as_deref().is_some_and(|token| {
+            data_set
+                .notifications
+                .iter()
+                .any(|sent| sent.client_token.as_deref() == Some(token))
+        });
+        if !already_accepted {
+            data_set.notifications.push(crate::state::SentNotification {
+                r#type: input.r#type,
+                comment: input.comment,
+                client_token: input.client_token,
+                accepted_at,
+            });
+            // Keep the newest; see `MAX_NOTIFICATIONS_PER_DATA_SET`.
+            let kept = crate::state::MAX_NOTIFICATIONS_PER_DATA_SET;
+            if data_set.notifications.len() > kept {
+                let surplus = data_set.notifications.len() - kept;
+                data_set.notifications.drain(..surplus);
+            }
+        }
+
+        Ok(SendDataSetNotificationOutput {})
     }
+}
+
+/// Check that `details` describes the notification `notification_type` declares.
+///
+/// `NotificationDetails` carries one member per kind of event - `DataUpdate`,
+/// `Deprecation`, `SchemaChange`, each documented as "Extra details specific to a
+/// <kind> type notification" - so the only detail a request may carry is the one its
+/// `Type` names: a `DEPRECATION` notification carrying data-update details describes
+/// two different events at once, and `DATA_DELAY` has no detail shape at all.
+///
+/// `Err` carries the message naming the member at fault, so the caller can fix the
+/// request from it alone.
+fn notified_details(
+    notification_type: &str,
+    details: Option<&NotificationDetails>,
+) -> Result<(), String> {
+    // The detail member the model declares for each `NotificationType` value, from
+    // `smithy_query(query="shape", shape="NotificationDetails")` and each member's own
+    // documentation. `DATA_DELAY` has none: the model declares no detail shape for it.
+    let expected: Option<&str> = match notification_type {
+        "DATA_UPDATE" => Some("DataUpdate"),
+        "DEPRECATION" => Some("Deprecation"),
+        "SCHEMA_CHANGE" => Some("SchemaChange"),
+        _ => None,
+    };
+
+    // Which detail members this request carries, under their modelled names.
+    let carried: [(&str, bool); 3] = [
+        (
+            "DataUpdate",
+            details.is_some_and(|details| details.data_update.is_some()),
+        ),
+        (
+            "Deprecation",
+            details.is_some_and(|details| details.deprecation.is_some()),
+        ),
+        (
+            "SchemaChange",
+            details.is_some_and(|details| details.schema_change.is_some()),
+        ),
+    ];
+    for (member, present) in carried {
+        if present && Some(member) != expected {
+            return Err(format!(
+                "Details.{member} does not belong to a {notification_type} notification"
+            ));
+        }
+    }
+
+    // A `DEPRECATION` or `SCHEMA_CHANGE` notification IS about the instant its detail
+    // carries - `DeprecationAt` and `SchemaChangeAt` are both `@required` - so that
+    // detail is required with those types. `DataUpdate`'s only member is optional, so
+    // a `DATA_UPDATE` notification without it still says what it is about.
+    if let Some(member) = expected.filter(|member| {
+        matches!(*member, "Deprecation" | "SchemaChange")
+            && !carried
+                .iter()
+                .any(|(name, present)| *name == *member && *present)
+    }) {
+        return Err(format!(
+            "Details.{member} is required for a {notification_type} notification"
+        ));
+    }
+
+    // The one caller-sized collection a notification carries. The model bounds it in
+    // prose only; see `crate::state::MAX_SCHEMA_CHANGES`.
+    if let Some(schema_change) = details.and_then(|details| details.schema_change.as_ref()) {
+        crate::state::bound_entries(
+            "Details.SchemaChange.Changes",
+            schema_change.changes.as_ref().map_or(0, Vec::len),
+            crate::state::MAX_SCHEMA_CHANGES,
+        )?;
+    }
+    Ok(())
 }

@@ -2,9 +2,13 @@
 
 //! @op GetWorkflowExecutionHistory
 //!
-//! A pure read: it replays the persisted event log of the ONE stored run addressed by
-//! `(domain, workflowId, runId)`, honouring `maximumPageSize` and `reverseOrder` and
-//! round-tripping `nextPageToken`, and writes nothing.
+//! A reporting operation: it replays the persisted event log of the ONE stored run
+//! addressed by `(domain, workflowId, runId)`, honouring `maximumPageSize` and
+//! `reverseOrder` and round-tripping `nextPageToken`. It decides nothing and appends
+//! nothing of its own; the one thing it writes is what the CLOCK already made due —
+//! a decision task whose own `startToCloseTimeout` ran out is timed out and replaced
+//! before the log is read, so the history this answer pages is the one the service owed
+//! at this instant whether or not anybody called.
 //!
 //! Shared types live in `super::types`; the error channel in `crate::scaffolded`.
 //!
@@ -151,7 +155,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
 
-        let guard = state.lock();
+        let now = crate::state::now();
+        let mut guard = state.lock();
         // An `UnknownResourceFault` message names the resource the lookup failed on and
         // nothing else: the domain when no domain is stored under that name, otherwise
         // the requested execution, in the
@@ -166,11 +171,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )),
             })
         };
-        let domain = guard.domains.get(&input.domain).ok_or_else(|| {
+        let domain = guard.domains.get_mut(&input.domain).ok_or_else(|| {
             GetWorkflowExecutionHistoryErrorModeled::UnknownResourceFault(UnknownResourceFault {
                 message: Some(format!("Unknown domain: {}", input.domain)),
             })
         })?;
+
+        // A decision task handed to a decider and not completed within its own
+        // `startToCloseTimeout` times out — recording `DecisionTaskTimedOut` and a
+        // replacement `DecisionTaskScheduled` — at the instant that duration ran out,
+        // whether or not anybody calls. Reading the history materialises what the clock
+        // already made due, so the log this answer pages is the one the service owed at
+        // this instant; nothing else is written and no task is handed out.
+        domain.expire_due_decision_tasks(now);
+
         let execution = domain
             .executions
             .get(&(

@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Assigns tags to the resource `resourceArn` names, merging them into the tag set that
+//! resource already holds: a key it does not carry is added, a key it does carry takes the
+//! new value, and every other key is left where it is. The tag set lives on the resource's
+//! own record (`crate::state::ComAmazonawsCloudwatchlogsLogs20140328State::resource_tags`),
+//! so `ListTagsForResource` and `ListLogGroups`'s `logGroupTags` filter read what this
+//! operation wrote.
 //!
 //! ## Shape of an operation
 //!
@@ -171,18 +169,85 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        // Tagging names its target by ARN alone, so nothing here is read off the request
+        // metadata `ctx` carries.
+        let _ = ctx;
+
+        // "A parameter is specified incorrectly" — this operation's refusal for a
+        // `resourceArn` the service cannot make a tagging target of.
+        let invalid = |message: &str| {
+            TagResourceError::from(TagResourceErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message.to_string()),
+                },
+            ))
+        };
+
+        // A value that is not an ARN at all is refused with the service's validation-error
+        // message naming the member and the value it could not parse; the kind check below
+        // answers a well-formed ARN naming a resource that carries no tags.
+        if let Some(message) =
+            crate::state::unparsable_arn_message("resourceArn", &input.resource_arn)
+        {
+            return Err(invalid(&message));
+        }
+        let Some(resource) = crate::state::tagged_resource(&input.resource_arn) else {
+            return Err(invalid(crate::state::UNTAGGABLE_RESOURCE_ARN));
+        };
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            TagResourceError::from(TagResourceErrorModeled::ServiceUnavailableException(
+                ServiceUnavailableException {
+                    message: Some("the log store is unavailable".to_string()),
+                },
+            ))
+        })?;
+        let mut store = state.lock();
+
+        let Some(stored) = store.resource_tags_mut(&resource) else {
+            return Err(TagResourceErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::resource_not_found_message(resource.kind())),
+                },
+            )
+            .into());
+        };
+
+        // "You can use the TagResource action with a resource that already has tags. If you
+        // specify a new tag key [...] this tag is appended to the list of tags associated
+        // with the [resource]. If you specify a tag key that is already associated [...] the
+        // new tag value that you specify replaces the previous value for that tag." So the
+        // request's tags are MERGED over the stored set, never a replacement of it.
+        let mut merged = stored.clone();
+        merged.extend(
+            input
+                .tags
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone())),
+        );
+
+        // "You can associate as many as 50 tags with a CloudWatch Logs resource." The bound
+        // is on what the resource ends up holding, which is why a request inside the
+        // modelled `Tags` length can still exceed it — and why the MERGED set is counted
+        // rather than the request's: re-tagging a key the resource already carries adds
+        // nothing to the total.
+        if merged.len() > crate::state::MAX_TAGS_PER_RESOURCE {
+            return Err(TagResourceErrorModeled::TooManyTagsException(
+                TooManyTagsException {
+                    message: Some(format!(
+                        "a resource can have no more than {} tags",
+                        crate::state::MAX_TAGS_PER_RESOURCE
+                    )),
+                    resource_name: Some(input.resource_arn.clone()),
+                },
+            )
+            .into());
+        }
+
+        // The quota refusal above leaves the stored set untouched, so a refused call assigns
+        // no tag at all.
+        *stored = merged;
+
+        Ok(TagResourceOutput)
     }
 }
