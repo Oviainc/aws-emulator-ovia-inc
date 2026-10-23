@@ -165,6 +165,10 @@ pub struct RestApiEntry {
     /// Every `Authorizer` of this API, keyed by authorizer id — the identifier a
     /// `Method`'s `authorizerId` names and `GetAuthorizer` takes in its path label.
     pub authorizers: BTreeMap<String, AuthorizerEntry>,
+    /// Every `RequestValidator` of this API, keyed by request validator id — the
+    /// identifier a `Method`'s `requestValidatorId` names and `GetRequestValidator`
+    /// takes in its path label.
+    pub request_validators: BTreeMap<String, RequestValidatorEntry>,
     /// This API's creation rank, from [`ComAmazonawsApigatewayBackplanecontrolserviceState::next_sequence`].
     pub sequence: u64,
 }
@@ -416,6 +420,26 @@ pub struct AuthorizerEntry {
     /// The TTL in seconds of cached authorizer results; `0` disables caching.
     pub authorizer_result_ttl_in_seconds: i32,
     /// This authorizer's creation rank, from
+    /// [`ComAmazonawsApigatewayBackplanecontrolserviceState::next_sequence`], so a
+    /// listing can report creation order rather than id order.
+    pub sequence: u64,
+}
+
+/// One stored `RequestValidator` of an API: the pair of validation flags an API's
+/// methods may name in their `requestValidatorId`.
+///
+/// `name` is optional on the request and so optional here: a validator created without
+/// one carries none, and a read of it reports none rather than a name invented per read.
+/// The two flags are NOT optional, because `validateRequestBody` and
+/// `validateRequestParameters` are modelled with a default of `false`, so a stored
+/// validator always has both.
+#[derive(Debug, Clone, Default)]
+pub struct RequestValidatorEntry {
+    pub id: String,
+    pub name: Option<String>,
+    pub validate_request_body: bool,
+    pub validate_request_parameters: bool,
+    /// This validator's creation rank, from
     /// [`ComAmazonawsApigatewayBackplanecontrolserviceState::next_sequence`], so a
     /// listing can report creation order rather than id order.
     pub sequence: u64,
@@ -845,6 +869,11 @@ pub const MAX_AUTHORIZERS_PER_API: usize = 10;
 /// Emulator resource guard, NOT an AWS quota: the most deployments this emulator keeps
 /// for one API. API Gateway publishes no deployment quota.
 pub const MAX_DEPLOYMENTS_PER_API: usize = 300;
+
+/// Emulator resource guard, NOT an AWS quota: the most request validators this emulator
+/// keeps for one API. API Gateway publishes no request-validator quota, so this bound is
+/// the emulator's own, the same order as the deployment guard above.
+pub const MAX_REQUEST_VALIDATORS_PER_API: usize = 300;
 
 /// From `CreateStage$stageName`'s own documentation: "Maximum length is 128
 /// characters."
@@ -1779,6 +1808,10 @@ pub const NO_SUCH_DOCUMENTATION_VERSION: &str = "Invalid Documentation version s
 /// The `NotFoundException` message for an `authorizerId` that names no stored authorizer
 /// of the API.
 pub const NO_SUCH_AUTHORIZER: &str = "Invalid Authorizer identifier specified";
+
+/// The `NotFoundException` message for a `requestValidatorId` that names no stored
+/// request validator of the API, in the shape of the sibling identifier messages above.
+pub const NO_SUCH_REQUEST_VALIDATOR: &str = "Invalid Request Validator identifier specified";
 
 /// The `target` every audit record this service emits carries, so a consumer can select
 /// the access trail without reading the rest of the emulator's traces.
