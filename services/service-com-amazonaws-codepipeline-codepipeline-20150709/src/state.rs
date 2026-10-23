@@ -13,6 +13,12 @@
 //! `PutWebhook` defines all live in the one store reached through [`service_state`],
 //! so every handler computes its answer from persisted state rather than from the
 //! request it is answering.
+//!
+//! What happens to an execution AFTER `StartPipelineExecution` accepted it — the stages
+//! it enters, the actions it runs, the approval tokens and the jobs their reporters need,
+//! and the statuses it all rolls up into — is the EXECUTION plane: its data model in
+//! [`execution`], the engine that moves it in [`driver`], and the job-worker lifecycle a
+//! `Custom`-owned action waits on in [`jobs`].
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{Duration, SystemTime};
@@ -33,6 +39,8 @@ use crate::ops::types::{
 pub mod execution;
 /// The driver that moves an execution forward and performs its artifact I/O.
 pub mod driver;
+/// The job-worker lifecycle a `Custom`-owned action's work is performed through.
+pub mod jobs;
 
 pub use driver::advance;
 pub use execution::{
@@ -41,6 +49,7 @@ pub use execution::{
     MAX_EXTRACTED_BYTES, STATUS_FAILED, STATUS_STOPPED, STATUS_SUCCEEDED, STATUS_SUPERSEDED,
     TRANSITION_INBOUND, TRANSITION_OUTBOUND,
 };
+pub use jobs::{JobProblem, MAX_OUTPUT_VARIABLES_BYTES, MAX_OUTPUT_VARIABLE_VALUE_BYTES};
 
 /// The region an ARN carries when the request names none.
 ///
@@ -93,14 +102,12 @@ pub const NON_TERMINAL_STATUSES: [&str; 2] = [STATUS_IN_PROGRESS, STATUS_STOPPIN
 /// (`smithy_query query="shape" shape="ActionExecutionStatus"` -> `InProgress`,
 /// `Abandoned`, `Succeeded`, `Failed`).
 ///
-/// It is the only status an action execution reaches in this emulator: nothing here
-/// RUNS an action — no source is fetched, no build or deployment is performed, and
-/// every operation a job worker would report a result through
-/// (`PutJobSuccessResult`, `PutJobFailureResult`, `PutApprovalResult`) is still a
-/// scaffold with its own issue — so an action that has started stays started rather
-/// than being moved to an outcome nothing produced. This mirrors the pipeline
-/// execution that contains it, which stays [`STATUS_IN_PROGRESS`] for the same
-/// reason.
+/// It is the status an action keeps until its outcome is REPORTED: by the approver a
+/// manual approval waits on (`PutApprovalResult`), by the job worker a `Custom`-owned
+/// action's job waits on (`PutJobSuccessResult` / `PutJobFailureResult`, see [`jobs`]),
+/// by the engine that performed the action's own work, or — for work this emulator
+/// cannot perform — by its refusal to invent an outcome, which fails the action with the
+/// reason that says so ([`driver`]).
 pub const ACTION_STATUS_IN_PROGRESS: &str = "InProgress";
 
 /// The `runOrder` an action runs in when its declaration names none.
@@ -143,7 +150,8 @@ pub const JOB_STATUS_SUCCEEDED: &str = "Succeeded";
 pub const JOB_STATUS_QUEUED: &str = "Queued";
 
 /// The `JobStatus` value a job carries once a job worker has reported failure for
-/// it, from the same enum. Terminal, like [`JOB_STATUS_SUCCEEDED`].
+/// it, or once the action it reports on was abandoned, from the same enum. Terminal,
+/// like [`JOB_STATUS_SUCCEEDED`].
 pub const JOB_STATUS_FAILED: &str = "Failed";
 
 /// The `JobStatus` value a job carries once its worker's window to report an outcome
@@ -509,11 +517,17 @@ pub struct ComAmazonawsCodepipelineCodepipeline20150709State {
     /// The third-party jobs waiting for a partner's job worker, per action type,
     /// oldest first — what `PollForThirdPartyJobs` reports to the registered partner.
     ///
-    /// Queued by the action-execution plane when an execution reaches a partner
-    /// action; this slice does not run that plane (every operation of it —
-    /// `GetPipelineState`, `PutThirdPartyJobSuccessResult`, the acknowledge
-    /// operations — is still a scaffold with its own issue), so no request path
-    /// writes this map and it needs no per-request bound.
+    /// NOT written by the execution plane: a `ThirdParty` action's job is served to the
+    /// partner named by a partner integration, and the API surface models no operation
+    /// that creates one ([`Self::third_party_partners`]), so in the assembled emulator
+    /// there is no partner for an execution to hand such an action to. The engine
+    /// therefore answers a `ThirdParty` action the way it answers any other work it
+    /// cannot perform — with the modelled failure and the reason that says so
+    /// ([`driver`]) — rather than queueing a job nothing could ever poll for. The map
+    /// stays the seam `PollForThirdPartyJobs` reads, so a test that registers a partner
+    /// and queues a job still exercises it. A `Custom`-owned action's job, which a job
+    /// worker of THIS account does poll for, lives on the action that waits for it
+    /// ([`jobs`]) rather than in a map of its own.
     pub third_party_jobs: BTreeMap<ActionTypeKey, Vec<ThirdPartyJobRecord>>,
     /// The jobs waiting for a CUSTOM action's job worker, per action type, oldest
     /// first — what `PollForJobs` hands out.
@@ -575,12 +589,12 @@ impl ComAmazonawsCodepipelineCodepipeline20150709State {
     /// tokens that named them — otherwise a token would keep naming an execution no
     /// caller can read, and the maps would grow per request without limit.
     ///
-    /// Starting an execution also starts the actions it begins with, so the action
-    /// executions those actions get are minted HERE rather than by each caller: this
-    /// is the one way an execution enters the store, so `StartPipelineExecution` and
-    /// `PutActionRevision` cannot disagree about what a started execution has
-    /// running. The records are dropped with the execution they belong to, here and
-    /// in [`Self::forget_pipeline`].
+    /// Starting an execution also records the action executions its first stage begins
+    /// with, so `ListActionExecutions` reports them from the same instant the start
+    /// returns: this is the one way an execution enters the store, so
+    /// `StartPipelineExecution` and `PutActionRevision` cannot disagree about what a
+    /// started execution has running. Those records are dropped with the execution they
+    /// belong to, here and in [`Self::forget_pipeline`].
     pub fn record_execution(
         &mut self,
         record: PipelineExecutionRecord,
@@ -647,6 +661,7 @@ impl ComAmazonawsCodepipelineCodepipeline20150709State {
             self.idempotency
                 .insert((pipeline_name, token), execution_id.clone());
         }
+
         execution_id
     }
 
@@ -3080,9 +3095,10 @@ impl PipelineExecutionRecord {
 /// One stored action execution: an action of a pipeline execution that the execution
 /// has STARTED, as `ListActionExecutions` reports it.
 ///
-/// Every member is either read from the declaration the execution runs or recorded
-/// when the action started; nothing about an outcome is held, because nothing in this
-/// emulator runs an action (see [`ACTION_STATUS_IN_PROGRESS`]).
+/// Every member is either read from the declaration the execution runs, recorded when
+/// the action started, or recorded when its outcome was reported — by an approver, by a
+/// job worker, or by the execution plane's refusal to invent an outcome for work that
+/// runs outside this emulator (see [`execution`]).
 #[derive(Debug, Clone)]
 pub struct ActionExecutionRecord {
     /// The generated id, modelled `ActionExecutionId`.
@@ -3185,8 +3201,9 @@ impl ActionExecutionRecord {
             updated_by: None,
             status: Some(self.status.clone()),
             input: Some(self.input.clone()),
-            // What the action produced. Nothing in this emulator runs an action, so
-            // there is no result, no output artifact and no output variable to report.
+            // What the action produced. The engine records an action's outcome on the
+            // execution's own plan (`execution::ActionRun`), so this record carries no
+            // output of its own rather than an invented one.
             output: None,
         }
     }
@@ -3213,18 +3230,19 @@ pub const MAX_RESOLVED_CONFIGURATION_VALUE_BYTES: usize = 1_000 * 1_000;
 
 /// `configuration` with every pipeline-variable reference replaced by the value this
 /// execution resolved for that variable, or `None` when a reference is left that this
-/// emulator cannot resolve.
+/// emulator cannot resolve here.
 ///
 /// CodePipeline's variable syntax is `#{namespace.variable}`, and a pipeline-level
 /// variable — the kind `PipelineDeclaration$variables` declares and
 /// `StartPipelineExecution` overrides — lives in the `variables` namespace. Those are
-/// exactly the variables an execution record resolves ([`resolve_execution_variables`]),
-/// so they are substituted here.
+/// exactly the variables an execution record resolves
+/// ([`resolve_execution_variables`]), so they are substituted here.
 ///
-/// Every other namespace is an ACTION's: its values are the output variables the
-/// action produced, and nothing in this emulator runs an action. A reference in the
-/// STORED configuration that this emulator cannot resolve therefore leaves the
-/// configuration with no resolved form at all, and
+/// Every other namespace is an ACTION's: its values are the output variables that
+/// action published as it ran, which the engine resolves against the execution's own
+/// variable map when it runs the action ([`execution::resolved_configuration`]). A
+/// reference in the STORED configuration that this reader cannot resolve therefore
+/// leaves the configuration with no resolved form at all, and
 /// `ActionExecutionInput$resolvedConfiguration` is reported absent rather than
 /// half-resolved. A configuration with no reference in it resolves to itself.
 ///

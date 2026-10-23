@@ -86,13 +86,19 @@ fn two_source_actions(name: &str, execution_mode: Option<&str>) -> Value {
     declaration
 }
 
+/// One source action of the fixture pipeline.
+///
+/// `Custom`-owned, so an execution that reaches it waits for the job worker that
+/// reports its outcome rather than being carried on by the clock: the executions this
+/// suite counts against the concurrency bound stay non-terminal for as long as the
+/// bound is being asserted.
 fn source_action(name: &str, key: &str) -> Value {
     json!({
         "name": name,
         "actionTypeId": {
             "category": "Source",
-            "owner": "AWS",
-            "provider": "S3",
+            "owner": "Custom",
+            "provider": "MySource",
             "version": "1",
         },
         "configuration": {"S3Bucket": "my-bucket", "S3ObjectKey": key},
