@@ -54,6 +54,19 @@ pub const PROVISIONING_DELAY: Duration = Duration::from_millis(500);
 /// (1..25), so no page can exceed what the model lets a caller ask for.
 pub const MAX_PAGE_SIZE: i32 = 25;
 
+/// The most tags one resource carries, from `TagMap`'s own `@length` maximum
+/// (0..200, `smithy_query(query="shape",shape="TagMap")`). It bounds what
+/// `TagResource` can MERGE onto a resource: the model refuses a single request
+/// carrying more than 200 entries at the boundary, and this is what keeps repeated
+/// requests from growing a resource's tag set past what `ListTagsForResource` is
+/// allowed to answer with.
+pub const MAX_TAGS: usize = 200;
+
+/// What a `resourceArn` names in the modelled errors of the tagging operations:
+/// they address a scope or a monitor through one member, so the refusal names the
+/// taggable resource rather than either store.
+pub const TAGGED_RESOURCE: &str = "resource";
+
 /// The most scopes this emulator holds at once.
 ///
 /// A bound on how far the store can grow under repeated creates: a create past it
@@ -238,6 +251,20 @@ pub fn tags_for_output(tags: &BTreeMap<String, String>) -> Option<HashMap<String
     }
 }
 
+/// The stored tags as a TAG LISTING carries them: always a map, and empty when
+/// the resource has none.
+///
+/// `tags` is the whole of `ListTagsForResource`'s output ("Returns all the tags for
+/// a resource"), so an untagged resource answers `{}` — the listing says "this
+/// resource has no tags" rather than leaving the one member it has unset. The
+/// create/read shapes use [`tags_for_output`] instead, where the record's other
+/// members already say what was read.
+pub fn tags_as_map(tags: &BTreeMap<String, String>) -> HashMap<String, String> {
+    tags.iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
+}
+
 /// The account id a `TargetId` union carries. `accountId` is its only member
 /// today ("currently, a target is always an Amazon Web Services account"), so an
 /// id that is not one compares equal to nothing.
@@ -352,6 +379,35 @@ impl ComAmazonawsNetworkflowmonitorNetworkflowmonitorState {
         match self.arn_index.get(arn) {
             Some(ResourceRef::Scope(scope_id)) => self.scopes.get(scope_id),
             _ => None,
+        }
+    }
+
+    /// The tags of the resource an ARN names, or `None` when the ARN names nothing
+    /// in this store.
+    ///
+    /// The tagging operations address EVERY taggable resource of this service
+    /// through one `resourceArn` member, so they resolve it here rather than each
+    /// naming the stores: whatever [`arn_index`](Self::arn_index) holds is
+    /// taggable, and a resource type added later is reachable without touching
+    /// them.
+    pub fn tags_by_arn(&self, arn: &str) -> Option<&BTreeMap<String, String>> {
+        match self.arn_index.get(arn)? {
+            ResourceRef::Scope(scope_id) => self.scopes.get(scope_id).map(|scope| &scope.tags),
+            ResourceRef::Monitor(name) => self.monitors.get(name).map(|monitor| &monitor.tags),
+        }
+    }
+
+    /// The same lookup for a writer. The reference is cloned out of the index
+    /// first, so the borrow of the index ends before the record is reached.
+    pub fn tags_by_arn_mut(&mut self, arn: &str) -> Option<&mut BTreeMap<String, String>> {
+        match self.arn_index.get(arn)?.clone() {
+            ResourceRef::Scope(scope_id) => {
+                self.scopes.get_mut(&scope_id).map(|scope| &mut scope.tags)
+            }
+            ResourceRef::Monitor(name) => self
+                .monitors
+                .get_mut(&name)
+                .map(|monitor| &mut monitor.tags),
         }
     }
 }
