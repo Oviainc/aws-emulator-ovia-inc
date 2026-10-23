@@ -169,6 +169,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             store
                 .membership_by_collaboration
                 .retain(|(collaboration, _), _| collaboration != &collaboration_id);
+            // The privacy budget template does NOT survive: it is a resource OF the
+            // collaboration ("creates a privacy budget template for a specified
+            // collaboration"), reachable only through a membership of that
+            // collaboration, so the collaboration's disappearance takes it — and its
+            // tags — with it, and the collaboration can hold a new one if it is
+            // recreated.
+            if let Some(template_id) = store
+                .privacy_budget_template_by_collaboration
+                .remove(&collaboration_id)
+            {
+                if let Some(template) = store.privacy_budget_templates.remove(&template_id) {
+                    store.tags.remove(&template.arn);
+                }
+                store
+                    .privacy_budget_template_order
+                    .retain(|id| id != &template_id);
+            }
         }
         Ok(DeleteCollaborationOutput {})
     }
