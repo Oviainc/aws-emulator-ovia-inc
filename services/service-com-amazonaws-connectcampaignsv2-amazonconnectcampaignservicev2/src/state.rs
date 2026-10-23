@@ -365,6 +365,35 @@ pub const ONBOARDING_STATUS_IN_PROGRESS: &str = "IN_PROGRESS";
 /// from the same catalog.
 pub const ONBOARDING_STATUS_SUCCEEDED: &str = "SUCCEEDED";
 
+/// The `InstanceOnboardingJobStatusCode` value a job that could not onboard the
+/// instance reports, from the same catalog. It is the ONLY status
+/// `DeleteInstanceOnboardingJob` accepts: "Instance onboarding job is not in failed
+/// status. Only failed job can be deleted."
+///
+/// No job this emulator stores reaches it — the onboarding it performs is writing
+/// the record, which either happened or was refused before the job started (see
+/// [`StoredInstanceOnboarding::to_job_status`]) — so the delete edge it opens is the
+/// one a failing job would use.
+pub const ONBOARDING_STATUS_FAILED: &str = "FAILED";
+
+/// Why `DeleteInstanceOnboardingJob` refuses to delete a job that has not failed.
+///
+/// A fixed service string: it names no instance and carries nothing from the
+/// request, so every refusal of this kind reads the same, as the recorded responses
+/// do.
+pub const ONBOARDING_JOB_NOT_FAILED_MESSAGE: &str =
+    "Instance onboarding job is not in failed status. Only failed job can be deleted.";
+
+/// What this service answers when a well-formed campaign id names no campaign.
+///
+/// A FIXED service string — it does not embed the requested id, which is what the
+/// recorded `DescribeCampaign` 404 carries — so every campaign-id lookup that
+/// resolves to nothing reads the same and the response is deterministic. The one
+/// not-found text the campaign-id operations share, so two of them cannot disagree.
+/// (`PutOutboundRequestBatch` keeps its own recorded wording, which does name the
+/// campaign: that operation's message is composed from the request.)
+pub const CAMPAIGN_NOT_FOUND_MESSAGE: &str = "CampaignId not found.";
+
 /// How long after the `StartInstanceOnboardingJob` call that started it an
 /// onboarding job is due to reach `SUCCEEDED`.
 ///
@@ -735,6 +764,41 @@ impl ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State {
     ) -> Option<&StoredInstanceOnboarding> {
         self.instance_onboarding.get(connect_instance_id)
     }
+
+    /// Delete the onboarding job of `connect_instance_id`, and report what became of
+    /// the request (see [`DeleteOnboardingOutcome`]).
+    ///
+    /// Only a job that has FAILED may be deleted: a job in any other status keeps
+    /// its record, so the status a later `GetInstanceOnboardingJobStatus` reports
+    /// and the config `GetConnectInstanceConfig` projects are untouched by a refused
+    /// delete. The status is read off the stored due instant at `now`, the same way
+    /// every other reader of the record reads it.
+    pub fn delete_instance_onboarding(
+        &mut self,
+        connect_instance_id: &str,
+        now: SystemTime,
+    ) -> DeleteOnboardingOutcome {
+        let Some(record) = self.instance_onboarding.get(connect_instance_id) else {
+            return DeleteOnboardingOutcome::NoSuchJob;
+        };
+        if record.status_at(now) != ONBOARDING_STATUS_FAILED {
+            return DeleteOnboardingOutcome::NotFailed;
+        }
+        self.instance_onboarding.remove(connect_instance_id);
+        DeleteOnboardingOutcome::Deleted
+    }
+}
+
+/// What [`ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State::delete_instance_onboarding`]
+/// did with a delete request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeleteOnboardingOutcome {
+    /// The record was FAILED and is gone.
+    Deleted,
+    /// The instance has no onboarding record at all.
+    NoSuchJob,
+    /// The record is in a status other than FAILED and was left untouched.
+    NotFailed,
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

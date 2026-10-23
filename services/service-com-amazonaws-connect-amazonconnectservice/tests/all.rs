@@ -23,5 +23,7 @@ mod hours_of_operation_lifecycle;
 mod instance_default_resources;
 #[path = "all/instance_queue_lifecycle.rs"]
 mod instance_queue_lifecycle;
+#[path = "all/phone_number_inventory.rs"]
+mod phone_number_inventory;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

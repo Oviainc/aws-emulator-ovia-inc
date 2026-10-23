@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ClaimPhoneNumber
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ClaimPhoneNumber`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ClaimPhoneNumber::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Claims one number of the inventory `SearchAvailablePhoneNumbers` advertises to the
+//! instance the request targets: a number outside that inventory, or one already
+//! claimed, is not available and is refused. The claim is recorded in
+//! [`crate::state::ComAmazonawsConnectAmazonconnectserviceState::phone_numbers`],
+//! which is what stops the number being advertised and what `DescribePhoneNumber`
+//! reads back.
 //!
 //! ## Shape of an operation
 //!
@@ -183,18 +181,109 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ClaimPhoneNumber` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ClaimPhoneNumberErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ClaimPhoneNumber"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ClaimPhoneNumberErrorModeled::InternalServiceException(InternalServiceException {
+                message: Some("the Amazon Connect store is unavailable".to_string()),
+            })
+        })?;
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // Minted before anything in the store is borrowed. Identifiers need not be
+        // contiguous: a refused claim simply leaves its id unused.
+        let id = store.mint_resource_id();
+
+        let target = store
+            .resolve_phone_number_target(input.instance_id.as_deref(), input.target_arn.as_deref())
+            .map_err(|problem| match problem {
+                // The target names nothing this account holds, which is the one
+                // refusal this operation models a not-found error for; a request
+                // that names no target at all is a bad parameter, not a missing
+                // resource.
+                crate::state::TargetProblem::Unresolved => {
+                    ClaimPhoneNumberErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: Some(problem.refusal().to_string()),
+                        },
+                    )
+                }
+                _ => ClaimPhoneNumberErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(problem.refusal().to_string()),
+                    },
+                ),
+            })?;
+        let instance_id = target.id.clone();
+        let target_arn = target.arn.clone();
+
+        // `ClientToken` is `@idempotencyToken`: the call that carried it already
+        // claimed a number, so the retry reports that claim rather than making a
+        // second one. A token reused for a DIFFERENT claim is the modelled
+        // `IdempotencyException` (HTTP 409) — the same token cannot stand for two
+        // different requests.
+        let client_token = input.client_token.filter(|token| !token.is_empty());
+        if let Some(token) = client_token.as_deref() {
+            if let Some(claimed) = store.phone_number_claimed_with_token(token) {
+                if claimed.phone_number == input.phone_number
+                    && claimed.instance_id == instance_id
+                {
+                    return Ok(ClaimPhoneNumberOutput {
+                        phone_number_id: Some(claimed.id.clone()),
+                        phone_number_arn: Some(claimed.arn.clone()),
+                    });
+                }
+                return Err(ClaimPhoneNumberErrorModeled::IdempotencyException(
+                    IdempotencyException {
+                        message: Some(format!(
+                            "The ClientToken {token} was already used to claim phone number {}",
+                            claimed.phone_number
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // Only a number the inventory advertises can be claimed: one it never
+        // offered, and one another claim already holds, are both unavailable.
+        let Some(entry) = crate::state::parse_inventory_number(&input.phone_number) else {
+            return Err(not_available(&input.phone_number));
+        };
+        if store.claimed_phone_number(&input.phone_number).is_some() {
+            return Err(not_available(&input.phone_number));
+        }
+
+        let arn = crate::state::phone_number_arn(&region, &id);
+        let record = crate::state::PhoneNumberRecord {
+            id: id.clone(),
+            arn: arn.clone(),
+            phone_number: input.phone_number,
+            country_code: entry.country_code,
+            number_type: entry.number_type,
+            description: input.phone_number_description,
+            instance_id,
+            target_arn,
+            tags: crate::state::tags_in(input.tags),
+            client_token,
+            claimed_at: now,
+        };
+        store.phone_numbers.insert(id.clone(), record);
+
+        Ok(ClaimPhoneNumberOutput {
+            phone_number_id: Some(id),
+            phone_number_arn: Some(arn),
+        })
     }
+}
+
+/// The modelled `InvalidParameterException` (HTTP 400) a number this account cannot
+/// claim is refused with: the number is not one the inventory is offering.
+fn not_available(phone_number: &str) -> ClaimPhoneNumberError {
+    ClaimPhoneNumberErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(format!(
+            "The phone number {phone_number} is not available to claim"
+        )),
+    })
+    .into()
 }

@@ -8,6 +8,15 @@
 //! modelled-shape projections). The helpers live here rather than in one operation's
 //! file because `src/ops/<op>.rs` is per-operation: a projection that `DescribeQueue`
 //! and `ListQueues` both need has to be reachable from both.
+//!
+//! The claimable phone-number inventory beside it works the same way:
+//! [`inventory_phone_number`] derives the numbers one country and type are offered,
+//! [`ComAmazonawsConnectAmazonconnectserviceState::available_phone_numbers`]
+//! subtracts the ones already claimed — which is what
+//! `SearchAvailablePhoneNumbers` advertises — and
+//! [`ComAmazonawsConnectAmazonconnectserviceState::phone_numbers`] is the single
+//! record set `ClaimPhoneNumber` writes, `DescribePhoneNumber` projects and
+//! `ReleasePhoneNumber` removes.
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, SystemTime};
@@ -15,9 +24,10 @@ use std::time::{Duration, SystemTime};
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    ContactFlow, ContactFlowSummary, HoursOfOperation, HoursOfOperationConfig,
-    HoursOfOperationSummary, HoursOfOperationTimeSlice, HoursOfOperationsIdentifier, Instance,
-    InstanceSummary, OutboundCallerConfig, OutboundEmailConfig, Queue, QueueSummary,
+    AvailableNumberSummary, ClaimedPhoneNumberSummary, ContactFlow, ContactFlowSummary,
+    HoursOfOperation, HoursOfOperationConfig, HoursOfOperationSummary, HoursOfOperationTimeSlice,
+    HoursOfOperationsIdentifier, Instance, InstanceSummary, OutboundCallerConfig,
+    OutboundEmailConfig, PhoneNumberStatus, Queue, QueueSummary, PHONE_NUMBER_TYPE_VALUES,
 };
 
 /// The region an unsigned request is served in. The emulator's own shared AWS config
@@ -224,6 +234,15 @@ pub struct ComAmazonawsConnectAmazonconnectserviceState {
     /// instance, so this map is bounded by [`INSTANCE_QUOTA`] too — which
     /// `CreateInstance` also checks directly rather than relying on that argument.
     pub client_tokens: BTreeMap<String, String>,
+    /// Every phone number claimed to this account, keyed by its phone number id —
+    /// the one record `ClaimPhoneNumber` writes, `DescribePhoneNumber` projects and
+    /// `ReleasePhoneNumber` removes, and the one answer to "is this inventory number
+    /// still available?" (see [`Self::claimed_phone_number`]).
+    ///
+    /// Bounded without a quota of its own: only a number the emulator's inventory
+    /// advertises can be claimed (see [`parse_inventory_number`]), and that inventory
+    /// is finite, so this map cannot grow past it.
+    pub phone_numbers: BTreeMap<String, PhoneNumberRecord>,
     /// How many identifiers this store has minted. It only ever grows, which is what
     /// makes [`Self::mint_resource_id`] hand out a different id every time.
     pub minted_ids: u64,
@@ -251,6 +270,582 @@ impl ComAmazonawsConnectAmazonconnectserviceState {
             &hex[16..20],
             &hex[20..32]
         )
+    }
+
+    /// The instance a phone-number operation's target names, resolved from the
+    /// `InstanceId` and `TargetArn` members both `SearchAvailablePhoneNumbers` and
+    /// `ClaimPhoneNumber` carry ("You must enter InstanceId or TargetArn").
+    ///
+    /// A request that names neither is [`TargetProblem::Missing`]; one whose
+    /// identifier resolves to no stored instance (an unknown id, an ARN of another
+    /// resource, or a traffic distribution group — none can exist until
+    /// `CreateTrafficDistributionGroup` stores one) is
+    /// [`TargetProblem::Unresolved`]; one that names an instance by id and a
+    /// DIFFERENT resource by ARN is [`TargetProblem::Mismatched`], since the two
+    /// members name one target.
+    pub fn resolve_phone_number_target(
+        &self,
+        instance_id: Option<&str>,
+        target_arn: Option<&str>,
+    ) -> Result<&InstanceRecord, TargetProblem> {
+        let by_id = instance_id.map(|id| self.instances.get(id));
+        let by_arn =
+            target_arn.map(|arn| self.instances.values().find(|instance| instance.arn == arn));
+        match (by_id, by_arn) {
+            (None, None) => Err(TargetProblem::Missing),
+            (Some(None), _) | (_, Some(None)) => Err(TargetProblem::Unresolved),
+            (Some(Some(by_id)), Some(Some(by_arn))) if by_id.id != by_arn.id => {
+                Err(TargetProblem::Mismatched)
+            }
+            (Some(Some(instance)), _) | (None, Some(Some(instance))) => Ok(instance),
+        }
+    }
+
+    /// The record of the phone number `phone_number` if this account holds it, or
+    /// `None` when the number is not claimed.
+    ///
+    /// One claim per number: a number this answers for is not available to claim and
+    /// is not advertised by `SearchAvailablePhoneNumbers`.
+    pub fn claimed_phone_number(&self, phone_number: &str) -> Option<&PhoneNumberRecord> {
+        self.phone_numbers
+            .values()
+            .find(|record| record.phone_number == phone_number)
+    }
+
+    /// The record `ClaimPhoneNumber` wrote for `client_token`, or `None` when no
+    /// claim carried that token. A repeated call with the token it was first given
+    /// reports the claim it made rather than making a second one.
+    pub fn phone_number_claimed_with_token(
+        &self,
+        client_token: &str,
+    ) -> Option<&PhoneNumberRecord> {
+        self.phone_numbers
+            .values()
+            .find(|record| record.client_token.as_deref() == Some(client_token))
+    }
+
+    /// Every number of the emulator's inventory for `country_code` / `number_type`
+    /// that nobody has claimed, in ascending number order, each paired with the
+    /// number itself as its pagination key.
+    ///
+    /// The inventory is derived, not stored: [`inventory_phone_number`] lays out the
+    /// [`PHONE_NUMBERS_PER_COUNTRY_AND_TYPE`] numbers of that country and type, and a
+    /// number is advertised exactly while no record in [`Self::phone_numbers`] holds
+    /// it — so claiming one stops it being advertised and releasing it advertises it
+    /// again. `prefix` keeps only the numbers it starts (`PhoneNumberPrefix`,
+    /// compared on digits so a prefix sent with or without its leading `+` matches
+    /// the same numbers).
+    pub fn available_phone_numbers(
+        &self,
+        country_code: &str,
+        number_type: &str,
+        prefix: Option<&str>,
+    ) -> Vec<(String, AvailableNumberSummary)> {
+        let wanted = prefix.map(|value| value.trim_start_matches('+').to_string());
+        (0..PHONE_NUMBERS_PER_COUNTRY_AND_TYPE)
+            .filter_map(|serial| inventory_phone_number(country_code, number_type, serial))
+            .filter(|number| {
+                wanted
+                    .as_deref()
+                    .is_none_or(|digits| number.trim_start_matches('+').starts_with(digits))
+            })
+            .filter(|number| self.claimed_phone_number(number).is_none())
+            .map(|number| {
+                let summary = AvailableNumberSummary {
+                    phone_number: Some(number.clone()),
+                    phone_number_country_code: Some(country_code.to_string()),
+                    phone_number_type: Some(number_type.to_string()),
+                };
+                (number, summary)
+            })
+            .collect()
+    }
+}
+
+/// Why a phone-number operation cannot resolve the target its request names. See
+/// [`ComAmazonawsConnectAmazonconnectserviceState::resolve_phone_number_target`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetProblem {
+    /// The request named neither an `InstanceId` nor a `TargetArn`.
+    Missing,
+    /// What it named is not a stored instance.
+    Unresolved,
+    /// Its `InstanceId` and `TargetArn` name different resources.
+    Mismatched,
+}
+
+impl TargetProblem {
+    /// What a refusal of this problem says. One wording for every phone-number
+    /// operation that resolves a target, so two of them cannot describe the same
+    /// refusal differently.
+    pub fn refusal(self) -> &'static str {
+        match self {
+            Self::Missing => "You must enter InstanceId or TargetArn",
+            Self::Unresolved => {
+                "The target does not name a Connect instance or traffic distribution group \
+                 in this account"
+            }
+            Self::Mismatched => "InstanceId and TargetArn name different targets",
+        }
+    }
+}
+
+/// `PhoneNumberWorkflowStatus` values, from the
+/// `com.amazonaws.connect#PhoneNumberWorkflowStatus` enum: `IN_PROGRESS` while a
+/// claim has not completed, `CLAIMED` once it has.
+pub const PHONE_NUMBER_STATUS_IN_PROGRESS: &str = "IN_PROGRESS";
+/// See [`PHONE_NUMBER_STATUS_IN_PROGRESS`].
+pub const PHONE_NUMBER_STATUS_CLAIMED: &str = "CLAIMED";
+
+/// How long after the `ClaimPhoneNumber` call that started it a claim is due to
+/// reach `CLAIMED`.
+///
+/// `ClaimedPhoneNumberSummary$PhoneNumberStatus` documents `IN_PROGRESS` as "a
+/// ClaimPhoneNumber ... operation is still in progress and has not yet completed.
+/// You can call DescribePhoneNumber at a later time to verify if the previous
+/// operation has completed" — so a claimed number is returned in a non-terminal
+/// status and the transition has to be observable. AWS documents no duration for it,
+/// so the span is the emulator's own and deliberately non-zero: a caller describing
+/// the number straight after the claim still sees the transient status. Nothing
+/// sleeps for it — the due instant is stored and the status is read off the clock.
+pub const PHONE_NUMBER_CLAIM_DELAY: Duration = Duration::from_millis(500);
+
+/// How many numbers of one (country code, phone number type) pair the emulator's
+/// claimable inventory holds.
+///
+/// AWS's available-number pool is account- and carrier-specific and it publishes no
+/// size, so this is the emulator's own: more than one page of
+/// `SearchAvailablePhoneNumbers`'s largest page (`MaxResult10`, max 10), so
+/// pagination is observable, and small enough that the whole inventory of a country
+/// and type can be walked.
+pub const PHONE_NUMBERS_PER_COUNTRY_AND_TYPE: u32 = 20;
+
+/// The page size `SearchAvailablePhoneNumbers` uses when the caller sends no
+/// `MaxResults`: the modelled maximum of its page-size member (`MaxResult10`, range
+/// 1..10), so an unpaginated caller sees as much as one page can legally hold.
+pub const SEARCH_AVAILABLE_PHONE_NUMBERS_DEFAULT_PAGE_SIZE: usize = 10;
+
+/// The E.164 country calling code of every ISO country
+/// `com.amazonaws.connect#PhoneNumberCountryCode` names, keyed by its ISO 3166-1
+/// alpha-2 code and sorted by it (see [`country_calling_code`]).
+///
+/// Source: the ITU-T Recommendation E.164 assigned country-code list (ITU-T
+/// Operational Bulletin "List of ITU-T Recommendation E.164 assigned country
+/// codes"), which is what the leading digits of a number in that country are. The
+/// catalog is the model's own: `PHONE_NUMBER_COUNTRY_CODE_VALUES` and this table
+/// cover exactly the same countries, which this crate's tests assert.
+pub const COUNTRY_CALLING_CODES: &[(&str, &str)] = &[
+    ("AD", "376"),
+    ("AE", "971"),
+    ("AF", "93"),
+    ("AG", "1"),
+    ("AI", "1"),
+    ("AL", "355"),
+    ("AM", "374"),
+    ("AN", "599"),
+    ("AO", "244"),
+    ("AQ", "672"),
+    ("AR", "54"),
+    ("AS", "1"),
+    ("AT", "43"),
+    ("AU", "61"),
+    ("AW", "297"),
+    ("AZ", "994"),
+    ("BA", "387"),
+    ("BB", "1"),
+    ("BD", "880"),
+    ("BE", "32"),
+    ("BF", "226"),
+    ("BG", "359"),
+    ("BH", "973"),
+    ("BI", "257"),
+    ("BJ", "229"),
+    ("BL", "590"),
+    ("BM", "1"),
+    ("BN", "673"),
+    ("BO", "591"),
+    ("BR", "55"),
+    ("BS", "1"),
+    ("BT", "975"),
+    ("BW", "267"),
+    ("BY", "375"),
+    ("BZ", "501"),
+    ("CA", "1"),
+    ("CC", "61"),
+    ("CD", "243"),
+    ("CF", "236"),
+    ("CG", "242"),
+    ("CH", "41"),
+    ("CI", "225"),
+    ("CK", "682"),
+    ("CL", "56"),
+    ("CM", "237"),
+    ("CN", "86"),
+    ("CO", "57"),
+    ("CR", "506"),
+    ("CU", "53"),
+    ("CV", "238"),
+    ("CW", "599"),
+    ("CX", "61"),
+    ("CY", "357"),
+    ("CZ", "420"),
+    ("DE", "49"),
+    ("DJ", "253"),
+    ("DK", "45"),
+    ("DM", "1"),
+    ("DO", "1"),
+    ("DZ", "213"),
+    ("EC", "593"),
+    ("EE", "372"),
+    ("EG", "20"),
+    ("EH", "212"),
+    ("ER", "291"),
+    ("ES", "34"),
+    ("ET", "251"),
+    ("FI", "358"),
+    ("FJ", "679"),
+    ("FK", "500"),
+    ("FM", "691"),
+    ("FO", "298"),
+    ("FR", "33"),
+    ("GA", "241"),
+    ("GB", "44"),
+    ("GD", "1"),
+    ("GE", "995"),
+    ("GG", "44"),
+    ("GH", "233"),
+    ("GI", "350"),
+    ("GL", "299"),
+    ("GM", "220"),
+    ("GN", "224"),
+    ("GQ", "240"),
+    ("GR", "30"),
+    ("GT", "502"),
+    ("GU", "1"),
+    ("GW", "245"),
+    ("GY", "592"),
+    ("HK", "852"),
+    ("HN", "504"),
+    ("HR", "385"),
+    ("HT", "509"),
+    ("HU", "36"),
+    ("ID", "62"),
+    ("IE", "353"),
+    ("IL", "972"),
+    ("IM", "44"),
+    ("IN", "91"),
+    ("IO", "246"),
+    ("IQ", "964"),
+    ("IR", "98"),
+    ("IS", "354"),
+    ("IT", "39"),
+    ("JE", "44"),
+    ("JM", "1"),
+    ("JO", "962"),
+    ("JP", "81"),
+    ("KE", "254"),
+    ("KG", "996"),
+    ("KH", "855"),
+    ("KI", "686"),
+    ("KM", "269"),
+    ("KN", "1"),
+    ("KP", "850"),
+    ("KR", "82"),
+    ("KW", "965"),
+    ("KY", "1"),
+    ("KZ", "7"),
+    ("LA", "856"),
+    ("LB", "961"),
+    ("LC", "1"),
+    ("LI", "423"),
+    ("LK", "94"),
+    ("LR", "231"),
+    ("LS", "266"),
+    ("LT", "370"),
+    ("LU", "352"),
+    ("LV", "371"),
+    ("LY", "218"),
+    ("MA", "212"),
+    ("MC", "377"),
+    ("MD", "373"),
+    ("ME", "382"),
+    ("MF", "590"),
+    ("MG", "261"),
+    ("MH", "692"),
+    ("MK", "389"),
+    ("ML", "223"),
+    ("MM", "95"),
+    ("MN", "976"),
+    ("MO", "853"),
+    ("MP", "1"),
+    ("MR", "222"),
+    ("MS", "1"),
+    ("MT", "356"),
+    ("MU", "230"),
+    ("MV", "960"),
+    ("MW", "265"),
+    ("MX", "52"),
+    ("MY", "60"),
+    ("MZ", "258"),
+    ("NA", "264"),
+    ("NC", "687"),
+    ("NE", "227"),
+    ("NG", "234"),
+    ("NI", "505"),
+    ("NL", "31"),
+    ("NO", "47"),
+    ("NP", "977"),
+    ("NR", "674"),
+    ("NU", "683"),
+    ("NZ", "64"),
+    ("OM", "968"),
+    ("PA", "507"),
+    ("PE", "51"),
+    ("PF", "689"),
+    ("PG", "675"),
+    ("PH", "63"),
+    ("PK", "92"),
+    ("PL", "48"),
+    ("PM", "508"),
+    ("PN", "64"),
+    ("PR", "1"),
+    ("PT", "351"),
+    ("PW", "680"),
+    ("PY", "595"),
+    ("QA", "974"),
+    ("RE", "262"),
+    ("RO", "40"),
+    ("RS", "381"),
+    ("RU", "7"),
+    ("RW", "250"),
+    ("SA", "966"),
+    ("SB", "677"),
+    ("SC", "248"),
+    ("SD", "249"),
+    ("SE", "46"),
+    ("SG", "65"),
+    ("SH", "290"),
+    ("SI", "386"),
+    ("SJ", "47"),
+    ("SK", "421"),
+    ("SL", "232"),
+    ("SM", "378"),
+    ("SN", "221"),
+    ("SO", "252"),
+    ("SR", "597"),
+    ("ST", "239"),
+    ("SV", "503"),
+    ("SX", "1"),
+    ("SY", "963"),
+    ("SZ", "268"),
+    ("TC", "1"),
+    ("TD", "235"),
+    ("TG", "228"),
+    ("TH", "66"),
+    ("TJ", "992"),
+    ("TK", "690"),
+    ("TL", "670"),
+    ("TM", "993"),
+    ("TN", "216"),
+    ("TO", "676"),
+    ("TR", "90"),
+    ("TT", "1"),
+    ("TV", "688"),
+    ("TW", "886"),
+    ("TZ", "255"),
+    ("UA", "380"),
+    ("UG", "256"),
+    ("US", "1"),
+    ("UY", "598"),
+    ("UZ", "998"),
+    ("VA", "39"),
+    ("VC", "1"),
+    ("VE", "58"),
+    ("VG", "1"),
+    ("VI", "1"),
+    ("VN", "84"),
+    ("VU", "678"),
+    ("WF", "681"),
+    ("WS", "685"),
+    ("YE", "967"),
+    ("YT", "262"),
+    ("ZA", "27"),
+    ("ZM", "260"),
+    ("ZW", "263"),
+];
+
+/// The E.164 country calling code of the ISO country `country_code`, or `None` when
+/// [`COUNTRY_CALLING_CODES`] does not name it.
+pub fn country_calling_code(country_code: &str) -> Option<&'static str> {
+    COUNTRY_CALLING_CODES
+        .binary_search_by(|(iso, _)| (*iso).cmp(country_code))
+        .ok()
+        .map(|found| COUNTRY_CALLING_CODES[found].1)
+}
+
+/// The slot an ISO 3166-1 alpha-2 code occupies in the 26x26 grid of two-letter
+/// codes: `0..=675`, different for every country, so the inventory numbers of two
+/// countries that share one calling code (`US` and `CA` share `1`) are still
+/// different numbers.
+fn country_slot(country_code: &str) -> Option<u32> {
+    let mut letters = country_code.bytes();
+    let (Some(first), Some(second), None) = (letters.next(), letters.next(), letters.next()) else {
+        return None;
+    };
+    if !first.is_ascii_uppercase() || !second.is_ascii_uppercase() {
+        return None;
+    }
+    Some(u32::from(first - b'A') * 26 + u32::from(second - b'A'))
+}
+
+/// The ISO country whose [`country_slot`] is `slot`, or `None` when `slot` is past
+/// the grid.
+fn country_of_slot(slot: u32) -> Option<String> {
+    if slot >= 26 * 26 {
+        return None;
+    }
+    let first = b'A' + (slot / 26) as u8;
+    let second = b'A' + (slot % 26) as u8;
+    Some(String::from_utf8(vec![first, second]).expect("two ASCII letters"))
+}
+
+/// The `serial`th number of the emulator's claimable inventory for `country_code`
+/// and `number_type`, or `None` when the country is not in
+/// [`COUNTRY_CALLING_CODES`], the type is not in the model's `PhoneNumberType`
+/// catalog, or the serial is past [`PHONE_NUMBERS_PER_COUNTRY_AND_TYPE`].
+///
+/// The number is `+<calling code><country slot, 3 digits><type slot><serial, 4
+/// digits>`: E.164, as the modelled `PhoneNumber` (`^\+[1-9]\d{1,14}$`) requires —
+/// at most 3 + 3 + 1 + 4 = 11 digits — carrying the calling code of the country it
+/// is offered for, and unique across every (country, type, serial) triple, so no two
+/// inventories advertise the same number. It is a pure function of those three, so
+/// the inventory does not have to be stored and every handler agrees on it.
+pub fn inventory_phone_number(
+    country_code: &str,
+    number_type: &str,
+    serial: u32,
+) -> Option<String> {
+    if serial >= PHONE_NUMBERS_PER_COUNTRY_AND_TYPE {
+        return None;
+    }
+    let calling_code = country_calling_code(country_code)?;
+    let slot = country_slot(country_code)?;
+    let type_slot = PHONE_NUMBER_TYPE_VALUES
+        .iter()
+        .position(|value| *value == number_type)?;
+    Some(format!("+{calling_code}{slot:03}{type_slot}{serial:04}"))
+}
+
+/// Which inventory number `phone_number` is, or `None` when it is not one at all —
+/// which is what makes a number claimable: `ClaimPhoneNumber` takes only a number
+/// `SearchAvailablePhoneNumbers` advertises.
+///
+/// The exact inverse of [`inventory_phone_number`]: the last eight digits are the
+/// country slot, the type slot and the serial, and what precedes them has to be the
+/// calling code of the country that slot names.
+pub fn parse_inventory_number(phone_number: &str) -> Option<InventoryNumber> {
+    let digits = phone_number.strip_prefix('+')?;
+    if !digits.bytes().all(|digit| digit.is_ascii_digit()) || digits.len() < 9 {
+        return None;
+    }
+    let (calling_code, tail) = digits.split_at(digits.len() - 8);
+    let country_code = country_of_slot(tail[..3].parse().ok()?)?;
+    if country_calling_code(&country_code) != Some(calling_code) {
+        return None;
+    }
+    let type_slot: usize = tail[3..4].parse().ok()?;
+    let number_type = PHONE_NUMBER_TYPE_VALUES.get(type_slot)?;
+    let serial: u32 = tail[4..].parse().ok()?;
+    if serial >= PHONE_NUMBERS_PER_COUNTRY_AND_TYPE {
+        return None;
+    }
+    Some(InventoryNumber {
+        country_code,
+        number_type: (*number_type).to_string(),
+        serial,
+    })
+}
+
+/// The inventory entry one E.164 number is, as [`parse_inventory_number`] reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InventoryNumber {
+    /// The ISO country the number is offered for.
+    pub country_code: String,
+    /// The `PhoneNumberType` it is offered as.
+    pub number_type: String,
+    /// Its position in that country and type's inventory.
+    pub serial: u32,
+}
+
+/// `arn:aws:connect:<region>:<account>:phone-number/<id>`: the ARN form Connect's own
+/// IAM resource types document for a claimed phone number, which is account-scoped
+/// rather than instance-scoped (a number can be re-targeted between instances).
+pub fn phone_number_arn(region: &str, phone_number_id: &str) -> String {
+    ::engine::emulator_arn("connect", region, &format!("phone-number/{phone_number_id}"))
+}
+
+/// One phone number claimed to this account.
+#[derive(Debug, Clone)]
+pub struct PhoneNumberRecord {
+    pub id: String,
+    pub arn: String,
+    /// The E.164 number, exactly as the inventory advertised it.
+    pub phone_number: String,
+    /// The ISO country and the `PhoneNumberType` of the inventory entry this number
+    /// came from — read off the number itself (see [`parse_inventory_number`]), so
+    /// what `DescribePhoneNumber` reports cannot disagree with what
+    /// `SearchAvailablePhoneNumbers` advertised.
+    pub country_code: String,
+    /// See [`PhoneNumberRecord::country_code`].
+    pub number_type: String,
+    pub description: Option<String>,
+    /// The instance the number's inbound traffic is routed through, and its ARN:
+    /// the target the claim resolved, never the text the request carried.
+    pub instance_id: String,
+    /// See [`PhoneNumberRecord::instance_id`].
+    pub target_arn: String,
+    pub tags: BTreeMap<String, String>,
+    /// The `ClientToken` the claim carried, which is what makes a repeated claim
+    /// report the first one rather than make a second (`@idempotencyToken`).
+    pub client_token: Option<String>,
+    /// The instant this claim reaches `CLAIMED`: the claim instant plus
+    /// [`PHONE_NUMBER_CLAIM_DELAY`]. Before it the number reports `IN_PROGRESS`.
+    pub claimed_at: SystemTime,
+}
+
+impl PhoneNumberRecord {
+    /// The claim's workflow status at `now` — derived from the stored instant, so
+    /// reading it changes nothing a later caller sees.
+    pub fn status(&self, now: SystemTime) -> &'static str {
+        if now < self.claimed_at + PHONE_NUMBER_CLAIM_DELAY {
+            PHONE_NUMBER_STATUS_IN_PROGRESS
+        } else {
+            PHONE_NUMBER_STATUS_CLAIMED
+        }
+    }
+
+    /// The modelled `ClaimedPhoneNumberSummary` shape `DescribePhoneNumber` returns.
+    ///
+    /// `SourcePhoneNumberArn` stays absent: it is the ARN a number IMPORTED from
+    /// another service carries, and `ImportPhoneNumber` is not implemented, so no
+    /// stored number has one.
+    pub fn to_summary(&self, now: SystemTime) -> ClaimedPhoneNumberSummary {
+        ClaimedPhoneNumberSummary {
+            phone_number_id: Some(self.id.clone()),
+            phone_number_arn: Some(self.arn.clone()),
+            phone_number: Some(self.phone_number.clone()),
+            phone_number_country_code: Some(self.country_code.clone()),
+            phone_number_type: Some(self.number_type.clone()),
+            phone_number_description: self.description.clone(),
+            target_arn: Some(self.target_arn.clone()),
+            instance_id: Some(self.instance_id.clone()),
+            tags: tags_out(&self.tags),
+            phone_number_status: Some(PhoneNumberStatus {
+                status: Some(self.status(now).to_string()),
+                message: None,
+            }),
+            source_phone_number_arn: None,
+        }
     }
 }
 

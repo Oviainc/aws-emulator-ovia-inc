@@ -170,7 +170,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if state.lock().remove_campaign(&input.id).is_none() {
             return Err(DeleteCampaignErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: format!("No campaign found for id {}", input.id),
+                    message: crate::state::CAMPAIGN_NOT_FOUND_MESSAGE.to_string(),
                     x_amz_error_type: None,
                 },
             )

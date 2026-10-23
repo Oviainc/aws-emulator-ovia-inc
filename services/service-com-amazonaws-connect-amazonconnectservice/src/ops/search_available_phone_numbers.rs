@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SearchAvailablePhoneNumbers
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SearchAvailablePhoneNumbers`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SearchAvailablePhoneNumbers::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the page of this account's claimable inventory that matches the requested
+//! country, type and prefix for the target the request names: the numbers
+//! [`crate::state::inventory_phone_number`] lays out for that country and type, minus
+//! the ones already claimed. A pure report — the inventory is derived from stored
+//! state, so searching it claims nothing and two callers searching at the same moment
+//! see the same page.
 //!
 //! ## Shape of an operation
 //!
@@ -167,18 +165,59 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SearchAvailablePhoneNumbers` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SearchAvailablePhoneNumbersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SearchAvailablePhoneNumbers"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            SearchAvailablePhoneNumbersErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the Amazon Connect store is unavailable".to_string()),
+                },
+            )
+        })?;
+
+        // This operation models no `InvalidRequestException`, so every refusal of a
+        // parameter it cannot act on — an unreadable cursor, a target it cannot
+        // resolve — is the modelled `InvalidParameterException` (HTTP 400).
+        let cursor = match input.next_token.as_deref() {
+            Some(token) => Some(crate::state::decode_page_token(token).ok_or_else(|| {
+                invalid_parameter("NextToken is not a token this service issued")
+            })?),
+            None => None,
+        };
+
+        let store = state.lock();
+        // The target has to exist: numbers are offered for an instance (or a traffic
+        // distribution group) to claim them to, so a target that names nothing is a
+        // bad parameter rather than an empty inventory.
+        store
+            .resolve_phone_number_target(input.instance_id.as_deref(), input.target_arn.as_deref())
+            .map_err(|problem| invalid_parameter(problem.refusal()))?;
+
+        let entries = store.available_phone_numbers(
+            &input.phone_number_country_code,
+            &input.phone_number_type,
+            input.phone_number_prefix.as_deref(),
+        );
+        drop(store);
+
+        let (available_numbers_list, next_token) = crate::state::paginate(
+            entries,
+            cursor.as_deref(),
+            input.max_results,
+            crate::state::SEARCH_AVAILABLE_PHONE_NUMBERS_DEFAULT_PAGE_SIZE,
+        );
+
+        Ok(SearchAvailablePhoneNumbersOutput {
+            available_numbers_list: Some(available_numbers_list),
+            next_token,
+        })
     }
+}
+
+/// The modelled `InvalidParameterException` (HTTP 400) this operation refuses a
+/// parameter it cannot act on with.
+fn invalid_parameter(message: &str) -> SearchAvailablePhoneNumbersError {
+    SearchAvailablePhoneNumbersErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(message.to_string()),
+    })
+    .into()
 }

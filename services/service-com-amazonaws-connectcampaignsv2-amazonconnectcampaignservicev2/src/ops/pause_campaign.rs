@@ -182,7 +182,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(campaign) = store.campaign_mut(&input.id) else {
             return Err(PauseCampaignErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: format!("No campaign found for id {}", input.id),
+                    message: crate::state::CAMPAIGN_NOT_FOUND_MESSAGE.to_string(),
                     x_amz_error_type: None,
                 },
             )
