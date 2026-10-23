@@ -30,7 +30,7 @@ use crate::automation_rule_lifecycle::{
 /// Record `actions` into the service's store — the one store
 /// `StartAutomationEvent` resolves an id against — the way Compute Optimizer's
 /// analysis would.
-fn record(engine: &Arc<engine::InMemoryEngine>, actions: Vec<RecommendedAction>) {
+pub(crate) fn record(engine: &Arc<engine::InMemoryEngine>, actions: Vec<RecommendedAction>) {
     let state = service_state(&**engine).expect("the engine bears this service's state");
     let mut guard = state.lock();
     for action in actions {
@@ -43,7 +43,7 @@ fn record(engine: &Arc<engine::InMemoryEngine>, actions: Vec<RecommendedAction>)
 }
 
 /// How many actions the store holds.
-fn stored_count(engine: &Arc<engine::InMemoryEngine>) -> usize {
+pub(crate) fn stored_count(engine: &Arc<engine::InMemoryEngine>) -> usize {
     service_state(&**engine)
         .expect("the engine bears this service's state")
         .lock()
@@ -52,7 +52,7 @@ fn stored_count(engine: &Arc<engine::InMemoryEngine>) -> usize {
 }
 
 /// A `RecommendedActionId`, modelled as `^[0-9A-Za-z]{16}$`.
-fn action_id(index: usize) -> String {
+pub(crate) fn action_id(index: usize) -> String {
     format!("acoaction{index:07}")
 }
 
@@ -71,7 +71,7 @@ fn ebs_details(volume_type: &str, size_in_gib: i32) -> ResourceDetails {
 /// One recorded recommended action, varying along every dimension
 /// `RecommendedActionFilterName` selects on.
 #[allow(clippy::too_many_arguments)]
-fn stored(
+pub(crate) fn stored(
     index: usize,
     resource_id: &str,
     account_id: &str,
@@ -117,7 +117,7 @@ fn stored(
 }
 
 /// The second account these fixtures use, beside the emulator's own.
-const MEMBER_ACCOUNT_ID: &str = "210987654321";
+pub(crate) const MEMBER_ACCOUNT_ID: &str = "210987654321";
 
 /// The four actions the filter and paging cases are taken over, in record order.
 fn fixtures() -> Vec<RecommendedAction> {

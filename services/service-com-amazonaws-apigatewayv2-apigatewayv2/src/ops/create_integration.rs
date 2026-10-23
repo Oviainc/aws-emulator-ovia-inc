@@ -347,7 +347,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let is_http = api.protocol_type == HTTP_PROTOCOL_TYPE;
+        let is_http = api.protocol_type == crate::state::HTTP_PROTOCOL_TYPE;
 
         // "For a Lambda integration, specify the URI of a Lambda function. For an HTTP
         // integration, specify a fully-qualified URL" (`CreateIntegration$IntegrationUri`):
@@ -468,11 +468,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })
     }
 }
-
-/// The `ProtocolType` value that selects an HTTP API, from `PROTOCOL_TYPE_VALUES`
-/// (`HTTP | WEBSOCKET`) — which of the two documented defaults an absent
-/// `TimeoutInMillis` takes, and whether `PayloadFormatVersion` is required.
-const HTTP_PROTOCOL_TYPE: &str = "HTTP";
 
 /// The one `IntegrationType` that names no endpoint, from `INTEGRATION_TYPE_VALUES`:
 /// "MOCK: for integrating the route or method request with API Gateway as a ‘loopback'

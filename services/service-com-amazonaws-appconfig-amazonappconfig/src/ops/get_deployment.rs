@@ -207,15 +207,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let Some(application) = store.applications.get_mut(&input.application_id) else {
             return Err(not_found(
-                format!("No application with id {} exists.", input.application_id),
+                crate::state::application_not_found(&input.application_id),
                 input.application_id,
             ));
         };
         let Some(environment) = application.environments.get_mut(&input.environment_id) else {
             return Err(not_found(
-                format!(
-                    "No environment with id {} exists in application {}.",
-                    input.environment_id, input.application_id
+                crate::state::environment_not_found(
+                    &input.application_id,
+                    &input.environment_id,
                 ),
                 input.environment_id,
             ));
@@ -228,9 +228,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let Some(deployment) = environment.deployments.get(&input.deployment_number) else {
             return Err(not_found(
-                format!(
-                    "No deployment number {} exists in environment {}.",
-                    input.deployment_number, input.environment_id
+                crate::state::deployment_not_found(
+                    &input.application_id,
+                    &input.environment_id,
+                    input.deployment_number,
                 ),
                 input.deployment_number.to_string(),
             ));

@@ -666,9 +666,9 @@ async fn criteria_outside_the_published_bounds_are_refused() {
             String::from_utf8_lossy(&refused.body)
         );
         assert!(
-            refused.error_code().contains("ValidationException"),
+            refused.error_code().contains("BadRequestException"),
             "case {case:?}: a bound the model declares is enforced by the schema walk, \
-             which refuses it with ValidationException; got {:?}",
+             which refuses it with the modelled BadRequestException; got {:?}",
             refused.error_code()
         );
         assert_eq!(
