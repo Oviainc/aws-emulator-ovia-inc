@@ -1301,6 +1301,10 @@ pub struct ComAmazonawsSagemakerSagemakerState {
     /// Lineage artifacts, keyed by `ArtifactArn` — the only identifier `DescribeArtifact`
     /// resolves one by, and the one `CreateArtifact` mints.
     pub artifacts: BTreeMap<String, Artifact>,
+    /// Keyed by `FeatureGroupName`. Served by the "Feature Store control plane" section
+    /// of this module, which holds the whole feature-group slice — its constants, its
+    /// record and its quota helper — in one block.
+    pub feature_groups: BTreeMap<String, FeatureGroup>,
     /// Keyed by `NotebookInstanceName`. See [`NotebookInstance`], at the end of this
     /// module with the rest of the notebook-instance slice.
     pub notebook_instances: BTreeMap<String, NotebookInstance>,
@@ -1589,9 +1593,9 @@ pub const NO_STATE: &str =
 /// It is a CONSTANT of the service, not built from the request: SageMaker answers the
 /// same sentence whatever resource kind and whatever name the caller asked for, and the
 /// name is not repeated back. Stated once here so each create that MODELS
-/// `ResourceInUse` refuses with the same wording — today `CreateAppImageConfig` and
-/// `CreateAIWorkloadConfig`; an operation whose model does not bind
-/// `ResourceInUse` (`CreateModel`, `CreateModelPackageGroup`) refuses with its own
+/// `ResourceInUse` refuses with the same wording — today `CreateAppImageConfig`,
+/// `CreateAIWorkloadConfig` and `CreateFeatureGroup`; an operation whose model does not
+/// bind `ResourceInUse` (`CreateModel`, `CreateModelPackageGroup`) refuses with its own
 /// `ValidationException` text instead and does not use this.
 pub const RESOURCE_IN_USE_MESSAGE: &str = "The ID or Name specified is already in use.";
 
@@ -2143,6 +2147,126 @@ pub fn timestamp(at: SystemTime) -> ::aws_smithy_types::DateTime {
 /// order against each other without going through a lossy float.
 pub fn timestamp_key(at: ::aws_smithy_types::DateTime) -> (i64, u32) {
     (at.secs(), at.subsec_nanos())
+}
+
+// ---------------------------------------------------------------------------
+// Feature Store control plane
+//
+// Everything the feature-group slice of this service needs — its constants, its record,
+// its status transition and its quota helper — is kept together in this ONE section, the
+// way the lineage-action and AI-workload-configuration slices below are, so one
+// resource's state reads as one block. Its shapes are named by their full
+// `crate::ops::types::` path rather than through a `use`, so the slice carries no import
+// of its own.
+// ---------------------------------------------------------------------------
+
+/// How long after `CreateFeatureGroup` the clock owes the `Creating` -> `Created`
+/// transition.
+///
+/// Same contract as [`ENDPOINT_IN_SERVICE_AFTER`]: a caller that describes the feature
+/// group straight after creating it still observes `Creating`, and one that polls (as
+/// `aws sagemaker wait` and the Feature Store SDK's own wait loop do) observes
+/// `Created`. The model's doc puts the real service at "approximately 10-15 minutes to
+/// provision an OnlineStore FeatureGroup with the InMemory StorageType", so the span is
+/// compressed, never zero.
+pub const FEATURE_GROUP_CREATED_AFTER: Duration = Duration::from_millis(300);
+
+/// See [`MODEL_QUOTA`]. `CreateFeatureGroup`'s doc points at the published quota
+/// ("Check Amazon Web Services service quotas to see the FeatureGroups quota for your
+/// Amazon Web Services account"), which is per-account and adjustable, so this is the
+/// emulator's own bound rather than a claim about any account's limit.
+pub const FEATURE_GROUP_QUOTA: usize = 1_000;
+
+/// `FeatureGroupStatus`'s members this emulator moves a feature group through (the
+/// modelled enum also carries `CreateFailed`, `Deleting` and `DeleteFailed`, which this
+/// slice does not reach). Named once here so no handler compares a bare string literal.
+/// Deliberately separate from [`STATUS_CREATING`] even though the two spell the same
+/// value today: they are members of two different modelled enums, and either may be
+/// re-spelled without the other.
+pub const FEATURE_GROUP_STATUS_CREATING: &str = "Creating";
+/// See [`FEATURE_GROUP_STATUS_CREATING`].
+pub const FEATURE_GROUP_STATUS_CREATED: &str = "Created";
+
+/// The `OfflineStoreStatusValue` an offline store this emulator holds reports: the
+/// replication it describes never fails here, so it is never `Blocked`.
+pub const OFFLINE_STORE_STATUS_ACTIVE: &str = "Active";
+
+/// The feature names a `FeatureGroup` may not declare, from `FeatureDefinitions`' own
+/// doc: "FeatureNames cannot be any of the following: is_deleted, write_time,
+/// api_invocation_time" — Feature Store writes those three columns itself.
+pub const RESERVED_FEATURE_NAMES: &[&str] = &["is_deleted", "write_time", "api_invocation_time"];
+
+/// A feature group created by `CreateFeatureGroup`, as `DescribeFeatureGroup` replays
+/// it.
+///
+/// `created_due_at` is the instant the clock owes the `Creating` -> `Created` transition;
+/// like [`Endpoint::in_service_at`] it is stored, never slept on, and materialised by
+/// whichever reporting call first runs at or after it.
+#[derive(Debug, Clone)]
+pub struct FeatureGroup {
+    pub name: String,
+    pub arn: String,
+    pub record_identifier_feature_name: String,
+    pub event_time_feature_name: String,
+    pub feature_definitions: Vec<crate::ops::types::FeatureDefinition>,
+    pub online_store_config: Option<crate::ops::types::OnlineStoreConfig>,
+    pub offline_store_config: Option<crate::ops::types::OfflineStoreConfig>,
+    pub throughput_config: Option<crate::ops::types::ThroughputConfig>,
+    pub role_arn: Option<String>,
+    pub description: Option<String>,
+    pub tags: Vec<Tag>,
+    pub status: String,
+    pub creation_time: SystemTime,
+    pub last_modified_time: SystemTime,
+    /// WHEN the `Created` status falls due, not when the group was created — that is
+    /// `creation_time`. Named the way [`Endpoint::in_service_at`] names the same thing.
+    pub created_due_at: SystemTime,
+}
+
+impl FeatureGroup {
+    /// Materialise the `Creating` -> `Created` transition the clock already owes.
+    ///
+    /// The one write a reporting operation may make, for the reason spelled out on
+    /// [`Endpoint::settle_status`]: the transition was due at `created_due_at` whether or
+    /// not anybody described the group.
+    ///
+    /// Answers whether the transition happened on this call, so the caller can record it.
+    pub fn settle_status(&mut self, now: SystemTime) -> bool {
+        if self.status == FEATURE_GROUP_STATUS_CREATING && now >= self.created_due_at {
+            self.status = FEATURE_GROUP_STATUS_CREATED.to_string();
+            self.last_modified_time = self.created_due_at;
+            return true;
+        }
+        false
+    }
+
+    /// This group's throughput configuration as `DescribeFeatureGroup` reports it.
+    ///
+    /// `ThroughputConfig` (what a create states) and `ThroughputConfigDescription`
+    /// (what a describe reports) are two shapes with the same three members, so the
+    /// active configuration is the one the create stated, re-shaped. A group created
+    /// without one has no mode to report and reports none.
+    pub fn throughput_config_description(
+        &self,
+    ) -> Option<crate::ops::types::ThroughputConfigDescription> {
+        self.throughput_config.as_ref().map(|config| {
+            crate::ops::types::ThroughputConfigDescription {
+                throughput_mode: config.throughput_mode.clone(),
+                provisioned_read_capacity_units: config.provisioned_read_capacity_units,
+                provisioned_write_capacity_units: config.provisioned_write_capacity_units,
+            }
+        })
+    }
+}
+
+/// The feature-group half of the store's API, in its own `impl` block for the same
+/// reason as the section: a resource's state reads as one block.
+impl ComAmazonawsSagemakerSagemakerState {
+    /// Whether another feature group fits, i.e. the store is below
+    /// [`FEATURE_GROUP_QUOTA`].
+    pub fn feature_groups_below_quota(&self) -> bool {
+        self.feature_groups.len() < FEATURE_GROUP_QUOTA
+    }
 }
 
 // ---------------------------------------------------------------------------

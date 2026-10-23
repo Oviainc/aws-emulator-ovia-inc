@@ -46,9 +46,12 @@ const DEFAULT_REGION: &str = "us-east-1";
 /// default data port, as `instance_lifecycle.rs`'s sibling suites use it.
 const ENDPOINT_HOST: &str = "127.0.0.1:9297";
 
-/// The path space a bucket's announced address lives under
-/// (`crate::state::BUCKET_PUBLIC_PATH_PREFIX`).
-const PUBLIC_PATH_PREFIX: &str = "/lightsail-bucket";
+/// The path-style S3 address of a bucket named `name` under the endpoint `host`:
+/// what `Bucket$url` announces, because that is where this emulator's Amazon S3
+/// data plane answers for the bucket (`crate::state::bucket_url`).
+fn announced_url(host: &str, name: &str) -> String {
+    format!("https://{host}/{name}")
+}
 
 /// Every member the modelled `Bucket` structure declares that a read without
 /// `includeConnectedResources` or `includeCors` reports
@@ -372,13 +375,7 @@ async fn a_created_bucket_reports_the_request_and_the_members_the_service_assign
         );
         assert_eq!(
             bucket["url"].as_str(),
-            Some(
-                format!(
-                    "https://{ENDPOINT_HOST}{PUBLIC_PATH_PREFIX}/{}/{}",
-                    row.reported_region, row.name
-                )
-                .as_str()
-            ),
+            Some(announced_url(ENDPOINT_HOST, row.name).as_str()),
             "case {case}: expected the bucket's address under the endpoint this request \
              arrived at, got {:?}",
             bucket["url"]
@@ -582,51 +579,82 @@ async fn every_published_bundle_is_accepted_and_an_unpublished_one_is_refused() 
     );
 }
 
-/// A bucket name identifies one bucket WITHIN one Region: the same name is
-/// refused in the Region that holds it and free in another, and each Region's
-/// listing reports only its own buckets.
+/// A bucket's name is its ADDRESS in the one object storage namespace this
+/// emulator serves (`Bucket$url` is "The URL of the bucket", and the path-style S3
+/// address it announces carries the name and no Region), so a name that is taken is
+/// taken whatever Region the create is made in: a second bucket of that name in
+/// another Region is not created at all, rather than created and unreachable. The
+/// refusal leaves the bucket that holds the name, and every Region's listing,
+/// exactly as they were.
+///
+/// The rows differ along the Region the second create is made in: the one that
+/// holds the name, and another one.
 #[tokio::test]
-async fn names_are_unique_within_one_region_only() {
+async fn a_taken_name_is_refused_in_every_region() {
     let emulator = Emulator::new();
     let body = json!({"bucketName": "shared-name", "bundleId": "small_1_0"});
 
     let (first, _) = create(&emulator, Some("us-east-2"), body.clone()).await;
-    let (status, refused) = emulator
-        .call_in(Some("us-east-2"), "CreateBucket", body.clone())
-        .await;
-    assert_eq!(
-        status, 400,
-        "case the same name in the same region: expected a 400, got {status} {refused:?}"
-    );
-    assert_eq!(
-        error_code(&refused),
-        "InvalidInputException",
-        "case the same name in the same region: expected InvalidInputException, got {refused:?}"
-    );
-    // The refusal left the bucket that holds the name exactly as it was.
-    let unchanged = read(&emulator, Some("us-east-2"), "shared-name").await;
-    assert_eq!(
-        unchanged, first,
-        "case the same name in the same region: the refused create must change nothing, got \
-         {unchanged:?}"
-    );
 
-    // The same name in another Region is a different bucket, with its own ARN.
+    for (case, region) in [
+        ("the same name in the same region", "us-east-2"),
+        ("the same name in another region", "eu-central-1"),
+    ] {
+        let (status, refused) = emulator
+            .call_in(Some(region), "CreateBucket", body.clone())
+            .await;
+        assert_eq!(
+            status, 400,
+            "case {case}: expected a 400, got {status} {refused:?}"
+        );
+        assert_eq!(
+            error_code(&refused),
+            "InvalidInputException",
+            "case {case}: expected InvalidInputException, got {refused:?}"
+        );
+        // The refusal left the bucket that holds the name exactly as it was.
+        let unchanged = read(&emulator, Some("us-east-2"), "shared-name").await;
+        assert_eq!(
+            unchanged, first,
+            "case {case}: the refused create must change nothing, got {unchanged:?}"
+        );
+        // And created nothing in the Region it was made in.
+        let (names, _) = list(&emulator, Some(region)).await;
+        let expected: Vec<String> = if region == "us-east-2" {
+            vec!["shared-name".to_string()]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(
+            names, expected,
+            "case {case}: expected {expected:?} in {region}, got {names:?}"
+        );
+    }
+
+    // The name is free again once the bucket that holds it is deleted, which is
+    // what releases it: "the bucket name is released and can be reused for a new
+    // bucket" (`DeleteBucket`).
+    emulator
+        .ok_at(
+            Some(ENDPOINT_HOST),
+            Some("us-east-2"),
+            "DeleteBucket",
+            json!({"bucketName": "shared-name"}),
+        )
+        .await;
     let (elsewhere, _) = create(&emulator, Some("eu-central-1"), body).await;
     assert_eq!(
         elsewhere["location"]["regionName"].as_str(),
         Some("eu-central-1"),
-        "case the same name in another region: expected that region, got {elsewhere:?}"
+        "case the released name in another region: expected that region, got {elsewhere:?}"
     );
     assert_ne!(
         elsewhere["arn"], first["arn"],
-        "case the same name in another region: expected its own arn, got {:?}",
+        "case the released name in another region: expected its own arn, got {:?}",
         elsewhere["arn"]
     );
-
-    // And each Region's listing reports only its own buckets.
     for (region, expected) in [
-        ("us-east-2", vec!["shared-name".to_string()]),
+        ("us-east-2", Vec::new()),
         ("eu-central-1", vec!["shared-name".to_string()]),
         (DEFAULT_REGION, Vec::new()),
     ] {
@@ -892,9 +920,10 @@ async fn the_pre_write_bounds_accept_the_bound_and_refuse_past_it_without_persis
 /// names no host names no endpoint to announce, so `url` is omitted rather than
 /// filled with an address nothing serves.
 ///
-/// The rows differ along the two things the announced address is built from: the
-/// endpoint the request arrived at (two different hosts, and no host at all) and
-/// the Region the bucket lives in.
+/// The rows differ along the endpoint the request arrived at (two different hosts,
+/// and no host at all) and the Region the bucket lives in — which the address does
+/// NOT carry, since a bucket's name alone addresses it in the object namespace the
+/// endpoint serves.
 #[tokio::test]
 async fn the_announced_address_is_the_endpoint_the_request_arrived_at() {
     let emulator = Emulator::new();
@@ -922,11 +951,10 @@ async fn the_announced_address_is_the_endpoint_the_request_arrived_at() {
             )
             .await["bucket"]
             .clone();
-        let served_region = region.unwrap_or(DEFAULT_REGION);
 
         match host {
             Some(host) => {
-                let expected = format!("https://{host}{PUBLIC_PATH_PREFIX}/{served_region}/{name}");
+                let expected = announced_url(host, &name);
                 assert_eq!(
                     created["url"].as_str(),
                     Some(expected.as_str()),
@@ -963,10 +991,7 @@ async fn the_announced_address_is_the_endpoint_the_request_arrived_at() {
             .clone();
         assert_eq!(
             elsewhere["url"].as_str(),
-            Some(
-                format!("https://another.endpoint:1234{PUBLIC_PATH_PREFIX}/{served_region}/{name}")
-                    .as_str()
-            ),
+            Some(announced_url("another.endpoint:1234", &name).as_str()),
             "case {case}: expected the read's own endpoint, got {:?}",
             elsewhere["url"]
         );

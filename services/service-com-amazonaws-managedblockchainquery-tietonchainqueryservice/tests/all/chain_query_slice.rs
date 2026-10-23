@@ -62,6 +62,20 @@ fn filtered_events_body(network: &str, address: &str) -> Value {
     })
 }
 
+/// A well-formed Bitcoin address that the fixture ledger holds nothing under.
+///
+/// Built here rather than written down: `z` is in the base58 alphabet and `1` is the
+/// leading character of a mainnet pay-to-public-key-hash address, so this has the shape
+/// the chain's base58 encoding fixes while being a body no fixture digest produces. A
+/// listing keyed by it is therefore empty for the only reason that matters: the index
+/// holds nothing under it. It takes no network, because what makes a string an address of
+/// this chain is the encoding, which both of the chain's networks share.
+///
+/// `pub(crate)` because the sibling suites need the same row.
+pub(crate) fn unseeded_bitcoin_address() -> String {
+    format!("1{}", "z".repeat(32))
+}
+
 /// The operations this slice deliberately leaves scaffolded, with a request that
 /// satisfies every modelled constraint so the answer can only be the scaffold's own.
 ///
@@ -1502,10 +1516,10 @@ async fn list_filtered_transaction_events_returns_exactly_the_events_sent_to_the
         }
         // Rows: every address the ledger knows — which spans addresses that received
         // several events, one, and none — plus an address it does not know at all. The
-        // unknown row satisfies `ChainAddress`'s `^[-A-Za-z0-9]{13,74}$` and is not a
-        // base58 digest the fixture could have produced.
+        // unknown row is a well-formed Bitcoin address (which this operation requires of
+        // its filter) that no fixture produced.
         let mut addresses: Vec<String> = network.addresses().into_iter().collect();
-        addresses.push("1".repeat(34));
+        addresses.push(unseeded_bitcoin_address());
 
         for address in addresses {
             let ascending = events_sent_to(&emulator, &network, &address).await;

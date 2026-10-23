@@ -25,6 +25,10 @@ tracing = { workspace = true }
 # SHA-256 of this store's counter plus a per-process seed, rendered as hex.
 sha2 = { workspace = true }
 hex = { workspace = true }
+# A Lightsail bucket IS an S3-compatible object store, so the bucket it is served
+# from lives in the ONE object store this emulator holds — Amazon S3's own — which
+# this service provisions a bucket in and reads the object presence of.
+service-com-amazonaws-s3-amazons3 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -34,6 +38,9 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 # `time` for the tests that wait on a clock-owed instance transition.
 tokio = { workspace = true, features = ["time"] }
+# An XML reader for the `ListObjectsV2` body the bucket object data plane answers
+# with, so a listing is read as a client reads it rather than by slicing the body.
+quick-xml = "0.41"
 
 [lints]
 workspace = true

@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutResourceConfig
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutResourceConfig`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutResourceConfig::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Records the configuration state of one custom resource into the discovered-resource
+//! inventory in [`crate::state`], which is what `GetDiscoveredResourceCounts` counts.
+//! A re-record of the same resource type and id replaces the configuration it holds
+//! and keeps the instant Config first recorded it.
 //!
 //! ## Shape of an operation
 //!
@@ -112,6 +107,67 @@ use super::types::*;
 // `PutResourceConfigError` enum is never produced.
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-configservice-starlingdoveservice.json");
 
+/// The most custom resources one account can have the configuration of recorded at
+/// once, after which this operation refuses (`MaxActiveResourcesExceededException`:
+/// "You have reached the limit of active custom resource types in your account. There
+/// is a limit of 100,000"). With [`MAX_RESOURCE_CONFIGURATION_BYTES`] it is also what
+/// bounds what the inventory can hold.
+///
+/// The quota counts ACTIVE resources, as AWS words it, so an entry carrying a
+/// recorded deletion does not occupy one. Nothing records a deletion yet
+/// (`DeleteResourceConfig` is still a scaffold); whoever implements it has to keep
+/// the inventory itself bounded — by dropping the entry, or by bounding how many
+/// deleted ones are retained.
+pub const ACTIVE_CUSTOM_RESOURCES_QUOTA: usize = 100_000;
+
+/// The largest `Configuration` document this operation records
+/// (`PutResourceConfigRequest$Configuration`: "The configuration JSON must not exceed
+/// 64 KB").
+pub const MAX_RESOURCE_CONFIGURATION_BYTES: usize = 64 * 1024;
+
+/// The organization names a custom resource type cannot use — the first segment of a
+/// resource type name, up to the first `::`
+/// (`PutResourceConfigRequest$ResourceType`: "You cannot use the organization names
+/// 'amzn', 'amazon', 'alexa', 'custom' with custom resource types. It is the first
+/// part of the ResourceType up to the first ::"; the CloudFormation registry a custom
+/// type must be registered with reserves `AWS` and `Dev` the same way). Spelled in
+/// lowercase because an organization name is matched case-insensitively.
+pub const RESERVED_RESOURCE_TYPE_ORGANIZATIONS: [&str; 6] =
+    ["alexa", "amazon", "amzn", "aws", "custom", "dev"];
+
+/// How many `::`-separated segments a CloudFormation registry type name carries
+/// (`Organization::Service::Resource`), which is the form a custom resource type
+/// recorded through this operation takes. A registry MODULE name carries a fourth
+/// segment (`::MODULE`) and names no resource, so it is not one of these.
+pub const RESOURCE_TYPE_SEGMENTS: usize = 3;
+
+/// Why `resource_type` cannot name a custom resource type, or `None` when it can.
+///
+/// A custom resource type is a CloudFormation registry type name —
+/// `Organization::Service::Resource` — whose organization is none of the reserved
+/// [`RESERVED_RESOURCE_TYPE_ORGANIZATIONS`]. The message is BUILT FROM THE REQUEST:
+/// it names the member, quotes the value sent and states the constraint it failed.
+fn custom_resource_type_refusal(resource_type: &str) -> Option<String> {
+    let segments: Vec<&str> = resource_type.split("::").collect();
+    if segments.len() != RESOURCE_TYPE_SEGMENTS || segments.iter().any(|segment| segment.is_empty())
+    {
+        return Some(format!(
+            "Value '{resource_type}' at 'resourceType' failed to satisfy constraint: a \
+             custom resource type must be registered with CloudFormation under a type \
+             name of the form Organization::Service::Resource"
+        ));
+    }
+    let organization = segments[0];
+    if RESERVED_RESOURCE_TYPE_ORGANIZATIONS.contains(&organization.to_ascii_lowercase().as_str()) {
+        return Some(format!(
+            "Value '{resource_type}' at 'resourceType' failed to satisfy constraint: the \
+             organization name '{organization}' is reserved and cannot be used with \
+             custom resource types"
+        ));
+    }
+    None
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct PutResourceConfigOutput;
 
@@ -196,18 +252,115 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutResourceConfig` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutResourceConfigErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutResourceConfig"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE)
+        })?;
+
+        let refuse = |message: String| -> Self::Error {
+            PutResourceConfigErrorModeled::ValidationException(ValidationException {
+                message: Some(message),
+            })
+            .into()
+        };
+
+        // This API records CUSTOM resource types: a CloudFormation registry type name
+        // whose organization is not one AWS reserves.
+        if let Some(message) = custom_resource_type_refusal(&input.resource_type) {
+            return Err(refuse(message));
+        }
+
+        // "The configuration object of the resource in valid JSON format", and "The
+        // configuration JSON must not exceed 64 KB".
+        if input.configuration.len() > MAX_RESOURCE_CONFIGURATION_BYTES {
+            return Err(refuse(format!(
+                "Value at 'configuration' failed to satisfy constraint: the configuration \
+                 JSON must not exceed {MAX_RESOURCE_CONFIGURATION_BYTES} bytes, and {} were \
+                 sent",
+                input.configuration.len(),
+            )));
+        }
+        if serde_json::from_str::<serde_json::Value>(&input.configuration).is_err() {
+            return Err(refuse(
+                "Value at 'configuration' failed to satisfy constraint: the configuration \
+                 object of the resource must be in valid JSON format"
+                    .to_string(),
+            ));
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // Config records a configuration item only while a recorder is recording.
+        if store.recording_recorder().is_none() {
+            return Err(
+                PutResourceConfigErrorModeled::NoRunningConfigurationRecorderException(
+                    NoRunningConfigurationRecorderException {
+                        message: Some(
+                            "there is no configuration recorder running; use \
+                             StartConfigurationRecorder to turn one on before recording a \
+                             resource configuration"
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let key = (input.resource_type.clone(), input.resource_id.clone());
+        if let Some(existing) = store.discovered_resources.get_mut(&key) {
+            // Re-recording a resource replaces its configuration state; the instant
+            // Config first discovered it is part of its identity and does not move.
+            existing.resource_name = input.resource_name.clone();
+            existing.schema_version_id = Some(input.schema_version_id.clone());
+            existing.configuration = Some(input.configuration.clone());
+            existing.tags = input.tags.clone().unwrap_or_default().into_iter().collect();
+            existing.first_recorded_at = existing.first_recorded_at.or(Some(now));
+            existing.last_recorded_at = Some(now);
+            // Recording the configuration of a resource Config had recorded the
+            // deletion of discovers it again.
+            existing.deleted_at = None;
+            return Ok(PutResourceConfigOutput);
+        }
+
+        // A new resource has to fit under the account's ACTIVE custom resources limit,
+        // which an entry Config recorded the deletion of does not occupy.
+        let active = store
+            .discovered_resources
+            .values()
+            .filter(|entry| entry.deleted_at.is_none())
+            .count();
+        if active >= ACTIVE_CUSTOM_RESOURCES_QUOTA {
+            return Err(
+                PutResourceConfigErrorModeled::MaxActiveResourcesExceededException(
+                    MaxActiveResourcesExceededException {
+                        message: Some(format!(
+                            "this account already holds the maximum of \
+                             {ACTIVE_CUSTOM_RESOURCES_QUOTA} active custom resources; delete \
+                             unused resources with DeleteResourceConfig"
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        store.discovered_resources.insert(
+            key,
+            crate::state::DiscoveredResourceEntry {
+                resource_type: input.resource_type.clone(),
+                resource_id: input.resource_id.clone(),
+                resource_name: input.resource_name.clone(),
+                deleted_at: None,
+                schema_version_id: Some(input.schema_version_id.clone()),
+                configuration: Some(input.configuration.clone()),
+                tags: input.tags.clone().unwrap_or_default().into_iter().collect(),
+                first_recorded_at: Some(now),
+                last_recorded_at: Some(now),
+            },
+        );
+
+        Ok(PutResourceConfigOutput)
     }
 }

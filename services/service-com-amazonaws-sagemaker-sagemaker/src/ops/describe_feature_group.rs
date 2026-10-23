@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeFeatureGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeFeatureGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeFeatureGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: replays the feature group `CreateFeatureGroup` stored under the name or
+//! ARN the request names, materialising the `Creating` -> `Created` transition the clock
+//! already owes, and refuses an unknown group with the modelled `ResourceNotFound`. The
+//! input `NextToken` resumes the list of features, and one response here carries every
+//! `FeatureDefinition` a group can hold, so the only token this operation issues — and
+//! the only one it accepts — is the empty one. This is the ONLY file to touch for this
+//! operation.
 //!
 //! ## Shape of an operation
 //!
@@ -192,18 +190,92 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeFeatureGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeFeatureGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeFeatureGroup"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        // `NextToken` resumes the list of features. This operation issues exactly one
+        // token — the empty one (see the output member below) — so a non-empty token is
+        // one it never minted and cannot resume from: refused, rather than answered with
+        // a 200 that silently restarts the list and would let a client's broken token
+        // handling pass here and fail against the real service.
+        if input.next_token.as_ref().is_some_and(|token| !token.is_empty()) {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "NextToken: the token is not one DescribeFeatureGroup issued. One response \
+                 carries every FeatureDefinition of a FeatureGroup, so the only token this \
+                 operation resumes from is the empty one.",
+            ));
+        }
+
+        // `FeatureGroupNameOrArn`: the ARN prefix is optional, so a group's ARN and its
+        // bare name describe the one group — resolved by the crate's own `ArnOrName`
+        // helper, which every reader that takes either form uses.
+        let name = crate::state::name_from_arn_or_name(&input.feature_group_name);
+
+        let mut store = state.lock();
+        let Some(group) = store.feature_groups.get_mut(name) else {
+            // Never a 200 with empty fields: a caller cannot tell that from a group that
+            // exists and carries nothing. `ResourceNotFound` is the modelled refusal.
+            return Err(DescribeFeatureGroupErrorModeled::ResourceNotFound(ResourceNotFound {
+                message: Some(format!(
+                    "Resource Not Found: Amazon SageMaker can't find a FeatureGroup with \
+                     name {name}."
+                )),
+            })
+            .into());
+        };
+
+        // The only write a reporting call makes: the provisioning the clock already
+        // owed. It was due at the stored instant whether or not anybody described the
+        // group, so a waiter terminates and no caller's read changes the outcome.
+        let settled = group.settle_status(::std::time::SystemTime::now());
+
+        let output = DescribeFeatureGroupOutput {
+            feature_group_arn: group.arn.clone(),
+            feature_group_name: group.name.clone(),
+            record_identifier_feature_name: group.record_identifier_feature_name.clone(),
+            event_time_feature_name: group.event_time_feature_name.clone(),
+            feature_definitions: group.feature_definitions.clone(),
+            creation_time: crate::state::timestamp(group.creation_time),
+            last_modified_time: Some(crate::state::timestamp(group.last_modified_time)),
+            online_store_config: group.online_store_config.clone(),
+            offline_store_config: group.offline_store_config.clone(),
+            throughput_config: group.throughput_config_description(),
+            role_arn: group.role_arn.clone(),
+            feature_group_status: Some(group.status.clone()),
+            // "The status of the OfflineStore. Notifies you if replicating data into the
+            // OfflineStore has failed": a group with no offline store has no replication
+            // to report on, and one that has it replicates without failing here, so the
+            // status is `Active` and carries no `BlockedReason`.
+            offline_store_status: group.offline_store_config.as_ref().map(|_| OfflineStoreStatus {
+                status: crate::state::OFFLINE_STORE_STATUS_ACTIVE.to_string(),
+                blocked_reason: None,
+            }),
+            // "A value indicating whether the update made to the feature group was
+            // successful": absent until an update has been made to this group.
+            last_update_status: None,
+            // Only set when the group failed to be created in, or deleted from, the
+            // OfflineStore; neither happens to a group this emulator holds.
+            failure_reason: None,
+            description: group.description.clone(),
+            // "A token to resume pagination of the list of Features": a FeatureGroup
+            // holds at most the modelled 2,500 `FeatureDefinitions`, which is also the
+            // page the model documents ("2,500 Features are returned by default"), so
+            // one response always carries every feature and there is never a next page
+            // to resume from. The member is required, so that is the empty token.
+            next_token: String::new(),
+            // The OnlineStore's records live in the Feature Store RUNTIME service, which
+            // owns its own state; this control plane keeps no byte count for them and
+            // reports none rather than claiming a size it did not measure.
+            online_store_total_size_bytes: None,
+        };
+        let group_arn = group.arn.clone();
+        drop(store);
+
+        if settled {
+            // The transition is a state change, so it leaves the same record a create
+            // does rather than happening unobservably on a read path.
+            crate::state::record_state_change(Self::NAME, &group_arn, ctx);
+        }
+        Ok(output)
     }
 }

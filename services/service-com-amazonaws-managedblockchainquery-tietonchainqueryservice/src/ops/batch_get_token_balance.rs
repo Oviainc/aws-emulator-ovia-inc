@@ -83,6 +83,10 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+// `http_status()` on the generated error enum — the `@httpError` the model puts on the
+// exception, which is what a per-item `errorCode` reports.
+use smithy_server_runtime::OperationError as _;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -170,6 +174,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // lists the output requires rather than by a refusal the model does not declare.
         let requested = input.get_token_balance_inputs.unwrap_or_default();
 
+        // Every item of one batch is read as of the same instant, so an item that named
+        // no `atBlockchainInstant` is read — and reported — as of this one.
+        let read_at = crate::state::now_secs();
+
         let mut token_balances = Vec::with_capacity(requested.len());
         let mut errors = Vec::new();
 
@@ -188,18 +196,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     at_blockchain_instant: balance.at_blockchain_instant,
                     last_updated_time: balance.last_updated_time,
                 }),
-                // The error item identifies WHICH request item failed, so it echoes that
-                // item's own `tokenIdentifier`, `ownerIdentifier` and
-                // `atBlockchainInstant` — the last one only when the caller named it,
-                // since no balance was read for an instant to be reported as of.
-                Err(failure) => errors.push(BatchGetTokenBalanceErrorItem {
-                    token_identifier: Some(item.token_identifier.clone()),
-                    owner_identifier: Some(item.owner_identifier.clone()),
-                    at_blockchain_instant: item.at_blockchain_instant.clone(),
-                    error_code: failure.error_code().to_string(),
-                    error_message: failure.message().to_string(),
-                    error_type: failure.error_type().to_string(),
-                }),
+                // The error item identifies WHICH request item failed: the holding that
+                // was read, in the spelling the ledger keys it by — the same identifiers
+                // a successful item reports, so a client can join either kind of entry
+                // back to its input — and the instant it was read as of, which is the
+                // one the item named or, when it named none, the current time
+                // (`TokenBalance$atBlockchainInstant`: "the time for when the
+                // TokenBalance is requested or the current time if a time is not
+                // provided in the request").
+                Err(failure) => {
+                    let key = crate::state::HoldingKey::from_identifiers(
+                        &item.token_identifier,
+                        &item.owner_identifier,
+                    );
+                    let at = crate::state::instant_to_secs(item.at_blockchain_instant.as_ref())
+                        .unwrap_or(read_at);
+                    let error_message = failure.message().to_string();
+                    let error_type = failure.error_type().to_string();
+                    // `errorCode` is the status CLASS of the per-item failure, and it is
+                    // taken from the one place the single-item read's status comes from
+                    // too: the failure raised through this service's generated error
+                    // channel, which reports the `@httpError` the model puts on that
+                    // exception. So a batch item and the single read cannot disagree
+                    // about the status, whatever the model says it is.
+                    let raised: BatchGetTokenBalanceErrorModeled = match failure {
+                        crate::state::BalanceFailure::Unidentified(error) => {
+                            BatchGetTokenBalanceErrorModeled::ValidationException(error)
+                        }
+                        crate::state::BalanceFailure::NotFound(error) => {
+                            BatchGetTokenBalanceErrorModeled::ResourceNotFoundException(error)
+                        }
+                    };
+                    errors.push(BatchGetTokenBalanceErrorItem {
+                        token_identifier: Some(key.token_identifier(&item.token_identifier.network)),
+                        owner_identifier: Some(key.owner_identifier()),
+                        at_blockchain_instant: Some(BlockchainInstant {
+                            time: Some(crate::state::instant_secs(at)),
+                        }),
+                        error_code: raised.http_status().to_string(),
+                        error_message,
+                        error_type,
+                    });
+                }
             }
         }
 

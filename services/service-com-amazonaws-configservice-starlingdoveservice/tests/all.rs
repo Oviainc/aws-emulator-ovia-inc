@@ -19,6 +19,8 @@ mod config_aggregator_lifecycle;
 mod config_compliance_by_config_rule;
 #[path = "all/config_delivery_channel_status.rs"]
 mod config_delivery_channel_status;
+#[path = "all/config_discovered_resource_counts.rs"]
+mod config_discovered_resource_counts;
 #[path = "all/config_read_shape_and_compliance.rs"]
 mod config_read_shape_and_compliance;
 #[path = "all/config_remediation_configurations.rs"]

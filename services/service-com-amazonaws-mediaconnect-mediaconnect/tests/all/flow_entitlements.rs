@@ -56,12 +56,16 @@ fn assert_minted_entitlement_arn(case: &str, arn: &str, name: &str) {
 }
 
 /// The `entitlements` member of a response body, as the raw JSON entries.
-fn entitlements(body: &Value) -> Vec<Value> {
+///
+/// `pub(crate)` because `tests/all/revoke_flow_entitlement.rs` reads the same member.
+pub(crate) fn entitlements(body: &Value) -> Vec<Value> {
     body["entitlements"].as_array().cloned().unwrap_or_default()
 }
 
 /// The `name` of each entry of an `entitlements` member.
-fn entitlement_names(body: &Value) -> Vec<String> {
+///
+/// `pub(crate)` because `tests/all/revoke_flow_entitlement.rs` asserts over the same names.
+pub(crate) fn entitlement_names(body: &Value) -> Vec<String> {
     entitlements(body)
         .iter()
         .map(|entitlement| entitlement["name"].as_str().unwrap_or_default().to_string())
@@ -81,7 +85,10 @@ fn many(prefix: &str, count: usize) -> Value {
 }
 
 /// Send one GrantFlowEntitlements request.
-async fn grant(
+///
+/// `pub(crate)` because `tests/all/revoke_flow_entitlement.rs` grants the entitlements it
+/// revokes through the same binding.
+pub(crate) async fn grant(
     emulator: &Emulator,
     flow_arn: &str,
     body: Value,
@@ -96,7 +103,10 @@ async fn grant(
 }
 
 /// Create a flow carrying `created` entitlements and answer its ARN.
-async fn flow_with(emulator: &Emulator, name: &str, created: &[Value]) -> String {
+///
+/// `pub(crate)` because `tests/all/revoke_flow_entitlement.rs` builds its fixtures the same
+/// way.
+pub(crate) async fn flow_with(emulator: &Emulator, name: &str, created: &[Value]) -> String {
     let (status, code, body) = emulator
         .create_flow(json!({
             "name": name,

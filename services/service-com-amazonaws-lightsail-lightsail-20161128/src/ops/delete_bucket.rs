@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteBucket
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteBucket`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Removes one bucket record from this service's store, releases the object store it was
+//! served from, withdraws the access keys it held, and answers the operation-log entry
+//! the delete wrote. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteBucket::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Without `forceDelete` the delete is refused while the bucket still has any of the
+//! conditions that member documents as needing a force delete — objects, access keys, or
+//! instances that were granted access to it — so a bucket that is still in use is not
+//! removed by accident. Whether it holds objects is read from the one object store the
+//! bucket's data plane is served from, never from a count of this service's own.
 //!
 //! ## Shape of an operation
 //!
@@ -165,18 +165,218 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteBucket` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteBucketErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // A bucket is a REGIONAL resource — `GetBuckets` reports "all of your buckets in
+        // the Amazon Web Services Region where the request is made" — so the region the
+        // request is signed for selects which bucket record this call deletes, exactly as
+        // `CreateBucket` and `GetBuckets` resolve it.
+        let region = crate::state::request_region(ctx.parts());
+        let now = crate::state::now_ms();
+        // "A Boolean value that indicates whether to force delete the bucket": an absent
+        // flag is not a request to force anything.
+        let force_delete = input.force_delete.unwrap_or(false);
+
+        // `bucketName` is a modelled `@required` member carrying the modelled length and
+        // pattern, so the centralized walk refused anything outside them before this body
+        // ran. What is left is what the model cannot express: the bucket has to exist in
+        // this region, and without `forceDelete` it has to be free of every condition the
+        // model says a force delete is required for.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteBucket"))
+        // This first step only READS, and hands back owned values rather than a guard, so
+        // the object store below is reached with no guard of this service's store held.
+        let held = crate::state::with_state(&*self.engine, |store| {
+            let bucket = store
+                .bucket(&region, &input.bucket_name)
+                .ok_or_else(|| not_found(&region, &input.bucket_name))?;
+            Ok::<_, DeleteBucketError>(HeldBucket {
+                access_keys: bucket.access_keys.len(),
+                resources_receiving_access: bucket.resources_receiving_access.len(),
+            })
+        })
+        .ok_or_else(unavailable)??;
+
+        // How many objects the bucket holds, read from the one object store its data plane
+        // is served from — the only place that knows.
+        let objects = crate::state::bucket_object_count(&*self.engine, &input.bucket_name)
+            .ok_or_else(unavailable)?;
+
+        // "You must force delete the bucket if it has one of the following conditions: The
+        // bucket is the origin of a distribution. The bucket has instances that were
+        // granted access to it using the SetResourceAccessForBucket action. The bucket has
+        // objects. The bucket has access keys." Three of those four are conditions this
+        // store knows about; a distribution is a resource this emulator does not hold, so
+        // no bucket here is the origin of one. Every condition the bucket does have is
+        // named, so the caller learns what to clear or force.
+        if !force_delete {
+            let mut blocked_by = Vec::new();
+            if objects > 0 {
+                blocked_by.push(format!("it holds {objects} object{}", plural(objects)));
+            }
+            if held.access_keys > 0 {
+                blocked_by.push(format!(
+                    "it has {} access key{}",
+                    held.access_keys,
+                    plural(held.access_keys)
+                ));
+            }
+            if held.resources_receiving_access > 0 {
+                blocked_by.push(format!(
+                    "{} resource{} were granted access to it",
+                    held.resources_receiving_access,
+                    plural(held.resources_receiving_access)
+                ));
+            }
+            if !blocked_by.is_empty() {
+                // The headline names the bucket and the condition, the way AWS words
+                // the objects case ("Bucket is not empty: <bucketName>"); the detail
+                // names every condition that blocks THIS delete, so the caller learns
+                // what to clear.
+                let headline = if objects > 0 {
+                    format!("Bucket is not empty: {}", input.bucket_name)
+                } else {
+                    format!("Bucket is in use: {}", input.bucket_name)
+                };
+                return Err(invalid(format!(
+                    "{headline} ({}); delete what the bucket holds, or set forceDelete to \
+                     delete it anyway",
+                    blocked_by.join(", and ")
+                )));
+            }
+        }
+
+        // "When you delete your bucket, the bucket name is released and can be reused for
+        // a new bucket": the object store the bucket was served from goes with it, with
+        // every object it still held, so the name is free again and nothing answers at the
+        // address the bucket announced.
+        //
+        // Released BEFORE the control-plane record is removed, so a release that cannot be
+        // performed is recoverable: the record stays and the caller is told (a modelled
+        // server fault), rather than the record going first and leaving an object store no
+        // bucket names — which, since the object API refuses to delete a provisioned
+        // bucket, would hold that name against every later create with nothing able to
+        // clear it. `Some(false)` is the reverse drift — the object store no longer held
+        // the bucket this record named — which costs nothing and is reported rather than
+        // dropped.
+        match crate::state::release_bucket_object_store(&*self.engine, &input.bucket_name) {
+            Some(true) => {}
+            Some(false) => ::tracing::warn!(
+                operation = "DeleteBucket",
+                bucket_name = %input.bucket_name,
+                "the object store did not hold the bucket this record named"
+            ),
+            None => return Err(unavailable()),
+        }
+
+        let (access_key_ids, output) = crate::state::with_state(&*self.engine, |store| {
+            // The removal reads the record again under the guard that performs it:
+            // between the two locks another call may have deleted the bucket, and a
+            // delete of a bucket that is no longer there is the same 404 as a name that
+            // never named one.
+            let bucket = store
+                .remove_bucket(&region, &input.bucket_name)
+                .ok_or_else(|| not_found(&region, &input.bucket_name))?;
+            let access_key_ids: Vec<String> = bucket
+                .access_keys
+                .iter()
+                .map(|key| key.access_key_id.clone())
+                .collect();
+
+            // The bucket is gone as this call returns, which is why the operation it logs
+            // is answered terminal.
+            let operation = store.start_operation(
+                now,
+                crate::state::OPERATION_TYPE_DELETE_BUCKET,
+                crate::state::RESOURCE_TYPE_BUCKET,
+                &input.bucket_name,
+                &bucket.location,
+                None,
+            );
+            Ok::<_, DeleteBucketError>((
+                access_key_ids,
+                DeleteBucketOutput {
+                    operations: Some(vec![operation.view()]),
+                },
+            ))
+        })
+        .ok_or_else(unavailable)??;
+
+        // Every access key the bucket held stops being signable with the bucket it granted
+        // access to: "Force deleting a bucket might impact other resources that rely on the
+        // bucket, such as instances, distributions, or software that use the issued access
+        // keys." A credential the store no longer knows is already withdrawn, so a
+        // `NotFound` here is not a failure of this call.
+        for access_key_id in &access_key_ids {
+            if let Err(error) = ctx.credential_store().delete(access_key_id) {
+                ::tracing::warn!(
+                    operation = "DeleteBucket",
+                    reason = ?error,
+                    "an access key of the deleted bucket was not held by the credential store"
+                );
+            }
+        }
+        // Audit record for a call that revokes credentials: the bucket and the key ids,
+        // never any secret material.
+        ::tracing::info!(
+            audit = true,
+            operation = "DeleteBucket",
+            outcome = "deleted",
+            bucket_name = %input.bucket_name,
+            access_key_ids = ?access_key_ids,
+            "bucket deleted"
+        );
+
+        Ok(output)
     }
+}
+
+/// What the stored bucket says about whether it may be deleted without a force delete.
+struct HeldBucket {
+    /// How many access keys the bucket holds — one of the documented conditions.
+    access_keys: usize,
+    /// How many Lightsail resources were granted access to the bucket through
+    /// `SetResourceAccessForBucket` — another of the documented conditions.
+    resources_receiving_access: usize,
+}
+
+/// The plural suffix for `count`, so a refusal reads as a sentence rather than as
+/// "1 objects".
+fn plural(count: usize) -> &'static str {
+    if count == 1 {
+        ""
+    } else {
+        "s"
+    }
+}
+
+/// This operation's 400 refusal for a request the model admits but the service does not:
+/// the modelled `InvalidInputException`, whose message names what is wrong with the
+/// request.
+fn invalid(message: String) -> DeleteBucketError {
+    DeleteBucketErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message),
+        ..Default::default()
+    })
+    .into()
+}
+
+/// This operation's 404 for a bucket name this account holds no bucket under in this
+/// region: the modelled `NotFoundException`, which the model documents as what "Lightsail
+/// throws when it cannot find a resource".
+fn not_found(region: &str, bucket_name: &str) -> DeleteBucketError {
+    DeleteBucketErrorModeled::NotFoundException(NotFoundException {
+        message: Some(format!(
+            "bucketName '{bucket_name}' does not name a bucket of this account in {region}"
+        )),
+        ..Default::default()
+    })
+    .into()
+}
+
+/// The store is unreachable — the engine is not the shared in-memory one. A modelled
+/// server fault, never a fresh engine.
+fn unavailable() -> DeleteBucketError {
+    DeleteBucketErrorModeled::ServiceException(ServiceException {
+        message: Some("the Lightsail bucket store is unavailable".to_string()),
+        ..Default::default()
+    })
+    .into()
 }

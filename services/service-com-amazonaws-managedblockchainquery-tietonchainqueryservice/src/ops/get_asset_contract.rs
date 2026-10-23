@@ -202,12 +202,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })?;
 
         Ok(GetAssetContractOutput {
-            // The request named the contract, so the response identifies the same one:
-            // the identifier is echoed rather than respelled into the ledger's own
-            // casing, which `ChainAddress` leaves free.
-            contract_identifier: requested.clone(),
+            // The response identifies the contract it answered ABOUT — the stored one,
+            // in the spelling the ledger keys addresses by — rather than echoing the
+            // characters the request reached it with: `ChainAddress` leaves an EVM
+            // address's letter case free, so the two spellings of one contract must not
+            // come back as two different identifiers.
+            contract_identifier: contract.identifier(),
             token_standard: contract.token_standard.clone(),
-            deployer_address: contract.deployer_address.clone(),
+            deployer_address: contract.deployer_address(),
             // `GetAssetContract`: "Metadata is currently only available for some ERC-20
             // contracts", so a contract the index holds none for reports none.
             metadata: contract.metadata.clone(),
