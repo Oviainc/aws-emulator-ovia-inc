@@ -1276,6 +1276,6 @@ fn one_tag(key: String, value: String) -> Value {
 /// Only `/` is escaped: RFC 3986 lets a path segment carry `:` unescaped (it is a
 /// `pchar`), and `/` is the one character in a search-job ARN that would otherwise split
 /// the segment. The framework percent-decodes the label before the handler sees it.
-fn percent_encode(segment: &str) -> String {
+pub(crate) fn percent_encode(segment: &str) -> String {
     segment.replace('/', "%2F")
 }

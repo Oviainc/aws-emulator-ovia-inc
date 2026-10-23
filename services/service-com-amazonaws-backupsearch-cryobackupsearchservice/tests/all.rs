@@ -19,3 +19,5 @@ mod export_listing;
 mod search_jobs;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/tag_removal.rs"]
+mod tag_removal;
