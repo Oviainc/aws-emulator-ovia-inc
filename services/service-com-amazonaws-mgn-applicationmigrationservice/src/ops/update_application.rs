@@ -183,7 +183,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "refused: UninitializedAccountException",
             );
             return Err(UpdateApplicationErrorModeled::UninitializedAccountException(
-                crate::state::uninitialized_account(&account),
+                crate::state::uninitialized_account(),
             )
             .into());
         }

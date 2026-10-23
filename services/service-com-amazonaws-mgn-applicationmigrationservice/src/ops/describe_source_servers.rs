@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeSourceServers
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeSourceServers`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeSourceServers::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the account's stored source servers in registration order, narrowed by the
+//! request's `filters`, one `maxResults`-sized page at a time; `nextToken` is a
+//! resume-after key naming the `sourceServerID` the previous page ended on.
+//! `@readonly`: it writes nothing, so what a caller sees is exactly what the writes
+//! left — a source server is reported only once something registered it in this
+//! service's store.
 //!
 //! ## Shape of an operation
 //!
@@ -86,11 +83,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-mgn-applicationmigratio
 // here — hence the `DescribeSourceServersError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.mgn#DescribeSourceServers")]
+// `extra_errors` widens the accepted set with a shape the SERVICE models but this
+// operation does not list: `InternalServerException` (HTTP 500) is the only honest
+// answer when the engine carries no store for this service.
+#[smithy_macros::operation_error(
+    "com.amazonaws.mgn#DescribeSourceServers",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum DescribeSourceServersErrorModeled {
     UninitializedAccountException(UninitializedAccountException),
     ValidationException(ValidationException),
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -144,18 +148,162 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeSourceServers` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeSourceServersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeSourceServers"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeSourceServersErrorModeled::InternalServerException(
+                crate::state::state_unavailable(),
+            )
+        })?;
+        let account = crate::state::account_key(input.account_id.as_deref());
+
+        // `nextToken` is this service's own cursor, and only a string this service
+        // issued is a token: the marker below plus the `sourceServerID` the previous
+        // page ended on. A resume-after key rather than a positional offset, so the
+        // cursor keeps its meaning when the selection changes between pages.
+        let resume_after = match input.next_token.as_deref() {
+            None | Some("") => None,
+            Some(token) => Some(
+                token
+                    .strip_prefix(PAGE_TOKEN_PREFIX)
+                    .ok_or_else(|| unresumable_token(token))?,
+            ),
+        };
+        let page_size = usize::try_from(input.max_results.unwrap_or(MAX_PAGE_SIZE))
+            .unwrap_or(MAX_PAGE_SIZE as usize)
+            // Defensive only: the modelled `MaxResultsType` range 1..1000 is already
+            // refused at the boundary, so no out-of-range value reaches this handler.
+            .clamp(1, MAX_PAGE_SIZE as usize);
+
+        let store = state.lock();
+        if !store.is_initialized(&account) {
+            return Err(
+                DescribeSourceServersErrorModeled::UninitializedAccountException(
+                    crate::state::uninitialized_account(),
+                )
+                .into(),
+            );
+        }
+
+        let matching: Vec<&crate::state::SourceServer> = store
+            .source_servers_of(&account)
+            .into_iter()
+            .filter(|server| matches_filters(server, input.filters.as_ref()))
+            .collect();
+        // The page starts after the source server the token names. A token naming a
+        // server this selection does not hold cannot be resumed — it is a token for a
+        // selection that no longer exists — so it is refused rather than served as
+        // some other page.
+        let start = match resume_after {
+            None => 0usize,
+            Some(last_returned) => matching
+                .iter()
+                .position(|server| server.source_server_id == last_returned)
+                .map(|index| index.saturating_add(1))
+                .ok_or_else(|| {
+                    unresumable_token(input.next_token.as_deref().unwrap_or_default())
+                })?,
+        };
+        let page: Vec<&crate::state::SourceServer> = matching
+            .iter()
+            .copied()
+            .skip(start)
+            .take(page_size)
+            .collect();
+        // A token only when source servers remain after this page, so a caller that
+        // follows tokens sees every server exactly once.
+        let next_token = if start.saturating_add(page.len()) < matching.len() {
+            page.last()
+                .map(|server| format!("{PAGE_TOKEN_PREFIX}{}", server.source_server_id))
+        } else {
+            None
+        };
+        let items: Vec<UpdateSourceServerOutput> =
+            page.iter().map(|server| server.to_shape()).collect();
+
+        Ok(DescribeSourceServersOutput {
+            items: Some(items),
+            next_token,
+        })
     }
+}
+
+/// The largest page `maxResults` can ask for, and the page size used when the request
+/// names none: the model's `MaxResultsType` range is 1..1000.
+const MAX_PAGE_SIZE: i32 = 1000;
+
+/// The marker every `nextToken` this operation issues carries, ahead of the
+/// `sourceServerID` the page ended on, so a string the service never issued cannot be
+/// mistaken for a cursor.
+const PAGE_TOKEN_PREFIX: &str = "mgn-source-servers-";
+
+/// The refusal for a `nextToken` this operation cannot resume from: a string it never
+/// issued, or one whose anchor source server the current selection no longer holds.
+/// This operation models `ValidationException`, so the refusal is that shape — naming
+/// the member it is about in `fieldList` — rather than the service's generic 400.
+fn unresumable_token(token: &str) -> DescribeSourceServersError {
+    DescribeSourceServersErrorModeled::ValidationException(ValidationException {
+        message: Some(format!(
+            "nextToken '{token}' cannot be resumed: it is not a token this service issued, or the source server it continues from is no longer in this selection"
+        )),
+        code: None,
+        // One of the model's `ValidationExceptionReason` values.
+        reason: Some("fieldValidationFailed".to_string()),
+        field_list: Some(vec![ValidationExceptionField {
+            name: Some("nextToken".to_string()),
+            message: Some("not a pagination token this service issued".to_string()),
+        }]),
+    })
+    .into()
+}
+
+/// Whether `server` satisfies every filter the request set. An absent filter, and a
+/// present-but-empty list, select everything; a list the server's member is not in —
+/// including a member it does not carry at all — deselects it.
+fn matches_filters(
+    server: &crate::state::SourceServer,
+    filters: Option<&DescribeSourceServersRequestFilters>,
+) -> bool {
+    let Some(filters) = filters else {
+        return true;
+    };
+    if let Some(ids) = filters.source_server_i_ds.as_ref() {
+        if !ids.is_empty() && !ids.contains(&server.source_server_id) {
+            return false;
+        }
+    }
+    if let Some(is_archived) = filters.is_archived {
+        if is_archived != server.is_archived {
+            return false;
+        }
+    }
+    if let Some(replication_types) = filters.replication_types.as_ref() {
+        if !replication_types.is_empty()
+            && server
+                .replication_type
+                .as_ref()
+                .is_none_or(|replication_type| !replication_types.contains(replication_type))
+        {
+            return false;
+        }
+    }
+    if let Some(states) = filters.life_cycle_states.as_ref() {
+        if !states.is_empty()
+            && server
+                .life_cycle_state()
+                .is_none_or(|state| !states.iter().any(|wanted| wanted == state))
+        {
+            return false;
+        }
+    }
+    if let Some(application_ids) = filters.application_i_ds.as_ref() {
+        if !application_ids.is_empty()
+            && server
+                .application_id
+                .as_ref()
+                .is_none_or(|application_id| !application_ids.contains(application_id))
+        {
+            return false;
+        }
+    }
+    true
 }

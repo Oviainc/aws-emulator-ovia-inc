@@ -35,6 +35,8 @@ mod hyperpod_cluster_listing;
 mod inference_deployment_lifecycle;
 #[path = "all/lineage_action_lifecycle.rs"]
 mod lineage_action_lifecycle;
+#[path = "all/lineage_associations.rs"]
+mod lineage_associations;
 #[path = "all/list_endpoints.rs"]
 mod list_endpoints;
 #[path = "all/mlflow_app_lifecycle.rs"]

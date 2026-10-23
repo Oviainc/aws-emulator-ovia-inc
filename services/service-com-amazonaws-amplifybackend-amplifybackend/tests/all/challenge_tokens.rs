@@ -10,6 +10,12 @@
 //! suite), with one addition: a variant that keeps the shared engine, so the expiry
 //! cases can seed a token the clock has already retired instead of waiting out a
 //! five-minute TTL.
+//!
+//! Every app id here is REGISTERED first (through `CreateBackend`, the only app registry
+//! reachable with this service mounted alone): a challenge token addresses an Amplify
+//! app, so an `AppId` that identifies no registered app is refused with HTTP 400
+//! `ValidationException` before anything is minted — the rule
+//! `app_registration_gate.rs` is about.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -114,50 +120,72 @@ async fn delete_token(router: &MultiServiceRouter, app_id: &str, session_id: &st
     .await
 }
 
+/// Register `app_id` as an Amplify app this emulator knows, by creating a backend for
+/// it: every token operation gates on the app's IDENTITY first, and `CreateBackend` is
+/// the one registry reachable with this service mounted alone.
+async fn register_app(router: &MultiServiceRouter, app_id: &str) {
+    let (status, body) = call(
+        router,
+        "POST",
+        "/backend",
+        Some(json!({
+            "appId": app_id,
+            "appName": "tokens",
+            "backendEnvironmentName": "staging"
+        })),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "seeding CreateBackend for {app_id:?} expected 200, got {status} {body}"
+    );
+}
+
 /// The `Ttl` every token reports: [`CHALLENGE_TOKEN_TTL`] in whole seconds, as a string.
 fn expected_ttl() -> String {
     CHALLENGE_TOKEN_TTL.as_secs().to_string()
 }
 
-/// One round-trip case: the app a token is minted for, whether that app has a backend,
-/// and how many tokens are minted for it at once.
+/// One round-trip case: the app a token is minted for, whether that app has a backend
+/// ENVIRONMENT beyond the one that registered it, and how many tokens are minted for it
+/// at once.
 struct Case {
     name: &'static str,
     app_id: String,
-    /// A challenge token addresses an APP, so it needs no backend environment: the rows
-    /// differ in whether `CreateBackend` ran for the app first.
-    with_backend: bool,
+    /// A challenge token addresses an APP, not an environment, so the rows differ in
+    /// whether a SECOND `CreateBackend` created another environment for the app.
+    extra_environment: bool,
     tokens: usize,
 }
 
-/// The round-trip cases. They differ along what the slice generalises over: whether the
-/// app has a backend at all, how many live tokens one app holds, and the SIZE of the app
-/// id — including one at `MAX_IDENTIFIER_CHARS`, the longest identifier this emulator
+/// The round-trip cases. They differ along what the slice generalises over: how many
+/// environments the app holds, how many live tokens one app holds, and the SIZE of the
+/// app id — including one at `MAX_IDENTIFIER_CHARS`, the longest identifier this emulator
 /// keys a record by.
 fn cases() -> Vec<Case> {
     vec![
         Case {
-            name: "app with a backend, one token",
+            name: "app with a second backend environment, one token",
             app_id: "d1ab2cd3ef4gh5".to_string(),
-            with_backend: true,
+            extra_environment: true,
             tokens: 1,
         },
         Case {
-            name: "app with no backend at all, one token",
+            name: "app with just the one environment, one token",
             app_id: "dnobackend0001".to_string(),
-            with_backend: false,
+            extra_environment: false,
             tokens: 1,
         },
         Case {
-            name: "app with no backend, several live tokens at once",
+            name: "several live tokens at once",
             app_id: "dmanytokens099".to_string(),
-            with_backend: false,
+            extra_environment: false,
             tokens: 5,
         },
         Case {
             name: "app id at the identifier length bound",
             app_id: "d".repeat(MAX_IDENTIFIER_CHARS),
-            with_backend: false,
+            extra_environment: false,
             tokens: 2,
         },
     ]
@@ -179,10 +207,11 @@ async fn a_challenge_token_round_trips_and_is_reclaimed_by_delete() {
         let Case {
             name,
             app_id,
-            with_backend,
+            extra_environment,
             tokens,
         } = case;
-        if with_backend {
+        register_app(&router, &app_id).await;
+        if extra_environment {
             let (status, body) = call(
                 &router,
                 "POST",
@@ -190,13 +219,13 @@ async fn a_challenge_token_round_trips_and_is_reclaimed_by_delete() {
                 Some(json!({
                     "appId": app_id,
                     "appName": "tokens",
-                    "backendEnvironmentName": "staging"
+                    "backendEnvironmentName": "production"
                 })),
             )
             .await;
             assert_eq!(
                 status, 200,
-                "case {name:?}: seeding CreateBackend expected 200, got {status} {body}"
+                "case {name:?}: seeding a second environment expected 200, got {status} {body}"
             );
         }
 
@@ -318,6 +347,7 @@ async fn every_minted_session_id_is_unique() {
     let per_app = 12;
     let mut all: Vec<(String, String, String)> = Vec::new();
     for app_id in apps {
+        register_app(&router, app_id).await;
         for index in 0..per_app {
             let (status, body) = create_token(&router, app_id).await;
             assert_eq!(
@@ -360,6 +390,10 @@ async fn every_minted_session_id_is_unique() {
 async fn a_token_lookup_is_scoped_to_its_app() {
     let router = router();
     let (owner, other) = ("downerapp0001", "dotherapp0002");
+    // BOTH apps are registered: the lookup under `other` must fail on the TOKEN, which
+    // is what this case is about, not on the app's identity.
+    register_app(&router, owner).await;
+    register_app(&router, other).await;
     let (status, body) = create_token(&router, owner).await;
     assert_eq!(status, 200, "seeding CreateToken expected 200, got {body}");
     let session_id = field(&body, "sessionId").to_string();
@@ -397,6 +431,7 @@ async fn a_token_lookup_is_scoped_to_its_app() {
 async fn a_token_stops_resolving_once_its_ttl_has_passed() {
     let (router, engine) = router_with_engine();
     let app_id = "dexpiryapp0001";
+    register_app(&router, app_id).await;
     let now = SystemTime::now();
     // (case, when the token expires, whether it still resolves)
     let rows = [
@@ -468,6 +503,9 @@ async fn a_token_stops_resolving_once_its_ttl_has_passed() {
 #[tokio::test]
 async fn the_token_store_is_bounded() {
     let router = router();
+    // An over-long app id is refused by the LENGTH bound before the app-identity gate
+    // runs: it is malformed input, and the refusal names the member so the caller can
+    // fix it.
     let over_long = "d".repeat(MAX_IDENTIFIER_CHARS + 1);
     let (status, body) = create_token(&router, &over_long).await;
     assert_eq!(
@@ -480,6 +518,7 @@ async fn the_token_store_is_bounded() {
     );
 
     let app_id = "dboundedapp001";
+    register_app(&router, app_id).await;
     let mut sessions = Vec::new();
     for index in 0..MAX_CHALLENGE_TOKENS_PER_APP {
         let (status, body) = create_token(&router, app_id).await;

@@ -571,6 +571,11 @@ async fn a_job_lookup_is_scoped_to_its_environment() {
 /// Every lookup of a resource that does not exist answers the modelled
 /// `NotFoundException` (404) — never 501 and never an empty 200 — whichever part of the
 /// address is unknown.
+///
+/// The APP is not one of those parts: an `AppId` that identifies no registered Amplify
+/// app is refused earlier, as HTTP 400 `ValidationException` (see
+/// `app_registration_gate.rs`), so every row below names a registered app and is unknown
+/// in some part BELOW it.
 #[tokio::test]
 async fn an_unknown_resource_is_a_modelled_not_found() {
     let router = router();
@@ -608,18 +613,6 @@ async fn an_unknown_resource_is_a_modelled_not_found() {
     // (what is unknown, method, path, body)
     let rows: Vec<(&str, &str, String, Option<Value>)> = vec![
         (
-            "the app, on GetBackend",
-            "POST",
-            "/backend/unknownapp/details".to_string(),
-            Some(json!({})),
-        ),
-        (
-            "the app, on GetBackendAuth",
-            "POST",
-            "/backend/unknownapp/auth/staging/details".to_string(),
-            Some(json!({ "resourceName": "authknown" })),
-        ),
-        (
             "the environment, on GetBackendAuth",
             "POST",
             "/backend/dknown/auth/unknownenv/details".to_string(),
@@ -632,34 +625,10 @@ async fn an_unknown_resource_is_a_modelled_not_found() {
             Some(json!({ "resourceName": "unknownresource" })),
         ),
         (
-            "the app, on GetBackendJob",
-            "GET",
-            "/backend/unknownapp/job/staging/1".to_string(),
-            None,
-        ),
-        (
             "the job id, on GetBackendJob",
             "GET",
             "/backend/dknown/job/staging/999".to_string(),
             None,
-        ),
-        (
-            "the app, on CreateBackendAuth",
-            "POST",
-            "/backend/unknownapp/auth".to_string(),
-            Some(json!({
-                "backendEnvironmentName": "staging",
-                "resourceName": "authknown",
-                "resourceConfig": {
-                    "authResources": "USER_POOL_ONLY",
-                    "service": "COGNITO",
-                    "userPoolConfigs": {
-                        "requiredSignUpAttributes": ["EMAIL"],
-                        "signInMethod": "EMAIL",
-                        "userPoolName": "knownPool"
-                    }
-                }
-            })),
         ),
         (
             "the environment, on CreateBackendAuth",
@@ -678,12 +647,6 @@ async fn an_unknown_resource_is_a_modelled_not_found() {
                     }
                 }
             })),
-        ),
-        (
-            "the app, on DeleteBackend",
-            "POST",
-            "/backend/unknownapp/environments/staging/remove".to_string(),
-            Some(json!({})),
         ),
         (
             "the environment, on DeleteBackend",

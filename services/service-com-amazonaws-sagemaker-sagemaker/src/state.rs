@@ -15,7 +15,10 @@
 //!
 //! Studio apps live here too, keyed by the [`AppKey`] their five input members name
 //! rather than by a bare name, because that tuple — domain, owning user profile or
-//! space, app type, app name — is what identifies one app.
+//! space, app type, app name — is what identifies one app. The ML Lineage entities
+//! (artifacts, actions, trial components) are keyed by the ARN or name their own slices
+//! document, and the associations BETWEEN them by the `(SourceArn, DestinationArn)` pair
+//! that is one edge's whole identity.
 //!
 //! # A job's status is moved by the CLOCK, never by a read
 //!
@@ -1296,6 +1299,11 @@ pub struct ComAmazonawsSagemakerSagemakerState {
     /// Keyed by `ClusterName`. See [`Cluster`], at the end of this module with the rest
     /// of the HyperPod cluster slice.
     pub clusters: BTreeMap<String, Cluster>,
+    /// Lineage associations, keyed by the `(SourceArn, DestinationArn)` pair that IS one
+    /// association's identity — the only identifier `AddAssociation` and
+    /// `DeleteAssociation` address one by. See [`Association`], at the end of this module
+    /// with the rest of the lineage-association slice.
+    pub associations: BTreeMap<(String, String), Association>,
 }
 
 impl ComAmazonawsSagemakerSagemakerState {
@@ -2378,7 +2386,7 @@ impl ComAmazonawsSagemakerSagemakerState {
         if identifier.starts_with("arn:") {
             identifier.to_string()
         } else {
-            resource_arn(region, "action", identifier)
+            resource_arn(region, ACTION_KIND, identifier)
         }
     }
 }
@@ -3007,5 +3015,90 @@ impl ComAmazonawsSagemakerSagemakerState {
     /// alias.
     pub fn latest_version_of(&self, image_name: &str) -> Option<&ImageVersion> {
         self.versions_of(image_name).next_back()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The lineage-association slice: `AddAssociation` and the `DeleteAssociation` that
+// releases one. Kept together at the end of this module, the way the lineage-action,
+// model-card and custom-image slices are, so one slice's record, constants and helpers
+// read as one unit.
+// ---------------------------------------------------------------------------
+
+/// The `<kind>` component of an `artifact/<id>` ARN, i.e. the kind `CreateArtifact`
+/// mints and the one an `AssociationEntityArn` names an artifact by. Named here so the
+/// create and the association slice mint and resolve the same kind.
+pub const ARTIFACT_KIND: &str = "artifact";
+
+/// The `<kind>` component of an `action/<name>` ARN. See [`ARTIFACT_KIND`].
+pub const ACTION_KIND: &str = "action";
+
+/// See [`MODEL_QUOTA`] for why the bound is the emulator's OWN rather than a claim about
+/// any account's limit. It bounds the association store the same way, and is what
+/// `AddAssociation` answers `ResourceLimitExceeded` past. It is higher than the
+/// per-resource bounds because an association is an EDGE: the store grows with the PAIRS
+/// of lineage entities a caller connects, not with the entities themselves, and every
+/// entry it holds is released by `DeleteAssociation`.
+pub const ASSOCIATION_QUOTA: usize = 10_000;
+
+/// One lineage association created by `AddAssociation`, as `DeleteAssociation` releases
+/// it.
+///
+/// The `(source_arn, destination_arn)` pair is the association's identity — SageMaker
+/// mints no id for an association and no operation addresses one by anything else — so
+/// the pair is the store key and these two fields repeat it, the way every other record
+/// here keeps the identifier it is filed under. `association_type` stays an `Option`
+/// because `AssociationType` is an optional member: an association created without one
+/// carries none, which is distinguishable on the wire from any of the modelled edge
+/// types. `creation_time` is the instant the association was FIRST added, so a repeated
+/// add does not pretend the edge is new.
+#[derive(Debug, Clone)]
+pub struct Association {
+    pub source_arn: String,
+    pub destination_arn: String,
+    pub association_type: Option<String>,
+    pub creation_time: SystemTime,
+}
+
+impl ComAmazonawsSagemakerSagemakerState {
+    /// Whether another association fits, i.e. the store is below [`ASSOCIATION_QUOTA`].
+    pub fn associations_below_quota(&self) -> bool {
+        self.associations.len() < ASSOCIATION_QUOTA
+    }
+
+    /// Whether `arn` names a lineage entity this service holds, i.e. one an association
+    /// may point at.
+    ///
+    /// `AssociationEntityArn`'s modelled pattern admits five entity kinds — experiment,
+    /// experiment-trial-component, artifact, action and context. Each is resolved against
+    /// the store the matching create writes to, through
+    /// [`entity_name_from_name_or_arn`], so an ARN naming another partition, service,
+    /// Region or account names no entity here. The experiment and context stores do not
+    /// exist yet — `CreateExperiment` and `CreateContext` are still scaffolds answering
+    /// 501, so nothing was ever created for an `experiment/...` or `context/...` ARN to
+    /// name and such an ARN names no entity.
+    pub fn lineage_entity_exists(&self, region: &str, arn: &str) -> bool {
+        // Every `AssociationEntityArn` IS an ARN (its pattern starts `^arn:`), so the
+        // bare-name branch of `entity_name_from_name_or_arn` is unreachable from an
+        // association request; guarded rather than assumed, so a bare name can never
+        // resolve to an entity through this helper.
+        if !arn.starts_with("arn:") {
+            return false;
+        }
+        if entity_name_from_name_or_arn(arn, region, ARTIFACT_KIND).is_some() {
+            // Both lineage stores are keyed by the WHOLE ARN the create minted, which
+            // already carries this request's Region and the emulator's account.
+            return self.artifacts.contains_key(arn);
+        }
+        if entity_name_from_name_or_arn(arn, region, ACTION_KIND).is_some() {
+            return self.actions.contains_key(arn);
+        }
+        if let Some(name) = entity_name_from_name_or_arn(arn, region, TRIAL_COMPONENT_KIND) {
+            // The trial-component store is keyed by the case-folded NAME (the name "is
+            // not case-sensitive" per its model doc), so the lookup goes through the same
+            // key `CreateTrialComponent` stored the record under.
+            return self.trial_components.contains_key(&entity_key(name));
+        }
+        false
     }
 }

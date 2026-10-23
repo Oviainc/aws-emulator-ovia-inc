@@ -6,7 +6,9 @@
 //! minted it: nothing about the token changes because it was read, so a later caller
 //! sees the same code. A session id this service holds no LIVE token for — never
 //! minted, already deleted, or past its `Ttl` — is the modelled `NotFoundException`
-//! (404).
+//! (404), and an `AppId` that identifies no registered Amplify app is refused with HTTP
+//! 400 `ValidationException` before the token is looked up at all
+//! ([`crate::state::require_registered_app`]).
 //!
 //! The one write it performs is the expiry the CLOCK already made due
 //! ([`crate::state::ComAmazonawsAmplifybackendAmplifybackendState::expire_challenge_tokens`]),
@@ -156,6 +158,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::store_unavailable(),
             ))
         })?;
+
+        // The app-identity gate, BEFORE the token lookup: a well-formed app id that
+        // identifies no registered Amplify app is a client-input error (400
+        // `ValidationException`), not a missing challenge token.
+        crate::state::require_registered_app(&*self.engine, &input.app_id)?;
 
         let now = std::time::SystemTime::now();
         let mut store = state.lock();

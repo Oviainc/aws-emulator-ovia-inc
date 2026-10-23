@@ -5,7 +5,9 @@
 //! Stores the submitted `CreateBackendAuthResourceConfig` VERBATIM under
 //! (AppId, BackendEnvironmentName, ResourceName) so `GetBackendAuth` reports exactly
 //! what was given, and records an async job for the call. An app or environment that
-//! was never created answers `NotFoundException` (404).
+//! was never created answers `NotFoundException` (404); an `AppId` that identifies no
+//! registered Amplify app is refused with HTTP 400 `ValidationException` before any
+//! lookup ([`crate::state::require_registered_app`]).
 //!
 //! Two DELIBERATE scope boundaries of this first slice, so a reader can tell a decision
 //! from a gap:
@@ -170,6 +172,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let now = std::time::SystemTime::now();
+
+        // The app-identity gate, BEFORE any per-resource lookup: a well-formed app id
+        // that identifies no registered Amplify app is a client-input error (400
+        // `ValidationException`), not a missing backend.
+        crate::state::require_registered_app(&*self.engine, &input.app_id)?;
+
         let mut store = state.lock();
 
         // The identifier that keys the stored resource is length-bounded before anything

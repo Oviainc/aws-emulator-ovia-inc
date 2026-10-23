@@ -41,9 +41,7 @@
 //! do not write it; editing the entry would let this file drift from the model.
 
 use aws_smithy_schema_server::constraints::{Violation, ViolationKind};
-use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
-};
+use smithy_server_runtime::{http, ErasedOperation, Refusal, Refused, Service};
 use std::sync::Arc;
 
 /// AppSync's own modelled error for a request that is not well formed:

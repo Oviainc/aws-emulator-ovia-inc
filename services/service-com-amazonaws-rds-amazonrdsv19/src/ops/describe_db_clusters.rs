@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeDBClusters
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeDBClusters`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: this operation reports DB clusters out of this service's store.
+//! This is the ONLY file to touch for it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeDBClusters::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The records and their projection onto the modelled `DBCluster` wire shape live in
+//! [`crate::state`], shared with `CreateDBCluster`, which stores what this reports.
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +158,107 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeDBClusters` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeDBClustersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeDBClusters"))
+        let region =
+            crate::state::request_region(ctx).map_err(DescribeDBClustersError::validation)?;
+        let page_size = crate::state::check_max_records(input.max_records)
+            .map_err(DescribeDBClustersError::validation)?;
+        let filters = input.filters.unwrap_or_default();
+        check_filter_names(&filters).map_err(DescribeDBClustersError::validation)?;
+        crate::state::check_filter_terms(&filters)
+            .map_err(DescribeDBClustersError::validation)?;
+
+        // No store means this service was mounted on an engine it has no state in, so it
+        // cannot serve the operation at all. Unreachable with the engine the router builds;
+        // 501 is the honest answer, never a fabricated empty list.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let mut store = state.lock();
+        // A report materialises the transitions the clock already made due: the ones owed
+        // at this instant whether or not anybody called.
+        store.settle_due_transitions(&region);
+
+        // RDS is regional: a request sees only the clusters of the region it was signed
+        // for. `IncludeShared` "specifies whether the output includes information about
+        // clusters shared from other Amazon Web Services accounts" — this emulator presents
+        // ONE account, which owns every cluster it holds, so no cluster is a shared one and
+        // the report is the same either way.
+        let candidates: Vec<&crate::state::DbClusterRecord> = match &input.db_cluster_identifier {
+            Some(requested) => {
+                // "The user-supplied DB cluster identifier or the Amazon Resource Name (ARN)
+                // of the DB cluster … This parameter isn't case-sensitive."
+                let record = store.resolve_db_cluster(&region, requested).ok_or_else(|| {
+                    DescribeDBClustersError::from(
+                        DescribeDBClustersErrorModeled::DBClusterNotFoundFault(
+                            DBClusterNotFoundFault {
+                                message: Some(format!("DBCluster {requested} not found.")),
+                            },
+                        ),
+                    )
+                })?;
+                vec![record]
+            }
+            None => store.clusters_in(&region),
+        };
+
+        let matching: Vec<(String, DBCluster)> = candidates
+            .into_iter()
+            .filter(|record| filters.iter().all(|filter| matches_filter(record, filter)))
+            .map(|record| (record.identifier.clone(), store.cluster_to_wire(record)))
+            .collect();
+
+        // A `Marker` no prior page issued is refused rather than resynchronised: see
+        // `crate::state::paginate`.
+        let page = crate::state::paginate(matching, input.marker.as_deref(), page_size)
+            .map_err(DescribeDBClustersError::invalid_parameter_value)?;
+        Ok(DescribeDBClustersOutput {
+            marker: page.next_marker,
+            db_clusters: Some(page.items),
+        })
     }
+}
+
+/// The filter names this operation's `Filters` member documents: "`clone-group-id`",
+/// "`db-cluster-id`", "`db-cluster-resource-id`", "`domain`" and "`engine`". RDS refuses
+/// any other name, and so does this operation — with a 400, because quietly ignoring a
+/// filter would report clusters the caller excluded.
+const SUPPORTED_FILTER_NAMES: [&str; 5] = [
+    "clone-group-id",
+    "db-cluster-id",
+    "db-cluster-resource-id",
+    "domain",
+    "engine",
+];
+
+/// Refuse a filter this operation does not support. "Filter names are case-sensitive."
+fn check_filter_names(filters: &[Filter]) -> Result<(), String> {
+    for filter in filters {
+        if !SUPPORTED_FILTER_NAMES.contains(&filter.name.as_str()) {
+            return Err(format!(
+                "unrecognized filter name: {}; supported filters are {}",
+                filter.name,
+                SUPPORTED_FILTER_NAMES.join(", ")
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Whether `record` matches one filter: true when any of the filter's values matches the
+/// member that filter names. "Filter values are case-sensitive."
+fn matches_filter(record: &crate::state::DbClusterRecord, filter: &Filter) -> bool {
+    filter.values.iter().any(|wanted| match filter.name.as_str() {
+        // "Accepts DB cluster identifiers and DB cluster Amazon Resource Names (ARNs)."
+        "db-cluster-id" => *wanted == record.identifier || *wanted == record.arn(),
+        "db-cluster-resource-id" => *wanted == record.resource_id,
+        "engine" => *wanted == record.engine,
+        "domain" => record.domain.as_ref().is_some_and(|stored| stored == wanted),
+        // "Accepts clone group identifiers": only a cluster CLONE belongs to a clone group,
+        // and nothing in this crate clones a cluster, so no cluster it holds carries one —
+        // `DBCluster$CloneGroupId` is reported for none of them. A request filtering on a
+        // clone group therefore matches nothing, which is what it should: the clusters here
+        // are in no clone group.
+        "clone-group-id" => false,
+        _ => false,
+    })
 }

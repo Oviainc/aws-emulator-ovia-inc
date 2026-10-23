@@ -13,9 +13,15 @@
 // points it into `tests/all/`.
 #[path = "all/dashboard_lifecycle.rs"]
 mod dashboard_lifecycle;
+#[path = "all/emulator.rs"]
+mod emulator;
+#[path = "all/lake_queries.rs"]
+mod lake_queries;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/target_prefix_dispatch.rs"]
 mod target_prefix_dispatch;
+#[path = "all/target_routing.rs"]
+mod target_routing;
 #[path = "all/trail_lifecycle.rs"]
 mod trail_lifecycle;

@@ -17,6 +17,11 @@ mod account_gate_and_not_found;
 mod builtin_readiness_rules;
 #[path = "all/cell_lifecycle.rs"]
 mod cell_lifecycle;
+// `cross_account_authorization.rs` (singular) is the CONCURRENCY suite for the
+// cross-account authorizations; `cross_account_authorizations.rs` (plural, below) holds
+// the single-threaded tables for the same surface.
+#[path = "all/cross_account_authorization.rs"]
+mod cross_account_authorization;
 #[path = "all/cross_account_authorizations.rs"]
 mod cross_account_authorizations;
 #[path = "all/readiness_check_lifecycle.rs"]

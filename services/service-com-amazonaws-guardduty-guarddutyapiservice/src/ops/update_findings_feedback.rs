@@ -149,8 +149,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `Feedback` is a modelled enum and `FindingIds` a modelled list
         // (`len 0..50`, each entry `len 1..300`), so the boundary validator has
-        // already refused anything outside those constraints: reaching here means the
-        // request carries one of the `Feedback` values.
+        // already refused anything outside those constraints — as
+        // `BadRequestException`/400, through `crate::service`'s refusal seam — which
+        // is why reaching here means the request carries one of the `Feedback` values
+        // and a refused one wrote nothing.
         let mut state = state.lock();
         let Some(detector) = state.detector_in_mut(&region, &input.detector_id) else {
             // Classified from the REQUEST: a value that cannot be a detector id at
@@ -182,6 +184,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `smithy_query(query="doc",shape="ListFindings",member="FindingCriteria")`).
         // Feedback is a caller's opinion about a finding, not a further observation of
         // the activity, so it must not make the finding look freshly seen.
+
+        // `UpdateFindingsFeedbackResponse` declares no members
+        // (`smithy_query(operation="UpdateFindingsFeedback")`).
         Ok(UpdateFindingsFeedbackOutput {})
     }
 }

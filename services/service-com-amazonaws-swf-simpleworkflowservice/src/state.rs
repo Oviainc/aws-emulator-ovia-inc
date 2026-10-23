@@ -14,10 +14,11 @@ use ::sha2::{Digest, Sha256};
 
 use crate::ops::types::{
     ActivityType, ActivityTypeInfo, DecisionTaskScheduledEventAttributes, DomainConfiguration,
-    DomainInfo, HistoryEvent, ResourceTag, TaskList, WorkflowExecution,
-    WorkflowExecutionConfiguration, WorkflowExecutionInfo, WorkflowExecutionOpenCounts,
-    WorkflowExecutionStartedEventAttributes, WorkflowExecutionTerminatedEventAttributes,
-    WorkflowType, WorkflowTypeConfiguration, WorkflowTypeInfo,
+    DomainInfo, ExecutionTimeFilter, HistoryEvent, ResourceTag, TagFilter, TaskList,
+    WorkflowExecution, WorkflowExecutionConfiguration, WorkflowExecutionFilter,
+    WorkflowExecutionInfo, WorkflowExecutionOpenCounts, WorkflowExecutionStartedEventAttributes,
+    WorkflowExecutionTerminatedEventAttributes, WorkflowType, WorkflowTypeConfiguration,
+    WorkflowTypeFilter, WorkflowTypeInfo,
 };
 
 /// The region an ARN carries when the request is unsigned (so it has no SigV4
@@ -77,6 +78,12 @@ pub const MAX_EXECUTIONS_PER_DOMAIN: usize = 1_000;
 /// cannot materialise a response that grows without bound. It is the modelled
 /// `PageSize` maximum (range 0..1000).
 pub const MAX_HISTORY_PAGE_SIZE: usize = 1_000;
+
+/// The page size a visibility list of workflow executions uses when the caller passes
+/// no `maximumPageSize` (the member defaults to `0`), so one unparameterised request
+/// cannot materialise a response that grows without bound. It is the modelled
+/// `PageSize` maximum (range 0..1000).
+pub const MAX_EXECUTION_PAGE_SIZE: usize = 1_000;
 
 /// A registered workflow type, as `RegisterWorkflowType` left it. The `default_*`
 /// members are what `StartWorkflowExecution` falls back to when the start request
@@ -581,6 +588,162 @@ pub fn decode_history_page_token(token: &str, reverse_order: bool) -> Result<i64
              this execution's history; pass the token back with the same reverseOrder"
         )
     })
+}
+
+/// A timestamp as an orderable pair of whole seconds and nanoseconds.
+///
+/// The wire timestamp type carries no total order of its own, and every visibility
+/// listing has to order executions by time, so this is the single place that turns one
+/// into a comparable key.
+pub fn instant_key(at: DateTime) -> (i64, u32) {
+    (at.secs(), at.subsec_nanos())
+}
+
+/// The total order a visibility listing of workflow executions pages through: the
+/// execution's start instant, then its `(workflowId, runId)` identity.
+///
+/// The identity is part of the key because the store holds executions in a map with no
+/// order of its own: two runs started in the same instant would otherwise have no
+/// defined position, and a page boundary between them would not be reproducible.
+pub type ExecutionOrderKey = ((i64, u32), String, String);
+
+/// The [`ExecutionOrderKey`] of one stored execution.
+pub fn execution_order_key(execution: &Execution) -> ExecutionOrderKey {
+    (
+        instant_key(execution.start_timestamp),
+        execution.workflow_id.clone(),
+        execution.run_id.clone(),
+    )
+}
+
+/// Whether an execution's start (or close) instant falls inside an
+/// `ExecutionTimeFilter` window.
+///
+/// The filter's doc: "Each parameter, if specified, defines a rule that must be
+/// satisfied by each returned query result" — `oldestDate` is required and
+/// `latestDate` is optional, so an absent `latestDate` leaves the window open-ended at
+/// the recent end. Both ends are inclusive.
+pub fn within_time_window(at: DateTime, filter: &ExecutionTimeFilter) -> bool {
+    let at = instant_key(at);
+    at >= instant_key(filter.oldest_date)
+        && filter
+            .latest_date
+            .is_none_or(|latest| at <= instant_key(latest))
+}
+
+/// Whether an execution satisfies the `executionFilter` / `typeFilter` / `tagFilter`
+/// the request named. A filter that was not given constrains nothing.
+///
+/// Each member's doc states its own rule: `executionFilter` keeps "only workflow
+/// executions matching the workflow ID specified in the filter", `typeFilter` "only
+/// executions of the type specified in the filter" (whose `version` is optional, so an
+/// absent one keeps every version registered under that name), and `tagFilter` "only
+/// executions that have the matching tag".
+pub fn execution_matches_filters(
+    execution: &Execution,
+    execution_filter: Option<&WorkflowExecutionFilter>,
+    type_filter: Option<&WorkflowTypeFilter>,
+    tag_filter: Option<&TagFilter>,
+) -> bool {
+    let id_matches =
+        execution_filter.is_none_or(|filter| execution.workflow_id == filter.workflow_id);
+    let type_matches = type_filter.is_none_or(|filter| {
+        execution.workflow_type.0 == filter.name
+            && non_empty(&filter.version).is_none_or(|version| execution.workflow_type.1 == version)
+    });
+    let tag_matches = tag_filter.is_none_or(|filter| execution.tag_list.contains(&filter.tag));
+    id_matches && type_matches && tag_matches
+}
+
+/// Refuse a visibility request that names more than one of the mutually exclusive
+/// filters, listing the ones it named.
+///
+/// Every visibility operation documents the same rule on each of them:
+/// "executionFilter, typeFilter and tagFilter are mutually exclusive. You can specify
+/// at most one of these in a request." The model cannot express it, so the boundary
+/// validator passes it and the handler applies this.
+pub fn validate_exclusive_filters(filters: &[(&str, bool)]) -> Result<(), String> {
+    let named: Vec<&str> = filters
+        .iter()
+        .filter(|(_, given)| *given)
+        .map(|(member, _)| *member)
+        .collect();
+    if named.len() > 1 {
+        return Err(format!(
+            "{} are mutually exclusive; specify at most one of them in a request, got {}",
+            filters
+                .iter()
+                .map(|(member, _)| *member)
+                .collect::<Vec<_>>()
+                .join(", "),
+            named.join(" and ")
+        ));
+    }
+    Ok(())
+}
+
+/// A visibility listing's `nextPageToken` for the next unread execution: the ordering
+/// the page was read in, then the [`ExecutionOrderKey`] the page ended on.
+///
+/// The token names a POSITION IN THE ORDER rather than a stored execution, so a run
+/// that starts or closes between two pages cannot invalidate it: the next page is
+/// whatever still sorts after that key. The ordering is part of the token because
+/// "after this one" means the opposite thing in the two orderings; carrying it lets a
+/// token replayed against the other ordering be refused instead of silently skipping
+/// or repeating executions.
+pub fn encode_execution_page_token(reverse_order: bool, key: &ExecutionOrderKey) -> String {
+    let ((secs, nanos), workflow_id, run_id) = key;
+    // Hex-encoded because the token is a response member with no structure of its own,
+    // and a `workflowId` may hold any character SWF's naming rule allows.
+    let payload = format!("{secs}.{nanos}\u{0}{workflow_id}\u{0}{run_id}");
+    format!(
+        "{}{}",
+        execution_order_tag(reverse_order),
+        ::hex::encode(payload)
+    )
+}
+
+/// The [`ExecutionOrderKey`] a `nextPageToken` resumes AFTER, for a request listing in
+/// `reverse_order`.
+pub fn decode_execution_page_token(
+    token: &str,
+    reverse_order: bool,
+) -> Result<ExecutionOrderKey, String> {
+    let rejected = || {
+        format!(
+            "nextPageToken {token:?} was not issued for a reverseOrder={reverse_order} listing \
+             of this domain's workflow executions; pass the token back unchanged, with every \
+             other argument unchanged"
+        )
+    };
+    let payload = token
+        .strip_prefix(execution_order_tag(reverse_order))
+        .and_then(|encoded| ::hex::decode(encoded).ok())
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .ok_or_else(rejected)?;
+    let mut parts = payload.split('\u{0}');
+    let (Some(instant), Some(workflow_id), Some(run_id), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return Err(rejected());
+    };
+    let (secs, nanos) = instant.split_once('.').ok_or_else(rejected)?;
+    let secs = secs.parse::<i64>().map_err(|_| rejected())?;
+    let nanos = nanos.parse::<u32>().map_err(|_| rejected())?;
+    Ok((
+        (secs, nanos),
+        workflow_id.to_string(),
+        run_id.to_string(),
+    ))
+}
+
+/// The ordering tag [`encode_execution_page_token`] stamps into a page token.
+fn execution_order_tag(reverse_order: bool) -> &'static str {
+    if reverse_order {
+        "a"
+    } else {
+        "d"
+    }
 }
 
 /// The ordering tag [`encode_history_page_token`] stamps into a page token.

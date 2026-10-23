@@ -87,15 +87,16 @@ fn rds_docdb_and_neptune_route_apart_under_one_signing_name() {
             // service it names (the shared `rds` name, each peer's own key, a host-style
             // endpoint instead of a credential scope) and which operation it asks for.
             //
-            // `DescribeDBClusters` is the discriminator that cannot be faked: Amazon RDS
-            // still has it scaffolded (501 `NotImplemented`) while DocumentDB and Neptune
-            // implement it (200), so the same Action under three keys must give three
-            // different answers — which only happens if each request reached exactly one,
-            // correct service. `DescribeDBEngineVersions` is the other way round: RDS
-            // implements it and DocumentDB does not. `DescribeOptionGroups` is a third
-            // kind of discriminator: ONLY the RDS model declares that action, so the
-            // shared name answers it (its modelled `OptionGroupNotFoundFault` for a group
-            // nothing holds) while each peer's own key answers its own `InvalidAction`.
+            // `DescribeDBClusters` is the discriminator that cannot be faked: all three
+            // models declare it and each service reads its OWN cluster store, so a cluster
+            // created through the `rds` key is reported there and nowhere else — the same
+            // Action under three keys reports three different things, which only happens if
+            // each request reached exactly one, correct service.
+            // `DescribeDBEngineVersions` is another kind of discriminator: RDS implements it
+            // and DocumentDB does not (501). `DescribeOptionGroups` is a third: ONLY the RDS
+            // model declares that action, so the shared name answers it (its modelled
+            // `OptionGroupNotFoundFault` for a group nothing holds) while each peer's own key
+            // answers its own `InvalidAction`.
             //
             // The last eight rows are the resource-lookup paths of the shared front door:
             // every operation that takes a resource NAME answers that resource's own
@@ -103,7 +104,7 @@ fn rds_docdb_and_neptune_route_apart_under_one_signing_name() {
             // declares — in the awsQuery `<ErrorResponse>` envelope, carrying the
             // `<RequestId>` AWS puts in one. Each was a `500 AmbiguousService` JSON
             // refusal before, so each row also pins that one service served it.
-            let calls: [Call; 20] = [
+            let calls: [Call; 21] = [
                 Call {
                     // The request the issue reports as `500 AmbiguousService`.
                     case: "rds DescribeDBEngineVersions",
@@ -124,24 +125,45 @@ fn rds_docdb_and_neptune_route_apart_under_one_signing_name() {
                     expected_body_contains: &[],
                 },
                 Call {
-                    // Amazon RDS owns the shared name, so its OWN scaffold answers here
-                    // — not DocumentDB's or Neptune's implementation.
-                    case: "rds DescribeDBClusters",
+                    // Amazon RDS owns the shared name, so its OWN handler serves this —
+                    // not DocumentDB's or Neptune's — and the cluster it stores lands in
+                    // the RDS store, which the next three rows read apart.
+                    case: "rds CreateDBCluster",
+                    addressed: Addressed::Signed("rds"),
+                    action: "CreateDBCluster",
+                    params: &[
+                        ("DBClusterIdentifier", "router-cluster-rds"),
+                        ("Engine", "aurora-postgresql"),
+                    ],
+                    expected_status: Some(200),
+                    expected_code: None,
+                    expected_body_contains: &[
+                        "<DBClusterIdentifier>router-cluster-rds</DBClusterIdentifier>",
+                        "<Engine>aurora-postgresql</Engine>",
+                    ],
+                },
+                Call {
+                    case: "rds DescribeDBClusters reads the created cluster back",
                     addressed: Addressed::Signed("rds"),
                     action: "DescribeDBClusters",
                     params: &[],
-                    expected_status: Some(501),
-                    expected_code: Some("NotImplemented"),
-                    expected_body_contains: &[],
+                    expected_status: Some(200),
+                    expected_code: None,
+                    expected_body_contains: &[
+                        "<DBClusterIdentifier>router-cluster-rds</DBClusterIdentifier>",
+                    ],
                 },
                 Call {
+                    // DocumentDB reads its own cluster store, which that create did not
+                    // touch: an EMPTY list here is what proves the request did not land on
+                    // Amazon RDS.
                     case: "docdb DescribeDBClusters",
                     addressed: Addressed::Signed("docdb"),
                     action: "DescribeDBClusters",
                     params: &[],
                     expected_status: Some(200),
                     expected_code: None,
-                    expected_body_contains: &[],
+                    expected_body_contains: &["<DBClusters></DBClusters>"],
                 },
                 Call {
                     case: "neptune DescribeDBClusters",
@@ -150,7 +172,7 @@ fn rds_docdb_and_neptune_route_apart_under_one_signing_name() {
                     params: &[],
                     expected_status: Some(200),
                     expected_code: None,
-                    expected_body_contains: &[],
+                    expected_body_contains: &["<DBClusters></DBClusters>"],
                 },
                 Call {
                     // DocumentDB's own scaffold, which proves this request did NOT land

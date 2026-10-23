@@ -28,12 +28,14 @@ hex = { workspace = true }
 # holds, which S3 owns, so it is read from S3's own state in the shared engine rather
 # than kept a second time here.
 service-com-amazonaws-s3-amazons3 = { workspace = true }
+# `sha2` derives the `ETag` validator this service puts on an error response from the
+# response bytes themselves (see `service.rs`).
+sha2 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
-sha2 = { workspace = true }
 # `time` is for the integration tests' `tokio::time::sleep`, which waits out a job's
 # completion delay without parking the test runtime's worker.
 tokio = { workspace = true, features = ["time"] }

@@ -7,11 +7,23 @@
 //! leaves the same tag set — and an empty `Tags` list (the modelled `len 0..200` allows
 //! one) changes nothing. There is no response body.
 //!
-//! An ARN that does not satisfy the ARN grammar is refused with the modelled
-//! `ValidationException` (400) without any lookup; a well-formed ARN that names no
-//! resource this service holds answers the modelled `ResourceNotFoundException` (404).
-//! A call that would carry a resource past [`crate::state::MAX_TAGS_PER_RESOURCE`] tags
-//! is refused with `ValidationException` and writes nothing.
+//! An ARN this service cannot ACT ON is refused with the modelled `ValidationException`
+//! (400) and nothing is stored — both a value that is not an ARN at all (refused without
+//! any lookup) and a well-formed ARN that names no resource this service holds (a stale
+//! ARN whose resource has been deleted, or one differing from a stored ARN in its
+//! partition, region, account or resource field). That is the behaviour RECORDED against
+//! AWS for this operation: trace `b2bi.tag-resource-nonexistent-arn-not-found` in
+//! `issues/things-that-now-work/20261022T031134Z-b2bi-tagging-test-harness-and-transformer-operations-answer.md`
+//! asserts `ValidationException` for tagging a deleted profile's well-formed ARN, i.e.
+//! this write validates `ResourceARN` as the request parameter it is rather than
+//! reporting the resource absent. The REPORTING `ListTagsForResource` keeps the two-way
+//! split (400 for a value that is not an ARN, 404 for a well-formed ARN naming no
+//! resource), and both operations resolve an ARN through the same `crate::state` helpers,
+//! so they cannot disagree about which resource an ARN names.
+//!
+//! A call that would carry a resource past [`crate::state::MAX_TAGS_PER_RESOURCE`] tags,
+//! or that claims a key under the prefix AWS reserves for its own tags, is refused with
+//! `ValidationException` and writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -141,6 +153,13 @@ impl From<TagResourceErrorModeled> for TagResourceError {
     }
 }
 
+/// Refuse this request with the modelled `ValidationException` (HTTP 400): the
+/// `ResourceARN` cannot be acted on, or the `Tags` cannot be stored. Either way nothing is
+/// written — which is the whole point of answering before the merge.
+fn invalid(message: String) -> TagResourceError {
+    TagResourceErrorModeled::ValidationException(ValidationException { message }).into()
+}
+
 /// The `TagResource` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -180,6 +199,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The tags belong to the resource the ARN names, so neither the caller nor the
         // request's signing scope takes part in this.
         let _ = ctx;
+
+        // Syntax first, and before the store is locked: something that is not an ARN at
+        // all cannot name a resource, so answering it is a pure function of the request —
+        // a malformed ARN therefore never contends for the state lock.
+        // (`ListTagsForResource` orders the same two steps the same way.) The modelled
+        // `len 1..1011` bound on `ResourceARN` is already enforced before this handler
+        // runs; the grammar is not.
+        if !crate::state::is_arn(&input.resource_arn) {
+            return Err(invalid(format!("Invalid ARN {}", input.resource_arn)));
+        }
+
         let Some(store) = crate::state::service_state(&*self.engine) else {
             return Err(TagResourceErrorModeled::InternalServerException(
                 InternalServerException {
@@ -189,63 +219,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-
-        // Syntax first, and without touching the store: something that is not an ARN at
-        // all cannot name a resource, so it is a client-side mistake (400) rather than a
-        // resource that is missing (404) — the same split `ListTagsForResource` makes.
-        // The modelled `len 1..1011` bound on `ResourceARN` is already enforced before
-        // this handler runs; the grammar is not.
-        if !crate::state::is_arn(&input.resource_arn) {
-            return Err(TagResourceErrorModeled::ValidationException(ValidationException {
-                message: format!("Invalid ARN {}", input.resource_arn),
-            })
-            .into());
-        }
-
         let mut state = store.lock();
-        let resource_arn = input.resource_arn;
-        let Some(stored) = state.tags_by_arn_mut(&resource_arn) else {
-            return Err(TagResourceErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: format!("Could not find resource with ARN {resource_arn}"),
-                },
-            )
-            .into());
+
+        // A well-formed ARN that no stored resource carries — a stale ARN whose resource
+        // has been deleted, or one that differs from a stored one in its region, account
+        // or resource type — is refused the same way here, and nothing is stored.
+        let Some(held) = state.tags_by_arn_mut(&input.resource_arn) else {
+            return Err(invalid(format!(
+                "Invalid ARN {}: it names no resource in this account",
+                input.resource_arn
+            )));
         };
 
-        // How many keys this call ADDS: a key the resource already carries has its value
-        // replaced in place, so only the new keys can push the resource past the ceiling,
-        // and a key named twice in one request counts once. Counted (and refused) BEFORE
-        // anything is written, so a refused call leaves the tag set exactly as it was
-        // rather than half-applied.
-        let mut added: Vec<&str> = Vec::new();
-        for tag in &input.tags {
-            let held = stored.iter().any(|existing| existing.key == tag.key)
-                || added.contains(&tag.key.as_str());
-            if !held {
-                added.push(tag.key.as_str());
+        // The merge itself enforces what a tag write cannot do — grow the set past the
+        // modelled `TagList len 0..200`, or claim a key under the prefix AWS reserves —
+        // and leaves the stored set untouched when it refuses.
+        let resource_arn = input.resource_arn;
+        match crate::state::merge_tags(held, input.tags) {
+            Ok(()) => {
+                ::tracing::debug!(
+                    operation = "TagResource",
+                    resource_arn = %resource_arn,
+                    "merged the request's tags onto the stored resource"
+                );
+                Ok(TagResourceOutput)
             }
+            Err(crate::state::TagWriteRefused::TooManyTags(would_hold)) => Err(invalid(format!(
+                "Tags: a resource holds at most {} tags, and this request would leave {} on {}",
+                crate::state::MAX_TAGS_PER_RESOURCE,
+                would_hold,
+                resource_arn
+            ))),
+            Err(crate::state::TagWriteRefused::ReservedKeyPrefix) => Err(invalid(format!(
+                "Tags: a tag key may not start with {:?}, which is reserved",
+                crate::state::RESERVED_TAG_KEY_PREFIX
+            ))),
         }
-        let total = stored.len() + added.len();
-        if total > crate::state::MAX_TAGS_PER_RESOURCE {
-            return Err(TagResourceErrorModeled::ValidationException(ValidationException {
-                message: format!(
-                    "Resource {resource_arn} would hold {total} tags, more than the maximum of {} tags per resource",
-                    crate::state::MAX_TAGS_PER_RESOURCE
-                ),
-            })
-            .into());
-        }
-
-        // Upsert in request order, so a request naming one key twice leaves the LAST
-        // value it gave for that key — the same answer as sending those two calls in turn.
-        for tag in input.tags {
-            match stored.iter_mut().find(|existing| existing.key == tag.key) {
-                Some(existing) => existing.value = tag.value,
-                None => stored.push(tag),
-            }
-        }
-
-        Ok(TagResourceOutput)
     }
 }
