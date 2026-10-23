@@ -93,11 +93,17 @@ use super::types::*;
 /// `createdBy`, `updatedOnBehalfOf` and `updatedOnBehalfOfJobTitle` identify the
 /// Trusted Advisor Priority person who acted on the recommendation; the store
 /// holds no such actor, so those optional members stay absent rather than
-/// carrying an invented name. `pillarSpecificAggregates` and `statusReason` are
-/// absent for the same reason.
+/// carrying an invented name. `statusReason` is absent for the same reason: the
+/// store records no discrepancy in how a status was determined.
+///
+/// `pillarSpecificAggregates` is computed from the recommendation's own
+/// resources by
+/// [`crate::state::ComAmazonawsTrustedadvisorTrustedadvisorState::pillar_aggregates_for`],
+/// and is `None` only for a recommendation that optimizes no cost.
 fn recommendation(
     entry: &crate::state::RecommendationEntry,
     resources_aggregates: RecommendationResourcesAggregates,
+    pillar_specific_aggregates: Option<RecommendationPillarSpecificAggregates>,
     language: Option<&str>,
 ) -> Recommendation {
     let text = entry.text.text(language);
@@ -112,7 +118,7 @@ fn recommendation(
         aws_services: Some(entry.aws_services.clone()),
         name: text.name.clone(),
         resources_aggregates,
-        pillar_specific_aggregates: None,
+        pillar_specific_aggregates,
         created_at: Some(crate::state::date_time(entry.created_at_millis)),
         last_updated_at: Some(crate::state::date_time(entry.last_updated_at_millis)),
         arn: entry.arn.clone(),
@@ -231,10 +237,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let aggregates = state.aggregates_for(&input.recommendation_identifier);
+        let pillar_aggregates = state.pillar_aggregates_for(&input.recommendation_identifier);
         Ok(GetRecommendationOutput {
             recommendation: Some(recommendation(
                 entry,
                 aggregates,
+                pillar_aggregates,
                 input.language.as_deref(),
             )),
         })
