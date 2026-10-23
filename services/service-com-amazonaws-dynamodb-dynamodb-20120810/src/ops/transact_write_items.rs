@@ -1,15 +1,44 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TransactWriteItems
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TransactWriteItems`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: applies every `TransactItems` action — `Put`, `Update`, `Delete` and
+//! `ConditionCheck` — as ONE all-or-nothing write: "the entire transaction must consist of
+//! [...] actions, all of which must either succeed or fail". Each action's condition is
+//! read against the item as it stood BEFORE the transaction, and only when every one of
+//! them holds does any write land; otherwise nothing is written and the call is
+//! `TransactionCanceledException`, whose `CancellationReasons` carry one reason per action
+//! in request order — `ConditionalCheckFailed` for each condition that was not met (with
+//! that action's item when its `ReturnValuesOnConditionCheckFailure` is `ALL_OLD`) and
+//! `None` for the rest.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TransactWriteItems::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The writes land through the same store write sites `PutItem`, `UpdateItem` and
+//! `DeleteItem` use, so numbers are canonicalized and capacity is accounted the same way
+//! on this path as on the single-item one, and an `Update` applies the same
+//! `UpdateExpression` language ([`crate::state::ParsedUpdate`]).
+//!
+//! "Transaction requests cannot include multiple operations on one item" and each entry
+//! carries exactly one action: both are a `ValidationException`, as are an item past the
+//! documented size, a key that is not the table's and an update that moves a key
+//! attribute. The documented ceiling of 100 action requests is the model's own `@length`
+//! on `TransactItems`, refused before this handler runs. An unknown — or not yet
+//! `ACTIVE` — table is `ResourceNotFoundException`, and
+//! a table whose resource-based policy denies the caller the action it performs
+//! (`dynamodb:PutItem`, `dynamodb:UpdateItem`, `dynamodb:DeleteItem` or
+//! `dynamodb:ConditionCheckItem`) is `AccessDeniedException`.
+//!
+//! `ClientRequestToken` is honoured: "providing a ClientRequestToken makes the call to
+//! TransactWriteItems idempotent, meaning that multiple identical calls have the same
+//! effect as one single call", so a repeat of a token inside the documented 10-minute
+//! window applies NOTHING and answers what the first call answered, and a repeat carrying
+//! different actions is `IdempotentParameterMismatchException`. What a token stands for is
+//! [`crate::state::CompletedTransaction`], remembered per REGION — a table name resolves
+//! inside one region, so a token names the transaction it ran there and nowhere else.
+//!
+//! A transactional write costs twice what the same single-item write costs
+//! ([`crate::state::TRANSACTIONAL_CAPACITY_FACTOR`]); `ReturnConsumedCapacity` reports it
+//! per table and `ReturnItemCollectionMetrics=SIZE` reports the item collections the
+//! transaction wrote into, both totalled from stored state by
+//! [`crate::state::WriteLedger`].
 //!
 //! ## Shape of an operation
 //!
@@ -248,18 +277,637 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TransactWriteItems` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TransactWriteItemsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TransactWriteItems"))
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
+
+        let report_item_collection = crate::state::returns_item_collection_metrics(
+            input.return_item_collection_metrics.as_deref(),
+        )
+        .map_err(lift)?;
+
+        // Every entry states exactly one action. The canonical form built from them is
+        // the REQUEST's own content — nothing of what the store holds — which is what
+        // makes it comparable across the retries a `ClientRequestToken` covers.
+        let mut actions: Vec<Requested<'_>> = Vec::with_capacity(input.transact_items.len());
+        for entry in &input.transact_items {
+            actions.push(Requested::of(entry).map_err(lift)?);
+        }
+        let canonical = crate::state::action_fingerprint(&canonical_actions(&actions));
+        let token = input
+            .client_request_token
+            .as_deref()
+            .filter(|token| !token.is_empty());
+
+        let mut store = state.lock();
+        store.apply_due_transitions(now);
+
+        // A token still inside its window stands for the transaction it was first used
+        // for IN THIS REGION — a table name resolves inside one region, so a token can
+        // only stand for what it ran against there: identical actions are answered from
+        // what that call DID, and different actions are the documented mismatch. Both
+        // decisions precede every condition below, because a retry must not be judged
+        // against the state its own first attempt left.
+        if let Some(token) = token {
+            if let Some(completed) = store.recorded_transaction(&region, token).cloned() {
+                if completed.actions != canonical {
+                    return Err(
+                        TransactWriteItemsErrorModeled::IdempotentParameterMismatchException(
+                            IdempotentParameterMismatchException {
+                                message: Some(
+                                    "Request parameters differ from those of a request \
+                                     already completed with this ClientRequestToken"
+                                        .to_string(),
+                                ),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+                return Ok(TransactWriteItemsOutput {
+                    consumed_capacity: completed
+                        .ledger
+                        .consumed_capacity(input.return_consumed_capacity.as_deref()),
+                    item_collection_metrics: report_item_collection
+                        .then(|| completed.ledger.item_collection_metrics())
+                        .flatten(),
+                });
+            }
+        }
+
+        // Pass one resolves every action against the stored items and reads its
+        // condition, writing NOTHING: a transaction only lands once all of it is known
+        // to be applicable, and every condition speaks about the item as it stood
+        // before the transaction.
+        let mut planned: Vec<Planned> = Vec::with_capacity(actions.len());
+        let mut keyed: std::collections::BTreeSet<(String, crate::state::ItemKey)> =
+            std::collections::BTreeSet::new();
+        for action in &actions {
+            let name = crate::state::resolve_table_name(action.table_name()).map_err(lift)?;
+            let substitutions = crate::state::Substitutions::new(
+                action.expression_attribute_names(),
+                action.expression_attribute_values(),
+            );
+            // A value a condition compares against, or one an update writes, is held to
+            // the same limits a stored value is: the documented nesting depth and this
+            // emulator's ceiling on a collection's members.
+            for (placeholder, value) in action.expression_attribute_values().into_iter().flatten() {
+                crate::state::check_attribute_value(placeholder, value).map_err(lift)?;
+            }
+            // "For ReturnValuesOnConditionCheckFailure, the valid values are: NONE and
+            // ALL_OLD."
+            let returns_old_on_failure =
+                match action.return_values_on_condition_check_failure() {
+                    None | Some("NONE") => false,
+                    Some("ALL_OLD") => true,
+                    Some(other) => {
+                        return Err(crate::scaffolded::Scaffolded::validation(format!(
+                            "ReturnValuesOnConditionCheckFailure can only be ALL_OLD or \
+                             NONE, got {other}"
+                        )))
+                    }
+                };
+
+            let prepared = match action {
+                Requested::Put(put) => {
+                    let mut item = put.item.clone();
+                    for (attribute, value) in &item {
+                        crate::state::check_attribute_value(attribute, value).map_err(lift)?;
+                    }
+                    crate::state::canonicalize_item(&mut item).map_err(lift)?;
+                    if crate::state::item_size(&item) > crate::state::MAX_ITEM_SIZE_BYTES {
+                        return Err(crate::scaffolded::Scaffolded::validation(
+                            crate::state::ITEM_SIZE_EXCEEDED_MESSAGE,
+                        ));
+                    }
+                    let table = store.active_table(&region, &name, now).map_err(lift)?;
+                    deny(table, action, now)?;
+                    table.check_index_key_limits(&item).map_err(lift)?;
+                    Prepared {
+                        key: table.key_of_item(&item).map_err(lift)?,
+                        addressed: item.clone(),
+                        write: PlannedWrite::Put(item),
+                    }
+                }
+                Requested::Delete(delete) => {
+                    for (attribute, value) in &delete.key {
+                        crate::state::check_attribute_value(attribute, value).map_err(lift)?;
+                    }
+                    let table = store.active_table(&region, &name, now).map_err(lift)?;
+                    deny(table, action, now)?;
+                    Prepared {
+                        key: table.key_of_key_map(&delete.key).map_err(lift)?,
+                        addressed: delete.key.clone(),
+                        write: PlannedWrite::Delete,
+                    }
+                }
+                Requested::Check(check) => {
+                    for (attribute, value) in &check.key {
+                        crate::state::check_attribute_value(attribute, value).map_err(lift)?;
+                    }
+                    let table = store.active_table(&region, &name, now).map_err(lift)?;
+                    deny(table, action, now)?;
+                    Prepared {
+                        key: table.key_of_key_map(&check.key).map_err(lift)?,
+                        addressed: check.key.clone(),
+                        write: PlannedWrite::Check,
+                    }
+                }
+                Requested::Update(update) => {
+                    for (attribute, value) in &update.key {
+                        crate::state::check_attribute_value(attribute, value).map_err(lift)?;
+                    }
+                    let applied = crate::state::ParsedUpdate::parse(
+                        "UpdateExpression",
+                        &update.update_expression,
+                        substitutions,
+                    )
+                    .map_err(lift)?;
+                    let table = store.active_table(&region, &name, now).map_err(lift)?;
+                    deny(table, action, now)?;
+                    let key = table.key_of_key_map(&update.key).map_err(lift)?;
+                    let partition_key = table.partition_key_name().to_string();
+                    let sort_key = table.sort_key_name().map(ToString::to_string);
+                    // An update of a key that holds no item starts from the key itself,
+                    // so the created item carries the primary key it was addressed by.
+                    let mut item = table
+                        .items
+                        .get(&key)
+                        .cloned()
+                        .unwrap_or_else(|| update.key.clone());
+                    let touched = applied.apply(&mut item).map_err(lift)?;
+                    for attribute in &touched {
+                        if attribute.as_str() == partition_key.as_str()
+                            || Some(attribute.as_str()) == sort_key.as_deref()
+                        {
+                            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                                "One or more parameter values were invalid: Cannot update \
+                                 attribute {attribute}. This attribute is part of the key"
+                            )));
+                        }
+                    }
+                    for (attribute, value) in &item {
+                        crate::state::check_attribute_value(attribute, value).map_err(lift)?;
+                    }
+                    crate::state::canonicalize_item(&mut item).map_err(lift)?;
+                    if crate::state::item_size(&item) > crate::state::MAX_ITEM_SIZE_BYTES {
+                        return Err(crate::scaffolded::Scaffolded::validation(
+                            crate::state::ITEM_SIZE_EXCEEDED_MESSAGE,
+                        ));
+                    }
+                    store
+                        .active_table(&region, &name, now)
+                        .map_err(lift)?
+                        .check_index_key_limits(&item)
+                        .map_err(lift)?;
+                    Prepared {
+                        key,
+                        addressed: item.clone(),
+                        write: PlannedWrite::Update(item),
+                    }
+                }
+            };
+
+            // "Transaction requests cannot include multiple operations on one item."
+            if !keyed.insert((name.clone(), prepared.key.clone())) {
+                return Err(crate::scaffolded::Scaffolded::validation(
+                    crate::state::DUPLICATE_TRANSACT_ITEM_MESSAGE,
+                ));
+            }
+            let before = store
+                .active_table(&region, &name, now)
+                .map_err(lift)?
+                .items
+                .get(&prepared.key)
+                .cloned();
+            let satisfied = crate::state::write_condition_satisfied(
+                action.condition_expression(),
+                None,
+                None,
+                substitutions,
+                before.as_ref(),
+            )
+            .map_err(lift)?;
+            planned.push(Planned {
+                table: name,
+                key: prepared.key,
+                addressed: prepared.addressed,
+                write: prepared.write,
+                before,
+                satisfied,
+                returns_old_on_failure,
+            });
+        }
+
+        // "All of which must either succeed or fail": one unmet condition cancels the
+        // whole transaction, and the reasons report what each action's own outcome was,
+        // in request order.
+        if planned.iter().any(|action| !action.satisfied) {
+            let codes: Vec<&str> = planned
+                .iter()
+                .map(|action| action.cancellation_code())
+                .collect();
+            let cancellation_reasons: Vec<CancellationReason> = planned
+                .iter()
+                .map(|action| CancellationReason {
+                    code: Some(action.cancellation_code().to_string()),
+                    message: (!action.satisfied)
+                        .then(|| crate::state::CONDITION_FAILED_MESSAGE.to_string()),
+                    item: (!action.satisfied && action.returns_old_on_failure)
+                        .then(|| action.before.clone())
+                        .flatten(),
+                })
+                .collect();
+            return Err(TransactWriteItemsErrorModeled::TransactionCanceledException(
+                TransactionCanceledException {
+                    message: Some(crate::state::transaction_cancelled_message(&codes)),
+                    cancellation_reasons: Some(cancellation_reasons),
+                },
+            )
+            .into());
+        }
+
+        // Pass two applies them. Each figure is read back from the table the write
+        // landed in, so the capacity fan-out and the item-collection size are computed
+        // from stored state rather than from the request.
+        let mut ledger = crate::state::WriteLedger::default();
+        let mut undo: Vec<(String, crate::state::ItemKey, Option<crate::state::Item>)> = Vec::new();
+        let mut refused: Option<Self::Error> = None;
+        for action in &planned {
+            let after = match &action.write {
+                PlannedWrite::Put(item) | PlannedWrite::Update(item) => Some(item.clone()),
+                PlannedWrite::Check | PlannedWrite::Delete => None,
+            };
+            if matches!(action.write, PlannedWrite::Check) {
+                // A `ConditionCheck` writes nothing, so it lands in no item collection;
+                // it is still part of the transactional write, and it reads one item,
+                // so the table is charged for that item and no index is.
+                ledger.record(
+                    &action.table,
+                    &crate::state::WriteCapacity {
+                        table: crate::state::write_capacity_units(
+                            action.before.as_ref().map_or(0, crate::state::item_size),
+                        ),
+                        ..crate::state::WriteCapacity::default()
+                    },
+                );
+                continue;
+            }
+            undo.push((
+                action.table.clone(),
+                action.key.clone(),
+                action.before.clone(),
+            ));
+            let landed = match &after {
+                Some(item) => store
+                    .put_item(&region, &action.table, now, action.key.clone(), item.clone())
+                    .map(|_| ()),
+                None => store
+                    .delete_item(&region, &action.table, now, &action.key)
+                    .map(|_| ()),
+            };
+            if let Err(error) = landed {
+                refused = Some(lift(error));
+                break;
+            }
+            // Reading the table back is on the same all-or-nothing path as the write
+            // itself: a failure here must roll back too, never return early past the
+            // undo below.
+            match store.active_table(&region, &action.table, now) {
+                Ok(table) => {
+                    ledger.record(
+                        &action.table,
+                        &table.write_capacity(action.before.as_ref(), after.as_ref()),
+                    );
+                    if report_item_collection {
+                        ledger.record_metrics(
+                            &action.table,
+                            table.item_collection_metrics(&action.addressed),
+                        );
+                    }
+                }
+                Err(error) => {
+                    refused = Some(lift(error));
+                    break;
+                }
+            }
+        }
+        if let Some(refused) = refused {
+            // A transaction is all-or-nothing, so a refusal from the store's own
+            // budgets part-way through puts back exactly what stood at every key it had
+            // already reached — each of which fitted the store a moment ago.
+            for (table, key, before) in undo.into_iter().rev() {
+                let restored = match before {
+                    Some(item) => store.put_item(&region, &table, now, key, item).map(|_| ()),
+                    None => store.delete_item(&region, &table, now, &key).map(|_| ()),
+                };
+                if let Err(error) = restored {
+                    // Nothing a caller can be told makes this right, so it is LOGGED:
+                    // a store that could not be put back is observable to whoever runs
+                    // the emulator rather than silent.
+                    ::tracing::error!(
+                        table = %table,
+                        error = %error.message(),
+                        "a cancelled transaction could not be rolled back"
+                    );
+                }
+            }
+            return Err(refused);
+        }
+
+        // "Transactional write requests require two write capacity units": the whole
+        // transaction is billed at twice what the same single-item writes would cost.
+        ledger.scale(crate::state::TRANSACTIONAL_CAPACITY_FACTOR);
+        if let Some(token) = token {
+            store.record_transaction(
+                &region,
+                token,
+                crate::state::CompletedTransaction {
+                    actions: canonical,
+                    completed_at: now,
+                    ledger: ledger.clone(),
+                },
+            );
+        }
+
+        Ok(TransactWriteItemsOutput {
+            consumed_capacity: ledger.consumed_capacity(input.return_consumed_capacity.as_deref()),
+            item_collection_metrics: report_item_collection
+                .then(|| ledger.item_collection_metrics())
+                .flatten(),
+        })
+    }
+}
+
+/// One action a transaction states: exactly one of the four a `TransactWriteItem` may
+/// carry ("a list of requests that can perform update, put, delete, or check operations
+/// on multiple items in one or more tables atomically").
+enum Requested<'a> {
+    Check(&'a ConditionCheck),
+    Put(&'a Put),
+    Delete(&'a Delete),
+    Update(&'a Update),
+}
+
+impl<'a> Requested<'a> {
+    /// The one action `entry` states, or the refusal for an entry that states none of
+    /// them — or more than one.
+    fn of(entry: &'a TransactWriteItem) -> Result<Self, crate::state::RequestError> {
+        let stated = [
+            entry.condition_check.as_ref().map(Self::Check),
+            entry.put.as_ref().map(Self::Put),
+            entry.delete.as_ref().map(Self::Delete),
+            entry.update.as_ref().map(Self::Update),
+        ];
+        let mut stated = stated.into_iter().flatten();
+        match (stated.next(), stated.next()) {
+            (Some(one), None) => Ok(one),
+            _ => Err(crate::state::exactly_one_operation(
+                "transactItems",
+                "ConditionCheck, Put, Delete or Update",
+            )),
+        }
+    }
+
+    /// The table this action addresses.
+    fn table_name(&self) -> &'a str {
+        match self {
+            Self::Check(check) => &check.table_name,
+            Self::Put(put) => &put.table_name,
+            Self::Delete(delete) => &delete.table_name,
+            Self::Update(update) => &update.table_name,
+        }
+    }
+
+    /// The condition this action states, which a `ConditionCheck` always does.
+    fn condition_expression(&self) -> Option<&'a str> {
+        match self {
+            Self::Check(check) => Some(check.condition_expression.as_str()),
+            Self::Put(put) => put.condition_expression.as_deref(),
+            Self::Delete(delete) => delete.condition_expression.as_deref(),
+            Self::Update(update) => update.condition_expression.as_deref(),
+        }
+    }
+
+    /// The update this action applies, which only an `Update` states.
+    fn update_expression(&self) -> Option<&'a str> {
+        match self {
+            Self::Update(update) => Some(update.update_expression.as_str()),
+            Self::Check(_) | Self::Put(_) | Self::Delete(_) => None,
+        }
+    }
+
+    /// The attribute-name substitutions its expressions dereference.
+    fn expression_attribute_names(
+        &self,
+    ) -> Option<&'a std::collections::HashMap<String, String>> {
+        match self {
+            Self::Check(check) => check.expression_attribute_names.as_ref(),
+            Self::Put(put) => put.expression_attribute_names.as_ref(),
+            Self::Delete(delete) => delete.expression_attribute_names.as_ref(),
+            Self::Update(update) => update.expression_attribute_names.as_ref(),
+        }
+    }
+
+    /// The attribute-value substitutions its expressions dereference.
+    fn expression_attribute_values(&self) -> Option<&'a crate::state::Item> {
+        match self {
+            Self::Check(check) => check.expression_attribute_values.as_ref(),
+            Self::Put(put) => put.expression_attribute_values.as_ref(),
+            Self::Delete(delete) => delete.expression_attribute_values.as_ref(),
+            Self::Update(update) => update.expression_attribute_values.as_ref(),
+        }
+    }
+
+    /// Whether this action reports its item when its condition is not met.
+    fn return_values_on_condition_check_failure(&self) -> Option<&'a str> {
+        match self {
+            Self::Check(check) => check.return_values_on_condition_check_failure.as_deref(),
+            Self::Put(put) => put.return_values_on_condition_check_failure.as_deref(),
+            Self::Delete(delete) => delete.return_values_on_condition_check_failure.as_deref(),
+            Self::Update(update) => update.return_values_on_condition_check_failure.as_deref(),
+        }
+    }
+
+    /// The `Item` or `Key` map the action carries — what it addresses, and what the
+    /// canonical form below encodes.
+    fn addressed(&self) -> &'a crate::state::Item {
+        match self {
+            Self::Check(check) => &check.key,
+            Self::Put(put) => &put.item,
+            Self::Delete(delete) => &delete.key,
+            Self::Update(update) => &update.key,
+        }
+    }
+
+    /// The IAM action this one performs, which is the action a table's resource-based
+    /// policy is read for: a transaction performs the item actions of the operations it
+    /// is made of, and `dynamodb:ConditionCheckItem` for a `ConditionCheck`.
+    fn policy_action(&self) -> &'static str {
+        match self {
+            Self::Check(_) => "dynamodb:ConditionCheckItem",
+            Self::Put(_) => "dynamodb:PutItem",
+            Self::Delete(_) => "dynamodb:DeleteItem",
+            Self::Update(_) => "dynamodb:UpdateItem",
+        }
+    }
+
+    /// This action's name, as the canonical form tags it.
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Check(_) => "ConditionCheck",
+            Self::Put(_) => "Put",
+            Self::Delete(_) => "Delete",
+            Self::Update(_) => "Update",
+        }
+    }
+}
+
+/// `AccessDeniedException` when `table`'s resource-based policy denies the caller the
+/// action `requested` performs, so authorization is decided before any item is read or
+/// keyed.
+fn deny(
+    table: &crate::state::Table,
+    requested: &Requested<'_>,
+    now: ::std::time::SystemTime,
+) -> Result<(), TransactWriteItemsError> {
+    match crate::state::policy_denial(table, requested.policy_action(), now) {
+        Some(denial) => Err(crate::scaffolded::Scaffolded::access_denied(denial)),
+        None => Ok(()),
+    }
+}
+
+/// The request's actions, canonically encoded: what a repeated `ClientRequestToken` is
+/// compared against (through [`crate::state::action_fingerprint`], which is what the
+/// store keeps), because "if you submit a request with the same client token but a
+/// change in other parameters within the 10-minute idempotency window, DynamoDB returns
+/// an IdempotentParameterMismatch exception".
+///
+/// Everything that decides what the transaction DOES is encoded, in request order:
+/// the action, its table, the item or key it addresses, its expressions and their
+/// substitutions. Maps and sets go through [`crate::state::canonical_item_text`], so two
+/// identical calls encode identically whatever order their JSON arrived in.
+fn canonical_actions(actions: &[Requested<'_>]) -> String {
+    let mut text = String::new();
+    for action in actions {
+        text.push_str(action.kind());
+        text.push('|');
+        // The RESOLVED table name and the CANONICAL form of every value: a retry that
+        // addresses the same table by ARN instead of by name, or spells the same number
+        // differently, is the same transaction, so it fingerprints the same way the
+        // handler itself reads those members.
+        text.push_str(
+            &crate::state::resolve_table_name(action.table_name())
+                .unwrap_or_else(|_| action.table_name().to_string()),
+        );
+        text.push('|');
+        text.push_str(&crate::state::canonical_item_text(&canonicalized(
+            action.addressed(),
+        )));
+        text.push('|');
+        text.push_str(action.condition_expression().unwrap_or_default());
+        text.push('|');
+        text.push_str(action.update_expression().unwrap_or_default());
+        text.push('|');
+        for (placeholder, name) in action
+            .expression_attribute_names()
+            .into_iter()
+            .flatten()
+            .collect::<std::collections::BTreeMap<_, _>>()
+        {
+            text.push_str(placeholder);
+            text.push('=');
+            text.push_str(name);
+            text.push(';');
+        }
+        text.push('|');
+        if let Some(values) = action.expression_attribute_values() {
+            text.push_str(&crate::state::canonical_item_text(&canonicalized(values)));
+        }
+        text.push('\n');
+    }
+    text
+}
+
+/// `item` with its numbers in the one form the store keeps them in, for the fingerprint
+/// above. A value no number can be read out of is left as it came: the request is
+/// refused later, by the handler, with the refusal that names what was wrong with it.
+fn canonicalized(item: &crate::state::Item) -> crate::state::Item {
+    let mut canonical = item.clone();
+    if crate::state::canonicalize_item(&mut canonical).is_err() {
+        return item.clone();
+    }
+    canonical
+}
+
+/// One action resolved against its table: the key it addresses and the write it would
+/// land, computed before any of the transaction is applied.
+struct Prepared {
+    key: crate::state::ItemKey,
+    addressed: crate::state::Item,
+    write: PlannedWrite,
+}
+
+/// One action of the transaction, ready to apply.
+struct Planned {
+    /// The resolved name of the table it writes to.
+    table: String,
+    key: crate::state::ItemKey,
+    /// The item or `Key` map it addressed, which the item-collection metrics of the
+    /// write are reported for.
+    addressed: crate::state::Item,
+    write: PlannedWrite,
+    /// The item that stood at `key` before the transaction: what the condition was read
+    /// against, what the capacity weighs, and what an unmet condition reports.
+    before: Option<crate::state::Item>,
+    satisfied: bool,
+    returns_old_on_failure: bool,
+}
+
+impl Planned {
+    /// The `CancellationReason$Code` this action reports when the transaction is
+    /// cancelled: the condition it failed, or `None` for an action nothing was wrong
+    /// with.
+    fn cancellation_code(&self) -> &'static str {
+        if self.satisfied {
+            crate::state::CANCELLATION_CODE_NONE
+        } else {
+            crate::state::CANCELLATION_CODE_CONDITION_FAILED
+        }
+    }
+}
+
+/// What one action writes once every condition has held.
+enum PlannedWrite {
+    /// A `ConditionCheck`, which writes nothing.
+    Check,
+    /// The item a `Put` stores, replacing whatever its key held.
+    Put(crate::state::Item),
+    /// A `Delete`, which removes whatever its key held.
+    Delete,
+    /// The item an `Update` leaves at its key.
+    Update(crate::state::Item),
+}
+
+/// The modelled server error for a request that cannot reach this service's store.
+fn store_unavailable() -> TransactWriteItemsError {
+    TransactWriteItemsErrorModeled::InternalServerError(InternalServerError {
+        message: Some("the DynamoDB table store is unavailable".to_string()),
+    })
+    .into()
+}
+
+/// Lift a store refusal into this operation's error channel.
+fn lift(error: crate::state::RequestError) -> TransactWriteItemsError {
+    match error {
+        crate::state::RequestError::NotFound(message) => {
+            TransactWriteItemsErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: Some(message),
+            })
+            .into()
+        }
+        crate::state::RequestError::Validation(message) => {
+            crate::scaffolded::Scaffolded::validation(message)
+        }
     }
 }

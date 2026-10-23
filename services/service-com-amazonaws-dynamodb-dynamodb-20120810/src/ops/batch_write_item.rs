@@ -1,15 +1,33 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchWriteItem
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchWriteItem`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: applies every `PutRequest` and `DeleteRequest` in `RequestItems` to the
+//! stored tables, so a put REPLACES whatever its key held and a delete REMOVES it — "if
+//! you perform a BatchWriteItem operation on an existing item, that item's values will be
+//! overwritten". Each operation lands through the same store write sites `PutItem` and
+//! `DeleteItem` use ([`crate::state::ComAmazonawsDynamodbDynamodb20120810State::put_item`]
+//! and `delete_item`), so numbers are canonicalized and capacity is accounted the same way
+//! on this path as on the single-item one.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchWriteItem::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The whole request is resolved and validated BEFORE any item lands — the tables, the key
+//! schema, every value's own rules, the documented item size and the index key limits — so
+//! a refused batch writes nothing. An unknown, or not yet `ACTIVE`, table is
+//! `ResourceNotFoundException`; a table whose resource-based policy denies the caller
+//! `dynamodb:BatchWriteItem` is `AccessDeniedException`.
+//!
+//! "You can only request one of these operations, not both, in a single WriteRequest" (the
+//! `WriteRequest` doc), and "you cannot put and delete the same item in the same
+//! BatchWriteItem request" (this operation's own doc): a `WriteRequest` carrying neither or
+//! both, a batch past the documented 25 operations, and a key addressed twice are each a
+//! `ValidationException`. No condition is read and no item is echoed, because
+//! "you cannot specify conditions on individual put and delete requests, and BatchWriteItem
+//! does not return deleted items in the response".
+//!
+//! Every operation this emulator accepts is processed, so `UnprocessedItems` is the empty
+//! map AWS answers with rather than an absent member. `ReturnConsumedCapacity` reports one
+//! `ConsumedCapacity` per table written and `ReturnItemCollectionMetrics=SIZE` one
+//! `ItemCollectionMetrics` list per table, both totalled from stored state by
+//! [`crate::state::WriteLedger`].
 //!
 //! ## Shape of an operation
 //!
@@ -243,18 +261,181 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchWriteItem` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchWriteItemErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchWriteItem"))
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
+
+        let report_item_collection = crate::state::returns_item_collection_metrics(
+            input.return_item_collection_metrics.as_deref(),
+        )
+        .map_err(lift)?;
+
+        // "up to 25 item put or delete operations": the ceiling is on the OPERATIONS,
+        // counted across every table the request grouped them under, so a batch that
+        // spreads 26 writes over two tables is refused as well.
+        let requested: usize = input.request_items.values().map(Vec::len).sum();
+        if requested > crate::state::MAX_BATCH_WRITE_REQUESTS {
+            return Err(lift(crate::state::too_many_batch_items("BatchWriteItem")));
+        }
+
+        let mut store = state.lock();
+        store.apply_due_transitions(now);
+
+        // Pass one resolves and validates the whole request without writing anything,
+        // so a batch refused for any reason leaves the store exactly as it was. The
+        // tables are walked in name order, so which refusal a bad batch earns does not
+        // depend on the request map's iteration order.
+        let mut addressed: Vec<(&String, &Vec<WriteRequest>)> = input.request_items.iter().collect();
+        addressed.sort_by(|left, right| left.0.cmp(right.0));
+        let mut pending: Vec<(String, PendingWrite)> = Vec::new();
+        let mut keyed: std::collections::BTreeSet<(String, crate::state::ItemKey)> =
+            std::collections::BTreeSet::new();
+        for (table_name, requests) in addressed {
+            let name = crate::state::resolve_table_name(table_name).map_err(lift)?;
+            // The table and the caller's authorization for it are decided BEFORE any of
+            // its requests is read: a table that is not there, or whose resource-based
+            // policy denies the caller this action, is answered with that rather than
+            // with whatever is wrong with the items it was sent.
+            if let Some(denial) = crate::state::policy_denial(
+                store.active_table(&region, &name, now).map_err(lift)?,
+                "dynamodb:BatchWriteItem",
+                now,
+            ) {
+                return Err(crate::scaffolded::Scaffolded::access_denied(denial));
+            }
+            for request in requests {
+                let write = match (&request.put_request, &request.delete_request) {
+                    (Some(put), None) => {
+                        let mut item = put.item.clone();
+                        for (attribute, value) in &item {
+                            crate::state::check_attribute_value(attribute, value).map_err(lift)?;
+                        }
+                        crate::state::canonicalize_item(&mut item).map_err(lift)?;
+                        if crate::state::item_size(&item) > crate::state::MAX_ITEM_SIZE_BYTES {
+                            return Err(crate::scaffolded::Scaffolded::validation(
+                                crate::state::ITEM_SIZE_EXCEEDED_MESSAGE,
+                            ));
+                        }
+                        let table = store.active_table(&region, &name, now).map_err(lift)?;
+                        table.check_index_key_limits(&item).map_err(lift)?;
+                        PendingWrite::Put {
+                            key: table.key_of_item(&item).map_err(lift)?,
+                            item,
+                        }
+                    }
+                    (None, Some(delete)) => {
+                        for (attribute, value) in &delete.key {
+                            crate::state::check_attribute_value(attribute, value).map_err(lift)?;
+                        }
+                        let table = store.active_table(&region, &name, now).map_err(lift)?;
+                        PendingWrite::Delete {
+                            key: table.key_of_key_map(&delete.key).map_err(lift)?,
+                            addressed: delete.key.clone(),
+                        }
+                    }
+                    _ => {
+                        return Err(lift(crate::state::exactly_one_operation(
+                            "requestItems",
+                            "PutRequest or DeleteRequest",
+                        )))
+                    }
+                };
+                // "You cannot put and delete the same item in the same BatchWriteItem
+                // request": one key is addressed by at most one operation.
+                if !keyed.insert((name.clone(), write.key().clone())) {
+                    return Err(crate::scaffolded::Scaffolded::validation(
+                        crate::state::DUPLICATE_BATCH_KEYS_MESSAGE,
+                    ));
+                }
+                pending.push((name.clone(), write));
+            }
+        }
+
+        // Pass two applies them. Both figures are read back from the table each write
+        // landed in, so the capacity fan-out and the item-collection size are computed
+        // from stored state rather than from the request.
+        let mut ledger = crate::state::WriteLedger::default();
+        for (name, write) in pending {
+            match write {
+                PendingWrite::Put { key, item } => {
+                    let replaced = store
+                        .put_item(&region, &name, now, key, item.clone())
+                        .map_err(lift)?;
+                    let table = store.active_table(&region, &name, now).map_err(lift)?;
+                    ledger.record(&name, &table.write_capacity(replaced.as_ref(), Some(&item)));
+                    if report_item_collection {
+                        ledger.record_metrics(&name, table.item_collection_metrics(&item));
+                    }
+                }
+                PendingWrite::Delete { key, addressed } => {
+                    let removed = store.delete_item(&region, &name, now, &key).map_err(lift)?;
+                    let table = store.active_table(&region, &name, now).map_err(lift)?;
+                    ledger.record(&name, &table.write_capacity(removed.as_ref(), None));
+                    if report_item_collection {
+                        ledger.record_metrics(&name, table.item_collection_metrics(&addressed));
+                    }
+                }
+            }
+        }
+
+        Ok(BatchWriteItemOutput {
+            // "A map of tables and requests against those tables that were not
+            // processed": every operation this emulator accepted was processed, so the
+            // map is EMPTY — the member AWS answers with, which is what lets a client's
+            // retry loop terminate.
+            unprocessed_items: Some(std::collections::HashMap::new()),
+            item_collection_metrics: ledger.item_collection_metrics(),
+            consumed_capacity: ledger.consumed_capacity(input.return_consumed_capacity.as_deref()),
+        })
+    }
+}
+
+/// One put or delete this batch has resolved against its table and not yet applied.
+///
+/// The whole request becomes a list of these before any of it lands, which is what lets
+/// a batch be refused — for a key that is not the table's, an item past the documented
+/// size, a key addressed twice — without having written part of itself.
+enum PendingWrite {
+    Put {
+        key: crate::state::ItemKey,
+        item: crate::state::Item,
+    },
+    Delete {
+        key: crate::state::ItemKey,
+        /// The `Key` map as the request spelled it, which is what the item-collection
+        /// metrics of a delete are reported for.
+        addressed: crate::state::Item,
+    },
+}
+
+impl PendingWrite {
+    /// The primary key this operation addresses — what the duplicate check compares.
+    fn key(&self) -> &crate::state::ItemKey {
+        match self {
+            Self::Put { key, .. } | Self::Delete { key, .. } => key,
+        }
+    }
+}
+
+/// The modelled server error for a request that cannot reach this service's store.
+fn store_unavailable() -> BatchWriteItemError {
+    BatchWriteItemErrorModeled::InternalServerError(InternalServerError {
+        message: Some("the DynamoDB table store is unavailable".to_string()),
+    })
+    .into()
+}
+
+/// Lift a store refusal into this operation's error channel.
+fn lift(error: crate::state::RequestError) -> BatchWriteItemError {
+    match error {
+        crate::state::RequestError::NotFound(message) => {
+            BatchWriteItemErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: Some(message),
+            })
+            .into()
+        }
+        crate::state::RequestError::Validation(message) => {
+            crate::scaffolded::Scaffolded::validation(message)
+        }
     }
 }

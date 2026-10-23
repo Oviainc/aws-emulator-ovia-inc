@@ -15,8 +15,11 @@
 //! members are canonical is refused with a `ValidationException`, and so is an `N`
 //! that denotes no number.
 //!
-//! Conditional writes (`ConditionExpression`, the legacy `Expected`) are refused with
-//! the scaffold's 501 and filed as their own gap issue.
+//! Conditional puts are served: `ConditionExpression` (or the legacy
+//! `Expected`/`ConditionalOperator`) is read against the item this put would replace,
+//! and an unmet condition is `ConditionalCheckFailedException`, carrying that item when
+//! `ReturnValuesOnConditionCheckFailure=ALL_OLD`. The expression language lives in
+//! [`crate::state`], shared with `UpdateItem` and `DeleteItem`.
 //!
 //! `ReturnConsumedCapacity=INDEXES` reports the capacity the write consumed on the table
 //! AND on each secondary index the written item reaches, and
@@ -311,29 +314,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
         let name = crate::state::resolve_table_name(&input.table_name).map_err(lift)?;
 
-        if input.condition_expression.is_some() {
-            return Err(crate::scaffolded::Scaffolded::not_implemented(
-                "PutItem with ConditionExpression",
+        if input.return_values_on_condition_check_failure.is_some()
+            && !matches!(
+                input.return_values_on_condition_check_failure.as_deref(),
+                Some("NONE" | "ALL_OLD")
+            )
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "ReturnValuesOnConditionCheckFailure can only be ALL_OLD or NONE",
             ));
         }
-        if input.expected.as_ref().is_some_and(|map| !map.is_empty()) {
-            return Err(crate::scaffolded::Scaffolded::not_implemented(
-                "PutItem with Expected",
-            ));
-        }
-        // The other two condition-path members are refused the same way rather than
-        // accepted and dropped, so this handler is no more permissive than the real
-        // service on a path it does not serve.
-        if input.conditional_operator.is_some() {
-            return Err(crate::scaffolded::Scaffolded::not_implemented(
-                "PutItem with ConditionalOperator",
-            ));
-        }
-        if input.return_values_on_condition_check_failure.is_some() {
-            return Err(crate::scaffolded::Scaffolded::not_implemented(
-                "PutItem with ReturnValuesOnConditionCheckFailure",
-            ));
-        }
+        let return_old_on_failure =
+            input.return_values_on_condition_check_failure.as_deref() == Some("ALL_OLD");
+        let substitutions = crate::state::Substitutions::new(
+            input.expression_attribute_names.as_ref(),
+            input.expression_attribute_values.as_ref(),
+        );
         // "Use ReturnValues if you want to get the item attributes as they appeared
         // before they were updated": PutItem accepts only NONE and ALL_OLD
         // (`PutItem$ReturnValues`).
@@ -352,12 +348,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )
         .map_err(lift)?;
 
-        // Nesting is refused before the item is sized or stored: "DynamoDB supports
-        // nested attributes up to 32 levels deep".
-        for value in input.item.values() {
-            if crate::state::attribute_depth_exceeds(value, crate::state::MAX_ATTRIBUTE_DEPTH) {
-                return Err(lift(crate::state::nesting_levels_exceeded()));
-            }
+        // Nesting and collection cardinality are refused before the item is sized or
+        // stored: "DynamoDB supports nested attributes up to 32 levels deep", plus this
+        // emulator's own ceiling on the members one set, list or map may carry.
+        for (attribute, value) in &input.item {
+            crate::state::check_attribute_value(attribute, value).map_err(lift)?;
+        }
+        // A value the condition compares against is held to the same limits, for the
+        // same reason: both terms bound the work this request can ask for.
+        for (placeholder, value) in input.expression_attribute_values.iter().flatten() {
+            crate::state::check_attribute_value(placeholder, value).map_err(lift)?;
         }
 
         // Numbers are canonicalized BEFORE the item is sized, keyed or stored, so
@@ -397,6 +397,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             table.check_index_key_limits(&item).map_err(lift)?;
             table.key_of_item(&item).map_err(lift)?
         };
+        // The condition is read against the item this put would replace, which is the
+        // only state it can speak about ("replace an existing item if it has certain
+        // attribute values").
+        let replaced_before = store
+            .active_table(&region, &name, now)
+            .map_err(lift)?
+            .items
+            .get(&key)
+            .cloned();
+        let satisfied = crate::state::write_condition_satisfied(
+            input.condition_expression.as_deref(),
+            input.expected.as_ref(),
+            input.conditional_operator.as_deref(),
+            substitutions,
+            replaced_before.as_ref(),
+        )
+        .map_err(lift)?;
+        if !satisfied {
+            return Err(PutItemErrorModeled::ConditionalCheckFailedException(
+                ConditionalCheckFailedException {
+                    message: Some(crate::state::CONDITION_FAILED_MESSAGE.to_string()),
+                    item: if return_old_on_failure {
+                        replaced_before
+                    } else {
+                        None
+                    },
+                },
+            )
+            .into());
+        }
         // The store enforces its own budgets here: the only growth site this
         // operation has is the item it inserts.
         let replaced = store

@@ -7,8 +7,11 @@
 //! with nothing to report (DynamoDB's delete is idempotent). An unknown — or not yet
 //! `ACTIVE` — table is `ResourceNotFoundException`.
 //!
-//! Conditional deletes (`ConditionExpression`, the legacy `Expected`) are refused
-//! with the scaffold's 501 and filed as their own gap issue.
+//! Conditional deletes are served: `ConditionExpression` (or the legacy
+//! `Expected`/`ConditionalOperator`) is read against the item this delete would remove,
+//! and an unmet condition is `ConditionalCheckFailedException`, carrying that item when
+//! `ReturnValuesOnConditionCheckFailure=ALL_OLD`. The expression language lives in
+//! [`crate::state`], shared with `PutItem` and `UpdateItem`.
 //!
 //! The `Key` is held to the documented key-value limits
 //! ([`crate::state::Table::check_key_limits`]), and a table whose resource-based
@@ -277,29 +280,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
         let name = crate::state::resolve_table_name(&input.table_name).map_err(lift)?;
 
-        if input.condition_expression.is_some() {
-            return Err(crate::scaffolded::Scaffolded::not_implemented(
-                "DeleteItem with ConditionExpression",
+        if input.return_values_on_condition_check_failure.is_some()
+            && !matches!(
+                input.return_values_on_condition_check_failure.as_deref(),
+                Some("NONE" | "ALL_OLD")
+            )
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "ReturnValuesOnConditionCheckFailure can only be ALL_OLD or NONE",
             ));
         }
-        if input.expected.as_ref().is_some_and(|map| !map.is_empty()) {
-            return Err(crate::scaffolded::Scaffolded::not_implemented(
-                "DeleteItem with Expected",
-            ));
-        }
-        // The other two condition-path members are refused the same way rather than
-        // accepted and dropped, so this handler is no more permissive than the real
-        // service on a path it does not serve.
-        if input.conditional_operator.is_some() {
-            return Err(crate::scaffolded::Scaffolded::not_implemented(
-                "DeleteItem with ConditionalOperator",
-            ));
-        }
-        if input.return_values_on_condition_check_failure.is_some() {
-            return Err(crate::scaffolded::Scaffolded::not_implemented(
-                "DeleteItem with ReturnValuesOnConditionCheckFailure",
-            ));
-        }
+        let return_old_on_failure =
+            input.return_values_on_condition_check_failure.as_deref() == Some("ALL_OLD");
+        let substitutions = crate::state::Substitutions::new(
+            input.expression_attribute_names.as_ref(),
+            input.expression_attribute_values.as_ref(),
+        );
         // Like PutItem, DeleteItem accepts only NONE and ALL_OLD
         // (`DeleteItem$ReturnValues`).
         let return_old = match input.return_values.as_deref() {
@@ -317,6 +313,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )
         .map_err(lift)?;
 
+        // A value a condition compares against is held to the same limits a stored
+        // value is: the documented nesting depth, and this emulator's own ceiling on
+        // the members one set may carry. Both bound the work this request can ask for.
+        for (placeholder, value) in input.expression_attribute_values.iter().flatten() {
+            crate::state::check_attribute_value(placeholder, value).map_err(lift)?;
+        }
+
         let mut store = state.lock();
         store.apply_due_transitions(now);
         let key = {
@@ -328,6 +331,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             table.key_of_key_map(&input.key).map_err(lift)?
         };
+        // The condition is read against the item this delete would remove, which is
+        // the only state it can speak about ("deletes the item if it exists, or if it
+        // has an expected attribute value").
+        let stored = store
+            .active_table(&region, &name, now)
+            .map_err(lift)?
+            .items
+            .get(&key)
+            .cloned();
+        let satisfied = crate::state::write_condition_satisfied(
+            input.condition_expression.as_deref(),
+            input.expected.as_ref(),
+            input.conditional_operator.as_deref(),
+            substitutions,
+            stored.as_ref(),
+        )
+        .map_err(lift)?;
+        if !satisfied {
+            return Err(DeleteItemErrorModeled::ConditionalCheckFailedException(
+                ConditionalCheckFailedException {
+                    message: Some(crate::state::CONDITION_FAILED_MESSAGE.to_string()),
+                    item: if return_old_on_failure { stored } else { None },
+                },
+            )
+            .into());
+        }
         let removed = store
             .delete_item(&region, &name, now, &key)
             .map_err(lift)?;
