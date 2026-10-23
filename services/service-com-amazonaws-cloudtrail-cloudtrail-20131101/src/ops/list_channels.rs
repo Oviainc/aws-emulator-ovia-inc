@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListChannels
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListChannels`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListChannels::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Lists the CloudTrail Lake channels the shared channel registry
+//! (`crate::state::channels`) holds for the Region this request was made in, one
+//! `MaxResults`-sized page at a time.
 //!
 //! ## Shape of an operation
 //!
@@ -83,6 +77,19 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// How many channels one `ListChannels` page carries when the request asks for no
+/// `MaxResults`.
+///
+/// The model bounds `ListChannelsRequest$MaxResults` at 1..1000 and documents no
+/// default, so the default page size is the service's to choose, on the terms
+/// [`crate::state::LIST_TRAILS_PAGE_SIZE`] states; a caller that wants another one
+/// sends `MaxResults`.
+pub const LIST_CHANNELS_DEFAULT_PAGE_SIZE: usize = 100;
+
+/// The largest page `MaxResults` can ask for, from the member's modelled
+/// `@range(min: 1, max: 1000)` on `ListChannelsRequest$MaxResults`.
+const LIST_CHANNELS_MAX_PAGE_SIZE: usize = 1_000;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -153,18 +160,129 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListChannels` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListChannelsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListChannels"))
+        let region = crate::state::request_region(ctx.parts());
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListChannelsErrorModeled::UnsupportedOperationException(
+                UnsupportedOperationException {
+                    message: Some(
+                        "ListChannels needs the CloudTrail channel registry, which this \
+                         engine does not carry"
+                            .to_string(),
+                    ),
+                },
+            )
+        })?;
+        let store = state.lock();
+
+        // `MaxResults` is "the maximum number of CloudTrail channels to display on a
+        // single page". Its modelled `@range 1..1000` is what keeps a request from
+        // asking outside those bounds (the framework enforces it before this handler
+        // runs); clamping to the same bounds here keeps the walk below terminating and
+        // bounded even if some future path reached it unvalidated. A request that
+        // sends no `MaxResults` gets the service's own page size, never a value
+        // derived from a request that sent one.
+        let page_size = match input.max_results {
+            Some(requested) => usize::try_from(requested)
+                .unwrap_or(1)
+                .clamp(1, LIST_CHANNELS_MAX_PAGE_SIZE),
+            None => LIST_CHANNELS_DEFAULT_PAGE_SIZE,
+        };
+        let resume_at = match input.next_token.as_deref() {
+            Some(token) => Some(decode_page_token(token, page_size, &region)?),
+            None => None,
+        };
+
+        // A channel is keyed by its id and the Region it lives in, so a call reports
+        // the channels of the Region it was made in — one page of them, id-ordered,
+        // resuming at the channel id the token carries.
+        let mut channels: Vec<Channel> = Vec::new();
+        let mut next_token = None;
+        let resume_from = (resume_at.unwrap_or_default(), String::new());
+        let remaining = store
+            .channels
+            .range(resume_from..)
+            .map(|(_, record)| record);
+        for record in remaining.filter(|record| record.home_region == region) {
+            if channels.len() == page_size {
+                // One channel past a full page: report where to resume rather than
+                // carrying it.
+                next_token = Some(encode_page_token(page_size, &region, &record.channel_id));
+                break;
+            }
+            channels.push(Channel {
+                channel_arn: Some(record.channel_arn.clone()),
+                name: Some(record.name.clone()),
+            });
+        }
+
+        Ok(ListChannelsOutput {
+            channels: Some(channels),
+            next_token,
+        })
     }
+}
+
+/// The page token this operation hands back: the hex of
+/// `<page size>|<region>|<channel id>`, where the id is the one the next page resumes
+/// AT. The registry is keyed by `(channel id, Region)` and iterates id-ordered, which
+/// is the order this operation pages through; neither a Region nor a channel id
+/// carries a `|`, so the split is unambiguous.
+///
+/// The page size and the Region are carried because both are parameters of the walk
+/// the token belongs to: the registry spans every Region, so a token replayed in
+/// another Region would otherwise resume at a key that Region cannot reach and report
+/// an empty page as a success instead of refusing.
+///
+/// It is hex-coded because a `PaginationToken` is opaque to the caller — it is only
+/// ever handed straight back — and because the coding keeps the token inside the
+/// member's modelled `@length 4..1000`: the shortest payload is already 4 bytes, and
+/// the longest (a channel id, a Region, at most four digits of page size and the
+/// separators) codes to well under 1000 characters.
+fn encode_page_token(page_size: usize, region: &str, resume_at: &str) -> String {
+    ::hex::encode(format!("{page_size}|{region}|{resume_at}"))
+}
+
+/// Read a page token this operation issued for THIS walk, or refuse the request.
+///
+/// `InvalidNextTokenException` is documented as "a token that is not valid, or a token
+/// that was previously used in a request with different parameters", which is exactly
+/// the ways this can fail: a token whose resume key is not even an id CloudTrail
+/// mints, so this operation cannot have issued it, and one issued for
+/// another page size or in another Region — the parameters `ListChannels` pages with.
+fn decode_page_token(
+    token: &str,
+    page_size: usize,
+    region: &str,
+) -> Result<String, ListChannelsErrorModeled> {
+    let invalid = |reason: &str| {
+        ListChannelsErrorModeled::InvalidNextTokenException(InvalidNextTokenException {
+            message: Some(format!("Invalid NextToken '{token}': {reason}")),
+        })
+    };
+    let unissued = || invalid("it was not issued by ListChannels");
+
+    let decoded = ::hex::decode(token)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .ok_or_else(unissued)?;
+    let (issued_for, rest) = decoded.split_once('|').ok_or_else(unissued)?;
+    let (issued_in, resume_at) = rest.split_once('|').ok_or_else(unissued)?;
+    if issued_for.parse::<usize>() != Ok(page_size) {
+        return Err(invalid(&format!(
+            "it was issued for a different MaxResults than the {page_size} this request asks for"
+        )));
+    }
+    if issued_in != region {
+        return Err(invalid(&format!(
+            "it was issued for the channels of another Region than {region}"
+        )));
+    }
+    // Every token this operation issues resumes at a channel id, which is the UUID
+    // CloudTrail mints; anything else is a key no page of this walk ever stopped at.
+    // A channel released since the page was issued is NOT refused here: the walk
+    // resumes from where it stopped whether or not that channel is still stored.
+    if !crate::state::channels::is_minted_channel_id(resume_at) {
+        return Err(unissued());
+    }
+    Ok(resume_at.to_string())
 }

@@ -15,6 +15,8 @@
 mod channel_deletion;
 #[path = "all/channel_error_envelope.rs"]
 mod channel_error_envelope;
+#[path = "all/channel_listing.rs"]
+mod channel_listing;
 #[path = "all/dashboard_enumeration.rs"]
 mod dashboard_enumeration;
 #[path = "all/dashboard_lifecycle.rs"]

@@ -27,21 +27,45 @@ use service_com_amazonaws_simpledbv2_simpledbv2::state::{
 use service_com_amazonaws_simpledbv2_simpledbv2::EmulatedService;
 
 /// The region every request below signs for; the minted ARNs must carry exactly it.
-const REGION: &str = "us-west-2";
+pub(crate) const REGION: &str = "us-west-2";
 /// The canonical emulator account (`engine::EMULATOR_ACCOUNT_ID`) every ARN carries.
-const ACCOUNT: &str = "000000000000";
+pub(crate) const ACCOUNT: &str = "000000000000";
 
 /// Margin added to a documented span before asserting the move it owes has happened.
 const SETTLE_MARGIN: Duration = Duration::from_millis(80);
 
-/// One emulator with an empty store, mounted exactly as `build_router` mounts it.
-fn emulator() -> MultiServiceRouter {
+/// One emulator with an empty store — no exports and NO domains — mounted exactly as
+/// `build_router` mounts it.
+pub(crate) fn emulator() -> MultiServiceRouter {
     emulator_over(Arc::new(engine::InMemoryEngine::new()))
+}
+
+/// One emulator whose account already holds `domains`.
+///
+/// No modelled operation of this service creates a SimpleDB domain (that is the
+/// SimpleDB 2009-04-15 `CreateDomain`), so a domain reaches the store only through its
+/// in-process seam — `create_domain`, the same one `SIMPLEDB_EXISTING_DOMAINS` reaches
+/// when the store is built. Every test that starts an export therefore declares the
+/// domains it exports, exactly as an operator does.
+pub(crate) fn emulator_with_domains(domains: &[&str]) -> MultiServiceRouter {
+    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    declare_domains(&engine, domains);
+    emulator_over(engine)
+}
+
+/// Declare `domains` in the store of `engine`, through the seam described on
+/// [`emulator_with_domains`].
+pub(crate) fn declare_domains(engine: &Arc<engine::InMemoryEngine>, domains: &[&str]) {
+    let state = engine.state::<ComAmazonawsSimpledbv2Simpledbv2State>();
+    let mut store = state.lock();
+    for domain in domains {
+        store.create_domain(domain);
+    }
 }
 
 /// One emulator over an engine the caller already holds, so a test can seed this
 /// service's store before any request runs.
-fn emulator_over(engine: Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
+pub(crate) fn emulator_over(engine: Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
     router.register_service(EmulatedService::new(engine));
@@ -49,10 +73,26 @@ fn emulator_over(engine: Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
 }
 
 /// Call one operation and return `(http status, parsed body)`.
+pub(crate) async fn call(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: &Value,
+) -> (u16, Value) {
+    let (status, _error_type, parsed) = call_reporting_error_type(router, operation, body).await;
+    (status, parsed)
+}
+
+/// Call one operation and return `(http status, the `x-amzn-errortype` response
+/// header, parsed body)` — the header verbatim, for a case that asserts the wire
+/// signal an SDK dispatches its error handling on.
 ///
 /// The routing signal an SDK request carries is the SigV4 credential scope, which
 /// names this service's signing name (`sdb`) and the region the handlers read.
-async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16, Value) {
+pub(crate) async fn call_reporting_error_type(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: &Value,
+) -> (u16, Option<String>, Value) {
     let request = http::Request::builder()
         .method("POST")
         .uri(format!("/v2/{operation}"))
@@ -86,15 +126,15 @@ async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u1
     };
     // restJson1 carries the error shape in `__type`; the framework also sets the
     // `x-amzn-errortype` header, so fold the header in and one accessor reads either.
-    if let (Some(error_type), Value::Object(map)) = (error_type, &mut parsed) {
+    if let (Some(error_type), Value::Object(map)) = (error_type.clone(), &mut parsed) {
         map.entry("__type")
             .or_insert_with(|| Value::String(error_type));
     }
-    (status, parsed)
+    (status, error_type, parsed)
 }
 
 /// A call that must answer 200.
-async fn ok_call(router: &MultiServiceRouter, operation: &str, body: &Value) -> Value {
+pub(crate) async fn ok_call(router: &MultiServiceRouter, operation: &str, body: &Value) -> Value {
     let (status, parsed) = call(router, operation, body).await;
     assert_eq!(
         status, 200,
@@ -104,7 +144,7 @@ async fn ok_call(router: &MultiServiceRouter, operation: &str, body: &Value) -> 
 }
 
 /// The modelled error shape a failed call reported.
-fn error_code(body: &Value) -> String {
+pub(crate) fn error_code(body: &Value) -> String {
     body.get("__type")
         .and_then(Value::as_str)
         .unwrap_or("<no __type>")
@@ -116,7 +156,7 @@ fn error_code(body: &Value) -> String {
 }
 
 /// A member of a JSON object as a string, or `None` when the member is absent.
-fn member(body: &Value, name: &str) -> Option<String> {
+pub(crate) fn member(body: &Value, name: &str) -> Option<String> {
     body.get(name).and_then(Value::as_str).map(str::to_string)
 }
 
@@ -275,11 +315,20 @@ const LONGEST_KEY_PREFIX: &str = "0123456789abcdefg0123456789abcdefg0123456789ab
      0123456789abcdefg0123456789abcdefg0123456789abcdefg0123456789abcdefg0123456789abcdefg\
      0123456789abcdefg0123456789abcdefg0123456789abcdefg0123456789abcdefg0123456789abcdefg";
 
+/// The domain every row of [`start_cases`] exports, which an account has to hold
+/// before any of those starts can succeed.
+fn start_case_domains() -> Vec<&'static str> {
+    start_cases()
+        .into_iter()
+        .map(|case| case.domain_name)
+        .collect()
+}
+
 /// `StartDomainExport` persists a record and `GetExport` reports exactly it, for every
 /// shape of request the model admits.
 #[tokio::test]
 async fn start_then_get_reports_every_stored_member() {
-    let router = emulator();
+    let router = emulator_with_domains(&start_case_domains());
     // No two starts may mint the same identifier, whether an export id or a generated
     // client token.
     let mut minted: BTreeSet<String> = BTreeSet::new();
@@ -390,7 +439,7 @@ async fn start_then_get_reports_every_stored_member() {
 /// parameters replay it, changed parameters conflict.
 #[tokio::test]
 async fn a_repeat_with_the_same_client_token_is_idempotent() {
-    let router = emulator();
+    let router = emulator_with_domains(&start_case_domains());
 
     for (index, case) in start_cases().into_iter().enumerate() {
         let token = format!("token-{index}");
@@ -431,7 +480,7 @@ async fn a_repeat_with_the_same_client_token_is_idempotent() {
 /// The parameter changes a same-token repeat may differ in, one row each.
 #[tokio::test]
 async fn a_repeat_with_the_same_token_and_changed_parameters_conflicts() {
-    let router = emulator();
+    let router = emulator_with_domains(&["conflicts", "other-domain"]);
     let base = StartCase::new("base", "conflicts", "conflict-bucket")
         .prefix("one/")
         .sse("KMS")
@@ -508,7 +557,7 @@ async fn a_repeat_with_the_same_token_and_changed_parameters_conflicts() {
 /// pairing is the modelled parameter-combination refusal.
 #[tokio::test]
 async fn a_kms_key_without_the_kms_algorithm_is_refused() {
-    let router = emulator();
+    let router = emulator_with_domains(&["combo", "combo-ok"]);
     let refused = [
         (
             "a KMS key with SSE-S3",
@@ -642,7 +691,7 @@ async fn get_export_refuses_a_non_arn_and_reports_an_unknown_one() {
 }
 
 /// The `exportArn`s of a `ListExports` page, in the order the page carries them.
-fn summary_arns(listed: &Value) -> Vec<String> {
+pub(crate) fn summary_arns(listed: &Value) -> Vec<String> {
     listed
         .get("exportSummaries")
         .and_then(Value::as_array)
@@ -700,7 +749,9 @@ async fn walk_pages(
 /// `maxResults` as a page bound across every page size.
 #[tokio::test]
 async fn list_exports_filters_and_pages_over_the_stored_records() {
-    let router = emulator();
+    // `gamma` is a domain this account holds that no export names, so a filter on it
+    // resolves and answers the required member as an empty list.
+    let router = emulator_with_domains(&["alpha", "beta", "gamma"]);
 
     // Two domains, interleaved, so neither the filter nor the order can be faked by
     // grouping.
@@ -762,9 +813,9 @@ async fn list_exports_filters_and_pages_over_the_stored_records() {
         );
     }
 
-    // A filter selects exactly that domain's exports; a domain with none answers the
-    // required member as an empty list.
-    for domain in ["alpha", "beta", "a-domain-that-never-had-an-export"] {
+    // A filter selects exactly that domain's exports; a domain the account holds that
+    // has none answers the required member as an empty list.
+    for domain in ["alpha", "beta", "gamma"] {
         let expected: Vec<String> = created
             .iter()
             .filter(|(stored_domain, _)| stored_domain == domain)
@@ -821,7 +872,7 @@ async fn list_exports_filters_and_pages_over_the_stored_records() {
 /// A `nextToken` this service did not issue is the modelled refusal, not a page.
 #[tokio::test]
 async fn an_unparseable_next_token_is_refused() {
-    let router = emulator();
+    let router = emulator_with_domains(&["tokens"]);
     ok_call(
         &router,
         "StartDomainExport",
@@ -863,7 +914,7 @@ async fn an_unparseable_next_token_is_refused() {
 /// stream with another's cursor would hand back a page the caller never started.
 #[tokio::test]
 async fn a_next_token_from_another_enumeration_is_refused() {
-    let router = emulator();
+    let router = emulator_with_domains(&["alpha", "beta"]);
     for (domain, bucket) in [
         ("alpha", "alpha-bucket"),
         ("beta", "beta-bucket"),
@@ -932,7 +983,7 @@ async fn a_next_token_from_another_enumeration_is_refused() {
 /// members appear exactly when it reaches `SUCCEEDED`.
 #[tokio::test]
 async fn export_status_advances_on_the_clock() {
-    let router = emulator();
+    let router = emulator_with_domains(&["clocked"]);
     let case = StartCase::new("clock", "clocked", "clock-bucket").prefix("snapshots/");
     let started = ok_call(&router, "StartDomainExport", &case.body(None)).await;
     let export_arn = member(&started, "exportArn").expect("the start minted an ARN");
@@ -1033,12 +1084,14 @@ async fn export_status_advances_on_the_clock() {
 /// refused rather than answered with a value the model does not admit.
 #[tokio::test]
 async fn a_domain_name_the_export_arn_cannot_carry_is_refused() {
-    let router = emulator();
     // The fixed part of the ARN (`arn:aws:sdb:<region>:<account>:domain//export/<uuid>`)
     // is well under 150 characters, so these two length rows sit either side of the
     // bound.
     let just_inside = "d".repeat(MAX_EXPORT_ARN_LEN - 150);
     let past_the_bound = "d".repeat(MAX_EXPORT_ARN_LEN + 1);
+    // Only the accepted row's domain is one the account holds: every refused row is
+    // refused on the value it supplies, before any domain is resolved.
+    let router = emulator_with_domains(&[just_inside.as_str()]);
 
     let accepted = ok_call(
         &router,
@@ -1101,6 +1154,9 @@ async fn a_start_past_the_store_ceiling_is_refused() {
     {
         let state = engine.state::<ComAmazonawsSimpledbv2Simpledbv2State>();
         let mut store = state.lock();
+        // The domain the start below names: the account holds it, so what refuses that
+        // start is the store's ceiling and nothing else.
+        store.create_domain("one-too-many");
         let now = std::time::SystemTime::now();
         for index in 0..MAX_EXPORTS {
             let export_id = format!("seeded-{index}");

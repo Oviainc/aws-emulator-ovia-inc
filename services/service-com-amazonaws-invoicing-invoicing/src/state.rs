@@ -32,11 +32,20 @@
 //! The procurement-portal plane keeps its preferences in
 //! [`ComAmazonawsInvoicingInvoicingState::procurement_portal_preferences`]: a preference is
 //! created by `CreateProcurementPortalPreference`, read back by
-//! `GetProcurementPortalPreference` and validated through
+//! `GetProcurementPortalPreference`, rewritten by `PutProcurementPortalPreference`,
+//! erased by `DeleteProcurementPortalPreference` and validated through
 //! `SendProcurementPortalValidation` / `VerifyProcurementPortalValidation`, each one stored
 //! as the modelled `ProcurementPortalPreference` a reader reports, so its `Version`,
 //! `CreateDate` and `LastUpdateDate` are what the last write left rather than anything
-//! computed per read.
+//! computed per read. There is no point-in-time read on this plane, so a DELETE erases
+//! the entry rather than tombstoning it as an invoice unit's delete does.
+//!
+//! Every call that WRITES a preference advances its `Version` and `LastUpdateDate`,
+//! including the two validation calls: they record what the validation flow tried
+//! ([`StoredProcurementPortalPreference::unconfirmed_validation_attempts`] and
+//! [`StoredProcurementPortalPreference::failed_verification_attempts`]), which is state
+//! about the preference that no modelled member reports, and a version counts the writes
+//! the resource took rather than the members a reader can see change.
 //!
 //! Beside the invoice units sits the INVOICE registry [`ComAmazonawsInvoicingInvoicingState::invoices`],
 //! the one copy of the invoices this emulator holds, which `ListInvoiceSummaries`
@@ -103,7 +112,9 @@ pub struct ComAmazonawsInvoicingInvoicingState {
     ///
     /// Empty until a create puts a preference here:
     /// `CreateProcurementPortalPreference` is the operation that does so,
-    /// `GetProcurementPortalPreference` reads one back and
+    /// `GetProcurementPortalPreference` reads one back,
+    /// `PutProcurementPortalPreference` rewrites one,
+    /// `DeleteProcurementPortalPreference` removes one and
     /// `ListProcurementPortalPreferences` reports exactly what it stored. An ARN naming
     /// no preference resolves to nothing — which is what every reader of this plane
     /// reports as the modelled `ResourceNotFoundException`, rather than claiming a
@@ -304,15 +315,20 @@ impl ComAmazonawsInvoicingInvoicingState {
             .find(|preference| preference.identity() == identity)
     }
 
-    /// The validation code the next `SendProcurementPortalValidation` issues: six
-    /// decimal digits, the form the portal-validation flow's `Code` is quoted in.
+    /// A procurement-portal validation code: six decimal digits, the form the
+    /// portal-validation flow's `Code` is quoted in.
     ///
     /// Minted from a monotonic counter mixed with the nanosecond clock, so two
     /// validations issued in one run do not share a code. It is NOT a credential and is
-    /// never returned on the wire: the real service delivers it out of band through the
-    /// configured portal, and this emulator has no out-of-band channel, so the code it
-    /// issued is kept here (see [`IssuedPortalValidation`]) for
-    /// `VerifyProcurementPortalValidation` to check a submitted code against.
+    /// never returned on the wire: the real service delivers it out of band, inside the
+    /// test e-invoice it posts to the configured portal, so the code it issued is kept
+    /// here (see [`IssuedPortalValidation`]) for `VerifyProcurementPortalValidation` to
+    /// check a submitted code against.
+    ///
+    /// No operation of this emulator issues one today:
+    /// `SendProcurementPortalValidation` cannot confirm that delivery (see that
+    /// operation's module docs) and so answers the modelled 400 instead of minting a
+    /// code. This is where a code comes from for whatever can confirm it.
     pub fn issue_portal_validation_code(&mut self) -> String {
         self.next_portal_validation_code = self.next_portal_validation_code.wrapping_add(1);
         let mixed = u64::from(now().subsec_nanos())
@@ -423,9 +439,26 @@ pub struct StoredProcurementPortalPreference {
     /// with exactly what the last write left.
     pub preference: ProcurementPortalPreference,
     /// The validation `SendProcurementPortalValidation` last issued for this
-    /// preference, if any. `None` means no validation has been requested, so there is
+    /// preference, if any. `None` means no code is outstanding, so there is
     /// no code a `VerifyProcurementPortalValidation` could match.
     pub validation: Option<IssuedPortalValidation>,
+    /// How many validations have been REQUESTED for this preference whose delivery of
+    /// the test e-invoice could not be confirmed — the attempts
+    /// `SendProcurementPortalValidation` made and refused.
+    ///
+    /// It is state the service keeps ABOUT the preference and no modelled member reports
+    /// it, which is why a reader never sees it; it is here because the attempt is a write
+    /// of the resource (the validation flow's own record of what it tried), and a write
+    /// is what `ProcurementPortalPreference$Version` counts.
+    pub unconfirmed_validation_attempts: u32,
+    /// How many submissions of a validation code for this preference have been REFUSED:
+    /// the failed attempts of `VerifyProcurementPortalValidation`.
+    ///
+    /// Like [`Self::unconfirmed_validation_attempts`] this is state the service keeps
+    /// about the preference that no modelled member reports, kept because a refused
+    /// submission is a write of the resource — what the validation flow has tried so far
+    /// — and a write is what `ProcurementPortalPreference$Version` counts.
+    pub failed_verification_attempts: u32,
 }
 
 /// One issued procurement-portal validation: the code the service issued, when it
@@ -502,6 +535,42 @@ impl StoredProcurementPortalPreference {
 /// calls that carry a preference past it, so nothing but a caller's verification (or an
 /// explicit `UpdateProcurementPortalPreferenceStatus`) moves it.
 pub const STATUS_PENDING_VERIFICATION: &str = "PENDING_VERIFICATION";
+
+/// `ProcurementPortalName$COUPA` — the portal whose Marketplace PunchOut configuration
+/// the model documents as required (`MarketplacePunchOutPreference`: "Required for Coupa
+/// when MarketplacePunchOutEnabled is true"). One of the values the modelled enum admits
+/// ([`crate::ops::types::PROCUREMENT_PORTAL_NAME_VALUES`]).
+///
+/// It lives beside the preference registry rather than inside one operation's module
+/// because the combination it gates is a rule about the RESOURCE: every write that sets
+/// a preference's Marketplace PunchOut configuration — the create and the update —
+/// refuses the same combination.
+pub const PORTAL_COUPA: &str = "COUPA";
+
+/// The 400 a write of a procurement portal preference answers when it enables
+/// Marketplace PunchOut for `procurement_portal_name` without the configuration that
+/// portal requires.
+///
+/// `MarketplacePunchOutEnabled` "defaults to false if not provided" and
+/// `MarketplacePunchOutPreference` is "required for Coupa when
+/// MarketplacePunchOutEnabled is true" — a combination of members the model cannot
+/// express, so the boundary validator passes it and it is refused here as the modelled
+/// `ValidationException`. The message names the portal the requirement is stated for, so
+/// it is built from what the write is acting on rather than from a constant.
+pub fn marketplace_punch_out_preference_required(
+    procurement_portal_name: &str,
+) -> ValidationException {
+    ValidationException {
+        message: Some(format!(
+            "MarketplacePunchOutPreference is required when MarketplacePunchOutEnabled is \
+             true and ProcurementPortalName is {procurement_portal_name}"
+        )),
+        // `invalidInput` is one of the model's `ValidationExceptionReason` values
+        // ([`crate::ops::types::VALIDATION_EXCEPTION_REASON_VALUES`]).
+        reason: Some("invalidInput".to_string()),
+        ..Default::default()
+    }
+}
 
 /// The identity of a procurement portal preference: its portal, buyer domain and
 /// identifier, and supplier domain and identifier.

@@ -19,6 +19,8 @@ mod batch_detect_entities;
 mod batch_inference;
 #[path = "all/batch_sentiment.rs"]
 mod batch_sentiment;
+#[path = "all/batch_syntax.rs"]
+mod batch_syntax;
 #[path = "all/comprehend_client.rs"]
 mod comprehend_client;
 #[path = "all/document_classifiers.rs"]

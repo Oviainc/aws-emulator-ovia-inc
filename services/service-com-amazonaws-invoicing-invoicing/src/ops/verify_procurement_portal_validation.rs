@@ -4,11 +4,18 @@
 //!
 //! Completes the validation of a procurement portal preference: resolves the
 //! `ProcurementPortalPreferenceArn` against the preference registry in
-//! [`crate::state`] and checks the submitted `Code` against the one
-//! `SendProcurementPortalValidation` issued for that preference. An ARN that names no
-//! stored preference is the modelled `ResourceNotFoundException` (HTTP 404) — nothing
-//! is validated and no validation state is fabricated for it — and a `Code` that is not
-//! the outstanding one is the modelled `ValidationException` (HTTP 400).
+//! [`crate::state`] and checks the submitted `Code` against the one outstanding for that
+//! preference. An ARN that names no stored preference is the modelled
+//! `ResourceNotFoundException` (HTTP 404) — nothing is validated and no validation state
+//! is fabricated for it — and a `Code` that is not the outstanding one (including any code
+//! while none is outstanding) is the modelled `ValidationException` (HTTP 400).
+//!
+//! A refused submission is still an attempt this flow made on the preference, so it is
+//! recorded against it
+//! ([`crate::state::StoredProcurementPortalPreference::failed_verification_attempts`])
+//! and the preference's `Version` and `LastUpdateDate` advance with that write, the way
+//! every write of this resource reports them. No plane's verification status moves:
+//! nothing verified the portal connection.
 //!
 //! ## Shape of an operation
 //!
@@ -228,6 +235,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .filter(|validation| validation.verified_at.is_none())
                 .map(|validation| validation.code.as_str());
             if outstanding != Some(input.code.as_str()) {
+                // A refused submission is still an attempt the validation flow made on
+                // this preference, so it is recorded against it and the preference's
+                // `Version` and `LastUpdateDate` advance with that write, the way they do
+                // for every write of this resource. The plane's verification status does
+                // not move: nothing completed the validation.
+                stored.failed_verification_attempts =
+                    stored.failed_verification_attempts.saturating_add(1);
+                stored.preference.version = stored.preference.version.saturating_add(1);
+                stored.preference.last_update_date = crate::state::now();
                 return Err(
                     VerifyProcurementPortalValidationErrorModeled::ValidationException(
                         ValidationException {

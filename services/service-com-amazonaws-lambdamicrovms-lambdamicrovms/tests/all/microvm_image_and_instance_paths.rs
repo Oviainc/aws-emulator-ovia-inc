@@ -169,17 +169,24 @@ async fn deleting_an_image_is_durable_and_idempotent() {
 
         tokio::time::sleep(PAST_THE_SPAN).await;
 
-        // The delete is DURABLE: neither form resolves the image any more.
-        for (form, lookup) in [("name", name), ("ARN", arn.as_str())] {
+        // The delete is DURABLE: neither form resolves the image any more. The forms
+        // differ in HOW they stop resolving: the minted ARN stays a well-formed
+        // identifier that now names nothing (404), while the name is no longer an id
+        // this account holds and is no ARN either, so it addresses nothing this API can
+        // name (400) — the separation `image_request_validation` owns.
+        for (form, lookup, expected_status, expected_type) in [
+            ("name", name, 400, "ValidationException"),
+            ("ARN", arn.as_str(), 404, "ResourceNotFoundException"),
+        ] {
             let (status, body) = get_image(&router, lookup).await;
             assert_eq!(
-                status, 404,
+                status, expected_status,
                 "case {case:?}: a deleted image must not read back by {form}, got {status} {body}"
             );
             assert_eq!(
                 body["__type"].as_str(),
-                Some("ResourceNotFoundException"),
-                "case {case:?}: expected ResourceNotFoundException by {form}, got {body}"
+                Some(expected_type),
+                "case {case:?}: expected {expected_type} by {form}, got {body}"
             );
         }
         let (status, listed) =
@@ -248,16 +255,12 @@ async fn every_not_found_carries_only_the_request_derived_message() {
 
     // Rows span every operation on these paths that resolves an identifier, both
     // identifier forms, and the two message templates: an image lookup, a MicroVM
-    // lookup, and `RunMicrovm`'s active-version resolution.
+    // lookup, and `RunMicrovm`'s active-version resolution. An IMAGE identifier that
+    // is neither an id this account holds nor a well-formed ARN is refused instead
+    // (400 `ValidationException`), which `image_request_validation` owns, so the image
+    // lookup is addressed here by the ARN form.
     let token_body = json!({"expirationInMinutes": 15, "allowedPorts": [{"allPorts": {}}]});
     let rows: Vec<(&str, &str, String, Option<Value>, String)> = vec![
-        (
-            "get an absent image by name",
-            "GET",
-            "/2025-09-09/microvm-images/absent".to_string(),
-            None,
-            "MicroVMImage not found for MicroVMImageID: absent".to_string(),
-        ),
         (
             "get an absent image by ARN",
             "GET",
