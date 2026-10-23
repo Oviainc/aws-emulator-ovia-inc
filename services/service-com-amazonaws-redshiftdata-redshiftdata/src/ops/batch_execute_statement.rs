@@ -258,10 +258,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // authorization method, resolved exactly as `ExecuteStatement`'s are:
         // the documentation names the same combinations for both. The
         // session-reuse form, where a caller that already holds a `SessionId`
-        // names neither warehouse, is a VALID request this slice cannot serve
-        // (no session store exists yet, so the warehouse and database its
-        // session was opened with are not knowable), so it is answered with the
-        // scaffold's `NotImplemented` rather than blamed on the caller.
+        // names neither warehouse, carries its connection on the SESSION, so it
+        // is resolved from the session store instead of from the request.
         let connection = match (ConnectionRequest {
             cluster_identifier: input.cluster_identifier.as_ref(),
             workgroup_name: input.workgroup_name.as_ref(),
@@ -274,9 +272,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             Ok(connection) => connection,
             Err(BadConnection::SessionOnly) => {
-                return Err(crate::scaffolded::Scaffolded::not_implemented(
-                    "BatchExecuteStatement with only a SessionId as its connection target",
-                ))
+                let session = non_empty(input.session_id.as_ref()).unwrap_or_default();
+                match state.lock().session_connection(&session) {
+                    Some(connection) => connection,
+                    // A `SessionId` that names no live session names no
+                    // warehouse and no database either, so there is nothing to
+                    // run the batch on: a missing resource, not a malformed
+                    // request.
+                    None => return Err(no_such_session(&session)),
+                }
             }
             Err(problem) => return Err(validation(problem.message())),
         };
@@ -329,16 +333,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // `SessionKeepAliveSeconds` asks for a session, which the Data API
-        // identifies with a UUID the caller passes back on later statements. A
-        // `SessionId` the caller supplies is recorded as given and reported back
-        // unchanged: session identity is not modelled in this slice, so this
-        // operation neither validates it against state nor derives anything
-        // from it beyond what it was sent.
-        let session_id = non_empty(input.session_id.as_ref()).or_else(|| {
-            input
-                .session_keep_alive_seconds
-                .map(|_| crate::state::new_uuid())
-        });
+        // identifies with a UUID it generates; `SessionId` names one a previous
+        // statement opened. Both are recorded by the state store when the batch
+        // is recorded, so the `SessionId` a statement reports is one this
+        // service really holds.
+        let session_id = non_empty(input.session_id.as_ref());
+        if let Some(session) = session_id.as_deref() {
+            // A batch submitted into a session that no longer exists, or that
+            // the clock has closed, has no session to run in.
+            if state.lock().session_connection(session).is_none() {
+                return Err(no_such_session(session));
+            }
+        }
 
         let submission = Submission {
             statements: input.sqls.clone(),
@@ -364,6 +370,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             result_format: non_empty(input.result_format.as_ref())
                 .unwrap_or_else(|| "JSON".to_string()),
             session_id,
+            session_keep_alive_seconds: input.session_keep_alive_seconds,
             client_token,
             wait_for_completion: input.wait_time_seconds.is_some(),
         };
@@ -512,6 +519,17 @@ fn validation(message: &str) -> BatchExecuteStatementError {
 fn unavailable() -> BatchExecuteStatementError {
     BatchExecuteStatementErrorModeled::InternalServerException(InternalServerException {
         message: "the Redshift Data API state store is unavailable".to_string(),
+    })
+    .into()
+}
+
+/// Refuse a `SessionId` that names no live session: a session this service does
+/// not hold, or one the clock has closed, which "can no longer run SQL
+/// statements".
+fn no_such_session(session_id: &str) -> BatchExecuteStatementError {
+    BatchExecuteStatementErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: format!("Session does not exist: {session_id}"),
+        resource_id: session_id.to_string(),
     })
     .into()
 }

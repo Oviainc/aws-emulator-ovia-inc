@@ -21,14 +21,22 @@
 //!   statement is visible to the `SELECT` submitted by the next, exactly as a
 //!   Redshift database is. A batch's statements run serially on that one
 //!   connection, which is what lets [`ExecutionMode::Transaction`] commit or
-//!   roll back all of them together.
+//!   roll back all of them together. `DescribeTable` reads its catalog, so a
+//!   table's columns are the ones the engine really declares.
+//! * [`Session`] — the connection a caller's later statements reuse. A submit
+//!   operation that asks to keep a session alive opens one; a statement that
+//!   names only its `SessionId` runs on the warehouse and database that session
+//!   was opened with, and `ListSessions` reports it. A session reuses its
+//!   database's one connection, so what a session gives a caller is a
+//!   connection target and a lifetime, not an isolated transaction of its own.
 //!
 //! The asynchronous status timeline is modelled with a stored due instant and
 //! never with a sleep: a statement is `SUBMITTED` when `ExecuteStatement`
 //! returns and the clock owes it its terminal status [`COMPLETION_SPAN`] later,
 //! so a caller that cancels straight away still finds a cancellable statement.
-//! Every operation materialises the transitions the clock has already made due
-//! before it reads.
+//! A session's close is on the clock the same way, through the `SessionTtl` it
+//! carries. Every operation materialises the transitions the clock has already
+//! made due before it reads.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -60,10 +68,32 @@ pub const COMPLETION_SPAN: Duration = Duration::from_millis(300);
 /// returns as much as one page can hold.
 pub const DEFAULT_LIST_PAGE_SIZE: usize = 100;
 
+/// Page size `DescribeTable` uses when the request leaves `MaxResults` at its
+/// modelled default of 0 — `PageSize`'s modelled maximum of 1000, so an
+/// unparameterised call returns as much of a `ColumnList` as one page can hold.
+pub const DEFAULT_COLUMN_PAGE_SIZE: usize = 1_000;
+
 /// Rows `GetStatementResult` returns in one page. Redshift documents no page
 /// size for this operation, so this is an emulator-chosen bound; it only
 /// decides where `NextToken` appears, never which rows exist.
 pub const RESULT_PAGE_ROWS: usize = 1_000;
+
+/// The message the Data API answers a result read for a statement that produced
+/// no result with — the fixed text recorded from the service, which points the
+/// caller at the operation that does report the statement's outcome.
+///
+/// It lives here, beside the predicate that decides the case
+/// ([`Statement::has_fetchable_result`]), so that every reader of a statement's
+/// result refuses it the same way.
+pub const NO_RESULT_MESSAGE: &str =
+    "Query does not have result. Please check query status with DescribeStatement.";
+
+/// The message the Data API answers a result read addressed to a BATCH's own
+/// `Id` with: a batch is not a query, and its results live on the `:<n>` ids of
+/// the statements it submitted.
+pub const BATCH_PARENT_RESULT_MESSAGE: &str =
+    "Query is a batch statement; fetch the results of each SQL statement of the batch with its \
+     own Id, which is this Id with a :<n> suffix";
 
 /// Wall-clock bound on one statement's execution. The SQL engine runs
 /// in-process with no isolation boundary, so a statement that never terminates
@@ -174,6 +204,16 @@ pub const MAX_RETAINED_STATEMENTS: usize = 100;
 /// after a statement runs, so a statement older than that is no longer readable
 /// on the real service either.
 const STATEMENT_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// How long a session is reported after it was created — `ListSessions` "lists
+/// the sessions that the caller created in the last 24 hours", so one older
+/// than this is no longer reported, closed or not.
+const SESSION_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Sessions this emulator holds at once. A caller opens one per submit request
+/// that asks to keep a session alive, so this bounds that map the way
+/// [`MAX_RETAINED_STATEMENTS`] bounds the statement history.
+pub const MAX_RETAINED_SESSIONS: usize = 100;
 
 /// SQL functions this emulator refuses even though the engine's own build may
 /// carry them: each one exists to reach something outside the database.
@@ -294,6 +334,85 @@ pub struct ResultSet {
     pub column_metadata: Vec<ColumnMetadata>,
     /// One entry per row; each row has one [`Field`] per column.
     pub rows: Vec<Vec<Field>>,
+}
+
+/// The status one session reports.
+///
+/// The wire spellings are the ones `SessionStatusString` declares, and the
+/// model documents what each one means: "AVAILABLE – The session is open and
+/// ready to run a SQL statement. BUSY – The session is currently running a SQL
+/// statement. CLOSED – The session is closed and can no longer run SQL
+/// statements."
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionStatus {
+    /// Open, with no statement running in it.
+    Available,
+    /// A statement submitted in this session has not reached its terminal
+    /// status yet.
+    Busy,
+    /// Past its `SessionTtl`: the clock closed it.
+    Closed,
+}
+
+impl SessionStatus {
+    /// The wire value, as `SessionStatusString` spells it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Available => "AVAILABLE",
+            Self::Busy => "BUSY",
+            Self::Closed => "CLOSED",
+        }
+    }
+}
+
+/// One Data API session: the connection a caller's later statements reuse, and
+/// the clock that closes it.
+///
+/// A session is opened by a submit operation that asked to keep one alive
+/// (`SessionKeepAliveSeconds`) and is reached afterwards by its `SessionId`,
+/// which stands in for the whole connection — "The number of seconds to keep
+/// the session alive after the query finishes", so its expiry is measured from
+/// the last statement that ran in it.
+#[derive(Debug, Clone)]
+pub struct Session {
+    /// `SessionId`, a UUID as the `UUID` shape's pattern requires.
+    pub id: String,
+    /// Monotonic sequence number. `ListSessions` orders by it and its
+    /// pagination cursor names it, so a page boundary survives later sessions.
+    pub seq: u64,
+    /// The cluster or workgroup the session is connected to.
+    pub target: ConnectionTarget,
+    /// The database the session is connected to.
+    pub database: String,
+    /// `DbUser`, when the session was opened with temporary credentials.
+    pub db_user: Option<String>,
+    /// The `SecretArn` the session was opened with, when it authenticates with
+    /// Secrets Manager. Not a member of `SessionData`, and held only so a
+    /// statement that reuses the session runs under the same authorization.
+    pub secret_arn: Option<String>,
+    /// `CreatedAt`.
+    pub created_at: SystemTime,
+    /// `UpdatedAt`: when the session last ran a statement, which is what its
+    /// expiry is measured from.
+    pub updated_at: SystemTime,
+    /// `SessionAliveSeconds`: the keep-alive the caller asked for.
+    pub keep_alive_seconds: i32,
+    /// `SessionTtl`: when the clock closes the session.
+    pub expires_at: SystemTime,
+}
+
+impl Session {
+    /// Whether the clock has closed this session by `now`.
+    fn is_closed(&self, now: SystemTime) -> bool {
+        now >= self.expires_at
+    }
+
+    /// How long after its last statement the session stays open: the
+    /// keep-alive it was opened with, which the model bounds to 0..86400 ("The
+    /// maximum time a session can keep alive is 24 hours").
+    fn keep_alive(&self) -> Duration {
+        Duration::from_secs(self.keep_alive_seconds.unsigned_abs().into())
+    }
 }
 
 /// Which data warehouse a statement was submitted against. Redshift accepts a
@@ -494,6 +613,31 @@ impl Statement {
             StatementStatus::Finished => self.result.as_ref(),
             _ => None,
         }
+    }
+
+    /// The `Id` of the SUBMISSION this statement belongs to: its own for a
+    /// statement submitted on its own, and the BATCH's for one statement of a
+    /// batch.
+    ///
+    /// `SubStatementData.Id` documents the `:<n>` suffix positionally — "a
+    /// suffix indicates the number of the SQL statement" — so the suffix is an
+    /// ADDRESS for reaching one statement of a batch, not the identity that
+    /// statement's record reports: a client walking a batch's `SubStatements`
+    /// and describing each one correlates the record it gets back to the batch
+    /// it belongs to through this.
+    pub fn submission_id(&self) -> &str {
+        split_batch_member(&self.id).map_or(self.id.as_str(), |(batch_id, _)| batch_id)
+    }
+
+    /// Whether this statement has a result a caller may fetch: it ran to
+    /// completion AND produced a result set.
+    ///
+    /// A statement that FAILED or was ABORTED has no result, and neither has a
+    /// FINISHED statement that returned no result set (DDL, or DML such as
+    /// INSERT) — "no result set" and "an empty result set" are different
+    /// answers, so the readers refuse the first instead of serving the second.
+    pub fn has_fetchable_result(&self) -> bool {
+        self.status == StatementStatus::Finished && self.result.is_some()
     }
 
     /// `ExecutionMode`. A single `ExecuteStatement` is committed on its own,
@@ -1350,11 +1494,23 @@ fn retained_bytes(value: rusqlite::types::ValueRef<'_>) -> usize {
     RETAINED_CELL_OVERHEAD.saturating_add(payload)
 }
 
-/// Map one engine value onto the modelled `Field` union. The column's type
-/// decides between `longValue` and `booleanValue`, which SQLite stores
-/// identically.
+/// Map one engine value onto the modelled `Field` union.
+///
+/// The column's TYPE decides the member, not the storage class the engine
+/// happened to use: `longValue` and `booleanValue` are stored identically by
+/// SQLite, and an EXACT-numeric column (`DECIMAL`/`NUMERIC`) is reported under
+/// `stringValue` carrying the value at the column's declared scale. A JSON
+/// number cannot carry that scale, and rendering it would round-trip the value
+/// through binary floating point, so `doubleValue` is for the APPROXIMATE
+/// numeric types (`REAL`, `DOUBLE PRECISION`) alone. The exact INTEGER types
+/// keep their own member, `longValue`, which loses nothing.
 fn field_from(value: rusqlite::types::ValueRef<'_>, column_type: Option<&ColumnType>) -> Field {
     use rusqlite::types::ValueRef;
+    if let Some(column_type) = column_type.filter(|column_type| column_type.is_exact_numeric()) {
+        if let Some(rendered) = exact_numeric(value, column_type.declared_scale()) {
+            return Field::stringValue(rendered);
+        }
+    }
     match value {
         ValueRef::Null => Field::isNull(true),
         ValueRef::Integer(integer) => {
@@ -1367,6 +1523,25 @@ fn field_from(value: rusqlite::types::ValueRef<'_>, column_type: Option<&ColumnT
         ValueRef::Real(double) => Field::doubleValue(double),
         ValueRef::Text(bytes) => Field::stringValue(String::from_utf8_lossy(bytes).into_owned()),
         ValueRef::Blob(bytes) => Field::blobValue(bytes.to_vec()),
+    }
+}
+
+/// Render one value of an exact-numeric column as the decimal text that
+/// column's declaration calls for: the value with exactly `scale` digits after
+/// the decimal point.
+///
+/// `None` for a value that is not one of the column's numbers — a NULL, or text
+/// or bytes the engine kept verbatim — which is reported under the member that
+/// matches what it actually is rather than dressed up as a number.
+fn exact_numeric(value: rusqlite::types::ValueRef<'_>, scale: usize) -> Option<String> {
+    use rusqlite::types::ValueRef;
+    match value {
+        // Scaled from the INTEGER itself rather than through a float, so a
+        // value past what a double can hold exactly keeps every digit.
+        ValueRef::Integer(integer) if scale == 0 => Some(integer.to_string()),
+        ValueRef::Integer(integer) => Some(format!("{integer}.{}", "0".repeat(scale))),
+        ValueRef::Real(double) => Some(format!("{double:.scale$}")),
+        ValueRef::Null | ValueRef::Text(_) | ValueRef::Blob(_) => None,
     }
 }
 
@@ -1441,12 +1616,41 @@ const DECLARED_TYPE_NAMES: &[(&str, &str)] = &[
 /// `ColumnMetadata.isSigned`. Every Redshift numeric type is signed.
 const SIGNED_TYPE_NAMES: &[&str] = &["int2", "int4", "int8", "numeric", "float4", "float8"];
 
+/// The type names [`ColumnType`] reports for an EXACT-numeric column whose
+/// values carry a declared scale: `DECIMAL` and its alias `NUMERIC`, which the
+/// Amazon Redshift *Numeric types* documentation
+/// (<https://docs.aws.amazon.com/redshift/latest/dg/r_Numeric_types201.html>)
+/// separates from the approximate `REAL`/`DOUBLE PRECISION`. The exact INTEGER
+/// types are not here: they declare no scale, and `longValue` carries them
+/// without loss.
+const EXACT_NUMERIC_TYPE_NAMES: &[&str] = &["numeric"];
+
+/// The greatest scale an exact-numeric column can declare: the same
+/// documentation gives `DECIMAL` a maximum precision of 38 digits, so no more
+/// than 38 of them can sit to the right of the decimal point.
+const MAX_NUMERIC_SCALE: i32 = 38;
+
 /// The type names [`ColumnType`] reports for a character column. Redshift
 /// compares `CHAR` and `VARCHAR` values case-sensitively, which is what
 /// `ColumnMetadata.isCaseSensitive` reports.
 const CASE_SENSITIVE_TYPE_NAMES: &[&str] = &["bpchar", "varchar", "super"];
 
 impl ColumnType {
+    /// Whether this column is an EXACT-numeric one, whose values are reported
+    /// as decimal text so that neither the declared scale nor an exact digit is
+    /// lost to binary floating point.
+    fn is_exact_numeric(&self) -> bool {
+        EXACT_NUMERIC_TYPE_NAMES.contains(&self.name.as_str())
+    }
+
+    /// How many digits this column declares after the decimal point, held to
+    /// the greatest scale an exact-numeric column can have
+    /// ([`MAX_NUMERIC_SCALE`]) so that a declaration naming more than Redshift
+    /// allows cannot widen a rendered value without bound.
+    fn declared_scale(&self) -> usize {
+        usize::try_from(self.scale.clamp(0, MAX_NUMERIC_SCALE)).unwrap_or(0)
+    }
+
     /// Resolve a column's declared type keyword — `VARCHAR(16)`,
     /// `NUMERIC(10,2)`, `BIGINT` — through [`DECLARED_TYPE_NAMES`]. A keyword
     /// the table does not carry keeps its own spelling: it is still the
@@ -1586,6 +1790,122 @@ fn column_metadata(name: &str, column_type: Option<&ColumnType>) -> ColumnMetada
     }
 }
 
+/// The schema a stored table is reported in.
+///
+/// Redshift creates a user table in `public` unless the statement names another
+/// schema, and this emulator's engine holds every table of a database in one
+/// namespace, so `public` is the schema the catalog reports a table in. Nothing
+/// is invented by it: a table a caller reaches through the Data API's metadata
+/// operations is in the database's default schema.
+pub const DEFAULT_SCHEMA: &str = "public";
+
+/// Build the modelled `ColumnMetadata` for one column of a STORED table, which
+/// — unlike a column of a result set, whose origin a prepared statement does
+/// not expose — has a schema and a table of origin to report.
+fn table_column_metadata(
+    name: &str,
+    column_type: Option<&ColumnType>,
+    table: &str,
+) -> ColumnMetadata {
+    ColumnMetadata {
+        schema_name: Some(DEFAULT_SCHEMA.to_string()),
+        table_name: Some(table.to_string()),
+        ..column_metadata(name, column_type)
+    }
+}
+
+/// One table of a database's catalog: its name, and the columns it declares in
+/// declaration order.
+#[derive(Debug, Clone)]
+pub struct TableColumns {
+    /// The table's name, as the engine's catalog spells it.
+    pub table: String,
+    /// One entry per declared column, in declaration order.
+    pub columns: Vec<ColumnMetadata>,
+}
+
+/// Read the catalog of the database `handle` guards: the tables it holds and the
+/// columns each one declares, optionally narrowed to one `table`.
+///
+/// BLOCKING for the same reason [`run_on`] is, and bounded the same way: the
+/// catalog is read with real SQL on the engine's own `sqlite_master`, and each
+/// table's columns come from the engine's answer to a zero-row query over it,
+/// so a reported column is one the engine really declares.
+pub fn catalog_on(
+    handle: &DatabaseHandle,
+    table: Option<&str>,
+    timeout: Duration,
+    bound: &ExecutionBound,
+) -> Result<Vec<TableColumns>, String> {
+    let database = handle
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let connection = &database.connection;
+
+    let guard = std::sync::Arc::clone(&bound.0);
+    let handler_guard = std::sync::Arc::clone(&guard);
+    connection.progress_handler(
+        PROGRESS_HANDLER_OPS,
+        Some(move || handler_guard.should_interrupt()),
+    );
+    guard.arm(timeout, SQL_STEP_BUDGET);
+    let read = read_catalog(connection, table);
+    guard.disarm();
+    read.map_err(|error| scrub_paths(&error.to_string()))
+}
+
+/// The catalog read [`catalog_on`] bounds: the engine's own list of tables and
+/// views, and the columns each of them declares.
+fn read_catalog(
+    connection: &rusqlite::Connection,
+    table: Option<&str>,
+) -> rusqlite::Result<Vec<TableColumns>> {
+    // The engine's own catalog, in name order. Views are tables a client can
+    // read columns from, so they are described too; the engine's internal
+    // objects are not part of the database's catalog.
+    let mut listing = connection.prepare(
+        "SELECT name FROM sqlite_master WHERE type IN ('table', 'view') \
+         AND name NOT LIKE 'sqlite_%' ORDER BY name",
+    )?;
+    let mut names: Vec<String> = Vec::new();
+    let mut rows = listing.query([])?;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(0)?;
+        // Redshift matches an unquoted identifier case-insensitively, and so
+        // does the engine, so the filter does too.
+        if table.is_none_or(|wanted| wanted.eq_ignore_ascii_case(&name)) {
+            names.push(name);
+        }
+    }
+    drop(rows);
+    drop(listing);
+
+    let mut described = Vec::with_capacity(names.len());
+    for name in names {
+        // A zero-row query over the table: the engine answers with the table's
+        // columns and their declared types, which is where every reported
+        // column comes from.
+        let quoted = name.replace('"', "\"\"");
+        let probe = connection.prepare(&format!("SELECT * FROM \"{quoted}\" LIMIT 0"))?;
+        let columns = probe
+            .columns()
+            .iter()
+            .map(|column| {
+                let declared = column
+                    .decl_type()
+                    .map(str::to_ascii_lowercase)
+                    .map(|declared| ColumnType::from_declared(&declared));
+                table_column_metadata(column.name(), declared.as_ref(), &name)
+            })
+            .collect();
+        described.push(TableColumns {
+            table: name,
+            columns,
+        });
+    }
+    Ok(described)
+}
+
 // ---------------------------------------------------------------------------
 // Pagination cursors
 // ---------------------------------------------------------------------------
@@ -1594,6 +1914,10 @@ fn column_metadata(name: &str, column_type: Option<&ColumnType>) -> ColumnMetada
 pub const CURSOR_STATEMENTS: &str = "statements";
 /// Cursor kind naming a row offset in a statement's result set.
 pub const CURSOR_ROWS: &str = "rows";
+/// Cursor kind naming a position in `ListSessions`' ordering.
+pub const CURSOR_SESSIONS: &str = "sessions";
+/// Cursor kind naming a column offset in one table's `ColumnList`.
+pub const CURSOR_COLUMNS: &str = "columns";
 
 /// Encode an opaque continuation token for `kind` at `position`.
 ///
@@ -1682,6 +2006,9 @@ pub struct Submission {
     pub result_format: String,
     /// The session the statement runs in, when the caller uses one.
     pub session_id: Option<String>,
+    /// `SessionKeepAliveSeconds`: how long to keep the session alive after the
+    /// statement finishes, when the caller asked for a session.
+    pub session_keep_alive_seconds: Option<i32>,
     /// The caller's `ClientToken`, for an idempotent replay.
     pub client_token: Option<String>,
     /// Whether the caller asked to wait for completion (`WaitTimeSeconds`).
@@ -1731,8 +2058,11 @@ pub enum BadConnection {
     BothWarehouses,
     /// Neither of them, and no session either.
     NoWarehouse,
-    /// Neither of them, but a `SessionId`: a valid request whose warehouse and
-    /// database belong to a session this emulator does not model yet.
+    /// Neither of them, but a `SessionId`: the warehouse and database this
+    /// request runs against are the ones its SESSION was opened with, so they
+    /// are resolved from the session store
+    /// ([`ComAmazonawsRedshiftdataRedshiftdataState::session_connection`])
+    /// rather than from the request.
     SessionOnly,
     /// No database.
     NoDatabase,
@@ -1754,7 +2084,10 @@ impl BadConnection {
                 "one of ClusterIdentifier (a provisioned cluster) or WorkgroupName (a serverless \
                  workgroup) is required"
             }
-            Self::SessionOnly => "only a SessionId as its connection target",
+            Self::SessionOnly => {
+                "SessionId does not name a live session: the warehouse and database a statement \
+                 runs against are the ones its session was opened with"
+            }
             Self::NoDatabase => "Database is required",
             Self::BothAuthMethods => {
                 "DbUser and SecretArn cannot both be supplied: DbUser authenticates with \
@@ -1777,14 +2110,12 @@ impl ConnectionRequest<'_> {
     /// submission.
     ///
     /// The session-reuse form, where a caller that already holds a `SessionId`
-    /// names neither warehouse, is a VALID request this slice cannot serve
-    /// faithfully: the warehouse and database such a call runs against are the
-    /// ones its session was opened with, and no session store exists yet
-    /// (`ListSessions` is still scaffolded), so answering it would mean
-    /// inventing a connection target. It is reported as
-    /// [`BadConnection::SessionOnly`], which a handler answers with the
-    /// scaffold's `NotImplemented` — the gap is the emulator's, not the
-    /// caller's.
+    /// names neither warehouse, carries its connection on the SESSION: it is
+    /// reported as [`BadConnection::SessionOnly`], which a handler resolves
+    /// against the session store
+    /// ([`ComAmazonawsRedshiftdataRedshiftdataState::session_connection`])
+    /// before deciding anything — only a `SessionId` that names no live session
+    /// is a request this cannot serve.
     pub fn resolve(self) -> Result<Connection, BadConnection> {
         let target = match (
             non_empty(self.cluster_identifier),
@@ -1863,6 +2194,8 @@ struct OpenDatabase {
 pub struct ComAmazonawsRedshiftdataRedshiftdataState {
     /// The retained statement history, by `Id`.
     statements: HashMap<String, Statement>,
+    /// The live and recently closed sessions, by `SessionId`.
+    sessions: HashMap<String, Session>,
     /// `ClientToken` -> `Id`, so an idempotent replay answers with the first
     /// statement rather than submitting a second one. An entry is dropped with
     /// the statement it points at, so this cannot outgrow the history.
@@ -1871,6 +2204,8 @@ pub struct ComAmazonawsRedshiftdataRedshiftdataState {
     databases: HashMap<String, OpenDatabase>,
     /// The next submission sequence number.
     next_seq: u64,
+    /// The next session sequence number.
+    next_session_seq: u64,
     /// The next `RedshiftQueryId`.
     next_query_id: i64,
     /// The next `RedshiftPid`.
@@ -1947,6 +2282,139 @@ impl ComAmazonawsRedshiftdataRedshiftdataState {
             }
         }
         Cancellation::Unknown
+    }
+
+    /// Every session this emulator holds, newest first — the order
+    /// `ListSessions` enumerates in.
+    pub fn sessions_newest_first(&self) -> Vec<&Session> {
+        let mut sessions: Vec<&Session> = self.sessions.values().collect();
+        sessions.sort_unstable_by_key(|session| std::cmp::Reverse(session.seq));
+        sessions
+    }
+
+    /// The session with this `SessionId`, live or closed.
+    pub fn session(&self, id: &str) -> Option<&Session> {
+        self.sessions.get(id)
+    }
+
+    /// The connection a LIVE session was opened with — what a statement naming
+    /// only a `SessionId` runs against. `None` for a `SessionId` no session
+    /// carries, and for one the clock has already closed: a closed session can
+    /// no longer run SQL statements.
+    pub fn session_connection(&self, id: &str) -> Option<Connection> {
+        let session = self
+            .sessions
+            .get(id)
+            .filter(|session| !session.is_closed(SystemTime::now()))?;
+        Some(Connection {
+            target: session.target.clone(),
+            database: session.database.clone(),
+            db_user: session.db_user.clone(),
+            secret_arn: session.secret_arn.clone(),
+        })
+    }
+
+    /// The status a session reports now, and the statement that makes it BUSY.
+    ///
+    /// Derived, never stored: a session is CLOSED once the clock has passed its
+    /// `SessionTtl`, BUSY while a statement submitted in it has not reached its
+    /// terminal status, and AVAILABLE otherwise. Call
+    /// [`Self::materialise_due_transitions`] first, so the statuses this reads
+    /// are the ones the clock already owes.
+    pub fn session_activity(&self, session: &Session) -> (SessionStatus, Option<String>) {
+        if session.is_closed(SystemTime::now()) {
+            return (SessionStatus::Closed, None);
+        }
+        let running = self
+            .statements
+            .values()
+            .filter(|statement| statement.session_id.as_deref() == Some(session.id.as_str()))
+            .filter(|statement| !statement.status.is_terminal())
+            .max_by_key(|statement| statement.seq)
+            .map(|statement| statement.id.clone());
+        match running {
+            // "This element is returned only when the session status is BUSY."
+            Some(id) => (SessionStatus::Busy, Some(id)),
+            None => (SessionStatus::Available, None),
+        }
+    }
+
+    /// Open the session a submission asked to keep alive, or extend the one it
+    /// ran in, and report the `SessionId` its statements record.
+    ///
+    /// A submission that named neither gets none: a session exists only because
+    /// a caller asked for one.
+    fn touch_session(&mut self, submission: &Submission, now: SystemTime) -> Option<String> {
+        if let Some(id) = submission.session_id.clone() {
+            if let Some(session) = self.sessions.get_mut(&id) {
+                // "The number of seconds to keep the session alive after the
+                // query finishes": the statement has run, so the keep-alive is
+                // measured from here, and a statement that asked for a new one
+                // changes the session's keep-alive to it.
+                if let Some(seconds) = submission.session_keep_alive_seconds {
+                    session.keep_alive_seconds = seconds;
+                }
+                session.updated_at = now;
+                session.expires_at = now + session.keep_alive();
+            }
+            return Some(id);
+        }
+
+        let keep_alive_seconds = submission.session_keep_alive_seconds?;
+        self.next_session_seq += 1;
+        let id = new_uuid();
+        let session = Session {
+            id: id.clone(),
+            seq: self.next_session_seq,
+            target: submission.target.clone(),
+            database: submission.database.clone(),
+            db_user: submission.db_user.clone(),
+            secret_arn: submission.secret_arn.clone(),
+            created_at: now,
+            updated_at: now,
+            keep_alive_seconds,
+            expires_at: now + Duration::from_secs(keep_alive_seconds.unsigned_abs().into()),
+        };
+        self.sessions.insert(id.clone(), session);
+        self.evict_expired_sessions(now);
+        Some(id)
+    }
+
+    /// Drop the sessions this service no longer reports: those closed longer
+    /// ago than [`SESSION_RETENTION`] — "Lists the sessions that the caller
+    /// created in the last 24 hours" — and then the oldest while more than
+    /// [`MAX_RETAINED_SESSIONS`] remain, so a caller repeating
+    /// `ExecuteStatement` cannot make the emulator hold sessions without limit.
+    fn evict_expired_sessions(&mut self, now: SystemTime) {
+        self.sessions.retain(|_, session| {
+            !now.duration_since(session.created_at)
+                .is_ok_and(|age| age > SESSION_RETENTION)
+        });
+        while self.sessions.len() > MAX_RETAINED_SESSIONS {
+            let Some(oldest) = self
+                .sessions
+                .values()
+                .min_by_key(|session| session.seq)
+                .map(|session| session.id.clone())
+            else {
+                break;
+            };
+            self.sessions.remove(&oldest);
+        }
+    }
+
+    /// A handle on one database of `target` this emulator ALREADY holds open,
+    /// for a reporting operation: `None` when no statement has opened it, so a
+    /// read never opens an engine a later caller would then find empty — and
+    /// never spends one of the [`MAX_OPEN_DATABASES`] a submission may need.
+    pub fn open_database(
+        &self,
+        target: &ConnectionTarget,
+        database: &str,
+    ) -> Option<DatabaseHandle> {
+        self.databases
+            .get(&target.database_key(database))
+            .map(|open| std::sync::Arc::clone(&open.handle))
     }
 
     /// Resolve the database a submission will run on, opening and confining it on
@@ -2097,6 +2565,12 @@ impl ComAmazonawsRedshiftdataRedshiftdataState {
         let created_at = SystemTime::now();
         self.next_seq += 1;
 
+        // The session this submission ran in: the one it asked to keep alive,
+        // opened here, or the one it named, whose expiry now runs from this
+        // statement. The statements record what the SESSION STORE says, so a
+        // `SessionId` on a statement is one this service really holds.
+        let session_id = self.touch_session(&submission, created_at);
+
         // The statement answers SUBMITTED now and owes its terminal status
         // later; a caller that asked to wait for completion has already waited
         // longer than the span, so for that caller it is due immediately.
@@ -2118,6 +2592,7 @@ impl ComAmazonawsRedshiftdataRedshiftdataState {
 
         let shared = Shared {
             submission: &submission,
+            session_id,
             created_at,
             due_at,
             completed_at,
@@ -2252,6 +2727,7 @@ impl ComAmazonawsRedshiftdataRedshiftdataState {
 /// its parameters and its clock.
 struct Shared<'a> {
     submission: &'a Submission,
+    session_id: Option<String>,
     created_at: SystemTime,
     due_at: Instant,
     completed_at: SystemTime,
@@ -2304,7 +2780,7 @@ fn build_statement(shared: &Shared<'_>, recorded: Recorded) -> Statement {
         with_event: submission.with_event,
         result_format: submission.result_format.clone(),
         parameters: submission.parameters.clone(),
-        session_id: submission.session_id.clone(),
+        session_id: shared.session_id.clone(),
         client_token: recorded.client_token,
         result: recorded.execution.result,
         is_batch: recorded.is_batch,
