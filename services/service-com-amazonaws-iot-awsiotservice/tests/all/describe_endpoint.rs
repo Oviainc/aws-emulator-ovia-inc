@@ -214,7 +214,7 @@ impl Reply {
 /// Hand-written, as the equivalent helpers in sibling crates' test modules are: it
 /// is three lines of test-only encoding, and a test helper is not worth a new
 /// dependency entry in the workspace lock file.
-fn percent_encode(value: &str) -> String {
+pub(crate) fn percent_encode(value: &str) -> String {
     value
         .bytes()
         .map(|byte| match byte {

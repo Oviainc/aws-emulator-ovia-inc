@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListThings
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListThings`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListThings::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! One page of the THING REGISTRY (`crate::state::ComAmazonawsIotAwsiotserviceState::things`),
+//! in `thingName` order, narrowed by the request's filters: every entry is built from
+//! the record `CreateThing` persisted, so what this reports and what `DescribeThing`
+//! reads are one value.
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +160,246 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListThings` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListThingsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListThings"))
+        let _ = ctx;
+
+        // The filters are resolved BEFORE the store is reached: a request whose
+        // attribute filter names no attribute, or whose `nextToken` is not one this
+        // listing issued, is refused whatever the registry holds.
+        let attribute_filter = AttributeFilter::of(
+            input.attribute_name.as_deref(),
+            input.attribute_value.as_deref(),
+            input.use_prefix_attribute_value,
+        )?;
+        let scope = listing_scope(&attribute_filter, input.thing_type_name.as_deref());
+        let resume_after = match input.next_token.as_deref() {
+            Some(token) => Some(decode_next_token(token, &scope)?),
+            None => None,
+        };
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListThingsErrorModeled::InternalFailureException(InternalFailureException {
+                message: Some("the IoT emulator has no state store attached".to_string()),
+            })
+        })?;
+
+        // `maxResults` is `range 1..250`, refused outside that before this handler
+        // runs, so a request that names it asks for at least one thing; one that does
+        // not asks for every thing that matches. The clamp is defensive rather than
+        // load-bearing: it keeps the page size inside the modelled range without
+        // depending on a validation performed outside this module.
+        let page_size = input
+            .max_results
+            .map_or(usize::MAX, |max| max.clamp(1, 250) as usize);
+
+        // A pure read of the registry: nothing here writes, so a later caller sees
+        // exactly what this one did.
+        let store = state.lock();
+        let mut page: Vec<ThingAttribute> = store
+            .things
+            .values()
+            // The registry is keyed by name, so iteration is already `thingName`
+            // order and "the things whose name sorts after the last one emitted" is a
+            // well-defined resume point even if that thing has since been deleted.
+            .filter(|thing| {
+                resume_after
+                    .as_deref()
+                    .is_none_or(|cursor| thing.thing_name.as_str() > cursor)
+            })
+            // `thingTypeName` is "The name of the thing type used to search for
+            // things": a thing matches only when it is associated with that type.
+            .filter(|thing| {
+                input.thing_type_name.as_deref().is_none_or(|wanted| {
+                    thing.configuration.thing_type_name.as_deref() == Some(wanted)
+                })
+            })
+            .filter(|thing| attribute_filter.matches(&thing.configuration.attributes))
+            // One thing beyond the page: its presence is what says the listing is
+            // truncated, and nothing more than that is read.
+            .take(page_size.saturating_add(1))
+            .map(thing_attribute)
+            .collect();
+        let truncated = page.len() > page_size;
+        page.truncate(page_size);
+
+        // `nextToken` is "The token to use to get the next set of results. Will not be
+        // returned if operation has returned all results."
+        let next_token = if truncated {
+            page.last()
+                .and_then(|last| last.thing_name.as_deref())
+                .map(|last_name| encode_next_token(&scope, last_name))
+        } else {
+            None
+        };
+
+        Ok(ListThingsOutput {
+            // `ThingAttributeList` carries no length constraint, so a registry with no
+            // matching thing answers with an EMPTY list rather than an absent member:
+            // "nothing matches" is an answer, not a missing one.
+            things: Some(page),
+            next_token,
+        })
     }
+}
+
+/// One registry record as the modelled `ThingAttribute` a response carries.
+///
+/// Every member is read off the stored record — `version` is "The version of the thing
+/// record in the registry", and `attributes` is reported even when the thing has none,
+/// because a thing with no attributes has an EMPTY attribute map.
+fn thing_attribute(thing: &crate::state::RegisteredThing) -> ThingAttribute {
+    ThingAttribute {
+        thing_name: Some(thing.thing_name.clone()),
+        thing_type_name: thing.configuration.thing_type_name.clone(),
+        thing_arn: Some(thing.thing_arn.clone()),
+        attributes: Some(thing.attributes()),
+        version: thing.version,
+    }
+}
+
+/// Which things an `attributeName`/`attributeValue`/`usePrefixAttributeValue` triple
+/// selects.
+///
+/// The operation documents the filter as "calling ListThings with attributeName=Color
+/// and attributeValue=Red retrieves all things in the registry that contain an
+/// attribute Color with the value Red", and `usePrefixAttributeValue` as "When true,
+/// the action returns the thing resources with attribute values that start with the
+/// attributeValue provided. When false, or not present, the action returns only the
+/// thing resources with attribute values that match the entire attributeValue
+/// provided."
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AttributeFilter {
+    /// No attribute filter: every thing matches.
+    Any,
+    /// A name with no value: the things that carry that attribute, whatever its value.
+    Present(String),
+    /// The things whose named attribute equals this value in full.
+    Exact { name: String, value: String },
+    /// The things whose named attribute STARTS WITH this value.
+    Prefix { name: String, prefix: String },
+}
+
+impl AttributeFilter {
+    /// The filter the request asks for, or `InvalidRequestException` (HTTP 400, "The
+    /// request is not valid") when it asks for one that selects nothing well defined:
+    /// an `attributeValue` with no `attributeName` names no attribute to compare it
+    /// against, so there is no set of things it could mean. Refusing it is the
+    /// modelled answer; ignoring it and listing everything would report things the
+    /// caller did not ask for.
+    fn of(
+        name: Option<&str>,
+        value: Option<&str>,
+        use_prefix: bool,
+    ) -> Result<Self, ListThingsError> {
+        match (name, value) {
+            (None, None) => Ok(Self::Any),
+            (Some(name), None) => Ok(Self::Present(name.to_string())),
+            (Some(name), Some(value)) if use_prefix => Ok(Self::Prefix {
+                name: name.to_string(),
+                prefix: value.to_string(),
+            }),
+            (Some(name), Some(value)) => Ok(Self::Exact {
+                name: name.to_string(),
+                value: value.to_string(),
+            }),
+            (None, Some(_)) => Err(ListThingsErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(
+                        "attributeValue can only be used with attributeName".to_string(),
+                    ),
+                },
+            )
+            .into()),
+        }
+    }
+
+    /// Whether a thing carrying `attributes` is in this filter's set.
+    fn matches(&self, attributes: &::std::collections::BTreeMap<String, String>) -> bool {
+        match self {
+            Self::Any => true,
+            Self::Present(name) => attributes.contains_key(name),
+            Self::Exact { name, value } => {
+                attributes.get(name).is_some_and(|stored| stored == value)
+            }
+            Self::Prefix { name, prefix } => attributes
+                .get(name)
+                .is_some_and(|stored| stored.starts_with(prefix.as_str())),
+        }
+    }
+
+    /// This filter as one field of a continuation token's scope; see
+    /// [`listing_scope`]. The leading tag keeps two filters that differ only in KIND
+    /// (a name-only filter and an exact match on the empty value, say) apart.
+    fn scope(&self) -> String {
+        match self {
+            Self::Any => "a".to_string(),
+            Self::Present(name) => format!("n{SCOPE_SEPARATOR}{name}"),
+            Self::Exact { name, value } => {
+                format!("e{SCOPE_SEPARATOR}{name}{SCOPE_SEPARATOR}{value}")
+            }
+            Self::Prefix { name, prefix } => {
+                format!("p{SCOPE_SEPARATOR}{name}{SCOPE_SEPARATOR}{prefix}")
+            }
+        }
+    }
+}
+
+/// The character that separates the fields of a token's SCOPE. A control character, so
+/// it is outside `AttributeName`'s pattern (`^[a-zA-Z0-9_.,@/:#-]+$`),
+/// `AttributeValue`'s (`^[a-zA-Z0-9_.,@/:#=\[\]-]*$`) and `ThingTypeName`'s
+/// (`^[a-zA-Z0-9:_-]+$`), and cannot occur inside any field it joins.
+const SCOPE_SEPARATOR: char = '\u{1e}';
+
+/// The character that separates a token's scope from the name it resumes after.
+/// Outside every modelled pattern a scope field is drawn from, and outside
+/// `ThingName`'s (`^[a-zA-Z0-9:_-]+$`), so the split is unambiguous.
+const TOKEN_SEPARATOR: char = '\u{1f}';
+
+/// The LISTING a continuation token belongs to: its filters, which decide which things
+/// it walks and therefore what "the next set of results" means.
+///
+/// A `thingTypeName` is modelled `len 1..128`, so it can never be empty and an absent
+/// one cannot be confused with a supplied one.
+fn listing_scope(attribute_filter: &AttributeFilter, thing_type_name: Option<&str>) -> String {
+    format!(
+        "{}{SCOPE_SEPARATOR}{}",
+        attribute_filter.scope(),
+        thing_type_name.unwrap_or_default()
+    )
+}
+
+/// The opaque `nextToken` that resumes `scope`'s listing after the thing named
+/// `last_name`.
+///
+/// Hex-encoded so the token is opaque to the caller whatever the name and the filters
+/// contain. The encoding carries no integrity protection and claims none: a caller
+/// that reverses it can name any resume point of the listing it is already reading,
+/// which selects a page of that same listing and nothing else.
+fn encode_next_token(scope: &str, last_name: &str) -> String {
+    ::hex::encode(format!("{scope}{TOKEN_SEPARATOR}{last_name}"))
+}
+
+/// The thing name a `nextToken` resumes after, or `InvalidRequestException` when the
+/// token is not one [`encode_next_token`] issued for THIS listing.
+///
+/// Every step is fallible on purpose: the token is caller-supplied, so nothing read out
+/// of it may panic the handler. A token issued for another filter set is refused rather
+/// than silently restarting a different listing from the middle.
+fn decode_next_token(token: &str, scope: &str) -> Result<String, ListThingsError> {
+    let invalid = || -> ListThingsError {
+        ListThingsErrorModeled::InvalidRequestException(InvalidRequestException {
+            message: Some("nextToken is not a continuation token of this listing".to_string()),
+        })
+        .into()
+    };
+    let bytes = ::hex::decode(token).map_err(|_| invalid())?;
+    let decoded = String::from_utf8(bytes).map_err(|_| invalid())?;
+    let (token_scope, resume_after) = decoded.split_once(TOKEN_SEPARATOR).ok_or_else(invalid)?;
+    // A resume point outside `ThingName` could name no thing in the registry, so a
+    // token carrying one was not issued by this listing.
+    if token_scope != scope
+        || !::service_common::iot_job_executions::is_modeled_thing_name(resume_after)
+    {
+        return Err(invalid());
+    }
+    Ok(resume_after.to_string())
 }
