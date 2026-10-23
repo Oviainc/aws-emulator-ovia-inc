@@ -21,18 +21,18 @@ use service_com_amazonaws_networkfirewall_networkfirewall_20201112::state;
 
 use crate::harness::{error_code, resource_policy_document, Harness, ACCOUNT, REGION};
 
-/// RULE: a Network Firewall resource policy is validated against the RAM managed
-/// permission for the shared resource's TYPE, so the actions its statement grants
-/// must be exactly that type's fixed set; any other document is refused with
-/// `InvalidResourcePolicyException` (HTTP 400) and nothing is attached, while an
-/// accepted one is returned verbatim by `DescribeResourcePolicy` until it is
-/// deleted.
+/// RULE: a Network Firewall resource policy may grant only the actions the shared
+/// resource's TYPE permits, and the test is CONTAINMENT: any non-empty subset of
+/// that type's set is accepted and returned verbatim by `DescribeResourcePolicy`
+/// until it is deleted, while a document naming any action outside the set is
+/// refused with `InvalidResourcePolicyException` (HTTP 400) and nothing is
+/// attached.
 ///
 /// The permitted set for a firewall policy is the one the AWS
 /// `PutResourcePolicy` documentation lists for that resource type, held in
 /// `state::FIREWALL_POLICY_POLICY_ACTIONS`; the rows vary the granted set around
-/// it (order, an out-of-set action, a missing one, an extra one, and the set
-/// that belongs to the other resource type).
+/// it (order, a subset, an out-of-set action, an extra one, and the set that
+/// belongs to the other resource type).
 #[tokio::test]
 async fn only_the_permitted_action_set_is_attached_to_a_firewall_policy() {
     let harness = Harness::new();
@@ -51,7 +51,7 @@ async fn only_the_permitted_action_set_is_attached_to_a_firewall_policy() {
             vec!["network-firewall:DeleteFirewallPolicy"],
             false,
         ),
-        ("missing-an-action", vec![permitted[0]], false),
+        ("a-single-action-subset", vec![permitted[0]], true),
         (
             "with-an-extra-action",
             permitted
@@ -218,6 +218,86 @@ async fn a_malformed_or_misdirected_resource_policy_is_refused() {
             (400, expected),
             "case {label}: expected {expected}, got {status} {body:?}"
         );
+    }
+}
+
+/// RULE: the `ResourceNotFoundException` a resource-policy operation answers
+/// carries the service's one fixed message — the recorded wire sentence, spelled
+/// out here as a literal — and no request-derived content, in particular not the
+/// `ResourceArn` the request gave.
+///
+/// The rows are the three operations on the resource-policy path, each driven both
+/// against a resource that exists but carries no policy and against an ARN that
+/// names no resource at all, for both shareable resource kinds.
+#[tokio::test]
+async fn a_resource_policy_not_found_answer_names_no_identifier() {
+    // The wire text the recordings show, written out rather than read from the
+    // service's own constant, so this pins the service's behaviour.
+    let expected_message = "No object with the provided name or resource identifier was found";
+    let harness = Harness::new();
+    let present_group = harness
+        .shared_rule_group("message-checks", "STATEFUL", 10)
+        .await;
+    let present_policy = harness.shared_policy("message-checks").await;
+    let absent_group =
+        format!("arn:aws:network-firewall:{REGION}:{ACCOUNT}:stateful-rulegroup/absent");
+    let absent_policy = format!("arn:aws:network-firewall:{REGION}:{ACCOUNT}:firewall-policy/absent");
+
+    let targets: [(&str, &str, &[&str]); 4] = [
+        (
+            "present-rule-group",
+            &present_group,
+            &state::RULE_GROUP_POLICY_ACTIONS,
+        ),
+        (
+            "present-firewall-policy",
+            &present_policy,
+            &state::FIREWALL_POLICY_POLICY_ACTIONS,
+        ),
+        (
+            "absent-rule-group",
+            &absent_group,
+            &state::RULE_GROUP_POLICY_ACTIONS,
+        ),
+        (
+            "absent-firewall-policy",
+            &absent_policy,
+            &state::FIREWALL_POLICY_POLICY_ACTIONS,
+        ),
+    ];
+
+    for (label, arn, actions) in targets {
+        let requests: [(&str, Value); 3] = [
+            ("DescribeResourcePolicy", json!({ "ResourceArn": arn })),
+            ("DeleteResourcePolicy", json!({ "ResourceArn": arn })),
+            (
+                "PutResourcePolicy",
+                json!({ "ResourceArn": arn, "Policy": resource_policy_document(actions, arn) }),
+            ),
+        ];
+        for (operation, request) in requests {
+            let case = format!("{label}/{operation}");
+            // `PutResourcePolicy` on a resource that EXISTS attaches the policy
+            // instead of missing, so that pairing is not a not-found row.
+            if operation == "PutResourcePolicy" && label.starts_with("present") {
+                continue;
+            }
+            let (status, body) = harness.call(operation, &request).await;
+            assert_eq!(
+                (status, error_code(&body).as_str()),
+                (400, "ResourceNotFoundException"),
+                "case {case}: expected ResourceNotFoundException, got {status} {body:?}"
+            );
+            let message = body["Message"].as_str().unwrap_or_default();
+            assert_eq!(
+                message, expected_message,
+                "case {case}: expected the service's fixed message, got {message:?}"
+            );
+            assert!(
+                !message.contains(arn),
+                "case {case}: the message must not quote the request's ARN, got {message:?}"
+            );
+        }
     }
 }
 
