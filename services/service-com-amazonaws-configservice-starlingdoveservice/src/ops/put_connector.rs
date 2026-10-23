@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutConnector
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutConnector`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutConnector::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates a connector between a third-party cloud service provider and Config. The
+//! request carries no name, so the connector's name is derived from the provider
+//! configuration it connects to, which is also why one configuration can have only
+//! one connector: a second request for it is refused rather than applied, since
+//! connectors cannot be updated.
 //!
 //! ## Shape of an operation
 //!
@@ -178,18 +175,128 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutConnector` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutConnectorErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutConnector"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE)
+        })?;
+
+        // `ConnectorConfiguration`: "You must specify exactly one provider
+        // configuration." The model carries one provider, so a configuration that
+        // names none names no provider to connect to.
+        let Some(azure) = input.connector_configuration.azure.as_ref() else {
+            return Err(validation(format!(
+                "ConnectorConfiguration must specify exactly one provider \
+                 configuration. The supported provider is '{}'.",
+                crate::state::PROVIDER_AZURE,
+            )));
+        };
+
+        // The provider's identifiers are what the connector connects with, so neither
+        // may be blank. The tenant identifier is also what the connector's name — and
+        // with it the resource portion of its ARN — is derived from, so it must be an
+        // identifier a name can be built from: padding would make the name and the
+        // identifier disagree, and the model constrains only their length.
+        for (member, value) in [
+            ("tenantIdentifier", azure.tenant_identifier.as_str()),
+            ("clientIdentifier", azure.client_identifier.as_str()),
+        ] {
+            if value.trim().is_empty() {
+                return Err(validation(format!(
+                    "ConnectorConfiguration.azure.{member} must not be blank."
+                )));
+            }
+        }
+        if azure.tenant_identifier.trim() != azure.tenant_identifier {
+            return Err(validation(
+                "ConnectorConfiguration.azure.tenantIdentifier must not have leading or \
+                 trailing whitespace: the connector's name is derived from it."
+                    .to_string(),
+            ));
+        }
+
+        // A connector has a name even though this request carries none, so the name is
+        // derived from the configuration: the provider and the tenant it connects to.
+        // A connector is a regional resource, so the Region of the request that
+        // creates it is part of its identity and of its ARN.
+        let provider = crate::state::PROVIDER_AZURE.to_string();
+        let name = crate::state::connector_name(&provider, &azure.tenant_identifier);
+        let region = crate::state::request_region(ctx);
+        let arn = crate::state::connector_arn(&region, &name);
+
+        // The derived name is the resource portion of the connector's ARN, so an
+        // identifier that does not yield a name an ARN can carry would mint a
+        // connector nothing could name afterwards. Refuse it instead of creating one.
+        if crate::state::connector_arn_parts(&arn).map(|(_, parsed)| parsed) != Some(name.as_str())
+        {
+            return Err(validation(format!(
+                "ConnectorConfiguration.azure.tenantIdentifier must be usable as the \
+                 name of a connector, which is the resource portion of the connector's \
+                 ARN: it must be at most {} characters and must not contain '/'.",
+                crate::state::CONNECTOR_NAME_MAX_LEN,
+            )));
+        }
+
+        let mut store = state.lock();
+
+        // `ConflictException`: "For PutConnector, you cannot create a connector
+        // because a connector already exists for the specified connector
+        // configuration." Connectors cannot be updated, so the second request for a
+        // configuration already connected in this Region is refused rather than
+        // applied — which is also what makes concurrent requests for one configuration
+        // have a single winner, since the store is held for the whole
+        // check-and-insert.
+        if let Some(existing) = store.connectors.get(&arn) {
+            return Err(PutConnectorErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "A connector already exists for the specified connector \
+                     configuration: '{}'. Connectors cannot be updated. To update the \
+                     connector configuration, delete the connector and recreate it.",
+                    existing.arn,
+                )),
+            })
+            .into());
+        }
+
+        // Config documents the connector quota per account per Region, and this store
+        // stands for one account in one Region, so the quota is enforced over the
+        // whole store: the Region a request is scoped to is the caller's own and must
+        // not multiply the state this store retains.
+        if store.connectors.len() >= crate::state::CONNECTORS_QUOTA {
+            return Err(
+                PutConnectorErrorModeled::MaxNumberOfConnectorsExceededException(
+                    MaxNumberOfConnectorsExceededException {
+                        message: Some(format!(
+                            "You have reached the limit of the number of connectors in \
+                             your account in {region}: {}.",
+                            crate::state::CONNECTORS_QUOTA,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        store.connectors.insert(
+            arn.clone(),
+            crate::state::ConnectorEntry {
+                name,
+                arn: arn.clone(),
+                region,
+                provider,
+                connector_configuration: input.connector_configuration.clone(),
+                created_at: ::std::time::SystemTime::now(),
+                tags: input.tags.clone().unwrap_or_default(),
+            },
+        );
+
+        Ok(PutConnectorOutput { arn })
     }
 }
+
+/// Refuse the request with this operation's own modelled `ValidationException`.
+fn validation(message: String) -> PutConnectorError {
+    PutConnectorErrorModeled::ValidationException(ValidationException {
+        message: Some(message),
+    })
+    .into()
+}
+

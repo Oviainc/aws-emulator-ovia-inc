@@ -17,6 +17,8 @@ mod config_aggregation_authorization;
 mod config_aggregator_lifecycle;
 #[path = "all/config_compliance_by_config_rule.rs"]
 mod config_compliance_by_config_rule;
+#[path = "all/config_connectors.rs"]
+mod config_connectors;
 #[path = "all/config_delivery_channel_status.rs"]
 mod config_delivery_channel_status;
 #[path = "all/config_discovered_resource_counts.rs"]

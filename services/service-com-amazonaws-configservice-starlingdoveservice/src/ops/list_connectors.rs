@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListConnectors
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListConnectors`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListConnectors::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the connectors this account and Region hold, as a page over the stored
+//! connectors ordered by name: a connector appears here from the `PutConnector` that
+//! created it until the `DeleteConnector` that removed it, and running this operation
+//! changes nothing about the store.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +146,111 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListConnectors` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListConnectorsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListConnectors"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE)
+        })?;
+
+        // Each filter constrains the listing on the connector attribute its
+        // `filterName` names. The model publishes exactly one name, so a filter naming
+        // anything else cannot be applied, and reporting the connectors it would have
+        // excluded is not an answer to the request.
+        let filters = input.filters.unwrap_or_default();
+        let mut provider_filters: Vec<&[String]> = Vec::new();
+        for (index, filter) in filters.iter().enumerate() {
+            match filter.filter_name.as_deref() {
+                Some(crate::state::CONNECTOR_FILTER_PROVIDER) => {
+                    provider_filters.push(filter.filter_values.as_deref().unwrap_or_default());
+                }
+                named => {
+                    let named = match named {
+                        Some(name) => format!("'{name}'"),
+                        None => "is missing, which".to_string(),
+                    };
+                    return Err(validation(format!(
+                        "Filters[{index}].filterName {named} is not a supported connector \
+                         filter name. The supported filter name is '{}'.",
+                        crate::state::CONNECTOR_FILTER_PROVIDER,
+                    )));
+                }
+            }
+        }
+
+        // The token is opaque, and the only keys this operation issues are connector
+        // ARNs: a value that does not decode to one is not a token this operation
+        // handed out, so it is malformed rather than a page.
+        let resume_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(
+                crate::state::decode_page_token(token)
+                    .filter(|key| crate::state::connector_arn_parts(key).is_some())
+                    .ok_or_else(|| {
+                        validation(
+                            "The specified NextToken is not valid. Please use the \
+                             NextToken a previous ListConnectors response returned."
+                                .to_string(),
+                        )
+                    })?,
+            ),
+        };
+
+        // `MaxResults` defaults to 0, which is "the request asked for no particular
+        // page size" rather than "no results": one page then carries as many
+        // connectors as the model lets a response report.
+        let page_size = if input.max_results > 0 {
+            input.max_results as usize
+        } else {
+            crate::state::LIST_CONNECTORS_PAGE_SIZE
+        };
+
+        // A connector is a regional resource, so this operation reports the
+        // connectors of the Region its request is scoped to — the same Region whose
+        // ARNs `PutConnector` mints and `GetConnector` and `DeleteConnector` serve.
+        let region = crate::state::request_region(ctx);
+
+        // A connector is reported when every filter holds for it, and a filter holds
+        // when the attribute it names equals one of the values it carries. The
+        // comparison is exact: `provider` is a modelled enum (`Provider`), so a value
+        // that is not one of its published values names no provider and matches
+        // nothing — and a filter carrying no value at all matches nothing either.
+        let selects = |entry: &crate::state::ConnectorEntry| -> bool {
+            entry.region == region
+                && provider_filters
+                    .iter()
+                    .all(|values| values.contains(&entry.provider))
+        };
+
+        let store = state.lock();
+
+        // Page over the store's own key ordering — the connector ARNs, which within
+        // one Region order by connector name — so a token holds the key the next page
+        // resumes at and survives connectors created or deleted between pages.
+        let mut page = Vec::new();
+        let mut next_token = None;
+        for (key, entry) in &store.connectors {
+            if resume_at.as_ref().is_some_and(|resume_at| key < resume_at) {
+                continue;
+            }
+            if !selects(entry) {
+                continue;
+            }
+            if page.len() == page_size {
+                next_token = Some(crate::state::encode_page_token(key));
+                break;
+            }
+            page.push(entry.to_summary());
+        }
+
+        Ok(ListConnectorsOutput {
+            connector_summaries: page,
+            next_token,
+        })
     }
+}
+
+/// Refuse the request with this operation's own modelled `ValidationException`.
+fn validation(message: String) -> ListConnectorsError {
+    ListConnectorsErrorModeled::ValidationException(ValidationException {
+        message: Some(message),
+    })
+    .into()
 }
