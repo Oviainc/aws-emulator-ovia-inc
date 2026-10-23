@@ -7,8 +7,12 @@
 //! `commandArn` must name a command that EXISTS in the shared command index the
 //! IoT control plane owns (`service_common::iot_commands`), or the call is refused
 //! 400 `ValidationException` naming the missing command rather than accepting an
-//! execution that could never run. Then it mints and persists a job execution for
-//! the thing named by `targetArn`, with
+//! execution that could never run. Then it ADMITS the request only while the target
+//! device is under the published per-device command-execution concurrency limit
+//! (`service_common::iot_job_executions::MAX_CONCURRENT_COMMAND_EXECUTIONS_PER_THING`
+//! non-terminal command executions); a device already at that limit is refused 402
+//! `ServiceQuotaExceededException` and nothing is stored. Then it mints and persists
+//! a job execution for the thing named by `targetArn`, with
 //! status `QUEUED` and a job document built from `commandArn` + `parameters`, and
 //! returns its id. `clientToken` makes the call idempotent: the same token with the
 //! same parameters returns the same `executionId` and creates nothing, the same
@@ -154,6 +158,22 @@ fn unsupported_target_type_message(resource_type: &str) -> String {
 /// echoed value is bounded by `TargetArn`'s own modeled maximum (len 0..2048).
 fn invalid_target_arn_message(target_arn: &str) -> String {
     unsupported_target_message(&format!("Invalid target arn {target_arn}"))
+}
+
+/// A refusal of this operation's request as the modeled `ServiceQuotaExceededException`
+/// (HTTP 402), carrying the limit that was reached.
+///
+/// The operation models two admission refusals — `ServiceQuotaExceededException`
+/// (402) and `ThrottlingException` (429, "the rate exceeds the limit"). A limit on
+/// how MANY executions may be outstanding is a quota and not a rate, so it is
+/// reported as the quota error; the message states the limit the request met.
+fn quota_exceeded(message: String) -> StartCommandExecutionError {
+    StartCommandExecutionErrorModeled::ServiceQuotaExceededException(
+        ServiceQuotaExceededException {
+            message: Some(message),
+        },
+    )
+    .into()
 }
 
 /// A refusal of this operation's request as the modeled `ValidationException`
@@ -460,6 +480,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let now = crate::state::now_epoch_seconds();
+
+        // ADMISSION CONTROL, before anything is minted: a device may hold only so
+        // many command executions that have not reached a terminal status at once
+        // (`MAX_CONCURRENT_COMMAND_EXECUTIONS_PER_THING`), so a start for a device
+        // already at that limit is refused with this operation's modelled quota
+        // error rather than enqueued. Executions that have finished — including one
+        // whose own `executionTimeoutSeconds` the clock has already made `TIMED_OUT`
+        // — have released their slot, which is why the count is taken through the
+        // store (it materialises those timers first) and not from a counter.
+        if let Err(limit) = state.try_admit_command_execution(&thing_name, now) {
+            return Err(quota_exceeded(limit));
+        }
+
         let execution_id = crate::state::mint_execution_id(&mut state);
         let mut record = JobExecutionRecord::queued(
             execution_id.clone(),
@@ -467,20 +500,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(document),
             now,
         );
+        // What makes this record a COMMAND execution of its target device, and so
+        // one of the device's concurrency slots while it is pending.
+        record.command_arn = Some(input.command_arn.clone());
         // "A timer is started as soon as the command execution is created" —
         // `executionTimeoutSeconds`.
         record.execution_timeout_expires_at = input
             .execution_timeout_seconds
             .map(|seconds| now.saturating_add(seconds));
         if let Err(quota) = state.try_insert_execution(record) {
-            return Err(
-                StartCommandExecutionErrorModeled::ServiceQuotaExceededException(
-                    ServiceQuotaExceededException {
-                        message: Some(quota),
-                    },
-                )
-                .into(),
-            );
+            return Err(quota_exceeded(quota));
         }
 
         if let Some(token) = input.client_token.clone() {
