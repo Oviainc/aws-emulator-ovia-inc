@@ -63,7 +63,39 @@ pub struct ConflictException {
     pub resource_type: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.notificationscontacts#EmailContact")]
+// `EmailContact`'s schema and codec are written out by hand rather than derived with
+// `#[smithy_macros::smithy(shape = ...)]`.
+//
+// WHY: `creationTime` and `updateTime` target `CreationTime`/`UpdateTime`, and both
+// the members and their target shapes carry `@timestampFormat("date-time")`
+// (`smithy_query(query="shape", shape="EmailContact")` reports
+// `"timestampFormat": "date-time"` on each). The derive captures `@length`,
+// `@pattern`, `@jsonName`, `@xmlName` and the HTTP bindings onto each member schema
+// but NOT `@timestampFormat` (grep `vendor/smithy-macros`: no `timestamp_format`
+// anywhere), and the restJson1 codec resolves a timestamp's wire form from the member
+// schema alone (`vendor/smithy-schema-server/src/json.rs::write_timestamp` ->
+// `Schema::timestamp_format()`), falling back to the protocol default of epoch
+// seconds. A derived `EmailContact` therefore renders
+// `"creationTime": 1792729178.653` where the service renders
+// `"2026-10-23T04:19:38.653Z"`, and an SDK deserializer bound to a `date-time`
+// member fails on it.
+//
+// Hand-writing the member schemas is what lets `.with_timestamp_format(DateTime)`
+// reach the two timestamp members. Everything else mirrors the derive exactly: the
+// member order and `member_index` values, the shape ids, the wire names (no member
+// here declares `@jsonName`/`@xmlName`, so each wire name IS its Smithy member name)
+// and the write/read call per member kind. Constraint traits are deliberately NOT
+// carried: they are read only by the request-path validating walk
+// (`vendor/smithy-server-runtime` validates an operation's `INPUT_SCHEMA` only), and
+// `EmailContact` appears in no operation input — it is reached only from
+// `GetEmailContactResponse$emailContact` and the `EmailContacts` list of
+// `ListEmailContactsResponse`.
+//
+// This block is a WORKAROUND and should be deleted once the derive carries the trait.
+// The core-library change that fixes it for every service is filed as
+// `issues/things-that-do-not-work/20261022T000000Z-smithy-macros-drops-timestampformat-from-member-schemas.md`.
+// `tests/all/email_contact_timestamp_wire_form.rs` pins both the wire form and this
+// block's agreement with the model, so neither can drift silently.
 #[derive(Debug, Clone)]
 pub struct EmailContact {
     pub arn: String,
@@ -72,6 +104,145 @@ pub struct EmailContact {
     pub status: String,
     pub creation_time: ::aws_smithy_types::DateTime,
     pub update_time: ::aws_smithy_types::DateTime,
+}
+
+/// One member schema of [`EmailContact`], at `index` in the model's member list.
+const fn email_contact_member(
+    shape_id: &'static str,
+    name: &'static str,
+    shape_type: ::aws_smithy_schema::ShapeType,
+    index: usize,
+) -> ::aws_smithy_schema::Schema {
+    ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            shape_id,
+            "com.amazonaws.notificationscontacts",
+            name,
+        ),
+        shape_type,
+        name,
+        index,
+    )
+}
+
+impl EmailContact {
+    pub const M_ARN: ::aws_smithy_schema::Schema = email_contact_member(
+        "com.amazonaws.notificationscontacts#EmailContact$arn",
+        "arn",
+        ::aws_smithy_schema::ShapeType::String,
+        0,
+    );
+    pub const M_NAME: ::aws_smithy_schema::Schema = email_contact_member(
+        "com.amazonaws.notificationscontacts#EmailContact$name",
+        "name",
+        ::aws_smithy_schema::ShapeType::String,
+        1,
+    );
+    pub const M_ADDRESS: ::aws_smithy_schema::Schema = email_contact_member(
+        "com.amazonaws.notificationscontacts#EmailContact$address",
+        "address",
+        ::aws_smithy_schema::ShapeType::String,
+        2,
+    );
+    /// `status` targets the `EmailContactStatus` enum, which is string-encoded on the
+    /// wire — the derive classifies an enum member as a string too.
+    pub const M_STATUS: ::aws_smithy_schema::Schema = email_contact_member(
+        "com.amazonaws.notificationscontacts#EmailContact$status",
+        "status",
+        ::aws_smithy_schema::ShapeType::String,
+        3,
+    );
+    /// `@timestampFormat("date-time")`, on the member and on the `CreationTime` shape
+    /// it targets. THE reason this schema is hand-written.
+    pub const M_CREATION_TIME: ::aws_smithy_schema::Schema = email_contact_member(
+        "com.amazonaws.notificationscontacts#EmailContact$creationTime",
+        "creationTime",
+        ::aws_smithy_schema::ShapeType::Timestamp,
+        4,
+    )
+    .with_timestamp_format(::aws_smithy_schema::traits::TimestampFormat::DateTime);
+    /// `@timestampFormat("date-time")`, as `creationTime` above.
+    pub const M_UPDATE_TIME: ::aws_smithy_schema::Schema = email_contact_member(
+        "com.amazonaws.notificationscontacts#EmailContact$updateTime",
+        "updateTime",
+        ::aws_smithy_schema::ShapeType::Timestamp,
+        5,
+    )
+    .with_timestamp_format(::aws_smithy_schema::traits::TimestampFormat::DateTime);
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.notificationscontacts#EmailContact",
+            "com.amazonaws.notificationscontacts",
+            "EmailContact",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[
+            &Self::M_ARN,
+            &Self::M_NAME,
+            &Self::M_ADDRESS,
+            &Self::M_STATUS,
+            &Self::M_CREATION_TIME,
+            &Self::M_UPDATE_TIME,
+        ],
+    );
+}
+
+pub static EMAIL_CONTACT_SCHEMA: &::aws_smithy_schema::Schema = &EmailContact::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for EmailContact {
+    fn serialize_members(
+        &self,
+        s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        // Every member is `@required`, so each one is written unconditionally — the
+        // derive's `is_option` split puts a non-`Option` field on this branch.
+        s.write_string(&Self::M_ARN, self.arn.as_str())?;
+        s.write_string(&Self::M_NAME, self.name.as_str())?;
+        s.write_string(&Self::M_ADDRESS, self.address.as_str())?;
+        s.write_string(&Self::M_STATUS, self.status.as_str())?;
+        s.write_timestamp(&Self::M_CREATION_TIME, &self.creation_time)?;
+        s.write_timestamp(&Self::M_UPDATE_TIME, &self.update_time)?;
+        Ok(())
+    }
+}
+
+impl ::aws_smithy_schema_server::DeserializableStruct for EmailContact {
+    fn deserialize(
+        d: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+    ) -> ::std::result::Result<Self, ::aws_smithy_schema::serde::SerdeError> {
+        // Collected into per-member slots rather than into a `default()`ed struct:
+        // every member is `@required`, so each field is bare (a `DateTime` has no
+        // `Default`) and an absent one is refused by name, exactly as the derive does.
+        let mut arn = ::std::option::Option::None;
+        let mut name = ::std::option::Option::None;
+        let mut address = ::std::option::Option::None;
+        let mut status = ::std::option::Option::None;
+        let mut creation_time = ::std::option::Option::None;
+        let mut update_time = ::std::option::Option::None;
+        d.read_struct(&Self::SCHEMA, &mut |member, d| {
+            match member.member_index() {
+                Some(0) => arn = Some(d.read_string(member)?),
+                Some(1) => name = Some(d.read_string(member)?),
+                Some(2) => address = Some(d.read_string(member)?),
+                Some(3) => status = Some(d.read_string(member)?),
+                Some(4) => creation_time = Some(d.read_timestamp(member)?),
+                Some(5) => update_time = Some(d.read_timestamp(member)?),
+                _ => {}
+            }
+            Ok(())
+        })?;
+        Ok(Self {
+            arn: arn.ok_or_else(|| ::aws_smithy_schema_server::missing_member("arn"))?,
+            name: name.ok_or_else(|| ::aws_smithy_schema_server::missing_member("name"))?,
+            address: address.ok_or_else(|| ::aws_smithy_schema_server::missing_member("address"))?,
+            status: status.ok_or_else(|| ::aws_smithy_schema_server::missing_member("status"))?,
+            creation_time: creation_time
+                .ok_or_else(|| ::aws_smithy_schema_server::missing_member("creationTime"))?,
+            update_time: update_time
+                .ok_or_else(|| ::aws_smithy_schema_server::missing_member("updateTime"))?,
+        })
+    }
 }
 
 /// The values `EmailContactStatus` accepts on the wire.

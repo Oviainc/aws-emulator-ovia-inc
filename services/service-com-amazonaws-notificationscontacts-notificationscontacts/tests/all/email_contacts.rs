@@ -27,17 +27,20 @@ use smithy_server_runtime::MultiServiceRouter;
 /// an EMPTY region field, so no ARN may mention it.
 const REGION: &str = "us-west-2";
 /// The canonical emulator account (`engine::EMULATOR_ACCOUNT_ID`) every ARN carries.
-const ACCOUNT: &str = "000000000000";
+pub(crate) const ACCOUNT: &str = "000000000000";
 
 /// One emulator with an empty store, mounted exactly as the router mounts it, plus
 /// the engine it was built from — the test reads the activation code out of that
 /// store, because the real service only ever delivers it by email.
-struct Emulator {
+///
+/// `pub(crate)` so a sibling suite in this test target drives the SAME harness rather
+/// than growing a second copy of it.
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
-    engine: Arc<engine::InMemoryEngine>,
+    pub(crate) engine: Arc<engine::InMemoryEngine>,
 }
 
-fn emulator() -> Emulator {
+pub(crate) fn emulator() -> Emulator {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -74,7 +77,12 @@ fn request(method: &str, uri: &str, body: Option<&Value>) -> http::Request<bytes
 }
 
 /// Status and parsed body of one call. An empty body reads as `Value::Null`.
-async fn call(em: &Emulator, method: &str, uri: &str, body: Option<&Value>) -> (u16, Value) {
+pub(crate) async fn call(
+    em: &Emulator,
+    method: &str,
+    uri: &str,
+    body: Option<&Value>,
+) -> (u16, Value) {
     let response = em.router.dispatch(request(method, uri, body)).await;
     let status = response.status().as_u16();
     let error_type = response
@@ -113,7 +121,7 @@ fn error_code(body: &Value) -> String {
 
 /// Percent-encode a value for use as a single `@httpLabel` path segment, which is
 /// what an SDK does: a non-greedy label may not carry a raw `/`.
-fn label(value: &str) -> String {
+pub(crate) fn label(value: &str) -> String {
     value.replace('/', "%2F")
 }
 
@@ -122,7 +130,7 @@ async fn create(em: &Emulator, body: &Value) -> (u16, Value) {
 }
 
 /// Create a contact that must succeed, returning its ARN.
-async fn create_ok(em: &Emulator, name: &str, address: &str) -> String {
+pub(crate) async fn create_ok(em: &Emulator, name: &str, address: &str) -> String {
     let (status, body) = create(em, &json!({ "name": name, "emailAddress": address })).await;
     assert_eq!(
         status, 201,
@@ -134,12 +142,12 @@ async fn create_ok(em: &Emulator, name: &str, address: &str) -> String {
         .to_string()
 }
 
-async fn get(em: &Emulator, arn: &str) -> (u16, Value) {
+pub(crate) async fn get(em: &Emulator, arn: &str) -> (u16, Value) {
     call(em, "GET", &format!("/emailcontacts/{}", label(arn)), None).await
 }
 
 /// The `emailContact` structure a successful Get reported.
-async fn get_ok(em: &Emulator, arn: &str) -> Value {
+pub(crate) async fn get_ok(em: &Emulator, arn: &str) -> Value {
     let (status, body) = get(em, arn).await;
     assert_eq!(
         status, 200,
@@ -150,7 +158,7 @@ async fn get_ok(em: &Emulator, arn: &str) -> Value {
         .unwrap_or_else(|| panic!("GetEmailContact must return emailContact, got {body:?}"))
 }
 
-async fn send_code(em: &Emulator, arn: &str) -> (u16, Value) {
+pub(crate) async fn send_code(em: &Emulator, arn: &str) -> (u16, Value) {
     call(
         em,
         "POST",
@@ -160,7 +168,7 @@ async fn send_code(em: &Emulator, arn: &str) -> (u16, Value) {
     .await
 }
 
-async fn activate(em: &Emulator, arn: &str, code: &str) -> (u16, Value) {
+pub(crate) async fn activate(em: &Emulator, arn: &str, code: &str) -> (u16, Value) {
     call(
         em,
         "PUT",
@@ -174,7 +182,7 @@ async fn delete(em: &Emulator, arn: &str) -> (u16, Value) {
     call(em, "DELETE", &format!("/emailcontacts/{}", label(arn)), None).await
 }
 
-async fn list(em: &Emulator, query: &str) -> (u16, Value) {
+pub(crate) async fn list(em: &Emulator, query: &str) -> (u16, Value) {
     let uri = if query.is_empty() {
         "/emailcontacts".to_string()
     } else {
@@ -185,7 +193,7 @@ async fn list(em: &Emulator, query: &str) -> (u16, Value) {
 
 /// The activation code the store currently holds for `arn`, which is the only place
 /// it exists: the real service mails it to the contact's address.
-fn issued_code(em: &Emulator, arn: &str) -> Option<String> {
+pub(crate) fn issued_code(em: &Emulator, arn: &str) -> Option<String> {
     state::service_state(&*em.engine)
         .expect("the emulator's own engine must expose this service's store")
         .lock()
@@ -227,25 +235,20 @@ fn arn_is_well_formed(arn: &str) -> bool {
 
 /// A `date-time` timestamp as epoch milliseconds, so two of them can be ordered.
 ///
-/// `CreationTime`/`UpdateTime` carry `@timestampFormat("date-time")` on their target
-/// shapes, which this framework's schema codegen does not propagate onto the member,
-/// so restJson1 renders them in its default epoch-seconds form. Both encodings are
-/// accepted here: what this suite asserts is the ordering and the identity of the
-/// instants the store reports, not the encoding the framework chooses for them.
-fn as_millis(contact: &Value, member: &str) -> i64 {
+/// `EmailContact$creationTime`/`$updateTime` carry `@timestampFormat("date-time")`, so
+/// the only wire form either of them takes is an RFC 3339 STRING — anything else is a
+/// defect, and `email_contact_timestamp_wire_form.rs` is the suite that owns that rule.
+pub(crate) fn as_millis(contact: &Value, member: &str) -> i64 {
     match contact.get(member) {
         Some(Value::String(text)) => {
             let parsed = DateTime::from_str(text, Format::DateTime)
                 .unwrap_or_else(|e| panic!("{member} {text:?} must parse as a date-time: {e}"));
             parsed.to_millis().expect("a representable instant")
         }
-        Some(Value::Number(seconds)) => {
-            let seconds = seconds
-                .as_f64()
-                .unwrap_or_else(|| panic!("{member} must be a number of seconds, got {contact:?}"));
-            (seconds * 1000.0).round() as i64
-        }
-        other => panic!("{member} must be a timestamp, got {other:?} in {contact:?}"),
+        other => panic!(
+            "{member} is modelled @timestampFormat(\"date-time\"), so it must be an RFC 3339 \
+             string, got {other:?} in {contact:?}"
+        ),
     }
 }
 
