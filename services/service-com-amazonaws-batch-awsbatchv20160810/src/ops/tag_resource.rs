@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Associates tags with the resource `resourceArn` names: the request's entries are
+//! MERGED over the tags that resource already holds, so a key the request carries is
+//! replaced and every other key is left alone ("If existing tags on a resource aren't
+//! specified in the request parameters, they aren't changed"). The tags live on the
+//! resource's own record in [`crate::state`] — the map `ListTagsForResource` reports and
+//! every `Describe*` reader already reports, so there is no second copy.
+//!
+//! An ARN this service holds no resource for is refused with the modelled
+//! `ClientException` (HTTP 400), as is a merge that would leave one resource holding more
+//! tags than `TagrisTagsMap` can carry
+//! ([`crate::state::limits::MAX_TAGS_PER_RESOURCE`]), and a tag key or value outside the
+//! bounds that shape declares ([`crate::state::validate_tags`] — the boundary walk
+//! enforces the map's own length but does not reach the shapes inside it).
 //!
 //! ## Shape of an operation
 //!
@@ -147,18 +152,50 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        use crate::state as batch;
+
+        let _ = ctx;
+        // The bounds the model declares for a tag KEY and a tag VALUE, which the
+        // boundary walk does not reach inside a map: refused here rather than stored.
+        if let Err(detail) = batch::validate_tags(&input.tags) {
+            return Err(
+                TagResourceErrorModeled::ClientException(batch::client_exception(detail)).into(),
+            );
+        }
+        let Some(state) = batch::service_state(&*self.engine) else {
+            return Err(
+                TagResourceErrorModeled::ServerException(batch::unreachable_state()).into(),
+            );
+        };
+        let now = batch::now_millis();
+        let mut state = state.lock();
+        // Everything the clock already owes first, so an ARN whose resource the clock
+        // has already removed (a deleted queue, an evicted terminal job) is refused
+        // rather than tagged.
+        state.materialize_due(now);
+
+        let Some(tags) = state.resource_tags_mut(&input.resource_arn) else {
+            return Err(TagResourceErrorModeled::ClientException(batch::not_found_exception(
+                "Resource",
+                &input.resource_arn,
+            ))
+            .into());
+        };
+
+        // The merge, computed before anything is stored: a key the resource already
+        // holds is REPLACED (so it does not count twice towards the ceiling) and every
+        // key the request does not name is left exactly as it was.
+        let mut merged = tags.clone().unwrap_or_default();
+        merged.extend(input.tags);
+        if merged.len() > batch::limits::MAX_TAGS_PER_RESOURCE {
+            let requested = merged.len();
+            return Err(TagResourceErrorModeled::ClientException(batch::client_exception(
+                batch::tag_limit_message(&input.resource_arn, requested),
+            ))
+            .into());
+        }
+        *tags = Some(merged);
+
+        Ok(TagResourceOutput {})
     }
 }

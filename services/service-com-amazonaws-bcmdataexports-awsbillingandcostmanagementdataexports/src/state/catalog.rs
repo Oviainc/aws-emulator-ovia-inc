@@ -36,7 +36,18 @@
 //!
 //! A schema that SUPERSEDES another (FOCUS 1.2 over FOCUS 1.0) publishes its own text for
 //! the columns its specification re-words, and the superseded schema keeps the text it
-//! was published with: see [`ColumnGroup::Revised`].
+//! was published with: see [`ColumnGroup::Revised`]. So the catalog is keyed per table AND
+//! per table VERSION — one entry per version, never one entry serving two versions, which
+//! would make the two versions' column semantics indistinguishable to a client reading the
+//! catalog to tell them apart.
+//!
+//! A table that is a VIEW over another publishes its own curated columns AND the columns
+//! it carries over from the viewed table under the viewed table's names: see
+//! [`ColumnGroup::View`]. A column the viewing table carries over is named out of the
+//! viewed group rather than copied, so one column is described once. A column the
+//! dictionary publishes for a table and the catalog omits is a column a client cannot
+//! discover or ask for in an export definition, so the column SET is part of the
+//! published data just as the text is.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -623,17 +634,20 @@ const CARBON_EMISSIONS_COLUMNS: &[ColumnSpec] = &[
     col(
         "product_code",
         STRING,
-        "The code of the AWS service that is associated with the carbon footprint value.",
+        "The code of the product measured. For example, Amazon EC2 is the product code for Amazon Elastic Compute Cloud.",
     ),
+    // The Region the usage originated in, published as a code and — in `location` — as the
+    // human-readable place that code stands for, which is why `location` names
+    // `region_code` in its own text.
     col(
         "region_code",
         STRING,
-        "A Region is a physical location around the world where data centers are clustered. AWS calls each group of logical data centers an Availability Zone. Each AWS Region consists of a minimum of three, isolated, and physically separate AZs within a geographic area.",
+        "Describes the Region code where the usage originated from.",
     ),
     col(
         "location",
         STRING,
-        "The location that is associated with the carbon footprint value.",
+        "Describes the human-readable location where the usage originated from, corresponding to the region_code.",
     ),
     // The emissions MEASURES. Each one is reported as a value and the unit that value is
     // measured in, rather than as a single column in an assumed unit: the table publishes
@@ -861,15 +875,17 @@ const COST_AND_USAGE_REPORT_COLUMNS: &[ColumnSpec] = &[
         STRING,
         "The type of tax that AWS applied to this line item.",
     ),
+    // The unblended pair, worded as the dictionary words the blended pair above: the rate
+    // an individual account is charged, and that rate times the usage.
     col(
         "line_item_unblended_cost",
         NUMBER,
-        "The unblended rate multiplied by the usage amount.",
+        "The UnblendedCost is the UnblendedRate multiplied by the UsageAmount.",
     ),
     col(
         "line_item_unblended_rate",
         STRING,
-        "The uncombined rate for specific usage.",
+        "In consolidated billing for accounts using Reserved Instances, the UnblendedRate is the rate associated with an individual account's service usage.",
     ),
     col(
         "line_item_usage_account_id",
@@ -884,7 +900,7 @@ const COST_AND_USAGE_REPORT_COLUMNS: &[ColumnSpec] = &[
     col(
         "line_item_usage_amount",
         NUMBER,
-        "The amount of usage that you incurred during the specified time period.",
+        "The amount of usage that you incurred during the specified time period. For size-flexible Reserved Instances, use the reservation_total_reserved_units column instead. Certain subscription charges will have a UsageAmount of 0.",
     ),
     col(
         "line_item_usage_end_date",
@@ -1416,10 +1432,14 @@ const COST_OPTIMIZATION_RECOMMENDATIONS_COLUMNS: &[ColumnSpec] = &[
         STRING,
         "The type of the current resource.",
     ),
+    // Both estimated monthly COST columns report the CURRENT resource's cost — before and
+    // after discounts — and it is the estimated monthly SAVINGS columns that report what
+    // the recommended resource would change. Attributing the after-discount cost to the
+    // recommended resource inverts what the column means.
     col(
         "estimated_monthly_cost_after_discount",
         DOUBLE,
-        "The estimated monthly cost of the recommended resource after discounts. For Reserved Instances and Savings Plans, it refers to the cost for eligible usage.",
+        "The estimated monthly cost of the current resource after discounts. For Reserved Instances and Savings Plans, it refers to the cost for eligible usage.",
     ),
     col(
         "estimated_monthly_cost_before_discount",
@@ -1544,12 +1564,12 @@ const FOCUS_1_0_COLUMNS: &[ColumnSpec] = &[
     col(
         "BillingPeriodEnd",
         TIMESTAMP,
-        "Represents the exclusive end date and time of a billing period.",
+        "The exclusive end date and time of a billing period.",
     ),
     col(
         "BillingPeriodStart",
         TIMESTAMP,
-        "Represents the inclusive start date and time of a billing period.",
+        "The inclusive start date and time of a billing period.",
     ),
     col(
         "ChargeCategory",
@@ -1574,12 +1594,12 @@ const FOCUS_1_0_COLUMNS: &[ColumnSpec] = &[
     col(
         "ChargePeriodEnd",
         TIMESTAMP,
-        "Represents the exclusive end date and time of a charge period.",
+        "The exclusive end date and time of a charge period.",
     ),
     col(
         "ChargePeriodStart",
         TIMESTAMP,
-        "Represents the inclusive start date and time within a charge period.",
+        "The inclusive start date and time of a charge period.",
     ),
     col(
         "CommitmentDiscountCategory",
@@ -1629,7 +1649,7 @@ const FOCUS_1_0_COLUMNS: &[ColumnSpec] = &[
     col(
         "EffectiveCost",
         NUMBER,
-        "The amortized cost of the charge after applying all reduced rates, discounts, and the applicable portion of relevant, prepaid purchases (one-time or recurring) that covered this charge.",
+        "Cost inclusive of the impacts of all reduced rates and discounts, augmented with the amortization of relevant purchases (one-time or recurring) paid to cover future eligible charges.",
     ),
     col(
         "InvoiceIssuerName",
@@ -1737,7 +1757,25 @@ const FOCUS_1_0_COLUMNS: &[ColumnSpec] = &[
 /// [`ColumnGroup::Revised`] when the FOCUS 1.2 schema carries those columns forward. The
 /// FOCUS 1.0 tables keep the text they were published with, so the same column name
 /// carries different published text in the two schemas.
+///
+/// Two re-wordings run right through the 1.2 revision of the 1.0 columns, so they are
+/// applied to every column they touch rather than only to the ones a report cited:
+///
+/// * a period's limits are published as its BOUNDS ("the exclusive end bound of a billing
+///   period") rather than as a date and time, for each of the billing and charge period
+///   bounds; and
+/// * the discount a commitment buys is a "commitment discount" rather than a
+///   "commitment-based discount", for every column of the commitment-discount family and
+///   for the contracted unit price, which excludes those discounts by name.
 const FOCUS_1_2_REVISED_DESCRIPTIONS: &[(&str, &str)] = &[
+    (
+        "BillingPeriodEnd",
+        "The exclusive end bound of a billing period.",
+    ),
+    (
+        "BillingPeriodStart",
+        "The inclusive start bound of a billing period.",
+    ),
     (
         "ChargeCategory",
         "Represents the highest-level classification of a charge based on the nature of how it is billed.",
@@ -1746,9 +1784,47 @@ const FOCUS_1_2_REVISED_DESCRIPTIONS: &[(&str, &str)] = &[
         "ChargeClass",
         "Indicates whether the row represents a correction to a previously invoiced billing period.",
     ),
+    (
+        "ChargePeriodEnd",
+        "The exclusive end bound of a charge period.",
+    ),
+    (
+        "ChargePeriodStart",
+        "The inclusive start bound of a charge period.",
+    ),
+    (
+        "CommitmentDiscountCategory",
+        "Indicates whether the commitment discount identified in the CommitmentDiscountId column is based on usage quantity or cost (aka \"spend\").",
+    ),
+    (
+        "CommitmentDiscountId",
+        "The identifier assigned to a commitment discount by the provider.",
+    ),
+    (
+        "CommitmentDiscountName",
+        "The display name assigned to a commitment discount.",
+    ),
+    (
+        "CommitmentDiscountStatus",
+        "Indicates whether the charge corresponds with the consumption of a commitment discount or the unused portion of the committed amount.",
+    ),
+    (
+        "CommitmentDiscountType",
+        "A provider-assigned identifier for the type of commitment discount applied to the row.",
+    ),
+    (
+        "ContractedUnitPrice",
+        "The agreed-upon unit price for a single Pricing Unit of the associated SKU, inclusive of negotiated discounts, if present, while excluding negotiated commitment discounts or any other discounts.",
+    ),
+    (
+        "EffectiveCost",
+        "The amortized cost of the charge after applying all reduced rates, discounts, and the applicable portion of relevant, prepaid purchases (one-time or recurring) that covered this charge.",
+    ),
 ];
 
-/// The columns FOCUS 1.2 adds to the FOCUS 1.0 schema, in the dictionary's order.
+/// The columns FOCUS 1.2 adds to the FOCUS 1.0 schema, in the dictionary's order. The
+/// commitment-discount columns here are 1.2's own, so they are worded the way 1.2 words
+/// that family throughout (see [`FOCUS_1_2_REVISED_DESCRIPTIONS`]).
 const FOCUS_1_2_ADDED_COLUMNS: &[ColumnSpec] = &[
     col(
         "BillingAccountType",
@@ -1768,12 +1844,12 @@ const FOCUS_1_2_ADDED_COLUMNS: &[ColumnSpec] = &[
     col(
         "CommitmentDiscountQuantity",
         NUMBER,
-        "The amount of a commitment-based discount purchased or accounted for in commitment-based discount related rows.",
+        "The amount of a commitment discount purchased or accounted for in commitment discount related rows.",
     ),
     col(
         "CommitmentDiscountUnit",
         STRING,
-        "The provider-specified measurement unit indicating the quantity of units of a commitment-based discount purchased or accounted for in commitment-based discount related rows.",
+        "The provider-specified measurement unit indicating the quantity of units of a commitment discount purchased or accounted for in commitment discount related rows.",
     ),
     col(
         "InvoiceId",
@@ -1868,10 +1944,12 @@ const COST_AND_USAGE_DASHBOARD_DESCRIPTION: &str = "A view over CUR for CostAndU
 
 /// The columns `COST_AND_USAGE_DASHBOARD` publishes, in the dictionary's order: the
 /// dimensions and measures the view aggregates the underlying cost and usage line items
-/// into, and nothing else. The view is a CURATED schema — it does not re-publish the
-/// cost and usage table's own `bill_*`/`line_item_*`/`pricing_*`/`product_*`/
-/// `reservation_*`/`savings_plan_*` columns, because a client selecting from this table
-/// selects from these aggregate columns.
+/// into. The view is a CURATED schema — it does not re-publish the cost and usage table's
+/// own `bill_*`/`line_item_*`/`reservation_*`/`savings_plan_*` columns, because a client
+/// selecting from this table selects from these aggregate columns — but it does carry a
+/// few of the viewed table's columns over under their own names, and those are named out
+/// of the viewed group rather than copied here: see
+/// [`COST_AND_USAGE_DASHBOARD_VIEWED_COLUMNS`].
 const COST_AND_USAGE_DASHBOARD_COLUMNS: &[ColumnSpec] = &[
     col(
         "billing_period",
@@ -2021,7 +2099,7 @@ const COST_AND_USAGE_DASHBOARD_COLUMNS: &[ColumnSpec] = &[
     col(
         "purchase_option",
         STRING,
-        "Whether your AWS usage is Reserved, On-Demand, or Spot.",
+        "The purchase option for this line item possible values are SavingsPLan, Reserved, Spot, and OnDemand.",
     ),
     col(
         "usage_quantity",
@@ -2033,10 +2111,12 @@ const COST_AND_USAGE_DASHBOARD_COLUMNS: &[ColumnSpec] = &[
         NUMBER,
         "The UnblendedRate multiplied by the UsageAmount.",
     ),
+    // The commitment a line item benefited from is a "Reservation" in this dictionary's
+    // words — the cost and usage dictionary's "Reserved Instance" is that dictionary's.
     col(
         "amortized_cost",
         NUMBER,
-        "The upfront and recurring costs of a reservation or Savings Plan, distributed across the term that they apply to.",
+        "The upfront and recurring costs of a Reservation or Savings Plan, distributed across the term that they apply to.",
     ),
     col(
         "public_cost",
@@ -2046,18 +2126,29 @@ const COST_AND_USAGE_DASHBOARD_COLUMNS: &[ColumnSpec] = &[
     col(
         "ri_sp_arn",
         STRING,
-        "The Amazon Resource Name (ARN) of the Reserved Instance or Savings Plan that this line item benefited from.",
+        "The Amazon Resource Name (ARN) of the Reservation or Savings Plan that this line item benefited from.",
     ),
     col(
         "ri_sp_trueup",
         NUMBER,
-        "The true-up charge for the Reserved Instance or Savings Plan that this line item benefited from.",
+        "The true-up charge for the Reservation or Savings Plan that this line item benefited from.",
     ),
     col(
         "ri_sp_upfront_fees",
         NUMBER,
-        "The upfront fees for the Reserved Instance or Savings Plan that this line item benefited from.",
+        "The upfront fees for the Reservation or Savings Plan that this line item benefited from.",
     ),
+];
+
+/// The columns `COST_AND_USAGE_DASHBOARD` carries over from the cost and usage table
+/// UNCHANGED, in the order the dictionary publishes them: the pricing unit the view's
+/// usage quantity is measured in, and the two ends of a data transfer. They keep the
+/// cost and usage name, so the view reports them exactly as the viewed table does rather
+/// than with a second description of the same column — see [`ColumnGroup::View`].
+const COST_AND_USAGE_DASHBOARD_VIEWED_COLUMNS: &[&str] = &[
+    "pricing_unit",
+    "product_from_location",
+    "product_to_location",
 ];
 
 /// Every table data exports publishes, ordered by name — the one catalog `GetTable`
@@ -2074,8 +2165,15 @@ pub const TABLE_CATALOG: &[TableSpec] = &[
         description: COST_AND_USAGE_DASHBOARD_DESCRIPTION,
         properties: BILLING_VIEW_ONLY_PROPERTIES,
         // A curated VIEW over the cost and usage data: the aggregate dimensions and
-        // measures it publishes, and only those.
-        column_groups: &[ColumnGroup::Own(COST_AND_USAGE_DASHBOARD_COLUMNS)],
+        // measures it publishes, plus the columns it carries over from the viewed table
+        // under the viewed table's own names.
+        column_groups: &[
+            ColumnGroup::Own(COST_AND_USAGE_DASHBOARD_COLUMNS),
+            ColumnGroup::View {
+                of: COST_AND_USAGE_REPORT_COLUMNS,
+                columns: COST_AND_USAGE_DASHBOARD_VIEWED_COLUMNS,
+            },
+        ],
     },
     TableSpec {
         name: "COST_AND_USAGE_REPORT",

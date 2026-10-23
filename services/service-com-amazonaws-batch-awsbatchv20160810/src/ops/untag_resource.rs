@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UntagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UntagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UntagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Deletes the tags `tagKeys` names from the resource `resourceArn` names, on the SAME
+//! stored tag map `TagResource` writes and `ListTagsForResource` reports. A key the
+//! resource does not hold is removed vacuously — the request asks for an absence and
+//! gets it — so repeating an untag answers the same success and changes nothing.
+//!
+//! An ARN this service holds no resource for is refused with the modelled
+//! `ClientException` (HTTP 400), exactly as `TagResource` refuses it, as is a `tagKeys`
+//! entry outside the bounds `TagKey` declares ([`crate::state::validate_tag_keys`]).
 //!
 //! ## Shape of an operation
 //!
@@ -139,18 +139,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UntagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UntagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UntagResource"))
+        use crate::state as batch;
+
+        let _ = ctx;
+        // The bound the model declares for a tag KEY, as in `TagResource`: a key outside
+        // it names nothing this service could have stored.
+        if let Err(detail) = batch::validate_tag_keys(&input.tag_keys) {
+            return Err(
+                UntagResourceErrorModeled::ClientException(batch::client_exception(detail)).into(),
+            );
+        }
+        let Some(state) = batch::service_state(&*self.engine) else {
+            return Err(
+                UntagResourceErrorModeled::ServerException(batch::unreachable_state()).into(),
+            );
+        };
+        let now = batch::now_millis();
+        let mut state = state.lock();
+        // As in `TagResource`: what the clock owes is materialised first, so an ARN whose
+        // resource is already gone is refused rather than written to.
+        state.materialize_due(now);
+
+        let Some(tags) = state.resource_tags_mut(&input.resource_arn) else {
+            return Err(UntagResourceErrorModeled::ClientException(
+                batch::not_found_exception("Resource", &input.resource_arn),
+            )
+            .into());
+        };
+
+        if let Some(held) = tags.as_mut() {
+            for key in &input.tag_keys {
+                held.remove(key);
+            }
+            // A resource holding no tag at all carries NO tag map: `TagrisTagsMap` is
+            // `@length(min: 1)`, so an emptied map is stored as absent — the state a
+            // resource nobody ever tagged is in.
+            if held.is_empty() {
+                *tags = None;
+            }
+        }
+
+        Ok(UntagResourceOutput {})
     }
 }

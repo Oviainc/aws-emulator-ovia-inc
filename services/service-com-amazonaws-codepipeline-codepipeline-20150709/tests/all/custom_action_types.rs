@@ -42,7 +42,7 @@ const PROPERTY_TYPES: [&str; 3] = ["String", "Number", "Boolean"];
 /// The owner a custom action type carries: `ActionTypeId$owner` is an `ActionOwner`
 /// (`AWS`, `ThirdParty`, `Custom`) and `CreateCustomActionType` "creates a new custom
 /// action".
-const CUSTOM: &str = "Custom";
+pub(crate) const CUSTOM: &str = "Custom";
 
 /// The Region `Emulator::call` signs for, so a listing in it sees what those creates
 /// registered.
@@ -146,7 +146,10 @@ pub(crate) fn contains(expected: &Value, actual: &Value) -> bool {
 
 /// The `(category, provider, version)` identity of a listed action type, which is
 /// also its key beside the owner.
-fn identity(action_type: &Value) -> String {
+///
+/// `pub(crate)` so the other suites of this target name a listed action type the same
+/// way; see `tests/all/delete_custom_action_type.rs`.
+pub(crate) fn identity(action_type: &Value) -> String {
     let id = &action_type["id"];
     let member = |name: &str| {
         id.get(name)
@@ -162,15 +165,16 @@ fn identity(action_type: &Value) -> String {
     )
 }
 
-/// Every `Custom`-owned action type the store holds in `region`, paged to the end.
+/// Every action type the listing reports for `owner` in `region`, paged to the end.
 ///
 /// The owner filter is what separates the account's own registrations from the
-/// catalog the service provides itself (pinned in `action_type_catalog.rs`).
-async fn registered_in(emulator: &Emulator, region: &str) -> Vec<Value> {
+/// catalog the service provides itself (pinned in `action_type_catalog.rs`), so a
+/// caller picks which of the two it is asking about.
+pub(crate) async fn listed_in(emulator: &Emulator, owner: &str, region: &str) -> Vec<Value> {
     let mut all = Vec::new();
     let mut token: Option<String> = None;
     loop {
-        let mut body = json!({"actionOwnerFilter": CUSTOM, "regionFilter": region});
+        let mut body = json!({"actionOwnerFilter": owner, "regionFilter": region});
         if let Some(token) = &token {
             body["nextToken"] = json!(token);
         }
@@ -182,7 +186,7 @@ async fn registered_in(emulator: &Emulator, region: &str) -> Vec<Value> {
             .clone();
         for action_type in &page {
             assert_eq!(
-                action_type["id"]["owner"], CUSTOM,
+                action_type["id"]["owner"], json!(owner),
                 "an owner-filtered listing reports only that owner, got {action_type}"
             );
         }
@@ -198,7 +202,7 @@ async fn registered_in(emulator: &Emulator, region: &str) -> Vec<Value> {
 /// Every action type this account registered in the Region the creates were signed
 /// for.
 async fn registered(emulator: &Emulator) -> Vec<Value> {
-    registered_in(emulator, DEFAULT_REGION).await
+    listed_in(emulator, CUSTOM, DEFAULT_REGION).await
 }
 
 /// One create request, and the member absences its answer must also show.
@@ -645,7 +649,7 @@ async fn a_created_action_type_belongs_to_the_region_its_request_was_signed_for(
         ("another Region one was created in", "ap-southeast-4", 1),
         ("a Region nothing was created in", "me-central-1", 0),
     ] {
-        let listed = registered_in(&emulator, region).await;
+        let listed = listed_in(&emulator, CUSTOM, region).await;
         assert_eq!(
             listed.len(),
             expected,
