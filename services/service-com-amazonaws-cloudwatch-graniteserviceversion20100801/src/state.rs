@@ -22,7 +22,12 @@
 use std::collections::{BTreeMap, HashMap};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::ops::types::{AlarmHistoryItem, Dimension, GetMetricStreamOutput, MetricAlarm, Tag};
+use ::serde_json::{Map, Value};
+
+use crate::ops::types::{
+    ActionConfiguration, AlarmHistoryItem, Dimension, EvaluationCriteria, EvaluationWindow,
+    GetMetricStreamOutput, MetricAlarm, MetricDataQuery, Tag,
+};
 
 /// A dimension set, normalised: dimension name to value, ordered by name, so the same set
 /// keys the same time series whatever order a request listed it in.
@@ -452,3 +457,427 @@ fn newest_sequence(history: &[StoredHistoryItem]) -> u64 {
 /// modelled limit error.
 #[derive(Debug, Clone, Copy)]
 pub struct AtCapacity;
+
+// ---------------------------------------------------------------------------
+// Alarm history documents (`AlarmHistoryItem$HistoryData`)
+// ---------------------------------------------------------------------------
+//
+// Every history item an alarm writer records carries `HistoryData`: "Data about the alarm, in
+// JSON format." (`smithy_query(query="shape",shape="AlarmHistoryItem")`), a `HistoryData`
+// string with `@length 1..4095`. It is the JSON record of the change the item reports, so it
+// is built HERE, from the alarm as the store holds it before and after the write, and shared
+// by every writer — one definition, so two writers cannot record two different shapes of
+// document.
+
+/// The modelled maximum length of one history document: `AlarmHistoryItem$HistoryData` targets
+/// `HistoryData`, a string with `@length 1..4095`.
+pub const MAX_HISTORY_DATA_LEN: usize = 4095;
+
+/// The schema version every history document this service records declares, so a consumer can
+/// tell which layout it is reading.
+const HISTORY_DATA_VERSION: &str = "1.0";
+
+/// A history document's `type` for an alarm the call CREATED.
+const CONFIGURATION_CREATE: &str = "Create";
+
+/// A history document's `type` for an alarm the call OVERWROTE.
+const CONFIGURATION_UPDATE: &str = "Update";
+
+/// The JSON record of a state transition: the alarm's state before and after the write.
+///
+/// A consumer of alarm history reads the state a transition moved the alarm to out of this
+/// document (`HistoryData` → `newState` → `stateValue`), which is why both states are named
+/// rather than only the reason text the summary already carries.
+pub fn state_update_history_data(previous: &MetricAlarm, updated: &MetricAlarm) -> String {
+    // `StateReasonData` is itself up to 4000 characters, so two of them need not fit the
+    // modelled bound: the second candidate is the same document without them, which always
+    // does (a state value plus two reasons of at most 1023 each).
+    bounded_history_data(&[
+        transition_document(previous, updated, true),
+        transition_document(previous, updated, false),
+    ])
+}
+
+/// The JSON record of a configuration write: the alarm the call stored, and the configuration
+/// it replaced when the call overwrote an alarm that already existed.
+pub fn configuration_update_history_data(
+    previous: Option<&MetricAlarm>,
+    updated: &MetricAlarm,
+) -> String {
+    let (kind, stored_member) = match previous {
+        Some(_) => (CONFIGURATION_UPDATE, "updatedAlarm"),
+        None => (CONFIGURATION_CREATE, "createdAlarm"),
+    };
+    let heading = |document: Value| -> Value {
+        Value::Object(
+            [
+                ("version".to_string(), Value::from(HISTORY_DATA_VERSION)),
+                ("type".to_string(), Value::from(kind)),
+                (stored_member.to_string(), document),
+            ]
+            .into_iter()
+            .collect(),
+        )
+    };
+    // An alarm's configuration is itself unbounded in the modelled sense (up to 20 metric
+    // queries, each with an expression of up to 2048 characters), so the candidates drop
+    // fidelity in order: both configurations, then only the stored one, then the name of the
+    // alarm the item already belongs to — which always fits.
+    let mut full = heading(alarm_configuration_document(updated));
+    if let (Some(previous), Value::Object(members)) = (previous, &mut full) {
+        members.insert(
+            "originalAlarm".to_string(),
+            alarm_configuration_document(previous),
+        );
+    }
+    bounded_history_data(&[
+        full,
+        heading(alarm_configuration_document(updated)),
+        heading(Value::Object(
+            [(
+                "alarmName".to_string(),
+                Value::from(updated.alarm_name.clone()),
+            )]
+            .into_iter()
+            .collect(),
+        )),
+    ])
+}
+
+/// One state-transition document, with or without the (potentially long) reason data.
+fn transition_document(previous: &MetricAlarm, updated: &MetricAlarm, reason_data: bool) -> Value {
+    Value::Object(
+        [
+            ("version".to_string(), Value::from(HISTORY_DATA_VERSION)),
+            (
+                "oldState".to_string(),
+                alarm_state_document(previous, reason_data),
+            ),
+            (
+                "newState".to_string(),
+                alarm_state_document(updated, reason_data),
+            ),
+        ]
+        .into_iter()
+        .collect(),
+    )
+}
+
+/// One alarm state as a transition document records it.
+///
+/// `stateReasonData` is itself JSON ("The reason that this alarm is set to this specific state,
+/// in JSON format." — `MetricAlarm$StateReasonData`), so it is embedded as JSON rather than as
+/// a quoted string whenever it parses as JSON.
+fn alarm_state_document(alarm: &MetricAlarm, reason_data: bool) -> Value {
+    let mut state = Map::new();
+    insert_member(&mut state, "stateValue", json_text(&alarm.state_value));
+    insert_member(&mut state, "stateReason", json_text(&alarm.state_reason));
+    if reason_data {
+        insert_member(
+            &mut state,
+            "stateReasonData",
+            alarm.state_reason_data.as_deref().map(embedded_json),
+        );
+    }
+    Value::Object(state)
+}
+
+/// An alarm's configuration as a history document records it: every configuration member the
+/// alarm carries, under the model's member name in lower camel case, and only those it carries
+/// — a member the alarm does not have is absent from the document, exactly as it is absent
+/// from the alarm. The state members are NOT part of it: "When you update an existing alarm,
+/// its state is left unchanged" (`PutMetricAlarm`), so a configuration write records no state.
+fn alarm_configuration_document(alarm: &MetricAlarm) -> Value {
+    let mut config = Map::new();
+    insert_member(&mut config, "alarmName", json_text(&alarm.alarm_name));
+    insert_member(&mut config, "alarmArn", json_text(&alarm.alarm_arn));
+    insert_member(
+        &mut config,
+        "alarmDescription",
+        json_text(&alarm.alarm_description),
+    );
+    insert_member(
+        &mut config,
+        "actionsEnabled",
+        alarm.actions_enabled.map(Value::from),
+    );
+    insert_member(&mut config, "okActions", json_strings(&alarm.ok_actions));
+    insert_member(
+        &mut config,
+        "alarmActions",
+        json_strings(&alarm.alarm_actions),
+    );
+    insert_member(
+        &mut config,
+        "insufficientDataActions",
+        json_strings(&alarm.insufficient_data_actions),
+    );
+    insert_member(&mut config, "namespace", json_text(&alarm.namespace));
+    insert_member(&mut config, "metricName", json_text(&alarm.metric_name));
+    insert_member(&mut config, "statistic", json_text(&alarm.statistic));
+    insert_member(
+        &mut config,
+        "extendedStatistic",
+        json_text(&alarm.extended_statistic),
+    );
+    insert_member(
+        &mut config,
+        "dimensions",
+        alarm.dimensions.as_deref().map(dimensions_document),
+    );
+    insert_member(&mut config, "period", alarm.period.map(Value::from));
+    insert_member(&mut config, "unit", json_text(&alarm.unit));
+    insert_member(
+        &mut config,
+        "evaluationPeriods",
+        alarm.evaluation_periods.map(Value::from),
+    );
+    insert_member(
+        &mut config,
+        "datapointsToAlarm",
+        alarm.datapoints_to_alarm.map(Value::from),
+    );
+    insert_member(&mut config, "threshold", alarm.threshold.map(Value::from));
+    insert_member(
+        &mut config,
+        "comparisonOperator",
+        json_text(&alarm.comparison_operator),
+    );
+    insert_member(
+        &mut config,
+        "treatMissingData",
+        json_text(&alarm.treat_missing_data),
+    );
+    insert_member(
+        &mut config,
+        "evaluateLowSampleCountPercentile",
+        json_text(&alarm.evaluate_low_sample_count_percentile),
+    );
+    insert_member(
+        &mut config,
+        "thresholdMetricId",
+        json_text(&alarm.threshold_metric_id),
+    );
+    insert_member(
+        &mut config,
+        "metrics",
+        alarm.metrics.as_deref().map(|queries| {
+            Value::Array(queries.iter().map(metric_query_document).collect())
+        }),
+    );
+    insert_member(
+        &mut config,
+        "evaluationInterval",
+        alarm.evaluation_interval.map(Value::from),
+    );
+    insert_member(
+        &mut config,
+        "evaluationWindow",
+        alarm.evaluation_window.as_ref().map(evaluation_window_document),
+    );
+    insert_member(
+        &mut config,
+        "warmUpConfiguration",
+        alarm.warm_up_configuration.as_ref().map(|warm_up| {
+            let mut document = Map::new();
+            document.insert(
+                "warmUpPeriodDurationInMinutes".to_string(),
+                Value::from(warm_up.warm_up_period_duration_in_minutes),
+            );
+            insert_member(
+                &mut document,
+                "onlyStartEvaluatingAfterWarmUpPeriodEnds",
+                warm_up
+                    .only_start_evaluating_after_warm_up_period_ends
+                    .map(Value::from),
+            );
+            Value::Object(document)
+        }),
+    );
+    insert_member(
+        &mut config,
+        "evaluationCriteria",
+        alarm
+            .evaluation_criteria
+            .as_ref()
+            .map(evaluation_criteria_document),
+    );
+    insert_member(
+        &mut config,
+        "actionConfiguration",
+        alarm
+            .action_configuration
+            .as_ref()
+            .map(action_configuration_document),
+    );
+    Value::Object(config)
+}
+
+/// A dimension list as a history document records it.
+fn dimensions_document(dimensions: &[Dimension]) -> Value {
+    Value::Array(
+        dimensions
+            .iter()
+            .map(|dimension| {
+                Value::Object(
+                    [
+                        ("name".to_string(), Value::from(dimension.name.clone())),
+                        ("value".to_string(), Value::from(dimension.value.clone())),
+                    ]
+                    .into_iter()
+                    .collect(),
+                )
+            })
+            .collect(),
+    )
+}
+
+/// One metric-math query of a `Metrics` alarm as a history document records it.
+fn metric_query_document(query: &MetricDataQuery) -> Value {
+    let mut document = Map::new();
+    document.insert("id".to_string(), Value::from(query.id.clone()));
+    insert_member(&mut document, "expression", json_text(&query.expression));
+    insert_member(&mut document, "label", json_text(&query.label));
+    insert_member(
+        &mut document,
+        "returnData",
+        query.return_data.map(Value::from),
+    );
+    insert_member(&mut document, "period", query.period.map(Value::from));
+    insert_member(&mut document, "accountId", json_text(&query.account_id));
+    insert_member(
+        &mut document,
+        "metricStat",
+        query.metric_stat.as_ref().map(|stat| {
+            let mut metric = Map::new();
+            insert_member(&mut metric, "namespace", json_text(&stat.metric.namespace));
+            insert_member(
+                &mut metric,
+                "metricName",
+                json_text(&stat.metric.metric_name),
+            );
+            insert_member(
+                &mut metric,
+                "dimensions",
+                stat.metric.dimensions.as_deref().map(dimensions_document),
+            );
+            let mut document = Map::new();
+            document.insert("metric".to_string(), Value::Object(metric));
+            document.insert("period".to_string(), Value::from(stat.period));
+            document.insert("stat".to_string(), Value::from(stat.stat.clone()));
+            insert_member(&mut document, "unit", json_text(&stat.unit));
+            Value::Object(document)
+        }),
+    );
+    Value::Object(document)
+}
+
+/// An `EvaluationWindow` union as a history document records it: the one member it carries.
+fn evaluation_window_document(window: &EvaluationWindow) -> Value {
+    let (member, document) = match window {
+        EvaluationWindow::WallClockWindow(wall_clock) => {
+            let mut inner = Map::new();
+            insert_member(&mut inner, "timezone", json_text(&wall_clock.timezone));
+            ("wallClockWindow", Value::Object(inner))
+        }
+        EvaluationWindow::SlidingWindow(_) => ("slidingWindow", Value::Object(Map::new())),
+    };
+    Value::Object([(member.to_string(), document)].into_iter().collect())
+}
+
+/// An `EvaluationCriteria` union as a history document records it.
+fn evaluation_criteria_document(criteria: &EvaluationCriteria) -> Value {
+    let EvaluationCriteria::PromQLCriteria(promql) = criteria;
+    let mut inner = Map::new();
+    inner.insert("query".to_string(), Value::from(promql.query.clone()));
+    insert_member(
+        &mut inner,
+        "pendingPeriod",
+        promql.pending_period.map(Value::from),
+    );
+    insert_member(
+        &mut inner,
+        "recoveryPeriod",
+        promql.recovery_period.map(Value::from),
+    );
+    Value::Object(
+        [("promQLCriteria".to_string(), Value::Object(inner))]
+            .into_iter()
+            .collect(),
+    )
+}
+
+/// An `ActionConfiguration` as a history document records it.
+fn action_configuration_document(configuration: &ActionConfiguration) -> Value {
+    let mut document = Map::new();
+    insert_member(
+        &mut document,
+        "alarmTagsPropagation",
+        configuration
+            .alarm_tags_propagation
+            .as_ref()
+            .map(|propagation| {
+                let mut inner = Map::new();
+                inner.insert("enabled".to_string(), Value::from(propagation.enabled));
+                insert_member(
+                    &mut inner,
+                    "includedTagKeys",
+                    json_strings(&propagation.included_tag_keys),
+                );
+                insert_member(
+                    &mut inner,
+                    "excludedTagKeys",
+                    json_strings(&propagation.excluded_tag_keys),
+                );
+                Value::Object(inner)
+            }),
+    );
+    Value::Object(document)
+}
+
+/// The first candidate whose rendering fits the modelled `HistoryData` length.
+///
+/// A document is JSON, so it can never be truncated to fit: a reader parses it. Dropping the
+/// longest part and re-rendering is what keeps it both parseable and inside
+/// [`MAX_HISTORY_DATA_LEN`]; the last candidate a caller passes is one that always fits, and
+/// the bare version object is the floor if even that one does not.
+fn bounded_history_data(candidates: &[Value]) -> String {
+    for candidate in candidates {
+        let rendered = candidate.to_string();
+        if (1..=MAX_HISTORY_DATA_LEN).contains(&rendered.len()) {
+            return rendered;
+        }
+    }
+    Value::Object(
+        [("version".to_string(), Value::from(HISTORY_DATA_VERSION))]
+            .into_iter()
+            .collect(),
+    )
+    .to_string()
+}
+
+/// Add `value` to a document under `member`, and nothing at all when there is no value.
+fn insert_member(document: &mut Map<String, Value>, member: &str, value: Option<Value>) {
+    if let Some(value) = value {
+        document.insert(member.to_string(), value);
+    }
+}
+
+/// An optional string member as a JSON string.
+fn json_text(value: &Option<String>) -> Option<Value> {
+    value.as_deref().map(Value::from)
+}
+
+/// An optional string list as a JSON array of strings.
+fn json_strings(values: &Option<Vec<String>>) -> Option<Value> {
+    values
+        .as_deref()
+        .map(|values| Value::Array(values.iter().map(|value| Value::from(value.as_str())).collect()))
+}
+
+/// A member whose stored value is itself JSON, embedded as JSON when it parses as JSON and as
+/// the string the writer stored when it does not — a caller may store anything in
+/// `StateReasonData`, and a history document has to stay parseable either way.
+fn embedded_json(raw: &str) -> Value {
+    ::serde_json::from_str(raw).unwrap_or_else(|_| Value::from(raw))
+}

@@ -189,6 +189,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // The state this call moves the alarm OUT of: a history item reports a transition, so
+        // the state before the write is as much a part of the record as the state after it.
+        let previous = stored.alarm.clone();
+
         // `StateTransitionedTimestamp` is "the time stamp of the last change to the alarm's
         // StateValue", so it only moves when the state value itself changes; the state
         // update itself always refreshes `StateUpdatedTimestamp`.
@@ -201,6 +205,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             stored.alarm.state_transitioned_timestamp = Some(crate::state::to_timestamp(now));
         }
 
+        // "Data about the alarm, in JSON format." (`AlarmHistoryItem$HistoryData`) — for a
+        // state update, the alarm's state before and after this write, read off the stored
+        // alarm rather than off the request.
+        let history_data = crate::state::state_update_history_data(&previous, &stored.alarm);
+        // "A summary of the alarm history, in text format." (`AlarmHistoryItem$HistorySummary`)
+        // — which state the alarm moved from and which it moved to.
+        let history_summary = format!(
+            "Alarm updated from {} to {}",
+            previous.state_value.as_deref().unwrap_or("INSUFFICIENT_DATA"),
+            input.state_value
+        );
+
         store.record_history(
             &input.alarm_name,
             now,
@@ -210,11 +226,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 alarm_type: Some("MetricAlarm".to_string()),
                 timestamp: Some(crate::state::to_timestamp(now)),
                 history_item_type: Some("StateUpdate".to_string()),
-                history_summary: Some(format!(
-                    "Alarm updated from state to {}",
-                    input.state_value
-                )),
-                history_data: input.state_reason_data.clone(),
+                history_summary: Some(history_summary),
+                history_data: Some(history_data),
                 alarm_contributor_attributes: None,
             },
         );
