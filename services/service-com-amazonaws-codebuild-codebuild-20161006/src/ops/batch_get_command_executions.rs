@@ -170,9 +170,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // `CommandExecutions` carries no `@length`, so an empty one is serialized
             // as `[]` — which is what a caller that asked only for unknown ids reads.
             command_executions: Some(command_executions),
-            // `commandExecutionsNotFound` targets `CommandExecutionIds`, bounded at
-            // 1..100 entries, so an empty one is left absent rather than `[]`.
-            command_executions_not_found: (!not_found.is_empty()).then_some(not_found),
+            // The other half of the same partition, serialized the same way: `[]` when
+            // every id resolved. The `@length(min: 1)` on `CommandExecutionIds` bounds
+            // what a request may carry, not whether the answer states its result.
+            command_executions_not_found: Some(not_found),
         })
     }
 }

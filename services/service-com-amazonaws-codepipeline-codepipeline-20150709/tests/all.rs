@@ -43,6 +43,8 @@ mod rule_executions;
 mod stage_transitions;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/third_party_job_failure_results.rs"]
+mod third_party_job_failure_results;
 #[path = "all/third_party_job_results.rs"]
 mod third_party_job_results;
 #[path = "all/third_party_jobs.rs"]

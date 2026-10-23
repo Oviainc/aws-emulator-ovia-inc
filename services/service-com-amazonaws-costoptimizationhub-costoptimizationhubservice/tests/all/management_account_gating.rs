@@ -3,34 +3,27 @@
 //! The organization gate, driven end-to-end over the wire (`awsJson1_0`)
 //! through the same multi-service router the emulator boots.
 //!
-//! The rule under test: a Cost Optimization Hub feature whose scope is the
+//! The rule under test: a Cost Optimization Hub READ whose scope is the
 //! organization's MEMBER accounts belongs to the organization's management
-//! account alone — writing the member-account discount-visibility preference,
-//! the savings-estimation mode that depends on it, and reading the enrollment
-//! or the recommendations of accounts other than the caller's. This emulator
-//! records no organization and so no management account
-//! (`state::organization_management_account_id`), so every such request is
-//! refused with the operation's own modelled error — HTTP 400
-//! `ValidationException` for a preference the account may not write, HTTP 403
-//! `AccessDeniedException` for a view it does not have
-//! (`smithy_query(query="operation", operation="UpdatePreferences,ListRecommendations,ListEnrollmentStatuses")`)
-//! — nothing is stored, and the same request without the organization-scoped
-//! member is served.
+//! account alone — the enrollment or the recommendations of accounts other than
+//! the caller's. This emulator records no organization and so no management
+//! account (`state::organization_management_account_id`), so every such request
+//! is refused with the operation's own modelled error — HTTP 403
+//! `AccessDeniedException` for a view the caller does not have
+//! (`smithy_query(query="operation", operation="ListRecommendations,ListEnrollmentStatuses")`)
+//! — and the same request without the organization-scoped member is served.
+//!
+//! The PREFERENCE writes are deliberately not here: the model declares no
+//! caller-scoped rule over `UpdatePreferences`' members, so none of them is
+//! refused (see `preference_writes`).
 //!
 //! Each rule is asserted over a table that spans the member's values, the
-//! members it is sent beside, and the operations that declare it; the request
-//! the issue recorded is one row of each.
+//! members it is sent beside, and the operations that declare it.
 
 use serde_json::{json, Value};
-use service_com_amazonaws_costoptimizationhub_costoptimizationhubservice as cost_optimization_hub;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::cost_optimization_hub::{call, enrolled_router, error_code, ok, router};
-
-/// The model's own value set for the management-account-only preference, so the
-/// table spans every value the member can take rather than the one the issue
-/// cited (`smithy_query(query="shape", shape="MemberAccountDiscountVisibility")`).
-use cost_optimization_hub::ops::types::shared_types::MEMBER_ACCOUNT_DISCOUNT_VISIBILITY_VALUES;
 
 /// Assert one refused call: the status, the wire error code, and that the
 /// answer carries a non-empty message.
@@ -58,177 +51,6 @@ async fn refused(
             .is_some_and(|message| !message.is_empty()),
         "case {case:?}: expected a message naming the rule, got {payload}"
     );
-}
-
-/// `memberAccountDiscountVisibility` is the management account's to write, so
-/// every request that sets it is refused with 400 `ValidationException`,
-/// whichever value it sets and whatever else it sends — and the preference
-/// record keeps what it held, so `GetPreferences` never reports the member.
-#[tokio::test]
-async fn member_account_discount_visibility_is_refused_to_a_non_management_account() {
-    let router = router();
-
-    // A preference the account MAY set, so the record under test is non-empty
-    // and a refusal that wrote something would show.
-    let before = ok(
-        &router,
-        "UpdatePreferences",
-        &json!({
-            "savingsEstimationMode": "BeforeDiscounts",
-            "preferredCommitment": {"term": "OneYear", "paymentOption": "NoUpfront"},
-        }),
-    )
-    .await;
-
-    // (case, request) — every value the model's enum holds, alone and beside
-    // the members this account may write.
-    let mut cases: Vec<(String, Value)> = Vec::new();
-    for visibility in MEMBER_ACCOUNT_DISCOUNT_VISIBILITY_VALUES {
-        cases.push((
-            format!("{visibility} alone"),
-            json!({"memberAccountDiscountVisibility": visibility}),
-        ));
-        cases.push((
-            format!("{visibility} beside a preference the account may write"),
-            json!({
-                "memberAccountDiscountVisibility": visibility,
-                "savingsEstimationMode": "BeforeDiscounts",
-            }),
-        ));
-        cases.push((
-            format!("{visibility} beside a nested member"),
-            json!({
-                "memberAccountDiscountVisibility": visibility,
-                "preferredCommitment": {"term": "ThreeYears"},
-            }),
-        ));
-    }
-
-    for (case, request) in &cases {
-        refused(
-            &router,
-            case,
-            "UpdatePreferences",
-            request,
-            400,
-            "ValidationException",
-        )
-        .await;
-
-        // Nothing the refused request carried was stored: not the restricted
-        // member, and not the members it was sent beside.
-        let fetched = ok(&router, "GetPreferences", &json!({})).await;
-        assert_eq!(
-            fetched, before,
-            "case {case:?}: a refused UpdatePreferences must leave the record at {before}, \
-             got {fetched}"
-        );
-        assert!(
-            fetched["memberAccountDiscountVisibility"].is_null(),
-            "case {case:?}: expected memberAccountDiscountVisibility never reported, got {fetched}"
-        );
-    }
-}
-
-/// `savingsEstimationMode=AfterDiscounts` needs member-account discount
-/// visibility enabled first — which only the management account can do — so it
-/// is refused with 400 `ValidationException` and the stored mode is unchanged,
-/// while `BeforeDiscounts` is accepted.
-#[tokio::test]
-async fn after_discounts_is_refused_until_discount_visibility_is_enabled() {
-    let router = router();
-
-    // (case, request, the status it must get, the mode a read must report
-    // afterwards — the stored preference, or the service's default where the
-    // account has set none). The accepted rows are the positive control: the
-    // same member, the other value.
-    let cases: [(&str, Value, u16, &str); 6] = [
-        (
-            // The account has set no mode yet, so a read reports the default
-            // the service applies; the refused call does not make it the
-            // account's own.
-            "AfterDiscounts on a fresh record",
-            json!({"savingsEstimationMode": "AfterDiscounts"}),
-            400,
-            "AfterDiscounts",
-        ),
-        (
-            "BeforeDiscounts is accepted",
-            json!({"savingsEstimationMode": "BeforeDiscounts"}),
-            200,
-            "BeforeDiscounts",
-        ),
-        (
-            "AfterDiscounts over a stored BeforeDiscounts",
-            json!({"savingsEstimationMode": "AfterDiscounts"}),
-            400,
-            "BeforeDiscounts",
-        ),
-        (
-            "AfterDiscounts beside a nested member",
-            json!({
-                "savingsEstimationMode": "AfterDiscounts",
-                "preferredCommitment": {"term": "OneYear"},
-            }),
-            400,
-            "BeforeDiscounts",
-        ),
-        (
-            // Asking for the mode and the visibility it depends on in one call
-            // is still refused: enabling the visibility is the management
-            // account's act, so this account cannot reach the mode either way.
-            "AfterDiscounts beside the visibility it depends on",
-            json!({
-                "savingsEstimationMode": "AfterDiscounts",
-                "memberAccountDiscountVisibility": "All",
-            }),
-            400,
-            "BeforeDiscounts",
-        ),
-        (
-            "BeforeDiscounts is still accepted afterwards",
-            json!({"savingsEstimationMode": "BeforeDiscounts"}),
-            200,
-            "BeforeDiscounts",
-        ),
-    ];
-
-    for (case, request, expected_status, expected_mode) in &cases {
-        // What a read reports before the call, so a refusal can be shown to
-        // have changed nothing at all.
-        let before = ok(&router, "GetPreferences", &json!({})).await;
-        if *expected_status == 200 {
-            ok(&router, "UpdatePreferences", request).await;
-        } else {
-            refused(
-                &router,
-                case,
-                "UpdatePreferences",
-                request,
-                *expected_status,
-                "ValidationException",
-            )
-            .await;
-        }
-
-        let fetched = ok(&router, "GetPreferences", &json!({})).await;
-        assert_eq!(
-            fetched["savingsEstimationMode"].as_str(),
-            Some(*expected_mode),
-            "case {case:?}: expected the reported mode {expected_mode:?}, got {fetched}"
-        );
-        if *expected_status != 200 {
-            assert_eq!(
-                fetched, before,
-                "case {case:?}: a refused UpdatePreferences must leave the record at {before}, \
-                 got {fetched}"
-            );
-        }
-        assert!(
-            fetched["memberAccountDiscountVisibility"].is_null(),
-            "case {case:?}: expected memberAccountDiscountVisibility never reported, got {fetched}"
-        );
-    }
 }
 
 /// A populated `filter.accountIds` asks `ListRecommendations` for other

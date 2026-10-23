@@ -294,7 +294,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ),
             queued_timeout_in_minutes: input.queued_timeout_in_minutes,
             encryption_key: input.encryption_key,
-            tags: input.tags,
+            // A resource's tag set is always reported, `[]` when it carries no tag —
+            // the rule `crate::ops::create_report_group` states.
+            tags: Some(input.tags.unwrap_or_default()),
             created: Some(created),
             last_modified: Some(created),
             // Written by CreateWebhook / UpdateProjectVisibility, so a freshly
