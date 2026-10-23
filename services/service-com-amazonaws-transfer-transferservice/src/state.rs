@@ -5,7 +5,8 @@
 //! Everything AWS Transfer Family's server + user + web app + AS2 profile + connector
 //! + host-key lifecycle needs to answer a read from stored state lives here: the
 //! resource maps (servers, their users and host keys, the web apps `ListWebApps`
-//! pages, the AS2 profiles, the connectors, and the
+//! pages, the AS2 profiles, the AS2 agreements a server's profiles trade under, the
+//! connectors, and the
 //! workflows a server's
 //! `WorkflowDetails` attach), the
 //! id-minting counter, the
@@ -58,7 +59,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use crate::ops::types::{
     AccessDeniedException, As2ConnectorConfig, ConnectorEgressConfig,
-    ConnectorVpcLatticeEgressConfig, DescribedWebAppEndpointDetails,
+    ConnectorVpcLatticeEgressConfig, CustomDirectoriesType, DescribedWebAppEndpointDetails,
     DescribedWebAppIdentityProviderDetails, EndpointDetails, HomeDirectoryMapEntry,
     IdentityProviderDetails, InvalidRequestException, PosixProfile, ProtocolDetails, ProxyConfig,
     ResourceExistsException, ResourceNotFoundException, S3StorageOptions, SftpConnectorConfig,
@@ -2847,6 +2848,10 @@ pub struct ComAmazonawsTransferTransferserviceState {
     /// AS2 profiles by `ProfileId` (`"p-" + 17 hex`). `BTreeMap` so `ListProfiles`
     /// pages in a stable, resumable order, like [`Self::servers`].
     pub profiles: BTreeMap<String, Profile>,
+    /// AS2 agreements by `(ServerId, AgreementId)` — the pair the model makes the
+    /// `AgreementResource`'s identifiers — so one server's agreements are a contiguous,
+    /// ordered range for `ListAgreements`, exactly as [`Self::users`] is keyed.
+    pub agreements: BTreeMap<(String, String), Agreement>,
     /// Imported certificates by `CertificateId` (`"cert-" + 17 hex`). `BTreeMap` so
     /// `ListCertificates` pages in a stable, resumable order, like [`Self::profiles`].
     pub certificates: BTreeMap<String, Certificate>,
@@ -3278,6 +3283,208 @@ impl ComAmazonawsTransferTransferserviceState {
 }
 
 // ---------------------------------------------------------------------------
+// The AS2 agreement resource
+// ---------------------------------------------------------------------------
+//
+// An agreement is "a bilateral trading partner agreement, or partnership, between an
+// Transfer Family server and an AS2 process", which "Transfer Family combines" out of
+// "a server, local profile, partner profile, certificate, and other attributes" — so
+// it is a RECORD that references a server and two profiles, all three of which must
+// resolve before one can be written. The emulator speaks no AS2, so nothing here
+// transfers a file; every member a reader reports is resolved once, at create time, on
+// the same rule as every other resource in this module.
+//
+// The model's `AgreementResource` identifies an agreement by `(ServerId, AgreementId)`
+// and gives it the ARN template `agreement/{ServerId}/{AgreementId}`, so the store is
+// keyed by that pair and [`agreement_arn`] renders that template.
+
+/// `ResourceType` for the AS2 agreement resource, addressed by its `AgreementId`.
+/// Same convention as [`RESOURCE_TYPE_SERVER`]; the `Message` that travels with it is
+/// [`NOT_FOUND_AGREEMENT`]'s.
+pub const RESOURCE_TYPE_AGREEMENT: &str = "Agreement";
+
+/// An `AgreementId` the addressed server holds no agreement for — never created, or
+/// already deleted.
+pub const NOT_FOUND_AGREEMENT: NotFoundResource = NotFoundResource {
+    resource_type: RESOURCE_TYPE_AGREEMENT,
+    message: "Unknown agreement",
+};
+
+/// The not-found payload for an `AgreementId` the addressed server holds no agreement
+/// for. Same construction as [`unknown_profile`]: the service's fixed text for the
+/// condition, with the unresolved identifier in `Resource` alone.
+pub fn unknown_agreement(agreement_id: &str) -> ResourceNotFoundException {
+    resource_not_found(&NOT_FOUND_AGREEMENT, agreement_id)
+}
+
+/// How many agreements ONE server holds before `CreateAgreement` refuses with the
+/// modelled `ServiceUnavailableException` instead of growing.
+///
+/// Chosen on the same basis as [`MAX_ACCESSES_PER_SERVER`] — the emulator's own bound
+/// on the store, not a claim about any account's Service Quota. `DeleteAgreement`
+/// releases one.
+pub const MAX_AGREEMENTS_PER_SERVER: usize = 1_000;
+
+/// How many agreements the WHOLE store holds before `CreateAgreement` refuses, whatever
+/// server each one is on.
+///
+/// The per-server bound above cannot bound the store on its own, because an agreement
+/// OUTLIVES the server it references (`DeleteServer` does not take a server's
+/// agreements with it), so a caller that keeps creating servers would keep a fresh
+/// per-server allowance for ever. This is the total bound every other resource map gets
+/// from [`MAX_STORED_SERVERS`]/[`MAX_STORED_PROFILES`]/[`MAX_STORED_CONNECTORS`], stated
+/// here for the one map nothing reclaims: past it a create is refused rather than
+/// growing the store, and `DeleteAgreement` releases one.
+pub const MAX_STORED_AGREEMENTS: usize = MAX_STORED_SERVERS * 10;
+
+/// `Status`'s value for an agreement whose create named none.
+///
+/// `AgreementStatusType` is `[ACTIVE, INACTIVE]` and `DescribedAgreement.Status` is
+/// "the current status of the agreement, either `ACTIVE` or `INACTIVE`" — so every
+/// stored agreement has one of the two, and a create that names neither makes the
+/// agreement the server can use straight away. A create that DOES name one keeps it.
+pub const DEFAULT_AGREEMENT_STATUS: &str = "ACTIVE";
+
+/// `PreserveFilename`'s documented default ("`DISABLED` (default value): when Transfer
+/// Family saves the file, the filename is adjusted").
+pub const DEFAULT_PRESERVE_FILENAME: &str = "DISABLED";
+
+/// `EnforceMessageSigning`'s documented default ("`DISABLED` (default value): Transfer
+/// Family accepts unsigned messages from your trading partner").
+pub const DEFAULT_ENFORCE_MESSAGE_SIGNING: &str = "DISABLED";
+
+/// One stored AS2 agreement, keyed by `(ServerId, AgreementId)`.
+///
+/// Every member a reader reports is RESOLVED here, at create time — the documented
+/// `PreserveFilename` and `EnforceMessageSigning` defaults, the agreement's `Status`
+/// and its own ARN — so no reader has to re-apply a default. The members
+/// `ListedAgreement` reports (`{Arn, AgreementId, Description, Status, ServerId,
+/// LocalProfileId, PartnerProfileId}`) are a subset of these, so both readers answer
+/// out of this ONE record rather than a second map beside it.
+#[derive(Debug, Clone, Default)]
+pub struct Agreement {
+    /// The minted `"a-" + 17 hex` identifier (`AgreementId` is `^a-([0-9a-f]{17})$`).
+    pub agreement_id: String,
+    /// The server the agreement is written on, the first half of its key.
+    pub server_id: String,
+    /// `arn:aws:transfer:<region>:<account>:agreement/<ServerId>/<AgreementId>`, as
+    /// [`agreement_arn`] builds it from the model's own ARN template.
+    pub arn: String,
+    pub description: Option<String>,
+    /// One of `AgreementStatusType`'s values, resolved at create time (see
+    /// [`DEFAULT_AGREEMENT_STATUS`]).
+    pub status: String,
+    pub local_profile_id: String,
+    pub partner_profile_id: String,
+    /// The landing directory, when the agreement has one.
+    ///
+    /// A blank `BaseDirectory` names no directory — the member's pattern `^(|/.*)$`
+    /// admits the empty string, the same reading [`agreement_base_directory`] gives it
+    /// and `connector_url` gives a blank `Url` — so it is stored as absent, never as
+    /// `""`. Absent exactly for an agreement configured with `CustomDirectories`
+    /// instead, which the model documents as the alternative to it.
+    pub base_directory: Option<String>,
+    pub custom_directories: Option<CustomDirectoriesType>,
+    pub access_role: String,
+    /// One of `PreserveFilenameType`'s values, resolved at create time.
+    pub preserve_filename: String,
+    /// One of `EnforceMessageSigningType`'s values, resolved at create time.
+    pub enforce_message_signing: String,
+    pub tags: Vec<Tag>,
+}
+
+/// `arn:aws:transfer:<region>:<account>:agreement/<ServerId>/<AgreementId>` — the
+/// model's own `aws.api#arn` template for `AgreementResource`.
+pub fn agreement_arn(region: &str, server_id: &str, agreement_id: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!("agreement/{server_id}/{agreement_id}"),
+    )
+}
+
+/// The landing directory a request supplied, when it names one.
+///
+/// A blank value names no directory: `BaseDirectory` targets `HomeDirectory`, whose
+/// pattern `^(|/.*)$` admits the empty string — and admits NOTHING else that is not
+/// rooted at `/`, so the empty string is the only value reaching a handler that names
+/// no directory. It is therefore stored as not configured and reported absent. Both
+/// the cross-member check and the stored record read the member through here, so the
+/// two cannot disagree — the rule [`connector_url`] follows for a blank `Url`.
+pub fn agreement_base_directory(base_directory: Option<&str>) -> Option<String> {
+    base_directory
+        .filter(|directory| !directory.is_empty())
+        .map(str::to_string)
+}
+
+/// The documented cross-member requirement an agreement's directory configuration
+/// violates, worded as the refusal states it — `None` when it violates none.
+///
+/// `CreateAgreement` and `UpdateAgreement` both state it: "Specify either
+/// `BaseDirectory` or `CustomDirectories`, but not both. Specifying both causes the
+/// command to fail." Read as the sentence states it, that is an EITHER/OR over the two
+/// members — one of them says where an agreement's AS2 files land, and the second half
+/// of the sentence rules out naming both — so an agreement is written with exactly one
+/// of them and a request naming both, or neither, is refused with the modelled
+/// `InvalidRequestException`. The wording is the one
+/// [`ConnectorConfig::cross_member_violation`] already gives the same either/or on
+/// `As2Config` and `SftpConfig` ("You must specify exactly one configuration object"),
+/// so the two cannot drift apart.
+///
+/// What counts as "specified" for `BaseDirectory` is EMPTINESS, not presence: the
+/// member's pattern `^(|/.*)$` admits the empty string, which names no directory (see
+/// [`agreement_base_directory`]), so a blank value cannot be the one configuration an
+/// agreement is written with and is read here exactly as the stored record reads it —
+/// the same test this crate applies to a blank `Url` on a connector and a blank
+/// `Certificate` on a server. A blank `BaseDirectory` therefore leaves
+/// `CustomDirectories` as the only configuration named, rather than making the request
+/// name two.
+pub fn agreement_directory_violation(
+    base_directory: Option<&str>,
+    custom_directories: Option<&CustomDirectoriesType>,
+) -> Option<String> {
+    let based = agreement_base_directory(base_directory).is_some();
+    if based == custom_directories.is_some() {
+        return Some(exactly_one_of("BaseDirectory", "CustomDirectories"));
+    }
+    None
+}
+
+impl ComAmazonawsTransferTransferserviceState {
+    /// The agreements stored for `server_id`, in `ListAgreements` paging order.
+    ///
+    /// A RANGE scan over the contiguous run of the `(ServerId, AgreementId)` key, on
+    /// the same basis as [`Self::users_of`].
+    pub fn agreements_of<'a>(
+        &'a self,
+        server_id: &'a str,
+    ) -> impl Iterator<Item = &'a Agreement> + 'a {
+        use ::std::ops::Bound;
+        let lower = (server_id.to_string(), String::new());
+        self.agreements
+            .range((Bound::Included(lower), Bound::Unbounded))
+            .take_while(move |((sid, _), _)| sid == server_id)
+            .map(|(_, agreement)| agreement)
+    }
+
+    /// Whether `server_id` can take another agreement, i.e. is below
+    /// [`MAX_AGREEMENTS_PER_SERVER`].
+    pub fn server_has_agreement_capacity(&self, server_id: &str) -> bool {
+        self.agreements_of(server_id).count() < MAX_AGREEMENTS_PER_SERVER
+    }
+
+    /// Whether the store can take another agreement at all, i.e. is below
+    /// [`MAX_STORED_AGREEMENTS`].
+    ///
+    /// The TOTAL bound, which [`Self::server_has_agreement_capacity`] cannot stand in
+    /// for: an agreement outlives its server, so a per-server allowance is renewed by
+    /// every new server while nothing reclaims the agreements of the old ones.
+    pub fn has_agreement_capacity(&self) -> bool {
+        self.agreements.len() < MAX_STORED_AGREEMENTS
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The imported-certificate plane
 // ---------------------------------------------------------------------------
 //
@@ -3509,6 +3716,13 @@ impl ComAmazonawsTransferTransferserviceState {
             .workflows
             .values()
             .map(|r| (r.arn.as_str(), r.tags.as_slice()));
+        // `AgreementResource` carries `aws.api#taggable{property: Tags}` in the model,
+        // and a stored agreement has an `arn` and a `tags` of its own, so it is
+        // taggable on the same terms as every kind above.
+        let agreements = self
+            .agreements
+            .values()
+            .map(|r| (r.arn.as_str(), r.tags.as_slice()));
         servers
             .chain(users)
             .chain(host_keys)
@@ -3516,6 +3730,7 @@ impl ComAmazonawsTransferTransferserviceState {
             .chain(profiles)
             .chain(connectors)
             .chain(workflows)
+            .chain(agreements)
     }
 
     /// The tag set of the resource `arn` identifies, or `None` when no stored resource
@@ -3554,6 +3769,9 @@ impl ComAmazonawsTransferTransferserviceState {
             return Some(&mut found.tags);
         }
         if let Some(found) = self.workflows.values_mut().find(|r| r.arn == arn) {
+            return Some(&mut found.tags);
+        }
+        if let Some(found) = self.agreements.values_mut().find(|r| r.arn == arn) {
             return Some(&mut found.tags);
         }
         None

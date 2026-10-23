@@ -19,6 +19,8 @@ mod disable_federation;
 mod emulator;
 #[path = "all/event_data_store_reads.rs"]
 mod event_data_store_reads;
+#[path = "all/event_selectors.rs"]
+mod event_selectors;
 #[path = "all/import_stop.rs"]
 mod import_stop;
 #[path = "all/lake_queries.rs"]

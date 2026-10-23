@@ -43,7 +43,13 @@ pub(crate) const ABSENT_DETECTOR_ID: &str = "deadbeefdeadbeefdeadbeefdeadbeef";
 
 /// A router carrying only this service, over its own engine.
 pub(crate) fn new_router() -> Router {
-    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    router_over(Arc::new(engine::InMemoryEngine::new()))
+}
+
+/// A router carrying only this service over `engine`, for a suite that needs a handle
+/// on the store the handlers write. [`new_router`] is this with an engine of its own,
+/// so the two cannot drift.
+pub(crate) fn router_over(engine: Arc<engine::InMemoryEngine>) -> Router {
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
     router.register_service(

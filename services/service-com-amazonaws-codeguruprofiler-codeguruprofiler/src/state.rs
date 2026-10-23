@@ -341,8 +341,15 @@ pub struct ProfilingGroup {
 }
 
 impl ProfilingGroup {
-    /// The `ProfilingGroupDescription` every profiling-group operation returns, built
-    /// from what is stored — never from the request that is asking for it.
+    /// The `ProfilingGroupDescription` every READ of a stored profiling group answers with
+    /// — `DescribeProfilingGroup`, `UpdateProfilingGroup` and the described form of
+    /// `ListProfilingGroups` — built from what is stored, never from the request that is
+    /// asking for it.
+    ///
+    /// These paths report the `profilingStatus` CONTAINER even while the group has no
+    /// activity to report in it (its three members are each absent until the activity they
+    /// name happens); the CREATE path is the one that omits the container, see
+    /// [`ProfilingGroup::created_description`].
     pub fn description(&self) -> ProfilingGroupDescription {
         ProfilingGroupDescription {
             name: Some(self.name.clone()),
@@ -352,21 +359,61 @@ impl ProfilingGroup {
             arn: Some(self.arn.clone()),
             created_at: Some(self.created_at),
             updated_at: Some(self.updated_at),
-            profiling_status: Some(ProfilingStatus {
-                latest_agent_profile_reported_at: self.latest_agent_profile_reported_at,
-                // `latestAggregatedProfile` is ONE `AggregatedProfileTime`, i.e. one
-                // aggregation period, while the service aggregates a group's posted
-                // profiles at all three periods at once (see
-                // [`ProfilingGroup::aggregated_profile_starts`], which derives the
-                // aggregated profiles for the period a caller asks about). There is no
-                // stored fact saying which period to report here, so this stays absent
-                // rather than picking one arbitrarily.
-                latest_aggregated_profile: None,
-                latest_agent_orchestrated_at: self.latest_agent_orchestrated_at,
-            }),
+            profiling_status: Some(self.profiling_status()),
             compute_platform: Some(self.compute_platform.clone()),
             tags: Some(self.tags.clone()),
         }
+    }
+
+    /// The description `CreateProfilingGroup` answers with: [`description`] with
+    /// `profilingStatus` ABSENT while the group has no profiling activity.
+    ///
+    /// `profilingStatus` is not `@required`, and each of its members reports one thing that
+    /// has HAPPENED to the group — the last time an agent pinged back, the last time a
+    /// profile was received, the most recent aggregated profile. A create reports only what
+    /// the create established, and nothing can have been reported against a group that is
+    /// only now coming into existence, so the member is left out of that payload entirely
+    /// rather than written as an empty object: the way a client tells "nothing has ever
+    /// been reported" from "activity, reported here" is whether the key is there at all,
+    /// and an empty object answers that question wrongly. A create replayed on its
+    /// `clientToken` against a group that HAS since reported carries the status, because by
+    /// then there is something to report.
+    ///
+    /// [`description`]: ProfilingGroup::description
+    pub fn created_description(&self) -> ProfilingGroupDescription {
+        ProfilingGroupDescription {
+            profiling_status: self
+                .has_profiling_activity()
+                .then(|| self.profiling_status()),
+            ..self.description()
+        }
+    }
+
+    /// The group's `profilingStatus`: each member present only once the activity it names
+    /// has happened.
+    fn profiling_status(&self) -> ProfilingStatus {
+        ProfilingStatus {
+            latest_agent_profile_reported_at: self.latest_agent_profile_reported_at,
+            // `latestAggregatedProfile` is ONE `AggregatedProfileTime`, i.e. one
+            // aggregation period, while the service aggregates a group's posted
+            // profiles at all three periods at once (see
+            // [`ProfilingGroup::aggregated_profile_starts`], which derives the
+            // aggregated profiles for the period a caller asks about). There is no
+            // stored fact saying which period to report here, so this stays absent
+            // rather than picking one arbitrarily.
+            latest_aggregated_profile: None,
+            latest_agent_orchestrated_at: self.latest_agent_orchestrated_at,
+        }
+    }
+
+    /// Whether anything has ever been reported about this group's profiling: an agent ping
+    /// (`ConfigureAgent`), a posted profile (`PostAgentProfile`) or an aggregated profile.
+    /// This is what decides whether a create's payload carries a `profilingStatus` at all.
+    fn has_profiling_activity(&self) -> bool {
+        let status = self.profiling_status();
+        status.latest_agent_profile_reported_at.is_some()
+            || status.latest_agent_orchestrated_at.is_some()
+            || status.latest_aggregated_profile.is_some()
     }
 
     /// Store a posted profile and record its receipt time, within this group's

@@ -25,6 +25,9 @@ tracing = { workspace = true }
 # and the creation instant, hex-encoded) instead of leaking either verbatim.
 sha2 = { workspace = true }
 hex = { workspace = true }
+# Parses the C-CDA (XML) documents `POST /validate-source` validates; the report is
+# computed by walking a real parse tree rather than by matching on the source text.
+roxmltree = "0.20"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

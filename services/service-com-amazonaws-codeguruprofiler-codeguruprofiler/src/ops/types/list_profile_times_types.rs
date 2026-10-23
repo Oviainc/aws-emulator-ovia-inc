@@ -30,9 +30,19 @@ pub struct ListProfileTimesOutput {
     pub next_token: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.codeguruprofiler#ProfileTime")]
+/// `ProfileTime`. Hand-written because `start` carries `@timestampFormat("date-time")` —
+/// see `types/date_time_wire.rs`.
 #[derive(Debug, Clone, Default)]
 pub struct ProfileTime {
     pub start: Option<::aws_smithy_types::DateTime>,
 }
+
+profiler_schema_and_codec!(
+    ProfileTime,
+    PROFILE_TIME_SCHEMA,
+    "com.amazonaws.codeguruprofiler#ProfileTime",
+    "com.amazonaws.codeguruprofiler",
+    "ProfileTime",
+    (M_START, start, "start", 0, opt, date_time),
+);
 

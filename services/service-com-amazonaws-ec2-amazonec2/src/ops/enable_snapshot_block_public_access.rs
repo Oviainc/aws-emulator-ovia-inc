@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op EnableSnapshotBlockPublicAccess
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `EnableSnapshotBlockPublicAccess`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`EnableSnapshotBlockPublicAccess::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Puts the account's *block public access for snapshots* setting into one of the two
+//! blocking modes, which `GetSnapshotBlockPublicAccessState` then reports. The setting is
+//! one account-level field of [`crate::state::ComAmazonawsEc2Amazonec2State`], so this is
+//! the writer and that operation the reader of the same fact.
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +153,49 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `EnableSnapshotBlockPublicAccess` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(EnableSnapshotBlockPublicAccessErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("EnableSnapshotBlockPublicAccess"))
+        use crate::state;
+
+        // "Enables or modifies the block public access for snapshots setting at the account
+        // level": the setting is one account-level fact, and this store is per account
+        // (`crate::state`'s module docs), so nothing of the request beyond `State` and
+        // `DryRun` is read and `ctx` carries nothing this operation needs.
+        let _ = ctx;
+
+        // "The mode in which to enable block public access for snapshots for the Region.
+        // Specify one of the following values: block-all-sharing …, block-new-sharing …
+        // `unblocked` is not a valid value for EnableSnapshotBlockPublicAccess"
+        // (`EnableSnapshotBlockPublicAccessRequest$State`). So the only values this
+        // operation accepts are the catalog's two blocking modes — turning the setting off
+        // is `DisableSnapshotBlockPublicAccess`'s job — and resolving the word here is also
+        // what keeps request text out of the store: what is stored is the catalog member,
+        // never the string the request carried.
+        let requested = input.state.as_str();
+        let Some(mode) = state::snapshot_block_public_access_mode(requested) else {
+            return Err(state::invalid_parameter_value(format!(
+                "Value ({requested}) for parameter state is invalid. Valid values for \
+                 EnableSnapshotBlockPublicAccess are {}",
+                state::SNAPSHOT_BLOCK_PUBLIC_ACCESS_MODES.join(", ")
+            )));
+        };
+
+        let store = state::require_service_state(&*self.engine)?;
+        let mut store = store.lock();
+
+        // DryRun sits AFTER `State` has been validated and BEFORE the write: the flag asks
+        // whether the request WOULD have succeeded, so one that would have been refused is
+        // refused with that reason instead, and one that would have succeeded leaves the
+        // setting where it was.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        // "Enables OR MODIFIES" — the mode the request names replaces whatever mode the
+        // setting was in, including the same one again. The response is read back off the
+        // store, so it says exactly what a `GetSnapshotBlockPublicAccessState` made in the
+        // same instant would report.
+        let in_effect = store.set_snapshot_block_public_access_state(mode);
+        Ok(EnableSnapshotBlockPublicAccessOutput {
+            state: Some(in_effect.to_string()),
+        })
     }
 }

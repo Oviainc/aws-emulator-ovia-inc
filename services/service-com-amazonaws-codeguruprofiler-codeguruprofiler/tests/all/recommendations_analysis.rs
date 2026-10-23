@@ -248,17 +248,16 @@ fn expected_window_refusal(start: f64, end: f64) -> String {
     )
 }
 
-/// The two analysis lists, which must always be present and — with no profile analyser in
-/// this emulator — empty, never absent and never invented.
+/// The two analysis lists, which AWS OMITS from the body when the analysis has nothing to
+/// report — and with no profile analyser in this emulator it never has — so neither key is
+/// there, and neither is ever invented.
 fn assert_empty_analysis(case: &str, body: &serde_json::Value) {
     for member in ["recommendations", "anomalies"] {
-        let list = body
-            .get(member)
-            .unwrap_or_else(|| panic!("case {case:?}: {member} is required, got {body}"));
         assert_eq!(
-            list.as_array().map(Vec::len),
-            Some(0),
-            "case {case:?}: {member} must be an empty list, got {list}"
+            body.get(member),
+            None,
+            "case {case:?}: {member} must be absent when there is no analysis to report, \
+             got {body}"
         );
     }
 }
