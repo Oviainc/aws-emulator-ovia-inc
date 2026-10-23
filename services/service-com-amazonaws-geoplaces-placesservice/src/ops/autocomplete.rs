@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op Autocomplete
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `Autocomplete`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Completes a partially typed query against the seeded place catalog in
+//! [`crate::state`] — the same records Geocode, GetPlace, ReverseGeocode,
+//! SearchNearby and SearchText answer from — and reports, per result, which
+//! sections of its own text the query's terms accounted for.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`Autocomplete::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Two request members this catalog cannot distinguish on:
+//!
+//! * `PostalCodeMode` chooses how a postal code that SPANS several localities is
+//!   enumerated. Every postal code this catalog holds belongs to one locality, so
+//!   there is no spanned code to enumerate and all three modes report the same
+//!   single entry for it.
+//! * `AdditionalFeatures` carries exactly one value (`Core`), and the model
+//!   documents no result member as gated behind it, so every result carries the
+//!   core fields the catalog holds for it.
 //!
 //! ## Shape of an operation
 //!
@@ -191,18 +196,337 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `Autocomplete` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AutocompleteErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("Autocomplete"))
+        // `ctx` carries request metadata only; this operation reads none of it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(AutocompleteErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the Geo Places catalog is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+        let state = state.lock();
+
+        // Modeled input constraints, enforced here too so an in-process caller is
+        // held to the same contract as a client on the wire. `MaxResults` is
+        // checked against THIS operation's ceiling (`range 1..20`), which is lower
+        // than its siblings'.
+        for invalid in [
+            crate::state::check_max_results_up_to(
+                input.max_results,
+                crate::state::AUTOCOMPLETE_MAX_RESULTS_CEILING,
+            ),
+            crate::state::check_language(input.language.as_deref()),
+            crate::state::check_political_view(input.political_view.as_deref()),
+            crate::state::check_query_text(Some(input.query_text.as_str()), "QueryText"),
+        ] {
+            if let Err(invalid) = invalid {
+                return Err(AutocompleteErrorModeled::ValidationException(invalid).into());
+            }
+        }
+
+        // `QueryText` is `@required` and modeled `len 1..200`, both enforced at the
+        // boundary. A query that satisfies that length but spells no word at all
+        // (separators only) names no term to complete, so it matches no record and
+        // completes to nothing — which is an empty `ResultItems`, never a refusal
+        // the model does not declare nor the catalog unfiltered.
+        let query_text = input.query_text.trim();
+
+        let filter = input.filter.as_ref();
+        let bounding_box = filter.and_then(|filter| filter.bounding_box.as_deref());
+        let circle = filter.and_then(|filter| filter.circle.as_ref());
+        // A bias that is not a WGS 84 two-element position is refused, not ignored.
+        let bias = match input.bias_position.as_deref() {
+            None => None,
+            Some(values) => match crate::state::position(values) {
+                Some(bias) => Some(bias),
+                None => {
+                    return Err(AutocompleteErrorModeled::ValidationException(
+                        crate::state::validation_exception(
+                            crate::state::REASON_FIELD_VALIDATION_FAILED,
+                            "BiasPosition",
+                            crate::state::must_be_length("BiasPosition", values.len(), 2),
+                        ),
+                    )
+                    .into())
+                }
+            },
+        };
+
+        // "The fields BiasPosition, FilterBoundingBox, and FilterCircle are
+        // mutually exclusive" (`AutocompleteRequest$BiasPosition`): they are
+        // alternative ways to say WHERE, so two of them cannot hold at once. Unlike
+        // SearchText, Autocomplete does not require one of them, so a request that
+        // sets none is answered over the whole catalog.
+        let areas = usize::from(input.bias_position.is_some())
+            + usize::from(bounding_box.is_some())
+            + usize::from(circle.is_some());
+        if areas > 1 {
+            return Err(AutocompleteErrorModeled::ValidationException(
+                crate::state::validation_exception_for(
+                    crate::state::REASON_OTHER,
+                    &["BiasPosition", "Filter.BoundingBox", "Filter.Circle"],
+                    crate::state::only_one_of(&[
+                        "BiasPosition",
+                        "Filter.BoundingBox",
+                        "Filter.Circle",
+                    ]),
+                ),
+            )
+            .into());
+        }
+
+        // Autocomplete "completes potential places and addresses ... based on the
+        // partial input", so the candidates are the records whose OWN REPORTED TEXT
+        // the typed words name — a partially typed word matching the leading part
+        // of one of their terms, which is what makes a prefix answer the places it
+        // begins. The category vocabulary a text search also indexes is not among
+        // those terms: see `PlaceRecord::completion_score`.
+        let mut candidates = state.completion_candidates(query_text);
+
+        if let Some(countries) = crate::state::non_empty(
+            filter.and_then(|filter| filter.include_countries.as_deref()),
+        ) {
+            candidates.retain(|candidate| state.places[candidate.index].in_countries(countries));
+        }
+        if let Some(place_types) = crate::state::non_empty(
+            filter.and_then(|filter| filter.include_place_types.as_deref()),
+        ) {
+            candidates.retain(|candidate| state.places[candidate.index].has_place_type(place_types));
+        }
+        if let Some(values) = bounding_box {
+            let Some(area) = crate::state::bounding_box(values) else {
+                return Err(AutocompleteErrorModeled::ValidationException(
+                    crate::state::validation_exception(
+                        crate::state::REASON_FIELD_VALIDATION_FAILED,
+                        "Filter.BoundingBox",
+                        crate::state::must_be_length("Filter.BoundingBox", values.len(), 4),
+                    ),
+                )
+                .into());
+            };
+            candidates.retain(|candidate| state.places[candidate.index].within_bounding_box(area));
+        }
+        if let Some(circle) = circle {
+            let Some(center) = crate::state::position(&circle.center) else {
+                return Err(AutocompleteErrorModeled::ValidationException(
+                    crate::state::validation_exception(
+                        crate::state::REASON_FIELD_VALIDATION_FAILED,
+                        "Filter.Circle.Center",
+                        crate::state::must_be_length(
+                            "Filter.Circle.Center",
+                            circle.center.len(),
+                            2,
+                        ),
+                    ),
+                )
+                .into());
+            };
+            candidates.retain(|candidate| {
+                crate::state::distance_metres(center, state.places[candidate.index].position)
+                    <= circle.radius
+            });
+        }
+
+        // `Distance` is measured from the position the caller biased towards; with
+        // no bias there is no reference point, so it keeps its modeled default of 0.
+        if let Some(bias) = bias {
+            for candidate in &mut candidates {
+                candidate.distance =
+                    crate::state::distance_metres(bias, state.places[candidate.index].position);
+            }
+        }
+        state.order_by_relevance(&mut candidates);
+
+        // "An optional limit for the number of results returned in a single call.
+        // Default value: 5" (`AutocompleteRequest$MaxResults`), bounded by this
+        // operation's own modeled range. Autocomplete models no `NextToken`, so the
+        // results past the limit are not resumable: they are simply not completions
+        // this call reports.
+        let limit = input
+            .max_results
+            .unwrap_or(crate::state::AUTOCOMPLETE_DEFAULT_MAX_RESULTS)
+            .clamp(1, crate::state::AUTOCOMPLETE_MAX_RESULTS_CEILING) as usize;
+        candidates.truncate(limit);
+
+        let political_view = match crate::state::resolve_political_view(
+            input.political_view.as_deref(),
+        ) {
+            Ok(political_view) => political_view,
+            Err(invalid) => {
+                return Err(AutocompleteErrorModeled::ValidationException(invalid).into())
+            }
+        };
+        let view = political_view.as_deref();
+        // "A list of BCP 47 compliant language codes for the results to be rendered
+        // in. If there is no data for the result in the requested language, data
+        // will be returned in the default language for the entry."
+        let language = input.language.as_deref();
+        let pricing_bucket = state.pricing_bucket(Self::NAME, input.intended_use.as_deref());
+
+        // Composing the items is the one part of this handler driven by the LENGTH
+        // of the caller's query, so it runs OUTSIDE the catalog lock: the records it
+        // reports (at most `AUTOCOMPLETE_MAX_RESULTS_CEILING` of them) are copied
+        // out and the guard released, so no caller's query can hold the catalog
+        // against the others while its own response is assembled.
+        let page: Vec<(crate::state::PlaceRecord, crate::state::Scored)> = candidates
+            .iter()
+            .map(|candidate| (state.places[candidate.index].clone(), *candidate))
+            .collect();
+        drop(state);
+
+        // The query is normalized ONCE for the whole response, not once per result.
+        let query_tokens = crate::state::normalize_tokens(query_text);
+        let result_items = page
+            .iter()
+            .map(|(place, candidate)| {
+                // The result text is rendered in the requested `Language`, falling
+                // back to the entry's own, and the sections marked below are
+                // sections of THAT text.
+                let rendered = place.address_rendered_in(view, language);
+                let title = place.title_modeled_in(view, language);
+                let address = place.address_modeled_in(view, language);
+                AutocompleteResultItem {
+                    place_id: place.place_id.clone(),
+                    place_type: place.place_type.clone(),
+                    distance: candidate.distance,
+                    highlights: highlights(&title, &address, &query_tokens),
+                    // `AutocompleteResultItem$Language` is the language the result
+                    // was rendered in: the one asked for where the entry holds text
+                    // in it, and "the default language for the entry" otherwise.
+                    language: Some(rendered.language.clone())
+                        .filter(|language| !language.is_empty()),
+                    political_view: political_view.clone(),
+                    title,
+                    address: Some(address),
+                    // `EstimatedPointAddress` says the reported coordinates are
+                    // estimated. Every catalog record carries a surveyed position,
+                    // so there is nothing to report — as for this service's other
+                    // operations that model the member.
+                    ..AutocompleteResultItem::default()
+                }
+            })
+            .collect();
+
+        Ok(AutocompleteOutput {
+            pricing_bucket,
+            result_items: Some(result_items),
+        })
     }
+}
+
+/// The modeled `Highlight` list for one piece of a result's text, or `None` when
+/// the query named none of it: every `HighlightList` member is optional, so "the
+/// query matched nothing here" is an ABSENT member rather than an empty list.
+fn highlight_list(text: &str, query_tokens: &[String]) -> Option<Vec<Highlight>> {
+    let found = crate::state::highlight_matches(text, query_tokens);
+    (!found.is_empty()).then(|| {
+        found
+            .into_iter()
+            .map(|section| Highlight {
+                start_index: Some(section.start_index),
+                end_index: Some(section.end_index),
+                value: Some(section.value),
+            })
+            .collect()
+    })
+}
+
+/// `Highlights`: "how the parts of the response element matched the input query by
+/// returning the sections of the response which matched to input query terms" —
+/// the sections of the `Title` and of the address this result reports that the
+/// query's terms accounted for, or `None` when the query named none of the text the
+/// response carries (a match on a category name, say, which no reported member
+/// spells).
+fn highlights(
+    title: &str,
+    address: &Address,
+    query_tokens: &[String],
+) -> Option<AutocompleteHighlights> {
+    let highlights = AutocompleteHighlights {
+        title: highlight_list(title, query_tokens),
+        address: address_highlights(address, query_tokens),
+    };
+    (highlights.title.is_some() || highlights.address.is_some()).then_some(highlights)
+}
+
+/// The sections of each address component a result reports that the query's terms
+/// accounted for. A component the result does not carry, or one the query named
+/// nothing of, is absent rather than an empty list.
+fn address_highlights(
+    address: &Address,
+    query_tokens: &[String],
+) -> Option<AutocompleteAddressHighlights> {
+    let list = |text: Option<&String>| {
+        text.and_then(|text| highlight_list(text, query_tokens))
+    };
+    // A `Country` carries an alpha-2 and an alpha-3 code while `CountryHighlights`
+    // carries ONE `Code` list, so that list reports the sections of whichever of
+    // the two forms the query named.
+    let country = address.country.as_ref().and_then(|country| {
+        let highlights = CountryHighlights {
+            code: list(country.code2.as_ref()).or_else(|| list(country.code3.as_ref())),
+            name: list(country.name.as_ref()),
+        };
+        (highlights.code.is_some() || highlights.name.is_some()).then_some(highlights)
+    });
+    let region = address.region.as_ref().and_then(|region| {
+        let highlights = RegionHighlights {
+            code: list(region.code.as_ref()),
+            name: list(region.name.as_ref()),
+        };
+        (highlights.code.is_some() || highlights.name.is_some()).then_some(highlights)
+    });
+    let sub_region = address.sub_region.as_ref().and_then(|sub_region| {
+        let highlights = SubRegionHighlights {
+            code: list(sub_region.code.as_ref()),
+            name: list(sub_region.name.as_ref()),
+        };
+        (highlights.code.is_some() || highlights.name.is_some()).then_some(highlights)
+    });
+    // `Address$Intersection` is a list of street names, and the modeled
+    // `IntersectionHighlightsList` is a list of highlight lists: one per street.
+    let intersection = address.intersection.as_ref().and_then(|streets| {
+        let lists: Vec<Vec<Highlight>> = streets
+            .iter()
+            .filter_map(|street| highlight_list(street, query_tokens))
+            .collect();
+        (!lists.is_empty()).then_some(lists)
+    });
+    let highlights = AutocompleteAddressHighlights {
+        label: list(address.label.as_ref()),
+        country,
+        region,
+        sub_region,
+        locality: list(address.locality.as_ref()),
+        district: list(address.district.as_ref()),
+        sub_district: list(address.sub_district.as_ref()),
+        street: list(address.street.as_ref()),
+        block: list(address.block.as_ref()),
+        sub_block: list(address.sub_block.as_ref()),
+        intersection,
+        postal_code: list(address.postal_code.as_ref()),
+        address_number: list(address.address_number.as_ref()),
+        building: list(address.building.as_ref()),
+    };
+    let matched = [
+        highlights.label.is_some(),
+        highlights.country.is_some(),
+        highlights.region.is_some(),
+        highlights.sub_region.is_some(),
+        highlights.locality.is_some(),
+        highlights.district.is_some(),
+        highlights.sub_district.is_some(),
+        highlights.street.is_some(),
+        highlights.block.is_some(),
+        highlights.sub_block.is_some(),
+        highlights.intersection.is_some(),
+        highlights.postal_code.is_some(),
+        highlights.address_number.is_some(),
+        highlights.building.is_some(),
+    ]
+    .into_iter()
+    .any(|matched| matched);
+    matched.then_some(highlights)
 }
