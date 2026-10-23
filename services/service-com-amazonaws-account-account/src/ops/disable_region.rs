@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DisableRegion
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DisableRegion`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DisableRegion::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Opts the resolved account out of one opt-in Region: a Region that is
+//! `ENABLED` for this account becomes `DISABLING`, and settles to `DISABLED`
+//! once the clock passes the instant stored with it
+//! (`crate::state::REGION_OPT_TRANSITION`). Already disabled or disabling is a
+//! no-op; a Region that is `ENABLING` conflicts (409) — "you cannot disable the
+//! Region until the enabling process is fully completed"; a Region enabled by
+//! default is not a Region-opt target and is refused 400 with reason
+//! `invalidRegionOptTarget`.
 //!
 //! ## Shape of an operation
 //!
@@ -87,6 +86,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::{RegionKind, RegionOptState};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -184,18 +184,82 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DisableRegion` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DisableRegionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DisableRegion"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DisableRegionErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: crate::state::STORE_UNAVAILABLE.to_string(),
+                    error_type: None,
+                },
+            )
+            .into());
+        };
+
+        // `RegionName`'s modelled `@length(min: 1, max: 50)` and `AccountId`'s
+        // `^\d{12}$` were already enforced at the boundary; which strings name a
+        // Region, and which Regions can be opted out of, are this service's own
+        // rules. Both are checked BEFORE the store is touched, so a refused
+        // call writes nothing.
+        let region_name = input.region_name;
+        match crate::state::region_kind(&region_name) {
+            None => {
+                return Err(DisableRegionErrorModeled::ValidationException(
+                    crate::state::unknown_region(&region_name),
+                )
+                .into())
+            }
+            Some(RegionKind::EnabledByDefault) => {
+                return Err(DisableRegionErrorModeled::ValidationException(
+                    crate::state::region_not_opt_target(&region_name),
+                )
+                .into())
+            }
+            Some(RegionKind::OptIn) => {}
+        }
+
+        let account_id = crate::state::resolve_account_id(input.account_id.as_deref());
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        let Some(account) = store.account_mut(&account_id, now) else {
+            return Err(DisableRegionErrorModeled::AccessDeniedException(
+                crate::state::account_store_full(&account_id),
+            )
+            .into());
+        };
+        account.settle_region_opts(now);
+        match account.region_opt_state(&region_name, RegionKind::OptIn, now) {
+            // Opted in: the opt-out starts now and completes once the clock
+            // reaches the stored instant.
+            RegionOptState::Enabled => {
+                account.region_opt_status.insert(
+                    region_name,
+                    RegionOptState::Disabling {
+                        ready_at: now + crate::state::REGION_OPT_TRANSITION,
+                    },
+                );
+            }
+            // Already opted out, or already opting out: disabling it again asks
+            // for the state it is already heading to, so there is nothing to
+            // write and nothing to refuse.
+            RegionOptState::Disabling { .. } | RegionOptState::Disabled => {}
+            // "You cannot disable the Region until the enabling process is
+            // fully completed" — a conflict with the status in flight.
+            status @ RegionOptState::Enabling { .. } => {
+                return Err(DisableRegionErrorModeled::ConflictException(
+                    crate::state::region_opt_in_progress(&region_name, status.as_wire()),
+                )
+                .into())
+            }
+            // Not reachable: the catalog check above already refused a
+            // default-enabled Region, which is the only source of this status.
+            RegionOptState::EnabledByDefault => {
+                return Err(DisableRegionErrorModeled::ValidationException(
+                    crate::state::region_not_opt_target(&region_name),
+                )
+                .into())
+            }
+        }
+
+        Ok(DisableRegionOutput)
     }
 }
