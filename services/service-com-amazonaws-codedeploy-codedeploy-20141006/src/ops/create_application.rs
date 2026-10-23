@@ -168,9 +168,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if state.applications.contains_key(&name) {
                 return Err(CreateApplicationErrorModeled::ApplicationAlreadyExistsException(
                     ApplicationAlreadyExistsException {
-                        message: Some(format!(
-                            "An application named {name} already exists with this account"
-                        )),
+                        message: Some(crate::state::application_already_exists(&name)),
                     },
                 ));
             }

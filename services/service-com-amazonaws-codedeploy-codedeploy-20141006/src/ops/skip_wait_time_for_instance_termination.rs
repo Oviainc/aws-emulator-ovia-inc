@@ -170,7 +170,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 SkipWaitTimeForInstanceTerminationErrorModeled::DeploymentIdRequiredException(
                     DeploymentIdRequiredException {
-                        message: Some("The deployment ID was not specified".to_string()),
+                        message: Some(crate::state::DEPLOYMENT_ID_MISSING.to_string()),
                     },
                 )
                 .into(),
@@ -199,9 +199,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(
                     SkipWaitTimeForInstanceTerminationErrorModeled::DeploymentDoesNotExistException(
                         DeploymentDoesNotExistException {
-                            message: Some(format!(
-                                "No deployment found for ID {deployment_id} with this account"
-                            )),
+                            message: Some(crate::state::deployment_not_found(&deployment_id)),
                         },
                     ),
                 );

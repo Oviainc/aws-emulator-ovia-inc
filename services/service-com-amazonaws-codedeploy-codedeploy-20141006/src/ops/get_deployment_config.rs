@@ -157,7 +157,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         .ok_or_else(|| {
             GetDeploymentConfigErrorModeled::DeploymentConfigDoesNotExistException(
                 DeploymentConfigDoesNotExistException {
-                    message: Some(format!("No deployment configuration found for name {name}")),
+                    message: Some(crate::state::deployment_config_not_found(&name)),
                 },
             )
         })?;

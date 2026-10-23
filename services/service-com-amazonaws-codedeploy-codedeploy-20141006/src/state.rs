@@ -106,6 +106,99 @@ pub const STATE_UNAVAILABLE: &str =
     "CodeDeploy state is unavailable: this service was mounted on an engine that does not \
      provide the shared in-memory store";
 
+// ---------------------------------------------------------------------------
+// The sentences CodeDeploy's modelled client errors carry
+// ---------------------------------------------------------------------------
+//
+// RULE: every modelled client error of this service carries the sentence that
+// belongs to the ERROR SHAPE, interpolating only the request value that error is
+// about — the resource's own name or id, delimited from the prose by `: ` where
+// the sentence ends in it — and no other request member; a refusal of an absent
+// or empty member answers its `…RequiredException`'s own sentence rather than
+// the constraint validator's generic clause. Every message a handler or
+// `crate::service` answers is built HERE, so the same error cannot be worded two
+// ways by two operations (`ApplicationDoesNotExistException` is raised by five of
+// them) and a message cannot drift into naming a member it is not about.
+
+/// `ApplicationDoesNotExistException` (HTTP 400): the application name after the
+/// delimiter, and nothing else from the request.
+pub fn application_not_found(application_name: &str) -> String {
+    format!("No application found for name: {application_name}")
+}
+
+/// `DeploymentGroupDoesNotExistException` (HTTP 400): the group name alone — the
+/// application the group was looked up in is NOT part of this sentence, which is
+/// scoped to the group.
+pub fn deployment_group_not_found(deployment_group_name: &str) -> String {
+    format!("No Deployment Group found for name: {deployment_group_name}")
+}
+
+/// `DeploymentDoesNotExistException` (HTTP 400): the deployment id the request
+/// asked for, inside the sentence rather than after a delimiter.
+pub fn deployment_not_found(deployment_id: &str) -> String {
+    format!("The deployment {deployment_id} could not be found")
+}
+
+/// `DeploymentConfigDoesNotExistException` (HTTP 400): the configuration name
+/// after the delimiter, in the same form as the other not-found sentences. Only
+/// the delimited name is a measured requirement here; the noun phrase follows
+/// the resource's name as the model spells it (`DeploymentConfigInfo`).
+pub fn deployment_config_not_found(deployment_config_name: &str) -> String {
+    format!("No Deployment Configuration found for name: {deployment_config_name}")
+}
+
+/// `ApplicationAlreadyExistsException` (HTTP 400): the conflicting name FIRST,
+/// so a client can recover it by stripping the fixed tail.
+pub fn application_already_exists(application_name: &str) -> String {
+    format!("{application_name} already exists.")
+}
+
+/// `DeploymentGroupAlreadyExistsException` (HTTP 400): the conflicting group
+/// name, with the application referred to as "this application" rather than
+/// named.
+pub fn deployment_group_already_exists(deployment_group_name: &str) -> String {
+    format!(
+        "An Deployment Group with the name {deployment_group_name} already exists for this \
+         application."
+    )
+}
+
+/// `ApplicationNameRequiredException` (HTTP 400): the fixed sentence for an
+/// application name the request did not give — absent or empty are the same
+/// refusal.
+pub const APPLICATION_NAME_MISSING: &str = "Application name is missing";
+
+/// `DeploymentGroupNameRequiredException` (HTTP 400). See
+/// [`APPLICATION_NAME_MISSING`]: one fixed sentence per required-member error,
+/// naming the member in prose and interpolating nothing.
+pub const DEPLOYMENT_GROUP_NAME_MISSING: &str = "Deployment group name is missing";
+
+/// `DeploymentConfigNameRequiredException` (HTTP 400). See
+/// [`APPLICATION_NAME_MISSING`].
+pub const DEPLOYMENT_CONFIG_NAME_MISSING: &str = "Deployment configuration name is missing";
+
+/// `DeploymentIdRequiredException` (HTTP 400). See [`APPLICATION_NAME_MISSING`].
+pub const DEPLOYMENT_ID_MISSING: &str = "Deployment ID is missing";
+
+/// `InstanceNameRequiredException` (HTTP 400). See [`APPLICATION_NAME_MISSING`].
+pub const INSTANCE_NAME_MISSING: &str = "Instance name is missing";
+
+/// `InstanceIdRequiredException` (HTTP 400). See [`APPLICATION_NAME_MISSING`].
+pub const INSTANCE_ID_MISSING: &str = "Instance ID is missing";
+
+/// `DeploymentTargetIdRequiredException` (HTTP 400). See
+/// [`APPLICATION_NAME_MISSING`].
+pub const DEPLOYMENT_TARGET_ID_MISSING: &str = "Deployment target ID is missing";
+
+/// `RoleRequiredException` (HTTP 400). See [`APPLICATION_NAME_MISSING`].
+pub const ROLE_MISSING: &str = "Service role ARN is missing";
+
+/// `ResourceArnRequiredException` (HTTP 400). See [`APPLICATION_NAME_MISSING`].
+pub const RESOURCE_ARN_MISSING: &str = "Resource ARN is missing";
+
+/// `RevisionRequiredException` (HTTP 400). See [`APPLICATION_NAME_MISSING`].
+pub const REVISION_MISSING: &str = "Revision is missing";
+
 /// The `DeploymentCreator` value for a deployment a client asked for, as opposed
 /// to one an auto-scaling event or a rollback created
 /// (`smithy_query(query="shape",shape="DeploymentCreator")`).

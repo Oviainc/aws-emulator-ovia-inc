@@ -290,7 +290,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 CreateDeploymentErrorModeled::DeploymentGroupNameRequiredException(
                     DeploymentGroupNameRequiredException {
-                        message: Some("The deployment group name was not specified".to_string()),
+                        message: Some(crate::state::DEPLOYMENT_GROUP_NAME_MISSING.to_string()),
                     },
                 )
                 .into(),
@@ -333,7 +333,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let Some(application) = state.applications.get(&application_name) else {
                 return Err(CreateDeploymentErrorModeled::ApplicationDoesNotExistException(
                     ApplicationDoesNotExistException {
-                        message: Some(format!("No application found for name {application_name}")),
+                        message: Some(crate::state::application_not_found(&application_name)),
                     },
                 ));
             };
@@ -341,9 +341,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(
                     CreateDeploymentErrorModeled::DeploymentGroupDoesNotExistException(
                         DeploymentGroupDoesNotExistException {
-                            message: Some(format!(
-                                "No deployment group found for name {deployment_group_name} in \
-                                 application {application_name}"
+                            message: Some(crate::state::deployment_group_not_found(
+                                &deployment_group_name,
                             )),
                         },
                     ),
@@ -381,8 +380,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         return Err(
                             CreateDeploymentErrorModeled::DeploymentConfigDoesNotExistException(
                                 DeploymentConfigDoesNotExistException {
-                                    message: Some(format!(
-                                        "No deployment configuration found for name {name}"
+                                    message: Some(crate::state::deployment_config_not_found(
+                                        &name,
                                     )),
                                 },
                             ),
@@ -404,7 +403,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let Some(revision) = requested_revision else {
                 return Err(CreateDeploymentErrorModeled::RevisionRequiredException(
                     RevisionRequiredException {
-                        message: Some("The revision was not specified".to_string()),
+                        message: Some(crate::state::REVISION_MISSING.to_string()),
                     },
                 ));
             };

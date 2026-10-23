@@ -45,91 +45,161 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
-/// Which modelled error CodeDeploy answers for a refused input member: the code
-/// for an ABSENT (or empty) value, and the code for a value that is present but
-/// not one the service accepts. `None` in either position means this service
-/// models no such code for that member, so the framework's default wording
-/// stands for that case.
+/// The answer for a member the request did not give: the modelled error's code,
+/// and the fixed sentence that error carries.
+type AbsentAnswer = Option<(&'static str, &'static str)>;
+
+/// The modelled error's code for a value that is present but not one the service
+/// accepts; the message stays the clause the framework built from the request.
+type InvalidAnswer = Option<&'static str>;
+
+/// What CodeDeploy answers for a refused input member: the modelled error for an
+/// ABSENT (or empty) value — with the fixed sentence that error carries — and
+/// the modelled error for a value that is present but not one the service
+/// accepts. `None` in either position means this service models no such error
+/// for that member, so the framework's default wording stands for that case.
 ///
-/// Every code here is a shape this service's model declares for the operations
+/// A `…RequiredException` means "you did not give me this", which is a fact
+/// about the REQUEST AS A WHOLE and not about the shape of a value, so its
+/// message is the error's own sentence (held beside the rest of this service's
+/// client-error wording in [`crate::state`]) and never the constraint
+/// validator's "Value '' at '<member>' failed to satisfy constraint …" clause.
+/// An `Invalid…Exception` IS about the value, so it keeps the clause the
+/// framework built from the request: that clause names the member and the
+/// constraint it failed, which is what the caller has to fix.
+///
+/// Every error here is a shape this service's model declares for the operations
 /// carrying that member — see the crate root's `OPERATIONS.md`, which lists each
 /// operation's errors.
-const REFUSAL_CODES: &[(&str, Option<&str>, Option<&str>)] = &[
+const REFUSAL_CODES: &[(&str, AbsentAnswer, InvalidAnswer)] = &[
     (
         "applicationName",
-        Some("ApplicationNameRequiredException"),
+        Some((
+            "ApplicationNameRequiredException",
+            crate::state::APPLICATION_NAME_MISSING,
+        )),
         Some("InvalidApplicationNameException"),
     ),
     (
         "applicationNames",
-        Some("ApplicationNameRequiredException"),
+        Some((
+            "ApplicationNameRequiredException",
+            crate::state::APPLICATION_NAME_MISSING,
+        )),
         Some("InvalidApplicationNameException"),
     ),
     (
         "deploymentGroupName",
-        Some("DeploymentGroupNameRequiredException"),
+        Some((
+            "DeploymentGroupNameRequiredException",
+            crate::state::DEPLOYMENT_GROUP_NAME_MISSING,
+        )),
         Some("InvalidDeploymentGroupNameException"),
     ),
     (
         "deploymentGroupNames",
-        Some("DeploymentGroupNameRequiredException"),
+        Some((
+            "DeploymentGroupNameRequiredException",
+            crate::state::DEPLOYMENT_GROUP_NAME_MISSING,
+        )),
         Some("InvalidDeploymentGroupNameException"),
     ),
     (
         "deploymentConfigName",
-        Some("DeploymentConfigNameRequiredException"),
+        Some((
+            "DeploymentConfigNameRequiredException",
+            crate::state::DEPLOYMENT_CONFIG_NAME_MISSING,
+        )),
         Some("InvalidDeploymentConfigNameException"),
     ),
     (
         "deploymentId",
-        Some("DeploymentIdRequiredException"),
+        Some((
+            "DeploymentIdRequiredException",
+            crate::state::DEPLOYMENT_ID_MISSING,
+        )),
         Some("InvalidDeploymentIdException"),
     ),
     (
         "deploymentIds",
-        Some("DeploymentIdRequiredException"),
+        Some((
+            "DeploymentIdRequiredException",
+            crate::state::DEPLOYMENT_ID_MISSING,
+        )),
         Some("InvalidDeploymentIdException"),
     ),
     (
         "instanceName",
-        Some("InstanceNameRequiredException"),
+        Some((
+            "InstanceNameRequiredException",
+            crate::state::INSTANCE_NAME_MISSING,
+        )),
         Some("InvalidInstanceNameException"),
     ),
     (
         "instanceNames",
-        Some("InstanceNameRequiredException"),
+        Some((
+            "InstanceNameRequiredException",
+            crate::state::INSTANCE_NAME_MISSING,
+        )),
         Some("InvalidInstanceNameException"),
     ),
-    ("instanceId", Some("InstanceIdRequiredException"), None),
-    ("instanceIds", Some("InstanceIdRequiredException"), None),
+    (
+        "instanceId",
+        Some((
+            "InstanceIdRequiredException",
+            crate::state::INSTANCE_ID_MISSING,
+        )),
+        None,
+    ),
+    (
+        "instanceIds",
+        Some((
+            "InstanceIdRequiredException",
+            crate::state::INSTANCE_ID_MISSING,
+        )),
+        None,
+    ),
     (
         "targetId",
-        Some("DeploymentTargetIdRequiredException"),
+        Some((
+            "DeploymentTargetIdRequiredException",
+            crate::state::DEPLOYMENT_TARGET_ID_MISSING,
+        )),
         Some("InvalidDeploymentTargetIdException"),
     ),
     (
         "targetIds",
-        Some("DeploymentTargetIdRequiredException"),
+        Some((
+            "DeploymentTargetIdRequiredException",
+            crate::state::DEPLOYMENT_TARGET_ID_MISSING,
+        )),
         Some("InvalidDeploymentTargetIdException"),
     ),
     (
         "serviceRoleArn",
-        Some("RoleRequiredException"),
+        Some(("RoleRequiredException", crate::state::ROLE_MISSING)),
         Some("InvalidRoleException"),
     ),
     (
+        // The framework reports a violated member by its lowerCamel name, even
+        // where the model spells it capitalised (`ResourceArn` on TagResource /
+        // UntagResource / ListTagsForResource).
         "resourceArn",
-        Some("ResourceArnRequiredException"),
+        Some((
+            "ResourceArnRequiredException",
+            crate::state::RESOURCE_ARN_MISSING,
+        )),
         Some("InvalidArnException"),
     ),
     (
         "revision",
-        Some("RevisionRequiredException"),
+        Some(("RevisionRequiredException", crate::state::REVISION_MISSING)),
         Some("InvalidRevisionException"),
     ),
     (
         "revisions",
-        Some("RevisionRequiredException"),
+        Some(("RevisionRequiredException", crate::state::REVISION_MISSING)),
         Some("InvalidRevisionException"),
     ),
     // Value-set members: a refusal can only ever be "not one of the values".
@@ -178,7 +248,18 @@ const REFUSAL_CODES: &[(&str, Option<&str>, Option<&str>)] = &[
     // boundary at all and there is nothing here to word.
 ];
 
-/// The code [`EmulatedService::override_refusal`] answers for `member` failing
+/// What this service answers for ONE refused member: the code a client branches
+/// on, and the sentence to state it with.
+struct RefusalAnswer {
+    /// The modelled error shape's name.
+    code: &'static str,
+    /// The fixed sentence that error owns, for a member the request did not
+    /// give. `None` keeps the clause the framework built from the request, which
+    /// is the right answer for a value that is present but unacceptable.
+    sentence: Option<&'static str>,
+}
+
+/// The error [`EmulatedService::override_refusal`] answers for `member` failing
 /// `kind`.
 ///
 /// A member absent from the request and one sent empty are the SAME refusal to
@@ -186,7 +267,7 @@ const REFUSAL_CODES: &[(&str, Option<&str>, Option<&str>)] = &[
 /// minimum failure maps to the member's `…RequiredException` alongside an absent
 /// one; every other constraint failure means the value itself is not one the
 /// service accepts.
-fn refusal_code(member: &str, kind: &ViolationKind) -> Option<&'static str> {
+fn refusal_answer(member: &str, kind: &ViolationKind) -> Option<RefusalAnswer> {
     let absent = matches!(
         kind,
         ViolationKind::MissingRequiredMember | ViolationKind::MinLength(_)
@@ -195,9 +276,16 @@ fn refusal_code(member: &str, kind: &ViolationKind) -> Option<&'static str> {
         .iter()
         .find(|(name, _, _)| *name == member)?;
     if absent {
-        *for_absent
+        let (code, sentence) = (*for_absent)?;
+        Some(RefusalAnswer {
+            code,
+            sentence: Some(sentence),
+        })
     } else {
-        *for_invalid
+        Some(RefusalAnswer {
+            code: (*for_invalid)?,
+            sentence: None,
+        })
     }
 }
 
@@ -268,12 +356,15 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // (`includeOnlyStatuses.1.member`), so the root segment is the member the
         // caller sent.
         let member = violation.path.split('.').next()?;
-        let code = refusal_code(member, &violation.kind)?;
+        let answer = refusal_answer(member, &violation.kind)?;
         Some(Refused {
-            code: code.to_string(),
-            // The clause the framework built from the request: it names the member
-            // and the constraint it failed, which is what a caller has to fix.
-            message: violation.message(),
+            code: answer.code.to_string(),
+            // A required-member error carries its OWN sentence; anything else
+            // keeps the clause the framework built from the request, which names
+            // the member and the constraint it failed.
+            message: answer
+                .sentence
+                .map_or_else(|| violation.message(), str::to_string),
         })
     }
 

@@ -180,7 +180,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 BatchGetDeploymentsErrorModeled::DeploymentIdRequiredException(
                     DeploymentIdRequiredException {
-                        message: Some("At least one deployment ID must be specified".to_string()),
+                        message: Some(crate::state::DEPLOYMENT_ID_MISSING.to_string()),
                     },
                 )
                 .into(),

@@ -152,9 +152,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 BatchGetApplicationsErrorModeled::ApplicationNameRequiredException(
                     ApplicationNameRequiredException {
-                        message: Some(
-                            "At least one application name must be specified".to_string(),
-                        ),
+                        message: Some(crate::state::APPLICATION_NAME_MISSING.to_string()),
                     },
                 )
                 .into(),
@@ -196,7 +194,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let applications_info = found.map_err(|missing| {
             BatchGetApplicationsErrorModeled::ApplicationDoesNotExistException(
                 ApplicationDoesNotExistException {
-                    message: Some(format!("No application found for name {missing}")),
+                    message: Some(crate::state::application_not_found(&missing)),
                 },
             )
         })?;
