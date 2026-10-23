@@ -21,3 +21,5 @@ mod state_roundtrip;
 mod validation_messages;
 #[path = "all/worker_configuration_create_and_describe.rs"]
 mod worker_configuration_create_and_describe;
+#[path = "all/worker_configuration_delete_and_tags.rs"]
+mod worker_configuration_delete_and_tags;

@@ -75,6 +75,8 @@ mod mlflow_app_lifecycle;
 mod mlflow_tracking_server;
 #[path = "all/model_card_deletion.rs"]
 mod model_card_deletion;
+#[path = "all/model_card_export_jobs.rs"]
+mod model_card_export_jobs;
 #[path = "all/model_card_governance.rs"]
 mod model_card_governance;
 #[path = "all/model_card_updates.rs"]

@@ -1,16 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeModelCardExportJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeModelCardExportJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: replays the export job `CreateModelCardExportJob` stored under the ARN
+//! this request names, materialising the terminal status the clock already owes it
+//! (`crate::state::ModelCardExportJob::settle_status`) and refusing an ARN the store
+//! does not hold with the modelled `ResourceNotFound`. This is the ONLY file to touch
+//! for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeModelCardExportJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
-//!
+//! No `ExportArtifacts` is reported: nothing rendered the model card PDF, so there is no
+//! object to name — see `crate::state::MODEL_CARD_EXPORT_NOT_RUN_FAILURE`.
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -161,18 +159,67 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeModelCardExportJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeModelCardExportJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeModelCardExportJob"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        // A job is resolved by ARN alone; the store is keyed by the card and job names
+        // that ARN carries, and the ARN's own partition, service, Region and account are
+        // checked against this request's, so an ARN naming another Region or account
+        // names no job here. A value that names no job of this service resolves to no
+        // key, and is refused exactly like an ARN the store does not hold.
+        let key = crate::state::model_card_export_job_key_from_arn(
+            &input.model_card_export_job_arn,
+            &crate::state::request_region(ctx),
+        );
+        let not_found = || {
+            DescribeModelCardExportJobErrorModeled::ResourceNotFound(ResourceNotFound {
+                // Built from the request: SageMaker names the ARN it was asked about and
+                // says no more.
+                message: Some(format!(
+                    "{} does not exist",
+                    input.model_card_export_job_arn
+                )),
+            })
+        };
+        let Some(key) = key else {
+            return Err(not_found().into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        let Some(job) = store.model_card_export_jobs.get_mut(&key) else {
+            // Never a 200 with empty fields: a caller cannot tell that from a job that
+            // exists and carries nothing.
+            return Err(not_found().into());
+        };
+
+        // The one write this reporting operation makes: the move out of `InProgress` was
+        // due at the stored instant whether or not anybody described the job, so the
+        // observer makes no difference to what a later caller sees.
+        let settled = job.settle_status(now);
+        let output = DescribeModelCardExportJobOutput {
+            model_card_export_job_name: job.name.clone(),
+            model_card_export_job_arn: job.arn.clone(),
+            status: job.status.clone(),
+            model_card_name: job.card_name.clone(),
+            // The version the create RESOLVED, replayed rather than recomputed, so a card
+            // that has gained versions since does not change what this job exported.
+            model_card_version: job.card_version,
+            output_config: job.output_config.clone(),
+            created_at: crate::state::timestamp(job.created_at),
+            last_modified_at: crate::state::timestamp(job.last_modified_at),
+            failure_reason: job.failure_reason.clone(),
+            // Nothing rendered the card's PDF, so there is no artifact to name: the
+            // optional member stays absent rather than pointing at an object nothing
+            // wrote.
+            export_artifacts: None,
+        };
+        let arn = job.arn.clone();
+        drop(store);
+
+        if settled {
+            crate::state::record_state_change(Self::NAME, &arn, ctx);
+        }
+        Ok(output)
     }
 }

@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeGameSessionQueues
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeGameSessionQueues`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeGameSessionQueues::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the stored game session queues: all of them, or the ones the request names,
+//! as a page of the collection.
 //!
 //! ## Shape of an operation
 //!
@@ -159,20 +153,103 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeGameSessionQueues` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeGameSessionQueuesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeGameSessionQueues"))
+        let invalid = |message: String| -> Self::Error {
+            DescribeGameSessionQueuesErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(message),
+                },
+            )
+            .into()
+        };
+
+        // `Limit`'s doc: "You can request up to 50 results." The modelled
+        // `PositiveInteger` range bounds it only below, so the documented maximum is
+        // refused here — before any state is locked and before a single record is cloned,
+        // so the size of the response can never be driven by the size of the request.
+        if let Some(limit) = input.limit {
+            if limit > MAX_RESULTS_PER_PAGE {
+                return Err(invalid(format!(
+                    "Limit asks for {limit} results; up to {MAX_RESULTS_PER_PAGE} can be \
+                     requested."
+                )));
+            }
+        }
+
+        // The model bounds `GameSessionQueueNameOrArnList` neither above nor below, and
+        // each ARN in it is resolved by a scan of the queue store, so the work one
+        // request can ask for is the PRODUCT of the list length and the stored queue
+        // count. Refuse an oversized list here too, for the same reason and in the same
+        // place as `DescribeFleetAttributes` refuses an oversized `FleetIds`: before the
+        // shared state is locked, so no caller-sized walk runs under that lock.
+        if let Some(names) = input.names.as_ref() {
+            if names.len() > crate::state::MAX_QUEUE_NAMES_PER_REQUEST {
+                return Err(invalid(format!(
+                    "Names names {} queue identifiers; the maximum allowed number is {}.",
+                    names.len(),
+                    crate::state::MAX_QUEUE_NAMES_PER_REQUEST
+                )));
+            }
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                DescribeGameSessionQueuesErrorModeled::InternalServiceException(
+                    InternalServiceException {
+                        message: Some("the GameLift emulator state is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let mut state = state.lock();
+        state.tick(::std::time::SystemTime::now());
+
+        // "A list of queue names to retrieve information for. You can use either the
+        // queue ID or ARN value. To request settings for all queues, leave this parameter
+        // empty." A name that selects nothing — "objects are returned only for queues
+        // that currently exist in the Region" — is simply absent from the page, so a
+        // client polling this operation to learn whether a queue exists reads an empty
+        // page rather than a thrown `NotFoundException`.
+        let requested: Option<::std::collections::HashSet<String>> =
+            input.names.as_ref().map(|names| {
+                names
+                    .iter()
+                    .filter_map(|name_or_arn| state.resolve_queue_name(name_or_arn))
+                    .collect()
+            });
+        // Paged out of the creation-ordered collection either way: unlike
+        // `DescribeFleetAttributes`, neither `Limit` nor `NextToken` documents a carve-out
+        // for a request that names its resources, so a named describe pages too.
+        let queues: Vec<GameSessionQueue> = state
+            .game_session_queues_in_order()
+            .into_iter()
+            .filter(|queue| {
+                requested
+                    .as_ref()
+                    .is_none_or(|selected| selected.contains(&queue.name))
+            })
+            .map(crate::state::GameSessionQueueRecord::to_modelled)
+            .collect();
+
+        let Some((page, next_token)) = crate::state::paginate(
+            crate::state::PageKind::GameSessionQueues,
+            &queues,
+            input.limit,
+            input.next_token.as_deref(),
+        ) else {
+            return Err(invalid(
+                "NextToken is not a pagination token this service issued.".to_string(),
+            ));
+        };
+        Ok(DescribeGameSessionQueuesOutput {
+            game_session_queues: Some(page),
+            next_token,
+        })
     }
 }
+
+/// How many queues one page may hold: `Limit`'s own doc — "You can request up to 50
+/// results."
+const MAX_RESULTS_PER_PAGE: i32 = 50;

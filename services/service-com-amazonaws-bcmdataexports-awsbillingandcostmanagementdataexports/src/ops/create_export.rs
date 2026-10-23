@@ -196,8 +196,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "The QueryStatement is an SQL statement. Data Exports only supports a limited
         // subset of the SQL syntax. … To view the available tables and columns, see the
         // Data Exports table dictionary" (the modelled doc for `Export`, quoted above):
-        // a query naming a table this service does not publish can never be served, so it
-        // is refused rather than persisted. See `crate::state::query`.
+        // a statement this service cannot read as a query over the tables it publishes —
+        // text that does not parse, a statement that is not a single SELECT, or one naming
+        // a table outside the catalog — can never be served, so it is refused rather than
+        // persisted. See `crate::state::query`.
         crate::state::validate_data_query(&input.export.data_query, false).map_err(
             |refusal| match refusal {
                 crate::state::QueryRefusal::Invalid(invalid) => {

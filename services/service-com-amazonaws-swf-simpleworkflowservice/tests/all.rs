@@ -21,6 +21,8 @@ mod count_open_workflow_executions;
 mod count_pending_decision_tasks;
 #[path = "all/delete_workflow_type.rs"]
 mod delete_workflow_type;
+#[path = "all/deprecate_activity_type.rs"]
+mod deprecate_activity_type;
 #[path = "all/deprecate_workflow_type.rs"]
 mod deprecate_workflow_type;
 #[path = "all/domain_deprecation.rs"]

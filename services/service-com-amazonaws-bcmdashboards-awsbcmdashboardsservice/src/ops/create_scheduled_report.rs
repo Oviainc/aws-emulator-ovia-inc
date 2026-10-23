@@ -253,7 +253,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // health to report: both stay unset until an execution sets them.
             last_execution_at: None,
             health_status: None,
-            // Persisted at create time so the tagging operations have state to read.
+            // Persisted at create time, as the tag list every tagging operation
+            // reads and writes.
             resource_tags: input.resource_tags.unwrap_or_default(),
         };
         state.scheduled_reports.insert(arn.clone(), record);

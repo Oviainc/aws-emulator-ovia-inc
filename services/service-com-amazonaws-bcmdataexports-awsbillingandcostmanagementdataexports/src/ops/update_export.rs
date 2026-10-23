@@ -197,10 +197,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "Updates an existing data export by overwriting all export parameters. All
         // export parameters must be specified in the UpdateExport request" (smithy_query
-        // operation `UpdateExport`): the submitted query is validated against the table
-        // catalog, and because the update REPLACES the definition rather than merging into
-        // it, each named table that publishes table properties must restate its
-        // `TableConfigurations` entry. See `crate::state::query`.
+        // operation `UpdateExport`): the submitted query is validated against the SQL
+        // subset this service publishes and the table catalog, and because the update
+        // REPLACES the definition rather than merging into it, each named table that
+        // publishes table properties must restate its `TableConfigurations` entry. See
+        // `crate::state::query`.
         crate::state::validate_data_query(&input.export.data_query, true).map_err(
             |refusal| match refusal {
                 crate::state::QueryRefusal::Invalid(invalid) => {

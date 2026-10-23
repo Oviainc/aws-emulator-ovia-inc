@@ -31,7 +31,8 @@ pub struct ComAmazonawsGuarddutyGuarddutyapiserviceState {
     /// Everything a detector owns is bounded in turn
     /// ([`MAX_MEMBERS_PER_DETECTOR`], [`MAX_FILTERS_PER_ACCOUNT_PER_REGION`],
     /// [`IP_SETS_PER_DETECTOR`] plus [`DELETED_IP_SETS_RETAINED`],
-    /// [`THREAT_INTEL_SETS_PER_DETECTOR`]), so the whole map is finite whatever a
+    /// [`THREAT_INTEL_SETS_PER_DETECTOR`],
+    /// [`THREAT_ENTITY_SETS_PER_DETECTOR`]), so the whole map is finite whatever a
     /// caller sends.
     pub detectors: HashMap<String, Detector>,
     /// `ClientToken` -> the detector a `CreateDetector` minted under it, so a
@@ -1466,6 +1467,16 @@ pub struct Detector {
     /// (`smithy_query(operation="CreateTrustedEntitySet")`) — so
     /// `DeleteDetector` drops them with it.
     pub trusted_entity_sets: BTreeMap<String, EntitySetRecord>,
+    /// This detector's threat entity sets, keyed by the minted entity-set id.
+    /// They hang off the detector like the trusted entity sets above — every
+    /// operation on one is reached through
+    /// `/detector/{DetectorId}/threatentityset`
+    /// (`smithy_query(operation="CreateThreatEntitySet")`) — so `DeleteDetector`
+    /// drops them with it.
+    ///
+    /// BOUNDED by [`THREAT_ENTITY_SETS_PER_DETECTOR`], which
+    /// `CreateThreatEntitySet` enforces before it writes.
+    pub threat_entity_sets: BTreeMap<String, EntitySetRecord>,
     /// This detector's IPSets (trusted IP lists), keyed by the minted `IpSetId`.
     /// They are sub-resources of the detector — every IPSet operation is bound
     /// under `/detector/{DetectorId}/ipset`
@@ -1698,6 +1709,19 @@ impl Detector {
     /// `ClientToken`.
     pub fn trusted_entity_set_for_token(&self, token: &str) -> Option<&EntitySetRecord> {
         self.trusted_entity_sets
+            .values()
+            .find(|set| set.client_token.as_deref() == Some(token))
+    }
+
+    /// The threat entity set a create already minted for `token`, if any — the
+    /// seam that makes `CreateThreatEntitySet` idempotent under a replayed
+    /// `ClientToken`.
+    ///
+    /// Scoped to the THREAT sets: a token resolves to a resource of the type the
+    /// create that carried it made, so one token replayed across the two
+    /// entity-set creates never hands back the other one's id.
+    pub fn threat_entity_set_for_token(&self, token: &str) -> Option<&EntitySetRecord> {
+        self.threat_entity_sets
             .values()
             .find(|set| set.client_token.as_deref() == Some(token))
     }
@@ -2239,6 +2263,12 @@ pub const ENTITY_SET_TRANSITION_MILLIS: i64 = 500;
 /// `trustedEntitySetId`). It is what a rejection names.
 pub const TRUSTED_ENTITY_SET_ID_MEMBER: &str = "trustedEntitySetId";
 
+/// The wire name of the `ThreatEntitySetId` member, as the request carries it in
+/// its URI label and the create reports it
+/// (`smithy_query(operation="GetThreatEntitySet")` renders the `jsonName`
+/// `threatEntitySetId`). It is what a rejection names.
+pub const THREAT_ENTITY_SET_ID_MEMBER: &str = "threatEntitySetId";
+
 /// The wire name of the `Name` member an entity-set create carries
 /// (`jsonName` `name`), for the same reason.
 pub const ENTITY_SET_NAME_MEMBER: &str = "name";
@@ -2253,6 +2283,36 @@ pub const ENTITY_SET_LOCATION_MEMBER: &str = "location";
 /// off the detector, which is the account/Region-level resource.
 pub const TRUSTED_ENTITY_SET_ALREADY_EXISTS_MESSAGE: &str =
     "The request is rejected because a trusted entity set already exists for the input detectorId.";
+
+/// How many threat entity sets one detector may hold.
+///
+/// Unlike a trusted entity set, of which "at any given time, you can have only
+/// one" (`smithy_query(query="doc",shape="CreateTrustedEntitySet")`), AWS
+/// documents no such rule for a threat entity set
+/// (`smithy_query(query="doc",shape="CreateThreatEntitySet")`), so a detector may
+/// hold several.
+///
+/// This ceiling is therefore EMULATOR-CHOSEN, not a published threat-entity-set
+/// quota: it reuses the number AWS publishes for the account's threat lists in a
+/// Region ([`THREAT_INTEL_SETS_PER_DETECTOR`]) because an entity set is the same
+/// kind of uploaded list under a newer API, and a detector is the account's
+/// single resource in a Region. Read it as "the emulator holds this many", never
+/// as a documented AWS limit.
+///
+/// A ceiling of some kind is what BOUNDS this store: without it a caller varying
+/// or omitting `ClientToken` would grow [`Detector::threat_entity_sets`] by one
+/// entry per request, and the `@idempotencyToken` scan over it
+/// ([`Detector::threat_entity_set_for_token`]) would grow with it.
+pub const THREAT_ENTITY_SETS_PER_DETECTOR: usize = THREAT_INTEL_SETS_PER_DETECTOR;
+
+/// The message a `CreateThreatEntitySet` past
+/// [`THREAT_ENTITY_SETS_PER_DETECTOR`] is refused with. It names the limit, never
+/// the caller's values.
+pub fn threat_entity_set_limit_message() -> String {
+    format!(
+        "The request is rejected because the account has reached the limit of {THREAT_ENTITY_SETS_PER_DETECTOR} threat entity sets."
+    )
+}
 
 /// Does `name` hold only the characters an entity-set `Name` may contain?
 ///
@@ -2354,6 +2414,56 @@ pub struct EntitySetRecord {
 }
 
 impl EntitySetRecord {
+    /// An entity set created at `now`: the record BOTH entity-set creates store,
+    /// so the trusted and the threat set cannot drift on what a create persists.
+    /// It is the entity-set counterpart of [`IpSetRecord::created`].
+    ///
+    /// `Activate` is "a boolean value that indicates whether GuardDuty should
+    /// start using the uploaded threat entity set to generate findings"
+    /// (`smithy_query(query="doc",shape="CreateThreatEntitySetRequest",member="Activate")`):
+    /// a set the caller asked to activate is not in use yet, so it starts in the
+    /// transitional [`ENTITY_SET_ACTIVATING`] and the clock owes it
+    /// [`ENTITY_SET_ACTIVE`] at [`ENTITY_SET_TRANSITION_MILLIS`], while one the
+    /// caller did not ask to activate is stored unused — [`ENTITY_SET_INACTIVE`],
+    /// which is settled, so nothing is owed on it until an update activates it.
+    ///
+    /// Nothing failed, so a created set carries no [`Self::error_details`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn created(
+        id: String,
+        name: String,
+        format: String,
+        location: String,
+        expected_bucket_owner: Option<String>,
+        tags: BTreeMap<String, String>,
+        activate: bool,
+        client_token: Option<String>,
+        now: i64,
+    ) -> Self {
+        let (status, status_due_millis) = if activate {
+            (
+                ENTITY_SET_ACTIVATING,
+                Some(now.saturating_add(ENTITY_SET_TRANSITION_MILLIS)),
+            )
+        } else {
+            (ENTITY_SET_INACTIVE, None)
+        };
+        Self {
+            id,
+            name,
+            format,
+            location,
+            expected_bucket_owner,
+            tags,
+            client_token,
+            status: status.to_string(),
+            status_due_millis,
+            created_at_millis: now,
+            updated_at_millis: now,
+            error_details: None,
+        }
+    }
+
     /// Apply the status change the CLOCK already made due, if any.
     ///
     /// The move out of [`ENTITY_SET_ACTIVATING`] was owed at

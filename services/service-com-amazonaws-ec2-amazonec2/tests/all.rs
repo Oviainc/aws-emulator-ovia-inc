@@ -74,6 +74,8 @@ mod mac_dedicated_hosts;
 mod modify_subnet_attribute;
 #[path = "all/network_performance_data.rs"]
 mod network_performance_data;
+#[path = "all/placement_groups.rs"]
+mod placement_groups;
 #[path = "all/secondary_networks.rs"]
 mod secondary_networks;
 #[path = "all/secondary_subnets.rs"]
@@ -99,6 +101,8 @@ mod transit_gateway_lifecycle;
 mod verified_access_trust_providers;
 #[path = "all/volume_lifecycle.rs"]
 mod volume_lifecycle;
+#[path = "all/volume_modifications.rs"]
+mod volume_modifications;
 #[path = "all/vpc_attributes.rs"]
 mod vpc_attributes;
 #[path = "all/vpc_block_public_access_exclusions.rs"]
