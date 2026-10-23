@@ -84,6 +84,8 @@ mod local_gateway_route_table_virtual_interface_group_associations;
 mod mac_dedicated_hosts;
 #[path = "all/modify_subnet_attribute.rs"]
 mod modify_subnet_attribute;
+#[path = "all/network_insights_access_scope_analyses.rs"]
+mod network_insights_access_scope_analyses;
 #[path = "all/network_performance_data.rs"]
 mod network_performance_data;
 #[path = "all/placement_groups.rs"]
