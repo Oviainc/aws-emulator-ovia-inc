@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetPortfolioPreferences
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetPortfolioPreferences`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetPortfolioPreferences::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the account's migration and modernization preferences: the one
+//! [`crate::state::PortfolioPreferences`] record `PutPortfolioPreferences` saved, member
+//! for member. `@readonly`, and nothing here is owed by the clock, so the store is only
+//! read — running this operation changes nothing a later caller sees.
+//!
+//! An account where no save has ever run holds no such record, so the read answers this
+//! operation's modelled `ResourceNotFoundException` (HTTP 404) rather than a 200 whose
+//! every member is absent.
 //!
 //! ## Shape of an operation
 //!
@@ -146,18 +146,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetPortfolioPreferences` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetPortfolioPreferencesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetPortfolioPreferences"))
+        // The operation models no input members, so there is nothing a caller could have
+        // sent wrongly and no validation refusal to reach.
+        let _ = (&input, ctx);
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetPortfolioPreferencesErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "the migrationhub-strategy portfolio preferences store is unavailable"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // A read, and only a read: the answer is the record `PutPortfolioPreferences`
+        // stored, reported through that record's own conversion so the two operations
+        // cannot drift apart.
+        let saved = state.lock().portfolio_preferences.clone();
+        match saved {
+            Some(preferences) => Ok(preferences.to_output()),
+            // Nothing has been saved for this account, so there is no preferences record
+            // to report: the absent resource is answered with this operation's modelled
+            // not-found (HTTP 404) rather than with empty fields.
+            None => Err(GetPortfolioPreferencesErrorModeled::ResourceNotFoundException(
+                crate::state::no_portfolio_preferences(),
+            )
+            .into()),
+        }
     }
 }

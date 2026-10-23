@@ -220,10 +220,10 @@ async fn a_declared_rule_is_refused_with_the_services_one_validation_message() {
 /// A request at each published bound is NOT refused: the one message is the answer to a
 /// genuine constraint failure, not to every request.
 ///
-/// `PutPortfolioPreferences` is still scaffolded, so a request it accepts answers the
-/// scaffold's 501 rather than a 200 — which is exactly the point: the boundary validator
-/// let it through to the handler. The assertion is therefore "not a validation refusal",
-/// which both operations satisfy in their own way.
+/// The assertion is "not a validation refusal", so it holds whatever the operation then
+/// does with the request it accepted: the point of the table is that the boundary
+/// validator let it through to the handler. (`PutPortfolioPreferences` now saves it and
+/// answers 200 — the round trip itself is pinned in `portfolio_preferences.rs`.)
 #[tokio::test]
 async fn a_value_at_a_published_bound_is_not_refused() {
     let router = emulator();

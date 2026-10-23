@@ -17,14 +17,19 @@
 //! Beside them sits the account's **server inventory** ([`ServerRecord`]), which
 //! `ListServers` reports: the servers an import file task ingested, each carrying the
 //! import groups it came in with.
+//!
+//! And beside those, the account's one **portfolio preferences** record
+//! ([`PortfolioPreferences`]): what `PutPortfolioPreferences` saves and
+//! `GetPortfolioPreferences` reports, member for member.
 
 use std::collections::BTreeMap;
 use std::ops::Bound;
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    AssessmentTarget, DataCollectionDetails, GetImportFileTaskOutput, Group,
-    ImportFileTaskInformation, OSInfo, RecommendationSet, ResourceNotFoundException, ServerDetail,
+    ApplicationPreferences, AssessmentTarget, DataCollectionDetails, DatabasePreferences,
+    GetImportFileTaskOutput, GetPortfolioPreferencesOutput, Group, ImportFileTaskInformation,
+    OSInfo, PrioritizeBusinessGoals, RecommendationSet, ResourceNotFoundException, ServerDetail,
     ServerError, SystemInfo, ValidationException,
 };
 
@@ -480,6 +485,43 @@ impl ServerRecord {
     }
 }
 
+/// The account's migration and modernization preferences, as `PutPortfolioPreferences`
+/// saved them and `GetPortfolioPreferences` reports them.
+///
+/// One record per account — the API names no id and takes no input on the read, so there
+/// is exactly one of these in the store. `PutPortfolioPreferences` *saves* the
+/// preferences, so the record it writes is the whole of the request: a member the request
+/// leaves out is not set afterwards, however an earlier call left it. Every member is
+/// optional in both directions, so a preference nobody expressed comes back absent rather
+/// than as a default nothing chose.
+#[derive(Debug, Clone, Default)]
+pub struct PortfolioPreferences {
+    /// `PutPortfolioPreferencesRequest$prioritizeBusinessGoals`.
+    pub prioritize_business_goals: Option<PrioritizeBusinessGoals>,
+    /// `PutPortfolioPreferencesRequest$applicationPreferences`.
+    pub application_preferences: Option<ApplicationPreferences>,
+    /// `PutPortfolioPreferencesRequest$databasePreferences`.
+    pub database_preferences: Option<DatabasePreferences>,
+    /// `PutPortfolioPreferencesRequest$applicationMode`, one of `ApplicationMode`'s
+    /// values ([`APPLICATION_MODE_VALUES`](crate::ops::types::APPLICATION_MODE_VALUES)).
+    pub application_mode: Option<String>,
+}
+
+impl PortfolioPreferences {
+    /// The `GetPortfolioPreferences` answer: this record, member for member.
+    ///
+    /// The read reports what the save stored and derives nothing, so the two operations
+    /// cannot drift apart.
+    pub fn to_output(&self) -> GetPortfolioPreferencesOutput {
+        GetPortfolioPreferencesOutput {
+            prioritize_business_goals: self.prioritize_business_goals.clone(),
+            application_preferences: self.application_preferences.clone(),
+            database_preferences: self.database_preferences.clone(),
+            application_mode: self.application_mode.clone(),
+        }
+    }
+}
+
 /// Per-service state for com-amazonaws-migrationhubstrategy-awsmigrationhubstrategyrecommendation. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsMigrationhubstrategyAwsmigrationhubstrategyrecommendationState {
@@ -495,6 +537,10 @@ pub struct ComAmazonawsMigrationhubstrategyAwsmigrationhubstrategyrecommendation
     /// The id of the most recently started assessment, which is what
     /// `GetLatestAssessmentId` answers. `None` until one is started.
     pub latest_assessment_id: Option<String>,
+    /// This account's migration and modernization preferences, written by
+    /// `PutPortfolioPreferences` and reported by `GetPortfolioPreferences`. `None` until a
+    /// save stores them: no preference is set in a fresh account.
+    pub portfolio_preferences: Option<PortfolioPreferences>,
     /// The counter both kinds of id are minted from, so no two resources of this
     /// service ever share a suffix.
     pub next_id: u64,
@@ -793,6 +839,22 @@ pub fn assessment_not_found() -> ResourceNotFoundException {
 /// The operation takes no input, so an invalid-request refusal is not a reachable
 /// outcome — there is nothing a caller could have sent wrongly.
 pub fn no_latest_assessment() -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(NOTHING_TO_REPORT.to_string()),
+    }
+}
+
+/// `GetPortfolioPreferences`'s answer in an account where no preferences have ever been
+/// saved: there is no preferences record to report, so the absent resource is reported
+/// with `ResourceNotFoundException` (HTTP 404), the not-found this operation's own error
+/// list carries — never a 200 whose every member is absent, which would claim the account
+/// holds a record nothing wrote.
+///
+/// The operation takes no input, so the message carries nothing from the request: it is
+/// this service's sentence for a report it cannot produce because the resource it would
+/// name does not exist yet ([`NOTHING_TO_REPORT`]), the same one `GetLatestAssessmentId`
+/// answers in an account with no assessment.
+pub fn no_portfolio_preferences() -> ResourceNotFoundException {
     ResourceNotFoundException {
         message: Some(NOTHING_TO_REPORT.to_string()),
     }

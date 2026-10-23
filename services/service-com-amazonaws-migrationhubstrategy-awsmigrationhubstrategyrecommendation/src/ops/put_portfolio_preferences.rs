@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutPortfolioPreferences
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutPortfolioPreferences`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutPortfolioPreferences::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Saves the account's migration and modernization preferences: the request IS the record
+//! this operation stores ([`crate::state::PortfolioPreferences`]), which
+//! `GetPortfolioPreferences` then reports member for member. A save replaces the whole
+//! record rather than merging into it — the operation saves "the specified preferences",
+//! so a member the request leaves out is not set afterwards.
+//!
+//! A value the model declares an enumeration for but the boundary validator lets through
+//! (`applicationMode`, `databaseManagementPreference`, and the target destination /
+//! database engine of each preference union's variant) is refused here with the service's
+//! 400 `ValidationException`, rather than stored and reported back as a preference the
+//! service does not have.
 //!
 //! ## Shape of an operation
 //!
@@ -76,6 +79,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::{invalid_request_body, PortfolioPreferences};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -110,6 +114,103 @@ pub type PutPortfolioPreferencesError = crate::scaffolded::Scaffolded<PutPortfol
 impl From<PutPortfolioPreferencesErrorModeled> for PutPortfolioPreferencesError {
     fn from(modeled: PutPortfolioPreferencesErrorModeled) -> Self {
         crate::scaffolded::Scaffolded::Modeled(modeled)
+    }
+}
+
+/// This operation's refusal of a request the model admits member by member but whose
+/// values this service does not accept, in the service's one wording for an invalid
+/// request body.
+fn refused() -> PutPortfolioPreferencesError {
+    PutPortfolioPreferencesErrorModeled::ValidationException(invalid_request_body()).into()
+}
+
+/// Refuse a value that is not one the named enumeration declares.
+///
+/// An absent member names no value, so it is accepted; enum membership is checked here
+/// because the boundary validator does not enforce it (the same reason `ListServers`
+/// checks its `serverCriteria`).
+fn check_enum(value: Option<&str>, declared: &[&str]) -> Result<(), PutPortfolioPreferencesError> {
+    match value {
+        Some(value) if !declared.contains(&value) => Err(refused()),
+        _ => Ok(()),
+    }
+}
+
+/// Refuse a preference's choice list that is not a single value the enumeration declares.
+///
+/// Every one of these lists is `@length(min: 1, max: 1)` except `Homogeneous`'s, which is
+/// `@length(min: 0, max: 1)` (`smithy_query(query="closure",operation="PutPortfolioPreferences")`),
+/// so `min` is the one thing that differs between them: a preference names at most one
+/// target, and every entry has to be a value its own enumeration declares.
+fn check_choice(
+    values: &[String],
+    declared: &[&str],
+    min: usize,
+) -> Result<(), PutPortfolioPreferencesError> {
+    if values.len() < min || values.len() > 1 {
+        return Err(refused());
+    }
+    for value in values {
+        check_enum(Some(value.as_str()), declared)?;
+    }
+    Ok(())
+}
+
+/// Refuse an `applicationPreferences` whose management preference names a target
+/// destination its own variant does not declare.
+///
+/// Each `ManagementPreference` variant carries its OWN destination enumeration, so the
+/// admitted values depend on the variant the caller chose.
+fn check_application_preferences(
+    preferences: &ApplicationPreferences,
+) -> Result<(), PutPortfolioPreferencesError> {
+    match &preferences.management_preference {
+        None => Ok(()),
+        Some(ManagementPreference::awsManagedResources(resources)) => check_choice(
+            &resources.target_destination,
+            AWS_MANAGED_TARGET_DESTINATION_VALUES,
+            1,
+        ),
+        Some(ManagementPreference::selfManageResources(resources)) => check_choice(
+            &resources.target_destination,
+            SELF_MANAGE_TARGET_DESTINATION_VALUES,
+            1,
+        ),
+        Some(ManagementPreference::noPreference(resources)) => check_choice(
+            &resources.target_destination,
+            NO_PREFERENCE_TARGET_DESTINATION_VALUES,
+            1,
+        ),
+    }
+}
+
+/// Refuse a `databasePreferences` whose management preference or migration preference
+/// names a value the model does not declare — again one enumeration per union variant,
+/// and `Homogeneous`'s list may be empty.
+fn check_database_preferences(
+    preferences: &DatabasePreferences,
+) -> Result<(), PutPortfolioPreferencesError> {
+    check_enum(
+        preferences.database_management_preference.as_deref(),
+        DATABASE_MANAGEMENT_PREFERENCE_VALUES,
+    )?;
+    match &preferences.database_migration_preference {
+        None => Ok(()),
+        Some(DatabaseMigrationPreference::Heterogeneous(target)) => check_choice(
+            &target.target_database_engine,
+            HETEROGENEOUS_TARGET_DATABASE_ENGINE_VALUES,
+            1,
+        ),
+        Some(DatabaseMigrationPreference::Homogeneous(target)) => check_choice(
+            target.target_database_engine.as_deref().unwrap_or_default(),
+            HOMOGENEOUS_TARGET_DATABASE_ENGINE_VALUES,
+            0,
+        ),
+        Some(DatabaseMigrationPreference::noPreference(target)) => check_choice(
+            &target.target_database_engine,
+            TARGET_DATABASE_ENGINE_VALUES,
+            1,
+        ),
     }
 }
 
@@ -149,18 +250,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutPortfolioPreferences` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutPortfolioPreferencesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutPortfolioPreferences"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(PutPortfolioPreferencesErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "the migrationhub-strategy portfolio preferences store is unavailable"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // Every refusal is decided from the request alone, before the store is written:
+        // a request this service cannot accept must leave the saved preferences exactly
+        // as they were.
+        check_enum(input.application_mode.as_deref(), APPLICATION_MODE_VALUES)?;
+        if let Some(preferences) = input.application_preferences.as_ref() {
+            check_application_preferences(preferences)?;
+        }
+        if let Some(preferences) = input.database_preferences.as_ref() {
+            check_database_preferences(preferences)?;
+        }
+
+        // The save: the record becomes exactly what this request carries, so a member it
+        // leaves out is not set afterwards. `GetPortfolioPreferences` reads this same
+        // record — there is one copy of it in the store.
+        state.lock().portfolio_preferences = Some(PortfolioPreferences {
+            prioritize_business_goals: input.prioritize_business_goals,
+            application_preferences: input.application_preferences,
+            database_preferences: input.database_preferences,
+            application_mode: input.application_mode,
+        });
+
+        // `PutPortfolioPreferencesResponse` models no members: the save is the whole of
+        // the answer.
+        Ok(PutPortfolioPreferencesOutput {})
     }
 }
