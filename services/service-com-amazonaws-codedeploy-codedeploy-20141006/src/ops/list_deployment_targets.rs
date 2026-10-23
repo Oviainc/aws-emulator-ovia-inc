@@ -1,15 +1,31 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListDeploymentTargets
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListDeploymentTargets`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Answers the ids of the deployment targets a deployment resolved, in
+//! resolution order, narrowed by the `targetFilters` the request names, one page
+//! at a time.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListDeploymentTargets::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The targets are the SNAPSHOT its deployment group resolved when the
+//! deployment was created ([`crate::state::deployment_targets`]), so a listing
+//! of a past deployment does not change when the fleet or the group is
+//! retargeted afterwards; their status follows how far that deployment has got
+//! ([`crate::state::target_status`]). A deployment the clock has not started yet
+//! has no target state to report, which is its `DeploymentNotStartedException`.
+//!
+//! NOTE: a target this emulator resolves but cannot NAME is not listed — a
+//! Lambda deployment's target is the function its revision's AppSpec names, and
+//! CodeDeploy's state holds no revision content to read it from (the same gap
+//! [`crate::state::deployment_targets`] documents for EC2 inventory). The target
+//! still counts towards the deployment's outcome.
+//!
+//! A `ServerInstanceLabel` filter selects targets by the ENVIRONMENT they belong
+//! to, which only a blue/green deployment has two of, so against an in-place
+//! deployment it is refused with `InvalidDeploymentInstanceTypeException` ("An
+//! instance type was specified for an in-place deployment. Instance types are
+//! supported for blue/green deployments only") rather than answered with an
+//! empty page; see [`crate::state::INSTANCE_TYPE_ON_IN_PLACE_DEPLOYMENT`].
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -174,18 +190,221 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListDeploymentTargets` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListDeploymentTargetsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListDeploymentTargets"))
+        let _ = ctx;
+        let deployment_id = input.deployment_id;
+        // The id's FORMAT is gated before the deployment is looked up, so "that
+        // is not an id" and "no deployment has that id" stay two different
+        // answers, as they are everywhere else in this service.
+        if deployment_id.trim().is_empty() {
+            return Err(
+                ListDeploymentTargetsErrorModeled::DeploymentIdRequiredException(
+                    DeploymentIdRequiredException {
+                        message: Some(crate::state::DEPLOYMENT_ID_MISSING.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+        if !crate::state::deployment_id_is_well_formed(&deployment_id) {
+            return Err(
+                ListDeploymentTargetsErrorModeled::InvalidDeploymentIdException(
+                    InvalidDeploymentIdException {
+                        message: Some(crate::state::malformed_deployment_id_message(
+                            &deployment_id,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let token = input.next_token;
+        let requested_filters = input.target_filters;
+
+        // The targets come from the deployment's own record — the snapshot its
+        // deployment group resolved when it was created — and their status from
+        // how far that deployment has got, which `with_state` has already
+        // brought up to the instants the clock owed it.
+        let outcome = crate::state::with_state(&*self.engine, |state| {
+            let Some(deployment) = state.deployments.get(&deployment_id) else {
+                return Err(
+                    ListDeploymentTargetsErrorModeled::DeploymentDoesNotExistException(
+                        DeploymentDoesNotExistException {
+                            message: Some(crate::state::deployment_not_found(&deployment_id)),
+                        },
+                    ),
+                );
+            };
+            // A deployment that has not started has deployed to nothing, so it
+            // has no target state to report: that is this operation's
+            // `DeploymentNotStartedException`, not an empty page.
+            if !deployment.is_started() {
+                return Err(
+                    ListDeploymentTargetsErrorModeled::DeploymentNotStartedException(
+                        DeploymentNotStartedException {
+                            message: Some(crate::state::deployment_not_started(&deployment_id)),
+                        },
+                    ),
+                );
+            }
+            // Only now that the deployment the request NAMES has been resolved
+            // are the request's own members validated, as everywhere else in
+            // this service: a request against a deployment that does not exist
+            // is answered for the deployment, not for a member it also got
+            // wrong.
+            let filters = target_filters(requested_filters.as_ref())?;
+            // Selecting targets by the environment they belong to only means
+            // anything for a deployment that HAS two environments: that is what
+            // `InvalidDeploymentInstanceTypeException` refuses for an in-place
+            // deployment (see `state::INSTANCE_TYPE_ON_IN_PLACE_DEPLOYMENT`),
+            // rather than the empty page that would suggest the deployment has
+            // no target of that environment.
+            if filters.iter().any(TargetFilter::selects_on_label) && !deployment.is_blue_green() {
+                return Err(
+                    ListDeploymentTargetsErrorModeled::InvalidDeploymentInstanceTypeException(
+                        InvalidDeploymentInstanceTypeException {
+                            message: Some(
+                                crate::state::INSTANCE_TYPE_ON_IN_PLACE_DEPLOYMENT.to_string(),
+                            ),
+                        },
+                    ),
+                );
+            }
+            let status = crate::state::target_status(deployment);
+            let matching: Vec<String> = deployment
+                .targets
+                .iter()
+                .filter(|target| {
+                    filters
+                        .iter()
+                        .all(|filter| filter.matches(status, target.instance_label.as_deref()))
+                })
+                // A target this emulator resolved but cannot NAME is not one a
+                // client can list; see `DeploymentTargetSnapshot::target_id`.
+                .filter_map(|target| target.target_id.clone())
+                .collect();
+
+            crate::state::paginate(&matching, token.as_deref()).ok_or_else(|| {
+                ListDeploymentTargetsErrorModeled::InvalidNextTokenException(
+                    InvalidNextTokenException {
+                        message: Some(
+                            "The next token was specified in an invalid format".to_string(),
+                        ),
+                    },
+                )
+            })
+        })
+        .ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE)
+        })?;
+
+        let (target_ids, next_token) = outcome?;
+        Ok(ListDeploymentTargetsOutput {
+            target_ids: Some(target_ids),
+            next_token,
+        })
     }
+}
+
+/// One `targetFilters` entry, resolved to the target property it selects on and
+/// the values it accepts for it.
+///
+/// `TargetFilterName` (`smithy_query(query="shape",shape="TargetFilterName")`:
+/// TargetStatus | ServerInstanceLabel) says WHICH property; the entry's value
+/// list says which values of it are wanted.
+#[derive(Debug)]
+enum TargetFilter {
+    /// The target's `TargetStatus`; see [`crate::state::target_status`].
+    Status(Vec<String>),
+    /// The target's `TargetLabel`, the environment it belongs to.
+    Label(Vec<String>),
+}
+
+impl TargetFilter {
+    /// Whether a target whose status is `status` and whose label is `label`
+    /// satisfies this filter.
+    ///
+    /// A filter is satisfied by ANY of the values it lists, so one listing none
+    /// names no target. A target with no label satisfies no label filter: it
+    /// belongs to neither environment of a blue/green deployment.
+    fn matches(&self, status: &str, label: Option<&str>) -> bool {
+        match self {
+            Self::Status(wanted) => wanted.iter().any(|value| value == status),
+            Self::Label(wanted) => {
+                label.is_some_and(|label| wanted.iter().any(|value| value == label))
+            }
+        }
+    }
+
+    /// Whether this filter selects on the ENVIRONMENT a target belongs to, which
+    /// only a blue/green deployment has.
+    fn selects_on_label(&self) -> bool {
+        matches!(self, Self::Label(_))
+    }
+}
+
+/// The request's `targetFilters` as the filters this operation applies.
+///
+/// A name outside `TargetFilterName` names no property of a target, and a value
+/// outside the enum of the property its name selects names no value of it; each
+/// is refused with the error the model gives this operation for it rather than
+/// silently narrowing the page to nothing. The catalogue each is checked against
+/// is the GENERATED one this crate renders from the model
+/// (`super::types::TARGET_FILTER_NAME_VALUES`, `TARGET_STATUS_VALUES`,
+/// `TARGET_LABEL_VALUES`), so no list here can drift from it. Entries are read
+/// in a stable order (the request's map has none), so a request that gets two of
+/// them wrong is answered the same way every time.
+fn target_filters(
+    filters: Option<&std::collections::HashMap<String, Vec<String>>>,
+) -> Result<Vec<TargetFilter>, ListDeploymentTargetsErrorModeled> {
+    let Some(filters) = filters else {
+        return Ok(Vec::new());
+    };
+    let mut names: Vec<&String> = filters.keys().collect();
+    names.sort();
+    let mut parsed = Vec::with_capacity(names.len());
+    for name in names {
+        let values = filters.get(name).cloned().unwrap_or_default();
+        if !TARGET_FILTER_NAME_VALUES.contains(&name.as_str()) {
+            return Err(
+                ListDeploymentTargetsErrorModeled::InvalidTargetFilterNameException(
+                    InvalidTargetFilterNameException {
+                        message: Some(crate::state::invalid_target_filter_name(name)),
+                    },
+                ),
+            );
+        }
+        // `TargetFilterName` has exactly two members, one per target property,
+        // and the check above has already refused anything else.
+        if name == "TargetStatus" {
+            if let Some(unknown) = values
+                .iter()
+                .find(|value| !TARGET_STATUS_VALUES.contains(&value.as_str()))
+            {
+                return Err(
+                    ListDeploymentTargetsErrorModeled::InvalidInstanceStatusException(
+                        InvalidInstanceStatusException {
+                            message: Some(crate::state::invalid_target_status(unknown)),
+                        },
+                    ),
+                );
+            }
+            parsed.push(TargetFilter::Status(values));
+        } else {
+            if let Some(unknown) = values
+                .iter()
+                .find(|value| !TARGET_LABEL_VALUES.contains(&value.as_str()))
+            {
+                return Err(
+                    ListDeploymentTargetsErrorModeled::InvalidInstanceTypeException(
+                        InvalidInstanceTypeException {
+                            message: Some(crate::state::invalid_instance_label(unknown)),
+                        },
+                    ),
+                );
+            }
+            parsed.push(TargetFilter::Label(values));
+        }
+    }
+    Ok(parsed)
 }

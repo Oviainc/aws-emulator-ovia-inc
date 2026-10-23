@@ -37,6 +37,8 @@ mod github_account_tokens;
 mod lifecycle_event_hook_status;
 #[path = "all/list_deployment_groups.rs"]
 mod list_deployment_groups;
+#[path = "all/list_deployment_targets.rs"]
+mod list_deployment_targets;
 #[path = "all/on_premises_instances.rs"]
 mod on_premises_instances;
 #[path = "all/on_premises_revisions_and_blue_green.rs"]
