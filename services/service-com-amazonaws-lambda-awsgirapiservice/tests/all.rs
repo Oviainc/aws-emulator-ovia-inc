@@ -17,6 +17,8 @@ mod account_settings;
 mod async_invocation;
 #[path = "all/capacity_provider_bounds.rs"]
 mod capacity_provider_bounds;
+#[path = "all/capacity_provider_naming.rs"]
+mod capacity_provider_naming;
 #[path = "all/capacity_providers.rs"]
 mod capacity_providers;
 #[path = "all/event_source_mappings.rs"]
@@ -39,6 +41,8 @@ mod function_url_config;
 mod function_version_listing;
 #[path = "all/layer_versions.rs"]
 mod layer_versions;
+#[path = "all/policy_versions_and_resources.rs"]
+mod policy_versions_and_resources;
 #[path = "all/resource_policy.rs"]
 mod resource_policy;
 #[path = "all/resource_tags.rs"]
@@ -49,6 +53,8 @@ mod runtime_management_config;
 mod signing_name_routing;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/untrusted_name_parsing.rs"]
+mod untrusted_name_parsing;
 #[path = "all/update_function_configuration.rs"]
 mod update_function_configuration;
 #[path = "all/version_publishing.rs"]

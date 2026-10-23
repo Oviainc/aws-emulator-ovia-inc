@@ -119,6 +119,12 @@
 //! through the service's OWN protocol (`routing_key`), so the claim and the later
 //! operation lookup cannot disagree.
 //!
+//! The four `lambda`-signing services are the other instance of that shape: the Lambda
+//! control plane, Lambda Core, Lambda Web and Lambda MicroVMs each bind their own dated
+//! URI prefixes, so the first segment separates all of them EXCEPT the tagging space
+//! `/2017-03-31/tags/{Resource}`, which the control plane and MicroVMs both bind; there
+//! the ARN in the path decides, which is what [`shared_path`] reads for both sides.
+//!
 //! When the two models' path spaces overlap at MANY segments, neither the first segment
 //! nor one deeper segment separates them: AgentCore's data plane and control plane share
 //! nine first path segments and differ, per operation, at a different depth of each. For

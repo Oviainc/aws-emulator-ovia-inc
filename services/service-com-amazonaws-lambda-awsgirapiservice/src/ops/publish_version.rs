@@ -488,15 +488,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// The modelled 400 this operation answers a request it cannot satisfy with.
-fn invalid_parameter(message: String) -> PublishVersionError {
-    PublishVersionErrorModeled::InvalidParameterValueException(InvalidParameterValueException {
-        r#type: None,
-        message: Some(message),
-    })
-    .into()
-}
-
 /// The one `FunctionConfiguration` the model declares, in this operation's own
 /// generated shape of it.
 ///
@@ -548,4 +539,13 @@ fn function_configuration(configuration: CreateFunctionOutput) -> PublishVersion
         config_sha256: configuration.config_sha256,
         durable_config: configuration.durable_config,
     }
+}
+
+/// The modelled 400 this operation answers a request it cannot satisfy with.
+fn invalid_parameter(message: String) -> PublishVersionError {
+    PublishVersionErrorModeled::InvalidParameterValueException(InvalidParameterValueException {
+        r#type: None,
+        message: Some(message),
+    })
+    .into()
 }

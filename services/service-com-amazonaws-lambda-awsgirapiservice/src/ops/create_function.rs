@@ -393,6 +393,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .unwrap_or_else(|| crate::state::PACKAGE_TYPE_ZIP.to_string());
         let code = package_code(&package_type, &input)?;
 
+        // AWS's published Lambda quota "Function timeout: 900 seconds (15 minutes)" is
+        // narrower than the model's `Timeout` range (1..5400), so the wider bound the
+        // boundary validator checked is not the whole constraint; the request is refused
+        // here against the published one, naming the member and the bound it failed.
+        let timeout = input.timeout.unwrap_or(crate::state::DEFAULT_TIMEOUT_SECONDS);
+        if timeout > crate::state::MAX_TIMEOUT_SECONDS {
+            return Err(invalid_parameter(format!(
+                "1 validation error detected: Value '{timeout}' at 'timeout' failed to satisfy \
+                 constraint: Member must have value less than or equal to {}",
+                crate::state::MAX_TIMEOUT_SECONDS
+            )));
+        }
+
         let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx);
         let mut store = state.lock();
@@ -452,7 +465,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             runtime: input.runtime.clone(),
             handler: input.handler.clone(),
             description: input.description.clone(),
-            timeout: input.timeout.unwrap_or(crate::state::DEFAULT_TIMEOUT_SECONDS),
+            timeout,
             memory_size: input
                 .memory_size
                 .unwrap_or(crate::state::DEFAULT_MEMORY_SIZE_MB),

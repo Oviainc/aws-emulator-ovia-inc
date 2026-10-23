@@ -54,6 +54,15 @@ const FUNCTIONS_URI: &str = "/2015-03-31/functions";
 /// revision, a fresh `LastModified`, and the in-flight update status.
 const VOLATILE_MEMBERS: [&str; 3] = ["RevisionId", "LastModified", "LastUpdateStatus"];
 
+/// The member DERIVED from `Runtime`, so a row that replaces the runtime moves it too
+/// without naming it: `RuntimeVersionConfig` reports "the ARN of the runtime version you
+/// want the function to use" (`smithy_query(query="shape",
+/// shape="RuntimeVersionConfig")`), which identifies the managed runtime the function is
+/// pinned to — another runtime is another runtime version. Its VALUE is asserted in
+/// `policy_versions_and_resources.rs`; here only the invariant "a member the request did
+/// not name is unchanged" is, and this one is not independent of `Runtime`.
+const DERIVED_FROM_RUNTIME: &str = "RuntimeVersionConfig";
+
 /// One service mounted on its own engine, reached the way the production router reaches
 /// it.
 fn router_on(engine: &Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
@@ -515,7 +524,9 @@ async fn a_named_setting_is_replaced_and_every_other_setting_is_left_alone() {
         // ...and every member it does not name is exactly what it was, bar the three an
         // update always moves.
         for (name_of, was) in members(&baseline) {
-            if case.expected.get(&name_of).is_some() || VOLATILE_MEMBERS.contains(&name_of.as_str())
+            if case.expected.get(&name_of).is_some()
+                || VOLATILE_MEMBERS.contains(&name_of.as_str())
+                || (name_of == DERIVED_FROM_RUNTIME && case.expected.get("Runtime").is_some())
             {
                 continue;
             }
