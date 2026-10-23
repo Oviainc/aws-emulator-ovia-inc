@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DisableFastLaunch
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DisableFastLaunch`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DisableFastLaunch::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Discontinues Windows fast launch for one image in [`crate::state`]: it moves the stored
+//! configuration into the non-terminal `disabling` state and leaves the cleanup — after
+//! which the image is no longer a fast launch enabled image at all — to the clock, then
+//! answers the configuration as it stood when the disable was asked for. A MUTATION: the
+//! call is what starts the discontinuation.
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +157,80 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DisableFastLaunch` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DisableFastLaunchErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DisableFastLaunch"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            FAST_LAUNCH_STATE_DISABLING, FastLaunchMove, FastLaunchRecord, FastLaunchTransition,
+            incorrect_state, require_service_state, require_visible_image,
+            system_time_to_date_time,
+        };
+
+        // `ctx` carries request metadata only; this operation reads none of it. The store
+        // is reached through the engine held on `self`.
+        let _ = ctx;
+
+        // "Forces the image settings to turn off Windows fast launch for your Windows AMI.
+        // This parameter overrides any errors that are encountered while cleaning up
+        // resources in your account" (`Force`). Nothing this emulator cleans up can fail —
+        // the pre-provisioned snapshots are the stored configuration itself — so there is
+        // no error for the flag to override and a disable behaves the same either way.
+        let _ = input.force;
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+        store.materialize_due_transitions();
+
+        // "You can only change these settings for Windows AMIs that you own or that have
+        // been shared with you": an id that is not an AMI id is malformed and one the
+        // account can see no image for does not exist. Whether the image is a Windows AMI
+        // is not asked here — only an image that carries a configuration can be
+        // discontinued, and only a Windows AMI can carry one.
+        require_visible_image(&store, &input.image_id)?;
+
+        if !store.fast_launch_images.contains_key(&input.image_id) {
+            return Err(incorrect_state(format!(
+                "Image '{}' does not have Windows fast launch enabled",
+                input.image_id
+            )));
+        }
+
+        // DryRun sits AFTER every parameter has been validated and the named image
+        // resolved, and BEFORE the first write: the flag asks whether the request WOULD
+        // have succeeded, so one that would have been refused is refused with that reason
+        // instead, and one that would have succeeded leaves the store untouched.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let record = store
+            .fast_launch_images
+            .get_mut(&input.image_id)
+            .ok_or_else(|| {
+                Scaffolded::internal_error(format!(
+                    "the Windows fast launch configuration of image '{}' could not be read",
+                    input.image_id
+                ))
+            })?;
+
+        // "Discontinue Windows fast launch for a Windows AMI, and clean up existing
+        // pre-provisioned snapshots": the configuration enters the non-terminal
+        // `disabling` state and the clock — not a caller — finishes the cleanup, after
+        // which nothing is reported for the image. A repeat of the call while the cleanup
+        // is already owed asks for what is already happening, so it neither restarts the
+        // clock nor moves the state again.
+        if record.state() != FAST_LAUNCH_STATE_DISABLING {
+            record.view.state = Some(FAST_LAUNCH_STATE_DISABLING.to_string());
+            record.view.state_transition_time = Some(system_time_to_date_time(now));
+            record.pending = Some(FastLaunchTransition::starting_now(
+                FastLaunchMove::Discontinued,
+            ));
+        }
+
+        // The response is read out of the store, so the caller sees what a
+        // `DescribeFastLaunchImages` made in the same instant would report: "parameters
+        // that were used for Windows fast launch for the Windows AMI before Windows fast
+        // launch was disabled. This informs the clean-up process"
+        // (`SnapshotConfiguration`).
+        Ok(FastLaunchRecord::disable_response(record))
     }
 }

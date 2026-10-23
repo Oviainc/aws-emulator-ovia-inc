@@ -121,8 +121,9 @@ use crate::state::{
     MAX_FILTER_VALUE_BYTES, MAX_FILTER_VALUES, MAX_FILTERS, MAX_PAGE_SIZE, MAX_RESOURCE_IDS,
     OWNER_SELF, aws_account_id_is_well_formed, decode_page_token, dry_run_operation,
     encode_page_token, filter_value_matches, image_id_is_well_formed, image_is_deprecated,
-    invalid_ami_id_malformed, invalid_ami_id_not_found, invalid_pagination_token,
-    invalid_parameter_value, invalid_user_id_malformed, require_service_state,
+    image_is_visible, invalid_ami_id_malformed, invalid_ami_id_not_found,
+    invalid_pagination_token, invalid_parameter_value, invalid_user_id_malformed,
+    require_service_state,
 };
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -312,7 +313,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if !store
                 .images
                 .get(image_id.as_str())
-                .is_some_and(|image| is_visible(image, account))
+                .is_some_and(|image| image_is_visible(image, account))
             {
                 return Err(invalid_ami_id_not_found(image_id));
             }
@@ -342,7 +343,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut selected: Vec<&Image> = store
             .images
             .values()
-            .filter(|image| is_visible(image, account))
+            .filter(|image| image_is_visible(image, account))
             .filter(|image| {
                 !named_ids
                     || requested_ids
@@ -400,18 +401,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             next_token,
         })
     }
-}
-
-/// Can the calling account see `image` at all?
-///
-/// "The images available to you include public images, private images that you own, and
-/// private images owned by other Amazon Web Services accounts for which you have explicit
-/// launch permissions" (`DescribeImages`). Nothing in this slice grants an explicit launch
-/// permission — `ModifyImageAttribute` is still a scaffold — so the images available are
-/// the public ones and the account's own, and a private image of another account is
-/// invisible however the request asks for it.
-fn is_visible(image: &Image, account: &str) -> bool {
-    image.public.unwrap_or(false) || image.owner_id.as_deref() == Some(account)
 }
 
 /// Is `term` something `Owners` may carry — "a combination of Amazon Web Services account

@@ -59,6 +59,24 @@
 //! attributes `ModifyVpcAttribute` sets and `DescribeVpcAttribute` reports, so those two
 //! operations and `CreateVpc`'s defaults cannot disagree about one VPC.
 //!
+//! ## Windows fast launch
+//!
+//! [`ComAmazonawsEc2Amazonec2State::fast_launch_images`] holds the Windows fast launch
+//! configuration of each image that has one, keyed by the `ImageId` it belongs to, as
+//! [`FastLaunchRecord`]s: the modelled [`DescribeFastLaunchImagesSuccessItem`] every
+//! operation that reports one answers with, plus the move the clock owes it
+//! ([`FastLaunchTransition`]) — `enabling` -> `enabled` after `EnableFastLaunch`, and the
+//! removal of the configuration after `DisableFastLaunch`, since `FastLaunchStateCode` has
+//! no word for "not enabled" and an image whose pre-provisioned snapshots are gone is
+//! simply not a fast launch enabled image any more. Both fall due on the same monotonic
+//! clock and the same [`TRANSITION_DELAY`] as an instance's [`PendingTransition`], and
+//! [`ComAmazonawsEc2Amazonec2State::materialize_due_transitions`] applies them.
+//!
+//! A configuration is keyed by an image of [`ComAmazonawsEc2Amazonec2State::images`], so
+//! the store cannot hold more configurations than there are images, and every string one
+//! retains is either a word the service chose or an id read back out of another store —
+//! nothing caller-sized — so no byte charge is made for one.
+//!
 //! ## Launch templates
 //!
 //! [`ComAmazonawsEc2Amazonec2State::launch_templates`] holds the account's launch
@@ -136,7 +154,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::{
     Address, AvailabilityZone, AvailabilityZoneMessage, BlockDeviceMapping, BlockPublicAccessStates,
-    CreateVolumeOutput, EbsBlockDevice, GroupIdentifier, INSTANCE_TYPE_VALUES, Image, Instance,
+    CreateVolumeOutput, DescribeFastLaunchImagesSuccessItem, DisableFastLaunchOutput,
+    EbsBlockDevice, EnableFastLaunchOutput, GroupIdentifier, INSTANCE_TYPE_VALUES, Image, Instance,
     InstanceState, InstanceTypeOffering, IpPermission, IpRange, LOCATION_TYPE_VALUES,
     LaunchTemplate, Monitoring, OperatorResponse, Placement, PrivateDnsNameOptionsOnLaunch,
     RequestLaunchTemplateData, RunInstancesOutput, SecurityGroup, StateReason, Subnet, Tag,
@@ -801,6 +820,10 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// A `CreateVolume` `ClientToken` and the volume id it minted, so a repeat of the
     /// same request answers with that volume instead of creating a second one.
     pub volume_client_tokens: HashMap<String, String>,
+    /// The Windows fast launch configuration of every image that has one, by `ImageId` —
+    /// see the module docs. Ordered by id, which is the order
+    /// `DescribeFastLaunchImages` reports and pages over.
+    pub fast_launch_images: BTreeMap<String, FastLaunchRecord>,
     /// Every Elastic IP address the account holds, by `AllocationId`, as the modelled
     /// [`Address`] shape itself — so a member a writer sets round-trips through
     /// `DescribeAddresses` without a field-by-field copy. Ordered by id, which is the
@@ -838,6 +861,7 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             id_counter: 0,
             volumes: BTreeMap::new(),
             volume_client_tokens: HashMap::new(),
+            fast_launch_images: BTreeMap::new(),
             addresses: BTreeMap::new(),
             next_elastic_ip: 0,
         };
@@ -1726,9 +1750,11 @@ impl ComAmazonawsEc2Amazonec2State {
     ///
     /// A reporting operation may call this: each move was already owed at this
     /// instant whether or not anybody asked, so materialising it changes nothing
-    /// a later caller would otherwise have seen. It covers both resource kinds that
-    /// have one — an instance's next state, and a `pending` VPC becoming `available`
-    /// with its IPv6 association moving `associating` -> `associated`.
+    /// a later caller would otherwise have seen. It covers every resource kind that
+    /// has one — an instance's next state, a `pending` VPC becoming `available`
+    /// with its IPv6 association moving `associating` -> `associated`, a `pending`
+    /// subnet becoming `available`, and a Windows fast launch configuration reaching
+    /// `enabled` or finishing the cleanup a disable started.
     pub fn materialize_due_transitions(&mut self) {
         let now = Instant::now();
         for instance in self.instances.values_mut() {
@@ -1774,6 +1800,33 @@ impl ComAmazonawsEc2Amazonec2State {
             }
             // The transition is applied once; nothing is owed on this subnet any more.
             false
+        });
+        self.fast_launch_images.retain(|_image_id, record| {
+            let Some(pending) = record
+                .pending
+                .as_ref()
+                .filter(|pending| now >= pending.due_at)
+                .cloned()
+            else {
+                return true;
+            };
+            match pending.to {
+                // "Discontinue Windows fast launch for a Windows AMI, and clean up existing
+                // pre-provisioned snapshots" (`DisableFastLaunch`): once the cleanup the
+                // disable started is done there is nothing left to report — the image is no
+                // longer a Windows fast launch enabled image, and `FastLaunchStateCode` has
+                // no member for one that is not.
+                FastLaunchMove::Discontinued => false,
+                FastLaunchMove::Enabled => {
+                    record.view.state = Some(FAST_LAUNCH_STATE_ENABLED.to_string());
+                    // The state changed when the move fell due, not when somebody asked
+                    // about it, so the time reported is the due instant.
+                    record.view.state_transition_time =
+                        Some(system_time_to_date_time(pending.at));
+                    record.pending = None;
+                    true
+                }
+            }
         });
     }
 
@@ -4393,6 +4446,271 @@ impl ComAmazonawsEc2Amazonec2State {
         }
         Some(vpc)
     }
+}
+
+// =============================================================================
+// Windows fast launch
+// =============================================================================
+
+/// `FastLaunchStateCode`'s `enabling`: Amazon EC2 "launches an instance and runs through
+/// Sysprep steps … then it creates a set of reserved snapshots" (`EnableFastLaunch`), and
+/// the AMI cannot launch from them yet
+/// (`smithy_query(query="shape",shape="FastLaunchStateCode")`).
+pub const FAST_LAUNCH_STATE_ENABLING: &str = "enabling";
+
+/// `FastLaunchStateCode`'s `enabled`: the pre-provisioned snapshots are in place.
+pub const FAST_LAUNCH_STATE_ENABLED: &str = "enabled";
+
+/// `FastLaunchStateCode`'s `disabling`: a caller has asked to "discontinue Windows fast
+/// launch for a Windows AMI, and clean up existing pre-provisioned snapshots"
+/// (`DisableFastLaunch`), and that cleanup is not finished.
+pub const FAST_LAUNCH_STATE_DISABLING: &str = "disabling";
+
+/// The one member of `FastLaunchResourceType`, and "the default value" when a request
+/// names none (`EnableFastLaunchRequest$ResourceType`).
+pub const FAST_LAUNCH_RESOURCE_TYPE_SNAPSHOT: &str = "snapshot";
+
+/// "Value must be `6` or greater" (`EnableFastLaunchRequest$MaxParallelLaunches`).
+///
+/// Also what a request that names no maximum gets: every operation that reports a
+/// configuration reports a `MaxParallelLaunches`, and the floor the member documents is the
+/// only value the service has been told anything about.
+pub const MIN_FAST_LAUNCH_MAX_PARALLEL_LAUNCHES: i32 = 6;
+
+/// The smallest `TargetResourceCount` a configuration may ask for: "the number of
+/// pre-provisioned snapshots to keep on hand for a Windows fast launch enabled AMI"
+/// (`FastLaunchSnapshotConfigurationRequest$TargetResourceCount`) is a count of snapshots
+/// kept on hand, so a configuration that keeps any keeps at least one. The model declares
+/// no `@range` for the member, so a handler is the only place the floor can be enforced.
+pub const MIN_FAST_LAUNCH_TARGET_RESOURCE_COUNT: i32 = 1;
+
+/// The code EC2 answers when the resource a request names exists but is not in a state
+/// that admits the request.
+pub const INCORRECT_STATE: &str = "IncorrectState";
+
+/// The code EC2 answers when a request is invalid in a way no member-specific code of its
+/// own covers.
+pub const INVALID_REQUEST: &str = "InvalidRequest";
+
+/// The code EC2 answers for a launch template version the named template does not hold.
+pub const INVALID_LAUNCH_TEMPLATE_ID_VERSION_NOT_FOUND: &str =
+    "InvalidLaunchTemplateId.VersionNotFound";
+
+/// The `Version` value that names a launch template's latest version: "valid values are
+/// $Latest, $Default, and numbers"
+/// (`DescribeLaunchTemplateVersionsRequest$Versions`).
+pub const LAUNCH_TEMPLATE_VERSION_LATEST: &str = "$Latest";
+
+/// The `Version` value that names a launch template's default version, from the same
+/// sentence as [`LAUNCH_TEMPLATE_VERSION_LATEST`].
+pub const LAUNCH_TEMPLATE_VERSION_DEFAULT: &str = "$Default";
+
+/// Refuse a request the service answers no member-specific code for: HTTP 400
+/// `InvalidRequest`.
+pub fn invalid_request<E>(message: impl Into<String>) -> Scaffolded<E> {
+    Scaffolded::service_error(INVALID_REQUEST, 400, message)
+}
+
+/// Refuse a request whose resource exists but is not in a state that admits it: HTTP 400
+/// `IncorrectState`.
+pub fn incorrect_state<E>(message: impl Into<String>) -> Scaffolded<E> {
+    Scaffolded::service_error(INCORRECT_STATE, 400, message)
+}
+
+/// What the clock owes a stored Windows fast launch configuration next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FastLaunchMove {
+    /// `enabling` -> `enabled`: the reserved snapshots an enable started are in place.
+    Enabled,
+    /// `disabling` -> reported no longer: the cleanup a disable started is finished, so
+    /// the image is not a fast launch enabled image any more.
+    Discontinued,
+}
+
+/// A move the clock owes one configuration, with the instants it falls due on.
+#[derive(Debug, Clone)]
+pub struct FastLaunchTransition {
+    /// What the configuration becomes.
+    pub to: FastLaunchMove,
+    /// The instant from which the move is due. Monotonic ([`Instant`]), because it is only
+    /// ever compared against the clock and never reported, so a wall-clock adjustment
+    /// cannot move a configuration back to `enabling`.
+    pub due_at: Instant,
+    /// The wall-clock instant the move falls due, which the configuration reports as its
+    /// `StateTransitionTime` once the move has been applied — the state changed when the
+    /// move fell due, not when somebody next asked about it.
+    pub at: SystemTime,
+}
+
+impl FastLaunchTransition {
+    /// A move to `to`, due [`TRANSITION_DELAY`] from now: the span this crate gives every
+    /// clock-owed transition, recorded rather than slept for.
+    pub fn starting_now(to: FastLaunchMove) -> Self {
+        Self {
+            to,
+            due_at: Instant::now() + TRANSITION_DELAY,
+            at: SystemTime::now() + TRANSITION_DELAY,
+        }
+    }
+}
+
+/// One image's Windows fast launch configuration: the modelled
+/// [`DescribeFastLaunchImagesSuccessItem`] every operation that reports one answers with,
+/// plus the move the clock owes it.
+///
+/// `EnableFastLaunch`, `DisableFastLaunch` and `DescribeFastLaunchImages` answer with the
+/// same member set, so the one stored item is what all three report and they cannot
+/// describe one configuration differently.
+#[derive(Debug, Clone)]
+pub struct FastLaunchRecord {
+    /// The configuration as the model shapes it, carrying the state reached so far.
+    pub view: DescribeFastLaunchImagesSuccessItem,
+    /// The move the clock owes this configuration, while one is owed.
+    pub pending: Option<FastLaunchTransition>,
+}
+
+impl FastLaunchRecord {
+    /// The configuration's `FastLaunchStateCode` as it was last reported.
+    pub fn state(&self) -> &str {
+        self.view.state.as_deref().unwrap_or_default()
+    }
+
+    /// This configuration as `EnableFastLaunch` reports it.
+    pub fn enable_response(&self) -> EnableFastLaunchOutput {
+        let view = self.view.clone();
+        EnableFastLaunchOutput {
+            image_id: view.image_id,
+            resource_type: view.resource_type,
+            snapshot_configuration: view.snapshot_configuration,
+            launch_template: view.launch_template,
+            max_parallel_launches: view.max_parallel_launches,
+            owner_id: view.owner_id,
+            state: view.state,
+            state_transition_reason: view.state_transition_reason,
+            state_transition_time: view.state_transition_time,
+        }
+    }
+
+    /// This configuration as `DisableFastLaunch` reports it.
+    pub fn disable_response(&self) -> DisableFastLaunchOutput {
+        let view = self.view.clone();
+        DisableFastLaunchOutput {
+            image_id: view.image_id,
+            resource_type: view.resource_type,
+            snapshot_configuration: view.snapshot_configuration,
+            launch_template: view.launch_template,
+            max_parallel_launches: view.max_parallel_launches,
+            owner_id: view.owner_id,
+            state: view.state,
+            state_transition_reason: view.state_transition_reason,
+            state_transition_time: view.state_transition_time,
+        }
+    }
+}
+
+/// Can the calling account see `image` at all?
+///
+/// "The images available to you include public images, private images that you own, and
+/// private images owned by other Amazon Web Services accounts for which you have explicit
+/// launch permissions" (`DescribeImages`). Nothing in this slice grants an explicit launch
+/// permission — `ModifyImageAttribute` is still a scaffold — so the images available are
+/// the public ones and the account's own, and a private image of another account is
+/// invisible however a request asks for it.
+pub fn image_is_visible(image: &Image, account: &str) -> bool {
+    image.public.unwrap_or(false) || image.owner_id.as_deref() == Some(account)
+}
+
+/// Can the calling account see the image `image_id` at all — does the store hold an image
+/// under that id that [`image_is_visible`] admits?
+pub fn account_can_see_image(store: &ComAmazonawsEc2Amazonec2State, image_id: &str) -> bool {
+    let account = ::engine::emulator_account_id();
+    store
+        .images
+        .get(image_id)
+        .is_some_and(|image| image_is_visible(image, account))
+}
+
+/// Refuse an image id a request named that the calling account cannot resolve: something
+/// that is not an AMI id at all is malformed, and a well-formed id the account can see no
+/// image for does not exist — the order EC2 answers the two in.
+pub fn require_visible_image<E>(
+    store: &ComAmazonawsEc2Amazonec2State,
+    image_id: &str,
+) -> Result<(), Scaffolded<E>> {
+    if !image_id_is_well_formed(image_id) {
+        return Err(invalid_ami_id_malformed(image_id));
+    }
+    if !account_can_see_image(store, image_id) {
+        return Err(invalid_ami_id_not_found(image_id));
+    }
+    Ok(())
+}
+
+/// Refuse an image id a Windows fast launch change names that cannot carry one.
+///
+/// Either the account cannot resolve it ([`require_visible_image`]), or the image is not a
+/// Windows AMI: Windows fast launch is a setting of "Windows AMIs that you own or that have
+/// been shared with you" (`EnableFastLaunch`), and "this value is set to `windows` for
+/// Windows AMIs; otherwise, it is blank" (`Image$Platform`) is what says which an image is.
+/// The images this account may change are therefore its own and the public ones — the same
+/// set [`image_is_visible`] answers, no image here carrying an explicit launch permission.
+pub fn require_windows_image<E>(
+    store: &ComAmazonawsEc2Amazonec2State,
+    image_id: &str,
+) -> Result<(), Scaffolded<E>> {
+    require_visible_image(store, image_id)?;
+    let is_windows = store
+        .images
+        .get(image_id)
+        .and_then(|image| image.platform.as_deref())
+        == Some(IMAGE_PLATFORM_WINDOWS);
+    if !is_windows {
+        return Err(invalid_parameter_value(format!(
+            "Invalid value '{image_id}' for imageId. \
+             Windows fast launch is supported for Windows AMIs only"
+        )));
+    }
+    Ok(())
+}
+
+/// Resolve the launch template version a request names against the template that holds it.
+///
+/// "Valid values are $Latest, $Default, and numbers"
+/// (`DescribeLaunchTemplateVersionsRequest$Versions`): an alias resolves to the number the
+/// template records for it, and a number has to be a version the template holds — a
+/// version that does not exist is `InvalidLaunchTemplateId.VersionNotFound`, while
+/// something that is neither an alias nor a number is a bad parameter value.
+pub fn resolve_launch_template_version<E>(
+    record: &LaunchTemplateRecord,
+    version: &str,
+) -> Result<i64, Scaffolded<E>> {
+    let numbered = match version {
+        LAUNCH_TEMPLATE_VERSION_LATEST => record.template.latest_version_number,
+        LAUNCH_TEMPLATE_VERSION_DEFAULT => record.template.default_version_number,
+        other => match other.parse::<i64>() {
+            Ok(number) => Some(number),
+            Err(_) => {
+                return Err(invalid_parameter_value(format!(
+                    "Invalid value '{version}' for version. Valid values are \
+                     {LAUNCH_TEMPLATE_VERSION_LATEST}, {LAUNCH_TEMPLATE_VERSION_DEFAULT}, \
+                     and version numbers"
+                )));
+            }
+        },
+    };
+    numbered
+        .filter(|number| record.versions.contains_key(number))
+        .ok_or_else(|| {
+            Scaffolded::service_error(
+                INVALID_LAUNCH_TEMPLATE_ID_VERSION_NOT_FOUND,
+                400,
+                format!(
+                    "Launch template version '{version}' does not exist for launch \
+                     template '{}'",
+                    record.launch_template_id()
+                ),
+            )
+        })
 }
 
 // =============================================================================

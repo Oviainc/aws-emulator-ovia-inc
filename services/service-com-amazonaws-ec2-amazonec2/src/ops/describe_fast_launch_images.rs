@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeFastLaunchImages
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeFastLaunchImages`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeFastLaunchImages::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the Windows fast launch configurations [`crate::state`] holds: every one by
+//! default, or the subset the request's `ImageIds` and `Filters` select, one
+//! `MaxResults`-sized page at a time. A reporting operation — it writes nothing of its
+//! own, and materialises only the state moves the clock already owed the stored
+//! configurations ([`crate::state::ComAmazonawsEc2Amazonec2State::materialize_due_transitions`]),
+//! which were due whether or not anybody asked.
 //!
 //! ## Shape of an operation
 //!
@@ -146,18 +144,249 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeFastLaunchImages` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeFastLaunchImagesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeFastLaunchImages"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            CompiledFilter, MAX_FILTER_MATCH_STEPS, MAX_FILTER_VALUE_BYTES, MAX_FILTER_VALUES,
+            MAX_FILTERS, MAX_RESOURCE_IDS, MatchBudget, account_can_see_image, decode_page_token,
+            encode_page_token, image_id_is_well_formed, invalid_pagination_token, invalid_request,
+            require_service_state,
+        };
+
+        // `ctx` carries request metadata only; this operation reads none of it. The store
+        // is reached through the engine held on `self`.
+        let _ = ctx;
+
+        let requested_ids = input.image_ids.clone().unwrap_or_default();
+        if requested_ids.len() > MAX_RESOURCE_IDS {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "ImageIds carries {} ids, above the maximum of {MAX_RESOURCE_IDS}",
+                requested_ids.len()
+            )));
+        }
+
+        // Matching cost is filters x values x held values x stored configurations, and the
+        // model bounds none of those, so the request-controlled factors are capped here
+        // before any work proportional to them is done — and their PRODUCT is charged to
+        // one [`MatchBudget`] below, which is the bound the per-factor caps cannot give.
+        let filters: &[Filter] = input.filters.as_deref().unwrap_or_default();
+        if filters.len() > MAX_FILTERS {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "The request carries {} filters, above the maximum of {MAX_FILTERS}",
+                filters.len()
+            )));
+        }
+
+        // A filter name this operation does not document is refused whether or not any
+        // configuration would have matched it, so an unsupported filter can never read as
+        // "no results".
+        let mut selectors: Vec<CompiledFilter> = Vec::with_capacity(filters.len());
+        for filter in filters {
+            let name = filter.name.as_deref().unwrap_or_default();
+            if !FAST_LAUNCH_IMAGE_FILTERS.contains(&name) {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "The filter '{name}' is invalid"
+                )));
+            }
+            let values = filter.values.as_deref().unwrap_or_default();
+            if values.len() > MAX_FILTER_VALUES {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "The filter '{name}' carries {} values, above the maximum of \
+                     {MAX_FILTER_VALUES}",
+                    values.len()
+                )));
+            }
+            // A capped NUMBER of comparisons is not capped WORK: the matcher's cost is the
+            // product of the pattern's length and the value's, so each value's size is
+            // bounded too, before any matching runs under the lock.
+            if let Some(oversize) = values
+                .iter()
+                .find(|value| value.len() > MAX_FILTER_VALUE_BYTES)
+            {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "A value of the filter '{name}' carries {} bytes, above the maximum of \
+                     {MAX_FILTER_VALUE_BYTES}",
+                    oversize.len()
+                )));
+            }
+            selectors.push(CompiledFilter::new(name.to_string(), values.to_vec()));
+        }
+
+        // "The token returned from a previous paginated request" (`NextToken`) — anything
+        // else is refused rather than read as an id.
+        let start_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(decode_page_token(token).ok_or_else(invalid_pagination_token)?),
+        };
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+        // The `enabling` -> `enabled` move, and the end of the cleanup a disable started,
+        // were owed at this instant whether or not anybody called: materialising them
+        // changes nothing a later caller would otherwise have seen, and it is what makes
+        // the `state` filter below compare against the state the caller is shown.
+        store.materialize_due_transitions();
+
+        // "Specify one or more Windows AMI image IDs for the request" (`ImageIds`): an id
+        // this operation cannot resolve to an image the account can see is refused rather
+        // than reported as an absent row, and the code it is refused with is this
+        // operation's own `InvalidRequest` rather than the `InvalidAMIID.*` codes the
+        // id-keyed describes answer. The message is built from the request the way the
+        // service builds it — "Can't describe EC2 Fast Launch images. Image ID: <id> is
+        // not valid." — so the caller is told which id it was. An image the account CAN see
+        // that carries no fast launch configuration is a different thing: it is simply not
+        // one of the "images that meet the requested criteria" (`FastLaunchImages`), so
+        // naming it narrows the report instead.
+        for image_id in &requested_ids {
+            if !image_id_is_well_formed(image_id) || !account_can_see_image(&store, image_id) {
+                return Err(invalid_request(format!(
+                    "Can't describe EC2 Fast Launch images. Image ID: {image_id} is not valid."
+                )));
+            }
+        }
+
+        // DryRun sits AFTER every parameter has been validated and every named image
+        // resolved: the flag asks whether the request WOULD have succeeded, so one that
+        // would have been refused is refused with that reason instead.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        // Every comparison is charged to ONE budget, so the PRODUCT of stored
+        // configurations, filters, values, held values and value length is bounded however
+        // the caller combines them — which is also what bounds how long this holds the
+        // state lock.
+        let mut budget = MatchBudget::new(MAX_FILTER_MATCH_STEPS);
+        let mut selected: Vec<DescribeFastLaunchImagesSuccessItem> = Vec::new();
+        for record in store.fast_launch_images.values() {
+            if budget.exhausted() {
+                break;
+            }
+            // The id narrowing is read off the stored record, so a configuration the
+            // request did not name costs no comparison at all.
+            if !requested_ids.is_empty()
+                && !requested_ids
+                    .iter()
+                    .any(|id| record.view.image_id.as_deref() == Some(id.as_str()))
+            {
+                continue;
+            }
+            if matches_every_filter(&record.view, &selectors, &mut budget) {
+                selected.push(record.view.clone());
+            }
+        }
+        // A spent budget means the answer is INCOMPLETE, which is not something to report
+        // as a result: the request asked for more filtering than one call will do, and is
+        // told so rather than given a silently truncated page.
+        if budget.exhausted() {
+            return Err(Scaffolded::request_limit_exceeded(format!(
+                "The request's filters would take more than {MAX_FILTER_MATCH_STEPS} \
+                 comparisons to evaluate; narrow them or page with MaxResults"
+            )));
+        }
+
+        // Page in `ImageId` order, which the cursor below names a position in. The store is
+        // an ordered map, so its iteration order already satisfies this sort; doing it here
+        // establishes the invariant the cursor depends on at the point of use.
+        selected.sort_by(|left, right| left.image_id.cmp(&right.image_id));
+
+        let from = match start_at.as_deref() {
+            None => 0,
+            Some(cursor) => selected
+                .partition_point(|item| item.image_id.as_deref().unwrap_or_default() < cursor),
+        };
+        let page = selected.get(from..).unwrap_or_default();
+
+        // "The maximum number of items to return for this request" (`MaxResults`), whose
+        // modelled range is 0..200 — so a request that names none, or names the 0 the range
+        // admits, asks for no page size at all and gets the largest page this operation
+        // serves: a page of none is not a page.
+        let limit = input
+            .max_results
+            .and_then(|max_results| usize::try_from(max_results).ok())
+            .filter(|max_results| *max_results > 0)
+            .unwrap_or(MAX_FAST_LAUNCH_IMAGES_PAGE_SIZE)
+            .clamp(1, MAX_FAST_LAUNCH_IMAGES_PAGE_SIZE);
+
+        // "The token to include in another request to get the next page of items. This
+        // value is null when there are no more items to return" (`NextToken`): a token only
+        // when a configuration follows this page.
+        let next_token = page
+            .get(limit)
+            .and_then(|item| item.image_id.as_deref())
+            .map(encode_page_token);
+
+        Ok(DescribeFastLaunchImagesOutput {
+            fast_launch_images: Some(page.iter().take(limit).cloned().collect()),
+            next_token,
+        })
     }
+}
+
+/// The largest page this operation serves: the maximum of the modelled
+/// `DescribeFastLaunchImagesRequestMaxResults` range, `0..200`
+/// (`smithy_query(query="operation",operation="DescribeFastLaunchImages")`). A request that
+/// names no page size gets one of this size, so the `NextToken` path behaves the same
+/// whether or not a page size was asked for.
+const MAX_FAST_LAUNCH_IMAGES_PAGE_SIZE: usize = 200;
+
+/// The filter names this operation documents, from `DescribeFastLaunchImagesRequest$Filters`:
+///
+/// ```text
+/// smithy_query(query="doc",shape="DescribeFastLaunchImagesRequest",member="Filters",model_path="services/service-com-amazonaws-ec2-amazonec2/smithy-model/com-amazonaws-ec2-amazonec2.json")
+/// ```
+///
+/// "Use the following filters to streamline results": `resource-type` - the resource type
+/// for pre-provisioning, `owner-id` - the owner ID for the pre-provisioning resource,
+/// `state` - the current state of fast launching for the Windows AMI. The member documents
+/// no `tag:` family for this operation, and a configuration carries no tags of its own, so
+/// there is none to answer. Every entry must be answered by [`filter_values`].
+const FAST_LAUNCH_IMAGE_FILTERS: [&str; 3] = ["owner-id", "resource-type", "state"];
+
+/// The values the EC2 filter `name` compares against this configuration.
+///
+/// A filter naming an attribute this configuration does not carry compares against NO
+/// values, so it selects nothing — the same answer AWS gives for any absent attribute.
+/// `name` is one of [`FAST_LAUNCH_IMAGE_FILTERS`].
+fn filter_values<'a>(
+    item: &'a DescribeFastLaunchImagesSuccessItem,
+    name: &str,
+) -> Vec<::std::borrow::Cow<'a, str>> {
+    use ::std::borrow::Cow;
+
+    let text = |value: Option<&'a str>| -> Vec<Cow<'a, str>> {
+        value.map(Cow::Borrowed).into_iter().collect()
+    };
+    match name {
+        "owner-id" => text(item.owner_id.as_deref()),
+        "resource-type" => text(item.resource_type.as_deref()),
+        "state" => text(item.state.as_deref()),
+        // Unreachable: the handler has already refused every other name. An undefined name
+        // compares against nothing, so it could never widen a result even if that check
+        // were bypassed.
+        _ => Vec::new(),
+    }
+}
+
+/// Does `item` satisfy every filter?
+///
+/// "If you specify multiple filters, the filters are joined with an AND" (`Filter`), and
+/// within one filter "if you specify multiple values for a filter, the values are joined
+/// with an OR" (`Filter$Values`) — each value matched case-sensitively, with EC2's own
+/// `*`/`?` wildcards, by the pattern the value was compiled into. So a filter carrying no
+/// value at all matches nothing, there being no value for the attribute to match.
+///
+/// Every comparison is charged to `budget`, so one request's filtering cannot cost more
+/// than the ceiling however it combines filters, values and value length.
+fn matches_every_filter(
+    item: &DescribeFastLaunchImagesSuccessItem,
+    selectors: &[crate::state::CompiledFilter],
+    budget: &mut crate::state::MatchBudget,
+) -> bool {
+    selectors.iter().all(|filter| {
+        let held = filter_values(item, &filter.name);
+        filter
+            .patterns
+            .iter()
+            .any(|pattern| held.iter().any(|value| pattern.matches_within(value, budget)))
+    })
 }

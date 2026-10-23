@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op EnableFastLaunch
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `EnableFastLaunch`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`EnableFastLaunch::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Configures Windows fast launch for one Windows AMI in [`crate::state`]: it stores the
+//! configuration the request asks for against the image's id, in the non-terminal
+//! `enabling` state the clock — not a caller — moves on to `enabled`, and answers it as
+//! `DescribeFastLaunchImages` will report it. A MUTATION: "when you enable Windows fast
+//! launch for a Windows AMI, images are pre-provisioned", so this call is what creates the
+//! configuration, and a repeat changes the settings of the one it already stored.
 //!
 //! ## Shape of an operation
 //!
@@ -169,18 +167,183 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `EnableFastLaunch` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(EnableFastLaunchErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("EnableFastLaunch"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            FAST_LAUNCH_RESOURCE_TYPE_SNAPSHOT, FAST_LAUNCH_STATE_DISABLING,
+            FAST_LAUNCH_STATE_ENABLING, FastLaunchMove, FastLaunchRecord, FastLaunchTransition,
+            MIN_FAST_LAUNCH_MAX_PARALLEL_LAUNCHES, MIN_FAST_LAUNCH_TARGET_RESOURCE_COUNT,
+            incorrect_state, require_service_state, require_windows_image,
+            resolve_launch_template_id, resolve_launch_template_version, system_time_to_date_time,
+        };
+
+        // `ctx` carries request metadata only; this operation reads none of it. The store
+        // is reached through the engine held on `self`.
+        let _ = ctx;
+
+        // "The type of resource to use for pre-provisioning the AMI for Windows fast
+        // launch. Supported values include: snapshot, which is the default value"
+        // (`EnableFastLaunchRequest$ResourceType`). The request member is a plain string,
+        // so the one value `FastLaunchResourceType` publishes is enforced here rather than
+        // by the boundary validator.
+        let resource_type = input
+            .resource_type
+            .clone()
+            .unwrap_or_else(|| FAST_LAUNCH_RESOURCE_TYPE_SNAPSHOT.to_string());
+        if resource_type != FAST_LAUNCH_RESOURCE_TYPE_SNAPSHOT {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "Invalid value '{resource_type}' for resourceType. Windows fast launch \
+                 pre-provisions the '{FAST_LAUNCH_RESOURCE_TYPE_SNAPSHOT}' resource type"
+            )));
+        }
+
+        // "Value must be 6 or greater" (`MaxParallelLaunches`). The model declares no
+        // `@range` for the member, so the handler is the only place that sentence can be
+        // enforced; a request that names no maximum gets the floor.
+        if input
+            .max_parallel_launches
+            .is_some_and(|maximum| maximum < MIN_FAST_LAUNCH_MAX_PARALLEL_LAUNCHES)
+        {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "Invalid value '{}' for maxParallelLaunches. It must be at least \
+                 {MIN_FAST_LAUNCH_MAX_PARALLEL_LAUNCHES}",
+                input.max_parallel_launches.unwrap_or_default()
+            )));
+        }
+        let max_parallel_launches = input
+            .max_parallel_launches
+            .unwrap_or(MIN_FAST_LAUNCH_MAX_PARALLEL_LAUNCHES);
+
+        // "The number of pre-provisioned snapshots to keep on hand"
+        // (`FastLaunchSnapshotConfigurationRequest$TargetResourceCount`) is a count of
+        // snapshots, and the model declares no `@range` for it either. A request that names
+        // no count leaves the member absent rather than carrying a number nothing asked
+        // for.
+        let target_resource_count = input
+            .snapshot_configuration
+            .as_ref()
+            .and_then(|configuration| configuration.target_resource_count);
+        if target_resource_count.is_some_and(|count| count < MIN_FAST_LAUNCH_TARGET_RESOURCE_COUNT)
+        {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "Invalid value '{}' for targetResourceCount. It must be at least \
+                 {MIN_FAST_LAUNCH_TARGET_RESOURCE_COUNT}",
+                target_resource_count.unwrap_or_default()
+            )));
+        }
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+        store.materialize_due_transitions();
+
+        // "You can only change these settings for Windows AMIs that you own or that have
+        // been shared with you": an id that is not an AMI id is malformed, one the account
+        // can see no image for does not exist, and an image that is not a Windows AMI
+        // cannot carry this setting at all.
+        require_windows_image(&store, &input.image_id)?;
+
+        // "The launch template to use when launching Windows instances from
+        // pre-provisioned snapshots. Launch template parameters can include either the
+        // name or ID of the launch template, but not both" (`LaunchTemplate`) — and the
+        // version the request names has to be one that template holds, so a stored
+        // configuration cannot report a launch template version that does not exist.
+        let launch_template = match input.launch_template.as_ref() {
+            None => None,
+            Some(requested) => {
+                let launch_template_id = resolve_launch_template_id(
+                    &store,
+                    requested.launch_template_id.as_deref(),
+                    requested.launch_template_name.as_deref(),
+                )?;
+                let record = store
+                    .launch_templates
+                    .get(&launch_template_id)
+                    .ok_or_else(|| {
+                        Scaffolded::internal_error(format!(
+                            "launch template '{launch_template_id}' resolved but is not stored"
+                        ))
+                    })?;
+                let version = resolve_launch_template_version(record, &requested.version)?;
+                Some(FastLaunchLaunchTemplateSpecificationResponse {
+                    launch_template_id: Some(launch_template_id.clone()),
+                    launch_template_name: Some(record.launch_template_name().to_string()),
+                    version: Some(version.to_string()),
+                })
+            }
+        };
+
+        // "Amazon EC2 must remove all pre-provisioned snapshots before you can enable
+        // Windows fast launch again" (`DisableFastLaunch`): while the cleanup a disable
+        // started is still owed, this request cannot be served.
+        if store
+            .fast_launch_images
+            .get(&input.image_id)
+            .is_some_and(|record| record.state() == FAST_LAUNCH_STATE_DISABLING)
+        {
+            return Err(incorrect_state(format!(
+                "Windows fast launch for image '{}' is '{FAST_LAUNCH_STATE_DISABLING}'; \
+                 Amazon EC2 must remove all pre-provisioned snapshots before it can be \
+                 enabled again",
+                input.image_id
+            )));
+        }
+
+        // DryRun sits AFTER every parameter has been validated and every named resource
+        // resolved, and BEFORE the first write: the flag asks whether the request WOULD
+        // have succeeded, so one that would have been refused is refused with that reason
+        // instead, and one that would have succeeded leaves the store untouched.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        // The configuration enters the non-terminal `enabling` state: "Amazon EC2 launches
+        // an instance and runs through Sysprep steps, rebooting as required. Then it
+        // creates a set of reserved snapshots" (`EnableFastLaunch`) — work the clock owes
+        // the configuration rather than this call completing. A repeat of the call CHANGES
+        // the settings of the configuration already stored, and so starts that work again
+        // from the new settings.
+        let now = ::std::time::SystemTime::now();
+        let record = FastLaunchRecord {
+            view: DescribeFastLaunchImagesSuccessItem {
+                image_id: Some(input.image_id.clone()),
+                resource_type: Some(resource_type),
+                // "This property is returned when the associated resourceType is snapshot"
+                // (`SnapshotConfiguration`), which is the only resource type there is.
+                snapshot_configuration: Some(FastLaunchSnapshotConfigurationResponse {
+                    target_resource_count,
+                }),
+                launch_template,
+                max_parallel_launches: Some(max_parallel_launches),
+                // "The owner ID for the pre-provisioning resource" (the `owner-id` filter
+                // of `DescribeFastLaunchImages`): the account the pre-provisioned snapshots
+                // belong to, which is the account making this call — not the AMI's owner,
+                // which may be another account that shared the image.
+                owner_id: Some(::engine::emulator_account_id().to_string()),
+                state: Some(FAST_LAUNCH_STATE_ENABLING.to_string()),
+                // "The reason that the state changed for Windows fast launch for the AMI"
+                // (`StateTransitionReason`): neither the model nor the API reference says
+                // what the service words that as, so the member is left absent rather than
+                // carrying text this emulator invented.
+                state_transition_reason: None,
+                state_transition_time: Some(system_time_to_date_time(now)),
+            },
+            pending: Some(FastLaunchTransition::starting_now(FastLaunchMove::Enabled)),
+        };
+        store
+            .fast_launch_images
+            .insert(input.image_id.clone(), record);
+
+        // Read the response back OUT of the store, so the caller sees what a later
+        // `DescribeFastLaunchImages` will see rather than the request object.
+        store
+            .fast_launch_images
+            .get(&input.image_id)
+            .map(FastLaunchRecord::enable_response)
+            .ok_or_else(|| {
+                Scaffolded::internal_error(format!(
+                    "the Windows fast launch configuration of image '{}' could not be \
+                     read back",
+                    input.image_id
+                ))
+            })
     }
 }

@@ -36,6 +36,8 @@ mod describe_vpcs;
 mod ec2_query;
 #[path = "all/elastic_ip_addresses.rs"]
 mod elastic_ip_addresses;
+#[path = "all/fast_launch_images.rs"]
+mod fast_launch_images;
 #[path = "all/images.rs"]
 mod images;
 #[path = "all/instance_lifecycle.rs"]
