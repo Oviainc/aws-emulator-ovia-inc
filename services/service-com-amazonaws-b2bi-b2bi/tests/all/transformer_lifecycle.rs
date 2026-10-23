@@ -27,7 +27,7 @@ use crate::onboarding_loop::{
 /// (`smithy_query(query="operation",operation="CreateTransformer")`) minus the
 /// system-assigned ones (`transformerId`, `transformerArn`, `status`, `createdAt`) and
 /// `name`.
-const CONFIGURATION_MEMBERS: &[&str] = &[
+pub(crate) const CONFIGURATION_MEMBERS: &[&str] = &[
     "ediType",
     "fileFormat",
     "mappingTemplate",
@@ -44,7 +44,7 @@ const CONFIGURATION_MEMBERS: &[&str] = &[
 /// Source: the `deprecated` trait ("This is a legacy trait. Please use input-conversion or
 /// output-conversion.") on those members; the values come from `X12TransactionSet` /
 /// `X12Version` / `FileFormat` as `smithy_query` lists them.
-fn legacy_members() -> Vec<(&'static str, Value)> {
+pub(crate) fn legacy_members() -> Vec<(&'static str, Value)> {
     vec![
         (
             "ediType",
@@ -61,7 +61,7 @@ fn legacy_members() -> Vec<(&'static str, Value)> {
 /// Source: `InputConversion$fromFormat` / `OutputConversion$toFormat` (`FromFormat` and
 /// `ToFormat` both accept only `X12`), `Mapping$templateLanguage` (`JSONATA` | `XSLT`) and
 /// `SampleDocuments` (`bucketName` + `keys`), as `smithy_query` reports them.
-fn current_members() -> Vec<(&'static str, Value)> {
+pub(crate) fn current_members() -> Vec<(&'static str, Value)> {
     vec![
         (
             "inputConversion",

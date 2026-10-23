@@ -575,16 +575,6 @@ impl ComAmazonawsIamAwsidentitymanagementv20100508State {
         unique_id(ROLE_ID_PREFIX, self.role_id_seq)
     }
 
-    /// Mint the next instance profile's `InstanceProfileId`.
-    ///
-    /// Unique and stable for the same reason [`next_user_id`](Self::next_user_id)
-    /// is: the counter is bijectively mixed into the suffix, and the id is minted
-    /// once and then stored with the instance profile.
-    pub fn next_instance_profile_id(&mut self) -> String {
-        self.instance_profile_id_seq += 1;
-        unique_id(INSTANCE_PROFILE_ID_PREFIX, self.instance_profile_id_seq)
-    }
-
     /// How many access keys the user keyed by `user_key` holds.
     ///
     /// This is the measure IAM's access-keys-per-user quota
@@ -642,6 +632,16 @@ impl ComAmazonawsIamAwsidentitymanagementv20100508State {
     pub fn next_policy_id(&mut self) -> String {
         self.policy_id_seq += 1;
         unique_id(POLICY_ID_PREFIX, self.policy_id_seq)
+    }
+
+    /// Mint the next instance profile's `InstanceProfileId`.
+    ///
+    /// Unique and stable for the same reason [`next_user_id`](Self::next_user_id) is: the
+    /// counter is bijectively mixed into the suffix, and the id is minted once and then
+    /// stored with the profile.
+    pub fn next_instance_profile_id(&mut self) -> String {
+        self.instance_profile_id_seq += 1;
+        unique_id(INSTANCE_PROFILE_ID_PREFIX, self.instance_profile_id_seq)
     }
 
     /// The managed policy `arn` names, if the account holds it.

@@ -2,13 +2,15 @@
 
 //! Engine state for the com-amazonaws-rds-amazonrdsv19 service.
 //!
-//! The DB instance, DB snapshot, option group, DB subnet group, cluster parameter group,
-//! event subscription and global cluster records the implemented handlers read and write,
-//! plus the projection of a stored record onto the modelled `DBInstance` / `DBSnapshot` /
-//! `OptionGroup` / `DBSubnetGroup` / `DBClusterParameterGroup` / `EventSubscription` /
+//! The DB instance, DB snapshot, DB cluster, option group, DB subnet group, cluster
+//! parameter group, event subscription and global cluster records the implemented
+//! handlers read and write, plus the projection of a stored record onto the modelled
+//! `DBInstance` / `DBSnapshot` / `DBCluster` / `OptionGroup` / `DBSubnetGroup` /
+//! `DBClusterParameterGroup` / `EventSubscription` /
 //! `GlobalCluster` wire shapes. These live here rather than in one operation file because
 //! every implemented operation shares them: `CreateDBInstance`, `DescribeDBInstances`,
 //! `ModifyDBInstance`, `CreateDBSnapshot`, `DescribeDBSnapshots`, `DeleteDBInstance`,
+//! `CreateDBCluster`, `DescribeDBClusters`,
 //! `CreateOptionGroup`, `ModifyOptionGroup`, `DescribeOptionGroups`,
 //! `DeleteOptionGroup`, `CreateDBSubnetGroup`, `DescribeDBSubnetGroups`, the six
 //! cluster-parameter-group operations, `CreateEventSubscription`,
@@ -28,6 +30,8 @@
 //! per-region quotas cap the records in each. The store therefore holds at most
 //! `MAX_REGIONS * DB_INSTANCE_QUOTA_PER_REGION` instances,
 //! `MAX_REGIONS * DB_SNAPSHOT_QUOTA_PER_REGION` snapshots,
+//! `MAX_REGIONS * DB_CLUSTER_QUOTA_PER_REGION` DB clusters — each carrying at most
+//! [`MAX_CLUSTER_LIST_VALUES`] values in each of its stored string lists —
 //! `MAX_REGIONS * OPTION_GROUP_QUOTA_PER_REGION` option groups and
 //! `MAX_REGIONS * DB_SUBNET_GROUP_QUOTA_PER_REGION` DB subnet groups,
 //! `MAX_REGIONS * DB_CLUSTER_PARAMETER_GROUP_QUOTA_PER_REGION` cluster parameter groups
@@ -711,8 +715,9 @@ pub struct ComAmazonawsRdsAmazonrdsv19State {
     ///
     /// `CreateDBCluster` inserts here — bounded by [`DB_CLUSTER_QUOTA_PER_REGION`] per
     /// region and by [`MAX_REGIONS`] regions — and this is also what a request that
-    /// REFERENCES a cluster (`CreateDBInstance$DBClusterIdentifier`) is resolved against,
-    /// so an instance can only join a cluster some create really stored.
+    /// REFERENCES a cluster (`CreateDBInstance$DBClusterIdentifier`,
+    /// `CreateGlobalCluster$SourceDBClusterIdentifier`) is resolved against, so a
+    /// reference can only name a cluster some create really stored.
     pub db_clusters: BTreeMap<RegionalKey, DbClusterRecord>,
     /// Cluster parameter groups by `(region, DBClusterParameterGroupName)` — the name
     /// always stored lowercased, as the model documents. Ordered, so

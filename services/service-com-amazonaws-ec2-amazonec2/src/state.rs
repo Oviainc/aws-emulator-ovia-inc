@@ -165,6 +165,21 @@
 //! [`SecurityGroup`] shape itself, keyed by `GroupId` in a [`BTreeMap`], for the same
 //! reasons the VPC and subnet stores do.
 //!
+//! ## Capacity Blocks
+//!
+//! [`ComAmazonawsEc2Amazonec2State::capacity_blocks`] holds the account's Capacity Blocks
+//! as [`CapacityBlockRecord`]s: the modelled [`CapacityBlock`] every operation that reports
+//! one answers with, plus the state a writer pinned it to, keyed by `CapacityBlockId` in a
+//! [`BTreeMap`] — the same stable order the VPC, subnet and volume stores are kept in, so a
+//! pagination token can name the id the next page starts at. A block's `State` is NOT stored
+//! on the view: "A Capacity Block expires" at its `EndDate` and its reserved window opens at
+//! its `StartDate` (`CapacityBlock$EndDate` / `$StartDate`), so `scheduled` -> `active` ->
+//! `expired` is a fact of where the WALL clock stands in that window and
+//! [`CapacityBlockRecord::state_at`] derives it on read instead of letting two writers store
+//! two different words for it. Only the states no clock drives — a block AWS could not
+//! deliver, one that was cancelled, one whose payment is pending or failed — are stored, as
+//! [`CapacityBlockRecord::pinned_state`].
+//!
 //! ## Application status is DERIVED, never stored
 //!
 //! [`ComAmazonawsEc2Amazonec2State::application_status`] holds, per `InstanceId`, the
@@ -183,7 +198,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::{
     Address, ApplicationStatus, ApplicationStatusDetail, AvailabilityZone,
-    AvailabilityZoneMessage, BlockDeviceMapping, BlockPublicAccessStates,
+    AvailabilityZoneMessage, BlockDeviceMapping, BlockPublicAccessStates, CapacityBlock,
     CreateVolumeOutput, DescribeFastLaunchImagesSuccessItem, DisableFastLaunchOutput,
     EbsBlockDevice, EnableFastLaunchOutput, GroupIdentifier, INSTANCE_TYPE_VALUES, Image, Instance,
     InstanceApplicationStatus,
@@ -852,6 +867,9 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// A `CreateVolume` `ClientToken` and the volume id it minted, so a repeat of the
     /// same request answers with that volume instead of creating a second one.
     pub volume_client_tokens: HashMap<String, String>,
+    /// Every Capacity Block the account holds, by `CapacityBlockId` — see the module docs.
+    /// Ordered by id, which is the order `DescribeCapacityBlocks` reports and pages over.
+    pub capacity_blocks: BTreeMap<String, CapacityBlockRecord>,
     /// What each instance's application health status is derived from, by `InstanceId` —
     /// see [`InstanceApplicationStatusRecord`] and the module docs. An instance with no
     /// entry has had no application status check reported for it, which is exactly the
@@ -903,6 +921,7 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             id_counter: 0,
             volumes: BTreeMap::new(),
             volume_client_tokens: HashMap::new(),
+            capacity_blocks: BTreeMap::new(),
             application_status: BTreeMap::new(),
             fast_launch_images: BTreeMap::new(),
             addresses: BTreeMap::new(),
@@ -4777,6 +4796,191 @@ impl ComAmazonawsEc2Amazonec2State {
         }
         Some(vpc)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Capacity Blocks
+// ---------------------------------------------------------------------------
+
+/// A Capacity Block whose reserved window has not opened yet: the
+/// `CapacityBlockResourceState` enum's `scheduled` member
+/// (`smithy_query(query="shape",shape="CapacityBlockResourceState")`).
+pub const CAPACITY_BLOCK_STATE_SCHEDULED: &str = "scheduled";
+
+/// A Capacity Block whose reserved window is open: that enum's `active` member.
+pub const CAPACITY_BLOCK_STATE_ACTIVE: &str = "active";
+
+/// A Capacity Block whose reserved window has closed: that enum's `expired` member — "When
+/// a Capacity Block expires, all instances in the Capacity Block are terminated"
+/// (`CapacityBlock$EndDate`).
+pub const CAPACITY_BLOCK_STATE_EXPIRED: &str = "expired";
+
+/// The members of `CapacityBlockResourceState` that are NOT a fact of where the clock
+/// stands in a block's reserved window, and so are stored on the record rather than derived
+/// ([`CapacityBlockRecord::pinned_state`]): a block AWS could not deliver, one that was
+/// cancelled, one that failed, and the two payment states a purchase can sit in.
+pub const CAPACITY_BLOCK_PINNED_STATES: [&str; 5] = [
+    "unavailable",
+    "cancelled",
+    "failed",
+    "payment-pending",
+    "payment-failed",
+];
+
+/// The id prefix a Capacity Block's id carries, in the `<prefix>-<hex>` form every EC2
+/// resource id takes (see [`ComAmazonawsEc2Amazonec2State::next_id`]).
+pub const CAPACITY_BLOCK_ID_PREFIX: &str = "cb";
+
+/// The code EC2 answers for a Capacity Block id the account holds no block for, in the
+/// `Invalid<Resource>Id.NotFound` family every other id of this service is refused with
+/// ([`INVALID_LAUNCH_TEMPLATE_ID_NOT_FOUND`], [`INVALID_SUBNET_ID_NOT_FOUND`]).
+pub const INVALID_CAPACITY_BLOCK_ID_NOT_FOUND: &str = "InvalidCapacityBlockId.NotFound";
+
+/// One stored Capacity Block: the modelled [`CapacityBlock`] every operation that reports
+/// one answers with, plus the state a writer pinned it to.
+///
+/// The view holds no `State`: a block's `scheduled` -> `active` -> `expired` progression is
+/// a fact of where the wall clock stands in the window its `StartDate` and `EndDate`
+/// delimit, so [`Self::state_at`] derives it rather than letting two writers store two
+/// different words for it. The clock is the WALL clock here, not the monotonic one a
+/// [`PendingTransition`] is due on, because these two instants are themselves reported to
+/// the caller.
+#[derive(Debug, Clone)]
+pub struct CapacityBlockRecord {
+    /// The block as the model shapes it, with `State` left for [`Self::view_at`] to fill.
+    pub block: CapacityBlock,
+    /// The state of a block the clock does not move: one of
+    /// [`CAPACITY_BLOCK_PINNED_STATES`], or `None` for a block whose state is read off its
+    /// reserved window. A `&'static str` so it can only ever be a member of the modelled
+    /// enum, never text taken from a request.
+    pub pinned_state: Option<&'static str>,
+}
+
+impl CapacityBlockRecord {
+    /// This block as of `now`: the stored view with the `State` the clock has reached. A
+    /// read observes the move the clock already owed without writing anything.
+    pub fn view_at(&self, now: SystemTime) -> CapacityBlock {
+        let mut block = self.block.clone();
+        block.state = Some(self.state_at(now).to_string());
+        block
+    }
+
+    /// The block's `CapacityBlockResourceState` at `now`.
+    ///
+    /// A pinned state wins: no passage of time moves a cancelled or unpaid block into its
+    /// reserved window. Otherwise the window delimits the three clock-driven states, a
+    /// block being `scheduled` before its `StartDate`, `active` from it, and `expired` from
+    /// its `EndDate`. A date the record does not carry does not bound the window on that
+    /// side, so a block with neither is `active`.
+    pub fn state_at(&self, now: SystemTime) -> &'static str {
+        if let Some(pinned) = self.pinned_state {
+            return pinned;
+        }
+        let now = timestamp_key(system_time_to_date_time(now));
+        if self.block.start_date.map(timestamp_key).is_some_and(|start| now < start) {
+            return CAPACITY_BLOCK_STATE_SCHEDULED;
+        }
+        if self.block.end_date.map(timestamp_key).is_some_and(|end| now >= end) {
+            return CAPACITY_BLOCK_STATE_EXPIRED;
+        }
+        CAPACITY_BLOCK_STATE_ACTIVE
+    }
+}
+
+/// A timestamp as a totally ordered key: the modelled timestamp type carries no `Ord`, and
+/// comparing the two instants of a window through `f64` seconds would lose precision the
+/// `MillisecondDateTime` the model uses for them keeps.
+fn timestamp_key(at: ::aws_smithy_types::DateTime) -> (i64, u32) {
+    (at.secs(), at.subsec_nanos())
+}
+
+/// What one stored Capacity Block is created with, for
+/// [`ComAmazonawsEc2Amazonec2State::insert_capacity_block`].
+///
+/// The instants are [`SystemTime`]s rather than modelled timestamps because every writer
+/// computes them from the clock it already holds; the store converts them once.
+#[derive(Debug, Clone)]
+pub struct CapacityBlockSpec {
+    /// "The EC2 UltraServer type of the Capacity Block" (`CapacityBlock$UltraserverType`).
+    pub ultraserver_type: Option<String>,
+    /// The Availability Zone the block's capacity sits in.
+    pub availability_zone: String,
+    /// That zone's id.
+    pub availability_zone_id: String,
+    /// The Capacity Reservations the block holds its capacity as.
+    pub capacity_reservation_ids: Vec<String>,
+    /// When the block's reserved window opens.
+    pub start_date: SystemTime,
+    /// When it closes, after which the block is `expired`.
+    pub end_date: SystemTime,
+    /// When the block was created.
+    pub create_date: SystemTime,
+    /// A state no clock drives, or `None` for a block whose state is its window's — see
+    /// [`CapacityBlockRecord::pinned_state`].
+    pub pinned_state: Option<&'static str>,
+    /// "The tags assigned to the Capacity Block" (`CapacityBlock$Tags`).
+    pub tags: Vec<Tag>,
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// Store one Capacity Block and answer the `CapacityBlockId` it was given.
+    ///
+    /// The one place a Capacity Block enters this store, so every writer of one — and
+    /// `DescribeCapacityBlocks`, which reports what this wrote — agrees on the id form, the
+    /// stored shape and which members a block carries.
+    pub fn insert_capacity_block(&mut self, spec: CapacityBlockSpec) -> String {
+        let capacity_block_id = self.next_id(CAPACITY_BLOCK_ID_PREFIX);
+        let block = CapacityBlock {
+            capacity_block_id: Some(capacity_block_id.clone()),
+            ultraserver_type: spec.ultraserver_type,
+            availability_zone: Some(spec.availability_zone),
+            availability_zone_id: Some(spec.availability_zone_id),
+            capacity_reservation_ids: Some(spec.capacity_reservation_ids),
+            start_date: Some(system_time_to_date_time(spec.start_date)),
+            end_date: Some(system_time_to_date_time(spec.end_date)),
+            create_date: Some(system_time_to_date_time(spec.create_date)),
+            // Derived on read from the window above, so nothing is stored here; see
+            // [`CapacityBlockRecord`].
+            state: None,
+            tags: Some(spec.tags),
+        };
+        self.capacity_blocks.insert(
+            capacity_block_id.clone(),
+            CapacityBlockRecord {
+                block,
+                pinned_state: spec.pinned_state,
+            },
+        );
+        capacity_block_id
+    }
+}
+
+/// Refuse a request that named a Capacity Block id no block of the account has: HTTP 400
+/// `InvalidCapacityBlockId.NotFound`.
+///
+/// The model publishes no pattern for `CapacityBlockId`
+/// (`smithy_query(query="shape",shape="CapacityBlockId")`), so there is no shape to call
+/// malformed ahead of the lookup the way a volume id has one: an id this store cannot
+/// resolve is reported not found whatever it looks like.
+pub fn invalid_capacity_block_id_not_found<E>(
+    capacity_block_id: &str,
+) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_error(
+        INVALID_CAPACITY_BLOCK_ID_NOT_FOUND,
+        400,
+        format!("The Capacity Block ID '{capacity_block_id}' does not exist"),
+    )
+}
+
+/// Refuse a Capacity Block id the request named that this store holds no block for.
+pub fn require_known_capacity_block<E>(
+    store: &ComAmazonawsEc2Amazonec2State,
+    capacity_block_id: &str,
+) -> Result<(), crate::scaffolded::Scaffolded<E>> {
+    if store.capacity_blocks.contains_key(capacity_block_id) {
+        return Ok(());
+    }
+    Err(invalid_capacity_block_id_not_found(capacity_block_id))
 }
 
 // =============================================================================
