@@ -32,9 +32,13 @@
 //! first, is what materialises the ones the clock has already made due.
 
 use std::collections::{BTreeMap, HashMap};
+use std::ops::Bound;
 use std::time::SystemTime;
 
-use crate::ops::types::{Multiplex, MultiplexProgram, MultiplexProgramSettings, MultiplexSettings};
+use crate::ops::types::{
+    Multiplex, MultiplexProgram, MultiplexProgramSettings, MultiplexProgramSummary,
+    MultiplexSettings,
+};
 
 use super::{ComAmazonawsMedialiveMedialiveState, TRANSIENT_STATE_SPAN};
 
@@ -980,6 +984,44 @@ impl ComAmazonawsMedialiveMedialiveState {
             pipeline_details: None,
             program_name: Some(program.program_name.clone()),
         })
+    }
+
+    /// One page of the programs the multiplex `multiplex_id` holds, as the
+    /// `MultiplexProgramSummary` list `ListMultiplexPrograms` reports: the
+    /// programs whose name is at or after `first`, in `ProgramName` order, at
+    /// most `page_size` of them, together with the name the next page starts at
+    /// when a program is left over after this one.
+    ///
+    /// `None` when the store holds no multiplex with that id — the one thing
+    /// that distinguishes "this multiplex has no programs" (an empty page) from
+    /// "there is no such multiplex" (the caller's `NotFoundException`).
+    ///
+    /// A summary's two members come from the same places the full
+    /// [`ComAmazonawsMedialiveMedialiveState::multiplex_program_description`]
+    /// takes them from — the stored `ProgramName` and the channel derived from
+    /// this store's channels — so a listed program cannot disagree with the
+    /// same program's describe.
+    pub fn multiplex_program_summaries(
+        &self,
+        multiplex_id: &str,
+        first: Bound<&str>,
+        page_size: usize,
+    ) -> Option<(Vec<MultiplexProgramSummary>, Option<String>)> {
+        let multiplex = self.multiplexes.get(multiplex_id)?;
+        let mut remaining = multiplex.programs.range::<str, _>((first, Bound::Unbounded));
+        let summaries: Vec<MultiplexProgramSummary> = remaining
+            .by_ref()
+            .take(page_size)
+            .map(|(_, program)| MultiplexProgramSummary {
+                channel_id: self
+                    .channel_in_multiplex_program(multiplex_id, &program.program_name),
+                program_name: Some(program.program_name.clone()),
+            })
+            .collect();
+        // Absent on the last page: a token is handed out only when a program is
+        // left over after the ones this page carries.
+        let next_token = remaining.next().map(|(program_name, _)| program_name.clone());
+        Some((summaries, next_token))
     }
 
     /// "The MediaLive channel associated with the program": the channel whose
