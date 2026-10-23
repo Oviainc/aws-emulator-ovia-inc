@@ -1247,6 +1247,38 @@ impl StoredFlow {
             .collect()
     }
 
+    /// What the media stream named `media_stream_name` is associated with, as the phrase a
+    /// refusal names it by, or `None` when nothing of this flow carries it.
+    ///
+    /// A media stream is associated with a source through
+    /// `Source.MediaStreamSourceConfigurations` ("the media streams that are associated
+    /// with the source") and with an output through
+    /// `Output.MediaStreamOutputConfigurations` ("the configuration for each media stream
+    /// that is associated with the output"), and both name the media stream by name. The
+    /// lookup is stated once here because every operation whose documented precondition is
+    /// an association — RemoveFlowMediaStream ("only available if the media stream is not
+    /// associated with a source or output") — must read the SAME associations.
+    pub fn media_stream_association(&self, media_stream_name: &str) -> Option<String> {
+        let source = self.sources.iter().find(|source| {
+            source
+                .media_stream_source_configurations
+                .iter()
+                .flatten()
+                .any(|configuration| configuration.media_stream_name == media_stream_name)
+        });
+        if let Some(source) = source {
+            return Some(format!("source {}", source.source_arn));
+        }
+        let output = self.outputs.iter().find(|output| {
+            output
+                .media_stream_output_configurations
+                .iter()
+                .flatten()
+                .any(|configuration| configuration.media_stream_name == media_stream_name)
+        });
+        output.map(|output| format!("output {}", output.output_arn))
+    }
+
     /// `ListedFlow.SourceType`: `ENTITLED` when the flow ingests through an entitlement
     /// granted by another account, `OWNED` otherwise.
     pub fn source_type(&self) -> &'static str {

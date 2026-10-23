@@ -439,7 +439,13 @@ async fn add_flow_outputs_refuses_what_it_cannot_add() {
 
 /// One `MediaStreamOutputConfigurations` entry for the media stream `media_stream_name`,
 /// sending to `destination_ip`.
-fn media_stream_output_configuration(media_stream_name: &str, destination_ip: &str) -> Value {
+///
+/// `pub(crate)` because `tests/all/remove_flow_media_stream.rs` associates a media stream
+/// with an output the same way.
+pub(crate) fn media_stream_output_configuration(
+    media_stream_name: &str,
+    destination_ip: &str,
+) -> Value {
     json!({
         "encodingName": "jxsv",
         "mediaStreamName": media_stream_name,
