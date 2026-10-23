@@ -227,6 +227,11 @@ pub(crate) fn is_modelled_profile_id(id: &str) -> bool {
     is_prefixed_lower_hex_id(id, "p-", 17)
 }
 
+/// `CertificateId` is modelled `len 22..22`, pattern `^cert-([0-9a-f]{17})$`.
+pub(crate) fn is_modelled_certificate_id(id: &str) -> bool {
+    is_prefixed_lower_hex_id(id, "cert-", 17)
+}
+
 /// `HostKeyId` is modelled `len 25..25`, pattern `^hostkey-[0-9a-f]{17}$`.
 pub(crate) fn is_modelled_host_key_id(id: &str) -> bool {
     is_prefixed_lower_hex_id(id, "hostkey-", 17)
@@ -267,6 +272,15 @@ pub(crate) fn host_key_algorithm(material: &str) -> String {
         .algorithm()
         .as_str()
         .to_string()
+}
+
+/// Seconds since the Unix epoch, at the clock's own precision — the unit the awsJson
+/// protocol puts a timestamp on the wire in. Shared by every suite that asserts on a
+/// timestamp member.
+pub(crate) fn unix_seconds(at: std::time::SystemTime) -> f64 {
+    at.duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .expect("the test clock is past the Unix epoch")
+        .as_secs_f64()
 }
 
 /// Assert that `actual` carries each member `expected` names, where a `null`
