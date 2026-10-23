@@ -17,6 +17,8 @@ mod availability_zones;
 mod create_security_group;
 #[path = "all/default_network.rs"]
 mod default_network;
+#[path = "all/delete_vpc.rs"]
+mod delete_vpc;
 #[path = "all/describe_images.rs"]
 mod describe_images;
 #[path = "all/describe_security_groups.rs"]
