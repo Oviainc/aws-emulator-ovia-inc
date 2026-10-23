@@ -2,7 +2,8 @@
 
 //! @op DeleteInput
 //! Deletes an input: refused while a channel attaches it, otherwise the input enters
-//! `DELETING` and the clock settles it into the terminal `DELETED`.
+//! `DELETING`, its ingest endpoints are released, and the clock settles it into the
+//! terminal `DELETED`.
 //!
 //! ## Shape of an operation
 //!
@@ -191,25 +192,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // answered 200 rather than with `ConflictException`: the state the
         // caller is asking for is the state the input is already heading for or
         // in, so nothing about the request conflicts with the stored resource —
-        // and `begin_delete_input` keeps the instant the first call set, so a
-        // repeat can neither restart the clock nor revive a deleted input. The
-        // conflict is reserved for the case the doc gives it: an input some
-        // channel still attaches.
-        let record = state
-            .inputs
-            .get_mut(&input.input_id)
-            .ok_or_else(unavailable)?;
-        crate::state::begin_delete_input(record, now);
-
-        // The response is the deleted input, read back out of the store after the
-        // deletion was written — so its `State` is the one that was just stored
-        // (`DELETING`, or `DELETED` on a repeat whose clock has already run) and
-        // every other member is the stored record's, never this request's. A
-        // client that reads `state` to learn the input entered `DELETING` has its
-        // starting state for a delete-then-wait flow, and the same projection a
-        // later `DescribeInput` reports.
+        // and the deletion keeps the instant the first call set, so a repeat can
+        // neither restart the clock nor revive a deleted input. The conflict is
+        // reserved for the case the doc gives it: an input some channel still
+        // attaches.
+        //
+        // The response is the input this call deleted, projected by the store:
+        // its `State` is the one the acceptance just wrote (`DELETING`, or
+        // `DELETED` on a repeat whose clock has already run) and every other
+        // member is the stored record's as the delete found it — the ingest
+        // endpoints this delete released included, so a client learns which
+        // endpoints are coming down, and reads `state` to get the starting state
+        // of a delete-then-wait flow. Every later read answers from the record,
+        // which no longer holds those endpoints.
         let deleted = state
-            .input_description(&input.input_id)
+            .delete_input_description(&input.input_id, now)
             .ok_or_else(unavailable)?;
         Ok(crate::state::input_description_output!(
             DescribeInputOutput,

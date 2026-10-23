@@ -44,8 +44,11 @@ async fn update_input(router: &MultiServiceRouter, id: &str, body: Value) -> Val
     response["input"].clone()
 }
 
-/// The destinations of one `Input`-shaped body.
-fn destinations(input: &Value) -> Vec<Value> {
+/// The destinations of one `Input`-shaped body, as a client reads them: the
+/// member may be absent, which is the same thing as reporting none. Shared with
+/// the teardown suite (`input_endpoint_release`), so the two cannot disagree
+/// about what "reports no destinations" means.
+pub(crate) fn destinations(input: &Value) -> Vec<Value> {
     input["destinations"]
         .as_array()
         .cloned()
@@ -319,17 +322,29 @@ async fn an_ingest_address_is_distinct_and_fixed_for_the_lifetime_of_the_input()
         "case \"a second input\": expected addresses the first input does not hold, got {second_addresses:?} beside {grown_addresses:?}"
     );
 
-    // Deleting the input does not take its endpoints away: the deleted input
-    // stays readable, endpoints and all.
+    // Deleting the input releases its endpoints: the delete's own response
+    // reports the addresses it is taking down, and no read of the input reports
+    // one afterwards (the subject of `input_endpoint_release.rs`).
     let (status, deleted) = call(&router, "DELETE", &format!("/prod/inputs/{id}"), None).await;
     assert_eq!(
         status, 200,
         "case \"deleted\": DeleteInput: expected 200, got {status}: {deleted}"
     );
-    let after_delete = addresses(&describe_input(&router, &id).await);
+    assert_eq!(
+        deleted["state"],
+        json!("DELETING"),
+        "case \"deleted\": expected the transient state the delete starts, got {:?}",
+        deleted["state"]
+    );
+    let after_delete = addresses(&deleted);
     assert_eq!(
         after_delete, grown_addresses,
-        "case \"deleted\": expected the deleted input to keep reporting its ingest addresses, got {after_delete:?}"
+        "case \"deleted\": expected the delete to report the ingest addresses it released, got {after_delete:?}"
+    );
+    let after_read = destinations(&describe_input(&router, &id).await);
+    assert!(
+        after_read.is_empty(),
+        "case \"deleted\": expected a read after the delete to report no destinations, got {after_read:?}"
     );
 }
 
