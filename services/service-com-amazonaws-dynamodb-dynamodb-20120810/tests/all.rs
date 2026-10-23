@@ -51,6 +51,9 @@ mod table_items;
 #[path = "all/table_scan.rs"]
 mod table_scan;
 
+#[path = "all/table_throughput_mode_and_warm_capacity.rs"]
+mod table_throughput_mode_and_warm_capacity;
+
 #[path = "all/validation_message_wording.rs"]
 mod validation_message_wording;
 

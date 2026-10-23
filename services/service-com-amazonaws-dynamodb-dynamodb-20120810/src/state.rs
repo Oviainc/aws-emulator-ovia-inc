@@ -17,7 +17,7 @@ use crate::ops::types::{
     GlobalSecondaryIndexDescription, GlobalSecondaryIndexWarmThroughputDescription,
     ItemCollectionMetrics, KeySchemaElement, LocalSecondaryIndexDescription, Projection,
     ProvisionedThroughput, ProvisionedThroughputDescription, Tag, TableClassSummary,
-    TableDescription, TableWarmThroughputDescription, WarmThroughput,
+    TableDescription, TableThroughputModeSummary, TableWarmThroughputDescription, WarmThroughput,
 };
 
 /// A DynamoDB item: the attribute-name -> attribute-value map a client put.
@@ -835,6 +835,12 @@ pub struct GlobalSecondaryIndex {
     /// decreases have been applied today, as `ProvisionedThroughputDescription`
     /// reports them.
     pub throughput_history: ThroughputHistory,
+    /// The warm throughput in force for this index, which its description reports as
+    /// `WarmThroughput`. No request can name one per index (`CreateTable`/`UpdateTable`
+    /// refuse that member with the scaffold's 501), so it follows the index's own
+    /// provisioned capacity until that capacity is withdrawn — see
+    /// [`WarmThroughputSettings::tracking_capacity`].
+    pub warm_throughput: WarmThroughputSettings,
     /// The metered figures this index's `ItemCount` and `IndexSizeBytes` report,
     /// refreshed with the table's on the documented schedule.
     pub reported_counters: MeteredCounters,
@@ -1163,23 +1169,29 @@ impl MeteredCounters {
     }
 }
 
-/// One table's warm throughput: the read and write units per second it keeps warm, and
-/// when the pair in force became (or becomes) `ACTIVE`.
+/// One table's or index's warm throughput: the read and write units per second it keeps
+/// warm, and when the pair in force became (or becomes) `ACTIVE`.
 ///
 /// "Warm throughput ... specifies the minimum provisioned capacity maintained for
 /// immediate data access" (the `TableWarmThroughputDescription` doc), and every table
 /// has one — the request's values when `CreateTable`/`UpdateTable` named them, otherwise
-/// the documented default pair ([`DEFAULT_WARM_READ_UNITS_PER_SECOND`] /
-/// [`DEFAULT_WARM_WRITE_UNITS_PER_SECOND`]). `Status` is the status of this SETTING, not
-/// of the table: `UPDATING` while an `UpdateTable` that changed it is still in flight,
-/// `ACTIVE` once the pair is in force.
+/// the capacity the resource is provisioned for, and the documented default pair
+/// ([`DEFAULT_WARM_READ_UNITS_PER_SECOND`] / [`DEFAULT_WARM_WRITE_UNITS_PER_SECOND`])
+/// for a resource created with no provisioned capacity at all.
+///
+/// The pair is STORED rather than derived on every read: it is set when a request names
+/// one and when the resource's provisioned capacity is set ([`Self::tracking_capacity`]),
+/// and WITHDRAWING that capacity leaves it alone — what the resource was keeping warm
+/// stays warm. `Status` is the status of this SETTING, not of the table: `UPDATING` while
+/// an `UpdateTable` that changed it is still in flight, `ACTIVE` once the pair is in
+/// force.
 #[derive(Debug, Clone)]
 pub struct WarmThroughputSettings {
     pub read_units_per_second: i64,
     pub write_units_per_second: i64,
-    /// Whether a REQUEST named this pair. A resource that has never been given one keeps
-    /// warm what [`derived_warm_throughput`] computes from its provisioned capacity
-    /// instead, so a capacity change moves it along.
+    /// Whether a REQUEST named this pair. A pair nobody named follows the capacity the
+    /// resource is provisioned for, so provisioning it differently moves the pair along;
+    /// a named one stands until another request names a new one.
     pub named: bool,
     /// When the clock makes this pair `ACTIVE`. Equal to the creation instant for the
     /// pair a table is created with, so a table never reports a warm throughput that is
@@ -1188,25 +1200,42 @@ pub struct WarmThroughputSettings {
 }
 
 impl WarmThroughputSettings {
-    /// The settings of a resource no request has named a warm throughput for: it keeps
-    /// warm what its capacity implies, from `now`.
-    pub fn default_at(now: SystemTime) -> Self {
+    /// The settings of a resource no request has named a warm throughput for: from `now`
+    /// it keeps warm the capacity it is provisioned for, or the documented default pair
+    /// when it is provisioned for none.
+    pub fn tracking(provisioned: Option<&ProvisionedThroughput>, now: SystemTime) -> Self {
+        let (read_units_per_second, write_units_per_second) = derived_warm_throughput(provisioned);
         Self {
-            read_units_per_second: DEFAULT_WARM_READ_UNITS_PER_SECOND,
-            write_units_per_second: DEFAULT_WARM_WRITE_UNITS_PER_SECOND,
+            read_units_per_second,
+            write_units_per_second,
             named: false,
             active_at: now,
         }
     }
 
-    /// The pair this resource reports, given the provisioned capacity it carries: the
-    /// named pair when a request set one, and otherwise the one
-    /// [`derived_warm_throughput`] computes.
-    pub fn in_force(&self, provisioned: Option<&ProvisionedThroughput>) -> (i64, i64) {
-        if self.named {
-            (self.read_units_per_second, self.write_units_per_second)
-        } else {
-            derived_warm_throughput(provisioned)
+    /// The pair in force: the one these settings hold.
+    pub fn in_force(&self) -> (i64, i64) {
+        (self.read_units_per_second, self.write_units_per_second)
+    }
+
+    /// These settings after the resource's provisioned capacity was SET to `provisioned`.
+    ///
+    /// A pair nobody named follows the capacity, because warm throughput is "the minimum
+    /// provisioned capacity maintained for immediate data access" (the
+    /// `TableWarmThroughputDescription` doc) — the recorded description of a provisioned
+    /// table and of its index report their own units. A capacity WITHDRAWN (`None`, which
+    /// is what a switch to `PAY_PER_REQUEST` leaves table and index with) changes nothing:
+    /// the capacity that was being kept warm stays warm, so the resource goes on
+    /// reporting the pair last in force rather than the pair a resource created on-demand
+    /// starts with. A named pair is untouched either way.
+    pub fn tracking_capacity(&self, provisioned: Option<&ProvisionedThroughput>) -> Self {
+        match (self.named, provisioned) {
+            (false, Some(capacity)) => Self {
+                read_units_per_second: capacity.read_capacity_units,
+                write_units_per_second: capacity.write_capacity_units,
+                ..self.clone()
+            },
+            _ => self.clone(),
         }
     }
 
@@ -1224,25 +1253,28 @@ impl WarmThroughputSettings {
 /// members it names, falling back to `current` for the ones it does not, becoming
 /// `ACTIVE` at `active_at` when it changes anything.
 ///
+/// `current` is the pair in force once the request's CAPACITY has been applied (see
+/// [`WarmThroughputSettings::tracking_capacity`]), so the half of the pair a request
+/// leaves out is the half the table keeps warm after that move.
+///
 /// The FLOOR applied here is the model's: the description reports both members as
 /// `PositiveLongObject` (range min 1), so a value below 1 is one no description could
 /// carry and is refused. The Developer Guide's "Warm throughput" 12,000 read / 4,000
-/// write pair is the value every table STARTS with — a default, which is why
-/// [`WarmThroughputSettings::default_at`] uses it — and no sentence in the model or the
-/// guide makes it a minimum a request may not go under, so this stores a lower value the
-/// caller asks for and reports it back rather than refusing on an unsourced rule.
+/// write pair is the value a table created with no provisioned capacity STARTS with — a
+/// default, which is why [`derived_warm_throughput`] uses it — and no sentence in the
+/// model or the guide makes it a minimum a request may not go under, so this stores a
+/// lower value the caller asks for and reports it back rather than refusing on an
+/// unsourced rule.
 pub fn resolved_warm_throughput(
     requested: Option<&WarmThroughput>,
     current: &WarmThroughputSettings,
-    provisioned: Option<&ProvisionedThroughput>,
     active_at: SystemTime,
 ) -> Result<WarmThroughputSettings, RequestError> {
     let Some(requested) = requested else {
         return Ok(current.clone());
     };
-    // A request that names one member leaves the other at the pair in force, which for a
-    // resource that has never been given one is the pair its capacity implies.
-    let (in_force_read, in_force_write) = current.in_force(provisioned);
+    // A request that names one member leaves the other at the pair in force.
+    let (in_force_read, in_force_write) = current.in_force();
     let read = requested.read_units_per_second.unwrap_or(in_force_read);
     let write = requested.write_units_per_second.unwrap_or(in_force_write);
     for (member, value) in [
@@ -1255,24 +1287,20 @@ pub fn resolved_warm_throughput(
             )));
         }
     }
-    let resolved = WarmThroughputSettings {
-        read_units_per_second: read,
-        write_units_per_second: write,
-        named: true,
-        active_at,
-    };
     // A request that asks for the values already in force asks for no CHANGE, so the
     // pair keeps the instant it became ACTIVE rather than going UPDATING again. The
     // values it reports are the requested ones either way: naming them fixes the pair,
     // so it no longer moves with the resource's capacity.
     let unchanged = read == in_force_read && write == in_force_write;
     Ok(WarmThroughputSettings {
+        read_units_per_second: read,
+        write_units_per_second: write,
+        named: true,
         active_at: if unchanged {
             current.active_at
         } else {
             active_at
         },
-        ..resolved
     })
 }
 
@@ -1777,13 +1805,13 @@ impl Table {
         let (number_of_decreases_today, last_increase_date_time, last_decrease_date_time) =
             index.throughput_history.describe(now);
         let capacity = reported_capacity(index.provisioned_throughput.as_ref());
-        // An index keeps warm the capacity it is provisioned for, by the same rule the
-        // table follows; no request can name one per index (`CreateTable`/`UpdateTable`
-        // refuse that member with the scaffold's 501), so none is ever in flight and the
-        // status is `ACTIVE` — "The status can only be UPDATING or ACTIVE"
+        // An index keeps warm the capacity it is provisioned for — or, once that capacity
+        // has been withdrawn, the pair it was keeping warm — by the same rule the table
+        // follows; no request can name one per index (`CreateTable`/`UpdateTable` refuse
+        // that member with the scaffold's 501), so none is ever in flight and the status
+        // is `ACTIVE` — "The status can only be UPDATING or ACTIVE"
         // (`GlobalSecondaryIndexWarmThroughputDescription$Status`).
-        let (warm_read_units, warm_write_units) =
-            derived_warm_throughput(index.provisioned_throughput.as_ref());
+        let (warm_read_units, warm_write_units) = index.warm_throughput.in_force();
         GlobalSecondaryIndexDescription {
             index_name: Some(index.name.clone()),
             index_arn: Some(index.arn.clone()),
@@ -1941,14 +1969,33 @@ impl Table {
     /// create, the metered counters of the last refresh, the billing mode and the
     /// instant `PAY_PER_REQUEST` was last set, the throughput and its history, and the
     /// warm throughput in force. `AttributeDefinitions` is reported in the order
+    /// When `PAY_PER_REQUEST` was LAST SET as this table's read/write mode, as a
+    /// description taken at `now` reports it: "Represents the time when
+    /// `PAY_PER_REQUEST` was last set as the read/write capacity mode"
+    /// (`BillingModeSummary$LastUpdateToPayPerRequestDateTime`).
+    ///
+    /// Withheld while the switch that set it is still settling — the stored instant is
+    /// when the mode takes effect — and `None` for a table that has never been
+    /// on-demand. Every summary member that reports the switch reads it from here, so
+    /// they all report the same instant.
+    fn pay_per_request_in_effect_at(&self, now: SystemTime) -> Option<::aws_smithy_types::DateTime> {
+        self.pay_per_request_at
+            .filter(|in_effect_at| now >= *in_effect_at)
+            .map(::aws_smithy_types::DateTime::from)
+    }
+
+    /// Project this table into the `TableDescription` every table operation returns.
+    ///
+    /// Every member here comes from what a previous request wrote: the id minted at
+    /// create, the metered counters of the last refresh, the billing mode and the
+    /// instant `PAY_PER_REQUEST` was last set, the throughput and its history, and the
+    /// warm throughput in force. `AttributeDefinitions` is reported in the order
     /// [`described_definitions`] gives it, which is by attribute name.
     pub fn describe(&self, now: SystemTime) -> TableDescription {
         let (number_of_decreases_today, last_increase_date_time, last_decrease_date_time) =
             self.throughput_history.describe(now);
         let capacity = reported_capacity(self.provisioned_throughput.as_ref());
-        let (warm_read_units, warm_write_units) = self
-            .warm_throughput
-            .in_force(self.provisioned_throughput.as_ref());
+        let (warm_read_units, warm_write_units) = self.warm_throughput.in_force();
         TableDescription {
             table_name: Some(self.name.clone()),
             table_arn: Some(self.arn.clone()),
@@ -1965,9 +2012,16 @@ impl Table {
                 // instant is when the call that set `PAY_PER_REQUEST` settles, so while
                 // that call is still settling there is nothing to report yet.
                 last_update_to_pay_per_request_date_time: self
-                    .pay_per_request_at
-                    .filter(|in_effect_at| now >= *in_effect_at)
-                    .map(::aws_smithy_types::DateTime::from),
+                    .pay_per_request_in_effect_at(now),
+            }),
+            // The SAME read/write mode, reported through the newer summary member every
+            // recorded table description carries beside `BillingModeSummary`: one stored
+            // mode and one stored switch instant feed both, so the two can never disagree
+            // about which mode a table is in.
+            table_throughput_mode_summary: Some(TableThroughputModeSummary {
+                table_throughput_mode: Some(self.billing_mode.clone()),
+                last_update_to_pay_per_request_date_time: self
+                    .pay_per_request_in_effect_at(now),
             }),
             provisioned_throughput: Some(ProvisionedThroughputDescription {
                 // A PAY_PER_REQUEST table reports zeroes: on-demand mode does not use

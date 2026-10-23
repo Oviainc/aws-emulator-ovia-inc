@@ -377,6 +377,7 @@ pub struct TableDescription {
     pub deletion_protection_enabled: Option<bool>,
     pub disassociation_protection_enabled: Option<bool>,
     pub on_demand_throughput: Option<OnDemandThroughput>,
+    pub table_throughput_mode_summary: Option<TableThroughputModeSummary>,
     pub warm_throughput: Option<TableWarmThroughputDescription>,
     pub multi_region_consistency: Option<String>,
     pub vector_indexes: Option<Vec<VectorIndexDescription>>,
@@ -396,6 +397,13 @@ pub struct ProvisionedThroughputDescription {
 #[derive(Debug, Clone, Default)]
 pub struct BillingModeSummary {
     pub billing_mode: Option<String>,
+    pub last_update_to_pay_per_request_date_time: Option<::aws_smithy_types::DateTime>,
+}
+
+#[smithy_macros::smithy(shape = "com.amazonaws.dynamodb#TableThroughputModeSummary")]
+#[derive(Debug, Clone, Default)]
+pub struct TableThroughputModeSummary {
+    pub table_throughput_mode: Option<String>,
     pub last_update_to_pay_per_request_date_time: Option<::aws_smithy_types::DateTime>,
 }
 

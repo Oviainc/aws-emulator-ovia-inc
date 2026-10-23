@@ -314,8 +314,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // from creation.
         let warm_throughput = crate::state::resolved_warm_throughput(
             input.warm_throughput.as_ref(),
-            &crate::state::WarmThroughputSettings::default_at(now),
-            provisioned_throughput.as_ref(),
+            &crate::state::WarmThroughputSettings::tracking(provisioned_throughput.as_ref(), now),
             now,
         )
         .map_err(lift)?;
@@ -773,6 +772,10 @@ fn validated_indexes(
             billing_mode,
             index.provisioned_throughput.clone(),
         )?;
+        // No request may name a warm throughput per index (that member is refused with
+        // the scaffold's 501), so a new index keeps warm the capacity it is provisioned
+        // for.
+        let warm_throughput = crate::state::WarmThroughputSettings::tracking(throughput.as_ref(), now);
         indexes.push(crate::state::GlobalSecondaryIndex {
             arn: crate::state::index_arn(region, table, &index.index_name),
             name: index.index_name.clone(),
@@ -782,6 +785,7 @@ fn validated_indexes(
             transient_status: crate::state::IndexStatus::Creating,
             active_at: now + crate::state::STATUS_TRANSITION,
             throughput_history: crate::state::ThroughputHistory::default(),
+            warm_throughput,
             reported_counters: crate::state::MeteredCounters::new(now),
         });
     }

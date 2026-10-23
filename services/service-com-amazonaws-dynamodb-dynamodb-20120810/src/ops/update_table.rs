@@ -355,10 +355,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A warm-throughput change is reported `UPDATING` for the same span as the rest
         // of the update, and becomes `ACTIVE` when the clock makes that span due; a
         // request that names none leaves the pair in force exactly as it is.
+        //
+        // The pair an unnamed setting keeps warm follows the capacity this update SETS,
+        // and survives a capacity this update WITHDRAWS (a switch to on-demand): what the
+        // table was keeping warm stays warm, which is what the recorded description of a
+        // table switched to `PAY_PER_REQUEST` reports.
         let warm_throughput = crate::state::resolved_warm_throughput(
             input.warm_throughput.as_ref(),
-            &table.warm_throughput,
-            table_throughput.as_ref(),
+            &table
+                .warm_throughput
+                .tracking_capacity(table_throughput.as_ref()),
             now + crate::state::STATUS_TRANSITION,
         )
         .map_err(lift)?;
@@ -853,6 +859,8 @@ fn resolve_indexes(
                 index.throughput_history.record_capacity_withdrawal(now);
             }
             index.provisioned_throughput = None;
+            // Its warm throughput is NOT withdrawn with it: the capacity the index was
+            // keeping warm stays warm, by the same rule the table-level move follows.
         }
     }
     for update in updates {
@@ -882,6 +890,11 @@ fn resolve_indexes(
                 billing_mode,
                 create.provisioned_throughput.clone(),
             )?;
+            // No request may name a warm throughput per index (that member is refused
+            // with the scaffold's 501), so a new index keeps warm the capacity it is
+            // provisioned for.
+            let warm_throughput =
+                crate::state::WarmThroughputSettings::tracking(throughput.as_ref(), now);
             indexes.push(crate::state::GlobalSecondaryIndex {
                 arn: crate::state::index_arn(&table.region, &table.name, &create.index_name),
                 name: create.index_name.clone(),
@@ -891,6 +904,7 @@ fn resolve_indexes(
                 transient_status: crate::state::IndexStatus::Creating,
                 active_at: now + crate::state::STATUS_TRANSITION,
                 throughput_history: crate::state::ThroughputHistory::default(),
+                warm_throughput,
                 // An index added to a table that already holds items is metered on the
                 // same schedule as every other one, starting from zero.
                 reported_counters: crate::state::MeteredCounters::new(now),
@@ -939,6 +953,11 @@ fn resolve_indexes(
                 index.throughput_history.record(now, before, after);
             }
             index.provisioned_throughput = throughput;
+            // An index nobody has named a warm throughput for keeps warm the capacity it
+            // is now provisioned for.
+            index.warm_throughput = index
+                .warm_throughput
+                .tracking_capacity(index.provisioned_throughput.as_ref());
             index.transient_status = crate::state::IndexStatus::Updating;
             index.active_at = now + crate::state::STATUS_TRANSITION;
         }
