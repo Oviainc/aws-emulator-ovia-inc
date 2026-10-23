@@ -1,13 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! How this service STATES a request that breaks a modelled `@pattern`.
+//! How this service STATES a request that breaks a modelled constraint.
 //!
-//! THE RULE: a boundary refusal is `HTTP 400` / `ValidationException` carrying the AWS
-//! envelope — `1 validation error detected: Value '<value>' at '<member path>' failed to
-//! satisfy constraint: Member must satisfy regular expression pattern: <expression>` — and
-//! `<expression>` is the member's modelled `@pattern` MINUS the leading `^` and the
-//! trailing `$` the model writes around the expression a value has to satisfy. The check
-//! still runs the model's pattern as written; only the quoting drops the pair.
+//! THE RULE has two halves, both of them AWS's rather than this service's:
+//!
+//! 1. a boundary refusal is `HTTP 400` / `ValidationException` carrying the AWS envelope —
+//!    `1 validation error detected: Value '<value>' at '<member path>' failed to satisfy
+//!    constraint: Member must satisfy regular expression pattern: <expression>` — and
+//!    `<expression>` is the member's modelled `@pattern` MINUS the leading `^` and the
+//!    trailing `$` the model writes around the expression a value has to satisfy. The check
+//!    still runs the model's pattern as written; only the quoting drops the pair;
+//! 2. a constraint broken by an ELEMENT of a list is stated at the LIST MEMBER — no element
+//!    index and no `member` step — with the element's requirement nested inside
+//!    `Member must satisfy constraint: [ … ]` and the value that member HELD (the whole
+//!    list, as a list renders) as the echo. A constraint broken by the list ITSELF, or by a
+//!    member that is not an element, is stated unnested at its own path.
 //!
 //! The rows below span every input member of this service that carries a `@pattern` and
 //! both expressions those members target, and they vary along what the rule generalises
@@ -21,6 +28,12 @@
 //!   `UpdateNetworkConnectorRequest$OperatorRole` ->
 //!   `com.amazonaws.lambdacore#NetworkConnectorRoleArn`, the same expression reached through
 //!   two different operations.
+//!
+//! The collection rows span every list this model binds to a request —
+//! `NetworkConnectorVpcEgressConfiguration`'s `SubnetIds`, `SecurityGroupIds` and
+//! `AssociatedComputeResourceTypes` — and both element constraint classes they declare (a
+//! `@pattern` on the two id lists, an enum value set on the compute-type list), through
+//! create and through update.
 //!
 //! `NetworkConnectorTags`' key and value also declare a `@pattern`, and no row covers them:
 //! the framework's constraint walk captures a map's collection-level traits only (a map key
@@ -39,7 +52,7 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use super::network_connector_lifecycle::{
-    call, create, emulator, minimal_configuration, text, update, Answer, PREFIX,
+    call, create, emulator, minimal_configuration, text, update, vpc_egress, Answer, PREFIX,
 };
 
 /// `NetworkConnectorName`'s `@pattern` as the MODEL spells it
@@ -58,6 +71,33 @@ const ROLE_PATTERN_MODELLED: &str = r"^arn:(aws[a-zA-Z-]*)?:iam::\d{12}:role/?[a
 
 /// The same expression as a refusal quotes it.
 const ROLE_PATTERN_QUOTED: &str = r"arn:(aws[a-zA-Z-]*)?:iam::\d{12}:role/?[a-zA-Z_0-9+=,.@\-_/]+";
+
+/// `NetworkConnectorSubnetId`'s `@pattern` as the MODEL spells it
+/// (`smithy_query(query="shape",shape="NetworkConnectorSubnetIds")` reports the element
+/// shape's constraints).
+const SUBNET_PATTERN_MODELLED: &str = r"^subnet-[0-9a-z]*$";
+
+/// The same expression as a refusal quotes it.
+const SUBNET_PATTERN_QUOTED: &str = r"subnet-[0-9a-z]*";
+
+/// `NetworkConnectorSecurityGroupId`'s `@pattern` as the MODEL spells it
+/// (`smithy_query(query="shape",shape="NetworkConnectorSecurityGroupIds")`).
+const SECURITY_GROUP_PATTERN_MODELLED: &str = r"^sg-[0-9a-zA-Z]*$";
+
+/// The same expression as a refusal quotes it.
+const SECURITY_GROUP_PATTERN_QUOTED: &str = r"sg-[0-9a-zA-Z]*";
+
+/// `ComputeResourceType`'s value set, in the order the model declares it
+/// (`smithy_query(query="shape",shape="ComputeResourceType")`).
+const COMPUTE_TYPE_SET: &str = "MicroVm, WebFunction";
+
+/// `NetworkProtocol`'s value set, in the order the model declares it
+/// (`smithy_query(query="shape",shape="NetworkProtocol")`).
+const NETWORK_PROTOCOL_SET: &str = "IPv4, DualStack";
+
+/// `NetworkConnectorSubnetIds`' `@length` maximum
+/// (`smithy_query(query="shape",shape="NetworkConnectorVpcEgressConfiguration")`).
+const SUBNET_IDS_MAX: usize = 16;
 
 /// An `OperatorRole` the modelled expression accepts, for a row that is refused for a
 /// DIFFERENT member.
@@ -351,4 +391,256 @@ async fn a_value_the_modelled_expression_admits_is_still_accepted() {
         "expected the refusal on the same route, got {} with {:?}",
         answer.status, answer.body
     );
+}
+
+/// A requirement as it reads when what broke it is an ELEMENT of a collection: nested
+/// inside the clause that names the collection member.
+fn element_requirement(requirement: &str) -> String {
+    format!("Member must satisfy constraint: [{requirement}]")
+}
+
+/// `elements` as a list-valued member's echo renders: the elements in order,
+/// comma-separated, in brackets.
+fn rendered_list(elements: &[&str]) -> String {
+    format!("[{}]", elements.join(", "))
+}
+
+/// RULE (half 2): a constraint broken by an ELEMENT of a list is stated at the LIST member,
+/// with the element's requirement nested and the whole list the caller sent as the echo.
+///
+/// The rows span every list this model binds to a request and both element constraint
+/// classes those lists declare, through create and through update, with the offending
+/// element in varying positions and counts — so no row's shape can be special-cased.
+#[tokio::test]
+async fn a_constraint_broken_by_a_list_element_is_stated_at_the_list() {
+    let router = emulator();
+    let host = create(&router, create_body(UPDATE_HOST)).await;
+    assert_eq!(
+        host.status, 202,
+        "expected HTTP 202 from CreateNetworkConnector, got {} with {:?}",
+        host.status, host.body
+    );
+
+    let subnet_requirement = element_requirement(&pattern_requirement(SUBNET_PATTERN_QUOTED));
+    let group_requirement =
+        element_requirement(&pattern_requirement(SECURITY_GROUP_PATTERN_QUOTED));
+    let rows = [
+        // One bad element LAST in a list of otherwise valid ids: the clause states the
+        // whole member, not just the element that failed.
+        Row {
+            case: "a subnet id outside its expression, last of three",
+            method: "POST",
+            body: json!({
+                "Name": "lnc-subnet-rows",
+                "Configuration": vpc_egress(
+                    &["subnet-0123456789abcdef0", "subnet-0fedcba9876543210", "not-a-subnet"],
+                    &[],
+                    None,
+                    None,
+                ),
+            }),
+            member: "configuration.vpcEgressConfiguration.subnetIds",
+            value: rendered_list(&[
+                "subnet-0123456789abcdef0",
+                "subnet-0fedcba9876543210",
+                "not-a-subnet",
+            ]),
+            requirement: subnet_requirement.clone(),
+            withheld: Some(SUBNET_PATTERN_MODELLED),
+        },
+        // The same list with the offending element FIRST, and alone: position and count are
+        // what this row varies.
+        Row {
+            case: "a subnet id outside its expression, the only element",
+            method: "POST",
+            body: json!({
+                "Name": "lnc-subnet-rows",
+                "Configuration": vpc_egress(&["subnet_wrong_separator"], &[], None, None),
+            }),
+            member: "configuration.vpcEgressConfiguration.subnetIds",
+            value: rendered_list(&["subnet_wrong_separator"]),
+            requirement: subnet_requirement.clone(),
+            withheld: Some(SUBNET_PATTERN_MODELLED),
+        },
+        // A SECOND list, with TWO offending elements: one clause, because the member is
+        // named once however many of its elements were refused.
+        Row {
+            case: "two security group ids outside their expression",
+            method: "POST",
+            body: json!({
+                "Name": "lnc-group-rows",
+                "Configuration": vpc_egress(
+                    &["subnet-0123456789abcdef0"],
+                    &["sg-0123456789abcdef0", "not-a-group", "also!bad"],
+                    None,
+                    None,
+                ),
+            }),
+            member: "configuration.vpcEgressConfiguration.securityGroupIds",
+            value: rendered_list(&["sg-0123456789abcdef0", "not-a-group", "also!bad"]),
+            requirement: group_requirement.clone(),
+            withheld: Some(SECURITY_GROUP_PATTERN_MODELLED),
+        },
+        // A THIRD list, whose element constraint is an ENUM value set rather than a
+        // pattern: the nesting is the rule, not the constraint class. This is the value the
+        // recording was taken from.
+        Row {
+            case: "a compute resource type outside its value set",
+            method: "POST",
+            body: json!({
+                "Name": "lnc-compute-rows",
+                "Configuration": vpc_egress(
+                    &["subnet-0123456789abcdef0"],
+                    &[],
+                    None,
+                    Some("Sim2RealProbe"),
+                ),
+            }),
+            member: "configuration.vpcEgressConfiguration.associatedComputeResourceTypes",
+            value: rendered_list(&["Sim2RealProbe"]),
+            requirement: element_requirement(&format!(
+                "Member must satisfy enum value set: [{COMPUTE_TYPE_SET}]"
+            )),
+            withheld: None,
+        },
+        // The SAME rule through UPDATE: it belongs to the member, not to one operation.
+        Row {
+            case: "a subnet id outside its expression, on update",
+            method: "PUT",
+            body: json!({
+                "Configuration": vpc_egress(
+                    &["subnet-0123456789abcdef0", "nope"],
+                    &[],
+                    Some("DualStack"),
+                    Some("MicroVm"),
+                ),
+            }),
+            member: "configuration.vpcEgressConfiguration.subnetIds",
+            value: rendered_list(&["subnet-0123456789abcdef0", "nope"]),
+            requirement: subnet_requirement.clone(),
+            withheld: Some(SUBNET_PATTERN_MODELLED),
+        },
+    ];
+
+    for row in &rows {
+        let answer = send(&router, row).await;
+        assert_refused(row, &answer);
+        let message = text(&answer.body, "/message");
+        assert!(
+            !message.contains(".member"),
+            "case {:?}: an element's failure is stated at its list, with no element step, \
+             got {message:?}",
+            row.case
+        );
+        assert!(
+            message.starts_with("1 validation error detected:"),
+            "case {:?}: however many elements failed, the member is named once, got \
+             {message:?}",
+            row.case
+        );
+    }
+}
+
+/// RULE (half 2), the other side: a constraint broken by something that is NOT a list
+/// element keeps its own path and its own unnested requirement — the list's own `@length`,
+/// and a scalar member whose value set is the one the elements of a list elsewhere declare.
+#[tokio::test]
+async fn a_constraint_not_broken_by_an_element_is_stated_unnested() {
+    let router = emulator();
+    // One subnet past the list's `@length` maximum, every one of them inside the element
+    // expression, so the only clause is the list's own.
+    let too_many: Vec<String> = (0..=SUBNET_IDS_MAX)
+        .map(|index| format!("subnet-{index:017}"))
+        .collect();
+    let borrowed: Vec<&str> = too_many.iter().map(String::as_str).collect();
+    let rows = [
+        Row {
+            case: "one subnet past the list's modelled maximum",
+            method: "POST",
+            body: json!({
+                "Name": "lnc-too-many-subnets",
+                "Configuration": vpc_egress(&borrowed, &[], None, None),
+            }),
+            member: "configuration.vpcEgressConfiguration.subnetIds",
+            value: rendered_list(&borrowed),
+            requirement: format!("Member must have length less than or equal to {SUBNET_IDS_MAX}"),
+            withheld: None,
+        },
+        Row {
+            case: "a network protocol outside its value set",
+            method: "POST",
+            body: json!({
+                "Name": "lnc-bad-protocol",
+                "Configuration": vpc_egress(
+                    &["subnet-0123456789abcdef0"],
+                    &[],
+                    Some("Carrier Pigeon"),
+                    None,
+                ),
+            }),
+            member: "configuration.vpcEgressConfiguration.networkProtocol",
+            value: "Carrier Pigeon".to_string(),
+            requirement: format!("Member must satisfy enum value set: [{NETWORK_PROTOCOL_SET}]"),
+            withheld: None,
+        },
+    ];
+
+    for row in &rows {
+        let answer = send(&router, row).await;
+        assert_refused(row, &answer);
+        let message = text(&answer.body, "/message");
+        assert!(
+            !message.contains("Member must satisfy constraint: ["),
+            "case {:?}: a constraint that is not an element's is stated unnested, got \
+             {message:?}",
+            row.case
+        );
+    }
+}
+
+/// RULE, the inverse for the collection half: the restatement changes the MESSAGE only, so
+/// every list the modelled constraints admit is still accepted — however many elements it
+/// carries and in whichever order.
+#[tokio::test]
+async fn a_list_the_model_admits_is_still_accepted() {
+    let router = emulator();
+    let many: Vec<String> = (0..SUBNET_IDS_MAX)
+        .map(|index| format!("subnet-{index:017}"))
+        .collect();
+    let many: Vec<&str> = many.iter().map(String::as_str).collect();
+    let accepted = [
+        (
+            "one subnet, no security groups",
+            vpc_egress(&["subnet-0123456789abcdef0"], &[], None, None),
+        ),
+        (
+            "the most subnets the list admits",
+            vpc_egress(&many, &[], Some("IPv4"), Some("MicroVm")),
+        ),
+        (
+            "mixed-case security group ids and a web function",
+            vpc_egress(
+                &["subnet-0123456789abcdef0"],
+                &["sg-0123456789abcDEF0", "sg-ABCDEF0123456789"],
+                Some("DualStack"),
+                Some("WebFunction"),
+            ),
+        ),
+    ];
+    for (index, (case, configuration)) in accepted.iter().enumerate() {
+        let answer = create(
+            &router,
+            json!({
+                "Name": format!("lnc-accepted-{index}"),
+                "Configuration": configuration,
+            }),
+        )
+        .await;
+        assert_eq!(
+            answer.status, 202,
+            "case {case:?}: every element satisfies the modelled constraints, so \
+             CreateNetworkConnector must accept the list, got {} with {:?}",
+            answer.status, answer.body
+        );
+    }
 }
