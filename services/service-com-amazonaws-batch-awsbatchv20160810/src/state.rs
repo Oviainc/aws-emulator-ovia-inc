@@ -43,6 +43,7 @@ use crate::ops::types::{
     JobStateTimeLimitAction, JobTimeout, KeyValuePair, NodeProperties, QuotaSharePolicy,
     ResourceRequirement, RetryStrategy, ServerException, ServiceEnvironmentOrder,
     ServiceJobPreemptionConfiguration, ServiceJobRetryStrategy, ServiceJobTimeout, ShareAttributes,
+    UpdatePolicy,
 };
 
 /// This service's ARN namespace and sigv4 signing name (`OPERATIONS.md`).
@@ -53,8 +54,8 @@ pub const ARN_SERVICE: &str = "batch";
 pub const DEFAULT_REGION: &str = "us-east-1";
 
 /// How long one clock-owed transition takes: a compute environment or job queue
-/// leaving `CREATING`, a job queue leaving `UPDATING`, and each move a submitted
-/// job makes.
+/// leaving `CREATING`, a compute environment or job queue leaving `UPDATING`, and
+/// each move a submitted job makes.
 ///
 /// A span chosen by this emulator (AWS documents no duration for it), inside the
 /// 250–750 ms band the project fixes for a transition the clock owes. It is never
@@ -140,7 +141,9 @@ pub const UNREACHABLE_STATE: &str = "the Batch emulator could not reach its serv
 // (`C_E_STATUS_VALUES`, `J_Q_STATUS_VALUES`, `JOB_STATUS_VALUES`, `CEState`/`JQState`).
 /// `CEStatus`/`JQStatus` value a resource carries while its creation is pending.
 pub const STATUS_CREATING: &str = "CREATING";
-/// `JQStatus` value a job queue carries while an update to it is pending.
+/// `CEStatus`/`JQStatus` value a resource carries while an update to it is pending
+/// (`UpdateComputeEnvironment`, `UpdateJobQueue`); the move back to [`STATUS_VALID`]
+/// is owed by the clock, like the one out of [`STATUS_CREATING`].
 pub const STATUS_UPDATING: &str = "UPDATING";
 /// `CEStatus`/`JQStatus` value of a created resource.
 pub const STATUS_VALID: &str = "VALID";
@@ -441,12 +444,17 @@ pub struct ComputeEnvironment {
     pub state: String,
     pub status: String,
     pub status_reason: Option<String>,
-    /// Set while the `CREATING` -> `VALID` move is still owed by the clock.
+    /// Set while the `CREATING` -> `VALID` or `UPDATING` -> `VALID` move is still
+    /// owed by the clock.
     pub status_due_at: Option<i64>,
     /// The environment's unique identifier, minted once at creation.
     pub uuid: String,
     pub unmanagedv_cpus: Option<i32>,
     pub compute_resources: Option<ComputeResource>,
+    /// The infrastructure update policy the last `UpdateComputeEnvironment` set, which
+    /// `DescribeComputeEnvironments` reports back; `None` until one sets it (nothing
+    /// else carries this member — `CreateComputeEnvironment` has no `updatePolicy`).
+    pub update_policy: Option<UpdatePolicy>,
     pub service_role: Option<String>,
     pub eks_configuration: Option<EksConfiguration>,
     pub ecs_settings: Option<EcsSettings>,
@@ -1087,6 +1095,8 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
     /// materialises the transitions that have actually fallen due — each of which happens
     /// once in a job's life — plus the jobs waiting on a job that just finished.
     pub fn materialize_due(&mut self, now: i64) {
+        // A compute environment's pending move is to `VALID`, whether it is leaving
+        // `CREATING` (a create) or `UPDATING` (an update).
         for environment in self.compute_environments.values_mut() {
             if environment.status_due_at.is_some_and(|due| due <= now) {
                 environment.status = STATUS_VALID.to_string();
