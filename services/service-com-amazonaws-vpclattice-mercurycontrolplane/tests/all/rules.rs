@@ -48,6 +48,13 @@ fn rule_kind(service_id: &str, listener_id: &str) -> String {
     format!("service/{service_id}/listener/{listener_id}/rule")
 }
 
+/// A listener port no other fixture listener of this suite has asked for, inside the
+/// modelled `Port` range (1..65535).
+fn next_fixture_port() -> i64 {
+    static NEXT: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(20_000);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Create a listener to hang rules off, answering its id.
 async fn a_listener(lattice: &Lattice, service_identifier: &str, name: &str) -> String {
     let created = create_listener(
@@ -56,6 +63,10 @@ async fn a_listener(lattice: &Lattice, service_identifier: &str, name: &str) -> 
         serde_json::json!({
             "name": name,
             "protocol": "HTTP",
+            // Its own port: a listener's port is unique within its service (the rule
+            // `listener_conflicts_and_deletion.rs` pins), so fixture listeners that share
+            // a service must not share a port.
+            "port": next_fixture_port(),
             "defaultAction": { "fixedResponse": { "statusCode": 404 } },
         }),
     )
