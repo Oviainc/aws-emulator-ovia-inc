@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Adds the request's tags to the resource its `ResourceArn` identifies, in
+//! [`crate::state`]: a key the resource already carries is updated, a key it does not
+//! carry is added, and a key the request does not name is left alone. The tags live on
+//! the resource, so `ListTagsForResource` reads back exactly what was written and
+//! deleting the resource deletes them with it.
 //!
 //! ## Shape of an operation
 //!
@@ -171,18 +167,74 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        // `ctx` carries request metadata only: this operation addresses the resource by
+        // the ARN the request names, so it needs nothing from the credential scope.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE)
+        })?;
+
+        // The ARN is matched VERBATIM, as the resource's read path reports it and as a
+        // tag key is: surrounding whitespace is part of the value the caller sent.
+        let resource_arn = input.resource_arn.as_str();
+        // An `AmazonResourceName` that is not an ARN identifies no resource at all,
+        // which is a malformed request rather than a missing resource.
+        if !crate::state::is_amazon_resource_name(resource_arn) {
+            return Err(TagResourceErrorModeled::ValidationException(ValidationException {
+                message: Some(crate::state::malformed_resource_arn_message(resource_arn)),
+            })
+            .into());
+        }
+
+        // A tag identifies the value it carries by its key, so an entry without one
+        // names nothing to add or update. The model leaves `Tag$Key` optional, so the
+        // boundary validator lets such an entry through and this is what refuses it.
+        if let Some(position) = input
+            .tags
+            .iter()
+            .position(|tag| tag.key.as_deref().map(str::trim).is_none_or(str::is_empty))
+        {
+            return Err(TagResourceErrorModeled::ValidationException(ValidationException {
+                message: Some(format!("Tags[{position}].Key is required and cannot be blank")),
+            })
+            .into());
+        }
+
+        let requested = crate::state::tag_set(&input.tags);
+
+        let mut store = state.lock();
+        let Some(tags) = store.tags_of_mut(resource_arn) else {
+            return Err(TagResourceErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::resource_not_found_message(resource_arn)),
+                },
+            )
+            .into());
+        };
+
+        // Only the keys the resource does not carry yet grow its tag set: updating the
+        // value of a key it already holds cannot take it over the limit.
+        let carried = tags.len();
+        let added = requested
+            .keys()
+            .filter(|key| !tags.contains_key(*key))
+            .count();
+        if carried + added > crate::state::TAGS_PER_RESOURCE_QUOTA {
+            return Err(TagResourceErrorModeled::TooManyTagsException(TooManyTagsException {
+                message: Some(format!(
+                    "The resource '{resource_arn}' already carries {carried} tags and this \
+                     request adds {added} more, which exceeds the limit of {} tags per \
+                     resource.",
+                    crate::state::TAGS_PER_RESOURCE_QUOTA,
+                )),
+            })
+            .into());
+        }
+
+        // Tagging is a MERGE: a key the request names takes the value the request
+        // carries for it, and every other key on the resource is left as it was.
+        tags.extend(requested);
+
+        Ok(TagResourceOutput)
     }
 }
