@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED. Adds the requested tags to the automation rule the ARN names:
+//! a key the rule does not carry is appended, and a key it already carries
+//! keeps its position and takes the new value, so the stored list holds at most
+//! one entry per key. A `ruleRevision` other than the rule's current one is
+//! refused with `InvalidParameterValueException` (400), as is an addition that
+//! would leave the rule holding more than `state::MAX_TAGS_PER_RESOURCE` tags;
+//! an ARN no rule has is `ResourceNotFoundException` (404). Tagging is not a
+//! rule revision, so the same request may be repeated — the operation is
+//! modelled `@idempotent`.
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +165,133 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(TagResourceErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the service is not mounted on a state-bearing engine".into()),
+                },
+            )
+            .into());
+        };
+
+        let mut probe = input.clone();
+        probe.client_token = None;
+        let request_fingerprint = crate::state::fingerprint(&probe);
+        let client_token = input.client_token.as_deref();
+
+        let mut guard = state.lock();
+
+        // The service-wide enrollment gate, AHEAD of the token ledger and of
+        // the rule lookup: an account that is not opted in may not change a
+        // rule's tags, and a refused call must not consume its client token
+        // either. See `crate::state::…::opt_in_required`.
+        if let Some(refusal) = guard.opt_in_required() {
+            return Err(TagResourceErrorModeled::OptInRequiredException(refusal).into());
+        }
+
+        match guard.classify_token(client_token, Self::NAME, &request_fingerprint) {
+            crate::state::TokenOutcome::Fresh => {}
+            // A retry of the same addition: the tags are already on the rule,
+            // which is the state the first call left. Reported as that first
+            // call was.
+            crate::state::TokenOutcome::Replay(_) => {
+                return match guard.rules.get(&input.resource_arn) {
+                    Some(_) => Ok(TagResourceOutput {}),
+                    None => Err(not_found()),
+                };
+            }
+            crate::state::TokenOutcome::ParameterMismatch => {
+                return Err(
+                    TagResourceErrorModeled::IdempotentParameterMismatchException(
+                        IdempotentParameterMismatchException {
+                            message: Some(
+                                crate::state::IDEMPOTENT_PARAMETER_MISMATCH_MESSAGE.into(),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            crate::state::TokenOutcome::TokenInUse => {
+                return Err(TagResourceErrorModeled::IdempotencyTokenInUseException(
+                    IdempotencyTokenInUseException {
+                        message: Some("The specified client token is already in use.".into()),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let Some(rule) = guard.rules.get(&input.resource_arn) else {
+            return Err(not_found());
+        };
+        // "This ensures you're tagging the correct version of the rule": the
+        // revision is the rule's optimistic-concurrency token, so a request
+        // carrying another one is refused rather than applied to whatever the
+        // rule has become. The rejection states the CURRENT revision, which is
+        // what a caller needs to re-read and retry.
+        if rule.rule_revision != input.rule_revision {
+            return Err(invalid_parameter(crate::state::revision_mismatch_message(
+                rule.rule_revision,
+            )));
+        }
+
+        // Computed off the STORED list before anything is written, so a request
+        // the per-resource bound refuses leaves the rule exactly as it was.
+        let merged = merge_tags(&rule.tags, &input.tags);
+        if merged.len() > crate::state::MAX_TAGS_PER_RESOURCE {
+            return Err(invalid_parameter(crate::state::tag_limit_exceeded_message()));
+        }
+
+        let Some(rule) = guard.rules.get_mut(&input.resource_arn) else {
+            return Err(not_found());
+        };
+        // The addition does not advance `ruleRevision`: a repeat of the same
+        // request would then fail the revision check above, and the operation is
+        // modelled `@idempotent`.
+        rule.tags = merged;
+
+        guard.record_token(
+            client_token,
+            Self::NAME,
+            &request_fingerprint,
+            Some(crate::state::TokenSubject::Rule(input.resource_arn.clone())),
+        );
+
+        Ok(TagResourceOutput {})
     }
+}
+
+/// `stored` with `added` applied: a key `stored` does not carry is APPENDED,
+/// and a key it already carries keeps its position and takes the new value —
+/// so a tag list holds at most one entry per key, in whatever order the
+/// additions arrive. Within one request a later entry for a key wins, for the
+/// same reason: the request's tags are applied in order.
+fn merge_tags(stored: &[Tag], added: &[Tag]) -> Vec<Tag> {
+    let mut merged = stored.to_vec();
+    for tag in added {
+        match merged.iter_mut().find(|existing| existing.key == tag.key) {
+            Some(existing) => existing.value = tag.value.clone(),
+            None => merged.push(tag.clone()),
+        }
+    }
+    merged
+}
+
+/// The modelled 404 (`ResourceNotFoundException`, HTTP 404), worded with this
+/// service's fixed not-found text, which names no resource.
+fn not_found() -> TagResourceError {
+    TagResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.into()),
+    })
+    .into()
+}
+
+/// The modelled 400 for a parameter value this operation refuses.
+fn invalid_parameter(message: String) -> TagResourceError {
+    TagResourceErrorModeled::InvalidParameterValueException(InvalidParameterValueException {
+        message: Some(message),
+    })
+    .into()
 }
