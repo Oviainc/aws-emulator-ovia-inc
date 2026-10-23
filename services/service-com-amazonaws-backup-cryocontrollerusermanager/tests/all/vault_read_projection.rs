@@ -595,9 +595,12 @@ async fn a_lock_day_count_outside_its_documented_span_is_refused() {
 
 /// A later configuration replaces the stored one while the vault lock is still
 /// changeable, and a vault-lock request naming a vault that does not exist is
-/// `ResourceNotFoundException`.
+/// refused for lack of privileges: a vault-lock action is authorized against the
+/// named vault before it is looked up, so the refusal says nothing about whether
+/// that vault exists. `vault_lock_refusal_order.rs` covers that rule across both
+/// vault-lock actions and every reason a vault can be invisible.
 #[tokio::test]
-async fn a_changeable_lock_is_replaced_and_an_unknown_vault_is_not_found() {
+async fn a_changeable_lock_is_replaced_and_an_invisible_vault_is_denied() {
     let router = router();
     let (status, _) = create_vault(&router, "relock-vault", "{}").await;
     assert_eq!(status, 200, "setup: CreateBackupVault should succeed");
@@ -642,15 +645,15 @@ async fn a_changeable_lock_is_replaced_and_an_unknown_vault_is_not_found() {
         let (status, response) = put_lock(&router, name, r#"{"MinRetentionDays":7}"#).await;
         assert_eq!(
             (status, error_code(&response).as_str()),
-            (400, "ResourceNotFoundException"),
-            "case {case:?}: expected 400 ResourceNotFoundException from the put, got {status} \
+            (403, "AccessDeniedException"),
+            "case {case:?}: expected 403 AccessDeniedException from the put, got {status} \
              {response:?}"
         );
         let (status, response) = delete_lock(&router, name).await;
         assert_eq!(
             (status, error_code(&response).as_str()),
-            (400, "ResourceNotFoundException"),
-            "case {case:?}: expected 400 ResourceNotFoundException from the delete, got {status} \
+            (403, "AccessDeniedException"),
+            "case {case:?}: expected 403 AccessDeniedException from the delete, got {status} \
              {response:?}"
         );
     }
