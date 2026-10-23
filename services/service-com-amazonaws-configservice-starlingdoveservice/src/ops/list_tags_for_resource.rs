@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTagsForResource
+//!
 //! Reports the tags the resource its `ResourceArn` identifies carries in
 //! [`crate::state`], one page at a time in tag-key order: this is the read path of
 //! `TagResource` and `UntagResource`, so it reports what they persisted and nothing
@@ -190,6 +191,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+
 
         // A token this service did not mint names no page to resume at.
         let resume_at = match input.next_token.as_deref() {

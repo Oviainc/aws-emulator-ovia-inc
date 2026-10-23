@@ -163,7 +163,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // token this service minted names the ARN to resume at.
         let resume_from = match input.next_token.as_deref() {
             None => None,
-            Some(token) => match crate::state::decode_page_token(token) {
+            Some(token) => match crate::state::decode_page_token(
+                token,
+                crate::state::DASHBOARD_ARN_SEGMENT,
+            ) {
                 Some(arn) => Some(arn),
                 None => {
                     return Err(ListDashboardsErrorModeled::ValidationException(

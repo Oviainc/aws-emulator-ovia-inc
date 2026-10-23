@@ -161,9 +161,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Nothing in this operation's answer depends on the request's metadata: the
-        // destination it stores is built from the request's own members.
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(PutRumMetricsDestinationErrorModeled::InternalServerException(
                 InternalServerException {
@@ -203,6 +200,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ValidationException { message },
             )
             .into());
+        }
+
+        // May this caller change THIS app monitor's metric destinations? Every operation
+        // in this service makes the decision on every call, from the caller's
+        // identity-based policies and the monitor's resource policy
+        // ([`crate::state::authorization`]); the monitor and the policy in force are read
+        // under a SHORT lock, because the decision needs no lock of this service's.
+        let (resource_arn, held_policy) = {
+            let store = state.lock();
+            let Some(record) = store.app_monitors.get(&input.app_monitor_name) else {
+                return Err(
+                    PutRumMetricsDestinationErrorModeled::ResourceNotFoundException(
+                        crate::state::app_monitor_not_found(&input.app_monitor_name),
+                    )
+                    .into(),
+                );
+            };
+            (record.arn.clone(), record.resource_policy_document())
+        };
+        if let Err(denial) = crate::state::authorization::authorize(
+            &*self.engine,
+            ctx,
+            crate::state::authorization::PUT_RUM_METRICS_DESTINATION,
+            &resource_arn,
+            held_policy.as_deref(),
+            &[],
+        ) {
+            return Err(
+                PutRumMetricsDestinationErrorModeled::AccessDeniedException(
+                    crate::state::access_denied(&denial),
+                )
+                .into(),
+            );
         }
 
         let mut store = state.lock();

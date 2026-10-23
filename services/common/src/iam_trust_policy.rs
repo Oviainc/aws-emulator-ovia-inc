@@ -21,6 +21,12 @@
 //! * an explicit `Deny` among those statements WINS, whatever any `Allow` says;
 //! * otherwise the role admits the principal exactly when one of them is an `Allow`.
 //!
+//! The two readers this rule is built on — [`parse_policy`], which accepts a document in
+//! either of the forms a store hands one back in, and [`json_strings`], which reads an
+//! element that is one string or a list of them — are the SAME readers
+//! [`super::iam_authorization`] evaluates a full policy with, so the two modules cannot
+//! disagree about what a document says.
+//!
 //! What a service does when the document cannot be PARSED at all is its own policy, not
 //! IAM's, which is why [`admits_service_principal`] reports that case as `None` instead of
 //! choosing: EventBridge Scheduler refuses (it resolved the role and found nothing it could
@@ -74,7 +80,7 @@ pub fn admits_service_principal(document: &str, principal: &str) -> Option<bool>
 /// inside the policy (a condition value, a base64-looking string) to a space and corrupt
 /// it. Only a document that does not parse is percent-decoded — the URL-encoded form IAM
 /// reports a trust policy in — and parsed again.
-fn parse_policy(document: &str) -> Option<::serde_json::Value> {
+pub(crate) fn parse_policy(document: &str) -> Option<::serde_json::Value> {
     if let Ok(policy) = ::serde_json::from_str::<::serde_json::Value>(document) {
         return Some(policy);
     }
@@ -112,7 +118,7 @@ fn action_covers_assume_role(action: &str) -> bool {
 
 /// The strings a policy member holds, whether it is one string or a list of them.
 /// Anything else contributes none.
-fn json_strings(value: &::serde_json::Value) -> Vec<&str> {
+pub(crate) fn json_strings(value: &::serde_json::Value) -> Vec<&str> {
     match value {
         ::serde_json::Value::String(one) => vec![one.as_str()],
         ::serde_json::Value::Array(many) => many.iter().filter_map(|item| item.as_str()).collect(),

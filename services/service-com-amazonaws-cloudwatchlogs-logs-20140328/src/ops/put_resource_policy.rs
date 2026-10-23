@@ -246,7 +246,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 else {
                     return Err(PutResourcePolicyErrorModeled::ResourceNotFoundException(
                         ResourceNotFoundException {
-                            message: Some("The specified log group does not exist.".to_string()),
+                            message: Some(crate::state::resource_not_found_message("log group")),
                         },
                     )
                     .into());

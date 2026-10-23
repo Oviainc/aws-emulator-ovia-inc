@@ -120,7 +120,7 @@ impl Emulator {
         self.call("GET", &format!("/collaborations/{id}"), None).await
     }
 
-    async fn delete_collaboration(&self, id: &str) -> (u16, Value) {
+    pub(crate) async fn delete_collaboration(&self, id: &str) -> (u16, Value) {
         self.call("DELETE", &format!("/collaborations/{id}"), None)
             .await
     }
@@ -133,7 +133,7 @@ impl Emulator {
         self.call("GET", &format!("/memberships/{id}"), None).await
     }
 
-    async fn delete_membership(&self, id: &str) -> (u16, Value) {
+    pub(crate) async fn delete_membership(&self, id: &str) -> (u16, Value) {
         self.call("DELETE", &format!("/memberships/{id}"), None).await
     }
 }
@@ -146,6 +146,17 @@ pub(crate) fn error_code(body: &Value) -> String {
         .rsplit(['#', ':'])
         .next()
         .unwrap_or("<no __type>")
+        .to_string()
+}
+
+/// The message a failure response carries. restJson1 serializes the modelled `message`
+/// member; an SDK surfaces it as `Message`, so both spellings are accepted here and the
+/// test asserts on the composed text rather than on which one the wire used.
+pub(crate) fn error_message(body: &Value) -> String {
+    body.get("message")
+        .or_else(|| body.get("Message"))
+        .and_then(Value::as_str)
+        .unwrap_or("<no message>")
         .to_string()
 }
 
@@ -397,8 +408,9 @@ async fn get_collaboration_refuses_an_id_that_is_not_stored() {
     let stored = created["collaboration"]["id"].as_str().unwrap().to_string();
 
     // Syntactically valid ids (36-char lowercase hex) that no CreateCollaboration
-    // minted. GetCollaboration declares no 404, so the modelled refusal is
-    // ValidationException (400).
+    // minted. GetCollaboration declares no 404, and a caller's authorization to a
+    // collaboration lives in the collaboration, so an id it cannot reach is refused as
+    // an authorization failure: AccessDeniedException (403).
     let absent = [
         "00000000-0000-0000-0000-000000000000",
         "ffffffff-ffff-ffff-ffff-ffffffffffff",
@@ -407,13 +419,13 @@ async fn get_collaboration_refuses_an_id_that_is_not_stored() {
     for id in absent {
         let (status, body) = emulator.get_collaboration(id).await;
         assert_eq!(
-            status, 400,
-            "case {id:?}: expected 400 for an unknown collaboration, got {status} with {body}"
+            status, 403,
+            "case {id:?}: expected 403 for an unknown collaboration, got {status} with {body}"
         );
         assert_eq!(
             error_code(&body),
-            "ValidationException",
-            "case {id:?}: expected ValidationException, got {body}"
+            "AccessDeniedException",
+            "case {id:?}: expected AccessDeniedException, got {body}"
         );
     }
 
@@ -813,22 +825,22 @@ async fn create_membership_copies_the_collaboration_from_state_and_refuses_a_sec
         );
 
         // The identical call again: one account holds at most one membership per
-        // collaboration.
-        let (status, conflict) = emulator.create_membership(body).await;
+        // collaboration, and the identifier it sent is what fails validation.
+        let (status, refusal) = emulator.create_membership(body).await;
         assert_eq!(
-            status, 409,
-            "case {label:?}: a second join must conflict, got {status} with {conflict}"
+            status, 400,
+            "case {label:?}: a second join must be refused, got {status} with {refusal}"
         );
         assert_eq!(
-            error_code(&conflict),
-            "ConflictException",
-            "case {label:?}: expected ConflictException, got {conflict}"
+            error_code(&refusal),
+            "ValidationException",
+            "case {label:?}: expected ValidationException, got {refusal}"
         );
     }
 }
 
 #[tokio::test]
-async fn create_membership_refuses_a_collaboration_that_is_not_stored() {
+async fn create_membership_refuses_a_collaboration_it_cannot_reach() {
     let emulator = Emulator::new();
     // Syntactically valid collaboration ids that no CreateCollaboration minted.
     for collaboration_id in [
@@ -842,13 +854,13 @@ async fn create_membership_refuses_a_collaboration_that_is_not_stored() {
             }))
             .await;
         assert_eq!(
-            status, 404,
-            "case {collaboration_id:?}: expected 404, got {status} with {body}"
+            status, 403,
+            "case {collaboration_id:?}: expected 403, got {status} with {body}"
         );
         assert_eq!(
             error_code(&body),
-            "ResourceNotFoundException",
-            "case {collaboration_id:?}: expected ResourceNotFoundException, got {body}"
+            "AccessDeniedException",
+            "case {collaboration_id:?}: expected AccessDeniedException, got {body}"
         );
     }
 }
@@ -1073,7 +1085,7 @@ async fn deleting_a_collaboration_hides_it_and_marks_its_memberships() {
 
         let (status, body) = emulator.get_collaboration(&collaboration_id).await;
         assert_eq!(
-            status, 400,
+            status, 403,
             "case {index}: a deleted collaboration must not be readable, got {status} with {body}"
         );
 
@@ -1291,8 +1303,8 @@ async fn the_resource_stores_refuse_to_grow_past_their_caps() {
         }))
         .await;
     assert_eq!(
-        status, 404,
-        "case unknown collaboration at the membership cap: expected 404, got {status} with {body}"
+        status, 403,
+        "case unknown collaboration at the membership cap: expected 403, got {status} with {body}"
     );
     let (status, body) = emulator
         .create_membership(json!({
@@ -1301,8 +1313,8 @@ async fn the_resource_stores_refuse_to_grow_past_their_caps() {
         }))
         .await;
     assert_eq!(
-        status, 409,
-        "case repeat join at the membership cap: expected 409, got {status} with {body}"
+        status, 400,
+        "case repeat join at the membership cap: expected 400, got {status} with {body}"
     );
     let (status, body) = emulator.get_membership(&seed_membership).await;
     assert_eq!(
