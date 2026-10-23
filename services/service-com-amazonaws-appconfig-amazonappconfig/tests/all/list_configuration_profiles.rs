@@ -419,7 +419,8 @@ async fn the_type_filter_selects_the_profiles_of_that_type() {
     let application = create_application(&router, "type-filter").await;
 
     // Two profiles of each documented `Type`, and one carrying no `Type` at all — which
-    // no filter value selects, because the profile stores none.
+    // is created freeform, so the freeform filter value selects it and the other does
+    // not.
     let mut by_type: Vec<(&str, BTreeSet<String>)> = Vec::new();
     for profile_type in PROFILE_TYPES {
         let mut ids = BTreeSet::new();
@@ -457,6 +458,13 @@ async fn the_type_filter_selects_the_profiles_of_that_type() {
         .and_then(Value::as_str)
         .expect("a created profile carries an Id")
         .to_string();
+    // A request that declares no `Type` creates a freeform profile, so it lists under
+    // that filter value beside the ones that named it.
+    for (profile_type, ids) in &mut by_type {
+        if *profile_type == "AWS.Freeform" {
+            ids.insert(untyped_id.clone());
+        }
+    }
 
     for (profile_type, expected) in &by_type {
         let case = format!("Type={profile_type}");
@@ -467,9 +475,10 @@ async fn the_type_filter_selects_the_profiles_of_that_type() {
             &reported, expected,
             "case {case:?}: expected {expected:?}, got {reported:?}"
         );
-        assert!(
-            !reported.contains(&untyped_id),
-            "case {case:?}: a profile with no Type matches no filter value, got {reported:?}"
+        assert_eq!(
+            reported.contains(&untyped_id),
+            *profile_type == "AWS.Freeform",
+            "case {case:?}: a profile created with no Type is freeform, got {reported:?}"
         );
         for summary in &page {
             assert_eq!(
@@ -494,7 +503,8 @@ async fn the_type_filter_selects_the_profiles_of_that_type() {
     let case = "no filter";
     let answer = list(&router, &application, &[]).await;
     let page = items(&answer, case);
-    let expected: usize = by_type.iter().map(|(_, ids)| ids.len()).sum::<usize>() + 1;
+    // The untyped profile is counted once, through the freeform row it was added to.
+    let expected: usize = by_type.iter().map(|(_, ids)| ids.len()).sum::<usize>();
     assert_eq!(
         page.len(),
         expected,

@@ -173,8 +173,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `Type` is "a filter based on the type of configurations that the configuration
         // profile contains", so it selects the profiles whose stored `Type` is that
-        // value; a profile created without a `Type` carries none and so matches no
-        // filter value.
+        // value; a profile created without a `Type` is a freeform one (see
+        // `state::FREEFORM_PROFILE_TYPE`) and so matches that value.
         let mut ordered: Vec<(String, ConfigurationProfileSummary)> = application
             .profiles
             .values()
@@ -182,7 +182,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 input
                     .r#type
                     .as_deref()
-                    .is_none_or(|wanted| profile.profile_type.as_deref() == Some(wanted))
+                    .is_none_or(|wanted| profile.profile_type == wanted)
             })
             .map(|profile| (profile.id.clone(), summary_of(profile)))
             .collect();
@@ -241,7 +241,7 @@ fn summary_of(profile: &crate::state::ConfigurationProfile) -> ConfigurationProf
         // Left unset for a profile with no validators, the way `GetConfigurationProfile`
         // leaves `Validators` unset for that same profile.
         validator_types: (!validator_types.is_empty()).then_some(validator_types),
-        r#type: profile.profile_type.clone(),
+        r#type: Some(profile.profile_type.clone()),
     }
 }
 

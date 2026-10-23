@@ -218,12 +218,22 @@ pub fn retrieval_role_required_message(location_uri: &str) -> String {
 /// `CreateConfigurationProfile` `Type` documentation says: "When calling this API, enter
 /// one of the following values for `Type`: `AWS.AppConfig.FeatureFlags`,
 /// `AWS.Freeform`."
-pub const CONFIGURATION_PROFILE_TYPES: &[&str] = &[FEATURE_FLAGS_PROFILE_TYPE, "AWS.Freeform"];
+pub const CONFIGURATION_PROFILE_TYPES: &[&str] =
+    &[FEATURE_FLAGS_PROFILE_TYPE, FREEFORM_PROFILE_TYPE];
 
 /// The configuration profile `Type` whose hosted configuration content AppConfig runs
 /// through the feature-flags helper extension before storing it; see
 /// [`feature_flags`].
 pub const FEATURE_FLAGS_PROFILE_TYPE: &str = "AWS.AppConfig.FeatureFlags";
+
+/// The configuration profile `Type` a profile carries when the create request declared
+/// none: AppConfig's two kinds are feature flags and freeform (the model's `Type` doc:
+/// "AppConfig supports feature flags and freeform configurations"), and a profile that
+/// did not ask for the feature-flag semantics is a freeform one — recorded AppConfig
+/// answers `Type = AWS.Freeform` on a create that set no `Type`. The value is therefore
+/// stored on the profile at creation, not substituted at serialization time, so every
+/// later read and every type-dependent rule sees the same kind.
+pub const FREEFORM_PROFILE_TYPE: &str = "AWS.Freeform";
 
 /// This service's namespace in an ARN: the third colon-separated section of every ARN
 /// that addresses an AppConfig resource. An ARN naming any other service addresses no
@@ -881,10 +891,12 @@ pub struct ConfigurationProfile {
     pub location_uri: String,
     pub retrieval_role_arn: Option<String>,
     pub validators: Vec<Validator>,
-    /// The `Type` the caller declared (`AWS.Freeform`, `AWS.AppConfig.FeatureFlags`),
-    /// or `None` when it declared none: the model lists the values it accepts but
-    /// states no default, so none is substituted.
-    pub profile_type: Option<String>,
+    /// The `Type` this profile is of (`AWS.Freeform`, `AWS.AppConfig.FeatureFlags`):
+    /// the one the create request declared, or [`FREEFORM_PROFILE_TYPE`] when it
+    /// declared none. Never absent — a profile always has a kind, and it is what
+    /// selects the profile's semantics — so every document describing a profile
+    /// reports it.
+    pub profile_type: String,
     pub kms_key_identifier: Option<String>,
     pub tags: HashMap<String, String>,
     pub hosted_versions: BTreeMap<i32, HostedConfigurationVersion>,
