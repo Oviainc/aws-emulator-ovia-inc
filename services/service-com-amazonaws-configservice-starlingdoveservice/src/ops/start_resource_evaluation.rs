@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartResourceEvaluation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartResourceEvaluation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Starts one PROACTIVE resource evaluation and persists it in [`crate::state`]: the
+//! `ResourceEvaluationId` Config mints, the instant its execution started, the
+//! deployment context it belongs to, the resource details it was handed and the
+//! timeout it runs under — which is what `ListResourceEvaluations` reads back.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartResourceEvaluation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The evaluation's OUTCOME is NOT decided here: deciding it means running every
+//! proactive Config rule against the resource details, which this emulator has no rule
+//! engine for, so `GetResourceEvaluationSummary` stays scaffolded and nothing
+//! synthesises a compliance or a status for an execution nothing ran.
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +164,137 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartResourceEvaluation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartResourceEvaluationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartResourceEvaluation"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE)
+        })?;
+
+        // PROACTIVE is the only mode this API runs an evaluation in, so any other
+        // modelled `EvaluationMode` is an invalid parameter value rather than an
+        // evaluation nothing will ever run.
+        if input.evaluation_mode != crate::state::EVALUATION_MODE_PROACTIVE {
+            return Err(
+                StartResourceEvaluationErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(crate::state::unsupported_evaluation_mode_message(
+                            &input.evaluation_mode,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The resource definition is evaluated "as per the resource configuration
+        // schema type", and the only published schema type is a CloudFormation
+        // resource schema, whose instances are JSON objects of the resource's
+        // properties: a body that is not one cannot be evaluated against it.
+        let configuration: Option<serde_json::Value> =
+            serde_json::from_str(&input.resource_details.resource_configuration).ok();
+        if !configuration.is_some_and(|parsed| parsed.is_object()) {
+            return Err(
+                StartResourceEvaluationErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(format!(
+                            "The ResourceDetails.ResourceConfiguration provided in the \
+                             request is invalid. It must be the resource definition as a \
+                             JSON object, as per the {} resource configuration schema type.",
+                            crate::state::RESOURCE_CONFIGURATION_SCHEMA_TYPE_CFN,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "The default is 900 seconds. ... If you specify 0, Config uses the default."
+        let evaluation_timeout_seconds = if input.evaluation_timeout == 0 {
+            crate::state::DEFAULT_EVALUATION_TIMEOUT_SECONDS
+        } else {
+            input.evaluation_timeout
+        };
+
+        // The evaluation records the schema type its definition was read as, which is
+        // the only published one when the request named none.
+        let resource_details = ResourceDetails {
+            resource_configuration_schema_type: Some(
+                input
+                    .resource_details
+                    .resource_configuration_schema_type
+                    .clone()
+                    .filter(|schema_type| !schema_type.is_empty())
+                    .unwrap_or_else(|| {
+                        crate::state::RESOURCE_CONFIGURATION_SCHEMA_TYPE_CFN.to_string()
+                    }),
+            ),
+            ..input.resource_details.clone()
+        };
+
+        let evaluation_context_identifier = input
+            .evaluation_context
+            .as_ref()
+            .and_then(|context| context.evaluation_context_identifier.clone())
+            .filter(|identifier| !identifier.is_empty());
+        let client_token = input.client_token.clone().filter(|token| !token.is_empty());
+
+        let mut store = state.lock();
+
+        // "If you retry a request that completed successfully using the same client
+        // token and the same parameters, the retry succeeds without performing any
+        // further actions" — it answers with the evaluation that token already started
+        // — "but one or more of the parameters are different ... the retry fails with
+        // an IdempotentParameterMismatch error".
+        if let Some(token) = client_token.as_deref() {
+            if let Some(started) = store
+                .resource_evaluation_tokens
+                .get(token)
+                .and_then(|id| store.resource_evaluations.get(id))
+            {
+                if started.started_with(
+                    &input.evaluation_mode,
+                    &resource_details,
+                    evaluation_context_identifier.as_deref(),
+                    evaluation_timeout_seconds,
+                ) {
+                    return Ok(StartResourceEvaluationOutput {
+                        resource_evaluation_id: Some(started.id.clone()),
+                    });
+                }
+                return Err(
+                    StartResourceEvaluationErrorModeled::IdempotentParameterMismatch(
+                        IdempotentParameterMismatch {
+                            message: Some(format!(
+                                "The ClientToken '{token}' provided in the request already \
+                                 started a resource evaluation with different parameters. \
+                                 Specify a new client token with the parameter changes and \
+                                 try again."
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        let sequence = store.next_resource_evaluation_seq;
+        // A u64 counter cannot be exhausted by API calls, so it never reissues an id;
+        // saturating rather than wrapping keeps that true by construction.
+        store.next_resource_evaluation_seq = sequence.saturating_add(1);
+        let id = crate::state::mint_resource_evaluation_id(sequence);
+        // Recorded through the state's own writer, which indexes the client token and
+        // keeps the evaluation store bounded.
+        store.record_resource_evaluation(crate::state::ResourceEvaluationEntry {
+            id: id.clone(),
+            evaluation_mode: input.evaluation_mode.clone(),
+            started_at: ::std::time::SystemTime::now(),
+            evaluation_context_identifier,
+            resource_details,
+            evaluation_timeout_seconds,
+            client_token,
+        });
+
+        Ok(StartResourceEvaluationOutput {
+            resource_evaluation_id: Some(id),
+        })
     }
 }

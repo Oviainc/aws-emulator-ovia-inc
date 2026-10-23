@@ -36,6 +36,11 @@
 //! once, when the resource is created or updated, so no reader has to re-apply a
 //! default.
 //!
+//! The [`authorization`] submodule is the one gate — the server, user, SSH-key and
+//! access-creating operations consult it before they act, and the other implemented
+//! families do not yet (its own header records that scope): it reads the calling
+//! principal's — and a passed role's — IAM policies out of the account's IAM store.
+//!
 //! The `Message` of a not-found, an already-exists or a documented state refusal is
 //! built here, as a FIXED text per condition that carries no request data: the
 //! identifier a caller needs to see travels in the error's own `Resource`/
@@ -45,6 +50,8 @@
 //! refusal, say); the one message built from the request is the framework's
 //! `ValidationException`, whose template (member path + modelled constraint, no value)
 //! lives in `crate::service`.
+
+pub mod authorization;
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant, SystemTime};
@@ -791,6 +798,53 @@ pub fn not_found<E>(error: E) -> crate::scaffolded::Scaffolded<E> {
     crate::scaffolded::Scaffolded::modeled_with_status(error, RESOURCE_NOT_FOUND_HTTP_STATUS)
 }
 
+/// The refusal for an `API_GATEWAY` identity provider whose `InvocationRole` could
+/// not be shown able to invoke the API the provider names.
+///
+/// The message names the API the request gave, so the caller knows which one could
+/// not be verified; a request that gave an invocation role but no `Url` names no API
+/// to quote, and is told exactly that rather than an empty value.
+pub fn unverifiable_identity_provider(url: Option<&str>) -> String {
+    match url {
+        Some(url) => format!("Unable to verify access to API {url}"),
+        None => {
+            "Unable to verify access to the API named by IdentityProviderDetails.Url".to_string()
+        }
+    }
+}
+
+/// The `SshPublicKeyBody` the service STORES for a submitted one, and so the body
+/// every reader of the key reports back.
+///
+/// Trailing whitespace is removed and nothing else is touched: the key material and
+/// the comment after it are kept byte-identical, so a client that fingerprints what
+/// it reads back fingerprints what it sent. The modelled pattern ends
+/// `(\s*|[ \t]+[\S \t]*\s*)$`, so the trailing-whitespace form is accepted on the
+/// wire and normalised here rather than refused — the recorded service behaviour.
+/// Every write that takes a key body (`CreateUser`, `ImportSshPublicKey`) stores the
+/// result of this function, so two writes of one key cannot differ by whitespace.
+pub fn stored_ssh_public_key_body(submitted: &str) -> String {
+    submitted.trim_end().to_string()
+}
+
+/// The refusal for a session policy that is not a JSON document — `None` when the
+/// request names a policy this service can parse, or names none at all.
+///
+/// `Policy` is modelled `@length 0..2048` with NO pattern, so a document's syntax is
+/// checked by the service and not at the boundary: a scope-down policy is a JSON
+/// document, and one that does not parse is refused before it can be stored and
+/// silently become a user's effective permissions. The empty string the member's
+/// `len 0..2048` admits names no policy rather than a malformed one.
+pub fn policy_document_violation(member: &str, policy: Option<&str>) -> Option<String> {
+    let policy = policy?;
+    if policy.trim().is_empty() {
+        return None;
+    }
+    ::serde_json::from_str::<::serde_json::Value>(policy)
+        .is_err()
+        .then(|| format!("{member} is not a valid JSON document"))
+}
+
 // ---------------------------------------------------------------------------
 // The service-managed security policy catalog
 // ---------------------------------------------------------------------------
@@ -1342,7 +1396,7 @@ pub fn unknown_security_policy(security_policy_name: &str) -> ResourceNotFoundEx
 pub struct SshKey {
     /// The minted `key-` + 17 hex-digit identifier (`^key-[0-9a-f]{17}$`).
     pub ssh_public_key_id: String,
-    /// The key material exactly as the caller supplied it.
+    /// The key material as [`stored_ssh_public_key_body`] normalises it.
     pub ssh_public_key_body: String,
     /// When this key was added to the user.
     pub date_imported: SystemTime,
@@ -2105,6 +2159,17 @@ fn must_be_when(member: &str, requirement: &str, condition: &str) -> String {
     format!("{member} must be {requirement} when {condition}")
 }
 
+/// "FTP and FTPS protocols unsupported for IdentityProviderType `<type>`" — the
+/// identity-provider half of the requirement `Protocols` documents, stated as the
+/// incompatibility it is: the authentication mode the server was asked for cannot
+/// serve those protocols at all.
+fn unsupported_for_identity_provider(identity_provider_type: &str) -> String {
+    format!(
+        "{PROTOCOL_FTP} and {PROTOCOL_FTPS} protocols unsupported for \
+         IdentityProviderType {identity_provider_type}"
+    )
+}
+
 /// "exactly one of `<first>` and `<second>` must be specified" — two members the model
 /// documents as alternatives, exactly one of which configures the resource.
 fn exactly_one_of(first: &str, second: &str) -> String {
@@ -2265,20 +2330,23 @@ impl ServerConfig<'_> {
             if !self.speaks(protocol) {
                 continue;
             }
+            // The identity-provider half of the requirement is evaluated FIRST,
+            // before the endpoint-type half: which protocols a server can serve
+            // follows from its authentication mode, and no endpoint type makes a
+            // provider that cannot serve FTP able to serve it. Evaluating the
+            // endpoint rule first would tell a caller to change the endpoint type
+            // for a combination that stays illegal once changed — and would accept
+            // `EndpointType=VPC` with the service-managed provider, which the
+            // requirement forbids.
+            if !self.needs_identity_provider_details() {
+                return Some(unsupported_for_identity_provider(
+                    self.identity_provider_type,
+                ));
+            }
             if endpoint_type != ENDPOINT_TYPE_VPC {
                 return Some(must_be_when(
                     "EndpointType",
                     ENDPOINT_TYPE_VPC,
-                    &format!("Protocols includes {protocol}"),
-                ));
-            }
-            if !self.needs_identity_provider_details() {
-                return Some(must_be_when(
-                    "IdentityProviderType",
-                    &format!(
-                        "{IDENTITY_PROVIDER_AWS_DIRECTORY_SERVICE}, \
-                         {IDENTITY_PROVIDER_AWS_LAMBDA} or {IDENTITY_PROVIDER_API_GATEWAY}"
-                    ),
                     &format!("Protocols includes {protocol}"),
                 ));
             }

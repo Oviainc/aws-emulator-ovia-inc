@@ -35,9 +35,17 @@ pub const ARN_NAMESPACE: &str = "bcm-pricing-calculator";
 /// [`ComAmazonawsBcmpricingcalculatorAwsbcmpricingcalculatorState::purge_expired`].
 pub const BILL_SCENARIO_RETENTION_SECS: i64 = 15 * 24 * 60 * 60;
 
-/// The page size a `@paginated` list operation uses when the caller sends no
-/// `maxResults`: the model's own maximum for that member (`range 1..25`).
+/// The page size a `@paginated` list operation whose page-size member is `MaxResults`
+/// uses when the caller sends no `maxResults`: the model's own maximum for that member
+/// (`range 1..25`).
 pub const MAX_PAGE_SIZE: i32 = 25;
+
+/// The page size `ListWorkloadEstimateUsage` uses when the caller sends no
+/// `maxResults`. Same rule as [`MAX_PAGE_SIZE`] — the modelled maximum of that
+/// operation's own page-size member — but that member is `WorkloadEstimateUsageMaxResults`
+/// (smithy_query: `shape="WorkloadEstimateUsageMaxResults"`, `range 1..300`) rather than
+/// `MaxResults`.
+pub const WORKLOAD_ESTIMATE_USAGE_MAX_PAGE_SIZE: i32 = 300;
 
 /// The greatest number of bill scenarios this emulator holds at once.
 ///
@@ -110,6 +118,12 @@ pub const MAX_USAGE_PER_WORKLOAD_ESTIMATE: usize = 2000;
 /// The only `CurrencyCode` the model declares (smithy_query: `shape="CurrencyCode"`,
 /// values `USD`), so it is the currency every cost this service reports is in.
 pub const COST_CURRENCY: &str = "USD";
+
+/// The `WorkloadEstimateCostStatus` a cost that is current carries (smithy_query:
+/// `shape="WorkloadEstimateCostStatus"`, values `VALID | INVALID | STALE`). Held here
+/// rather than in one handler, so every reader of a usage line's cost qualifies it the
+/// same way (see [`WorkloadEstimateUsage::cost_status`]).
+pub const COST_STATUS_VALID: &str = "VALID";
 
 /// What the `resourceType` member of a modelled error names a bill scenario as: the
 /// resource's own Smithy shape name (`com.amazonaws.bcmpricingcalculator#BillScenario`),
@@ -244,27 +258,66 @@ impl UsageModification {
     }
 
     /// The value a `ListUsageFilter` name selects on this modification, or `None` when
-    /// this modification carries nothing for it.
-    ///
-    /// Names are the `ListUsageFilterName` enum's own values (smithy_query:
-    /// `shape="ListUsageFilterName"`); the `HISTORICAL_*` half reads the entry's
-    /// `historicalUsage`.
+    /// this modification carries nothing for it: [`usage_filter_value`] over this
+    /// modification's attributes.
     pub fn filter_value(&self, name: &str) -> Option<&str> {
-        let historical = self.historical_usage.as_ref();
-        match name {
-            "USAGE_ACCOUNT_ID" => Some(self.usage_account_id.as_str()),
-            "SERVICE_CODE" => Some(self.service_code.as_str()),
-            "USAGE_TYPE" => Some(self.usage_type.as_str()),
-            "OPERATION" => Some(self.operation.as_str()),
-            "LOCATION" => self.location.as_deref(),
-            "USAGE_GROUP" => self.group.as_deref(),
-            "HISTORICAL_USAGE_ACCOUNT_ID" => historical.map(|h| h.usage_account_id.as_str()),
-            "HISTORICAL_SERVICE_CODE" => historical.map(|h| h.service_code.as_str()),
-            "HISTORICAL_USAGE_TYPE" => historical.map(|h| h.usage_type.as_str()),
-            "HISTORICAL_OPERATION" => historical.map(|h| h.operation.as_str()),
-            "HISTORICAL_LOCATION" => historical.and_then(|h| h.location.as_deref()),
-            _ => None,
-        }
+        usage_filter_value(
+            &UsageFilterFields {
+                usage_account_id: self.usage_account_id.as_str(),
+                service_code: self.service_code.as_str(),
+                usage_type: self.usage_type.as_str(),
+                operation: self.operation.as_str(),
+                location: self.location.as_deref(),
+                group: self.group.as_deref(),
+                historical_usage: self.historical_usage.as_ref(),
+            },
+            name,
+        )
+    }
+}
+
+/// The attributes a `ListUsageFilter` can select on, borrowed from one stored usage row.
+///
+/// It is a struct rather than a parameter list so [`usage_filter_value`] names what it
+/// reads: this service has two kinds of usage row (a bill scenario's
+/// [`UsageModification`] and a workload estimate's [`WorkloadEstimateUsage`]) and both
+/// are filtered through the SAME `ListUsageFilters` shape, so both must answer one
+/// filter table.
+pub struct UsageFilterFields<'a> {
+    pub usage_account_id: &'a str,
+    pub service_code: &'a str,
+    pub usage_type: &'a str,
+    pub operation: &'a str,
+    /// The row's pricing location. Only resolvable from the price list, which this
+    /// emulator does not carry, so no row has one yet and a `LOCATION` filter selects
+    /// nothing rather than being refused — the real service does support it.
+    pub location: Option<&'a str>,
+    pub group: Option<&'a str>,
+    pub historical_usage: Option<&'a HistoricalUsageEntity>,
+}
+
+/// The value a `ListUsageFilter` name selects on a usage row, or `None` when the row
+/// carries nothing for it (which selects the row out).
+///
+/// ONE table for every usage row this service filters, so a `ListUsageFilterName` the
+/// model adds is handled in one place instead of drifting between two copies. The names
+/// are that enum's own values (smithy_query: `shape="ListUsageFilterName"`); the
+/// `HISTORICAL_*` half reads the row's `historicalUsage`.
+pub fn usage_filter_value<'a>(row: &UsageFilterFields<'a>, name: &str) -> Option<&'a str> {
+    let historical = row.historical_usage;
+    match name {
+        "USAGE_ACCOUNT_ID" => Some(row.usage_account_id),
+        "SERVICE_CODE" => Some(row.service_code),
+        "USAGE_TYPE" => Some(row.usage_type),
+        "OPERATION" => Some(row.operation),
+        "LOCATION" => row.location,
+        "USAGE_GROUP" => row.group,
+        "HISTORICAL_USAGE_ACCOUNT_ID" => historical.map(|h| h.usage_account_id.as_str()),
+        "HISTORICAL_SERVICE_CODE" => historical.map(|h| h.service_code.as_str()),
+        "HISTORICAL_USAGE_TYPE" => historical.map(|h| h.usage_type.as_str()),
+        "HISTORICAL_OPERATION" => historical.map(|h| h.operation.as_str()),
+        "HISTORICAL_LOCATION" => historical.and_then(|h| h.location.as_deref()),
+        _ => None,
     }
 }
 
@@ -313,6 +366,41 @@ impl WorkloadEstimateUsage {
             unit: None,
             amount: Some(self.amount),
         }
+    }
+
+    /// The value a `ListUsageFilter` name selects on this usage line, or `None` when
+    /// this line carries nothing for it: [`usage_filter_value`] over this line's
+    /// attributes, the same table a bill scenario's [`UsageModification`] answers,
+    /// since both are filtered through the SAME `ListUsageFilters` shape.
+    pub fn filter_value(&self, name: &str) -> Option<&str> {
+        usage_filter_value(
+            &UsageFilterFields {
+                usage_account_id: self.usage_account_id.as_str(),
+                service_code: self.service_code.as_str(),
+                usage_type: self.usage_type.as_str(),
+                operation: self.operation.as_str(),
+                location: self.location.as_deref(),
+                group: self.group.as_deref(),
+                historical_usage: self.historical_usage.as_ref(),
+            },
+            name,
+        )
+    }
+
+    /// The currency a reader reports this line's cost in: [`COST_CURRENCY`] exactly when
+    /// a `cost` is reported, since `currency` says which currency THAT cost is in and has
+    /// nothing to qualify without one.
+    pub fn cost_currency(&self) -> Option<String> {
+        self.cost.map(|_| COST_CURRENCY.to_string())
+    }
+
+    /// The `WorkloadEstimateCostStatus` a reader reports for this line: it qualifies the
+    /// reported `cost`, so it is reported exactly when a cost is — and the cost a reader
+    /// has just computed off stored state is current, hence [`COST_STATUS_VALID`]. With
+    /// no cost there is nothing to qualify, so it stays unset rather than asserting a
+    /// cost state nothing established.
+    pub fn cost_status(&self) -> Option<String> {
+        self.cost.map(|_| COST_STATUS_VALID.to_string())
     }
 }
 
@@ -1121,19 +1209,34 @@ pub fn paginate<T: Clone>(
     max_results: Option<i32>,
     scope: &str,
 ) -> Result<(Vec<T>, Option<String>), String> {
+    paginate_sized(items, next_token, max_results, MAX_PAGE_SIZE, scope)
+}
+
+/// [`paginate`], for an operation whose `maxResults` member is modelled with a
+/// different maximum than [`MAX_PAGE_SIZE`] — `default_page_size` is the page size a
+/// caller that sends no `maxResults` gets, which this service takes to be that
+/// operation's own modelled maximum.
+pub fn paginate_sized<T: Clone>(
+    items: &[T],
+    next_token: Option<&str>,
+    max_results: Option<i32>,
+    default_page_size: i32,
+    scope: &str,
+) -> Result<(Vec<T>, Option<String>), String> {
     let offset = match next_token {
         Some(token) if !token.is_empty() => decode_page_token(token, scope)?,
         _ => 0,
     };
-    // The model declares `maxResults` as `range 1..25`, so the boundary validator has
-    // already refused anything outside it; refuse rather than clamp, so a page size
-    // that somehow reached here is reported instead of silently becoming 1.
+    // Every `maxResults` member of this service is modelled with a minimum of 1, so the
+    // boundary validator has already refused anything below it; refuse rather than
+    // clamp, so a page size that somehow reached here is reported instead of silently
+    // becoming 1.
     let page_size = match max_results {
         Some(requested) if requested < 1 => {
             return Err(format!("maxResults must be at least 1, got {requested}"))
         }
         Some(requested) => requested as usize,
-        None => MAX_PAGE_SIZE as usize,
+        None => default_page_size as usize,
     };
     if offset >= items.len() {
         return Ok((Vec::new(), None));

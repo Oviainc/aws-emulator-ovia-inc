@@ -2,9 +2,9 @@
 
 //! Engine state for the com-amazonaws-ssm-amazonssm service.
 //!
-//! The slice modelled here is **Parameter Store**: `PutParameter` creates or updates a
-//! parameter and `GetParameter` reads one back. Both reach the one store below, so
-//! whatever a put persisted is what a later get reports.
+//! Two slices are modelled here. The first is **Parameter Store**: `PutParameter`
+//! creates or updates a parameter and `GetParameter` reads one back. Both reach the one
+//! store below, so whatever a put persisted is what a later get reports.
 //!
 //! A parameter lives at a name that is unique *within a Region* (the `PutParameter`
 //! `Name` doc: "A parameter name must be unique within an Amazon Web Services Region"),
@@ -12,11 +12,20 @@
 //! **versions**, oldest first: a put that overwrites an existing name appends a new
 //! version rather than replacing the old one, which is what lets a `name:version`
 //! selector resolve an earlier value.
+//!
+//! The second is the **managed nodes** the console-facing describes report
+//! ([`ManagedNodeRecord`]), keyed by `(region, node id)` and filtered by the keys
+//! [`is_node_filter_key`] accepts.
 
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::SystemTime;
 
-use crate::ops::types::{Parameter, Tag};
+use crate::ops::types::{
+    InstanceProperty, Parameter, Tag, ASSOCIATION_STATUS_NAME_VALUES,
+    INSTANCE_PROPERTY_FILTER_KEY_VALUES, PING_STATUS_VALUES, PLATFORM_TYPE_VALUES,
+    RESOURCE_TYPE_VALUES, SOURCE_TYPE_VALUES,
+};
 
 /// The signing name, endpoint prefix and ARN namespace of this service, all three
 /// `ssm` (the model's `aws.auth#sigv4` / `aws.api#service` traits).
@@ -466,6 +475,18 @@ pub struct ComAmazonawsSsmAmazonssmState {
     /// unique within an Amazon Web Services Region". A `BTreeMap` so a listing walks a
     /// stable, total order.
     pub parameters: BTreeMap<(String, String), ParameterRecord>,
+
+    /// Every managed node, keyed by `(region, node id)`: a node is registered with the
+    /// Systems Manager endpoint of one Region and is identified there by its node id. A
+    /// `BTreeMap` so a describe walks a stable, total order and can resume a page from
+    /// the id it stopped at.
+    ///
+    /// Nothing registers a node yet: registration is the SSM Agent's own call, which
+    /// this service's model does not expose, and every operation that would admit one
+    /// another way (`CreateActivation`, `CreateAssociation`, `PutInventory`) is still a
+    /// scaffold. A describe therefore reports the empty set for a fresh emulator — what
+    /// the store holds — rather than nodes nobody registered.
+    pub managed_nodes: BTreeMap<(String, String), ManagedNodeRecord>,
 }
 
 impl ComAmazonawsSsmAmazonssmState {
@@ -498,6 +519,30 @@ impl ComAmazonawsSsmAmazonssmState {
             .filter(|(held, _)| held == region)
             .count()
     }
+
+    /// Every managed node `region` holds, in ascending node-id order, as
+    /// `(node id, record)`.
+    pub fn managed_nodes_in_region<'a>(
+        &'a self,
+        region: &'a str,
+    ) -> impl Iterator<Item = (&'a str, &'a ManagedNodeRecord)> + 'a {
+        self.managed_nodes
+            .iter()
+            .filter(move |((held, _), _)| held == region)
+            .map(|((_, id), node)| (id.as_str(), node))
+    }
+
+    /// Store `node` as a managed node of `region`, keyed by the node id it reports.
+    ///
+    /// Answers `false` for a record reporting no node id: a managed node is identified
+    /// by that id, so there is no key to store one without it.
+    pub fn insert_managed_node(&mut self, region: &str, node: ManagedNodeRecord) -> bool {
+        let Some(id) = node.node_id().map(str::to_string) else {
+            return false;
+        };
+        self.managed_nodes.insert((region.to_string(), id), node);
+        true
+    }
 }
 
 /// A modelled `TagList` as the store holds it: ordered, so two reads of one record
@@ -507,6 +552,222 @@ pub fn to_btree_map(tags: Option<Vec<Tag>>) -> BTreeMap<String, String> {
         .into_iter()
         .map(|tag| (tag.key, tag.value))
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Managed nodes
+// ---------------------------------------------------------------------------
+
+/// The filter keys a managed-node describe accepts beside the modelled
+/// `InstancePropertyFilterKey` enum (`ActivationIds`, `AgentVersion`,
+/// `AssociationStatus`, `DocumentName`, `IamRole`, `InstanceIds`, `PingStatus`,
+/// `PlatformTypes`, `ResourceType`).
+///
+/// Both come from this service's own model: the enum is what
+/// `InstancePropertyFilter$key` targets, and these two are the remaining keys the
+/// sibling string filter over the same managed nodes publishes — "Valid filter key
+/// values: ActivationIds | AgentVersion | AssociationStatus | IamRole | InstanceIds |
+/// PingStatus | PlatformTypes | ResourceType | SourceIds | SourceTypes | "tag-key" |
+/// "tag:{keyname}"" (`InstanceInformationStringFilter$Key`). `InstanceProperty`
+/// reports a `SourceId` and a `SourceType` for every node, so both are properties this
+/// store can answer a filter on.
+pub const EXTRA_NODE_FILTER_KEYS: &[&str] = &["SourceIds", "SourceTypes"];
+
+/// The filter key that matches a node carrying a tag of a given KEY, whatever its
+/// value: "Valid tag examples: `Key=tag-key,Values=Purpose`" (same doc).
+pub const TAG_KEY_FILTER_KEY: &str = "tag-key";
+
+/// The prefix of the filter key that matches a node whose tag of that name has a given
+/// value: "`Key=tag:Purpose,Values=Test`" (same doc).
+pub const TAG_FILTER_KEY_PREFIX: &str = "tag:";
+
+/// The filter operator a filter that names none is served with: the modelled
+/// `InstancePropertyFilterOperator` values are `Equal`, `NotEqual`, `BeginWith`,
+/// `LessThan` and `GreaterThan`, and `InstancePropertyFilter` — which carries no
+/// operator at all — selects the nodes whose property EQUALS one of its values.
+pub const OPERATOR_EQUAL: &str = "Equal";
+
+/// See [`OPERATOR_EQUAL`].
+pub const OPERATOR_NOT_EQUAL: &str = "NotEqual";
+
+/// See [`OPERATOR_EQUAL`].
+pub const OPERATOR_BEGIN_WITH: &str = "BeginWith";
+
+/// See [`OPERATOR_EQUAL`].
+pub const OPERATOR_LESS_THAN: &str = "LessThan";
+
+/// See [`OPERATOR_EQUAL`].
+pub const OPERATOR_GREATER_THAN: &str = "GreaterThan";
+
+/// Whether `key` is a filter key a managed-node describe knows, which is what tells an
+/// accepted filter from a refused one. The comparison is exact: a filter key is a name,
+/// not a prose label, so neither a different spelling nor a different case names a
+/// property of a node.
+pub fn is_node_filter_key(key: &str) -> bool {
+    INSTANCE_PROPERTY_FILTER_KEY_VALUES.contains(&key)
+        || EXTRA_NODE_FILTER_KEYS.contains(&key)
+        || key == TAG_KEY_FILTER_KEY
+        || key
+            .strip_prefix(TAG_FILTER_KEY_PREFIX)
+            .is_some_and(|name| !name.is_empty())
+}
+
+/// Why `key` is not a filter key a managed-node describe accepts, as the service words
+/// it: the key the caller submitted, then the member it filled — "`<Key>` filter Key is
+/// invalid." The text is built from the request, so a caller reading it knows which
+/// filter to fix.
+pub fn filter_key_rejection(key: &str) -> String {
+    format!("{key} filter Key is invalid.")
+}
+
+/// Every filter key a managed-node describe accepts, for a refusal or a report that
+/// lists them. The tag form is listed as the doc writes it, with the tag name as a
+/// placeholder.
+pub fn node_filter_keys() -> Vec<&'static str> {
+    INSTANCE_PROPERTY_FILTER_KEY_VALUES
+        .iter()
+        .chain(EXTRA_NODE_FILTER_KEYS.iter())
+        .copied()
+        .chain([TAG_KEY_FILTER_KEY, "tag:{keyname}"])
+        .collect()
+}
+
+/// The values `key` accepts, for the filter keys whose value set this service's model
+/// publishes, or `None` for a key whose values are free text (a node id, an agent
+/// version, a role name, a tag value).
+///
+/// Each set is the modelled enum the property targets, which is also what
+/// `InstanceInformationStringFilter$Key` lists for the same keys ("Valid values for the
+/// `PingStatus` filter key: Online | ConnectionLost | Inactive", and so on for
+/// `AssociationStatus`, `PlatformTypes`, `ResourceType` and `SourceType`).
+pub fn node_filter_key_value_set(key: &str) -> Option<&'static [&'static str]> {
+    match key {
+        "AssociationStatus" => Some(ASSOCIATION_STATUS_NAME_VALUES),
+        "PingStatus" => Some(PING_STATUS_VALUES),
+        "PlatformTypes" => Some(PLATFORM_TYPE_VALUES),
+        "ResourceType" => Some(RESOURCE_TYPE_VALUES),
+        "SourceTypes" => Some(SOURCE_TYPE_VALUES),
+        _ => None,
+    }
+}
+
+/// Whether `id` is shaped like a managed-node id, from the modelled `InstanceId`
+/// pattern `^(^i-(\w{8}|\w{17})$)|(^mi-\w{17}$)$`: an EC2 instance id with an 8- or
+/// 17-character suffix, or a 17-character hybrid-activation (`mi-`) id.
+pub fn managed_node_id_is_well_formed(id: &str) -> bool {
+    let is_word = |rest: &str| rest.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if let Some(rest) = id.strip_prefix("i-") {
+        return (rest.len() == 8 || rest.len() == 17) && is_word(rest);
+    }
+    if let Some(rest) = id.strip_prefix("mi-") {
+        return rest.len() == 17 && is_word(rest);
+    }
+    false
+}
+
+/// How `LessThan` and `GreaterThan` order two filter values.
+///
+/// Both operators are declared for a filter over properties that are mostly dotted
+/// numbers (`AgentVersion` is modelled as `^[0-9]{1,6}(\.[0-9]{1,6}){2,3}$`), so two
+/// values whose every dot-separated segment is a number are ordered segment by segment
+/// as numbers — `3.0.1` is above `3.0.10` nowhere, unlike a text comparison. Anything
+/// else is ordered as text.
+pub fn compare_filter_values(left: &str, right: &str) -> Ordering {
+    let segments = |value: &str| {
+        value
+            .split('.')
+            .map(str::parse::<u64>)
+            .collect::<Result<Vec<u64>, _>>()
+            .ok()
+    };
+    match (segments(left), segments(right)) {
+        (Some(left), Some(right)) => left.cmp(&right),
+        _ => left.cmp(right),
+    }
+}
+
+/// Whether a node's `held` value satisfies `operator` against a filter's `wanted`
+/// value.
+pub fn operator_matches(operator: &str, held: &str, wanted: &str) -> bool {
+    match operator {
+        OPERATOR_NOT_EQUAL => held != wanted,
+        OPERATOR_BEGIN_WITH => held.starts_with(wanted),
+        OPERATOR_LESS_THAN => compare_filter_values(held, wanted) == Ordering::Less,
+        OPERATOR_GREATER_THAN => compare_filter_values(held, wanted) == Ordering::Greater,
+        // `Equal`, and the operator an `InstancePropertyFilter` does not carry.
+        _ => held == wanted,
+    }
+}
+
+/// One managed node, as the console-facing describes report it.
+///
+/// `properties` is the modelled `InstanceProperty` itself, so a describe reports what
+/// was persisted rather than a second copy of it; `tags` is what the `tag-key` and
+/// `tag:<name>` filter keys match against, which no response member carries.
+#[derive(Debug, Clone, Default)]
+pub struct ManagedNodeRecord {
+    /// Everything a describe reports about this node.
+    pub properties: InstanceProperty,
+    /// The node's tags, keyed by tag key.
+    pub tags: BTreeMap<String, String>,
+}
+
+impl ManagedNodeRecord {
+    /// The node id this record is stored under, from the properties it reports.
+    pub fn node_id(&self) -> Option<&str> {
+        self.properties.instance_id.as_deref()
+    }
+
+    /// The values of this node that a filter on `key` is matched against, or `None`
+    /// when `key` is not a filter key at all ([`is_node_filter_key`]).
+    ///
+    /// A node the store holds no value of that property for answers with an EMPTY list
+    /// and so is reported by no filter on it, whatever the operator: a filter selects
+    /// the nodes whose property satisfies it, and a node without the property has
+    /// nothing to satisfy it with.
+    pub fn filter_values(&self, key: &str) -> Option<Vec<&str>> {
+        fn one(value: &Option<String>) -> Option<Vec<&str>> {
+            Some(value.as_deref().into_iter().collect())
+        }
+        match key {
+            "ActivationIds" => one(&self.properties.activation_id),
+            "AgentVersion" => one(&self.properties.agent_version),
+            "AssociationStatus" => one(&self.properties.association_status),
+            "IamRole" => one(&self.properties.iam_role),
+            "InstanceIds" => one(&self.properties.instance_id),
+            "PingStatus" => one(&self.properties.ping_status),
+            "PlatformTypes" => one(&self.properties.platform_type),
+            "ResourceType" => one(&self.properties.resource_type),
+            "SourceIds" => one(&self.properties.source_id),
+            "SourceTypes" => one(&self.properties.source_type),
+            // `DocumentName` selects the nodes an association of that SSM document
+            // targets. Associations are a separate resource of this service and no
+            // operation that creates one is implemented yet, so no node in this store
+            // is the target of any document and a filter on it selects nothing — which
+            // is the store's answer, not a refusal.
+            "DocumentName" => Some(Vec::new()),
+            TAG_KEY_FILTER_KEY => Some(self.tags.keys().map(String::as_str).collect()),
+            _ => match key.strip_prefix(TAG_FILTER_KEY_PREFIX) {
+                Some(name) if !name.is_empty() => {
+                    Some(self.tags.get(name).map(String::as_str).into_iter().collect())
+                }
+                _ => None,
+            },
+        }
+    }
+
+    /// Whether this node satisfies one filter: any value it holds for `key` against any
+    /// of the filter's `values`, under `operator`.
+    pub fn matches_filter(&self, key: &str, values: &[String], operator: &str) -> bool {
+        let Some(held) = self.filter_values(key) else {
+            return false;
+        };
+        held.iter().any(|held| {
+            values
+                .iter()
+                .any(|wanted| operator_matches(operator, held, wanted))
+        })
+    }
 }
 
 /// The region this request was signed for, from its SigV4 credential scope; the

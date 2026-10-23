@@ -111,6 +111,18 @@
 //! caller name either. An Elastic IP address AWS hands back is usable at once — it has no
 //! non-terminal status — so no entry beside it records a clock-owed transition.
 //!
+//! ## Dedicated Hosts
+//!
+//! [`ComAmazonawsEc2Amazonec2State::dedicated_hosts`] holds the account's Dedicated Hosts
+//! as the modelled [`Host`] shape itself, keyed by `HostId`, for the same reason the VPC
+//! store holds [`Vpc`]s: `AllocateHosts` and the describe operations cannot report one
+//! host differently. Which of those hosts is an EC2 Mac Dedicated Host is a fact of the
+//! host's instance family rather than a stored flag ([`is_mac_instance_family`]), and the
+//! macOS releases one can launch are a fact of that family's hardware
+//! ([`mac_os_supported_versions`]) — so [`mac_host_view`] derives the `MacHost` shape
+//! `DescribeMacHosts` reports from the one stored host, and no second record can disagree
+//! with it.
+//!
 //! ## VPC endpoint connections
 //!
 //! [`ComAmazonawsEc2Amazonec2State::vpc_endpoint_connections`] holds the connections to
@@ -200,10 +212,11 @@ use crate::ops::types::{
     Address, ApplicationStatus, ApplicationStatusDetail, AvailabilityZone,
     AvailabilityZoneMessage, BlockDeviceMapping, BlockPublicAccessStates, CapacityBlock,
     CreateVolumeOutput, DescribeFastLaunchImagesSuccessItem, DisableFastLaunchOutput,
-    EbsBlockDevice, EnableFastLaunchOutput, GroupIdentifier, INSTANCE_TYPE_VALUES, Image, Instance,
-    InstanceApplicationStatus,
+    EbsBlockDevice, EnableFastLaunchOutput, GroupIdentifier, Host, INSTANCE_TYPE_VALUES, Image,
+    Instance, InstanceApplicationStatus,
     InstanceState, InstanceTypeOffering, IpPermission, IpRange, LOCATION_TYPE_VALUES,
-    LaunchTemplate, Monitoring, OperatorResponse, Placement, PrivateDnsNameOptionsOnLaunch,
+    LaunchTemplate, MacHost, Monitoring, OperatorResponse, Placement,
+    PrivateDnsNameOptionsOnLaunch,
     DnsEntry, PayerResponsibilityEntry,
     RequestLaunchTemplateData, RunInstancesOutput, SecurityGroup, StateReason, Subnet, Tag,
     TagSpecification,
@@ -915,6 +928,16 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// Monotonic source of the Elastic IP addresses [`Self::mint_elastic_ip`] hands out,
     /// so one allocation can never be given an address another still holds.
     next_elastic_ip: u64,
+    /// Every Dedicated Host the account holds, by `HostId`, as the modelled [`Host`]
+    /// shape itself — so a member a writer sets round-trips through a describe without a
+    /// field-by-field copy that can silently drop one. Ordered by id, which is the order
+    /// the describe operations report and page over.
+    pub dedicated_hosts: BTreeMap<String, Host>,
+    /// An `AllocateHosts` `ClientToken` and the host ids that request minted, so a repeat
+    /// of the same request answers with those hosts instead of allocating more. One token
+    /// names EVERY host of the one allocation, because one call allocates `Quantity` of
+    /// them.
+    pub dedicated_host_client_tokens: HashMap<String, Vec<String>>,
     /// Every connection to one of the account's own VPC endpoint services, by
     /// `VpcEndpointId`, as the modelled [`VpcEndpointConnection`] shape itself — see the
     /// module docs. Ordered by endpoint id, which is the order
@@ -954,6 +977,8 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             fast_launch_images: BTreeMap::new(),
             addresses: BTreeMap::new(),
             next_elastic_ip: 0,
+            dedicated_hosts: BTreeMap::new(),
+            dedicated_host_client_tokens: HashMap::new(),
             vpc_endpoint_connections: BTreeMap::new(),
         };
         let default_vpc = state.insert_vpc(
@@ -4864,6 +4889,33 @@ pub const CAPACITY_BLOCK_ID_PREFIX: &str = "cb";
 /// ([`INVALID_LAUNCH_TEMPLATE_ID_NOT_FOUND`], [`INVALID_SUBNET_ID_NOT_FOUND`]).
 pub const INVALID_CAPACITY_BLOCK_ID_NOT_FOUND: &str = "InvalidCapacityBlockId.NotFound";
 
+/// How many Capacity Blocks this emulator stores before a writer must refuse.
+///
+/// CHOSEN, like [`MAX_STORED_VOLUMES`] and for the same reason: nothing in this emulator
+/// reclaims a stored block, so the store needs a ceiling that is not the process's memory.
+/// A count ceiling is no bound on the caller-chosen bytes each record holds, so those are
+/// charged against [`MAX_STORED_BYTES`] too ([`capacity_block_payload_bytes`]).
+pub const MAX_STORED_CAPACITY_BLOCKS: usize = 4096;
+
+/// The caller-chosen bytes one stored Capacity Block holds: its tags and the Capacity
+/// Reservation ids it holds its capacity as. Everything else on the record — the id, the
+/// zone, the window instants, the state — is derived by this module or bounded by the
+/// model, so it is fixed-size.
+///
+/// The ONE definition of that charge, the way [`host_payload_bytes`] and
+/// [`address_payload_bytes`] are for their own stores:
+/// [`ComAmazonawsEc2Amazonec2State::insert_capacity_block`] charges exactly it, and a
+/// removal path must give back the same number.
+pub fn capacity_block_payload_bytes(block: &CapacityBlock) -> usize {
+    let reservation_bytes: usize = block
+        .capacity_reservation_ids
+        .iter()
+        .flatten()
+        .map(String::len)
+        .sum();
+    tag_list_bytes(block.tags.as_deref().unwrap_or_default()).saturating_add(reservation_bytes)
+}
+
 /// One stored Capacity Block: the modelled [`CapacityBlock`] every operation that reports
 /// one answers with, plus the state a writer pinned it to.
 ///
@@ -4951,11 +5003,23 @@ pub struct CapacityBlockSpec {
 }
 
 impl ComAmazonawsEc2Amazonec2State {
+    /// Whether another `count` Capacity Blocks fit inside the store's ceiling
+    /// ([`MAX_STORED_CAPACITY_BLOCKS`]).
+    ///
+    /// A writer must ask this BEFORE inserting and refuse when it answers `false`, the way
+    /// [`Self::has_vpc_capacity`] and [`Self::has_dedicated_host_capacity`] gate their own
+    /// stores: nothing in this emulator reclaims a stored block, so without a count ceiling
+    /// repeated writes would grow memory without bound.
+    pub fn has_capacity_block_capacity(&self, count: usize) -> bool {
+        self.capacity_blocks.len().saturating_add(count) <= MAX_STORED_CAPACITY_BLOCKS
+    }
+
     /// Store one Capacity Block and answer the `CapacityBlockId` it was given.
     ///
     /// The one place a Capacity Block enters this store, so every writer of one — and
     /// `DescribeCapacityBlocks`, which reports what this wrote — agrees on the id form, the
-    /// stored shape and which members a block carries.
+    /// stored shape and which members a block carries. The caller-chosen bytes the record
+    /// retains are charged here, so no path can store them uncharged.
     pub fn insert_capacity_block(&mut self, spec: CapacityBlockSpec) -> String {
         let capacity_block_id = self.next_id(CAPACITY_BLOCK_ID_PREFIX);
         let block = CapacityBlock {
@@ -4972,6 +5036,7 @@ impl ComAmazonawsEc2Amazonec2State {
             state: None,
             tags: Some(spec.tags),
         };
+        self.add_stored_bytes(capacity_block_payload_bytes(&block));
         self.capacity_blocks.insert(
             capacity_block_id.clone(),
             CapacityBlockRecord {
@@ -5480,6 +5545,258 @@ pub fn address_limit_exceeded<E>(message: impl Into<String>) -> Scaffolded<E> {
 /// one border group.
 pub fn network_border_group_of_region(region: &str) -> String {
     region.to_string()
+}
+
+// ---------------------------------------------------------------------------
+// Dedicated Hosts
+// ---------------------------------------------------------------------------
+
+/// A Dedicated Host that is allocated and can accept launches: `AllocationState`'s
+/// `available` (`smithy_query(query="shape",shape="AllocationState")`).
+pub const HOST_STATE_AVAILABLE: &str = "available";
+
+/// The auto-placement a Dedicated Host gets when the request names none: "Default:
+/// `off`" (`AllocateHostsRequest$AutoPlacement`). A value of the modelled
+/// `AutoPlacement` enum ([`crate::ops::types::AUTO_PLACEMENT_VALUES`]).
+pub const DEFAULT_AUTO_PLACEMENT: &str = "off";
+
+/// The host recovery a Dedicated Host gets when the request names none: "Host recovery is
+/// disabled by default […] Default: `off`" (`AllocateHostsRequest$HostRecovery`). A value
+/// of the modelled `HostRecovery` enum.
+pub const DEFAULT_HOST_RECOVERY: &str = "off";
+
+/// The AMD SEV-SNP setting a Dedicated Host gets when the request's `CpuOptions` names
+/// none: "If you don't specify a value, AMD SEV-SNP is `disabled`"
+/// (`HostCpuOptionsRequest$AmdSevSnp`). A value of the modelled `AmdSevSnp` enum
+/// ([`crate::ops::types::AMD_SEV_SNP_VALUES`]).
+pub const AMD_SEV_SNP_DISABLED: &str = "disabled";
+
+/// A Dedicated Host that supports every instance type of ONE instance family:
+/// "`on`[,] the Dedicated Host supports multiple instance types in the instance family"
+/// (`Host$AllowsMultipleInstanceTypes`), which is the host an `InstanceFamily` request
+/// allocates. A value of the modelled `AllowsMultipleInstanceTypes` enum
+/// ([`crate::ops::types::ALLOWS_MULTIPLE_INSTANCE_TYPES_VALUES`]).
+pub const ALLOWS_MULTIPLE_INSTANCE_TYPES_ON: &str = "on";
+
+/// A Dedicated Host that supports ONE instance type only — "`off`[,] the Dedicated Host
+/// supports a single instance type only" (`Host$AllowsMultipleInstanceTypes`), which is
+/// the host an `InstanceType` request allocates.
+pub const ALLOWS_MULTIPLE_INSTANCE_TYPES_OFF: &str = "off";
+
+/// The one resource type `AllocateHosts`'s `TagSpecifications` can name: "The tags to
+/// apply to the Dedicated Host during creation"
+/// (`AllocateHostsRequest$TagSpecifications`), which is the `dedicated-host` member of the
+/// modelled `ResourceType` enum ([`crate::ops::types::RESOURCE_TYPE_VALUES`]).
+pub const DEDICATED_HOST_TAGGABLE_RESOURCE: &str = "dedicated-host";
+
+/// How many Dedicated Hosts this emulator stores before `AllocateHosts` is refused.
+///
+/// CHOSEN, like [`MAX_STORED_VOLUMES`] and for the same reason: nothing in this emulator
+/// reclaims a stored host, so the store needs a ceiling that is not the process's memory.
+/// It is well above any published per-Region Dedicated Host quota a test would exercise.
+/// A count ceiling is no bound on the caller-chosen bytes each record holds, so those are
+/// charged against [`MAX_STORED_BYTES`] too ([`host_payload_bytes`]).
+pub const MAX_STORED_DEDICATED_HOSTS: usize = 4096;
+
+/// `HostLimitExceeded` (HTTP 400): the allocation would take the account past the number
+/// of Dedicated Hosts it may hold.
+pub const HOST_LIMIT_EXCEEDED: &str = "HostLimitExceeded";
+
+/// `InvalidHostID.NotFound` (HTTP 400): the request named a host id the account holds no
+/// such host for.
+pub const INVALID_HOST_ID_NOT_FOUND: &str = "InvalidHostID.NotFound";
+
+/// `InvalidHostID.Malformed` (HTTP 400): the request named something that is not a host id
+/// at all, so there is nothing to look up.
+pub const INVALID_HOST_ID_MALFORMED: &str = "InvalidHostID.Malformed";
+
+/// The prefix EC2 names its Apple-hardware instance families with: `mac1`, `mac2`,
+/// `mac2-m2pro`. The families themselves are read off the modelled `InstanceType` enum
+/// rather than listed here — see [`is_mac_instance_family`].
+pub const MAC_INSTANCE_FAMILY_PREFIX: &str = "mac";
+
+/// The instance family part of an instance type: `mac2-m2pro` of `mac2-m2pro.metal`, `m5`
+/// of `m5.large` — "The instance family […] For example, `m5`"
+/// (`HostProperties$InstanceFamily`). A value carrying no size is its own family.
+pub fn instance_family_of(instance_type: &str) -> &str {
+    instance_type
+        .split_once('.')
+        .map_or(instance_type, |(family, _size)| family)
+}
+
+/// Whether the model declares `instance_type` at all: it is a value of the `InstanceType`
+/// enum, the catalog [`offered_instance_types`] reports.
+pub fn instance_type_is_modelled(instance_type: &str) -> bool {
+    offered_instance_types().contains(&instance_type)
+}
+
+/// Whether `instance_family` is the family of at least one instance type the model
+/// declares, so that a host allocated for it could ever run an instance.
+pub fn instance_family_is_modelled(instance_family: &str) -> bool {
+    offered_instance_types()
+        .iter()
+        .any(|instance_type| instance_family_of(instance_type) == instance_family)
+}
+
+/// Whether `instance_family` runs macOS, and so whether a Dedicated Host configured for it
+/// is an EC2 Mac Dedicated Host.
+///
+/// EC2 names every Apple-hardware family with the [`MAC_INSTANCE_FAMILY_PREFIX`] and no
+/// other family with it, and the families themselves come from the modelled `InstanceType`
+/// enum — so this is the model's own answer rather than a list maintained here.
+pub fn is_mac_instance_family(instance_family: &str) -> bool {
+    instance_family.starts_with(MAC_INSTANCE_FAMILY_PREFIX)
+        && instance_family_is_modelled(instance_family)
+}
+
+/// The macOS release lines each EC2 Mac instance family's hardware supports, newest first,
+/// as `(instance family, releases)`.
+///
+/// Source: "Amazon EC2 Mac instances" in the Amazon EC2 User Guide, which pairs each Mac
+/// instance type with the macOS releases its hardware runs — `mac1` is the x86 Mac mini
+/// and reaches back to macOS Mojave (10.14), `mac2` the M1 Mac mini, which starts at Big
+/// Sur (11), `mac2-m1ultra` the M1 Ultra Mac Studio, which starts at Monterey (12), and
+/// the M2 families start at Ventura (13). Every Mac family of the modelled `InstanceType`
+/// enum ([`is_mac_instance_family`]) appears exactly once.
+///
+/// Release LINES, not patch versions: which patch is current is Apple's to decide and
+/// changes without any EC2 API call, and this emulator makes no outbound connection to
+/// find out — so a line is the part of "the latest macOS versions that the EC2 Mac
+/// Dedicated Host can launch without being upgraded" (`MacHost$MacOSLatestSupportedVersions`)
+/// that is a stable fact of the host's hardware.
+pub const MAC_OS_SUPPORTED_VERSIONS: [(&str, &[&str]); 5] = [
+    ("mac1", &["15", "14", "13", "12", "11", "10.15", "10.14"]),
+    ("mac2", &["15", "14", "13", "12", "11"]),
+    ("mac2-m1ultra", &["15", "14", "13", "12"]),
+    ("mac2-m2", &["15", "14", "13"]),
+    ("mac2-m2pro", &["15", "14", "13"]),
+];
+
+/// The macOS release lines `instance_family`'s hardware supports, newest first, or `None`
+/// for a family [`MAC_OS_SUPPORTED_VERSIONS`] publishes none for.
+pub fn mac_os_supported_versions(instance_family: &str) -> Option<&'static [&'static str]> {
+    MAC_OS_SUPPORTED_VERSIONS
+        .iter()
+        .find(|(family, _versions)| *family == instance_family)
+        .map(|(_family, versions)| *versions)
+}
+
+/// The instance family a stored host is configured for: the family it was allocated for,
+/// or the family of the one instance type it supports.
+///
+/// A host allocated for an `InstanceFamily` carries that family and no instance type, and
+/// one allocated for an `InstanceType` carries both — "If the host supports multiple
+/// instance types, no `instanceType` is returned" (`HostProperties$InstanceType`) — so the
+/// family is the member every host has.
+pub fn host_instance_family(host: &Host) -> Option<&str> {
+    let properties = host.host_properties.as_ref()?;
+    properties
+        .instance_family
+        .as_deref()
+        .or_else(|| properties.instance_type.as_deref().map(instance_family_of))
+}
+
+/// `host` as the modelled [`MacHost`] shape, or `None` when it is not an EC2 Mac Dedicated
+/// Host at all.
+///
+/// Both members are derived from the stored host rather than stored beside it: the id is
+/// the host's own, and the macOS releases it can launch are a fact of its family's
+/// hardware ([`mac_os_supported_versions`]), so nothing can report one host two ways.
+pub fn mac_host_view(host: &Host) -> Option<MacHost> {
+    let instance_family = host_instance_family(host)?;
+    if !is_mac_instance_family(instance_family) {
+        return None;
+    }
+    Some(MacHost {
+        host_id: host.host_id.clone(),
+        mac_os_latest_supported_versions: mac_os_supported_versions(instance_family).map(
+            |versions| {
+                versions
+                    .iter()
+                    .map(|version| (*version).to_string())
+                    .collect()
+            },
+        ),
+    })
+}
+
+/// The caller-chosen bytes one stored Dedicated Host holds: its tags and the `ClientToken`
+/// the token map keeps for it. Everything else on the record — the id, the zone, the
+/// family, the states, the account — is derived by this module or bounded by the model, so
+/// it is fixed-size.
+///
+/// The ONE definition of that charge: `AllocateHosts` asks it before the write and charges
+/// exactly it, and a removal path must give back the same number.
+pub fn host_payload_bytes(host: &Host) -> usize {
+    tag_list_bytes(host.tags.as_deref().unwrap_or_default())
+        .saturating_add(host.client_token.as_deref().map_or(0, str::len))
+}
+
+/// Whether `id` is a well-formed Dedicated Host id.
+///
+/// A host id is `h-` followed by 8 or 17 lowercase hexadecimal digits — the short and the
+/// long id form, as the model's own `^h-([0-9a-f]{8}|[0-9a-f]{17})$` style id patterns
+/// read. EC2 answers `InvalidHostID.Malformed` for anything else, BEFORE it looks the id
+/// up.
+pub fn host_id_is_well_formed(id: &str) -> bool {
+    let Some(suffix) = id.strip_prefix("h-") else {
+        return false;
+    };
+    matches!(suffix.len(), 8 | 17)
+        && suffix
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Refuse a request that named a host id the account holds no such host for: HTTP 400
+/// `InvalidHostID.NotFound`.
+pub fn invalid_host_id_not_found<E>(host_id: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_HOST_ID_NOT_FOUND,
+        400,
+        format!("The host ID '{host_id}' does not exist"),
+    )
+}
+
+/// Refuse a host id this service cannot resolve: a malformed one is answered as malformed
+/// and a well-formed one as not found — the way the service orders the two, and the same
+/// ordering [`require_known_volume`] keeps.
+pub fn unresolvable_host_id<E>(host_id: &str) -> Scaffolded<E> {
+    if host_id_is_well_formed(host_id) {
+        return invalid_host_id_not_found(host_id);
+    }
+    Scaffolded::service_error(
+        INVALID_HOST_ID_MALFORMED,
+        400,
+        format!("Invalid id: '{host_id}'"),
+    )
+}
+
+/// Refuse an allocation that would take the store past [`MAX_STORED_DEDICATED_HOSTS`] or
+/// its byte budget: HTTP 400 `HostLimitExceeded`, EC2's own Dedicated-Hosts quota code.
+pub fn host_limit_exceeded<E>(message: impl Into<String>) -> Scaffolded<E> {
+    Scaffolded::service_error(HOST_LIMIT_EXCEEDED, 400, message)
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// Whether another `count` Dedicated Hosts fit inside the store's ceiling
+    /// ([`MAX_STORED_DEDICATED_HOSTS`]).
+    ///
+    /// An allocation must ask this BEFORE inserting anything and refuse with
+    /// [`host_limit_exceeded`] when it answers `false`: one call allocates `Quantity`
+    /// hosts, so the whole batch is gated rather than each host as it is written.
+    pub fn has_dedicated_host_capacity(&self, count: usize) -> bool {
+        self.dedicated_hosts.len().saturating_add(count) <= MAX_STORED_DEDICATED_HOSTS
+    }
+
+    /// Store one newly allocated Dedicated Host, charging the caller-chosen bytes it
+    /// holds, and answer its id.
+    pub fn insert_dedicated_host(&mut self, host: Host) -> String {
+        let host_id = host.host_id.clone().unwrap_or_default();
+        self.add_stored_bytes(host_payload_bytes(&host));
+        self.dedicated_hosts.insert(host_id.clone(), host);
+        host_id
+    }
 }
 
 // =============================================================================

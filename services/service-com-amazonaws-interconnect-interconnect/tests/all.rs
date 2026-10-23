@@ -15,5 +15,9 @@
 mod attach_points;
 #[path = "all/connection_lifecycle.rs"]
 mod connection_lifecycle;
+#[path = "all/emulator.rs"]
+mod emulator;
+#[path = "all/refusals_and_gateway_attach_points.rs"]
+mod refusals_and_gateway_attach_points;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

@@ -149,9 +149,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(stored) = store.connections.get_mut(&input.identifier) else {
             return Err(DeleteConnectionErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "no connection with identifier '{}'",
-                        input.identifier
+                    message: Some(crate::state::connection_not_retrievable_message(
+                        &input.identifier,
                     )),
                 },
             )

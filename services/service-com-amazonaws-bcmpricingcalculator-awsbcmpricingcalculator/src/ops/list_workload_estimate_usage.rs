@@ -1,15 +1,27 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListWorkloadEstimateUsage
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListWorkloadEstimateUsage`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the usage lines stored under a workload estimate, in the order they were
+//! created. It reports only stored state, as the model's `@readonly` says; its one write
+//! is materialising what the clock had already made due (an expiry, and the move out of
+//! a workload estimate's transient status), through `crate::state::\
+//! ComAmazonawsBcmpricingcalculatorAwsbcmpricingcalculatorState::settle`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListWorkloadEstimateUsage::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `filters` select on the attribute each `ListUsageFilterName` names (the `HISTORICAL_*`
+//! half reading the line's `historicalUsage`) with the filter's `matchOption`; several
+//! filters are AND-ed and the values of one filter are OR-ed, exactly as
+//! `ListBillScenarioUsageModifications` applies the same `ListUsageFilters` shape.
+//! `maxResults` is the page size — defaulting to this operation's own modelled maximum,
+//! `crate::state::WORKLOAD_ESTIMATE_USAGE_MAX_PAGE_SIZE` — and `nextToken` is emitted
+//! only while items remain. A `workloadEstimateId` no live estimate carries is
+//! `ResourceNotFoundException` (HTTP 404).
+//!
+//! Two limitations worth stating, both of them the price list this emulator does not
+//! carry: a line's `location`, `cost`, `currency` and `status` and its quantity's `unit`
+//! are reported absent rather than invented (as `BatchCreateWorkloadEstimateUsage`
+//! stores them), and a `LOCATION` (or location-less `HISTORICAL_LOCATION`) filter
+//! therefore selects nothing rather than being refused, since the real service does
+//! support it.
 //!
 //! ## Shape of an operation
 //!
@@ -110,6 +122,46 @@ impl From<ListWorkloadEstimateUsageErrorModeled> for ListWorkloadEstimateUsageEr
     }
 }
 
+/// Whether `line` satisfies every `ListUsageFilter` the request carries: several filters
+/// are AND-ed, and `crate::state::matches_filter` OR-s the values of one.
+fn selected(line: &crate::state::WorkloadEstimateUsage, filters: Option<&[ListUsageFilter]>) -> bool {
+    filters
+        .unwrap_or_default()
+        .iter()
+        .all(|filter| match line.filter_value(&filter.name) {
+            Some(candidate) => crate::state::matches_filter(
+                candidate,
+                &filter.values,
+                filter.match_option.as_deref(),
+            ),
+            // The line carries nothing for this attribute, so nothing matches.
+            None => false,
+        })
+}
+
+/// This operation's item for one stored usage line.
+fn item_for(line: &crate::state::WorkloadEstimateUsage) -> WorkloadEstimateUsageItem {
+    WorkloadEstimateUsageItem {
+        id: Some(line.id.clone()),
+        service_code: line.service_code.clone(),
+        usage_type: line.usage_type.clone(),
+        operation: line.operation.clone(),
+        location: line.location.clone(),
+        group: line.group.clone(),
+        usage_account_id: Some(line.usage_account_id.clone()),
+        quantity: Some(line.quantity()),
+        cost: line.cost,
+        // `currency` says which currency a reported `cost` is in, and `status` (a
+        // `WorkloadEstimateCostStatus`) qualifies that same cost, so both are reported
+        // exactly when a cost is. Both come from `crate::state`, which is the rule
+        // `BatchCreateWorkloadEstimateUsage` reports a freshly stored line by too, so the
+        // two readers of one line cannot be told apart.
+        currency: line.cost_currency(),
+        status: line.cost_status(),
+        historical_usage: line.historical_usage.clone(),
+    }
+}
+
 /// The `ListWorkloadEstimateUsage` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -144,20 +196,70 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListWorkloadEstimateUsage` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListWorkloadEstimateUsageErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListWorkloadEstimateUsage"))
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                ListWorkloadEstimateUsageErrorModeled::DataUnavailableException(
+                    DataUnavailableException {
+                        message: "the workload estimate store is unavailable".to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+        let mut state = store.lock();
+        // Materialise what the clock has already made due, so an estimate past its
+        // `expiresAt` reads as gone rather than lingering for the life of the process,
+        // and no reader reports a status the clock has already moved on from.
+        state.settle(crate::state::now_millis());
+
+        let Some(estimate) = state.workload_estimate(&input.workload_estimate_id) else {
+            return Err(
+                ListWorkloadEstimateUsageErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!(
+                            "No workload estimate found with identifier {}",
+                            input.workload_estimate_id
+                        ),
+                        resource_id: input.workload_estimate_id.clone(),
+                        resource_type: crate::state::WORKLOAD_ESTIMATE_RESOURCE_TYPE.to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let matching: Vec<WorkloadEstimateUsageItem> = estimate
+            .usage
+            .iter()
+            .filter(|line| selected(line, input.filters.as_deref()))
+            .map(item_for)
+            .collect();
+
+        // A page token is bound to the selection it was measured against, so an offset
+        // from one estimate or filter set is never applied to another's list.
+        let mut scope_parts: Vec<String> =
+            vec![Self::NAME.to_string(), input.workload_estimate_id.clone()];
+        for filter in input.filters.as_deref().unwrap_or_default() {
+            scope_parts.push(filter.name.clone());
+            scope_parts.push(filter.match_option.clone().unwrap_or_default());
+            scope_parts.extend(filter.values.iter().cloned());
+        }
+        let scope = crate::state::request_fingerprint(&scope_parts);
+
+        let (items, next_token) = crate::state::paginate_sized(
+            &matching,
+            input.next_token.as_deref(),
+            input.max_results,
+            crate::state::WORKLOAD_ESTIMATE_USAGE_MAX_PAGE_SIZE,
+            &scope,
+        )
+        .map_err(crate::scaffolded::Scaffolded::validation)?;
+
+        Ok(ListWorkloadEstimateUsageOutput {
+            items: Some(items),
+            next_token,
+        })
     }
 }

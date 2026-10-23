@@ -1,0 +1,504 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! The identity-based authorization gate this service's server, user, SSH-key and
+//! access-creating operations consult, and the one place an IAM policy document is
+//! evaluated.
+//!
+//! The remaining implemented operations (the connector, profile, workflow, web-app,
+//! host-key and security-policy families) do NOT consult it yet: the gate is one
+//! shared helper and pointing them at it is a mechanical follow-up, so this header
+//! states the scope the code actually has rather than the scope it should grow to.
+//!
+//! Three questions are answered here, all of them from PERSISTED state — the
+//! account's IAM store in the shared engine — and never from the request alone:
+//!
+//! 1. [`explicit_deny`]: does the calling principal's identity policy explicitly
+//!    deny the action this request performs? An explicit `Deny` is the one IAM
+//!    decision that is final whatever else the account holds, so it is the decision
+//!    this emulator can make soundly: the rest of a principal's permission set
+//!    (group policies, permissions boundaries, SCPs) is not modelled by the IAM
+//!    emulator, so an ABSENT `Allow` here is not evidence that the caller lacks the
+//!    permission and is therefore not refused. (The IAM store holds no
+//!    user-attached managed policies at all, so for a user there is no further
+//!    document to read; a ROLE's attachments are read, in `invocation_role_can_invoke`.)
+//! 2. [`invocation_role_can_invoke`]: can the role an `API_GATEWAY` identity
+//!    provider names invoke the API it names? That is the precondition
+//!    `CreateServer` verifies synchronously.
+//! 3. [`cross_account_role`]: does a role ARN the request asks this service to pass
+//!    belong to another account? Passing a role across accounts is refused.
+//!
+//! Nothing here reaches outside the emulator: the policies evaluated are the ones
+//! the account's own IAM emulator persisted (`PutUserPolicy`, `PutRolePolicy`,
+//! `AttachRolePolicy`), and the decision is recomputed per request, so revoking a
+//! policy changes the next answer.
+//!
+//! This module lives beside this service's state because that is where a service
+//! crate may add code, and it holds only the IAM-STORE LOOKUPS that are specific to
+//! this gate: which documents are in force on the caller, and which on an invocation
+//! role. The DECISION those documents imply is not made here — it is
+//! [`::service_common::iam_authorization`], the one shared evaluation of IAM policy
+//! documents against `(action, resource)`, so this service and every other one handed
+//! the same documents answer alike (CloudWatch RUM's gate consumes the same module).
+//! That is also where IAM's reading of a `Condition` this emulator cannot decide
+//! lives: such a statement never grants and still refuses.
+
+use ::service_common::iam_authorization::{self as iam_policy, Decision};
+
+use service_com_amazonaws_iam_awsidentitymanagementv20100508::state as iam;
+
+/// This service's IAM action prefix: an action is `transfer:<OperationName>`
+/// ("Actions defined by Amazon Transfer Family", IAM Service Authorization
+/// Reference).
+pub const ACTION_PREFIX: &str = "transfer";
+
+/// The action an `API_GATEWAY` identity provider's `InvocationRole` has to be
+/// allowed to perform on the API: `IdentityProviderDetails$InvocationRole` is "the
+/// type of `InvocationRole` used to authenticate the user account", and an API
+/// Gateway REST endpoint is invoked with `execute-api:Invoke`.
+const EXECUTE_API_INVOKE: &str = "execute-api:Invoke";
+
+/// The `Resource` a request that addresses NO nameable ARN is decided against.
+///
+/// A listing, and a create whose identifier this service mints, name no resource to
+/// compare a statement's `Resource` against. The empty value is what expresses that
+/// in the shared evaluator's terms: IAM's wildcard matching lets only a pattern that
+/// covers every resource (`"*"`) match it, so a narrower statement — one scoped to a
+/// server or a user — cannot decide such a request, while a statement that states its
+/// resources as `NotResource` still covers it.
+const NO_RESOURCE: &str = "";
+
+/// The account's IAM store in the shared engine.
+///
+/// The IAM service's OWN accessor is called rather than copied, so this gate reads
+/// the exact store IAM's handlers write. `None` when the emulator is not the
+/// in-memory engine, which is EVIDENCE OF NOTHING, and so refuses nothing in either
+/// caller: [`explicit_deny`] finds no stored deny, and
+/// [`invocation_role_can_invoke`] cannot show the role unable to invoke.
+fn iam_state<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+) -> Option<::engine::ServiceState<iam::ComAmazonawsIamAwsidentitymanagementv20100508State>> {
+    iam::service_state(engine)
+}
+
+/// The refusal text IAM states an explicit-deny decision with: who was refused,
+/// which action, and that the refusal came from an explicit deny in an
+/// identity-based policy. Every value in it comes from the request and the stored
+/// policy, not from a recording.
+fn not_authorized(principal: &str, action: &str) -> String {
+    format!(
+        "User: {principal} is not authorized to perform: {action} \
+         with an explicit deny in an identity-based policy"
+    )
+}
+
+/// The refusal text for a role ARN in another account, as the service states it.
+pub const CROSS_ACCOUNT_PASS_ROLE: &str = "Cross-account pass role is not allowed.";
+
+/// `Some(message)` when the caller's identity policy explicitly denies
+/// `transfer:<operation>` on `resource` — the message a modelled
+/// `AccessDeniedException` carries — and `None` when no stored policy denies it.
+///
+/// `resource` is the ARN the request addresses — including the ARN of a resource the
+/// request would CREATE, when the request itself names it (a user is addressed by
+/// its server and name, so `CreateUser` passes it) — or `None` for a request that
+/// addresses no nameable resource: a listing, and a create whose identifier this
+/// service mints (`CreateServer`). See [`NO_RESOURCE`] for what `None` means to the
+/// shared evaluator.
+pub fn explicit_deny<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    parts: &::http::request::Parts,
+    operation: &str,
+    resource: Option<&str>,
+) -> Option<String> {
+    let action = format!("{ACTION_PREFIX}:{operation}");
+    let state = iam_state(engine)?;
+    let guard = state.lock();
+    // The calling principal is the one that signed: the access key id in the
+    // SigV4 credential, resolved through the keys IAM minted. A key IAM never
+    // minted belongs to no IAM user — the emulator's own root credential, say —
+    // and the account root is subject to no identity policy.
+    let record = guard.access_keys.get(&::engine::extract_akid(&parts.headers))?;
+    let principal = guard
+        .users
+        .get(&record.user_key)
+        .map(|user| user.arn.clone())
+        .unwrap_or_else(|| record.user_key.clone());
+    // The documents in force on the caller: its inline policies. The IAM store holds
+    // no user-attached managed policies at all (it has `user_inline_policies` and
+    // `role_attached_policies`), so there is no further document to read for a user.
+    let documents: Vec<String> = guard
+        .user_inline_policies
+        .get(&record.user_key)
+        .into_iter()
+        .flat_map(|policies| policies.values())
+        .map(|policy| policy.policy_document.clone())
+        .collect();
+    let request = iam_policy::Request::new(&action, resource.unwrap_or(NO_RESOURCE), &[]);
+    (iam_policy::identity_decision(&documents, &request) == Decision::Denied)
+        .then(|| not_authorized(&principal, &action))
+}
+
+/// Whether the role `role_arn` names can invoke the API `url` names, according to
+/// the role's own stored identity policies.
+///
+/// IAM's deny-overrides rule decides: an explicit `Deny` of the invoke in any of the
+/// role's readable policies means it cannot invoke, whatever else allows it, and
+/// otherwise an `Allow` that covers the API is what makes the verification succeed.
+/// A policy attached to the role that this account's store does not hold — an
+/// AWS-managed one, which AWS owns — can neither be read nor be ruled out, and this
+/// service refuses only what it can SHOW to be unverifiable, so such a role passes.
+///
+/// A role this account does not hold cannot invoke anything, so an ARN naming no
+/// stored role answers `false`: the verification FAILED, which is the same answer
+/// the real service gives for a role it cannot assume or that cannot reach the API.
+/// A store that cannot be read at all, by contrast, shows nothing and refuses
+/// nothing.
+/// A `url` that names no API Gateway invoke endpoint leaves no API ARN to compare, so
+/// only a policy covering every resource can verify such a provider.
+pub fn invocation_role_can_invoke<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    role_arn: &str,
+    url: Option<&str>,
+) -> bool {
+    if cross_account_role(role_arn) {
+        return false;
+    }
+    // No store to read is EVIDENCE OF NOTHING, exactly like an attached policy this
+    // account does not own (see `undecidable` below): it cannot show the role unable
+    // to invoke, so it does not refuse. This is the same reading `explicit_deny`
+    // takes of a missing store.
+    let Some(state) = iam_state(engine) else {
+        return true;
+    };
+    let Some(role_key) = role_name(role_arn).map(iam::name_key) else {
+        return false;
+    };
+    let guard = state.lock();
+    if !guard.roles.contains_key(&role_key) {
+        return false;
+    }
+    // The API the URL names, as an `execute-api` ARN, so a policy scoped to one
+    // API is honoured; `None` when the URL names no API Gateway endpoint, which
+    // leaves only a statement covering every resource able to allow the invoke.
+    let api = url.and_then(execute_api_arn);
+    let inline = guard
+        .role_inline_policies
+        .get(&role_key)
+        .into_iter()
+        .flat_map(|policies| policies.values())
+        .map(|policy| policy.policy_document.clone());
+    // The policies attached to the role, and whether ANY of them is one this account
+    // does not own: an AWS-MANAGED policy, whose document AWS holds rather than this
+    // account (`AmazonAPIGatewayInvokeFullAccess` is AWS's), so it can neither be read
+    // nor be ruled out and is evidence of nothing. An attachment naming a
+    // CUSTOMER-managed policy the account does not hold is not that case — the account
+    // IS the authority on its own policies, so such an attachment grants nothing —
+    // which is the same reading CloudWatch RUM's gate takes of the same store.
+    let mut undecidable = false;
+    let mut documents: Vec<String> = inline.collect();
+    for arn in guard
+        .role_attached_policies
+        .get(&role_key)
+        .into_iter()
+        .flatten()
+    {
+        match default_policy_document(&guard, arn) {
+            Some(document) => documents.push(document),
+            None if is_aws_managed_policy(arn) => undecidable = true,
+            None => {}
+        }
+    }
+
+    // The decision those documents imply, from the ONE shared evaluator: a `Deny`
+    // about this invoke wins over every `Allow`, an `Allow` that covers the API is
+    // what verifies the role, and documents that say neither decide nothing.
+    let request = iam_policy::Request::new(
+        EXECUTE_API_INVOKE,
+        api.as_deref().unwrap_or(NO_RESOURCE),
+        &[],
+    );
+    match iam_policy::identity_decision(&documents, &request) {
+        Decision::Denied => false,
+        Decision::Allowed => true,
+        // An AWS-managed policy attached to the role might be the one that allows the
+        // invoke, and this service refuses only what it can SHOW to be unverifiable —
+        // the same principle `explicit_deny` applies to a permission set this emulator
+        // does not model in full.
+        Decision::NotStated => undecidable,
+    }
+}
+
+/// The vendor field of an ARN that names an IAM resource, and the resource type of
+/// one that names a role: `arn:<partition>:iam::<account>:role/<path>/<name>`.
+const IAM_VENDOR: &str = "iam";
+const ROLE_RESOURCE_TYPE: &str = "role";
+
+/// Whether `role_arn` names a role in an account other than this one.
+///
+/// The ARN's fields are read through the ONE shared parse
+/// ([`service_common::arn::parse`]) rather than split again here. An ARN whose
+/// account field is empty names no account to compare, so it is not a cross-account
+/// ARN, and neither is a value that is no ARN at all — that shape is already refused
+/// by the member's modelled pattern.
+pub fn cross_account_role(role_arn: &str) -> bool {
+    ::service_common::arn::parse(role_arn)
+        .map(|arn| arn.account)
+        .filter(|account| !account.is_empty())
+        .is_some_and(|account| account != ::engine::emulator_account_id())
+}
+
+/// The role name an IAM role ARN names: the last segment of the resource field of
+/// `arn:<partition>:iam::<account>:role/<path>/<name>`.
+///
+/// `None` for a value that is not a well-formed ARN, that names another vendor's
+/// resource, or whose resource field is not a `role/…` — none of those names a role
+/// this account's IAM store could hold.
+fn role_name(role_arn: &str) -> Option<&str> {
+    let arn = ::service_common::arn::parse(role_arn)?;
+    if arn.vendor != IAM_VENDOR || arn.resource_type() != ROLE_RESOURCE_TYPE {
+        return None;
+    }
+    let (_, path_and_name) = arn.resource.split_once('/')?;
+    path_and_name
+        .rsplit('/')
+        .next()
+        .filter(|name| !name.is_empty())
+}
+
+/// Whether `arn` names an AWS-MANAGED policy: one whose account segment is IAM's own
+/// `aws`, so AWS owns the document and this account's store holds none for it. Read
+/// through IAM's OWN ARN parser and its own constant, so this service and IAM agree
+/// on what an AWS-managed policy ARN is.
+fn is_aws_managed_policy(arn: &str) -> bool {
+    iam::parse_policy_arn(arn).is_some_and(|policy| policy.account == iam::AWS_MANAGED_POLICY_ACCOUNT)
+}
+
+/// The default version's document of the managed policy `arn` names, or `None` when
+/// the account holds no such policy or no document for its default version.
+///
+/// The version is the one `Policy$DefaultVersionId` names, falling back to the version
+/// that carries `PolicyVersion$IsDefaultVersion` — the two spellings of "the version in
+/// force" the IAM store can hold.
+fn default_policy_document(
+    iam_state: &iam::ComAmazonawsIamAwsidentitymanagementv20100508State,
+    arn: &str,
+) -> Option<String> {
+    let managed = iam_state.policy_by_arn(arn)?;
+    managed
+        .policy
+        .default_version_id
+        .as_deref()
+        .and_then(|default| managed.versions.get(default))
+        .or_else(|| {
+            managed
+                .versions
+                .values()
+                .find(|version| version.is_default_version)
+        })
+        .and_then(|version| version.document.clone())
+}
+
+/// The `execute-api` ARN of the API an API Gateway invoke URL addresses.
+///
+/// An invoke endpoint is `https://<api-id>.execute-api.<region>.amazonaws.com/<stage>`,
+/// and the resource a policy names for it is
+/// `arn:aws:execute-api:<region>:<account>:<api-id>/<stage>/*`. `None` for a URL
+/// that is not an invoke endpoint, so nothing is derived from a URL that names no
+/// API.
+fn execute_api_arn(url: &str) -> Option<String> {
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))?;
+    let (host, path) = rest.split_once('/').unwrap_or((rest, ""));
+    let (api_id, domain) = host.split_once('.')?;
+    let mut labels = domain.split('.');
+    if labels.next()? != "execute-api" {
+        return None;
+    }
+    let region = labels.next()?;
+    let stage = path.split('/').find(|segment| !segment.is_empty())?;
+    Some(::engine::emulator_arn(
+        "execute-api",
+        region,
+        &format!("{api_id}/{stage}/*"),
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// What one stored document says about `action` on `resource`, through the shared
+    /// evaluator this gate consults — the decision both public functions above read.
+    fn decision(document: &str, action: &str, resource: Option<&str>) -> Decision {
+        iam_policy::identity_decision(
+            &[document.to_string()],
+            &iam_policy::Request::new(action, resource.unwrap_or(NO_RESOURCE), &[]),
+        )
+    }
+
+    /// Whether one stored document explicitly denies `action` on `resource` — the
+    /// question [`explicit_deny`] asks of the caller's policies.
+    fn denies(document: &str, action: &str, resource: Option<&str>) -> bool {
+        decision(document, action, resource) == Decision::Denied
+    }
+
+    const DENY_CREATE_SERVER: &str = r#"{
+        "Version": "2012-10-17",
+        "Statement": [
+            {"Effect": "Allow", "Action": "transfer:*", "Resource": "*"},
+            {"Effect": "Deny", "Action": "transfer:CreateServer", "Resource": "*"}
+        ]
+    }"#;
+
+    #[test]
+    fn an_explicit_deny_is_found_for_the_action_it_names_only() {
+        assert!(
+            denies(DENY_CREATE_SERVER, "transfer:CreateServer", None),
+            "the denied action must be found"
+        );
+        assert!(
+            !denies(DENY_CREATE_SERVER, "transfer:CreateUser", None),
+            "an action the deny does not name must not be denied"
+        );
+        assert_eq!(
+            decision(DENY_CREATE_SERVER, "transfer:CreateUser", None),
+            Decision::Allowed,
+            "the allow the document also states must still be read"
+        );
+    }
+
+    #[test]
+    fn a_wildcard_action_matches_case_insensitively() {
+        let document = r#"{"Statement": {"Effect": "Deny", "Action": "TRANSFER:Create*", "Resource": "*"}}"#;
+        assert!(
+            denies(document, "transfer:CreateUser", None),
+            "a wildcard action must match case-insensitively"
+        );
+    }
+
+    #[test]
+    fn a_statement_whose_condition_cannot_be_decided_still_refuses() {
+        // The shared evaluator's fail-closed reading, which this gate inherits: a
+        // `Deny` whose condition MAY hold is never weakened into permission, while an
+        // `Allow` whose condition may not hold is no grant.
+        let denied = r#"{"Statement": [{"Effect": "Deny", "Action": "transfer:*",
+            "Resource": "*", "Condition": {"Bool": {"aws:SecureTransport": "false"}}}]}"#;
+        assert!(
+            denies(denied, "transfer:CreateServer", None),
+            "a deny this emulator cannot decide must still refuse"
+        );
+        let allowed = r#"{"Statement": [{"Effect": "Allow", "Action": "transfer:*",
+            "Resource": "*", "Condition": {"Bool": {"aws:SecureTransport": "false"}}}]}"#;
+        assert_eq!(
+            decision(allowed, "transfer:CreateServer", None),
+            Decision::NotStated,
+            "an allow this emulator cannot decide must not grant"
+        );
+    }
+
+    #[test]
+    fn a_malformed_document_denies_nothing() {
+        assert!(
+            !denies("{not json", "transfer:CreateServer", None),
+            "a document that does not parse carries no statement"
+        );
+    }
+
+    #[test]
+    fn a_resource_scoped_deny_does_not_cover_an_unnamed_resource() {
+        let document = r#"{"Statement": {"Effect": "Deny", "Action": "transfer:DeleteServer",
+            "Resource": "arn:aws:transfer:us-east-1:000000000000:server/s-1"}}"#;
+        assert!(
+            denies(
+                document,
+                "transfer:DeleteServer",
+                Some("arn:aws:transfer:us-east-1:000000000000:server/s-1"),
+            ),
+            "the named resource must be denied"
+        );
+        assert!(
+            !denies(
+                document,
+                "transfer:DeleteServer",
+                Some("arn:aws:transfer:us-east-1:000000000000:server/s-2"),
+            ),
+            "another resource must not be denied"
+        );
+        assert!(
+            !denies(document, "transfer:DeleteServer", None),
+            "a request that names no resource must not be covered by it"
+        );
+    }
+
+    #[test]
+    fn an_invoke_url_resolves_to_the_apis_execute_api_arn() {
+        assert_eq!(
+            execute_api_arn("https://abc123.execute-api.us-east-1.amazonaws.com/prod"),
+            Some("arn:aws:execute-api:us-east-1:000000000000:abc123/prod/*".to_string()),
+            "the invoke endpoint names the API, the region and the stage"
+        );
+        assert_eq!(
+            execute_api_arn("https://example.invalid/auth"),
+            None,
+            "a URL that is not an invoke endpoint names no API"
+        );
+    }
+
+    #[test]
+    fn a_role_arn_in_another_account_is_cross_account() {
+        assert!(
+            cross_account_role("arn:aws:iam::111122223333:role/idp"),
+            "another account's role is cross-account"
+        );
+        assert!(
+            !cross_account_role("arn:aws:iam::000000000000:role/idp"),
+            "this account's role is not cross-account"
+        );
+        assert!(
+            !cross_account_role("not-an-arn-at-all"),
+            "a value that is no ARN names no account to compare"
+        );
+    }
+
+    #[test]
+    fn the_role_name_is_the_last_segment_of_the_arn() {
+        // (case, value, the role it names)
+        let rows: &[(&str, &str, Option<&str>)] = &[
+            (
+                "a path'd role ARN names the role by its last segment",
+                "arn:aws:iam::000000000000:role/service-role/transfer-idp",
+                Some("transfer-idp"),
+            ),
+            (
+                "a role ARN with no path",
+                "arn:aws:iam::000000000000:role/transfer-idp",
+                Some("transfer-idp"),
+            ),
+            (
+                "another vendor's resource names no IAM role",
+                "arn:aws:transfer:us-east-1:000000000000:role/transfer-idp",
+                None,
+            ),
+            (
+                "an IAM resource that is not a role",
+                "arn:aws:iam::000000000000:user/transfer-idp",
+                None,
+            ),
+            (
+                "a resource field that is the bare type",
+                "arn:aws:iam::000000000000:role",
+                None,
+            ),
+            ("a value that is no ARN", "transfer-idp", None),
+        ];
+        for (case, value, expected) in rows {
+            assert_eq!(
+                role_name(value),
+                *expected,
+                "case {case:?}: expected {expected:?}, got {:?}",
+                role_name(value)
+            );
+        }
+    }
+}

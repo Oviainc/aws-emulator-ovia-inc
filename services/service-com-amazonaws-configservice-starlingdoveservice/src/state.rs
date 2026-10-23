@@ -23,7 +23,8 @@ use crate::ops::types::{
     EvaluationModeConfiguration, ExclusionByResourceTypes,
     ExecutionControls, OrganizationAggregationSource, PendingAggregationRequest, RecordingGroup,
     RecordingMode, RecordingStrategy, RemediationConfiguration, RemediationParameterValue,
-    ResourceIdentifier, RetentionConfiguration, Scope, Source, Tag,
+    ResourceDetails, ResourceEvaluation, ResourceIdentifier, RetentionConfiguration, Scope, Source,
+    Tag,
 };
 
 /// The ARN namespace of this service (`awsService.arnNamespace` in the model), used
@@ -58,6 +59,13 @@ pub const CONFIG_RULE_STATE_ACTIVE: &str = "ACTIVE";
 /// The default `EvaluationModes` entry for a new rule (`ConfigRule$EvaluationModes`:
 /// "By default, the value is Detective evaluation mode only").
 pub const EVALUATION_MODE_DETECTIVE: &str = "DETECTIVE";
+
+/// The other `EvaluationMode` value (`com.amazonaws.configservice#EvaluationMode`),
+/// and the ONLY one the resource-evaluation path accepts
+/// (`StartResourceEvaluationRequest$EvaluationMode`: "The only valid value for this
+/// API is PROACTIVE"; `ResourceEvaluationFilters$EvaluationMode`: "Currently,
+/// DECTECTIVE is not supported as a valid value").
+pub const EVALUATION_MODE_PROACTIVE: &str = "PROACTIVE";
 
 /// `RecordingStrategyType` value the default recording group uses
 /// (`com.amazonaws.configservice#RecordingStrategyType`).
@@ -131,6 +139,11 @@ pub const COMPLIANCE_RESOURCE_CAP: i32 = 100;
 
 /// `Owner` value for a Custom Policy rule (`com.amazonaws.configservice#Owner`).
 pub const OWNER_CUSTOM_POLICY: &str = "CUSTOM_POLICY";
+
+/// The only `ResourceConfigurationSchemaType` the model publishes
+/// (`com.amazonaws.configservice#ResourceConfigurationSchemaType`), and so the schema
+/// type a resource definition is read as when the request names none.
+pub const RESOURCE_CONFIGURATION_SCHEMA_TYPE_CFN: &str = "CFN_RESOURCE_SCHEMA";
 
 /// `Owner` value for a Custom Lambda rule, whose evaluation Config performs by
 /// invoking the caller's Lambda function (`com.amazonaws.configservice#Owner`).
@@ -243,6 +256,32 @@ pub const AGGREGATION_AUTHORIZATIONS_QUOTA: usize = 5_000;
 /// it matches the `ConfigRuleNames` length maximum (0..25) the same operation
 /// declares.
 pub const DESCRIBE_CONFIG_RULES_PAGE_SIZE: usize = 25;
+
+/// The timeout an evaluation runs under when the request asks for none
+/// (`StartResourceEvaluationRequest$EvaluationTimeout`: "The timeout for an
+/// evaluation. The default is 900 seconds. ... If you specify 0, Config uses the
+/// default").
+pub const DEFAULT_EVALUATION_TIMEOUT_SECONDS: i32 = 900;
+
+/// How many resource evaluations one `ListResourceEvaluations` page carries when the
+/// request asks for no `Limit` (`ListResourceEvaluationsRequest$Limit`: "The maximum
+/// number of evaluations returned on each page. The default is 10. ... If you specify
+/// 0, Config uses the default").
+pub const LIST_RESOURCE_EVALUATIONS_DEFAULT_LIMIT: usize = 10;
+
+/// The most resource evaluations this store keeps.
+///
+/// Config publishes no quota for started resource evaluations and
+/// `StartResourceEvaluation` models no limit error, so this bound is this emulator's
+/// and is CHOSEN: every record retains the caller's `ResourceDetails`, whose
+/// `ResourceConfiguration` the model bounds at 51200 characters, and no operation of
+/// this service deletes a resource evaluation, so the store is capped to keep this
+/// process's memory bounded however many evaluations are started. Starting one past
+/// the bound drops the OLDEST evaluation (and the client token that started it)
+/// rather than refusing an evaluation AWS accepts, so the list path keeps reporting
+/// the most recent evaluations and nothing grows without end. See
+/// [`ComAmazonawsConfigserviceStarlingdoveserviceState::record_resource_evaluation`].
+pub const RESOURCE_EVALUATIONS_KEPT: usize = 1_000;
 
 /// How many rule evaluation statuses one `DescribeConfigRuleEvaluationStatus` page
 /// carries when the request does not ask for a number of its own.
@@ -1168,6 +1207,81 @@ impl ConfigurationAggregatorEntry {
     }
 }
 
+/// The key one resource evaluation is listed at: the instant its execution started,
+/// MOST RECENT FIRST, with the id breaking ties so the ordering is total and one page
+/// token names exactly one evaluation.
+pub type ResourceEvaluationPageKey = (::std::cmp::Reverse<i128>, String);
+
+/// One resource evaluation `StartResourceEvaluation` started.
+///
+/// The evaluation's OUTCOME is not part of this record: deciding whether the resource
+/// details comply means running every proactive Config rule against them, which this
+/// emulator has no rule engine for — the same reason
+/// [`ConfigRuleEntry::resource_compliance`] stays empty and
+/// `GetResourceEvaluationSummary` is still scaffolded. What is persisted is what the
+/// control plane owns and what the list path reports: the id Config minted, the mode
+/// the evaluation runs in, when its execution started, the deployment context it
+/// belongs to, the resource details it was handed and the timeout it runs under.
+#[derive(Debug, Clone)]
+pub struct ResourceEvaluationEntry {
+    /// The `ResourceEvaluationId` Config minted for this execution.
+    pub id: String,
+    pub evaluation_mode: String,
+    pub started_at: SystemTime,
+    /// The `EvaluationContext$EvaluationContextIdentifier` the request carried, which
+    /// is what `ResourceEvaluationFilters$EvaluationContextIdentifier` filters on.
+    pub evaluation_context_identifier: Option<String>,
+    pub resource_details: ResourceDetails,
+    pub evaluation_timeout_seconds: i32,
+    /// The `ClientToken` this evaluation was started with, if any; the token index
+    /// ([`ComAmazonawsConfigserviceStarlingdoveserviceState::resource_evaluation_tokens`])
+    /// points back at this entry.
+    pub client_token: Option<String>,
+}
+
+impl ResourceEvaluationEntry {
+    /// The modelled `ResourceEvaluation`, read back out of state.
+    pub fn to_shape(&self) -> ResourceEvaluation {
+        ResourceEvaluation {
+            resource_evaluation_id: Some(self.id.clone()),
+            evaluation_mode: Some(self.evaluation_mode.clone()),
+            evaluation_start_timestamp: Some(timestamp(self.started_at)),
+        }
+    }
+
+    /// The instant this evaluation's execution started, as nanoseconds since the Unix
+    /// epoch.
+    pub fn started_at_nanos(&self) -> i128 {
+        epoch_nanos(timestamp(self.started_at))
+    }
+
+    /// See [`ResourceEvaluationPageKey`].
+    pub fn page_key(&self) -> ResourceEvaluationPageKey {
+        (::std::cmp::Reverse(self.started_at_nanos()), self.id.clone())
+    }
+
+    /// Whether this evaluation was started with exactly the parameters `other` carries
+    /// — what decides between a retry carrying the same `ClientToken` succeeding
+    /// idempotently and `IdempotentParameterMismatch`.
+    pub fn started_with(
+        &self,
+        evaluation_mode: &str,
+        resource_details: &ResourceDetails,
+        evaluation_context_identifier: Option<&str>,
+        evaluation_timeout_seconds: i32,
+    ) -> bool {
+        let details = &self.resource_details;
+        self.evaluation_mode == evaluation_mode
+            && self.evaluation_timeout_seconds == evaluation_timeout_seconds
+            && self.evaluation_context_identifier.as_deref() == evaluation_context_identifier
+            && details.resource_id == resource_details.resource_id
+            && details.resource_type == resource_details.resource_type
+            && details.resource_configuration == resource_details.resource_configuration
+            && details.resource_configuration_schema_type
+                == resource_details.resource_configuration_schema_type
+    }
+}
+
 /// One persisted aggregation authorization.
 ///
 /// An authorization is identified by the PAIR it authorizes — the aggregator account
@@ -1226,6 +1340,26 @@ pub struct ComAmazonawsConfigserviceStarlingdoveserviceState {
     /// Source of the next configuration recorder id, so every recorder Config
     /// creates here gets a distinct one.
     pub next_recorder_seq: u64,
+    /// Resource evaluations started by `StartResourceEvaluation`, keyed by
+    /// `ResourceEvaluationId`. A `BTreeMap` so the store's iteration order is stable;
+    /// `ListResourceEvaluations` reports them in [`ResourceEvaluationPageKey`] order.
+    ///
+    /// BOUNDED at [`RESOURCE_EVALUATIONS_KEPT`] entries: write it through
+    /// [`Self::record_resource_evaluation`], which drops the oldest evaluation past
+    /// that bound, so repeated starts cannot grow this process's state without end.
+    pub resource_evaluations: BTreeMap<String, ResourceEvaluationEntry>,
+    /// The `ResourceEvaluationId` each `ClientToken` already started an evaluation
+    /// for, so a retry with the same token is idempotent rather than a second
+    /// execution.
+    ///
+    /// Holds at most one entry per evaluation in [`Self::resource_evaluations`], so it
+    /// is bounded by the same [`RESOURCE_EVALUATIONS_KEPT`]: dropping an evaluation
+    /// drops the token that started it, and a caller varying only the token cannot
+    /// grow this index on its own.
+    pub resource_evaluation_tokens: HashMap<String, String>,
+    /// Source of the next `ResourceEvaluationId`, so every evaluation gets a distinct
+    /// one.
+    pub next_resource_evaluation_seq: u64,
     /// The resources Config has discovered in this account and Region, keyed by
     /// `(resourceType, resourceId)` — the pair that identifies a resource in Config,
     /// which is why a resource read takes both. A `BTreeMap` so a discovered-resource
@@ -1268,6 +1402,44 @@ pub struct ComAmazonawsConfigserviceStarlingdoveserviceState {
 }
 
 impl ComAmazonawsConfigserviceStarlingdoveserviceState {
+    /// Record `entry` as a started resource evaluation, with the `ClientToken` that
+    /// started it indexed back to it.
+    ///
+    /// This is the ONE place [`Self::resource_evaluations`] and
+    /// [`Self::resource_evaluation_tokens`] are written, so the two cannot drift: past
+    /// [`RESOURCE_EVALUATIONS_KEPT`] entries it drops the OLDEST evaluation together
+    /// with the token that started it, keeping both stores bounded whatever a caller
+    /// does.
+    pub fn record_resource_evaluation(&mut self, entry: ResourceEvaluationEntry) {
+        if let Some(token) = entry.client_token.clone() {
+            self.resource_evaluation_tokens
+                .insert(token, entry.id.clone());
+        }
+        self.resource_evaluations.insert(entry.id.clone(), entry);
+
+        while self.resource_evaluations.len() > RESOURCE_EVALUATIONS_KEPT {
+            // One insert can take the store at most one entry past the bound, so this
+            // runs once; it is a loop so the bound holds however the store was filled.
+            // The oldest execution, by the instant it started and then by id so the
+            // choice is deterministic when two started in the same instant.
+            let oldest = self
+                .resource_evaluations
+                .values()
+                .min_by(|left, right| {
+                    (left.started_at_nanos(), left.id.as_str())
+                        .cmp(&(right.started_at_nanos(), right.id.as_str()))
+                })
+                .map(|entry| (entry.id.clone(), entry.client_token.clone()));
+            let Some((id, client_token)) = oldest else {
+                break;
+            };
+            self.resource_evaluations.remove(&id);
+            if let Some(token) = client_token {
+                self.resource_evaluation_tokens.remove(&token);
+            }
+        }
+    }
+
     /// The configuration recorder that is RECORDING right now, if any: Config
     /// discovers resources only while a recorder is turned on.
     pub fn recording_recorder(&self) -> Option<&RecorderEntry> {
@@ -1793,6 +1965,46 @@ pub fn decode_page_token(token: &str) -> Option<String> {
     String::from_utf8(bytes).ok()
 }
 
+/// The `ResourceEvaluationId` Config assigns the `seq`-th resource evaluation started
+/// in this emulator.
+///
+/// The model gives `ResourceEvaluationId` no pattern (only a 1..128 length), so the id
+/// takes the opaque sixteen-base-36-character form this service already mints ids in
+/// (see [`mint_recorder_id`]). [`splitmix64`] is a bijection on `u64`, so distinct
+/// sequence numbers give distinct ids; it spreads the digits so a caller cannot read a
+/// start order out of an id.
+pub fn mint_resource_evaluation_id(seq: u64) -> String {
+    // A different mixing input from `mint_recorder_id`'s, so the n-th evaluation and
+    // the n-th recorder do not carry the same opaque id.
+    base36(splitmix64(seq ^ 0x5265_736f_7572_6345), 16)
+}
+
+/// `at` as nanoseconds since the Unix epoch: one totally ordered integer for an
+/// instant, so a time-window filter and a page ordering compare instants the same way,
+/// at the full resolution a modelled timestamp carries.
+pub fn epoch_nanos(at: ::aws_smithy_types::DateTime) -> i128 {
+    i128::from(at.secs()) * 1_000_000_000 + i128::from(at.subsec_nanos())
+}
+
+/// Encode the [`ResourceEvaluationPageKey`] a `ListResourceEvaluations` page should
+/// resume at as an opaque `NextToken`.
+pub fn encode_resource_evaluation_token(resume_at: &ResourceEvaluationPageKey) -> String {
+    encode_page_token(&format!("{}:{}", resume_at.0 .0, resume_at.1))
+}
+
+/// The [`ResourceEvaluationPageKey`] a `NextToken` resumes at, or `None` when the
+/// token is malformed — i.e. not something [`encode_resource_evaluation_token`]
+/// produced.
+pub fn decode_resource_evaluation_token(token: &str) -> Option<ResourceEvaluationPageKey> {
+    let decoded = decode_page_token(token)?;
+    let (nanos, id) = decoded.split_once(':')?;
+    let nanos: i128 = nanos.parse().ok()?;
+    if id.is_empty() {
+        return None;
+    }
+    Some((::std::cmp::Reverse(nanos), id.to_string()))
+}
+
 /// How Config words `NoAvailableConfigurationRecorderException` on an operation for
 /// which no per-operation text is known: a paraphrase of the shape's own doc ("There
 /// are no customer managed configuration recorders available to record your
@@ -1848,6 +2060,21 @@ pub fn no_such_config_rule_message(name: &str) -> String {
     format!(
         "The ConfigRule '{name}' provided in the request is invalid. Please check the \
          configRule name."
+    )
+}
+
+/// How the resource-evaluation path words `InvalidParameterValueException` for a
+/// request that asked for an `EvaluationMode` it does not accept.
+///
+/// The message is BUILT FROM THE REQUEST — it names the mode the caller asked for and
+/// the modes this path supports (`PROACTIVE` alone, per
+/// `StartResourceEvaluationRequest$EvaluationMode` and
+/// `ResourceEvaluationFilters$EvaluationMode`) — so every operation whose
+/// `EvaluationMode` is documented as `PROACTIVE`-only words the refusal the same way.
+pub fn unsupported_evaluation_mode_message(requested: &str) -> String {
+    format!(
+        "{requested} Evaluation Mode is not supported. The supported Evaluation Modes \
+         are: [{EVALUATION_MODE_PROACTIVE}]."
     )
 }
 
@@ -2232,5 +2459,143 @@ mod tests {
             )),
             "the recorder ARN carries the resource type, the name and the id, got {arn:?}"
         );
+    }
+
+    #[test]
+    fn a_resource_evaluation_id_is_distinct_for_every_evaluation() {
+        let mut ids: Vec<String> = (0..1_000).map(mint_resource_evaluation_id).collect();
+        let minted = ids.len();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(
+            ids.len(),
+            minted,
+            "every resource evaluation must get a distinct id, got {} distinct of {minted}",
+            ids.len()
+        );
+        for id in &ids {
+            assert!(
+                (1..=128).contains(&id.len())
+                    && id
+                        .chars()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()),
+                "a ResourceEvaluationId is 1..128 opaque base-36 characters, got {id:?}"
+            );
+        }
+        assert_ne!(
+            mint_resource_evaluation_id(0),
+            mint_recorder_id(0),
+            "the n-th evaluation and the n-th recorder must not carry the same id"
+        );
+    }
+
+    #[test]
+    fn a_resource_evaluation_page_token_round_trips_its_key() {
+        // Rows differ along the instant the key names (the epoch itself, before it,
+        // after it, and a sub-second offset) and along the id beside it.
+        let cases: [(&str, i128, &str); 5] = [
+            ("the epoch itself", 0, "0000000000000000"),
+            ("one nanosecond past the epoch", 1, "abcdefgh12345678"),
+            ("before the epoch", -1_500_000_000, "zzzzzzzzzzzzzzzz"),
+            ("a whole second", 1_700_000_000_000_000_000, "7f3k9q1m5x8c2v0b"),
+            (
+                "a sub-second offset",
+                1_700_000_000_123_456_789,
+                "0123456789abcdef",
+            ),
+        ];
+
+        for (case, nanos, id) in cases {
+            let key = (::std::cmp::Reverse(nanos), id.to_string());
+            let token = encode_resource_evaluation_token(&key);
+            let decoded = decode_resource_evaluation_token(&token)
+                .unwrap_or_else(|| panic!("case {case:?}: {token:?} must decode"));
+            assert_eq!(
+                decoded, key,
+                "case {case:?}: expected the token to round trip, got {decoded:?}"
+            );
+        }
+
+        // Rows differ along how the token is malformed; none of them is a token this
+        // service issued, so none of them decodes.
+        let malformed: [(&str, &str); 4] = [
+            ("not base64", "**not base64**"),
+            ("base64 with no separator", "MTIzNDU2"),
+            ("base64 whose instant is not a number", "d2hlbjppZA=="),
+            ("base64 with no id", "MTIzNDU2Nzg5MDo="),
+        ];
+        for (case, token) in malformed {
+            let decoded = decode_resource_evaluation_token(token);
+            assert!(
+                decoded.is_none(),
+                "case {case:?}: expected {token:?} to be refused, got {decoded:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_resource_evaluation_store_stays_bounded_and_drops_the_oldest() {
+        // Rows differ along how far the starts go past the bound: one short of it,
+        // exactly it, one past it and well past it.
+        let cases: [(&str, usize); 4] = [
+            ("one short of the bound", RESOURCE_EVALUATIONS_KEPT - 1),
+            ("exactly the bound", RESOURCE_EVALUATIONS_KEPT),
+            ("one past the bound", RESOURCE_EVALUATIONS_KEPT + 1),
+            ("well past the bound", RESOURCE_EVALUATIONS_KEPT + 25),
+        ];
+
+        for (case, started) in cases {
+            let mut store = ComAmazonawsConfigserviceStarlingdoveserviceState::default();
+            let mut ids: Vec<String> = Vec::new();
+            for index in 0..started {
+                let id = mint_resource_evaluation_id(index as u64);
+                ids.push(id.clone());
+                store.record_resource_evaluation(ResourceEvaluationEntry {
+                    id,
+                    evaluation_mode: EVALUATION_MODE_PROACTIVE.to_string(),
+                    // One millisecond apart, so the oldest is the first one started.
+                    started_at: SystemTime::UNIX_EPOCH + Duration::from_millis(index as u64),
+                    evaluation_context_identifier: None,
+                    resource_details: ResourceDetails::default(),
+                    evaluation_timeout_seconds: DEFAULT_EVALUATION_TIMEOUT_SECONDS,
+                    client_token: Some(format!("token-{index}")),
+                });
+            }
+
+            let kept = started.min(RESOURCE_EVALUATIONS_KEPT);
+            assert_eq!(
+                store.resource_evaluations.len(),
+                kept,
+                "case {case:?}: expected the store to hold {kept} evaluations after \
+                 {started} starts, got {}",
+                store.resource_evaluations.len()
+            );
+            assert_eq!(
+                store.resource_evaluation_tokens.len(),
+                kept,
+                "case {case:?}: expected the token index to hold one entry per kept \
+                 evaluation, got {}",
+                store.resource_evaluation_tokens.len()
+            );
+
+            // What is kept is the MOST RECENT window: the last `kept` evaluations
+            // started, each with the token that started it.
+            for (index, id) in ids.iter().enumerate() {
+                let expected = index >= started - kept;
+                assert_eq!(
+                    store.resource_evaluations.contains_key(id),
+                    expected,
+                    "case {case:?}: evaluation {index} ({id:?}) kept should be {expected}"
+                );
+                assert_eq!(
+                    store
+                        .resource_evaluation_tokens
+                        .contains_key(&format!("token-{index}")),
+                    expected,
+                    "case {case:?}: the token of evaluation {index} indexed should be \
+                     {expected}"
+                );
+            }
+        }
     }
 }

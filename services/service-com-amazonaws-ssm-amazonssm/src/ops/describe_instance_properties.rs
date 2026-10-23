@@ -1,15 +1,42 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeInstanceProperties
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeInstanceProperties`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! An API operation used by the Systems Manager console to display information about
+//! Systems Manager managed nodes. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeInstanceProperties::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The answer is computed from the managed nodes this service's store holds for the
+//! Region the request was signed for ([`crate::state::ComAmazonawsSsmAmazonssmState::managed_nodes`]):
+//! the nodes that satisfy every filter the request carries, in ascending node-id order,
+//! one page at a time. Nothing here mutates the store — a read must not change what a
+//! later caller sees.
+//!
+//! ## Filters
+//!
+//! A request may carry both filter lists, and a node is reported only when it satisfies
+//! EVERY filter in them (a filter is satisfied by ANY of its values). The two lists
+//! differ only in what they can say: `InstancePropertyFilterList` carries a modelled
+//! `InstancePropertyFilterKey` and no operator, so it selects the nodes whose property
+//! EQUALS one of its values, while `FiltersWithOperator` carries a free-text key and one
+//! of the modelled operators.
+//!
+//! The set of filter keys is CLOSED, so a key that names no property of a node is
+//! refused before any node is looked at — as a `ValidationException` whose message names
+//! the key the caller submitted and the member it filled, which is what the recorded
+//! service answers for one (`InstancePropertyStringFilter$Key` is modelled as free text,
+//! so the refusal is the service's own rather than the modelled boundary's). For the
+//! operators that compare a whole value, a value outside the set the model publishes for
+//! its key is the modelled `InvalidInstancePropertyFilterValue` ("The specified filter
+//! value isn't valid"), and a node id that is not shaped like one is the modelled
+//! `InvalidInstanceId`. [`crate::state`] holds the key set, the value sets and the
+//! operator comparison, so the describes over the same nodes cannot disagree about them.
+//!
+//! ## Nodes nobody registered
+//!
+//! A managed node enters the store when it registers with the Systems Manager endpoint,
+//! which is the SSM Agent's own call and is not part of this service's model, so a fresh
+//! emulator holds none and this operation reports the empty set. Answering with invented
+//! nodes would be fabricating resources nobody created; the store's answer is the
+//! truthful one, and every node another operation persists is reported here.
 //!
 //! ## Shape of an operation
 //!
@@ -128,6 +155,18 @@ impl From<DescribeInstancePropertiesErrorModeled> for DescribeInstanceProperties
     }
 }
 
+/// The largest page this operation answers with, and the page a request that names no
+/// `MaxResults` is served: the modelled `DescribeInstancePropertiesMaxResults` range is
+/// 5..1000, so 1000 items is the most any request may ask for.
+const MAX_RESULTS_CAP: usize = 1000;
+
+/// One filter of the request, from either of the two filter lists.
+struct RequestFilter<'a> {
+    key: &'a str,
+    values: &'a [String],
+    operator: &'a str,
+}
+
 /// The `DescribeInstanceProperties` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -164,18 +203,141 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeInstanceProperties` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeInstancePropertiesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeInstanceProperties"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeInstancePropertiesErrorModeled::InternalServerError(InternalServerError {
+                message: Some("the managed node store is unavailable".to_string()),
+            })
+        })?;
+
+        // Every filter the request carries: the modelled filter list compares whole
+        // values and carries no operator of its own, so it is served with `Equal`, and
+        // so is a string filter that names none.
+        let mut filters: Vec<RequestFilter<'_>> = Vec::new();
+        for filter in input.instance_property_filter_list.iter().flatten() {
+            filters.push(RequestFilter {
+                key: filter.key.as_str(),
+                values: filter.value_set.as_slice(),
+                operator: crate::state::OPERATOR_EQUAL,
+            });
+        }
+        for filter in input.filters_with_operator.iter().flatten() {
+            filters.push(RequestFilter {
+                key: filter.key.as_str(),
+                values: filter.values.as_slice(),
+                operator: filter
+                    .operator
+                    .as_deref()
+                    .unwrap_or(crate::state::OPERATOR_EQUAL),
+            });
+        }
+
+        for filter in &filters {
+            let RequestFilter {
+                key,
+                values,
+                operator,
+            } = filter;
+            if !crate::state::is_node_filter_key(key) {
+                // A key that names no property of a node is refused before any node is
+                // looked at, and the refusal is built from the request: it names the key
+                // the caller submitted and the member it filled.
+                return Err(crate::scaffolded::Scaffolded::validation(
+                    crate::state::filter_key_rejection(key),
+                ));
+            }
+            // A value belongs to a published set only where the operator compares the
+            // WHOLE value. `BeginWith`, `LessThan` and `GreaterThan` are satisfied by a
+            // prefix of, or a bound on, such a value, so a set membership test there
+            // would refuse filters the operators exist to express.
+            let compares_whole_value = *operator == crate::state::OPERATOR_EQUAL
+                || *operator == crate::state::OPERATOR_NOT_EQUAL;
+            if !compares_whole_value {
+                continue;
+            }
+            if let Some(allowed) = crate::state::node_filter_key_value_set(key) {
+                if let Some(rejected) = values
+                    .iter()
+                    .find(|value| !allowed.contains(&value.as_str()))
+                {
+                    return Err(
+                        DescribeInstancePropertiesErrorModeled::InvalidInstancePropertyFilterValue(
+                            InvalidInstancePropertyFilterValue {
+                                message: Some(format!(
+                                    "Value '{rejected}' for filter key '{key}' isn't valid: valid \
+                                     values are {}",
+                                    allowed.join(" | ")
+                                )),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+            }
+            if *key == "InstanceIds" {
+                if let Some(rejected) = values
+                    .iter()
+                    .find(|value| !crate::state::managed_node_id_is_well_formed(value))
+                {
+                    return Err(DescribeInstancePropertiesErrorModeled::InvalidInstanceId(
+                        InvalidInstanceId {
+                            message: Some(format!(
+                                "Value '{rejected}' for filter key '{key}' isn't a managed node id"
+                            )),
+                        },
+                    )
+                    .into());
+                }
+            }
+        }
+
+        // The token this operation hands out is the id of the node the next page starts
+        // at, so a token that is not shaped like a node id was not one of ours.
+        let resume_from = match input.next_token.as_deref() {
+            None | Some("") => None,
+            Some(token) if crate::state::managed_node_id_is_well_formed(token) => Some(token),
+            Some(token) => {
+                return Err(DescribeInstancePropertiesErrorModeled::InvalidNextToken(
+                    InvalidNextToken {
+                        message: Some(format!("NextToken '{token}' isn't valid")),
+                    },
+                )
+                .into())
+            }
+        };
+
+        let page_size = match input.max_results {
+            Some(max_results) => usize::try_from(max_results)
+                .unwrap_or(MAX_RESULTS_CAP)
+                .clamp(1, MAX_RESULTS_CAP),
+            None => MAX_RESULTS_CAP,
+        };
+
+        let region = crate::state::request_region(ctx.parts());
+        let store = state.lock();
+        let mut instance_properties = Vec::new();
+        let mut next_token = None;
+        for (id, node) in store.managed_nodes_in_region(&region) {
+            if resume_from.is_some_and(|from| id < from) {
+                continue;
+            }
+            if !filters
+                .iter()
+                .all(|filter| node.matches_filter(filter.key, filter.values, filter.operator))
+            {
+                continue;
+            }
+            if instance_properties.len() == page_size {
+                // The page is full and a node is still waiting: hand the caller the id
+                // it resumes at, so the next request continues where this one stopped.
+                next_token = Some(id.to_string());
+                break;
+            }
+            instance_properties.push(node.properties.clone());
+        }
+
+        Ok(DescribeInstancePropertiesOutput {
+            instance_properties: Some(instance_properties),
+            next_token,
+        })
     }
 }

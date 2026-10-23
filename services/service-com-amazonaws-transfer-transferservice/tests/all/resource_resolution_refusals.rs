@@ -97,6 +97,15 @@ const TOKENS: [&str; 3] = [
 /// shape="CustomStepStatus")`: `[SUCCESS, FAILURE]`).
 const CUSTOM_STEP_STATUSES: [&str; 2] = ["SUCCESS", "FAILURE"];
 
+/// A policy allowing an API Gateway invoke on every resource.
+///
+/// The `API_GATEWAY` row of [`external_provider_servers`] names an `InvocationRole`,
+/// and `CreateServer` VERIFIES that the role can invoke the API before it accepts the
+/// server (the rule and its whole table live in `identity_and_authorization.rs`), so
+/// a suite that creates such a server seeds a role that may.
+const ALLOW_INVOKE_ANY_API: &str = r#"{"Version":"2012-10-17","Statement":[
+    {"Effect":"Allow","Action":"execute-api:Invoke","Resource":"*"}]}"#;
+
 /// A `CreateServer` request for each `IdentityProviderType` that delegates
 /// authentication to a customer-run provider, with the `IdentityProviderDetails` the
 /// model documents as required for it. The values satisfy the modelled patterns:
@@ -288,6 +297,7 @@ async fn test_identity_provider_refuses_every_service_managed_server() {
 #[tokio::test]
 async fn test_identity_provider_passes_the_gate_for_an_external_identity_provider() {
     let emulator = Emulator::new();
+    emulator.seed_role(ROLE, ALLOW_INVOKE_ANY_API);
 
     for (provider_type, request) in external_provider_servers() {
         let server_id = emulator.create_server(request).await;
@@ -337,6 +347,7 @@ async fn test_identity_provider_on_an_unminted_server_is_not_found() {
 #[tokio::test]
 async fn delete_access_refuses_every_server_without_a_directory() {
     let emulator = Emulator::new();
+    emulator.seed_role(ROLE, ALLOW_INVOKE_ANY_API);
 
     let mut non_directory: Vec<(&'static str, Value)> = service_managed_servers();
     non_directory.extend(

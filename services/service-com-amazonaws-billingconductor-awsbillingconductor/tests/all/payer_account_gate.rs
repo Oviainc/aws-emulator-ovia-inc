@@ -46,7 +46,7 @@ use std::sync::Arc;
 
 /// The account id every generated emulator presents, and so the account every request to
 /// this emulator is made by — read from the one source of truth rather than re-spelled.
-fn account_id() -> &'static str {
+pub(crate) fn account_id() -> &'static str {
     ::engine::emulator_account_id()
 }
 
@@ -73,7 +73,11 @@ const MODEL: &str = include_str!(concat!(
 ));
 
 /// A live emulator holding only this service.
-struct Emulator {
+///
+/// `pub(crate)`, with the helpers below, because the sibling suite
+/// `tests/all/payer_gate_precedes_idempotency_existence_and_assembly.rs` drives the same
+/// gate from the same harness rather than standing up a second one.
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
     /// The engine the router was built over, so a test can change WHICH account the
     /// store records as the payer — the one input the gate's decision is made from.
@@ -84,13 +88,13 @@ impl Emulator {
     /// A router over this service's DEFAULT store: the emulated account as it stands up,
     /// a standalone account that is the payer account of no organization — the caller
     /// every recorded Billing Conductor response was taken from.
-    fn standalone() -> Self {
+    pub(crate) fn standalone() -> Self {
         Self::with_payer(None)
     }
 
     /// The same router with `payer` designated the organization's payer account, so the
     /// admitted arm of the gate is reachable.
-    fn with_payer(payer: Option<&str>) -> Self {
+    pub(crate) fn with_payer(payer: Option<&str>) -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         engine
             .state::<BillingConductorState>()
@@ -102,32 +106,51 @@ impl Emulator {
     }
 
     /// A router whose store records the EMULATED account as the payer account.
-    fn payer() -> Self {
+    pub(crate) fn payer() -> Self {
         Self::with_payer(Some(account_id()))
     }
 
     /// Withdraw the organization's payer account from the store, so the same caller is
     /// a non-payer from the next request on.
     fn revoke_payer(&self) {
+        self.designate_payer(None);
+    }
+
+    /// Record `payer` as the organization's payer account in the store this router reads,
+    /// so one router can serve both arms of the gate in turn.
+    pub(crate) fn designate_payer(&self, payer: Option<&str>) {
         self.engine
             .state::<BillingConductorState>()
             .lock()
-            .payer_account_id = None;
+            .payer_account_id = payer.map(str::to_string);
     }
 
     /// Send one request over the wire and return the status, the parsed body and the
     /// `x-amzn-errortype` header restJson1 resolves an error shape from.
-    async fn call(
+    pub(crate) async fn call(
         &self,
         method: &str,
         path: &str,
         body: Option<&Value>,
     ) -> (u16, Value, Option<String>) {
+        self.call_with_headers(method, path, body, &[]).await
+    }
+
+    /// The same call with extra request headers — the seam an operation whose member is
+    /// modelled `@httpHeader` (`CreatePricingRule`'s `@idempotencyToken ClientToken`,
+    /// bound to `X-Amzn-Client-Token`) is driven through.
+    pub(crate) async fn call_with_headers(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&Value>,
+        headers: &[(&str, &str)],
+    ) -> (u16, Value, Option<String>) {
         let payload = match body {
             Some(value) => Bytes::from(serde_json::to_vec(value).expect("serialize the body")),
             None => Bytes::new(),
         };
-        let request = http::Request::builder()
+        let mut builder = http::Request::builder()
             .method(method)
             .uri(format!(
                 "https://billingconductor.us-east-1.amazonaws.com{path}"
@@ -139,9 +162,11 @@ impl Emulator {
                 "AWS4-HMAC-SHA256 \
                  Credential=AKIDEXAMPLE/20260101/us-east-1/billingconductor/aws4_request, \
                  SignedHeaders=host, Signature=00",
-            )
-            .body(payload)
-            .expect("build the request");
+            );
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        let request = builder.body(payload).expect("build the request");
         let response = self.router.dispatch(request).await;
         let status = response.status().as_u16();
         let error_type = response
@@ -158,13 +183,13 @@ impl Emulator {
     }
 
     /// POST a JSON body, the shape most of this service's operations take.
-    async fn post(&self, path: &str, body: &Value) -> (u16, Value, Option<String>) {
+    pub(crate) async fn post(&self, path: &str, body: &Value) -> (u16, Value, Option<String>) {
         self.call("POST", path, Some(body)).await
     }
 }
 
 /// The wire error code of a failure response (`__type`), without any namespace.
-fn error_code(body: &Value) -> String {
+pub(crate) fn error_code(body: &Value) -> String {
     body.get("__type")
         .and_then(Value::as_str)
         .unwrap_or_default()
@@ -207,7 +232,7 @@ fn untag_path(resource_arn: &str, tag_keys: &[&str]) -> String {
 
 /// Assert that `answered` IS the payer-account denial of `operation`: the status, the
 /// wire error code in both places restJson1 carries it, and the request-derived message.
-fn assert_denied(case: &str, operation: &str, answered: &(u16, Value, Option<String>)) {
+pub(crate) fn assert_denied(case: &str, operation: &str, answered: &(u16, Value, Option<String>)) {
     let (status, body, error_type) = answered;
     assert_eq!(
         *status, 403,
@@ -896,7 +921,7 @@ async fn concurrent_identical_calls_are_all_denied_identically() {
 /// A local join rather than a new dependency: the only thing this suite needs from a
 /// futures library is "drive these N calls at once", which `FuturesUnordered` would do
 /// no better for a fixed, small N.
-async fn futures_lite_join<F: std::future::Future>(
+pub(crate) async fn futures_lite_join<F: std::future::Future>(
     futures: impl Iterator<Item = F>,
 ) -> Vec<F::Output> {
     let mut pending: Vec<std::pin::Pin<Box<F>>> = futures.map(Box::pin).collect();

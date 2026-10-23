@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AllocateHosts
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AllocateHosts`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AllocateHosts::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: mints `Quantity` Dedicated Hosts from the request and stores them in
+//! [`crate::state`], where every describe of a host reads them back. This is the ONLY
+//! file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -180,18 +174,333 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AllocateHosts` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AllocateHostsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AllocateHosts"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            availability_zones_in_region, host_limit_exceeded, host_payload_bytes,
+            instance_family_is_modelled, instance_family_of, instance_type_is_modelled,
+            request_region, require_service_state, system_time_to_date_time, tag_list_bytes,
+            tags_from_specifications, ALLOWS_MULTIPLE_INSTANCE_TYPES_OFF,
+            ALLOWS_MULTIPLE_INSTANCE_TYPES_ON, AMD_SEV_SNP_DISABLED,
+            DEDICATED_HOST_TAGGABLE_RESOURCE, DEFAULT_AUTO_PLACEMENT, DEFAULT_HOST_RECOVERY,
+            HOST_STATE_AVAILABLE, MAX_CLIENT_TOKEN_CHARS, MAX_STORED_BYTES,
+            MAX_STORED_DEDICATED_HOSTS,
+        };
+
+        // The Region of the request's SigV4 credential scope: a Dedicated Host sits in one
+        // Availability Zone of one Region, and the zone the request names is resolved
+        // against that Region's zones.
+        let region = request_region(ctx.parts());
+
+        // "The Availability Zone in which to allocate the Dedicated Host"
+        // (`AllocateHostsRequest$AvailabilityZone`) / "The ID of the Availability Zone"
+        // (`$AvailabilityZoneId`): the two name one zone two ways, so a request gives one
+        // of them, and the zone has to be one the signed Region has — the naming rule for
+        // those zones lives in one place, `availability_zones_in_region`.
+        let zones = availability_zones_in_region(&region);
+        let zone = match (
+            input.availability_zone.as_deref(),
+            input.availability_zone_id.as_deref(),
+        ) {
+            (Some(_), Some(_)) => {
+                return Err(Scaffolded::invalid_parameter_combination(
+                    "Either availabilityZone or availabilityZoneId may be specified, not both",
+                ));
+            }
+            (None, None) => {
+                return Err(Scaffolded::missing_parameter(
+                    "Either availabilityZone or availabilityZoneId must be specified",
+                ));
+            }
+            (Some(zone_name), None) => zones
+                .iter()
+                .find(|zone| zone.zone_name == zone_name)
+                .ok_or_else(|| {
+                    Scaffolded::invalid_parameter_value(format!(
+                        "Invalid value '{zone_name}' for availabilityZone. \
+                         Region '{region}' has no such Availability Zone"
+                    ))
+                })?,
+            (None, Some(zone_id)) => zones
+                .iter()
+                .find(|zone| zone.zone_id == zone_id)
+                .ok_or_else(|| {
+                    Scaffolded::invalid_parameter_value(format!(
+                        "Invalid value '{zone_id}' for availabilityZoneId. \
+                         Region '{region}' has no such Availability Zone"
+                    ))
+                })?,
+        };
+
+        // "You cannot specify InstanceFamily and InstanceType in the same request"
+        // (`AllocateHostsRequest$InstanceFamily`) and "At a minimum, specify the supported
+        // instance type or instance family" (`AllocateHosts`) — so exactly one of the two
+        // configures the host. Either way the value has to name hardware EC2 offers: the
+        // modelled `InstanceType` enum is the catalog both are checked against, so a
+        // misspelling is refused instead of being stored as a host nothing can launch on.
+        let (instance_type, instance_family) = match (
+            input.instance_type.as_deref(),
+            input.instance_family.as_deref(),
+        ) {
+            (Some(_), Some(_)) => {
+                return Err(Scaffolded::invalid_parameter_combination(
+                    "You cannot specify instanceType and instanceFamily in the same request",
+                ));
+            }
+            (None, None) => {
+                return Err(Scaffolded::missing_parameter(
+                    "Either instanceType or instanceFamily must be specified",
+                ));
+            }
+            (Some(instance_type), None) => {
+                if !instance_type_is_modelled(instance_type) {
+                    return Err(Scaffolded::invalid_parameter_value(format!(
+                        "Invalid value '{instance_type}' for instanceType. \
+                         EC2 offers no such instance type"
+                    )));
+                }
+                (
+                    Some(instance_type.to_string()),
+                    instance_family_of(instance_type).to_string(),
+                )
+            }
+            (None, Some(instance_family)) => {
+                if !instance_family_is_modelled(instance_family) {
+                    return Err(Scaffolded::invalid_parameter_value(format!(
+                        "Invalid value '{instance_family}' for instanceFamily. \
+                         EC2 offers no instance type in such a family"
+                    )));
+                }
+                (None, instance_family.to_string())
+            }
+        };
+
+        // "This parameter is supported only if you specify OutpostArn"
+        // (`AllocateHostsRequest$AssetIds`), and an Outpost is hardware AWS installs in a
+        // customer's own facility: no operation of this service creates one, so an ARN or
+        // an asset id a caller names here can only name an Outpost the account does not
+        // have. The value is refused rather than ignored and answered with a host in the
+        // Region instead.
+        if let Some(outpost_arn) = input.outpost_arn.as_deref() {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "Invalid value '{outpost_arn}' for outpostArn. \
+                 This account holds no such Outpost"
+            )));
+        }
+        if let Some(asset_id) = input.asset_ids.iter().flatten().next() {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "Invalid value '{asset_id}' for assetId. \
+                 assetIds is supported only together with outpostArn, \
+                 and this account holds no Outpost"
+            )));
+        }
+
+        // "The number of Dedicated Hosts to allocate to your account with these
+        // parameters" (`AllocateHostsRequest$Quantity`). It may be omitted only when
+        // `AssetIds` names the hardware to allocate on, which is refused above, so a
+        // request reaching here has to carry it — and a count below one allocates nothing,
+        // which is not something to answer with an empty success.
+        let Some(requested_quantity) = input.quantity else {
+            return Err(Scaffolded::missing_parameter(
+                "quantity must be specified: it is the number of Dedicated Hosts to allocate",
+            ));
+        };
+        let Some(quantity) = usize::try_from(requested_quantity)
+            .ok()
+            .filter(|count| *count > 0)
+        else {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "Invalid value '{requested_quantity}' for quantity. It must be at least 1"
+            )));
+        };
+
+        // "The tags to apply to the Dedicated Host during creation"
+        // (`AllocateHostsRequest$TagSpecifications`): the host is the only resource this
+        // call creates, so a specification naming any other resource type is refused
+        // rather than accepted and discarded. The shared helper also bounds the tag count,
+        // each key and value, and the reserved `aws:` prefix.
+        let tags = tags_from_specifications(
+            input.tag_specifications.as_deref(),
+            DEDICATED_HOST_TAGGABLE_RESOURCE,
+            Self::NAME,
+        )?;
+        if input
+            .client_token
+            .as_ref()
+            .is_some_and(|token| token.chars().count() > MAX_CLIENT_TOKEN_CHARS)
+        {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "clientToken accepts at most {MAX_CLIENT_TOKEN_CHARS} characters"
+            )));
+        }
+
+        // "Default: off" (`AllocateHostsRequest$AutoPlacement`) and "Host recovery is
+        // disabled by default […] Default: off" (`$HostRecovery`). The modelled enums have
+        // already refused every other spelling of either.
+        let auto_placement = input
+            .auto_placement
+            .clone()
+            .unwrap_or_else(|| DEFAULT_AUTO_PLACEMENT.to_string());
+        let host_recovery = input
+            .host_recovery
+            .clone()
+            .unwrap_or_else(|| DEFAULT_HOST_RECOVERY.to_string());
+        // "If you don't specify a value, AMD SEV-SNP is disabled"
+        // (`HostCpuOptionsRequest$AmdSevSnp`) — including when the request carries no
+        // `CpuOptions` at all.
+        let amd_sev_snp = input
+            .cpu_options
+            .as_ref()
+            .and_then(|cpu_options| cpu_options.amd_sev_snp.clone())
+            .unwrap_or_else(|| AMD_SEV_SNP_DISABLED.to_string());
+
+        // The caller-chosen bytes ONE host of this batch retains for the process's
+        // lifetime: its tags and the client token the token map keeps, counted by the ONE
+        // definition of that charge ([`host_payload_bytes`], asserted below against each
+        // record this call stores).
+        let bytes_per_host =
+            tag_list_bytes(&tags).saturating_add(input.client_token.as_deref().map_or(0, str::len));
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+
+        // Idempotency: "Unique, case-sensitive identifier that you provide to ensure the
+        // idempotency of the request" (`AllocateHostsRequest$ClientToken`) — one token
+        // names the hosts it allocated, so a replay reports those and allocates nothing.
+        // Read here and answered below the ceilings, because a replay stores nothing and
+        // so passes the gates a fresh allocation has to clear.
+        let replayed = input
+            .client_token
+            .as_deref()
+            .and_then(|token| store.dedicated_host_client_tokens.get(token).cloned());
+
+        // Nothing in this emulator reclaims a stored host, so both ceilings — the number of
+        // records and the caller-chosen bytes they hold — are asked for the WHOLE batch
+        // before the first write, a count being no bound on the bytes each record carries.
+        if replayed.is_none() && !store.has_dedicated_host_capacity(quantity) {
+            return Err(host_limit_exceeded(format!(
+                "This emulator holds {} of at most {MAX_STORED_DEDICATED_HOSTS} Dedicated \
+                 Hosts, so it cannot allocate {quantity} more",
+                store.dedicated_hosts.len()
+            )));
+        }
+        let payload_bytes = bytes_per_host.saturating_mul(quantity);
+        if replayed.is_none() && store.would_exceed_stored_bytes(payload_bytes) {
+            return Err(host_limit_exceeded(format!(
+                "This emulator holds {} of at most {MAX_STORED_BYTES} bytes of \
+                 caller-supplied data, so it cannot store {payload_bytes} more",
+                store.stored_bytes()
+            )));
+        }
+
+        if let Some(host_ids) = replayed {
+            return Ok(AllocateHostsOutput {
+                host_ids: Some(host_ids),
+            });
+        }
+
+        // The allocation time is the one wall-clock fact of a host, so every host of one
+        // call carries the instant that call was served at.
+        let allocation_time = system_time_to_date_time(::std::time::SystemTime::now());
+        let owner_id = ::engine::emulator_account_id().to_string();
+        let mut host_ids: Vec<String> = Vec::with_capacity(quantity);
+        for _ in 0..quantity {
+            let host_id = store.next_id("h");
+            let host = Host {
+                host_id: Some(host_id),
+                auto_placement: Some(auto_placement.clone()),
+                availability_zone: Some(zone.zone_name.clone()),
+                availability_zone_id: Some(zone.zone_id.clone()),
+                // "Allocates a Dedicated Host to your account" (`AllocateHosts`): the host
+                // is allocated by the time the call answers and can be launched onto, so it
+                // is `available` rather than in a state the clock owes it a move out of.
+                state: Some(HOST_STATE_AVAILABLE.to_string()),
+                allocation_time: Some(allocation_time),
+                // "The time that the Dedicated Host was released" (`Host$ReleaseTime`):
+                // this host is held, not released. `ReleaseHosts` is the operation that
+                // would set it, and it is still a stub.
+                release_time: None,
+                host_properties: Some(HostProperties {
+                    // "If the host supports multiple instance types, no instanceType is
+                    // returned" (`HostProperties$InstanceType`) — which is the host an
+                    // `InstanceFamily` request allocates. The family is a fact of either
+                    // configuration, so it is reported for both.
+                    instance_type: instance_type.clone(),
+                    instance_family: Some(instance_family.clone()),
+                    // The core, socket and vCPU counts of a host are facts of the hardware
+                    // behind its instance type, and neither the model nor the request
+                    // carries them, so this emulator reports none rather than inventing
+                    // numbers a caller would size a workload against.
+                    cores: None,
+                    sockets: None,
+                    total_v_cpus: None,
+                }),
+                // "If the value is on, the Dedicated Host supports multiple instance types
+                // in the instance family […] if off, the Dedicated Host supports a single
+                // instance type only" (`Host$AllowsMultipleInstanceTypes`): exactly the
+                // difference between an `InstanceFamily` and an `InstanceType` allocation.
+                allows_multiple_instance_types: Some(
+                    if instance_type.is_some() {
+                        ALLOWS_MULTIPLE_INSTANCE_TYPES_OFF
+                    } else {
+                        ALLOWS_MULTIPLE_INSTANCE_TYPES_ON
+                    }
+                    .to_string(),
+                ),
+                // The capacity available on a host is what its hardware offers less what is
+                // running on it, and the hardware counts are not modelled (see
+                // `host_properties` above), so none is reported rather than a guess.
+                available_capacity: None,
+                client_token: input.client_token.clone(),
+                // "This returns a null response if the Dedicated Host doesn't have an
+                // associated reservation" (`Host$HostReservationId`):
+                // `PurchaseHostReservation` is the operation that would give it one, and it
+                // is still a stub.
+                host_reservation_id: None,
+                // Nothing is running on a freshly allocated host.
+                instances: Some(Vec::new()),
+                tags: Some(tags.clone()),
+                host_recovery: Some(host_recovery.clone()),
+                // "Indicates whether host maintenance is enabled or disabled for the
+                // Dedicated Host" (`Host$HostMaintenance`): the model documents no default
+                // for the request member, so the host carries the setting the request asked
+                // for, and none when it asked for none.
+                host_maintenance: input.host_maintenance.clone(),
+                owner_id: Some(owner_id.clone()),
+                // A host resource group is created through Resource Groups, not through
+                // EC2, so no host this emulator allocates is a member of one.
+                member_of_service_linked_resource_group: Some(false),
+                // An Outpost host is one allocated on an Outpost, which a request naming
+                // one is refused for above.
+                outpost_arn: None,
+                asset_id: None,
+                cpu_options: Some(HostCpuOptions {
+                    amd_sev_snp: Some(amd_sev_snp.clone()),
+                }),
+            };
+            // The bytes each record retains are charged at the insert, so no path can store
+            // them uncharged — and the batch gate above asked for exactly this many per
+            // host.
+            debug_assert_eq!(host_payload_bytes(&host), bytes_per_host);
+            host_ids.push(store.insert_dedicated_host(host));
+        }
+        if let Some(token) = input.client_token.clone() {
+            store
+                .dedicated_host_client_tokens
+                .insert(token, host_ids.clone());
+        }
+
+        // Read the ids back OUT of the store, so the caller is told about hosts a later
+        // describe will find rather than about ids this handler merely minted.
+        if let Some(missing) = host_ids
+            .iter()
+            .find(|host_id| !store.dedicated_hosts.contains_key(*host_id))
+        {
+            return Err(Scaffolded::internal_error(format!(
+                "the newly allocated Dedicated Host '{missing}' could not be read back"
+            )));
+        }
+        Ok(AllocateHostsOutput {
+            host_ids: Some(host_ids),
+        })
     }
 }

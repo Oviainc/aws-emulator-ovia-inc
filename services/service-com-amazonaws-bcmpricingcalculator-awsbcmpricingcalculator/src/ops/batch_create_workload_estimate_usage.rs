@@ -133,9 +133,10 @@ impl From<BatchCreateWorkloadEstimateUsageErrorModeled> for BatchCreateWorkloadE
     }
 }
 
-/// The `WorkloadEstimateCostStatus` a cost that is current carries (smithy_query:
-/// `shape="WorkloadEstimateCostStatus"`, values `VALID | INVALID | STALE`).
-const COST_STATUS_VALID: &str = "VALID";
+// The `WorkloadEstimateCostStatus` a current cost carries, and the currency it is in,
+// live in `crate::state` (`COST_STATUS_VALID` / `COST_CURRENCY`, reported through
+// `WorkloadEstimateUsage::cost_status` and `cost_currency`), so every reader of a usage
+// line qualifies its cost the same way.
 
 /// Push the digest parts of one batch entry.
 ///
@@ -172,17 +173,12 @@ fn item_for(line: &crate::state::WorkloadEstimateUsage) -> BatchCreateWorkloadEs
         usage_account_id: Some(line.usage_account_id.clone()),
         quantity: Some(line.quantity()),
         cost: line.cost,
-        // `currency` says which currency a reported `cost` is in, so it is reported
-        // exactly when a cost is — and then it is the one `CurrencyCode` the model
-        // declares.
-        currency: line
-            .cost
-            .map(|_| crate::state::COST_CURRENCY.to_string()),
-        // `status` (a `WorkloadEstimateCostStatus`) says whether the cost reported for
-        // this line is current, and the cost of a line created just now is. With no
-        // cost reported there is nothing for it to qualify, so it stays unset rather
-        // than asserting a cost state nothing established.
-        status: line.cost.map(|_| COST_STATUS_VALID.to_string()),
+        // `currency` says which currency a reported `cost` is in, and `status` (a
+        // `WorkloadEstimateCostStatus`) qualifies that same cost, so both are reported
+        // exactly when a cost is — the rule `crate::state` holds for every reader of a
+        // usage line, so the batch answer and a later read cannot disagree.
+        currency: line.cost_currency(),
+        status: line.cost_status(),
         historical_usage: line.historical_usage.clone(),
     }
 }

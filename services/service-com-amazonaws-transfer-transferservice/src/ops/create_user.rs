@@ -154,9 +154,19 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-transfer-transferservic
 // here — hence the `CreateUserError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.transfer#CreateUser")]
+//
+// `AccessDeniedException` is widened in with `extra_errors`: the SERVICE models the
+// shape (`CreateServer`, `UpdateServer` and `DeleteServer` all list it) and the real
+// service answers this operation with it — for a caller an identity policy denies,
+// and for a role ARN in another account — but this operation's modelled error list
+// omits it. The shape, its status (403) and its body stay the model's own.
+#[smithy_macros::operation_error(
+    "com.amazonaws.transfer#CreateUser",
+    extra_errors = ["AccessDeniedException"]
+)]
 #[derive(Debug)]
 pub enum CreateUserErrorModeled {
+    AccessDeniedException(AccessDeniedException),
     InternalServiceError(InternalServiceError),
     InvalidRequestException(InvalidRequestException),
     ResourceExistsException(ResourceExistsException),
@@ -216,6 +226,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         use crate::state as st;
+
+        // WHO is asking is decided before WHAT is asked: a caller whose identity
+        // policy explicitly denies this action on the user it would create is
+        // refused with `AccessDeniedException` (HTTP 403) and no user is created.
+        let resource = st::user_arn(
+            &st::request_region(ctx.parts()),
+            &input.server_id,
+            &input.user_name,
+        );
+        if let Some(message) = st::authorization::explicit_deny(
+            &*self.engine,
+            ctx.parts(),
+            Self::NAME,
+            Some(&resource),
+        ) {
+            return Err(CreateUserErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        // The ACCOUNT of the role this request asks the service to pass is checked
+        // BEFORE any resource the request names is resolved: passing a role across
+        // accounts is a privilege-escalation guard, so it is refused for its own
+        // reason (`AccessDeniedException`, HTTP 403) whether or not the server
+        // exists — otherwise a caller cannot tell "your role belongs to another
+        // account" from "that server does not exist".
+        if st::authorization::cross_account_role(&input.role) {
+            return Err(CreateUserErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(st::authorization::CROSS_ACCOUNT_PASS_ROLE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // A session policy that is not a JSON document is refused before it can be
+        // stored: a document the service cannot parse would otherwise silently
+        // become this user's effective permissions.
+        if let Some(message) = st::policy_document_violation("Policy", input.policy.as_deref()) {
+            return Err(CreateUserErrorModeled::InvalidRequestException(
+                InvalidRequestException { message },
+            )
+            .into());
+        }
 
         // A home-directory configuration the service would never create is refused
         // BEFORE the state write, with the modelled `InvalidRequestException`
@@ -282,7 +339,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 let ssh_public_key_id = guard.mint_id("key");
                 vec![st::SshKey {
                     ssh_public_key_id,
-                    ssh_public_key_body: body,
+                    // Normalised once, here, so every reader reports the body the
+                    // service stores rather than the bytes this request sent.
+                    ssh_public_key_body: st::stored_ssh_public_key_body(&body),
                     date_imported: ::std::time::SystemTime::now(),
                 }]
             }

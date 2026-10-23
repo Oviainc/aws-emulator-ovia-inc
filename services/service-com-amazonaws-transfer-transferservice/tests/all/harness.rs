@@ -12,6 +12,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{json, Value};
+use service_com_amazonaws_iam_awsidentitymanagementv20100508::ops::types::{
+    Policy, PolicyVersion, Role, User,
+};
+use service_com_amazonaws_iam_awsidentitymanagementv20100508::state as iam;
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The region the test signs for. It is read back out of ARNs, so it must not be the
@@ -30,6 +34,10 @@ pub(crate) const SSH_KEY: &str = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQ==";
 
 /// A role ARN satisfying `Role`'s modelled pattern `^arn:.*role/\S+$` and `len 20..2048`.
 pub(crate) const ROLE: &str = "arn:aws:iam::000000000000:role/transfer-s3";
+
+/// The access key id every request this harness signs carries, so a test that seeds
+/// an IAM principal seeds it against this key.
+pub(crate) const ACCESS_KEY_ID: &str = "AKIDTEST";
 
 /// This service's own store in the shared engine, as a suite seeds and reads it.
 pub(crate) type TransferState =
@@ -52,6 +60,10 @@ pub(crate) const PROFILE_TYPES: [&str; 2] = ["LOCAL", "PARTNER"];
 /// One emulator: the shared engine plus the transfer service mounted on a router.
 pub(crate) struct Emulator {
     router: MultiServiceRouter,
+    /// The SAME engine the service was built from, so a test can reach this
+    /// service's own store and can seed the account's IAM store — the one this
+    /// service's authorization gate and its API_GATEWAY identity-provider
+    /// verification read.
     engine: Arc<engine::InMemoryEngine>,
 }
 
@@ -108,6 +120,161 @@ impl Emulator {
         self.engine.state()
     }
 
+    /// The account's IAM store in this emulator's engine.
+    fn iam(
+        &self,
+    ) -> engine::ServiceState<iam::ComAmazonawsIamAwsidentitymanagementv20100508State> {
+        self.engine
+            .state::<iam::ComAmazonawsIamAwsidentitymanagementv20100508State>()
+    }
+
+    /// Put an IAM role into the account carrying one inline policy, exactly where
+    /// IAM's own `CreateRole` + `PutRolePolicy` would have written it.
+    ///
+    /// This is what the `API_GATEWAY` identity-provider verification reads: a role
+    /// the account does not hold, or holds without the invoke permission, cannot
+    /// invoke the identity provider's API.
+    pub(crate) fn seed_role(&self, role_arn: &str, policy_document: &str) {
+        let role_name = role_arn
+            .rsplit('/')
+            .next()
+            .expect("the seeded role ARN names a role");
+        let key = iam::name_key(role_name);
+        let state = self.iam();
+        let mut guard = state.lock();
+        guard.roles.insert(
+            key.clone(),
+            Role {
+                path: "/".to_string(),
+                role_name: role_name.to_string(),
+                role_id: format!("AROA{}", role_name.to_ascii_uppercase()),
+                arn: role_arn.to_string(),
+                create_date: iam::now(),
+                assume_role_policy_document: None,
+                description: None,
+                max_session_duration: None,
+                permissions_boundary: None,
+                tags: None,
+                role_last_used: None,
+                source_role_template: None,
+            },
+        );
+        guard.role_inline_policies.entry(key).or_default().insert(
+            iam::name_key("seeded"),
+            iam::InlinePolicy {
+                policy_name: "seeded".to_string(),
+                policy_document: policy_document.to_string(),
+            },
+        );
+    }
+
+    /// Put an IAM role into the account carrying NO inline policy and ONE attached
+    /// managed policy, exactly where IAM's own `CreateRole` + `AttachRolePolicy`
+    /// (+ `CreatePolicy`, when the account holds the policy) would have written it.
+    ///
+    /// `document` is the attached policy's default-version document when the account
+    /// HOLDS that policy, and `None` when it does not — an AWS-managed policy, which
+    /// the account does not own, so its document can neither be read nor be ruled
+    /// out. Both are what the `API_GATEWAY` verification reads through
+    /// `role_attached_policies`.
+    pub(crate) fn seed_role_with_attached_policy(
+        &self,
+        role_arn: &str,
+        policy_arn: &str,
+        document: Option<&str>,
+    ) {
+        // The role itself, with an inline policy that decides nothing, so what the
+        // verification reads is the ATTACHED policy alone.
+        self.seed_role(role_arn, r#"{"Version":"2012-10-17","Statement":[]}"#);
+        let role_name = role_arn
+            .rsplit('/')
+            .next()
+            .expect("the seeded role ARN names a role");
+        let state = self.iam();
+        let mut guard = state.lock();
+        guard
+            .role_attached_policies
+            .entry(iam::name_key(role_name))
+            .or_default()
+            .insert(policy_arn.to_string());
+        let Some(document) = document else {
+            return;
+        };
+        let policy_name = policy_arn
+            .rsplit('/')
+            .next()
+            .expect("the seeded policy ARN names a policy");
+        let created = iam::now();
+        guard.policies.insert(
+            iam::name_key(policy_name),
+            iam::ManagedPolicy {
+                policy: Policy {
+                    arn: Some(policy_arn.to_string()),
+                    policy_id: Some(format!("ANPA{}", policy_name.to_ascii_uppercase())),
+                    policy_name: Some(policy_name.to_string()),
+                    path: Some("/".to_string()),
+                    default_version_id: Some("v1".to_string()),
+                    attachment_count: Some(1),
+                    permissions_boundary_usage_count: Some(0),
+                    is_attachable: true,
+                    description: None,
+                    create_date: Some(created),
+                    update_date: Some(created),
+                    tags: None,
+                },
+                versions: [(
+                    "v1".to_string(),
+                    PolicyVersion {
+                        document: Some(document.to_string()),
+                        version_id: Some("v1".to_string()),
+                        is_default_version: true,
+                        create_date: Some(created),
+                    },
+                )]
+                .into_iter()
+                .collect(),
+            },
+        );
+    }
+
+    /// Put an IAM user holding [`ACCESS_KEY_ID`] into the account, with one inline
+    /// identity policy — where IAM's own `CreateUser` + `CreateAccessKey` +
+    /// `PutUserPolicy` would have written it. This is the calling principal the
+    /// authorization gate resolves the request's access key to.
+    pub(crate) fn seed_calling_principal(&self, user_name: &str, policy_document: &str) {
+        let key = iam::name_key(user_name);
+        let state = self.iam();
+        let mut guard = state.lock();
+        guard.users.insert(
+            key.clone(),
+            User {
+                path: "/".to_string(),
+                user_name: user_name.to_string(),
+                user_id: format!("AIDA{}", user_name.to_ascii_uppercase()),
+                arn: iam::user_arn("/", user_name),
+                create_date: iam::now(),
+                password_last_used: None,
+                permissions_boundary: None,
+                tags: None,
+            },
+        );
+        guard.access_keys.insert(
+            ACCESS_KEY_ID.to_string(),
+            iam::AccessKeyRecord {
+                user_key: key.clone(),
+                status: "Active".to_string(),
+                create_date: iam::now(),
+            },
+        );
+        guard.user_inline_policies.entry(key).or_default().insert(
+            iam::name_key("seeded"),
+            iam::InlinePolicy {
+                policy_name: "seeded".to_string(),
+                policy_document: policy_document.to_string(),
+            },
+        );
+    }
+
     pub(crate) async fn call(&self, op: &str, body: Value) -> Answer {
         self.call_in(REGION, op, body).await
     }
@@ -123,8 +290,8 @@ impl Emulator {
             .header(
                 "authorization",
                 format!(
-                    "AWS4-HMAC-SHA256 Credential=AKIDTEST/20240101/{region}/transfer/aws4_request, \
-                     SignedHeaders=host, Signature=0123456789abcdef"
+                    "AWS4-HMAC-SHA256 Credential={ACCESS_KEY_ID}/20240101/{region}/transfer/\
+                     aws4_request, SignedHeaders=host, Signature=0123456789abcdef"
                 ),
             )
             .body(bytes::Bytes::from(

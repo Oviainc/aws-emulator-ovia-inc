@@ -94,8 +94,9 @@ const MAX_TEXT_BYTES: usize = crate::state::REALTIME_TEXT_QUOTA_BYTES;
 /// VADER's lexicon and its boosters, negations and idioms are English. Every other
 /// value Comprehend's `LanguageCode` enum names is answered with the modelled
 /// `UnsupportedLanguageException` rather than with a neutral verdict that no
-/// analysis produced.
-const ANALYSABLE_LANGUAGES: &[&str] = &["en"];
+/// analysis produced. Shared with `crate::ops::batch_detect_sentiment`, whose
+/// `LanguageCode` covers every document in the batch.
+pub(crate) const ANALYSABLE_LANGUAGES: &[&str] = &["en"];
 
 /// The shared sentiment engine. Built once: `new()` parses the lexicon files, which
 /// is far more expensive than scoring one document, and it is immutable afterwards.
@@ -139,8 +140,11 @@ fn ranked_labels(
 /// it.
 ///
 /// Visible to the crate because `DetectTargetedSentiment` scores the clause each
-/// mention sits in through exactly this function: one document and one clause must
-/// be scored on the same scale, so there is one scorer rather than two.
+/// mention sits in through exactly this function, and `BatchDetectSentiment` scores
+/// every document of a batch through it: one document, one clause and one batched
+/// document must all be scored on the same scale, so there is one scorer rather
+/// than three. Batching changes how many documents one request carries, never how a
+/// document is scored, so a batch answers the same verdict for the same text.
 pub(crate) fn score_sentiment(text: &str) -> (String, SentimentScore) {
     let scores = analyzer().polarity_scores(text);
     let positive_share = scores.get("pos").copied().unwrap_or_default();
