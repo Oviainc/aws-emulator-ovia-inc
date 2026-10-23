@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteSecondaryNetwork
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteSecondaryNetwork`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteSecondaryNetwork::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: starts deleting the secondary network the request names and answers it as
+//! [`crate::state`] now holds it — `delete-in-progress`, with its IPv4 CIDR block
+//! `disassociating` and `delete-complete` owed by the clock. This is the ONLY file to touch
+//! for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -140,18 +135,84 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteSecondaryNetwork` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteSecondaryNetworkErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteSecondaryNetwork"))
+        use crate::state;
+        use std::time::Instant;
+
+        // `ctx` carries request metadata only; this operation reads none of it — a
+        // secondary network is named by id, which is unique across Regions in this store.
+        // The store is reached through the engine held on `self`.
+        let _ = ctx;
+
+        // "Unique, case-sensitive identifier that you provide to ensure the idempotency of
+        // the request" (`ClientToken`), held to the published constraint every client token
+        // of this crate is held to ([`state::MAX_CLIENT_TOKEN_CHARS`]). Nothing is stored
+        // for it, and nothing needs to be: this delete is already idempotent in the network
+        // it names — the record keeps the due instant the first call gave it — so a repeat
+        // reports that same deletion without a token map to keep, and no caller-chosen
+        // bytes are added to the store.
+        if input
+            .client_token
+            .as_ref()
+            .is_some_and(|token| token.chars().count() > state::MAX_CLIENT_TOKEN_CHARS)
+        {
+            return Err(state::invalid_parameter_value(format!(
+                "clientToken accepts at most {} characters",
+                state::MAX_CLIENT_TOKEN_CHARS
+            )));
+        }
+
+        let networks = state::require_service_state(&*self.engine)?;
+        let mut store = networks.lock();
+
+        // "Deletes a secondary network" (`DeleteSecondaryNetwork`): an id the account holds
+        // no network for is a refusal, not a no-op — a caller has to be able to tell the
+        // deletion it performed from one it did not.
+        state::require_known_secondary_network(&store, &input.secondary_network_id)?;
+
+        // "You must delete all secondary subnets in the secondary network before you can
+        // delete the secondary network" (`DeleteSecondaryNetwork`). Nothing in this emulator
+        // stores a secondary subnet yet — `CreateSecondarySubnet` is still a scaffold
+        // answering 501 — so no network of this store can hold one and the precondition
+        // holds for every network it does hold. The operation that starts storing secondary
+        // subnets is the one that has to refuse here.
+
+        // DryRun sits AFTER every parameter has been validated and the named network
+        // resolved, and BEFORE the write: the flag asks whether the request WOULD have
+        // worked, so one that would have been refused is refused with that reason instead,
+        // and one that would have succeeded leaves state untouched.
+        if input.dry_run == Some(true) {
+            return Err(state::dry_run_operation());
+        }
+
+        let now = Instant::now();
+        // The deletion is owed to the clock rather than finished here: the network answers
+        // `delete-in-progress` with its IPv4 CIDR block `disassociating` until the stored
+        // instant falls due, so a caller acting straight after this call still sees the
+        // transient states. The record itself stays in the store — a network in either
+        // delete state is still reported, `DescribeSecondaryNetworks` documenting both among
+        // its `state` filter's values — so the bytes it holds stay charged to the store's
+        // budget, which still holds them.
+        let secondary_network = store
+            .begin_secondary_network_deletion(
+                &input.secondary_network_id,
+                now,
+                now + state::TRANSITION_DELAY,
+            )
+            .ok_or_else(|| {
+                state::internal_error(format!(
+                    "the secondary network '{}' checked a moment ago could not be deleted",
+                    input.secondary_network_id
+                ))
+            })?;
+
+        // The network as the store now holds it, so the caller sees what a later
+        // `DescribeSecondaryNetworks` will see rather than the request object. "Only
+        // returned if a client token was provided in the request"
+        // (`DeleteSecondaryNetworkResult$ClientToken`).
+        Ok(DeleteSecondaryNetworkOutput {
+            secondary_network: Some(secondary_network),
+            client_token: input.client_token,
+        })
     }
 }
+

@@ -17,7 +17,14 @@
 //!    CLOCK, not a caller, moves both to `create-complete` / `associated`;
 //! 3. a CIDR block outside the published block size is refused with EC2's own error code
 //!    and nothing is stored;
-//! 4. one `ClientToken` names one network.
+//! 4. one `ClientToken` names one network;
+//! 5. `DeleteSecondaryNetwork` puts the network the request names into
+//!    `delete-in-progress` with its CIDR block `disassociating`, the CLOCK moves both to
+//!    `delete-complete` / `disassociated`, the store keeps reporting the network in those
+//!    states (`DescribeSecondaryNetworks` documents both among its `state` filter's
+//!    values), a repeat of the delete reports that same deletion without restarting its
+//!    clock, and an id the account holds no network for is refused with EC2's own
+//!    `Invalid<Resource>Id.NotFound` code while nothing changes.
 //!
 //! Each table row is a distinct input along what the rule generalises over — the block's
 //! prefix length at each published bound and one past it, a block whose host bits are set,
@@ -29,7 +36,8 @@ use std::time::Duration;
 use service_com_amazonaws_ec2_amazonec2 as ec2;
 use ec2::ops::types::SECONDARY_NETWORK_TYPE_VALUES;
 use ec2::state::{
-    MAX_SECONDARY_NETWORK_IPV4_PREFIX, MIN_SECONDARY_NETWORK_IPV4_PREFIX, TRANSITION_DELAY,
+    MAX_CLIENT_TOKEN_CHARS, MAX_SECONDARY_NETWORK_IPV4_PREFIX, MIN_SECONDARY_NETWORK_IPV4_PREFIX,
+    TRANSITION_DELAY,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -57,6 +65,10 @@ async fn create(router: &MultiServiceRouter, params: &[(String, String)]) -> (u1
 
 async fn describe(router: &MultiServiceRouter, params: &[(String, String)]) -> (u16, String) {
     super::ec2_query::call(router, REGION, "DescribeSecondaryNetworks", params).await
+}
+
+async fn delete(router: &MultiServiceRouter, params: &[(String, String)]) -> (u16, String) {
+    super::ec2_query::call(router, REGION, "DeleteSecondaryNetwork", params).await
 }
 
 /// Wait until every clock-owed transition started before now has certainly fallen due.
@@ -143,6 +155,13 @@ async fn described_ids(
 /// One `MaxResults` parameter.
 fn max_results_param(max_results: i64) -> Params {
     vec![p("MaxResults", max_results.to_string())]
+}
+
+/// The pair of states a secondary network reports — its own, then the one of its IPv4 CIDR
+/// block association — in the order a response carries them, as `elements(body, "state")`
+/// answers them.
+fn state_pair(network: &str, association: &str) -> Vec<String> {
+    vec![network.to_string(), association.to_string()]
 }
 
 /// What one seeded network is created with: its CIDR block and its tags.
@@ -317,7 +336,7 @@ async fn a_created_network_round_trips_through_describe_in_canonical_form() {
             // created before either has finished.
             assert_eq!(
                 elements(&body, "state"),
-                vec!["create-in-progress".to_string(), "associating".to_string()],
+                state_pair("create-in-progress", "associating"),
                 "case {case:?}: expected the states of a brand new network, got {body}"
             );
             let association_id = element(&body, "associationId")
@@ -405,7 +424,7 @@ async fn the_clock_moves_a_new_network_to_create_complete() {
     );
     assert_eq!(
         elements(&before, "state"),
-        vec!["create-in-progress".to_string(), "associating".to_string()],
+        state_pair("create-in-progress", "associating"),
         "before the transition: a caller acting straight after the create sees the \
          transient states, got {before}"
     );
@@ -419,7 +438,7 @@ async fn the_clock_moves_a_new_network_to_create_complete() {
     );
     assert_eq!(
         elements(&after, "state"),
-        vec!["create-complete".to_string(), "associated".to_string()],
+        state_pair("create-complete", "associated"),
         "after the transition: the clock owes the network both moves, got {after}"
     );
 
@@ -1141,4 +1160,451 @@ async fn dry_run_reports_the_permitted_outcome_without_doing_the_work() {
         vec![id],
         "describe DryRun=false: expected the ordinary report, got {reported:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// RULE 5: a delete is a clock-owed move the store keeps reporting
+// ---------------------------------------------------------------------------
+
+/// What one delete row creates and how it deletes it.
+struct DeleteCase {
+    cidr_block: &'static str,
+    tags: Vec<(&'static str, &'static str)>,
+    client_token: Option<&'static str>,
+}
+
+/// The rows the delete table runs. They differ along everything the rule generalises over:
+/// the block size (both published bounds and one between them), how many tags the network
+/// carries, and whether the delete carries a `ClientToken`.
+fn delete_cases() -> Vec<DeleteCase> {
+    vec![
+        DeleteCase {
+            cidr_block: "10.0.0.0/16",
+            tags: vec![("Name", "deleted"), ("Owner", "TeamA")],
+            client_token: Some("delete-token"),
+        },
+        DeleteCase {
+            cidr_block: "172.16.0.0/12",
+            tags: Vec::new(),
+            client_token: None,
+        },
+        DeleteCase {
+            cidr_block: "10.9.9.0/28",
+            tags: vec![("Project", "atlas")],
+            client_token: None,
+        },
+        DeleteCase {
+            cidr_block: "192.168.4.0/24",
+            tags: vec![("Name", "deleted")],
+            client_token: Some("x"),
+        },
+    ]
+}
+
+/// A delete reports the network it names as the store then holds it — `delete-in-progress`
+/// with its CIDR block `disassociating`, every other member the one the create minted — the
+/// clock moves both states on with nobody asking, the network stays reportable in them, and
+/// a network nobody deleted is untouched.
+#[tokio::test]
+async fn deleting_a_network_hands_it_to_the_clock_and_the_store_keeps_reporting_it() {
+    for row in delete_cases() {
+        // Every modelled network type, so the catalog is covered rather than one entry.
+        for network_type in SECONDARY_NETWORK_TYPE_VALUES {
+            let case = format!(
+                "{} as {network_type} with {} tag(s), token {:?}",
+                row.cidr_block,
+                row.tags.len(),
+                row.client_token
+            );
+            let router = emulator();
+            // A second network nobody asks to delete, so the delete's reach is visible.
+            let untouched = created(&router, &case, "10.200.0.0/16", &[("Name", "kept")]).await;
+
+            let (status, created_body) = create_network(
+                &router,
+                row.cidr_block,
+                network_type,
+                tag_params(&row.tags),
+            )
+            .await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected HTTP 200 from the create, got {status} with \
+                 body {created_body}"
+            );
+            let id = element(&created_body, "secondaryNetworkId").unwrap_or_else(|| {
+                panic!("case {case:?}: expected a secondaryNetworkId in {created_body}")
+            });
+
+            let mut params = vec![p("SecondaryNetworkId", id.clone())];
+            if let Some(token) = row.client_token {
+                params.push(p("ClientToken", token));
+            }
+            let (status, deleted) = delete(&router, &params).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected HTTP 200 from the delete, got {status} with \
+                 body {deleted}"
+            );
+            assert_eq!(
+                elements(&deleted, "state"),
+                state_pair("delete-in-progress", "disassociating"),
+                "case {case:?}: expected the states of a network being deleted, got {deleted}"
+            );
+            // A delete REPORTS the network it deleted; it mints nothing, so every member
+            // the service owns is the one the create gave it.
+            for member in [
+                "secondaryNetworkId",
+                "secondaryNetworkArn",
+                "ownerId",
+                "type",
+                "cidrBlock",
+                "associationId",
+            ] {
+                assert_eq!(
+                    element(&deleted, member),
+                    element(&created_body, member),
+                    "case {case:?}: <{member}> must be the created network's, got {deleted}"
+                );
+            }
+            match row.client_token {
+                Some(token) => assert_eq!(
+                    element(&deleted, "clientToken").as_deref(),
+                    Some(token),
+                    "case {case:?}: the token the request carried is echoed, got {deleted}"
+                ),
+                None => assert!(
+                    elements(&deleted, "clientToken").is_empty(),
+                    "case {case:?}: the token is reported only if the request carried one, \
+                     got {deleted}"
+                ),
+            }
+
+            // The same network, read back: the deletion is in the store, not just in the
+            // answer.
+            let by_id = indexed("SecondaryNetworkId", &[&id]);
+            let (status, before) = describe(&router, &by_id).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected HTTP 200 from the read back, got {status} \
+                 with {before}"
+            );
+            assert_eq!(
+                elements(&before, "state"),
+                state_pair("delete-in-progress", "disassociating"),
+                "case {case:?}: a caller acting straight after the delete sees the \
+                 transient states, got {before}"
+            );
+
+            past_the_transition().await;
+
+            let (status, after) = describe(&router, &by_id).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected HTTP 200 after the transition, got {status} \
+                 with {after}"
+            );
+            assert_eq!(
+                elements(&after, "state"),
+                state_pair("delete-complete", "disassociated"),
+                "case {case:?}: the clock owes the network both moves, got {after}"
+            );
+            // Reading it twice reports the same thing: a read writes nothing.
+            let (_, again) = describe(&router, &by_id).await;
+            assert_eq!(
+                elements(&again, "state"),
+                elements(&after, "state"),
+                "case {case:?}: a read must not change what a later caller sees: \
+                 {after} then {again}"
+            );
+            // The record is still the one that was created, tags and all.
+            for (key, value) in &row.tags {
+                assert!(
+                    after.contains(&format!("<key>{key}</key>"))
+                        && after.contains(&format!("<value>{value}</value>")),
+                    "case {case:?}: a deleted network still reports the tag {key}={value}, \
+                     got {after}"
+                );
+            }
+
+            // The network nobody deleted finished being CREATED instead.
+            let (_, kept) = describe(&router, &indexed("SecondaryNetworkId", &[&untouched])).await;
+            assert_eq!(
+                elements(&kept, "state"),
+                state_pair("create-complete", "associated"),
+                "case {case:?}: a network nobody deleted is untouched, got {kept}"
+            );
+
+            // The delete states are values of the documented filters, so they select the
+            // deleted network and only it.
+            let selected = described_ids(
+                &router,
+                &case,
+                &filters(&[("state", &["delete-complete"])]),
+            )
+            .await;
+            assert_eq!(
+                selected,
+                vec![id.clone()],
+                "case {case:?}: state=delete-complete selects the deleted network, \
+                 got {selected:?}"
+            );
+            let by_association = described_ids(
+                &router,
+                &case,
+                &filters(&[("ipv4-cidr-block-association.state", &["disassociated"])]),
+            )
+            .await;
+            assert_eq!(
+                by_association,
+                vec![id.clone()],
+                "case {case:?}: the association state selects the deleted network, \
+                 got {by_association:?}"
+            );
+            let still_creating = described_ids(
+                &router,
+                &case,
+                &filters(&[("state", &["create-in-progress", "create-complete"])]),
+            )
+            .await;
+            assert_eq!(
+                still_creating,
+                vec![untouched.clone()],
+                "case {case:?}: a deleted network is in neither create state, \
+                 got {still_creating:?}"
+            );
+        }
+    }
+}
+
+/// An id the account holds no network for is refused with EC2's own
+/// `Invalid<Resource>Id.NotFound` code — `SecondaryNetworkId` publishes no pattern, so
+/// every shape of unknown id is answered the same way — and nothing is deleted.
+#[tokio::test]
+async fn deleting_an_id_no_network_has_is_refused_and_changes_nothing() {
+    let router = emulator();
+    let seeded = seed(&router).await;
+
+    // Rows: the id form this service mints but no network has, the same form at its
+    // extremes, an id of another EC2 resource family, text that is no id at all, the
+    // right id in the wrong case, and the empty id.
+    let unknown = [
+        "sn-0123456789abcdef0",
+        "sn-00000000000000000",
+        "vpc-0123456789abcdef0",
+        "not-a-secondary-network-id",
+        "SN-0123456789ABCDEF0",
+        "",
+    ];
+    for id in unknown {
+        let (status, body) = delete(&router, &[p("SecondaryNetworkId", id)]).await;
+        assert_eq!(
+            status, 400,
+            "case {id:?}: expected HTTP 400, got {status} with body {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "InvalidSecondaryNetworkId.NotFound",
+            "case {id:?}: expected InvalidSecondaryNetworkId.NotFound, got {body}"
+        );
+        assert!(
+            elements(&body, "secondaryNetworkId").is_empty(),
+            "case {id:?}: a refused delete reports no network, got {body}"
+        );
+    }
+
+    let reported = described_ids(&router, "after the refusals", &[]).await;
+    assert_eq!(
+        reported, seeded.ids,
+        "after the refusals: every stored network is still reported, got {reported:?}"
+    );
+    let deleting = described_ids(
+        &router,
+        "after the refusals",
+        &filters(&[("state", &["delete-in-progress", "delete-complete"])]),
+    )
+    .await;
+    assert!(
+        deleting.is_empty(),
+        "after the refusals: no network is being deleted, got {deleting:?}"
+    );
+}
+
+/// A repeat of a delete reports the same deletion and does NOT restart its clock: a repeat
+/// made after the move fell due still answers `delete-complete`.
+#[tokio::test]
+async fn repeating_a_delete_reports_the_same_deletion_without_restarting_its_clock() {
+    let router = emulator();
+    let id = created(&router, "repeat", "10.4.0.0/16", &[("Name", "repeat")]).await;
+    let params = vec![p("SecondaryNetworkId", id.clone())];
+
+    let (status, first) = delete(&router, &params).await;
+    assert_eq!(
+        status, 200,
+        "first delete: expected HTTP 200, got {status} with body {first}"
+    );
+    assert_eq!(
+        elements(&first, "state"),
+        state_pair("delete-in-progress", "disassociating"),
+        "first delete: expected the states of a network being deleted, got {first}"
+    );
+
+    let (status, immediate_repeat) = delete(&router, &params).await;
+    assert_eq!(
+        status, 200,
+        "immediate repeat: expected HTTP 200, got {status} with body {immediate_repeat}"
+    );
+    assert_eq!(
+        elements(&immediate_repeat, "state"),
+        elements(&first, "state"),
+        "immediate repeat: expected the deletion already under way, got {immediate_repeat}"
+    );
+    assert_eq!(
+        element(&immediate_repeat, "secondaryNetworkId").as_deref(),
+        Some(id.as_str()),
+        "immediate repeat: expected the same network, got {immediate_repeat}"
+    );
+
+    past_the_transition().await;
+
+    // The repeat AFTER the move fell due is what shows the clock was never restarted: a
+    // restarted deletion would answer `delete-in-progress` again.
+    let (status, late_repeat) = delete(&router, &params).await;
+    assert_eq!(
+        status, 200,
+        "late repeat: expected HTTP 200, got {status} with body {late_repeat}"
+    );
+    assert_eq!(
+        elements(&late_repeat, "state"),
+        state_pair("delete-complete", "disassociated"),
+        "late repeat: a repeat must not restart the deletion's clock, got {late_repeat}"
+    );
+
+    let (_, read) = describe(&router, &indexed("SecondaryNetworkId", &[&id])).await;
+    assert_eq!(
+        elements(&read, "state"),
+        state_pair("delete-complete", "disassociated"),
+        "after the late repeat: expected the deleted network, got {read}"
+    );
+}
+
+/// `DryRun` reports the permitted outcome — `DryRunOperation`, HTTP 412 — and deletes
+/// nothing; a dry run of a request that WOULD have been refused is refused with that reason
+/// instead.
+#[tokio::test]
+async fn a_dry_run_delete_reports_the_permitted_outcome_without_deleting() {
+    let router = emulator();
+    let id = created(&router, "dry run", "10.5.0.0/16", &[]).await;
+
+    let (status, body) = delete(
+        &router,
+        &[p("SecondaryNetworkId", id.clone()), p("DryRun", "true")],
+    )
+    .await;
+    assert_eq!(
+        status, 412,
+        "delete DryRun=true: expected HTTP 412, got {status} with body {body}"
+    );
+    assert_eq!(
+        error_code(&body),
+        "DryRunOperation",
+        "delete DryRun=true: expected DryRunOperation, got {body}"
+    );
+
+    let (_, read) = describe(&router, &indexed("SecondaryNetworkId", &[&id])).await;
+    assert!(
+        !elements(&read, "state")
+            .iter()
+            .any(|state| state.starts_with("delete") || state.starts_with("disassoci")),
+        "delete DryRun=true: a dry run deletes nothing, got {read}"
+    );
+
+    // A dry run naming a network the account does not hold is refused with that reason.
+    let (status, body) = delete(
+        &router,
+        &[
+            p("SecondaryNetworkId", "sn-0123456789abcdef0"),
+            p("DryRun", "true"),
+        ],
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "delete DryRun=true on an unknown id: expected HTTP 400, got {status} with body {body}"
+    );
+    assert_eq!(
+        error_code(&body),
+        "InvalidSecondaryNetworkId.NotFound",
+        "delete DryRun=true on an unknown id: expected InvalidSecondaryNetworkId.NotFound, \
+         got {body}"
+    );
+
+    let (status, body) = delete(
+        &router,
+        &[p("SecondaryNetworkId", id.clone()), p("DryRun", "false")],
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "delete DryRun=false: expected HTTP 200, got {status} with body {body}"
+    );
+    assert_eq!(
+        elements(&body, "state"),
+        state_pair("delete-in-progress", "disassociating"),
+        "delete DryRun=false: expected an ordinary delete, got {body}"
+    );
+}
+
+/// A delete's `ClientToken` is held to the published constraint — "Maximum 128 ASCII
+/// characters" (`ClientToken`), re-exported as [`MAX_CLIENT_TOKEN_CHARS`] — the bound
+/// itself being accepted and anything past it refused with nothing deleted.
+#[tokio::test]
+async fn a_client_token_past_the_published_limit_is_refused_and_deletes_nothing() {
+    // Rows: one below the bound, the bound itself, one past it, and far past it.
+    let cases = [
+        (MAX_CLIENT_TOKEN_CHARS - 1, true),
+        (MAX_CLIENT_TOKEN_CHARS, true),
+        (MAX_CLIENT_TOKEN_CHARS + 1, false),
+        (MAX_CLIENT_TOKEN_CHARS * 4, false),
+    ];
+    for (length, accepted) in cases {
+        let case = format!("a {length}-character ClientToken");
+        let router = emulator();
+        let id = created(&router, &case, "10.6.0.0/16", &[]).await;
+        let token = "t".repeat(length);
+
+        let (status, body) = delete(
+            &router,
+            &[p("SecondaryNetworkId", id.clone()), p("ClientToken", token)],
+        )
+        .await;
+        if accepted {
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected HTTP 200, got {status} with body {body}"
+            );
+            assert_eq!(
+                elements(&body, "state"),
+                state_pair("delete-in-progress", "disassociating"),
+                "case {case:?}: expected an ordinary delete, got {body}"
+            );
+            continue;
+        }
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected HTTP 400, got {status} with body {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "InvalidParameterValue",
+            "case {case:?}: expected InvalidParameterValue, got {body}"
+        );
+        let (_, read) = describe(&router, &indexed("SecondaryNetworkId", &[&id])).await;
+        assert!(
+            !elements(&read, "state")
+                .iter()
+                .any(|state| state.starts_with("delete") || state.starts_with("disassoci")),
+            "case {case:?}: a refused delete deletes nothing, got {read}"
+        );
+    }
 }

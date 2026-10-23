@@ -105,9 +105,12 @@
 //! networks as [`SecondaryNetworkRecord`]s, the same shape of record the volume store
 //! keeps: the modelled [`SecondaryNetwork`] every operation that reports one answers with,
 //! plus the instant the clock owes the network its `create-in-progress` ->
-//! `create-complete` move. The network's `State` and the `State` of each of its IPv4 CIDR
-//! block associations are facts of its age rather than of the request, so
-//! [`SecondaryNetworkRecord::view_at`] derives both on read instead of storing them. Keyed
+//! `create-complete` move and, once a delete has asked for it, the instant it owes it its
+//! `delete-in-progress` -> `delete-complete` move. The network's `State` and the `State` of
+//! each of its IPv4 CIDR block associations are facts of its age rather than of the
+//! request, so [`SecondaryNetworkRecord::view_at`] derives both on read instead of storing
+//! them; a deleted network keeps its record, because `DescribeSecondaryNetworks` reports
+//! the delete states too. Keyed
 //! by `SecondaryNetworkId` in a [`BTreeMap`], the same stable order the VPC, subnet and
 //! volume stores are kept in, so a pagination token can name the id the next page starts
 //! at.
@@ -4760,6 +4763,27 @@ pub const SECONDARY_NETWORK_STATE_CREATE_IN_PROGRESS: &str = "create-in-progress
 /// `create-complete`.
 pub const SECONDARY_NETWORK_STATE_CREATE_COMPLETE: &str = "create-complete";
 
+/// A secondary network AWS has been asked to delete and has not finished deleting:
+/// `SecondaryNetworkState`'s `delete-in-progress`.
+pub const SECONDARY_NETWORK_STATE_DELETE_IN_PROGRESS: &str = "delete-in-progress";
+
+/// A secondary network AWS has finished deleting: `SecondaryNetworkState`'s
+/// `delete-complete`.
+///
+/// A network in either delete state is still REPORTED: `DescribeSecondaryNetworks`
+/// documents `delete-in-progress` and `delete-complete` among the values of its `state`
+/// filter (`smithy_query(query="doc",shape="DescribeSecondaryNetworksRequest",member="Filters")`),
+/// which no report could ever select on if a deleted network left the account's networks.
+pub const SECONDARY_NETWORK_STATE_DELETE_COMPLETE: &str = "delete-complete";
+
+/// The IPv4 CIDR block of a secondary network that is being deleted:
+/// `SecondaryNetworkCidrBlockAssociationState`'s `disassociating`.
+pub const SECONDARY_NETWORK_CIDR_STATE_DISASSOCIATING: &str = "disassociating";
+
+/// The IPv4 CIDR block of a secondary network that has finished being deleted:
+/// `SecondaryNetworkCidrBlockAssociationState`'s `disassociated`.
+pub const SECONDARY_NETWORK_CIDR_STATE_DISASSOCIATED: &str = "disassociated";
+
 /// An IPv4 CIDR block whose association with a secondary network is still being made:
 /// `SecondaryNetworkCidrBlockAssociationState`'s `associating`.
 pub const SECONDARY_NETWORK_CIDR_STATE_ASSOCIATING: &str = "associating";
@@ -4812,6 +4836,11 @@ pub struct SecondaryNetworkRecord {
     /// clock and never reported, so a wall-clock adjustment cannot move a network back to
     /// `create-in-progress`.
     pub create_complete_at: Instant,
+    /// The instant from which this network's `delete-in-progress` -> `delete-complete`
+    /// move is due, and `None` for a network nobody has asked to delete. Set once, by the
+    /// delete that asked for it ([`ComAmazonawsEc2Amazonec2State::begin_secondary_network_deletion`]),
+    /// and monotonic for the same reason as [`Self::create_complete_at`].
+    pub delete_complete_at: Option<Instant>,
 }
 
 impl SecondaryNetworkRecord {
@@ -4828,7 +4857,18 @@ impl SecondaryNetworkRecord {
     }
 
     /// The network's `SecondaryNetworkState` at `now`.
+    ///
+    /// A deletion that has been asked for is the only move left, so it takes precedence:
+    /// a network asked to delete while it was still being created does not report
+    /// `create-complete` once the creation's own move falls due.
     pub fn state_at(&self, now: Instant) -> &'static str {
+        if let Some(delete_complete_at) = self.delete_complete_at {
+            return if now < delete_complete_at {
+                SECONDARY_NETWORK_STATE_DELETE_IN_PROGRESS
+            } else {
+                SECONDARY_NETWORK_STATE_DELETE_COMPLETE
+            };
+        }
         if now < self.create_complete_at {
             SECONDARY_NETWORK_STATE_CREATE_IN_PROGRESS
         } else {
@@ -4838,8 +4878,16 @@ impl SecondaryNetworkRecord {
 
     /// The `SecondaryNetworkCidrBlockAssociationState` of this network's IPv4 CIDR block
     /// associations at `now`: a block is associated once the network it belongs to has
-    /// finished being created, so the two moves fall due together.
+    /// finished being created and disassociated once it has finished being deleted, so the
+    /// block's moves fall due with the network's own.
     pub fn cidr_association_state_at(&self, now: Instant) -> &'static str {
+        if let Some(delete_complete_at) = self.delete_complete_at {
+            return if now < delete_complete_at {
+                SECONDARY_NETWORK_CIDR_STATE_DISASSOCIATING
+            } else {
+                SECONDARY_NETWORK_CIDR_STATE_DISASSOCIATED
+            };
+        }
         if now < self.create_complete_at {
             SECONDARY_NETWORK_CIDR_STATE_ASSOCIATING
         } else {
@@ -4917,9 +4965,38 @@ impl ComAmazonawsEc2Amazonec2State {
             SecondaryNetworkRecord {
                 view,
                 create_complete_at: spec.create_complete_at,
+                // Nobody has asked to delete a network that is being created.
+                delete_complete_at: None,
             },
         );
         secondary_network_id
+    }
+
+    /// Start deleting the secondary network `secondary_network_id`, and answer it as the
+    /// store then holds it — `None` when the account holds no such network.
+    ///
+    /// The deletion is a CLOCK-OWED move, like the creation: the network is
+    /// `delete-in-progress` with its IPv4 CIDR block `disassociating` until
+    /// `delete_complete_at`, which is stored rather than slept for, and
+    /// [`SecondaryNetworkRecord::view_at`] derives both states from it on every read.
+    ///
+    /// The record STAYS in the store, because a network in either delete state is still
+    /// reported ([`SECONDARY_NETWORK_STATE_DELETE_COMPLETE`]) — so its caller-chosen bytes
+    /// stay charged to the store's budget, which still holds them, and it still counts
+    /// against [`MAX_SECONDARY_NETWORKS`], which bounds the records this process holds.
+    ///
+    /// A network already being deleted keeps the due instant its own delete gave it: a
+    /// repeat of the call reports the deletion already under way instead of restarting its
+    /// clock.
+    pub fn begin_secondary_network_deletion(
+        &mut self,
+        secondary_network_id: &str,
+        now: Instant,
+        delete_complete_at: Instant,
+    ) -> Option<SecondaryNetwork> {
+        let record = self.secondary_networks.get_mut(secondary_network_id)?;
+        record.delete_complete_at.get_or_insert(delete_complete_at);
+        Some(record.view_at(now))
     }
 }
 
@@ -9307,21 +9384,98 @@ pub fn unexpected_attachment_kind<E>(attachment_id: &str) -> Scaffolded<E> {
 // Writers for the resources above
 // =============================================================================
 
+/// How many records each of the stores the writers below fill holds before a writer is
+/// refused.
+///
+/// CHOSEN, like [`MAX_STORED_VPC_ENDPOINT_CONNECTIONS`] and [`MAX_STORED_DEDICATED_HOSTS`]
+/// and for the same reason: nothing in this emulator reclaims one of these records, and
+/// every write mints a FRESH id, so without a count ceiling repeated writes would grow
+/// memory without bound. ONE number for all of them because they are bounded for the same
+/// reason and at the same scale, and it is well above any published quota a test would
+/// exercise. A count ceiling is no bound on the BYTES each record holds, so every write
+/// also charges [`STORED_RECORD_OVERHEAD_BYTES`] on top of the caller-chosen text the
+/// record carries.
+pub const MAX_STORED_RECORDS_PER_STORE: usize = 4096;
+
+/// The fixed overhead one of the records the writers below store costs whatever it
+/// carries: the modelled record itself and the map entry holding it, as a CHOSEN constant
+/// in the same spirit as [`VPC_ENDPOINT_CONNECTION_RECORD_BYTES`] — the point is that a
+/// record created with no tags and no optional text is NOT free against
+/// [`MAX_STORED_BYTES`], so repeated writes advance the budget whatever they carry, not
+/// that it is byte-exact.
+pub const STORED_RECORD_OVERHEAD_BYTES: usize = 512;
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// Whether another transit gateway attachment fits inside the store's ceiling
+    /// ([`MAX_STORED_RECORDS_PER_STORE`]).
+    ///
+    /// The same contract as [`Self::has_vpc_endpoint_connection_capacity`]: a writer asks
+    /// this BEFORE storing anything and refuses the request with EC2's own quota code when
+    /// it answers `false`, and [`Self::insert_transit_gateway_attachment`] asks it again
+    /// for itself, so no path can get past the ceiling by forgetting to.
+    pub fn has_transit_gateway_attachment_capacity(&self) -> bool {
+        self.transit_gateway_attachments.len() < MAX_STORED_RECORDS_PER_STORE
+    }
+
+    /// Whether another transit gateway multicast domain fits inside the store's ceiling
+    /// ([`MAX_STORED_RECORDS_PER_STORE`]), on the contract of
+    /// [`Self::has_transit_gateway_attachment_capacity`].
+    pub fn has_transit_gateway_multicast_domain_capacity(&self) -> bool {
+        self.transit_gateway_multicast_domains.len() < MAX_STORED_RECORDS_PER_STORE
+    }
+
+    /// Whether another transit gateway route table announcement fits inside the store's
+    /// ceiling ([`MAX_STORED_RECORDS_PER_STORE`]), on the contract of
+    /// [`Self::has_transit_gateway_attachment_capacity`].
+    pub fn has_transit_gateway_route_table_announcement_capacity(&self) -> bool {
+        self.transit_gateway_route_table_announcements.len() < MAX_STORED_RECORDS_PER_STORE
+    }
+
+    /// Whether another VPC endpoint service configuration fits inside the store's ceiling
+    /// ([`MAX_STORED_RECORDS_PER_STORE`]), on the contract of
+    /// [`Self::has_transit_gateway_attachment_capacity`].
+    pub fn has_vpc_endpoint_service_capacity(&self) -> bool {
+        self.vpc_endpoint_services.len() < MAX_STORED_RECORDS_PER_STORE
+    }
+
+    /// Whether another VPC endpoint fits inside the store's ceiling
+    /// ([`MAX_STORED_RECORDS_PER_STORE`]), on the contract of
+    /// [`Self::has_transit_gateway_attachment_capacity`].
+    pub fn has_vpc_endpoint_capacity(&self) -> bool {
+        self.vpc_endpoints.len() < MAX_STORED_RECORDS_PER_STORE
+    }
+
+    /// Whether another IPAM pool fits inside the store's ceiling
+    /// ([`MAX_STORED_RECORDS_PER_STORE`]), on the contract of
+    /// [`Self::has_transit_gateway_attachment_capacity`].
+    pub fn has_ipam_pool_capacity(&self) -> bool {
+        self.ipam_pools.len() < MAX_STORED_RECORDS_PER_STORE
+    }
+}
+
 impl ComAmazonawsEc2Amazonec2State {
     /// Store a transit gateway attachment and answer the `TransitGatewayAttachmentId` it
-    /// was given.
+    /// was given — or `None` when the store is full.
     ///
     /// The id is minted here rather than taken from `view`, the way
     /// [`Self::insert_vpc_endpoint_connection`] mints a connection id, and the
-    /// caller-chosen bytes the record holds are charged here, so no path can store them
-    /// uncharged.
+    /// caller-chosen bytes the record holds are charged here on top of the fixed
+    /// [`STORED_RECORD_OVERHEAD_BYTES`] every stored record costs, so no path can store a
+    /// record uncharged and a tag-free attachment is not free against the byte budget.
+    ///
+    /// `None` means the store is at [`MAX_STORED_RECORDS_PER_STORE`] and NOTHING was
+    /// stored; a writer that sees it refuses the request with EC2's own quota code rather
+    /// than reporting an attachment it does not hold.
     pub fn insert_transit_gateway_attachment(
         &mut self,
         mut view: TransitGatewayAttachmentView,
-    ) -> String {
+    ) -> Option<String> {
+        if !self.has_transit_gateway_attachment_capacity() {
+            return None;
+        }
         let attachment_id = self.next_id(TRANSIT_GATEWAY_ATTACHMENT_ID_PREFIX);
         view.set_attachment_id(&attachment_id);
-        self.add_stored_bytes(view.payload_bytes());
+        self.add_stored_bytes(STORED_RECORD_OVERHEAD_BYTES + view.payload_bytes());
         self.transit_gateway_attachments.insert(
             attachment_id.clone(),
             TransitGatewayAttachmentRecord {
@@ -9329,20 +9483,25 @@ impl ComAmazonawsEc2Amazonec2State {
                 pending: None,
             },
         );
-        attachment_id
+        Some(attachment_id)
     }
 
     /// Store a transit gateway multicast domain and answer the
-    /// `TransitGatewayMulticastDomainId` it was given.
+    /// `TransitGatewayMulticastDomainId` it was given — or `None` when the store is at
+    /// [`MAX_STORED_RECORDS_PER_STORE`] and nothing was stored.
     pub fn insert_transit_gateway_multicast_domain(
         &mut self,
         mut record: TransitGatewayMulticastDomainRecord,
-    ) -> String {
+    ) -> Option<String> {
+        if !self.has_transit_gateway_multicast_domain_capacity() {
+            return None;
+        }
         let domain_id = self.next_id(TRANSIT_GATEWAY_MULTICAST_DOMAIN_ID_PREFIX);
         record.transit_gateway_multicast_domain_id = domain_id.clone();
         // The caller-chosen bytes a domain holds are the ids of the associations written
-        // with it, charged here like every other writer's so no path can store them
-        // uncharged.
+        // with it, charged here like every other writer's — on top of the fixed overhead
+        // the record itself costs — so no path can store them uncharged and a domain with
+        // no association is not free against the byte budget either.
         let association_bytes: usize = record
             .associations
             .iter()
@@ -9352,21 +9511,27 @@ impl ComAmazonawsEc2Amazonec2State {
                     + association.subnet_id.len()
             })
             .sum();
-        self.add_stored_bytes(association_bytes);
+        self.add_stored_bytes(STORED_RECORD_OVERHEAD_BYTES + association_bytes);
         self.transit_gateway_multicast_domains
             .insert(domain_id.clone(), record);
-        domain_id
+        Some(domain_id)
     }
 
     /// Store a transit gateway route table announcement and answer the
-    /// `TransitGatewayRouteTableAnnouncementId` it was given.
+    /// `TransitGatewayRouteTableAnnouncementId` it was given — or `None` when the store is
+    /// at [`MAX_STORED_RECORDS_PER_STORE`] and nothing was stored.
     pub fn insert_transit_gateway_route_table_announcement(
         &mut self,
         mut view: TransitGatewayRouteTableAnnouncement,
-    ) -> String {
+    ) -> Option<String> {
+        if !self.has_transit_gateway_route_table_announcement_capacity() {
+            return None;
+        }
         let announcement_id = self.next_id(TRANSIT_GATEWAY_ROUTE_TABLE_ANNOUNCEMENT_ID_PREFIX);
         view.transit_gateway_route_table_announcement_id = Some(announcement_id.clone());
-        self.add_stored_bytes(tag_list_bytes(view.tags.as_deref().unwrap_or_default()));
+        self.add_stored_bytes(
+            STORED_RECORD_OVERHEAD_BYTES + tag_list_bytes(view.tags.as_deref().unwrap_or_default()),
+        );
         self.transit_gateway_route_table_announcements.insert(
             announcement_id.clone(),
             TransitGatewayRouteTableAnnouncementRecord {
@@ -9374,30 +9539,49 @@ impl ComAmazonawsEc2Amazonec2State {
                 pending: None,
             },
         );
-        announcement_id
+        Some(announcement_id)
     }
 
     /// Store one of the account's own VPC endpoint service configurations and answer the
-    /// `ServiceId` it was given.
-    pub fn insert_vpc_endpoint_service(&mut self, mut view: ServiceConfiguration) -> String {
+    /// `ServiceId` it was given — or `None` when the store is at
+    /// [`MAX_STORED_RECORDS_PER_STORE`] and nothing was stored.
+    pub fn insert_vpc_endpoint_service(
+        &mut self,
+        mut view: ServiceConfiguration,
+    ) -> Option<String> {
+        if !self.has_vpc_endpoint_service_capacity() {
+            return None;
+        }
         let service_id = self.next_id(VPC_ENDPOINT_SERVICE_ID_PREFIX);
         view.service_id = Some(service_id.clone());
-        self.add_stored_bytes(tag_list_bytes(view.tags.as_deref().unwrap_or_default()));
+        self.add_stored_bytes(
+            STORED_RECORD_OVERHEAD_BYTES + tag_list_bytes(view.tags.as_deref().unwrap_or_default()),
+        );
         self.vpc_endpoint_services.insert(service_id.clone(), view);
-        service_id
+        Some(service_id)
     }
 
-    /// Store a VPC endpoint and answer the `VpcEndpointId` it was given.
-    pub fn insert_vpc_endpoint(&mut self, mut view: VpcEndpoint) -> String {
+    /// Store a VPC endpoint and answer the `VpcEndpointId` it was given — or `None` when
+    /// the store is at [`MAX_STORED_RECORDS_PER_STORE`] and nothing was stored.
+    pub fn insert_vpc_endpoint(&mut self, mut view: VpcEndpoint) -> Option<String> {
+        if !self.has_vpc_endpoint_capacity() {
+            return None;
+        }
         let endpoint_id = self.next_id(VPC_ENDPOINT_ID_PREFIX);
         view.vpc_endpoint_id = Some(endpoint_id.clone());
-        self.add_stored_bytes(tag_list_bytes(view.tags.as_deref().unwrap_or_default()));
+        self.add_stored_bytes(
+            STORED_RECORD_OVERHEAD_BYTES + tag_list_bytes(view.tags.as_deref().unwrap_or_default()),
+        );
         self.vpc_endpoints.insert(endpoint_id.clone(), view);
-        endpoint_id
+        Some(endpoint_id)
     }
 
-    /// Store an IPAM pool and answer the `IpamPoolId` it was given.
-    pub fn insert_ipam_pool(&mut self, mut view: IpamPool) -> String {
+    /// Store an IPAM pool and answer the `IpamPoolId` it was given — or `None` when the
+    /// store is at [`MAX_STORED_RECORDS_PER_STORE`] and nothing was stored.
+    pub fn insert_ipam_pool(&mut self, mut view: IpamPool) -> Option<String> {
+        if !self.has_ipam_pool_capacity() {
+            return None;
+        }
         let pool_id = self.next_id(IPAM_POOL_ID_PREFIX);
         view.ipam_pool_id = Some(pool_id.clone());
         view.ipam_pool_arn = Some(::engine::emulator_arn(
@@ -9406,11 +9590,12 @@ impl ComAmazonawsEc2Amazonec2State {
             &format!("ipam-pool/{pool_id}"),
         ));
         self.add_stored_bytes(
-            tag_list_bytes(view.tags.as_deref().unwrap_or_default())
+            STORED_RECORD_OVERHEAD_BYTES
+                + tag_list_bytes(view.tags.as_deref().unwrap_or_default())
                 + view.description.as_deref().unwrap_or_default().len(),
         );
         self.ipam_pools.insert(pool_id.clone(), view);
-        pool_id
+        Some(pool_id)
     }
 }
 

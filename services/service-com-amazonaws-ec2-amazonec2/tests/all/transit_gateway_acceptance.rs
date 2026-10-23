@@ -178,7 +178,8 @@ async fn accepting_an_attachment_of_each_kind_moves_it_towards_available() {
         let attachment_id = engine
             .state::<Ec2State>()
             .lock()
-            .insert_transit_gateway_attachment((kind.view)());
+            .insert_transit_gateway_attachment((kind.view)())
+            .expect("the store holds the seeded attachment");
         assert_eq!(
             stored_state(&engine, &attachment_id),
             kind.pending_acceptance,
@@ -249,7 +250,8 @@ async fn rejecting_a_vpc_attachment_moves_it_towards_rejected_and_rules_out_acce
     let attachment_id = engine
         .state::<Ec2State>()
         .lock()
-        .insert_transit_gateway_attachment(pending_vpc_attachment());
+        .insert_transit_gateway_attachment(pending_vpc_attachment())
+        .expect("the store holds the seeded attachment");
 
     let (status, body) = invoke(
         &router,
@@ -325,7 +327,9 @@ async fn an_attachment_of_another_kind_is_not_found_for_this_operation() {
             .map(|kind| {
                 (
                     kind.accept.to_string(),
-                    guard.insert_transit_gateway_attachment((kind.view)()),
+                    guard
+                        .insert_transit_gateway_attachment((kind.view)())
+                        .expect("the store holds the seeded attachment"),
                 )
             })
             .collect()
@@ -360,7 +364,8 @@ async fn a_dry_run_leaves_an_acceptable_attachment_untouched() {
     let attachment_id = engine
         .state::<Ec2State>()
         .lock()
-        .insert_transit_gateway_attachment(pending_vpc_attachment());
+        .insert_transit_gateway_attachment(pending_vpc_attachment())
+        .expect("the store holds the seeded attachment");
 
     let mut dry_run = attachment_param(&attachment_id);
     dry_run.push(("DryRun".to_string(), "true".to_string()));
@@ -428,7 +433,11 @@ fn seed_multicast_domain(engine: &engine::InMemoryEngine) -> (String, Vec<String
     let store = engine.state::<Ec2State>();
     let mut guard = store.lock();
     let attachments: Vec<String> = (0..2)
-        .map(|_| guard.insert_transit_gateway_attachment(pending_vpc_attachment()))
+        .map(|_| {
+            guard
+                .insert_transit_gateway_attachment(pending_vpc_attachment())
+                .expect("the store holds the seeded attachment")
+        })
         .collect();
     let associations = association_fixtures()
         .into_iter()
@@ -449,7 +458,8 @@ fn seed_multicast_domain(engine: &engine::InMemoryEngine) -> (String, Vec<String
         // The `TransitGatewayMulticastDomainState` enum's `available` member.
         state: "available".to_string(),
         associations,
-    });
+    })
+    .expect("the store holds the seeded multicast domain");
     (domain_id, attachments)
 }
 
@@ -596,7 +606,8 @@ async fn an_unassociated_subnet_or_attachment_is_refused() {
     let stranger = engine
         .state::<Ec2State>()
         .lock()
-        .insert_transit_gateway_attachment(pending_vpc_attachment());
+        .insert_transit_gateway_attachment(pending_vpc_attachment())
+        .expect("the store holds the seeded attachment");
 
     // A subnet of another attachment's association, and one nothing associated at all.
     for subnet in ["subnet-0000000000000000d", "subnet-0000000000000000e"] {
@@ -678,7 +689,8 @@ async fn deleting_a_route_table_announcement_moves_it_towards_deleted() {
             state: Some(ANNOUNCEMENT_STATE_AVAILABLE.to_string()),
             tags: Some(vec![tag("Name", "announcement")]),
             ..Default::default()
-        });
+        })
+        .expect("the store holds the seeded announcement");
     let params = vec![(
         "TransitGatewayRouteTableAnnouncementId".to_string(),
         announcement_id.clone(),
