@@ -45,6 +45,8 @@ mod role_policy_removal;
 mod role_tags;
 #[path = "all/service_linked_roles.rs"]
 mod service_linked_roles;
+#[path = "all/service_provisioned_roles.rs"]
+mod service_provisioned_roles;
 #[path = "all/service_specific_credentials.rs"]
 mod service_specific_credentials;
 #[path = "all/state_roundtrip.rs"]

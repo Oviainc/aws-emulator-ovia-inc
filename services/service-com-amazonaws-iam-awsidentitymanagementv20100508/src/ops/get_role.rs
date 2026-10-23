@@ -149,8 +149,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         // A read: it reports the stored role and writes nothing.
-        let store = state.lock();
-
+        //
         // IAM entity names "are not distinguished by case", so the request finds
         // the role under the case-folded name whatever case it spelled it in, and
         // the response reports the role as the account holds it.
@@ -158,15 +157,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The stored `AssumeRolePolicyDocument` is reported verbatim, as this
         // crate's `GetUserPolicy` reports a stored inline policy: a document is
         // handed back exactly as it was persisted.
-        match store.roles.get(&crate::state::name_key(&input.role_name)) {
-            Some(role) => Ok(GetRoleOutput { role: role.clone() }),
-            None => Err(GetRoleErrorModeled::NoSuchEntityException(NoSuchEntityException {
+        //
+        // The guard is scoped to the state access alone: what follows reads no
+        // state.
+        let stored = {
+            let store = state.lock();
+            store
+                .roles
+                .get(&crate::state::name_key(&input.role_name))
+                .cloned()
+        };
+        if let Some(role) = stored {
+            return Ok(GetRoleOutput { role });
+        }
+
+        // The account holds no record of its own under that name. A role name AWS
+        // PUBLISHES for a service still names a role: a service-linked role is
+        // predefined and controlled by the service rather than by the account, and
+        // the service keeps it provisioned for an account that uses the service — so
+        // this read reports THAT role (`crate::state::service_provisioned_role`)
+        // instead of claiming nothing by that name exists.
+        if let Some(role) = crate::state::service_provisioned_role(&input.role_name) {
+            return Ok(GetRoleOutput { role });
+        }
+
+        // Neither the account nor any service holds a role under that name, so it
+        // refers to no entity at all.
+        Err(
+            GetRoleErrorModeled::NoSuchEntityException(NoSuchEntityException {
                 message: Some(format!(
                     "The role with name {} cannot be found.",
                     input.role_name
                 )),
             })
-            .into()),
-        }
+            .into(),
+        )
     }
 }
