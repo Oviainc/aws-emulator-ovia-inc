@@ -21,13 +21,17 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Mint the UUID `SearchJobIdentifier`/`ExportJobIdentifier` this service hands out
+# (`state::new_uuid`), which is the identifier shape its recordings show: `sha2` digests
+# the entropy behind the 128 bits and `hex` renders them. Both were already declared for
+# this crate, and this is how the services beside it mint a UUID-shaped id (see
+# `service-com-amazonaws-batch-awsbatchv20160810`'s `state::new_uuid`), so the fix needs
+# no new crate and leaves the workspace lockfile alone.
+sha2 = { workspace = true }
+hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
-
-[dev-dependencies]
-sha2 = { workspace = true }
-hex = { workspace = true }
 
 [lints]
 workspace = true

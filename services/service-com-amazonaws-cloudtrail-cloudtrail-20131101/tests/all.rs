@@ -43,6 +43,8 @@ mod insights_metric_data;
 mod lake_queries;
 #[path = "all/query_cancellation.rs"]
 mod query_cancellation;
+#[path = "all/resource_policies.rs"]
+mod resource_policies;
 #[path = "all/resource_tagging.rs"]
 mod resource_tagging;
 #[path = "all/state_roundtrip.rs"]

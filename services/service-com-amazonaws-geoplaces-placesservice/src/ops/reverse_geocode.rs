@@ -255,6 +255,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let features = input.additional_features.as_deref().unwrap_or_default();
         let wants = |feature: &str| features.iter().any(|asked| asked == feature);
+        // "A list of BCP 47 compliant language codes for the results to be rendered
+        // in. If there is no data for the result in the requested language, data
+        // will be returned in the default language for the entry."
+        let language = input.language.as_deref();
         let political_view = match crate::state::resolve_political_view(
             input.political_view.as_deref(),
         ) {
@@ -272,8 +276,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ReverseGeocodeResultItem {
                     place_id: place.place_id.clone(),
                     place_type: place.place_type.clone(),
-                    title: place.title_modeled_in(view),
-                    address: Some(place.address_modeled_in(view)),
+                    // The result text is rendered in the requested `Language`,
+                    // falling back to the entry's own.
+                    title: place.title_modeled_in(view, language),
+                    address: Some(place.address_modeled_in(view, language)),
                     position: Some(place.position_modeled()),
                     distance: candidate.distance,
                     map_view: Some(place.map_view_modeled()),

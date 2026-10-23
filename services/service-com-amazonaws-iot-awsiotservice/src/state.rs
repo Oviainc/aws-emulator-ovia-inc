@@ -33,6 +33,12 @@
 //! the `@httpLabel` of `/rules/{ruleName}`. One record carries everything a reader
 //! hands back, so `GetTopicRule` after `CreateTopicRule` returns the created rule
 //! member-for-member.
+//!
+//! Finally it holds the account's COMMANDS, keyed by `commandId` ("A unique
+//! identifier for the command", and the `@httpLabel` of `/commands/{commandId}`),
+//! whose EXISTENCE the IoT Jobs data plane also needs — `StartCommandExecution`
+//! refuses an execution of a command nobody created — so every recorded command's
+//! ARN is registered in the shared index as well (see [`command_registry`]).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::SystemTime;
@@ -40,7 +46,19 @@ use std::time::SystemTime;
 use service_common::iot_job_executions::{is_modeled_thing_name, JobExecutionStore};
 use sha2::{Digest, Sha256};
 
-use crate::ops::types::{Action, TopicRule, TopicRulePayload};
+use crate::ops::types::{
+    Action, CommandParameter, CommandPayload, CommandPreprocessor, GetCommandOutput, TopicRule,
+    TopicRulePayload,
+};
+
+/// The shared index of which IoT COMMANDS exist, which the IoT Jobs data plane's
+/// `StartCommandExecution` validates its `commandArn` against.
+///
+/// Re-exported here for the same reason the job-execution store is: a command is
+/// created by THIS control plane (`CreateCommand`) and read by the data plane, the
+/// engine keys state by TYPE, and a store two service crates share has to be declared
+/// in a crate they both depend on. See `service_common::iot_commands`.
+pub use ::service_common::iot_commands;
 
 /// The configuration of a thing: the members of a `CreateThing` request that
 /// describe the thing rather than name it.
@@ -329,6 +347,22 @@ pub struct ComAmazonawsIotAwsiotserviceState {
     /// A caller grows this store, so it is bounded: [`MAX_TOPIC_RULES`] is the
     /// ceiling `CreateTopicRule` refuses past.
     pub topic_rules: BTreeMap<String, RegisteredTopicRule>,
+    /// Every command that exists, keyed by `commandId`.
+    ///
+    /// The id is the command's identity — `CreateCommand$commandId` is "A unique
+    /// identifier for the command" and the model binds it as the `@httpLabel` of
+    /// `/commands/{commandId}` on every single-command operation — so a `BTreeMap`
+    /// keyed by id is the command store itself. `BTreeMap` (not `HashMap`) because
+    /// `ListCommands` is `@paginated` and a page boundary is only meaningful over a
+    /// stable order.
+    ///
+    /// The command's EXISTENCE is also needed outside this crate, by the IoT Jobs
+    /// data plane's `StartCommandExecution`, so the ARN of every command recorded
+    /// here is registered in the shared index as well ([`command_registry`]); this
+    /// map is the command's record, that index is the cross-service answer to "does
+    /// this command exist?". Both are bounded by
+    /// [`iot_commands::MAX_REGISTERED_COMMANDS`].
+    pub commands: BTreeMap<String, RegisteredCommand>,
 }
 
 impl ComAmazonawsIotAwsiotserviceState {
@@ -697,6 +731,128 @@ impl RegisteredTopicRule {
     }
 }
 
+/// The ARN of a command: `arn:aws:iot:<region>:<account>:command/<commandId>`.
+///
+/// `command/` is the resource type AWS IoT's command ARNs use —
+/// `CreateCommand$commandArn` documents "The Amazon Resource Number (ARN) of the
+/// command. For example, arn:aws:iot:::command/" — and it is the form the IoT Jobs
+/// data plane's `StartCommandExecution$commandArn` names a command by; the namespace
+/// and account segments are the ones [`thing_arn`] documents.
+pub fn command_arn(region: &str, command_id: &str) -> String {
+    ::emulator_server::emulator_arn("iot", region, &format!("command/{command_id}"))
+}
+
+/// One command in the control plane, as this service persists it.
+///
+/// It holds the create request's members as the command then HAS them, so a reader
+/// (`GetCommand`) clones what the writer stored and the two cannot drift. The
+/// lifecycle flags are part of the record rather than of the request: a created
+/// command is neither deprecated nor being deleted, and `UpdateCommand` /
+/// `DeleteCommand` (their own operations) are what move them.
+#[derive(Debug, Clone)]
+pub struct RegisteredCommand {
+    /// The id the command was created under; also its key in the store.
+    pub command_id: String,
+    /// `arn:aws:iot:<region>:<account>:command/<commandId>`, minted on create.
+    pub command_arn: String,
+    /// The namespace the command was created in, when the request named one. Stored
+    /// as supplied: the model gives `CommandNamespace` no default, so a command
+    /// created without one reports none rather than a namespace nobody asked for.
+    pub namespace: Option<String>,
+    /// `displayName` as supplied, when the request carried one.
+    pub display_name: Option<String>,
+    /// `description` as supplied, when the request carried one.
+    pub description: Option<String>,
+    /// The static payload the command was created with, when it has one.
+    pub payload: Option<CommandPayload>,
+    /// The dynamic command's payload template, when it has one.
+    pub payload_template: Option<String>,
+    /// How `payloadTemplate` is processed, when the request carried a preprocessor.
+    pub preprocessor: Option<CommandPreprocessor>,
+    /// The parameters `StartCommandExecution` must supply, in the order the request
+    /// listed them. `None` — never an empty list — when the request carried none:
+    /// `CommandParameterList` is modelled `len 1..`, so an empty list is not a value
+    /// a response may carry.
+    pub mandatory_parameters: Option<Vec<CommandParameter>>,
+    /// The IAM role the command uses to build its payload, when it has one.
+    pub role_arn: Option<String>,
+    /// `Tag$Key` -> `Tag$Value` for the tags the create request carried. Tags "are
+    /// used as metadata to manage a command" rather than describe it, so they are
+    /// kept beside the command instead of inside its configuration.
+    pub tags: BTreeMap<String, Option<String>>,
+    /// When the command was created — `GetCommand$createdAt`, "The timestamp, when
+    /// the command was created".
+    pub created_at: SystemTime,
+    /// When the command was last written — `GetCommand$lastUpdatedAt`. On a freshly
+    /// created command this is the instant it was created: the create IS its last
+    /// write.
+    pub last_updated_at: SystemTime,
+    /// Whether the command has been deprecated (`UpdateCommand$deprecated`). A
+    /// created command is not.
+    pub deprecated: bool,
+    /// Whether the command is being deleted (`GetCommand$pendingDeletion`,
+    /// "Indicates whether the command is being deleted"). A created command is not.
+    pub pending_deletion: bool,
+}
+
+impl RegisteredCommand {
+    /// A newly created command: the minted identity and creation instant plus the
+    /// members the request carried, with the lifecycle flags at what a created
+    /// command has.
+    pub fn new(
+        command_id: String,
+        command_arn: String,
+        created_at: SystemTime,
+        input: &crate::ops::types::CreateCommandInput,
+    ) -> Self {
+        Self {
+            command_id,
+            command_arn,
+            namespace: input.namespace.clone(),
+            display_name: input.display_name.clone(),
+            description: input.description.clone(),
+            payload: input.payload.clone(),
+            payload_template: input.payload_template.clone(),
+            preprocessor: input.preprocessor.clone(),
+            mandatory_parameters: input.mandatory_parameters.clone(),
+            role_arn: input.role_arn.clone(),
+            tags: input
+                .tags
+                .iter()
+                .flatten()
+                .map(|tag| (tag.key.clone(), tag.value.clone()))
+                .collect(),
+            created_at,
+            last_updated_at: created_at,
+            deprecated: false,
+            pending_deletion: false,
+        }
+    }
+
+    /// The command as the modelled `GetCommandResponse` a reader hands back.
+    ///
+    /// A reader clones what the writer stored, so `GetCommand` after `CreateCommand`
+    /// reports the created command member-for-member and the two cannot drift.
+    pub fn view(&self) -> GetCommandOutput {
+        GetCommandOutput {
+            command_id: Some(self.command_id.clone()),
+            command_arn: Some(self.command_arn.clone()),
+            namespace: self.namespace.clone(),
+            display_name: self.display_name.clone(),
+            description: self.description.clone(),
+            mandatory_parameters: self.mandatory_parameters.clone(),
+            payload: self.payload.clone(),
+            payload_template: self.payload_template.clone(),
+            preprocessor: self.preprocessor.clone(),
+            role_arn: self.role_arn.clone(),
+            created_at: Some(::aws_smithy_types::DateTime::from(self.created_at)),
+            last_updated_at: Some(::aws_smithy_types::DateTime::from(self.last_updated_at)),
+            deprecated: Some(self.deprecated),
+            pending_deletion: Some(self.pending_deletion),
+        }
+    }
+}
+
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
 ///
 /// Answer `None` with a modelled server error, never with a fresh engine.
@@ -729,4 +885,28 @@ pub fn job_execution_store<Eng: Send + Sync + 'static>(
     (engine as &dyn ::std::any::Any)
         .downcast_ref::<::engine::InMemoryEngine>()
         .map(::engine::InMemoryEngine::state::<JobExecutionStore>)
+}
+
+/// The SHARED index of which IoT commands exist, in the shared engine: call it with a
+/// handler's `&*self.engine`.
+///
+/// A command is created here (`CreateCommand`) and read by the IoT Jobs data plane
+/// (`StartCommandExecution` refuses an execution of a command that does not exist), so
+/// it is ONE index under one shared type —
+/// `service_common::iot_commands::IotCommandRegistry` — and not a second copy inside
+/// [`ComAmazonawsIotAwsiotserviceState`]: the engine keys state by TYPE, so a copy of
+/// its own here would be invisible to the data plane.
+///
+/// LOCK ORDER, for an operation that writes BOTH stores: take [`service_state`] first
+/// and this one second (`CreateCommand` does). The data plane takes its own store and
+/// then this one, so that order has no inversion — keep it if another writer of both
+/// is added.
+///
+/// Answer `None` with a modelled server error, never with a fresh engine.
+pub fn command_registry<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+) -> Option<::engine::ServiceState<iot_commands::IotCommandRegistry>> {
+    (engine as &dyn ::std::any::Any)
+        .downcast_ref::<::engine::InMemoryEngine>()
+        .map(::engine::InMemoryEngine::state::<iot_commands::IotCommandRegistry>)
 }

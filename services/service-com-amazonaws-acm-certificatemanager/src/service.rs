@@ -17,19 +17,21 @@
 //! own behaviour, so an unedited service still routes and answers correctly:
 //!
 //! - `can_handle` — which requests this service claims. The default matches the
-//!   request's resolved route key against this service's signing name. Edit it
-//!   for anything the model does not express: a signing name shared by several
-//!   services, or routing that keys on the access-key id.
+//!   request's resolved route key against this service's signing name. EDITED HERE: it
+//!   also claims a request addressed to an ACME enrollment host (see "The ACME HTTP
+//!   surface" below).
 //! - `override_operation` — serve a request the model's routing key cannot name
-//!   correctly. The default returns `None`, so every request resolves through the
-//!   generated routing table. Return `Some(op)` to route one yourself.
+//!   correctly. EDITED HERE: a request to a published ACME URL that presents a SigV4
+//!   credential is named as an operation, so the router verifies that credential before
+//!   anything is served. Every other request resolves through the generated routing
+//!   table.
 //! - `override_refusal` — how this service words a request the framework refused
 //!   before any handler ran. The default returns `None`, keeping the framework's
 //!   wording. See the inline note on that method for how to reword.
 //! - `override_routing_error` — how this service words a request that reached it
-//!   but named no modeled operation. The default returns `None`, so the entry
-//!   renders the protocol-correct default (query -> 400 InvalidAction, awsJson ->
-//!   404, …). Return `Some(resp)` to answer in your own envelope if desired.
+//!   but named no modeled operation. EDITED HERE: that is what an unsigned ACME client's
+//!   request to a published ACME URL is, by construction, and this is where it is
+//!   served. Anything else keeps the protocol-correct default (awsJson -> 404).
 //! - `override_framework_error` — how this service words a transport-level
 //!   failure the orchestrator detects up front (e.g. a malformed `aws-chunked`
 //!   body). The default returns `None`, keeping the entry's protocol-correct
@@ -39,6 +41,39 @@
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
+//!
+//! ## The ACME HTTP surface
+//!
+//! ACM publishes two kinds of hostname. The CONTROL plane is
+//! `acm.<region>.amazonaws.com`, whose first label names the service, and that is what
+//! the framework's route key resolves. Beside it, every managed ACME endpoint is given
+//! a URL on the Region's ACME ENROLLMENT host,
+//! `acm-acme-enroll.<region>.amazonaws.com` ([`crate::state::acme_endpoint_url`]),
+//! which is the URL `AcmeEndpoint$EndpointUrl` hands an ACME client and the address
+//! that client is configured with. A request to it has to reach THIS service rather
+//! than the control-plane resolver, which cannot name a service from the enrollment
+//! label and answers `404 UnknownService` — for a URL this service handed out.
+//!
+//! Three seams carry it, and nothing else changes:
+//!
+//! - [`Service::can_handle`] also claims a request whose host is an enrollment host
+//!   ([`acme_http::enrollment_region_of_parts`]), which is what routes it here at all.
+//! - [`Service::override_routing_error`] serves the request that presents NO
+//!   credential. An ACME client holds none, and an ACME interaction names no modelled
+//!   operation by construction, so the router reaches exactly this seam for it — BEFORE
+//!   authentication, which is what lets an unsigned ACME client be answered at all.
+//! - [`Service::override_operation`] serves the request that DOES present a SigV4
+//!   credential, through the same [`acme_http::AcmeHttpSurface`]. The router
+//!   authenticates whatever it names an operation for, so naming one here is what puts
+//!   the emulator's own signature verification in front of a credentialed request to a
+//!   published URL — the same verification a control-plane request gets, rather than a
+//!   second signature check written into this service.
+//!
+//! What is served on that surface — the RFC 8555 directory, a fresh nonce, and a `501`
+//! problem document for the JWS interactions this emulator cannot perform — is
+//! documented in [`acme_http`].
+
+pub mod acme_http;
 
 use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service, Violation, ViolationKind,
@@ -239,6 +274,12 @@ fn constraint_envelope(violations: &[Violation]) -> Option<String> {
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// Serves the ACME HTTP surface an ACME endpoint publishes — the wire its
+    /// `EndpointUrl` advertises. Held on the service because
+    /// [`Service::override_operation`] hands the router a BORROW of one of its own
+    /// operations, and it owns the shared engine so every answer is computed from the
+    /// same store the control-plane handlers write.
+    acme_http: acme_http::AcmeHttpSurface<Eng>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -247,6 +288,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
+            acme_http: acme_http::AcmeHttpSurface::new(Arc::clone(&engine)),
             entry: crate::ServiceDefinition::new(engine),
         }
     }
@@ -261,24 +303,37 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn can_handle(&self, parts: &http::request::Parts) -> bool {
-        // Claim a request whose resolved route key is this service's signing
-        // name. Edit this for anything the model does not express — a signing
-        // name shared by several services, or access-key-id-based routing.
-        match smithy_server_runtime::resolve_route_key(parts) {
-            Some(key) => key == self.entry.identity().signing_name(),
-            None => false,
+        // A request whose resolved route key is this service's signing name is the
+        // control plane, exactly as the framework's default claims it.
+        if smithy_server_runtime::resolve_route_key(parts)
+            .is_some_and(|key| key == self.entry.identity().signing_name())
+        {
+            return true;
         }
+        // And a request addressed to an ACME enrollment host, the hostname this service
+        // PUBLISHES in every ACME endpoint's `EndpointUrl`, whose first label is not
+        // this service's signing name and which no route key can therefore name. See
+        // the module docs: without this the router answers `404 UnknownService` for a
+        // URL this service handed out.
+        acme_http::enrollment_region_of_parts(parts).is_some()
     }
 
     fn override_operation(
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // Return `Some(op)` to serve a request the model's routing key cannot name
-        // correctly; `None` (the default) lets the generated routing table resolve
-        // it. `req` is the whole request, so a decision that depends on the body —
-        // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
+        // A request to a published ACME URL that PRESENTS a SigV4 credential is named as
+        // an operation, so the router verifies that credential's signature before
+        // anything is served — the router authenticates only what it names an operation
+        // for. A request carrying NO credential is left unnamed on purpose: it is
+        // answered by `override_routing_error` below, which the router reaches before
+        // authentication, so an ACME client — which holds no AWS credential at all —
+        // still gets this service's own answer rather than the emulator's "sign this
+        // request".
+        if acme_http::carries_sigv4_credential(req) && acme_http::addresses_acme_surface(req) {
+            return Some(&self.acme_http);
+        }
+        // Everything else resolves through the generated routing table.
         None
     }
 
@@ -312,13 +367,14 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<aws_smithy_runtime_api::http::Response> {
         // The router calls this when a request reached this service but named no
-        // modeled operation — neither `override_operation` nor the generated
-        // routing table resolved it. Returning `None` renders the protocol-correct
-        // default for this service's envelope (query -> 400 InvalidAction text/xml,
-        // awsJson -> 404, rpcv2Cbor -> 404, rest -> 501). Return `Some(resp)` to
-        // word that routing failure in your own envelope instead.
-        let _ = req;
-        None
+        // modeled operation — neither `override_operation` nor the generated routing
+        // table resolved it. An ACME interaction is exactly that case by construction:
+        // it carries no `X-Amz-Target` and no modelled operation serves its path, and
+        // an ACME client presents no credential (`override_operation` names an
+        // operation only for the credentialed ones), so this is where an unsigned
+        // client's fetch of a published ACME URL is served. Anything else keeps the
+        // framework's protocol-correct default (awsJson -> 404).
+        acme_http::addresses_acme_surface(req).then(|| self.acme_http.serve(req))
     }
 
     fn override_framework_error(

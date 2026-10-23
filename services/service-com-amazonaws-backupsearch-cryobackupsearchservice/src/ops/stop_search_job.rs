@@ -1,16 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StopSearchJob
-//! Ends a running search job. The model's own documentation is the rule: "Only a
-//! search job with a status of `RUNNING` can be stopped" — so a job in a status it
-//! never leaves (`COMPLETED`, `STOPPED`, `FAILED`) is a `ConflictException` (409), and
-//! an identifier this account holds no job for is a `ResourceNotFoundException` (404).
+//! Ends a running search job. The operation is `@idempotent` and asks for ONE end state,
+//! the job stopped, so a job that is already `STOPPED` (or `STOPPING`) answers the
+//! modelled empty 200 and changes nothing: a retry of a safe-to-retry operation is never
+//! a caller-visible failure. A job that ended in a status this operation does not
+//! produce (`COMPLETED`, `FAILED`) can no longer be stopped and is a
+//! `ConflictException` (409), and an identifier this account holds no job for is a
+//! `ResourceNotFoundException` (404).
 //!
 //! A stop moves the job to `STOPPING`, the transient status, and the clock owes it
 //! `STOPPED` — so a `GetSearchJob` straight after this call observes the stop in
-//! progress and a later one observes it finished, with its `CompletionTime`. Because
-//! the operation is `@idempotent`, a repeat while the job is already `STOPPING` is a
-//! success that changes nothing rather than a conflict.
+//! progress and a later one observes it finished, with its `CompletionTime`.
 //!
 //! ## Shape of an operation
 //!
@@ -175,6 +176,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ))
         })?;
 
+        // Already stopped, or already stopping: the end state this call asks for is the
+        // one the job is in or is on its way to, and the operation is `@idempotent`, so
+        // the repeat is a no-op success and the due instant stays where it is. This is
+        // what makes an SDK retry, or a caller's own "ensure stopped", safe to re-send.
+        if job.is_stop_satisfied() {
+            return Ok(StopSearchJobOutput {});
+        }
+
+        // A job that ended in a status this operation does not produce cannot be stopped
+        // at all: the request asks for a transition the record can no longer make.
         if job.is_terminal() {
             return Err(StopSearchJobErrorModeled::ConflictException(ConflictException {
                 message: format!(
@@ -187,14 +198,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // Already stopping: the end state this call asks for is the one in flight, and
-        // the operation is `@idempotent`, so leave the due instant where it is.
-        if job.status == crate::state::STOPPING {
-            return Ok(StopSearchJobOutput {});
-        }
-
         job.status = crate::state::STOPPING.to_string();
-        job.next_status_due = Some((now + crate::state::TRANSITION_DELAY, crate::state::STOPPED));
+        job.next_status_due = Some((
+            now + crate::state::TRANSITION_DELAY,
+            crate::state::STOPPED,
+            None,
+        ));
         Ok(StopSearchJobOutput {})
     }
 }

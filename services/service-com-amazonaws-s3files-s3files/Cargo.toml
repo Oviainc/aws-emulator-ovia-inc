@@ -26,6 +26,13 @@ tracing = { workspace = true }
 sha2 = { workspace = true }
 # Hex codec for those ids and for the opaque `nextToken` the listings issue.
 hex = { workspace = true }
+# The AWS SDK for S3, driven over the in-process callback
+# (`OperationContext::callback`) the way `scheduler` drives the IAM SDK:
+# `CreateFileSystem` resolves the bucket its `bucket` ARN names with `HeadBucket` before
+# it persists a file system. Only the generated client is needed — the emulator supplies
+# the transport and the credentials, so the SDK's own HTTPS stack and runtime are left
+# out.
+aws-sdk-s3 = { version = "1", default-features = false }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeStaleSecurityGroups
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeStaleSecurityGroups`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeStaleSecurityGroups::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the STALE rules of the security groups of one VPC out of [`crate::state`]: a
+//! rule is stale when the security group it references cannot be resolved to a live group
+//! reachable from the VPC that holds the rule. A reporting operation only — it writes
+//! nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +144,205 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeStaleSecurityGroups` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeStaleSecurityGroupsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeStaleSecurityGroups"))
+        // `ctx` carries request metadata only; this operation reads none of it. The store
+        // is reached through the engine held on `self`.
+        let _ = ctx;
+
+        // "Checks whether you have the required permissions for the action, without
+        // actually making the request, and provides an error response. If you have the
+        // required permissions, the error response is DryRunOperation"
+        // (`DescribeStaleSecurityGroupsRequest$DryRun`). Every caller of this emulator is
+        // permitted, so a dry run reports that outcome and reads nothing.
+        if input.dry_run.unwrap_or(false) {
+            return Err(crate::state::dry_run_operation());
+        }
+
+        let state = crate::state::require_service_state(&*self.engine)?;
+
+        // "The token returned from a previous paginated request"
+        // (`DescribeStaleSecurityGroupsRequest$NextToken`) — anything else is refused
+        // rather than read as an id, and it is refused before any other member is looked
+        // at, so whether a bogus token is caught never depends on the rest of the request.
+        let start_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(
+                crate::state::decode_page_token(token)
+                    .ok_or_else(|| crate::state::invalid_pagination_token_for(token))?,
+            ),
+        };
+
+        let store = state.lock();
+
+        // "The ID of the VPC" (`DescribeStaleSecurityGroupsRequest$VpcId`, required): a VPC
+        // the account does not have is an error, not an empty report — the same refusal
+        // every operation of this crate that resolves a `VpcId` answers.
+        if !store.vpcs.contains_key(&input.vpc_id) {
+            return Err(crate::state::invalid_vpc_id_not_found(&input.vpc_id));
+        }
+
+        // "Describes a stale security group (a security group that contains stale rules)"
+        // (`StaleSecurityGroup`): a group of this VPC is reported only when at least one of
+        // its rules is stale, and it is reported with only the stale part of each.
+        let mut stale: Vec<StaleSecurityGroup> = store
+            .security_groups
+            .values()
+            .filter(|group| group.vpc_id.as_deref() == Some(input.vpc_id.as_str()))
+            .filter_map(|group| stale_view(&store, group))
+            .collect();
+
+        // Page in `GroupId` order, which the cursor below names a position in. The store is
+        // an ordered map, so its iteration order already satisfies this sort; doing it here
+        // establishes the invariant the cursor depends on at the point of use rather than
+        // inheriting it from the container `crate::state` happens to hold.
+        stale.sort_by(|left, right| left.group_id.cmp(&right.group_id));
+
+        // That order is both the stable paging order and the cursor, so a token naming the
+        // id the next page starts at always advances.
+        let from = match start_at.as_deref() {
+            None => 0,
+            Some(cursor) => {
+                stale.partition_point(|group| group.group_id.as_deref().unwrap_or_default() < cursor)
+            }
+        };
+        let page = stale.get(from..).unwrap_or_default();
+
+        // "The maximum number of items to return for this request. To get the next page of
+        // items, make another request with the token returned in the output"
+        // (`DescribeStaleSecurityGroupsRequest$MaxResults`) — a request that names none is
+        // not paged at all. The model's `range 5..255` has already refused anything outside
+        // it, so the only value that cannot convert is one the boundary validator would
+        // have rejected.
+        let limit = input
+            .max_results
+            .and_then(|max_results| usize::try_from(max_results).ok())
+            .unwrap_or(page.len());
+
+        // "This value is null when there are no more items to return"
+        // (`DescribeStaleSecurityGroupsResult$NextToken`): a token only when a stale group
+        // follows this page.
+        let next_token = page
+            .get(limit)
+            .and_then(|group| group.group_id.as_deref())
+            .map(crate::state::encode_page_token);
+
+        Ok(DescribeStaleSecurityGroupsOutput {
+            stale_security_group_set: Some(page.iter().take(limit).cloned().collect()),
+            next_token,
+        })
     }
+}
+
+/// The stale report for one security group, or `None` when none of its rules is stale —
+/// "a security group that contains stale rules" (`StaleSecurityGroup`) is the only kind
+/// this operation reports.
+///
+/// The group's own identity is copied from the stored group rather than rebuilt, so this
+/// operation and `DescribeSecurityGroups` cannot describe one group differently.
+fn stale_view(
+    store: &crate::state::ComAmazonawsEc2Amazonec2State,
+    group: &SecurityGroup,
+) -> Option<StaleSecurityGroup> {
+    let inbound = stale_rules(store, group, group.ip_permissions.as_deref().unwrap_or_default());
+    let outbound = stale_rules(
+        store,
+        group,
+        group.ip_permissions_egress.as_deref().unwrap_or_default(),
+    );
+    if inbound.is_empty() && outbound.is_empty() {
+        return None;
+    }
+    Some(StaleSecurityGroup {
+        description: group.description.clone(),
+        group_id: group.group_id.clone(),
+        group_name: group.group_name.clone(),
+        vpc_id: group.vpc_id.clone(),
+        // "Information about the stale inbound rules in the security group" / "the stale
+        // outbound rules" (`StaleSecurityGroup$StaleIpPermissions`, `$…Egress`): each
+        // direction is reported on its own, and a direction with nothing stale is reported
+        // empty rather than left out, so a caller reads both members the same way.
+        stale_ip_permissions: Some(inbound),
+        stale_ip_permissions_egress: Some(outbound),
+    })
+}
+
+/// The stale rules among `rules`, each carrying only the references that are stale.
+///
+/// "Describes a stale rule in a security group" (`StaleIpPermission`) — so a rule appears
+/// only when at least one of its security group references is stale, with the protocol and
+/// port range of the rule it came from and the stale pairs themselves. `IpRanges` and
+/// `PrefixListIds` are "not applicable for stale security group rules"
+/// (`StaleIpPermission$IpRanges`, `$PrefixListIds`): a CIDR block and a prefix list
+/// reference nothing that can be deleted out from under the rule, so they are reported for
+/// no stale rule.
+fn stale_rules(
+    store: &crate::state::ComAmazonawsEc2Amazonec2State,
+    group: &SecurityGroup,
+    rules: &[IpPermission],
+) -> Vec<StaleIpPermission> {
+    rules
+        .iter()
+        .filter_map(|rule| {
+            let stale_pairs: Vec<UserIdGroupPair> = rule
+                .user_id_group_pairs
+                .iter()
+                .flatten()
+                .filter(|pair| !reference_is_live(store, group, pair))
+                .cloned()
+                .collect();
+            (!stale_pairs.is_empty()).then(|| StaleIpPermission {
+                from_port: rule.from_port,
+                to_port: rule.to_port,
+                ip_protocol: rule.ip_protocol.clone(),
+                ip_ranges: None,
+                prefix_list_ids: None,
+                // "The security group pairs. Returns the ID of the referenced security
+                // group and VPC, and the ID and status of the VPC peering connection"
+                // (`StaleIpPermission$UserIdGroupPairs`) — the stored pair, which carries
+                // exactly those facts, rather than a rebuilt one.
+                user_id_group_pairs: Some(stale_pairs),
+            })
+        })
+        .collect()
+}
+
+/// Whether the reference `pair`, held by a rule of `group`, still resolves to a live
+/// security group reachable from `group`'s VPC.
+///
+/// "Rules are stale when they reference a deleted security group. Rules can also be stale
+/// if they reference a security group in a peer VPC for which the VPC peering connection
+/// has been deleted, across a transit gateway where the transit gateway has been deleted
+/// (or the transit gateway security group referencing feature has been disabled), or if a
+/// security group VPC association has been disassociated"
+/// (`DescribeStaleSecurityGroups`). Both halves of that are one condition: the reference is
+/// live only while the referenced group exists AND something still carries traffic from the
+/// referencing group's VPC to it.
+///
+/// A reference is resolved out of the store the way the rule names it — "[Default VPC] the
+/// name of the security group. For a security group in a nondefault VPC, use the security
+/// group ID" (`UserIdGroupPair$GroupName`) — never out of the pair's own `VpcId`, which a
+/// stored rule need not carry.
+///
+/// Reachability, in this emulator, is "in the same VPC": a reference that crosses VPCs
+/// needs a VPC peering connection, a transit gateway attachment or a security group VPC
+/// association, and this crate stores NONE of those objects (every operation that creates
+/// one is still a scaffold), so nothing could be carrying such a reference. When this crate
+/// starts storing them, that store is the one thing to consult here beside the group's VPC.
+fn reference_is_live(
+    store: &crate::state::ComAmazonawsEc2Amazonec2State,
+    group: &SecurityGroup,
+    pair: &UserIdGroupPair,
+) -> bool {
+    let holding_vpc = group.vpc_id.as_deref();
+    let referenced = match pair.group_id.as_deref() {
+        Some(group_id) => store.security_groups.get(group_id),
+        None => pair
+            .group_name
+            .as_deref()
+            .zip(holding_vpc)
+            .and_then(|(name, vpc_id)| store.security_group_id_for_name(vpc_id, name))
+            .and_then(|group_id| store.security_groups.get(&group_id)),
+    };
+    // A reference the store cannot resolve at all is a reference to a deleted security
+    // group, which is the first thing the operation's own doc calls stale.
+    referenced.is_some_and(|referenced| referenced.vpc_id.as_deref() == holding_vpc)
 }

@@ -78,6 +78,8 @@ mod security_groups;
 mod snapshot_block_public_access;
 #[path = "all/spot_placement_scores.rs"]
 mod spot_placement_scores;
+#[path = "all/stale_security_groups.rs"]
+mod stale_security_groups;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/transit_gateway_acceptance.rs"]

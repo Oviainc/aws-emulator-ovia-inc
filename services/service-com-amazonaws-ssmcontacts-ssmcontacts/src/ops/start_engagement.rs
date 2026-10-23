@@ -1,15 +1,31 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartEngagement
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartEngagement`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartEngagement::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Starts an engagement to the contact or escalation plan the request's `ContactId` names:
+//! the message the call carried (`Sender`, `Subject`, `Content`, and the public pair and
+//! `IncidentId` when present) is persisted as an engagement under a freshly minted
+//! `EngagementArn`, stamped with the instant it started, so `DescribeEngagement` and
+//! `ListEngagements` report it from then on and `StopEngagement` can stop it.
+//!
+//! Two refusals come before that, in this order:
+//!
+//! 1. the account-level Incident Manager precondition
+//!    ([`crate::state::ComAmazonawsSsmcontactsSsmcontactsState::require_active_replication_set`])
+//!    — SSM Contacts is fronted by a per-account replication set, and until an ACTIVE one
+//!    exists the data plane has no account to serve, so the call is refused with the
+//!    modelled `ValidationException` (HTTP 400) BEFORE the contact is looked up and without
+//!    persisting anything. That ordering is the contract: a caller distinguishes "this
+//!    account is not onboarded" (400) from "that contact does not exist" (404);
+//! 2. a `ContactId` the store does not hold — the modelled `ResourceNotFoundException`
+//!    (HTTP 404).
+//!
+//! `IdempotencyToken` is "a token ensuring that the operation is called only once with the
+//! specified details", so a retry carrying the token of a call that already started an
+//! engagement of the same contact answers that engagement's ARN instead of starting a
+//! second one — the shared ledger
+//! ([`crate::state::ComAmazonawsSsmcontactsSsmcontactsState::idempotent_replay`]) every
+//! create in this service uses.
 //!
 //! ## Shape of an operation
 //!
@@ -171,18 +187,120 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartEngagement` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartEngagementErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartEngagement"))
+        use crate::state::{engagement_arn, EngagementRecord};
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(StartEngagementErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "this service is mounted on an engine that holds no state"
+                        .to_string(),
+                    retry_after_seconds: 0,
+                },
+            )
+            .into());
+        };
+
+        let mut state = state.lock();
+
+        // The account gate comes FIRST, before `ContactId` is resolved, so a non-onboarded
+        // account is refused identically whether or not the contact it named exists — and
+        // nothing is persisted on the way out.
+        state
+            .require_active_replication_set()
+            .map_err(account_precondition_failed)?;
+
+        // A retried start carrying the token its first call carried is the SAME call, so it
+        // answers with the engagement already started rather than starting a second one —
+        // but only while that engagement still names the SAME contact; a token reused for
+        // another contact is a different request.
+        if let Some(arn) = state.idempotent_replay(Self::NAME, input.idempotency_token.as_deref()) {
+            let engaged = state
+                .engagements
+                .get(&arn)
+                .map(|engagement| engagement.contact_arn.clone());
+            if engaged.as_deref() == Some(input.contact_id.as_str()) {
+                return Ok(StartEngagementOutput {
+                    engagement_arn: arn,
+                });
+            }
+        }
+
+        // The engagement is named after the contact or escalation plan it engages, so the
+        // contact has to exist before an ARN can be minted for it.
+        let Some(contact) = state.contacts.get(&input.contact_id) else {
+            return Err(StartEngagementErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("Contact {} not found", input.contact_id),
+                    resource_id: input.contact_id.clone(),
+                    resource_type: CONTACT_RESOURCE_TYPE.to_string(),
+                },
+            )
+            .into());
+        };
+        let alias = contact.alias.clone();
+
+        // The emulator's own store ceiling. This operation models no quota error, so the
+        // refusal is its `ValidationException`: a 400 the caller can read, never a 501.
+        if state.engagements.len() >= crate::state::MAX_ENGAGEMENTS {
+            return Err(validation(format!(
+                "This emulator holds at most {} engagements",
+                crate::state::MAX_ENGAGEMENTS
+            )));
+        }
+
+        let sequence = state.engagements_started;
+        state.engagements_started = state.engagements_started.saturating_add(1);
+        let arn = engagement_arn(&crate::state::request_region(ctx.parts()), &alias, sequence);
+
+        let record = EngagementRecord {
+            arn: arn.clone(),
+            contact_arn: input.contact_id.clone(),
+            sender: input.sender.clone(),
+            subject: input.subject.clone(),
+            content: input.content.clone(),
+            public_subject: input.public_subject.clone(),
+            public_content: input.public_content.clone(),
+            incident_id: input.incident_id.clone(),
+            start_time: ::std::time::SystemTime::now(),
+            // An engagement starts running: only `StopEngagement` stops it.
+            stop_time: None,
+            stop_reason: None,
+        };
+        state.engagements.insert(arn.clone(), record);
+        state.remember_idempotency_token(Self::NAME, input.idempotency_token.as_deref(), &arn);
+
+        Ok(StartEngagementOutput {
+            engagement_arn: arn,
+        })
     }
+}
+
+/// The `resourceType` this operation's not-found error names: what the request named is a
+/// contact (or escalation plan), not the engagement this call would start.
+const CONTACT_RESOURCE_TYPE: &str = "contact";
+
+/// The account precondition's refusal: this operation's modelled `ValidationException`,
+/// which the model classifies `client` with `httpError` 400.
+///
+/// `reason` carries `OTHER` because the failure is not a member-level one — every member of
+/// the request is well formed; what cannot be resolved is the account's registry — and
+/// `fields` is present but EMPTY for the same reason. The same shape `StopEngagement`
+/// answers this precondition with.
+fn account_precondition_failed(message: String) -> StartEngagementError {
+    StartEngagementErrorModeled::ValidationException(ValidationException {
+        message,
+        reason: Some("OTHER".to_string()),
+        fields: Some(Vec::new()),
+    })
+    .into()
+}
+
+/// This operation's modelled `ValidationException`, carrying `message`.
+fn validation(message: impl Into<String>) -> StartEngagementError {
+    StartEngagementErrorModeled::ValidationException(ValidationException {
+        message: message.into(),
+        reason: Some("OTHER".to_string()),
+        fields: None,
+    })
+    .into()
 }

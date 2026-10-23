@@ -49,7 +49,7 @@ const DAILY_RECURRENCE: &str = r#"{
 /// A well-formed resource policy document.
 const A_POLICY: &str = r#"{"Version": "2012-10-17", "Statement": []}"#;
 
-/// A fixed wall-clock instant, as `StartEngagement` would have stamped one.
+/// A fixed wall-clock instant, as `StartEngagement` stamps one.
 fn at_epoch_secs(secs: u64) -> SystemTime {
     SystemTime::UNIX_EPOCH + Duration::from_secs(secs)
 }
@@ -149,9 +149,9 @@ fn engagement_arn(alias: &str, id: &str) -> String {
     format!("arn:aws:ssm-contacts:{REGION}:{ACCOUNT}:engagement/{alias}/{id}")
 }
 
-/// Put `record` in the store, as `StartEngagement` will once it is implemented (its own
-/// stub issue): `DescribeEngagement` must report what the store holds, not what the request
-/// said.
+/// Put `record` in the store, the way `StartEngagement` does, so this suite's stored
+/// engagement is fixed and independent of the clock: `DescribeEngagement` must report what
+/// the store holds, not what the request said.
 fn insert_engagement(emulator: &Emulator, record: EngagementRecord) {
     let state = service_state(&*emulator.engine).expect("the engine holds this service's state");
     state.lock().engagements.insert(record.arn.clone(), record);

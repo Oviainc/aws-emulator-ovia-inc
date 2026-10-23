@@ -309,7 +309,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
+        // The service-managed keyspaces are part of the account before any call, so one of
+        // them resolves here instead of 404-ing — and is then refused below.
+        store.ensure_service_managed_catalog(&region);
         store.settle(now);
+
+        // A service-managed keyspace holds the SERVICE's system tables and takes none of
+        // the caller's: Cassandra refuses DDL against a system keyspace as an invalid
+        // query ("system keyspace is not user-modifiable"), which is this operation's
+        // `ValidationException` — "The operation failed due to an invalid or malformed
+        // request".
+        if crate::state::is_service_managed_keyspace(&input.keyspace_name) {
+            return Err(CreateTableErrorModeled::ValidationException(ValidationException {
+                message: Some(crate::state::service_managed_rejection(&input.keyspace_name)),
+            })
+            .into());
+        }
 
         let Some(keyspace) = store.keyspaces.get_mut(&input.keyspace_name) else {
             return Err(CreateTableErrorModeled::ResourceNotFoundException(
@@ -394,21 +409,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 keyspace_name: input.keyspace_name,
                 table_name: input.table_name,
                 resource_arn: resource_arn.clone(),
-                creation_timestamp: now,
+                creation_timestamp: Some(now),
                 // "CreateTable is an asynchronous operation. When the request is received,
                 // the status of the table is set to CREATING. ... You can start using a
                 // table when the status is ACTIVE." The clock owes the ACTIVE transition
                 // one span from now; `settle` materialises it, and nothing sleeps for it.
                 status: crate::state::TABLE_STATUS_CREATING.to_string(),
                 status_due_at: Some(settles_at),
-                schema_definition: input.schema_definition,
-                capacity_specification,
+                schema_definition: Some(input.schema_definition),
+                capacity_specification: Some(capacity_specification),
                 auto_scaling_specification,
                 // Only an `UpdateTable` that moves the table to PAY_PER_REQUEST sets
                 // this; a table created in a mode was never updated into it.
                 last_update_to_pay_per_request: None,
-                encryption_specification,
-                point_in_time_recovery,
+                encryption_specification: Some(encryption_specification),
+                point_in_time_recovery: Some(point_in_time_recovery),
                 ttl: input.ttl,
                 default_time_to_live: input.default_time_to_live,
                 comment: input.comment,

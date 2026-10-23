@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTagsForResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTagsForResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTagsForResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED. Reports the tags the resource its `ResourceArn` names holds — the ones
+//! its creating operation's `Tags` persisted and the ones `TagResource` associated
+//! later, which are one set on one record — and answers the modelled
+//! `ResourceNotFoundException` for an ARN naming no resource this service holds.
 //!
 //! ## Shape of an operation
 //!
@@ -79,6 +75,8 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use std::time::SystemTime;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -150,18 +148,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTagsForResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTagsForResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTagsForResource"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListTagsForResourceErrorModeled::InternalServerException(InternalServerException {
+                message: Some("The service store is unavailable. Retry your request.".to_string()),
+            })
+        })?;
+
+        let now = SystemTime::now();
+        let mut store = state.lock();
+        // Reporting, not mutating: `settle_document_classifiers` only materialises the
+        // transitions the clock already owed at `now`, which were due whether or not
+        // anybody called — including the removal of a classifier whose deletion has
+        // come due, which is no longer a resource whose tags can be reported.
+        store.settle_document_classifiers(now);
+
+        let mut tags = store
+            .resource_tags_mut(&input.resource_arn)
+            .ok_or_else(|| {
+                ListTagsForResourceErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
+                    },
+                )
+            })?
+            .clone();
+        // A resource's tags are a set keyed by the tag key, which the model leaves
+        // unordered; reporting them in key order gives one stable order for that set
+        // rather than one that depends on the order they were associated in.
+        tags.sort_by(|left, right| left.key.cmp(&right.key));
+
+        Ok(ListTagsForResourceOutput {
+            resource_arn: Some(input.resource_arn),
+            tags: Some(tags),
+        })
     }
 }

@@ -372,12 +372,13 @@ async fn deprecating_an_already_deprecated_type_is_refused_and_writes_nothing() 
 }
 
 #[tokio::test]
-async fn a_type_the_domain_cascade_deprecated_is_refused_the_same_way() {
-    // `DeprecateDomain` "also deprecates all activity and workflow types registered in
-    // the domain", so a type can reach DEPRECATED without ever being addressed
-    // directly — and the rule is about the STORED status, not about which call set it.
+async fn a_type_in_a_deprecated_domain_still_deprecates_on_its_own() {
+    // Deprecating the DOMAIN does not move the status of the types registered in it, so
+    // a type there is still REGISTERED and the first `DeprecateWorkflowType` addressing
+    // it succeeds; only a second one is the modelled fault. The rule is about the STORED
+    // status of the type, which only a call addressing that type moves.
     let emulator = Emulator::new();
-    let domain = "cascade-deprecated";
+    let domain = "deprecated-domain";
     register_domain(&emulator, domain, domain).await;
     for case in type_cases() {
         register_type(
@@ -392,21 +393,30 @@ async fn a_type_the_domain_cascade_deprecated_is_refused_the_same_way() {
     }
 
     emulator
-        .ok("cascade", "DeprecateDomain", &json!({ "name": domain }))
+        .ok("deprecate domain", "DeprecateDomain", &json!({ "name": domain }))
         .await;
 
     for case in type_cases() {
-        let cascaded =
+        let after_domain =
             describe_type(&emulator, case.case, domain, &case.name, &case.version).await;
-        let stamp = assert_deprecated(case.case, &cascaded);
+        assert_registered(case.case, &after_domain);
+
+        let request = json!({
+            "domain": domain,
+            "workflowType": type_ref(&case.name, &case.version),
+        });
+        emulator
+            .ok(case.case, "DeprecateWorkflowType", &request)
+            .await;
+        let deprecated =
+            describe_type(&emulator, case.case, domain, &case.name, &case.version).await;
+        let stamp = assert_deprecated(case.case, &deprecated);
+
         emulator
             .refused(
                 case.case,
                 "DeprecateWorkflowType",
-                &json!({
-                    "domain": domain,
-                    "workflowType": type_ref(&case.name, &case.version),
-                }),
+                &request,
                 "TypeDeprecatedFault",
             )
             .await;
@@ -414,8 +424,7 @@ async fn a_type_the_domain_cascade_deprecated_is_refused_the_same_way() {
         assert_eq!(
             assert_deprecated(case.case, &after),
             stamp,
-            "case {:?}: a refused deprecation must not restamp a record the domain \
-             cascade already deprecated, got {after:?}",
+            "case {:?}: a refused deprecation must not restamp the record, got {after:?}",
             case.case
         );
     }

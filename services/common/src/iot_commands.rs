@@ -20,9 +20,11 @@
 //! of the resource.
 //!
 //! WHO WRITES IT: the owner. `iot:CreateCommand` registers the ARN it mints here
-//! and `iot:DeleteCommand` removes it; both are still scaffolds answering HTTP 501
-//! (each has its own issue), so until one is implemented the index is empty and
-//! every `commandArn` names a command that does not exist — which is exactly what
+//! and `iot:DeleteCommand` removes it. The create is implemented, so a command
+//! created through the control plane is in this index from that moment;
+//! `iot:DeleteCommand` is still a scaffold answering HTTP 501 (its own issue), so a
+//! command's ARN stays here until it is. A `commandArn` this index does not hold
+//! names a command that does not exist — which is exactly what
 //! `StartCommandExecution` must then refuse. The IoT control plane already
 //! carries the same shape of store for the same reason: its `thing_types` /
 //! `billing_groups` sets exist so `CreateThing` can refuse a name that is not in

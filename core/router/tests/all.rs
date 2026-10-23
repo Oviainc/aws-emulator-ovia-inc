@@ -98,6 +98,8 @@ mod rds_shared_signing_name_routing;
 mod rds_signing_name_routing;
 #[path = "all/resiliencehub_signing_name_routing.rs"]
 mod resiliencehub_signing_name_routing;
+#[path = "all/s3files_create_file_system_bucket.rs"]
+mod s3files_create_file_system_bucket;
 #[path = "all/scheduler_execution_role.rs"]
 mod scheduler_execution_role;
 #[path = "all/servicecatalog_signing_name_routing.rs"]

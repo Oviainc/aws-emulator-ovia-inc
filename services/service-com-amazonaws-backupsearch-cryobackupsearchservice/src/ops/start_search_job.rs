@@ -1,11 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartSearchJob
-//! Mints a search job and PERSISTS it in [`crate::state`]: an opaque
+//! Mints a search job and PERSISTS it in [`crate::state`]: a UUID
 //! `SearchJobIdentifier`, the `search-job/<id>` ARN built from it, the server clock's
 //! `CreationTime`, the submitted `SearchScope`/`ItemFilters`/`Name`/`EncryptionKeyArn`/
-//! `Tags`, and `Status = RUNNING`. The members it answers with are read back out of
-//! that record, so `GetSearchJob` reports the same values.
+//! `Tags`, the recovery points that scope resolves to, and `Status = RUNNING`. The
+//! members it answers with are read back out of that record, so `GetSearchJob` reports
+//! the same values.
+//!
+//! The clock owes the job a terminal status, and WHICH one follows from the resolved
+//! scope: a scan with recovery points in scope runs to `COMPLETED`, while a scope that
+//! resolved to none ends `FAILED` with the `StatusMessage` the service explains an empty
+//! scope with ([`crate::state::scan_outcome`]).
 //!
 //! `ClientToken` is idempotent: the same token with the same body answers with the job
 //! the first call minted, and the same token with a different body is a
@@ -245,19 +251,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let identifier = state.mint_identifier();
+        let identifier = state.mint_identifier().ok_or_else(|| {
+            StartSearchJobError::from(StartSearchJobErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: crate::state::MINT_EXHAUSTED.to_string(),
+                    retry_after_seconds: None,
+                },
+            ))
+        })?;
         let arn = crate::state::search_job_arn(
             ctx.identity().signing_name(),
             &crate::state::request_region(ctx),
             &identifier,
         );
 
-        // What the scan has to get through. A recovery point exists for this account
-        // only once the Backup data plane holds one, and this emulator holds none, so
-        // the scope is empty and these totals are the size of that empty set — counted,
-        // not invented. The progress starts at nothing scanned.
+        // What the scan has to get through: the recovery points of this account the
+        // submitted scope resolves to, counted from the store rather than assumed. A
+        // recovery point exists only once the Backup data plane holds one and nothing in
+        // this service creates one, so ordinarily the scope resolves to the empty set —
+        // and then the scan has nothing to search. The items to scan are the items those
+        // recovery points' backup indexes hold, which is none here. The progress starts
+        // at nothing scanned.
+        let backups = state.recovery_points_in_scope(&input.search_scope);
         let search_scope_summary = SearchScopeSummary {
-            total_recovery_points_to_scan_count: Some(0),
+            total_recovery_points_to_scan_count: Some(
+                i32::try_from(backups.len()).unwrap_or(i32::MAX),
+            ),
             total_items_to_scan_count: Some(0),
         };
         let current_search_progress = CurrentSearchProgress {
@@ -265,13 +284,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             items_scanned_count: Some(0),
             items_matched_count: Some(0),
         };
+        // The terminal status the clock owes this scan follows from that resolved scope:
+        // a scope holding nothing to search is a terminal FAILURE the service explains
+        // in StatusMessage, and anything else runs to COMPLETED.
+        let (owed_status, owed_message) = crate::state::scan_outcome(backups.len());
 
         let job = SearchJob {
             identifier: identifier.clone(),
             arn,
             name: input.name.clone(),
-            // A new search job is RUNNING; the clock owes it COMPLETED once the scan's
-            // span has passed (`crate::state::TRANSITION_DELAY`).
+            // A new search job is RUNNING; the clock owes it the status above once the
+            // scan's span has passed (`crate::state::TRANSITION_DELAY`).
             status: crate::state::RUNNING.to_string(),
             creation_time: crate::state::timestamp(now),
             completion_time: None,
@@ -283,15 +306,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             item_filters: input.item_filters.clone().unwrap_or_default(),
             search_scope_summary,
             current_search_progress,
-            // The matches recorded so far: nothing is in scope, so the scan finds none.
+            // The matches recorded so far: the backup indexes of the recovery points in
+            // scope hold no items here, so the scan finds none.
             results: Vec::new(),
-            // Nor does it cover any recovery point: this emulator holds none, so
-            // `ListSearchJobBackups` reports the empty set it actually covered.
-            backups: Vec::new(),
+            // The recovery points the scan covers are exactly the ones in scope, which
+            // is what `ListSearchJobBackups` reports.
+            backups,
             tags,
             client_token: input.client_token.clone(),
             request_fingerprint: fingerprint,
-            next_status_due: Some((now + crate::state::TRANSITION_DELAY, crate::state::COMPLETED)),
+            next_status_due: Some((
+                now + crate::state::TRANSITION_DELAY,
+                owed_status,
+                owed_message,
+            )),
         };
         state.insert_job(job);
 

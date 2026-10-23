@@ -50,6 +50,38 @@ pub(crate) fn emulator() -> MultiServiceRouter {
     emulator_with_engine().0
 }
 
+/// One recovery point of the backup index a search job's `SearchScope` is resolved
+/// against — what the Backup data plane holds and what a scan has to get through. The
+/// members are the ones a scope filters on: the model's `ResourceType`, the
+/// recovery-point and source-resource ARNs, and the instant the backup was created.
+pub(crate) fn recovery_point(
+    resource_type: &str,
+    backup_resource_arn: &str,
+    source_resource_arn: &str,
+    created: std::time::SystemTime,
+) -> types::SearchJobBackupsResult {
+    types::SearchJobBackupsResult {
+        status: Some(state::COMPLETED.to_string()),
+        status_message: None,
+        resource_type: Some(resource_type.to_string()),
+        backup_resource_arn: Some(backup_resource_arn.to_string()),
+        source_resource_arn: Some(source_resource_arn.to_string()),
+        index_creation_time: Some(state::timestamp(created)),
+        backup_creation_time: Some(state::timestamp(created)),
+    }
+}
+
+/// Put `points` in the store as the recovery points this account holds. Nothing in THIS
+/// service creates one — the Backup data plane does — so a test that needs a scope to
+/// resolve to something seeds them, exactly as the store would hold them.
+pub(crate) fn seed_recovery_points(
+    engine: &engine::InMemoryEngine,
+    points: Vec<types::SearchJobBackupsResult>,
+) {
+    let store = engine.state::<state::ComAmazonawsBackupsearchCryobackupsearchserviceState>();
+    store.lock().recovery_points = points;
+}
+
 /// A request's SigV4 credential scope, which is where the service reads the region its
 /// ARNs name from. Signatures are not verified here (authentication is off above); the
 /// header is what routes the request to this service.
@@ -359,12 +391,14 @@ async fn a_started_job_appears_in_the_list_with_the_members_it_was_stored_with()
         expected.len(),
         "ListSearchJobs must return one summary per persisted job, got {summaries:?}"
     );
-    for (position, (identifier, body)) in expected.iter().enumerate() {
+    // The listing reports the NEWEST-created job first, so the rows come back in the
+    // reverse of the order they were started in.
+    for (position, (identifier, body)) in expected.iter().rev().enumerate() {
         let summary = &summaries[position];
         assert_eq!(
             summary["SearchJobIdentifier"].as_str(),
             Some(identifier.as_str()),
-            "position {position}: jobs must be listed in creation order, got {summary:?}"
+            "position {position}: jobs must be listed newest-created first, got {summary:?}"
         );
         assert_eq!(
             summary["Name"],
@@ -450,9 +484,12 @@ async fn the_status_filter_keeps_only_jobs_in_that_status() {
 
 #[tokio::test]
 async fn paging_returns_every_job_exactly_once_whatever_the_page_size() {
-    // The invariant: for any page size, following NextToken to exhaustion yields each
-    // persisted job exactly once, in creation order, and no page exceeds MaxResults.
-    for job_count in [1_usize, 2, 5] {
+    // The invariant: for any page size, the first page opens with the newest-created
+    // job, following NextToken to exhaustion yields each persisted job exactly once
+    // newest-first, no page exceeds MaxResults, and a page carries a NextToken exactly
+    // when it FILLED MaxResults (a full page says nothing about what follows it; a short
+    // page is the end of the sequence).
+    for job_count in [1_usize, 2, 3, 5] {
         for max_results in [1_usize, 2, 3, 5, 1000] {
             let emulator = emulator();
             let mut created: Vec<String> = Vec::new();
@@ -470,6 +507,7 @@ async fn paging_returns_every_job_exactly_once_whatever_the_page_size() {
                 .await;
                 created.push(started.string("SearchJobIdentifier"));
             }
+            let newest_first: Vec<String> = created.iter().rev().cloned().collect();
 
             let case = format!("{job_count} jobs, MaxResults={max_results}");
             let mut seen: Vec<String> = Vec::new();
@@ -496,10 +534,32 @@ async fn paging_returns_every_job_exactly_once_whatever_the_page_size() {
                     "case {case:?}: a page must hold at most MaxResults jobs, got {}",
                     page.len()
                 );
-                seen.extend(
-                    page.iter()
-                        .map(|summary| summary["SearchJobIdentifier"].as_str().unwrap_or_default().to_string()),
+                let page_identifiers: Vec<String> = page
+                    .iter()
+                    .map(|summary| {
+                        summary["SearchJobIdentifier"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_string()
+                    })
+                    .collect();
+                if pages == 0 {
+                    assert_eq!(
+                        page_identifiers.first().map(String::as_str),
+                        newest_first.first().map(String::as_str),
+                        "case {case:?}: the first page must open with the newest job, got {page_identifiers:?}"
+                    );
+                }
+                let full = page_identifiers.len() == max_results;
+                assert_eq!(
+                    listed.get("NextToken").as_str().is_some(),
+                    full,
+                    "case {case:?}: a page of {} must {}carry a NextToken, got {:?}",
+                    page_identifiers.len(),
+                    if full { "" } else { "not " },
+                    listed.get("NextToken")
                 );
+                seen.extend(page_identifiers);
                 pages += 1;
                 assert!(
                     pages <= job_count + 1,
@@ -511,8 +571,8 @@ async fn paging_returns_every_job_exactly_once_whatever_the_page_size() {
                 }
             }
             assert_eq!(
-                seen, created,
-                "case {case:?}: paging must yield every job exactly once in creation order, got {seen:?}"
+                seen, newest_first,
+                "case {case:?}: paging must yield every job exactly once, newest-created first, got {seen:?}"
             );
         }
     }
@@ -918,9 +978,11 @@ async fn stopping_a_running_job_moves_it_to_stopping_and_then_to_stopped() {
         "ListSearchJobs must observe the stopped status, got {identifiers:?}"
     );
 
-    // Stopping a job in a status it never leaves is a conflict: "Only a search job with
-    // a status of RUNNING can be stopped".
-    let conflict = call(
+    // Stopping a job that has already STOPPED is the end state this `@idempotent`
+    // operation asks for, so the repeat is an empty 200 that leaves the job stopped.
+    // (A terminal status this operation does NOT produce is the conflict; that is
+    // asserted per status in `search_job_outcome_and_paging.rs`.)
+    let again = call(
         &emulator,
         "us-west-2",
         "PUT",
@@ -929,20 +991,24 @@ async fn stopping_a_running_job_moves_it_to_stopping_and_then_to_stopped() {
     )
     .await;
     assert_eq!(
-        conflict.status, 409,
-        "stopping a terminal job must conflict, got {} ({:?})",
-        conflict.status, conflict.body
+        again.status, 200,
+        "a repeated StopSearchJob on a STOPPED job must be a no-op success, got {} ({:?})",
+        again.status, again.body
     );
     assert_eq!(
-        conflict.error_code.as_deref(),
-        Some("ConflictException"),
-        "the refusal must carry ConflictException, got {:?}",
-        conflict.error_code
+        call(&emulator, "us-west-2", "GET", &job_uri, None)
+            .await
+            .string("Status"),
+        "STOPPED",
+        "the repeat must leave the job STOPPED"
     );
 }
 
 #[tokio::test]
-async fn a_running_job_completes_when_the_clock_makes_it_due() {
+async fn a_running_job_settles_when_the_clock_makes_it_due() {
+    // This store holds no recovery points, so the scope resolves to nothing and the
+    // terminal status the clock owes is the failure that says so. Which status follows
+    // from which resolved scope is the table in `search_job_outcome_and_paging.rs`.
     let emulator = emulator();
     let started = call(
         &emulator,
@@ -970,32 +1036,36 @@ async fn a_running_job_completes_when_the_clock_makes_it_due() {
     );
 
     tokio::time::sleep(PAST_THE_DUE_INSTANT).await;
-    let completed = call(&emulator, "us-west-2", "GET", &job_uri, None).await;
+    let settled = call(&emulator, "us-west-2", "GET", &job_uri, None).await;
     assert_eq!(
-        completed.string("Status"),
-        "COMPLETED",
-        "once the scan's span has passed the job is COMPLETED, got {:?}",
-        completed.get("Status")
+        settled.string("Status"),
+        state::FAILED,
+        "a scan whose scope resolved to nothing ends FAILED, got {:?}",
+        settled.get("Status")
+    );
+    assert_eq!(
+        settled.string("StatusMessage"),
+        state::SCOPE_EMPTY,
+        "the failure must explain the empty scope, got {:?}",
+        settled.get("StatusMessage")
     );
     assert!(
-        completed.get("CompletionTime").as_f64().is_some(),
-        "a completed job carries a CompletionTime, got {:?}",
-        completed.get("CompletionTime")
+        settled.get("CompletionTime").as_f64().is_some(),
+        "a settled job carries a CompletionTime, got {:?}",
+        settled.get("CompletionTime")
     );
-    // A completed scan has got through everything that was in scope.
+    // A scan that failed never got through its scope, so it reports no progress.
     assert_eq!(
-        completed.get("CurrentSearchProgress")["RecoveryPointsScannedCount"],
-        completed.get("SearchScopeSummary")["TotalRecoveryPointsToScanCount"],
-        "a completed scan has scanned every recovery point in scope, got {:?} of {:?}",
-        completed.get("CurrentSearchProgress"),
-        completed.get("SearchScopeSummary")
+        settled.get("CurrentSearchProgress")["RecoveryPointsScannedCount"].as_i64(),
+        Some(0),
+        "a failed scan has scanned no recovery point, got {:?}",
+        settled.get("CurrentSearchProgress")
     );
     assert_eq!(
-        completed.get("CurrentSearchProgress")["ItemsScannedCount"],
-        completed.get("SearchScopeSummary")["TotalItemsToScanCount"],
-        "a completed scan has scanned every item in scope, got {:?} of {:?}",
-        completed.get("CurrentSearchProgress"),
-        completed.get("SearchScopeSummary")
+        settled.get("CurrentSearchProgress")["ItemsScannedCount"].as_i64(),
+        Some(0),
+        "a failed scan has scanned no item, got {:?}",
+        settled.get("CurrentSearchProgress")
     );
 
     // A read did not move the status on: the completion time it reports is the instant
@@ -1003,7 +1073,7 @@ async fn a_running_job_completes_when_the_clock_makes_it_due() {
     let read_again = call(&emulator, "us-west-2", "GET", &job_uri, None).await;
     assert_eq!(
         read_again.get("CompletionTime").as_f64(),
-        completed.get("CompletionTime").as_f64(),
+        settled.get("CompletionTime").as_f64(),
         "reading a job must not change what a later reader sees, got {:?}",
         read_again.get("CompletionTime")
     );

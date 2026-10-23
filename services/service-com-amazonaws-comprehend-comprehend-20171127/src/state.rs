@@ -66,6 +66,16 @@
 //! modelled `DocumentClassifierProperties` shape that `ListDocumentClassifiers` and
 //! `DescribeDocumentClassifier` report.
 //!
+//! ## Tags
+//!
+//! A resource's tags live ON the record they belong to ([`AnalysisJob::tags`],
+//! [`DocumentClassifier::tags`]), so the `Tags` a creating operation was called with
+//! and the tags `TagResource` associates later are ONE set.
+//! [`ComAmazonawsComprehendComprehend20171127State::resource_tags_mut`] is the ONE
+//! place an ARN is resolved to that set, so no tagging operation can disagree with
+//! another about which ARNs name a resource, and [`apply_tags`] / [`remove_tags`] are
+//! the ONE pair that changes it.
+//!
 //! ## Service-wide rules that are not state
 //!
 //! [`REALTIME_TEXT_QUOTA_BYTES`], [`DOMINANT_LANGUAGE_TEXT_QUOTA_BYTES`] and
@@ -75,7 +85,7 @@
 //! caller. [`request_region`], [`epoch_parts`] and [`datetime_parts`] are the other
 //! service-wide helpers that live here rather than in one operation's file.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
@@ -128,6 +138,89 @@ pub fn too_many_tags_message(tags: &[Tag]) -> Option<String> {
         )
     })
 }
+
+/// The refusal message for a request that would leave a resource already holding
+/// `held` carrying more tags than it can, or `None` when the merged set is within
+/// [`MAX_TAGS_PER_RESOURCE`].
+///
+/// `TooManyTagsException`'s own documentation states that the bound counts BOTH
+/// sides — "The maximum number of tags includes both existing tags and those
+/// included in your current request" — so a request is measured against the set it
+/// would leave behind, not against its own length. A tag is identified by its key,
+/// so a request that only gives keys the resource already holds a new value adds
+/// nothing to the count.
+pub fn too_many_merged_tags_message(held: &[Tag], incoming: &[Tag]) -> Option<String> {
+    let merged = merged_tag_count(held, incoming);
+    (merged > MAX_TAGS_PER_RESOURCE).then(|| {
+        format!(
+            "The request would leave the resource with {merged} tags, more than the \
+             {MAX_TAGS_PER_RESOURCE} tags that can be associated with a resource, counting \
+             both its existing tags and those in this request."
+        )
+    })
+}
+
+/// How many tags a resource holding `held` would hold once `incoming` is applied:
+/// the number of DISTINCT keys across both, because a resource's tags are keyed by
+/// their key.
+fn merged_tag_count(held: &[Tag], incoming: &[Tag]) -> usize {
+    held.iter()
+        .chain(incoming)
+        .map(|tag| tag.key.as_str())
+        .collect::<BTreeSet<_>>()
+        .len()
+}
+
+/// The refusal message for a request naming more tag keys than a resource can hold,
+/// or `None` when `tag_keys` is within [`MAX_TAGS_PER_RESOURCE`].
+///
+/// `TooManyTagKeysException` states the same bound from the removal side: "The
+/// request contains more tag keys than can be associated with a resource (50 tag
+/// keys per resource)."
+pub fn too_many_tag_keys_message(tag_keys: &[String]) -> Option<String> {
+    (tag_keys.len() > MAX_TAGS_PER_RESOURCE).then(|| {
+        format!(
+            "The request contains {} tag keys, more than the {MAX_TAGS_PER_RESOURCE} tag \
+             keys that can be associated with a resource.",
+            tag_keys.len()
+        )
+    })
+}
+
+/// Associate `incoming` with a resource already holding `held`.
+///
+/// A resource's tags are a key-value MAP: a tag whose key the resource already
+/// holds has its value replaced, and only a key it does not hold is added — so
+/// associating the same tag twice leaves one tag, and the same key with a new value
+/// leaves the new value. Repeated keys within one request are applied in order, so
+/// the last one given wins; the model declares neither `uniqueItems` on `TagList`
+/// nor an error for a repeated key.
+pub fn apply_tags(held: &mut Vec<Tag>, incoming: Vec<Tag>) {
+    for tag in incoming {
+        match held.iter_mut().find(|existing| existing.key == tag.key) {
+            Some(existing) => existing.value = tag.value,
+            None => held.push(tag),
+        }
+    }
+}
+
+/// Remove from `held` every tag whose key `tag_keys` names.
+///
+/// A key the resource does not hold is removed by having nothing to remove: the
+/// request asked for that key to be absent and it is, and the model declares no
+/// error for it.
+pub fn remove_tags(held: &mut Vec<Tag>, tag_keys: &[String]) {
+    held.retain(|tag| !tag_keys.contains(&tag.key));
+}
+
+/// What a tagging operation tells a caller whose `ResourceArn` names no resource
+/// this service holds.
+///
+/// ONE fixed sentence, naming no ARN: that is what Comprehend answers for an unknown
+/// resource ARN, exactly as `JOB_NOT_FOUND_MESSAGE` is the one sentence an unknown
+/// `JobId` gets. Shared by `TagResource`, `UntagResource` and `ListTagsForResource`,
+/// so an unknown ARN gets one answer whichever of them is called with it.
+pub const RESOURCE_NOT_FOUND_MESSAGE: &str = "RESOURCE_NOT_FOUND: Could not find specified resource.";
 
 /// Why a job whose batch run this emulator does not perform ends in the modelled
 /// `FAILED` state, naming the analysis that was not carried out and both S3
@@ -1148,6 +1241,39 @@ pub struct ComAmazonawsComprehendComprehend20171127State {
 }
 
 impl ComAmazonawsComprehendComprehend20171127State {
+    /// The tag set of the resource `resource_arn` names, for every kind of resource
+    /// this service persists: a custom document classifier, keyed by the ARN its
+    /// creation minted, and an asynchronous analysis job, found by the `JobArn` its
+    /// submission minted.
+    ///
+    /// The ONE ARN lookup every tagging operation uses, so `TagResource`,
+    /// `UntagResource` and `ListTagsForResource` cannot disagree about which ARNs
+    /// name a resource, and so a tag associated through one of them is the tag the
+    /// others see. The job scan is bounded by [`MAX_ANALYSIS_JOB_RECORDS`].
+    ///
+    /// A resource kind whose creating operation is still a scaffold stub (an
+    /// endpoint, a flywheel, a dataset, an entity recognizer) has no records here,
+    /// so its ARN resolves to nothing — which is what a store holding no such
+    /// resource means, and what the modelled `ResourceNotFoundException` reports.
+    /// Callers settle the clock-owed changes first, so an ARN whose record a due
+    /// deletion has already removed is not found either.
+    pub fn resource_tags_mut(&mut self, resource_arn: &str) -> Option<&mut Vec<Tag>> {
+        // `contains_key` and then `get_mut` deliberately: returning the borrow from
+        // inside an `if let Some(..) = self.document_classifiers.get_mut(..)` keeps
+        // that mutable borrow of `self` alive across the job lookup below, which the
+        // borrow checker refuses. Two map lookups are the price of one early return.
+        if self.document_classifiers.contains_key(resource_arn) {
+            return self
+                .document_classifiers
+                .get_mut(resource_arn)
+                .map(|classifier| &mut classifier.tags);
+        }
+        self.analysis_jobs
+            .values_mut()
+            .find(|job| job.job_arn == resource_arn)
+            .map(|job| &mut job.tags)
+    }
+
     /// Mint the next submission sequence number and a `JobId` for it.
     ///
     /// The id is the first 16 bytes of a digest over the sequence number and the

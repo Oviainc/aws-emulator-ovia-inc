@@ -196,9 +196,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(workflow_type) = domain.workflow_types.get_mut(&key) else {
             return Err(DeprecateWorkflowTypeErrorModeled::UnknownResourceFault(
                 UnknownResourceFault {
-                    message: Some(format!(
-                        "Unknown type: WorkflowType=[name={}, version={}]",
-                        input.workflow_type.name, input.workflow_type.version
+                    message: Some(crate::state::unknown_workflow_type_message(
+                        &input.workflow_type.name,
+                        &input.workflow_type.version,
                     )),
                 },
             )
@@ -212,17 +212,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if workflow_type.is_deprecated() {
             return Err(DeprecateWorkflowTypeErrorModeled::TypeDeprecatedFault(
                 TypeDeprecatedFault {
-                    message: Some(format!(
-                        "WorkflowType=[name={}, version={}]",
-                        workflow_type.name, workflow_type.version
+                    message: Some(crate::state::type_reference(
+                        crate::state::WORKFLOW_TYPE_KIND,
+                        &workflow_type.name,
+                        &workflow_type.version,
                     )),
                 },
             )
             .into());
         }
 
-        // The same one-way move `DeprecateDomain`'s cascade makes per type record, so
-        // the status and the stamp are written in one place for both callers.
+        // The one-way move off REGISTERED this call makes on the record it addresses.
         workflow_type.deprecate(crate::state::now());
 
         Ok(DeprecateWorkflowTypeOutput)

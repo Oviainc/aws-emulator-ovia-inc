@@ -215,11 +215,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         // A replayed `clientToken` is a retry of the call that created the group, so it
-        // answers that group instead of creating or conflicting with a second one.
+        // answers that group instead of creating or conflicting with a second one. The
+        // replay is scoped to the name THIS request carries: a token spent again on a
+        // different `name` is a request for another group, which is still created rather
+        // than answered with the first one.
         if let Some(token) = input.client_token.as_deref() {
-            if let Some(record) = store.replayed_collection_group(Self::NAME, token) {
+            let replayed = store
+                .replayed_collection_group(Self::NAME, token)
+                .filter(|record| record.name == input.name)
+                .map(crate::state::CollectionGroupRecord::create_detail);
+            if let Some(detail) = replayed {
                 return Ok(CreateCollectionGroupOutput {
-                    create_collection_group_detail: Some(record.create_detail()),
+                    create_collection_group_detail: Some(detail),
                 });
             }
         }
