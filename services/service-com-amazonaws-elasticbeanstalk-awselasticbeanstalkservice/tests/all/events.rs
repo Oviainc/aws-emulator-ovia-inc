@@ -21,7 +21,7 @@ use aws_smithy_types::date_time::Format;
 use aws_smithy_types::DateTime;
 use service_com_amazonaws_elasticbeanstalk_awselasticbeanstalkservice as eb;
 
-use super::harness::{Answer, Emulator, PAST_DUE};
+use super::harness::{Answer, Emulator, PAST_DUE, SOLUTION_STACK};
 
 /// `EventSeverity` from least to most severe, in the order the model declares
 /// the enum's members —
@@ -168,6 +168,7 @@ async fn the_lifecycle_calls_record_the_events_describe_events_reports() {
         &[
             ("ApplicationName", "events-app"),
             ("EnvironmentName", "events-env"),
+            ("SolutionStackName", SOLUTION_STACK.as_str()),
             ("VersionLabel", "v1"),
         ],
     )
@@ -564,6 +565,7 @@ async fn a_backdated_clock_owed_event_is_reported_in_its_place_in_time() {
         &[
             ("ApplicationName", "order-app"),
             ("EnvironmentName", "order-env"),
+            ("SolutionStackName", SOLUTION_STACK.as_str()),
         ],
     )
     .await;

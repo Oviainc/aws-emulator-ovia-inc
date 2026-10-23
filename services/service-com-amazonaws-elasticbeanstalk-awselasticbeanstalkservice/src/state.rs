@@ -582,27 +582,115 @@ pub enum ResourceArnRefusal {
     NotFound,
 }
 
-/// Whether `requested` asks for a version lifecycle configuration this
-/// application has no service role to apply it with.
+/// Whether `requested` leaves the call with no `ServiceRole` it can be served with:
+/// the ONE check both supporting calls make on that member.
 ///
-/// From `ApplicationResourceLifecycleConfig$ServiceRole`: "The `ServiceRole`
-/// property is required the first time that you provide a
-/// `VersionLifecycleConfig` for the application in one of the supporting calls
-/// (`CreateApplication` or `UpdateApplicationResourceLifecycle`). After you
-/// provide it once, in either one of the calls, Elastic Beanstalk persists the
-/// Service Role with the application, and you don't need to specify it again in
-/// subsequent `UpdateApplicationResourceLifecycle` calls."
-pub fn version_lifecycle_service_role_missing(
+/// Two requests fail it, and the service reports both the same way — as the member
+/// whose value is not an IAM role ARN (see [`invalid_parameter_message`]):
+///
+/// * one that SUPPLIES a value that is not an IAM role ARN (an empty value included:
+///   a value was sent and it is not one);
+/// * one that supplies NONE where the call needs one — "The `ServiceRole` property is
+///   required the first time that you provide a `VersionLifecycleConfig` for the
+///   application in one of the supporting calls (`CreateApplication` or
+///   `UpdateApplicationResourceLifecycle`). After you provide it once, in either one of
+///   the calls, Elastic Beanstalk persists the Service Role with the application, and
+///   you don't need to specify it again in subsequent
+///   `UpdateApplicationResourceLifecycle` calls."
+///
+/// So a request that asks for a version lifecycle configuration is served by the role
+/// ALREADY PERSISTED with the application when it supplies none, and refused when
+/// neither it nor the application carries one.
+pub fn service_role_unusable(
     stored: Option<&ApplicationResourceLifecycleConfig>,
     requested: &ApplicationResourceLifecycleConfig,
 ) -> bool {
-    let requests_version_lifecycle = requested.version_lifecycle_config.is_some();
-    let has_service_role = requested
-        .service_role
-        .as_ref()
-        .or_else(|| stored.and_then(|config| config.service_role.as_ref()))
-        .is_some_and(|role| !role.is_empty());
-    requests_version_lifecycle && !has_service_role
+    if let Some(supplied) = requested.service_role.as_ref() {
+        return !is_iam_role_arn(supplied);
+    }
+    requested.version_lifecycle_config.is_some()
+        && !stored
+            .and_then(|config| config.service_role.as_deref())
+            .is_some_and(is_iam_role_arn)
+}
+
+/// The form `ApplicationResourceLifecycleConfig$ServiceRole` states: "The ARN of an
+/// IAM service role that Elastic Beanstalk has permission to assume."
+///
+/// An IAM role ARN is `arn:<partition>:iam::<account>:role/<name>`: IAM is a
+/// partition-global service, so the Region field is empty, and the resource names the
+/// `role` type and a non-empty name (a name may itself carry a path,
+/// `role/service-role/<name>`). The account is either empty or the 12 digits an AWS
+/// account id has, and the partition is `aws` or `aws-` plus a non-empty suffix. That
+/// grammar is the one every AWS model states for an IAM role ARN —
+/// `^arn:aws(-[^:]+)?:iam::([0-9]{12})?:role/.+$`, e.g.
+/// `com.amazonaws.bedrockagentcorecontrol#RoleArn`, and
+/// `^arn:aws(-[^:]+)?:iam::[0-9]{12}:role/.+$` on Comprehend's `IamRoleArn`.
+///
+/// The six fields are split here rather than through `services/common`'s shared ARN
+/// reader for the reason `tests/all/lifecycle.rs` already records for its own helpers: a
+/// new dependency has to be recorded in `Cargo.lock`, the one file this branch shares
+/// with every other fix landing on mainline, and that shared hunk is what kept this
+/// change's squash merge colliding. The split is the same one
+/// [`elasticbeanstalk_arn_resource`] below performs for this service's own ARNs, so the
+/// crate states the six-field form once per direction it reads.
+///
+/// A value whose form this rejects names no role that could ever be assumed, so it is a
+/// defect in the REQUEST — reported as an invalid parameter naming the member and this
+/// constraint (see [`service_role_unusable`]).
+pub fn is_iam_role_arn(value: &str) -> bool {
+    // `splitn(6, …)` leaves the whole resource — colons included — as the last field.
+    let mut fields = value.splitn(6, ':');
+    let (Some("arn"), Some(partition), Some("iam"), Some(""), Some(account), Some(resource)) = (
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        // IAM is partition-global, so an IAM ARN's Region field is empty.
+        fields.next(),
+        fields.next(),
+        fields.next(),
+    ) else {
+        return false;
+    };
+    // `aws(-[^:]+)?`: the partition is `aws`, or `aws-` plus a non-empty suffix
+    // (`aws-cn`, `aws-us-gov`) — not merely a value STARTING with those letters.
+    let partition_well_formed = partition == "aws"
+        || partition
+            .strip_prefix("aws-")
+            .is_some_and(|suffix| !suffix.is_empty());
+    let account_well_formed = account.is_empty()
+        || (account.len() == 12 && account.bytes().all(|byte| byte.is_ascii_digit()));
+    partition_well_formed
+        && account_well_formed
+        && resource
+            .strip_prefix("role/")
+            .is_some_and(|name| !name.is_empty())
+}
+
+/// The message a rejected parameter VALUE is reported with: the member the request
+/// named and the constraint that member's value failed, which is how AWS words a
+/// validation refusal it builds from the request ("Parameter ServiceRole is invalid.
+/// Must be a valid IAM Role ARN.").
+pub fn invalid_parameter_message(member: &str, requirement: &str) -> String {
+    format!("Parameter {member} is invalid. Must be {requirement}.")
+}
+
+/// The requirement clause [`invalid_parameter_message`] states for a member documented
+/// as the ARN of an IAM role, in the one place both supporting calls read it from.
+pub const IAM_ROLE_ARN_REQUIREMENT: &str = "a valid IAM Role ARN";
+
+/// The message the modelled `TooManyTagsException` is answered with: the quota a
+/// resource has, which is what the exception states — "The number of tags in the
+/// resource would exceed the number of tags that each resource can have."
+///
+/// Built from [`MAX_TAGS_PER_RESOURCE`], so the sentence cannot state a limit this
+/// service does not enforce, and shared by every check that raises the exception: the
+/// quota is one fact, so a caller reads one sentence for it however it was exceeded.
+pub fn too_many_tags_message() -> String {
+    format!(
+        "The maximum number of tags per resource is exceeded. The number of allowed tags \
+         is {MAX_TAGS_PER_RESOURCE}."
+    )
 }
 
 /// A stored application.

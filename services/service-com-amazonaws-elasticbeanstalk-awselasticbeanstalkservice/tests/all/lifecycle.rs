@@ -49,6 +49,25 @@ const API_VERSION: &str = "2010-12-01";
 /// is asserted against something that is not the default.
 pub(crate) const TEST_REGION: &str = "us-west-2";
 
+/// A platform for an environment to run on: a `SolutionStackName` from the service's
+/// OWN published catalogue (`eb::state::SOLUTION_STACKS`, what
+/// `ListAvailableSolutionStacks` reports), derived through the same
+/// `SolutionStack::name()` the service reports it by — AWS's `<os> v<version> running
+/// <runtime>` form — so it cannot drift from the catalogue or from the member it is
+/// sent as.
+///
+/// `CreateEnvironment` refuses a request that names no configuration template, no
+/// solution stack and no platform version ("You must specify either Configuration
+/// Template name or Solution Stack name."), so a fixture environment names one of the
+/// three; this is the one suites reach for when WHICH platform is not what they are
+/// asserting.
+pub(crate) static SOLUTION_STACK: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    eb::state::SOLUTION_STACKS
+        .first()
+        .expect("the service publishes at least one solution stack")
+        .name()
+});
+
 /// Long enough that a status change the clock owed is due. Derived from the
 /// service's own span so the two cannot drift apart.
 pub(crate) const PAST_DUE: Duration =
@@ -718,6 +737,7 @@ async fn created_environments_are_derived_from_the_request_and_persisted() {
         let mut params: Vec<(&str, &str)> = vec![
             ("ApplicationName", "tiers"),
             ("EnvironmentName", name),
+            ("SolutionStackName", SOLUTION_STACK.as_str()),
         ];
         if let Some(prefix) = case.cname_prefix {
             params.push(("CNAMEPrefix", prefix));
@@ -864,6 +884,7 @@ async fn describe_environments_filters_and_paginates() {
                 &[
                     ("ApplicationName", application),
                     ("EnvironmentName", environment),
+                    ("SolutionStackName", SOLUTION_STACK.as_str()),
                     ("VersionLabel", "v1"),
                 ],
             )
@@ -979,6 +1000,7 @@ async fn a_launching_environment_becomes_ready_when_the_clock_makes_it_due() {
             &[
                 ("ApplicationName", "clock"),
                 ("EnvironmentName", "clock-env"),
+                ("SolutionStackName", SOLUTION_STACK.as_str()),
             ],
         )
         .await;
@@ -1044,6 +1066,7 @@ async fn a_launching_environment_becomes_ready_when_the_clock_makes_it_due() {
             &[
                 ("ApplicationName", "clock"),
                 ("EnvironmentName", "clock-env"),
+                ("SolutionStackName", SOLUTION_STACK.as_str()),
             ],
         )
         .await;
@@ -1096,6 +1119,7 @@ async fn bad_requests_are_refused_with_the_services_own_error_codes() {
                 &[
                     ("ApplicationName", "taken"),
                     ("EnvironmentName", "taken-env"),
+                    ("SolutionStackName", SOLUTION_STACK.as_str()),
                 ],
             )
             .await
@@ -1132,6 +1156,7 @@ async fn bad_requests_are_refused_with_the_services_own_error_codes() {
             params: vec![
                 ("ApplicationName", "taken"),
                 ("EnvironmentName", "taken-env"),
+                ("SolutionStackName", SOLUTION_STACK.as_str()),
             ],
             status: 400,
             code: "InvalidParameterValue",
@@ -1146,7 +1171,11 @@ async fn bad_requests_are_refused_with_the_services_own_error_codes() {
         RefusalCase {
             case: "environment for an unknown application",
             action: "CreateEnvironment",
-            params: vec![("ApplicationName", "nope"), ("EnvironmentName", "nope-env")],
+            params: vec![
+                ("ApplicationName", "nope"),
+                ("EnvironmentName", "nope-env"),
+                ("SolutionStackName", SOLUTION_STACK.as_str()),
+            ],
             status: 400,
             code: "InvalidParameterValue",
         },
@@ -1156,6 +1185,7 @@ async fn bad_requests_are_refused_with_the_services_own_error_codes() {
             params: vec![
                 ("ApplicationName", "taken"),
                 ("EnvironmentName", "other-env"),
+                ("SolutionStackName", SOLUTION_STACK.as_str()),
                 ("VersionLabel", "v9"),
             ],
             status: 400,
@@ -1178,7 +1208,10 @@ async fn bad_requests_are_refused_with_the_services_own_error_codes() {
         RefusalCase {
             case: "create an environment with no name",
             action: "CreateEnvironment",
-            params: vec![("ApplicationName", "taken")],
+            params: vec![
+                ("ApplicationName", "taken"),
+                ("SolutionStackName", SOLUTION_STACK.as_str()),
+            ],
             status: 400,
             code: "MissingRequiredParameter",
         },
@@ -1258,7 +1291,11 @@ async fn an_application_with_running_environments_is_not_deleted_silently() {
     let created = emulator
         .call(
             "CreateEnvironment",
-            &[("ApplicationName", "busy"), ("EnvironmentName", "busy-env")],
+            &[
+                ("ApplicationName", "busy"),
+                ("EnvironmentName", "busy-env"),
+                ("SolutionStackName", SOLUTION_STACK.as_str()),
+            ],
         )
         .await;
     assert_eq!(
@@ -1426,6 +1463,7 @@ async fn the_account_quotas_are_enforced_with_the_modelled_errors() {
                 &[
                     ("ApplicationName", "quota"),
                     ("EnvironmentName", name.as_str()),
+                    ("SolutionStackName", SOLUTION_STACK.as_str()),
                 ],
             )
             .await;
@@ -1441,6 +1479,7 @@ async fn the_account_quotas_are_enforced_with_the_modelled_errors() {
             &[
                 ("ApplicationName", "quota"),
                 ("EnvironmentName", "env-one-too-many"),
+                ("SolutionStackName", SOLUTION_STACK.as_str()),
             ],
         )
         .await;
