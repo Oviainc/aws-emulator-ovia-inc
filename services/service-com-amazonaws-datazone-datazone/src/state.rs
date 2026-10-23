@@ -951,6 +951,15 @@ pub struct Asset {
     /// and the least is the first. NEVER empty: a created asset is its own first
     /// revision. Bounded by [`MAX_ASSET_REVISIONS`].
     pub revisions: BTreeMap<u32, AssetRevision>,
+    /// The asset filters defined ON this asset, keyed by their `FilterId` — the
+    /// identifier `GetAssetFilter`/`DeleteAssetFilter` address one by — so a filter goes
+    /// with the asset it is a view of. Kept on the ASSET rather than on a revision: a
+    /// filter addresses the asset (`CreateAssetFilterInput` names no revision,
+    /// smithy_query operation="CreateAssetFilter"), so adding a revision neither
+    /// duplicates nor drops one. A `BTreeMap` so `ListAssetFilters` iterates in one
+    /// stable order and a pagination token can resume from a key. Bounded by
+    /// [`MAX_FILTERS_PER_ASSET`].
+    pub filters: BTreeMap<String, AssetFilter>,
 }
 
 impl Asset {
@@ -1117,6 +1126,413 @@ pub struct StoredPredictionConfiguration {
 #[derive(Debug, Clone, Default)]
 pub struct StoredBusinessNameGeneration {
     pub enabled: Option<bool>,
+}
+
+/// One stored asset filter: a controlled view of ONE asset — either the columns of it a
+/// consumer sees (`columnConfiguration`) or the rows (`rowConfiguration`).
+///
+/// What is STORED is what the request set: the filter's identity, its name and
+/// description, and the `configuration` as the modelled union the request carried, so a
+/// read reports back exactly what was persisted rather than a lossy projection of it.
+/// The derived members (`status`, `errorMessage`, `effective*`) are not stored at all:
+/// they are a function of that configuration and of the asset's schema AS IT IS NOW, so
+/// every operation reporting this filter derives them through
+/// [`asset_filter_evaluation`] and no stored copy of them can go stale when a new asset
+/// revision changes the schema.
+#[derive(Debug, Clone)]
+pub struct AssetFilter {
+    /// The filter's own `FilterId`, minted by
+    /// [`ComAmazonawsDatazoneDatazoneState::mint_id`].
+    pub id: String,
+    pub domain_id: String,
+    /// The asset this filter is a view OF.
+    pub asset_id: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub configuration: crate::ops::types::AssetFilterConfiguration,
+    pub created_at_ms: i64,
+    /// The `@idempotencyToken` the request that created this filter carried, so a replay
+    /// of that request answers with this filter instead of adding a second one. Stored on
+    /// the filter (rather than in a side map) so the token is released with it, the way
+    /// [`PolicyGrant::client_token`] is.
+    pub client_token: Option<String>,
+}
+
+/// The `FilterStatus` members (model enum `com.amazonaws.datazone#FilterStatus`:
+/// VALID | INVALID). Both are verdicts on a filter evaluated against its asset — the
+/// enum has no in-progress member — so a filter is reported with its verdict from the
+/// moment it is stored and owes the clock no transition.
+pub const FILTER_STATUS_VALID: &str = "VALID";
+pub const FILTER_STATUS_INVALID: &str = "INVALID";
+
+/// The most asset filters this emulator stores on one asset.
+///
+/// A CHOSEN ceiling, not a published quota: `CreateAssetFilter` is a caller-driven
+/// growth site, so the per-asset filter map has to be bounded or a create loop grows the
+/// emulator's heap without limit. The refusal past it is the
+/// `ServiceQuotaExceededException` the operation already models.
+pub const MAX_FILTERS_PER_ASSET: usize = 100;
+
+/// The deepest `and`/`or` nesting this emulator evaluates in one row filter.
+///
+/// A CHOSEN bound, not a published quota: `RowFilterList` declares no length and
+/// `RowFilter` nests into itself (smithy_query shape="RowFilter"), so a request can
+/// describe a filter of any depth. Past this the request is refused with the operation's
+/// `ValidationException` rather than walked, so neither rendering nor validating a
+/// stored filter can run away.
+pub const MAX_ROW_FILTER_DEPTH: usize = 10;
+
+/// The most nodes (`and`/`or` groups plus expressions) this emulator evaluates in one
+/// row filter.
+///
+/// A CHOSEN bound, and the one that makes the whole filter bounded rather than just its
+/// nesting: depth alone caps no total, because the BREADTH of each `and`/`or` member
+/// list is unconstrained by the model, so one shallow group can carry any number of
+/// expressions. Every walk over a row filter — measuring, collecting its columns,
+/// rendering it — is linear in the node count, so capping the count caps the CPU one
+/// request can ask for, both at create time and on every later read of the stored
+/// filter. Past it the request is refused with the operation's `ValidationException`.
+pub const MAX_ROW_FILTER_NODES: usize = 1_000;
+
+/// The most columns this emulator accepts in one column filter's `includedColumnNames`.
+///
+/// A CHOSEN bound: `ColumnNameList` declares no length (smithy_query
+/// shape="ColumnNameList"), so the list is a caller-chosen size that every evaluation of
+/// the stored filter walks. Past it the request is refused with the operation's
+/// `ValidationException`.
+pub const MAX_INCLUDED_COLUMN_NAMES: usize = 1_000;
+
+/// How big a row filter is: its `and`/`or` nesting depth (1 for a bare expression) and
+/// its total node count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RowFilterSize {
+    pub depth: usize,
+    /// The nodes counted, which STOPS one past [`MAX_ROW_FILTER_NODES`]: a filter is
+    /// refused at that point, so there is never a reason to walk the rest of it.
+    pub nodes: usize,
+}
+
+/// Measure `filter`, stopping as soon as it is already too big to accept.
+///
+/// Walked with an explicit stack rather than by recursion, so measuring a deeply nested
+/// request costs no stack, and abandoned once more than [`MAX_ROW_FILTER_NODES`] nodes
+/// have been seen, so measuring a request of ANY size costs at most that many steps.
+/// A handler refuses the filter when either figure exceeds its bound, before the filter
+/// is stored and before anything walks it again.
+pub fn measure_row_filter(filter: &crate::ops::types::RowFilter) -> RowFilterSize {
+    use crate::ops::types::RowFilter;
+    let mut deepest = 0;
+    let mut nodes = 0;
+    let mut pending = vec![(filter, 1usize)];
+    while let Some((node, depth)) = pending.pop() {
+        deepest = deepest.max(depth);
+        nodes += 1;
+        if nodes > MAX_ROW_FILTER_NODES {
+            break;
+        }
+        match node {
+            RowFilter::Expression(_) => {}
+            RowFilter::And(members) | RowFilter::Or(members) => {
+                // The children still to visit are themselves bounded by the node cap:
+                // the walk stops one past it, so the stack cannot grow past the number
+                // of children of the nodes already counted.
+                for member in members.iter().take(MAX_ROW_FILTER_NODES + 1) {
+                    pending.push((member, depth + 1));
+                }
+            }
+        }
+    }
+    RowFilterSize {
+        depth: deepest,
+        nodes,
+    }
+}
+
+/// Every column name `filter` references, in the order the filter names them and with
+/// repeats dropped.
+///
+/// Linear in the filter's node count: membership is decided through a set, not by
+/// rescanning what has been collected. The walk visits at most
+/// [`MAX_ROW_FILTER_NODES`] nodes, the bound every handler enforces before it stores a
+/// filter, so no stored filter can make this walk unbounded either.
+pub fn row_filter_column_names(filter: &crate::ops::types::RowFilter) -> Vec<String> {
+    use crate::ops::types::{RowFilter, RowFilterExpression as Expr};
+    let mut names: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // The members of a group are walked in order, so the names come out in the order
+    // the request listed them; the stack is popped from the back, so each group's
+    // members are pushed in reverse.
+    let mut pending: Vec<&RowFilter> = vec![filter];
+    let mut visited = 0;
+    while let Some(node) = pending.pop() {
+        visited += 1;
+        if visited > MAX_ROW_FILTER_NODES {
+            break;
+        }
+        match node {
+            RowFilter::Expression(expression) => {
+                let column = match expression {
+                    Expr::equalTo(e) => &e.column_name,
+                    Expr::notEqualTo(e) => &e.column_name,
+                    Expr::greaterThan(e) => &e.column_name,
+                    Expr::lessThan(e) => &e.column_name,
+                    Expr::greaterThanOrEqualTo(e) => &e.column_name,
+                    Expr::lessThanOrEqualTo(e) => &e.column_name,
+                    Expr::isNull(e) => &e.column_name,
+                    Expr::isNotNull(e) => &e.column_name,
+                    Expr::In(e) => &e.column_name,
+                    Expr::notIn(e) => &e.column_name,
+                    Expr::Like(e) => &e.column_name,
+                    Expr::notLike(e) => &e.column_name,
+                };
+                if seen.insert(column.clone()) {
+                    names.push(column.clone());
+                }
+            }
+            RowFilter::And(members) | RowFilter::Or(members) => {
+                for member in members.iter().take(MAX_ROW_FILTER_NODES + 1).rev() {
+                    pending.push(member);
+                }
+            }
+        }
+    }
+    names
+}
+
+/// `filter` as ONE predicate, the modelled `effectiveRowFilter` string.
+///
+/// `effectiveRowFilter` is an unconstrained `String` (smithy_query
+/// shape="CreateAssetFilterOutput" member="effectiveRowFilter") and AWS documents no
+/// grammar for it, so this is a CHOSEN canonical rendering: a SQL `WHERE` predicate,
+/// with each comparison as `<column> <operator> '<value>'`, an `in`/`notIn` as a
+/// parenthesised value list, and a group of two or more members joined by `AND`/`OR`
+/// inside parentheses. A single-member group renders as that member, and a group with
+/// no member renders as nothing at all, since it restricts nothing. A value's single
+/// quotes are doubled, so a value can never end the quoted literal early.
+///
+/// Recursion is bounded by [`MAX_ROW_FILTER_DEPTH`] and the work by
+/// [`MAX_ROW_FILTER_NODES`], both of which every handler checks with
+/// [`measure_row_filter`] before it stores a filter — so rendering a stored filter is
+/// bounded however big a request was.
+pub fn render_row_filter(filter: &crate::ops::types::RowFilter) -> String {
+    use crate::ops::types::{RowFilter, RowFilterExpression as Expr};
+
+    /// A value as a SQL string literal: single quotes doubled, the whole quoted.
+    fn literal(value: &str) -> String {
+        format!("'{}'", value.replace('\'', "''"))
+    }
+    /// A `(v1, v2, …)` value list for `in`/`notIn`.
+    fn literal_list(values: &[String]) -> String {
+        let rendered: Vec<String> = values.iter().map(|value| literal(value)).collect();
+        format!("({})", rendered.join(", "))
+    }
+
+    match filter {
+        RowFilter::Expression(expression) => match expression {
+            Expr::equalTo(e) => format!("{} = {}", e.column_name, literal(&e.value)),
+            Expr::notEqualTo(e) => format!("{} <> {}", e.column_name, literal(&e.value)),
+            Expr::greaterThan(e) => format!("{} > {}", e.column_name, literal(&e.value)),
+            Expr::lessThan(e) => format!("{} < {}", e.column_name, literal(&e.value)),
+            Expr::greaterThanOrEqualTo(e) => {
+                format!("{} >= {}", e.column_name, literal(&e.value))
+            }
+            Expr::lessThanOrEqualTo(e) => format!("{} <= {}", e.column_name, literal(&e.value)),
+            Expr::isNull(e) => format!("{} IS NULL", e.column_name),
+            Expr::isNotNull(e) => format!("{} IS NOT NULL", e.column_name),
+            Expr::In(e) => format!("{} IN {}", e.column_name, literal_list(&e.values)),
+            Expr::notIn(e) => format!("{} NOT IN {}", e.column_name, literal_list(&e.values)),
+            Expr::Like(e) => format!("{} LIKE {}", e.column_name, literal(&e.value)),
+            Expr::notLike(e) => format!("{} NOT LIKE {}", e.column_name, literal(&e.value)),
+        },
+        RowFilter::And(members) => render_group(members, "AND"),
+        RowFilter::Or(members) => render_group(members, "OR"),
+    }
+}
+
+/// One `and`/`or` group of [`render_row_filter`]: the members that render to something,
+/// joined by `operator` and parenthesised once there is more than one of them.
+fn render_group(members: &[crate::ops::types::RowFilter], operator: &str) -> String {
+    let rendered: Vec<String> = members
+        .iter()
+        .map(render_row_filter)
+        .filter(|member| !member.is_empty())
+        .collect();
+    match rendered.len() {
+        0 => String::new(),
+        1 => rendered.into_iter().next().unwrap_or_default(),
+        _ => format!("({})", rendered.join(&format!(" {operator} "))),
+    }
+}
+
+/// The column names an asset's own schema declares, or `None` when nothing it stores
+/// declares any.
+///
+/// An asset's columns live in the content of a metadata form — DataZone's relational
+/// table form carries a `columns` array whose entries name a `columnName` — and this
+/// emulator persists that content verbatim, so the schema is read back off the stored
+/// forms of the asset's LATEST revision: that is the asset as it is now, which is what a
+/// filter created against it has to agree with. Entries are collected in the order the
+/// forms declare them, with repeats dropped, and a column named by a bare string is
+/// taken as that name, so a form that lists `["id"]` and one that lists
+/// `[{"columnName": "id"}]` declare the same column.
+///
+/// `None` means NOT KNOWN, not empty: an asset whose forms declare no `columns` array
+/// says nothing about its schema, and a filter over it is therefore not contradicted by
+/// it. An asset that declares an EMPTY array declares a schema with no columns.
+///
+/// Linear in the number of entries the forms declare: membership is decided through a
+/// set, not by rescanning what has been collected.
+pub fn asset_schema_columns(asset: &Asset) -> Option<Vec<String>> {
+    let mut columns: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut declared = false;
+    for form in asset
+        .latest_revision()
+        .map(|revision| revision.forms.as_slice())
+        .unwrap_or_default()
+    {
+        let Some(content) = form.content.as_deref() else {
+            continue;
+        };
+        let Ok(parsed) = serde_json::from_str::<serde_json::Value>(content) else {
+            continue;
+        };
+        let Some(listed) = parsed.get("columns").and_then(serde_json::Value::as_array) else {
+            continue;
+        };
+        declared = true;
+        for entry in listed {
+            let name = match entry {
+                serde_json::Value::String(name) => Some(name.clone()),
+                serde_json::Value::Object(_) => entry
+                    .get("columnName")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+                _ => None,
+            };
+            if let Some(name) = name {
+                if seen.insert(name.clone()) {
+                    columns.push(name);
+                }
+            }
+        }
+    }
+    declared.then_some(columns)
+}
+
+/// What an asset filter's configuration, evaluated against the asset's schema, makes of
+/// it: the derived members every asset-filter operation reports.
+#[derive(Debug, Clone)]
+pub struct AssetFilterEvaluation {
+    pub status: String,
+    pub error_message: Option<String>,
+    pub effective_column_names: Option<Vec<String>>,
+    pub effective_row_filter: Option<String>,
+}
+
+/// The derived members a stored filter is reported with, against the asset's schema as
+/// it is NOW ([`asset_schema_columns`]).
+///
+/// Derived on every report rather than stored, so a filter's verdict follows the asset:
+/// a filter naming a column the asset did not have is `INVALID`, and becomes `VALID`
+/// once a later revision of that asset declares the column. Shared by every operation
+/// that reports a filter, so `CreateAssetFilter` and `GetAssetFilter` cannot disagree
+/// about one.
+///
+/// Takes the schema rather than the asset so a handler can read both out of the store,
+/// RELEASE the store guard, and only then derive: the walk is bounded
+/// ([`MAX_ROW_FILTER_NODES`], [`MAX_INCLUDED_COLUMN_NAMES`]) but it is not work to do
+/// while every other caller of this service waits on the same lock.
+///
+/// "The asset must have the referenced columns available in its schema for column-based
+/// filtering" (smithy_query doc shape="CreateAssetFilter"), so a filter is
+/// [`FILTER_STATUS_VALID`] exactly when every column it names is available in the
+/// asset's schema, and [`FILTER_STATUS_INVALID`] otherwise, with an `errorMessage`
+/// naming the columns that are not. A schema of `None` is NOT KNOWN, so it contradicts
+/// nothing and every named column stands.
+///
+/// A column filter's `effectiveColumnNames` are the included columns the asset actually
+/// has — "the column names in the asset filter" (smithy_query doc
+/// shape="CreateAssetFilterOutput" member="effectiveColumnNames") — and a row filter's
+/// `effectiveRowFilter` is its predicate ([`render_row_filter`]). Each configuration
+/// fills the member that belongs to it and leaves the other absent: a row filter selects
+/// rows rather than columns, and a column filter names no rows.
+pub fn evaluate_asset_filter(
+    configuration: &crate::ops::types::AssetFilterConfiguration,
+    schema: Option<&[String]>,
+) -> AssetFilterEvaluation {
+    use crate::ops::types::AssetFilterConfiguration as Config;
+
+    // Built once per evaluation, so deciding whether a column is in the schema is a
+    // hash lookup rather than a scan of the schema per named column.
+    let known: Option<std::collections::HashSet<&str>> =
+        schema.map(|columns| columns.iter().map(String::as_str).collect());
+    let available =
+        |name: &String| known.as_ref().is_none_or(|columns| columns.contains(name.as_str()));
+    match configuration {
+        Config::columnConfiguration(column) => {
+            let mut requested: Vec<String> = Vec::new();
+            let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+            // Bounded by the cap the handler refuses a longer list with, so no stored
+            // filter makes this walk unbounded either.
+            for name in column
+                .included_column_names
+                .iter()
+                .flatten()
+                .take(MAX_INCLUDED_COLUMN_NAMES)
+            {
+                if seen.insert(name.as_str()) {
+                    requested.push(name.clone());
+                }
+            }
+            let (effective, missing): (Vec<String>, Vec<String>) =
+                requested.into_iter().partition(available);
+            AssetFilterEvaluation {
+                status: filter_status(&missing).to_string(),
+                error_message: unavailable_columns_message(&missing),
+                effective_column_names: Some(effective),
+                effective_row_filter: None,
+            }
+        }
+        Config::rowConfiguration(row) => {
+            let missing: Vec<String> = row_filter_column_names(&row.row_filter)
+                .into_iter()
+                .filter(|name| !available(name))
+                .collect();
+            AssetFilterEvaluation {
+                status: filter_status(&missing).to_string(),
+                error_message: unavailable_columns_message(&missing),
+                effective_column_names: None,
+                effective_row_filter: Some(render_row_filter(&row.row_filter)),
+            }
+        }
+    }
+}
+
+/// The `FilterStatus` a filter missing `missing` columns from the asset's schema carries.
+fn filter_status(missing: &[String]) -> &'static str {
+    if missing.is_empty() {
+        FILTER_STATUS_VALID
+    } else {
+        FILTER_STATUS_INVALID
+    }
+}
+
+/// The `errorMessage` an [`FILTER_STATUS_INVALID`] filter reports — "the error message
+/// that is displayed if the asset filter is not created successfully" (smithy_query doc
+/// shape="CreateAssetFilterOutput" member="errorMessage").
+///
+/// Built from the request and the asset's stored schema: it names the columns the filter
+/// asked for that the asset does not have, which is exactly why the filter is invalid.
+/// `None` when nothing is missing, so a valid filter carries no error message.
+fn unavailable_columns_message(missing: &[String]) -> Option<String> {
+    if missing.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "The following columns are not available in the asset's schema: {}",
+        missing.join(", ")
+    ))
 }
 
 /// One stored policy grant: an authorization policy of one `policyType`, held by one
@@ -1689,6 +2105,24 @@ impl ComAmazonawsDatazoneDatazoneState {
         self.domains.get(domain_id)?.domain_units.get(unit_id)
     }
 
+    /// The asset `asset_id` stored in the live domain `domain_id`, when both exist.
+    ///
+    /// The domain liveness notion is [`Self::live_domain`]'s: a domain on its way out no
+    /// longer takes a new asset filter, and its assets are about to go with it. Shared by
+    /// every asset-filter handler so they resolve the pair by one rule.
+    pub fn live_asset(&self, domain_id: &str, asset_id: &str) -> Option<&Asset> {
+        self.live_domain(domain_id)?.assets.get(asset_id)
+    }
+
+    /// [`Self::live_asset`], for a call that writes the asset (adding a filter to it).
+    pub fn live_asset_mut(&mut self, domain_id: &str, asset_id: &str) -> Option<&mut Asset> {
+        self.domains
+            .get_mut(domain_id)
+            .filter(|domain| domain.status != DOMAIN_STATUS_DELETING)?
+            .assets
+            .get_mut(asset_id)
+    }
+
     /// The entity an entity-owner call names, when it is stored.
     ///
     /// `DataZoneEntityType` has exactly one member, `DOMAIN_UNIT` (smithy_query
@@ -1889,6 +2323,7 @@ pub enum ResourceKind {
     FormType,
     Glossary,
     Asset,
+    AssetFilter,
     DataProduct,
     Listing,
 }
@@ -1904,6 +2339,7 @@ impl ResourceKind {
             Self::FormType => "Form type",
             Self::Glossary => "Glossary",
             Self::Asset => "Asset",
+            Self::AssetFilter => "Asset filter",
             Self::DataProduct => "Data product",
             Self::Listing => "Listing",
         }

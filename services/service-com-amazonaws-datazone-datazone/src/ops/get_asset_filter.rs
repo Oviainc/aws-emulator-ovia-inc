@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetAssetFilter
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetAssetFilter`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetAssetFilter::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports ONE stored asset filter: the filter `identifier` names, on the asset
+//! `assetIdentifier` names, in the live domain `domainIdentifier` names. "Domain,
+//! asset, and filter must all exist" and "the asset filter should not have been
+//! deleted" (smithy_query doc shape="GetAssetFilter"), so a call that names any of them
+//! wrongly is a 404 and nothing else.
+//!
+//! A pure read (`@readonly`): the filter's identity, name, description and
+//! configuration come off the record `CreateAssetFilter` stored, and the derived
+//! `status`, `errorMessage` and `effective*` members are computed from that
+//! configuration against the asset's schema AS IT IS NOW
+//! ([`crate::state::evaluate_asset_filter`]) — so a filter whose columns a later asset
+//! revision added reports `VALID` without this call writing anything. It changes
+//! nothing a later caller sees. Both the filter and that schema are copied out of the
+//! store and the guard released before either is walked, and the walk is bounded by the
+//! size limits `CreateAssetFilter` enforces, so no stored filter can make this read
+//! expensive or hold the service's lock.
 //!
 //! ## Shape of an operation
 //!
@@ -168,18 +176,62 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetAssetFilter` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetAssetFilterErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetAssetFilter"))
+        use crate::state::{
+            asset_schema_columns, date_time, evaluate_asset_filter, now_ms, ResourceKind,
+        };
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetAssetFilterErrorModeled::InternalServerException(InternalServerException {
+                message: "the DataZone store is unavailable".to_string(),
+            })
+        })?;
+        let mut store = state.lock();
+        // The only write a read makes: what the clock already owed at this instant,
+        // whether or not anybody called.
+        store.settle_clock(now_ms());
+
+        // Which of the three is missing is reported by KIND only, never by echoing the
+        // caller's identifier back.
+        let asset = store
+            .live_asset(&input.domain_identifier, &input.asset_identifier)
+            .ok_or_else(|| {
+                let kind = if store.live_domain(&input.domain_identifier).is_none() {
+                    ResourceKind::Domain
+                } else {
+                    ResourceKind::Asset
+                };
+                GetAssetFilterErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message: kind.not_found_message(),
+                })
+            })?;
+        let filter = asset.filters.get(&input.identifier).ok_or_else(|| {
+            GetAssetFilterErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: ResourceKind::AssetFilter.not_found_message(),
+            })
+        })?;
+        // Copied out of the store, so the store guard is RELEASED before anything is
+        // derived from them: deriving is bounded work, but it is not work to do while
+        // every other caller of this service waits on the same lock.
+        let filter = filter.clone();
+        let schema = asset_schema_columns(asset);
+        drop(store);
+        // The derived members follow the ASSET as it is now, so a filter naming a column
+        // a later revision added is reported valid without anything being rewritten.
+        let evaluation = evaluate_asset_filter(&filter.configuration, schema.as_deref());
+
+        Ok(GetAssetFilterOutput {
+            id: filter.id.clone(),
+            domain_id: filter.domain_id.clone(),
+            asset_id: filter.asset_id.clone(),
+            name: filter.name.clone(),
+            description: filter.description.clone(),
+            status: Some(evaluation.status),
+            configuration: filter.configuration.clone(),
+            created_at: Some(date_time(filter.created_at_ms)),
+            error_message: evaluation.error_message,
+            effective_column_names: evaluation.effective_column_names,
+            effective_row_filter: evaluation.effective_row_filter,
+        })
     }
 }

@@ -1,15 +1,29 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateAssetFilter
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateAssetFilter`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateAssetFilter::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Stores a filter — a controlled view of ONE persisted asset — under that asset in a
+//! live domain, so `GetAssetFilter` answers from the stored record and the filter
+//! disappears with the asset (and with the domain).
+//!
+//! `configuration` is a UNION (smithy_query shape="AssetFilterConfiguration"), so "you
+//! cannot specify both (columnConfiguration, rowConfiguration) at the same time" is
+//! already true of every request that deserializes. What this handler stores is that
+//! configuration; what it REPORTS is the view the configuration defines against the
+//! asset's OWN stored schema ([`crate::state::evaluate_asset_filter`]): a column
+//! filter's `effectiveColumnNames`, a row filter's `effectiveRowFilter`, and the
+//! `status`/`errorMessage` verdict on whether every column the filter names is
+//! available in that schema. The derived members are not persisted, so a later asset
+//! revision that changes the schema changes the verdict instead of leaving a stale copy
+//! of it. `FilterStatus` has no in-progress member, so the filter is reported with its
+//! verdict from the moment it is stored and owes the clock no transition.
+//!
+//! The model bounds neither the nesting of a row filter, nor the breadth of one
+//! `and`/`or` list, nor the length of `includedColumnNames`, and every report of the
+//! filter walks all three — so a request bigger than this emulator evaluates
+//! (`MAX_ROW_FILTER_DEPTH`, `MAX_ROW_FILTER_NODES`, `MAX_INCLUDED_COLUMN_NAMES`) is
+//! refused here, before the store guard is taken, rather than stored and walked again
+//! on every later read.
 //!
 //! ## Shape of an operation
 //!
@@ -185,18 +199,190 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateAssetFilter` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateAssetFilterErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateAssetFilter"))
+        use crate::state::{
+            asset_schema_columns, measure_row_filter, now_ms, AssetFilter, ResourceKind,
+            MAX_FILTERS_PER_ASSET, MAX_INCLUDED_COLUMN_NAMES, MAX_ROW_FILTER_DEPTH,
+            MAX_ROW_FILTER_NODES,
+        };
+        let _ = ctx;
+
+        // Rules about the request's own SIZE, answered before anything is looked up and
+        // before the store guard is taken: the model bounds neither the nesting of a row
+        // filter, nor the breadth of one `and`/`or` list, nor the length of
+        // `includedColumnNames`, and this emulator walks all three every time it reports
+        // the filter. So a request bigger than it will evaluate is refused here rather
+        // than stored and walked again on every later read.
+        match &input.configuration {
+            AssetFilterConfiguration::rowConfiguration(row) => {
+                let size = measure_row_filter(&row.row_filter);
+                if size.nodes > MAX_ROW_FILTER_NODES {
+                    return Err(CreateAssetFilterErrorModeled::ValidationException(
+                        ValidationException {
+                            message: format!(
+                                "rowFilter holds more than {MAX_ROW_FILTER_NODES} expressions and groups, which is the most this emulator evaluates"
+                            ),
+                        },
+                    )
+                    .into());
+                }
+                if size.depth > MAX_ROW_FILTER_DEPTH {
+                    return Err(CreateAssetFilterErrorModeled::ValidationException(
+                        ValidationException {
+                            message: format!(
+                                "rowFilter nests {} levels deep; this emulator evaluates at most {MAX_ROW_FILTER_DEPTH}",
+                                size.depth
+                            ),
+                        },
+                    )
+                    .into());
+                }
+            }
+            AssetFilterConfiguration::columnConfiguration(column) => {
+                let named = column
+                    .included_column_names
+                    .as_ref()
+                    .map_or(0, |names| names.len());
+                if named > MAX_INCLUDED_COLUMN_NAMES {
+                    return Err(CreateAssetFilterErrorModeled::ValidationException(
+                        ValidationException {
+                            message: format!(
+                                "includedColumnNames names {named} columns; this emulator evaluates at most {MAX_INCLUDED_COLUMN_NAMES}"
+                            ),
+                        },
+                    )
+                    .into());
+                }
+            }
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateAssetFilterErrorModeled::InternalServerException(InternalServerException {
+                message: "the DataZone store is unavailable".to_string(),
+            })
+        })?;
+        let mut store = state.lock();
+        let now = now_ms();
+        store.settle_clock(now);
+
+        // Which of the two is missing is reported by KIND only, never by echoing the
+        // caller's identifier back.
+        let not_found = if store.live_domain(&input.domain_identifier).is_none() {
+            ResourceKind::Domain
+        } else {
+            ResourceKind::Asset
+        };
+        let asset = store
+            .live_asset(&input.domain_identifier, &input.asset_identifier)
+            .ok_or_else(|| {
+                CreateAssetFilterErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: not_found.not_found_message(),
+                    },
+                )
+            })?;
+
+        // The `@idempotencyToken`: a repeat of the SAME request returns the filter the
+        // first one created, so a retry never leaves two filters on the asset.
+        if let Some(token) = input.client_token.as_deref() {
+            if let Some(existing) = asset
+                .filters
+                .values()
+                .find(|filter| filter.client_token.as_deref() == Some(token))
+            {
+                // Copied out of the store, so the derived members are worked out with
+                // the guard RELEASED (see `filter_output`).
+                let existing = existing.clone();
+                let schema = asset_schema_columns(asset);
+                drop(store);
+                return Ok(filter_output(&existing, schema.as_deref()));
+            }
+        }
+        // The store is bounded, so a create loop cannot grow the emulator's heap
+        // without limit; the refusal is an error the operation already models.
+        if asset.filters.len() >= MAX_FILTERS_PER_ASSET {
+            return Err(CreateAssetFilterErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "this emulator stores at most {MAX_FILTERS_PER_ASSET} filters on one asset"
+                    ),
+                },
+            )
+            .into());
+        }
+
+        let id = store.mint_id(now);
+        let filter = AssetFilter {
+            id: id.clone(),
+            domain_id: input.domain_identifier.clone(),
+            asset_id: input.asset_identifier.clone(),
+            name: input.name,
+            description: input.description,
+            configuration: input.configuration,
+            created_at_ms: now,
+            client_token: input.client_token,
+        };
+
+        // The asset was proved present above, but the lookup is answered rather than
+        // assumed: the response is built from the record that was actually inserted, so
+        // a 201 can never report a filter this call did not persist.
+        let Some(asset) = store.live_asset_mut(&input.domain_identifier, &input.asset_identifier)
+        else {
+            return Err(CreateAssetFilterErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the asset is no longer in the DataZone store".to_string(),
+                },
+            )
+            .into());
+        };
+        // `mint_id` never repeats within one process, so this slot is vacant; were it
+        // ever not, inserting would silently replace a stored filter, so that is
+        // refused loudly instead.
+        if asset.filters.contains_key(&id) {
+            return Err(CreateAssetFilterErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: format!("the minted asset filter id {id} is already in use"),
+                },
+            )
+            .into());
+        }
+        asset.filters.insert(id.clone(), filter);
+        // The record that was actually inserted, and the schema it is judged against,
+        // copied out so the guard is released before anything is derived from them.
+        let stored = asset.filters[&id].clone();
+        let schema = asset_schema_columns(asset);
+        drop(store);
+        Ok(filter_output(&stored, schema.as_deref()))
+    }
+}
+
+/// The stored filter, as this operation reports it.
+///
+/// Identity, name, description and configuration are read off the stored record, and the
+/// derived members come from [`crate::state::evaluate_asset_filter`] against the schema
+/// of the asset the filter is a view of. So the response a retry gets (through the
+/// idempotency token) is the response the first call got, and it is the same answer
+/// `GetAssetFilter` gives for that filter.
+///
+/// Both arguments are COPIES of what the store holds, so this runs with the store guard
+/// released and one caller's filter cannot make another caller wait.
+fn filter_output(
+    filter: &crate::state::AssetFilter,
+    schema: Option<&[String]>,
+) -> CreateAssetFilterOutput {
+    use crate::state::{date_time, evaluate_asset_filter};
+
+    let evaluation = evaluate_asset_filter(&filter.configuration, schema);
+    CreateAssetFilterOutput {
+        id: filter.id.clone(),
+        domain_id: filter.domain_id.clone(),
+        asset_id: filter.asset_id.clone(),
+        name: filter.name.clone(),
+        description: filter.description.clone(),
+        status: Some(evaluation.status),
+        configuration: filter.configuration.clone(),
+        created_at: Some(date_time(filter.created_at_ms)),
+        error_message: evaluation.error_message,
+        effective_column_names: evaluation.effective_column_names,
+        effective_row_filter: evaluation.effective_row_filter,
     }
 }

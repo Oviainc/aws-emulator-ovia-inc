@@ -377,6 +377,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             revisions: [(first_revision.revision, first_revision)]
                 .into_iter()
                 .collect(),
+            // A filter is a view of an asset, added by `CreateAssetFilter`; a freshly
+            // created asset has none.
+            filters: std::collections::BTreeMap::new(),
         };
 
         // The domain was proved present above, but the lookup is answered rather than
