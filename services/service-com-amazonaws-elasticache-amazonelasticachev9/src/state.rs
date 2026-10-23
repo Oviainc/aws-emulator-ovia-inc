@@ -10,6 +10,14 @@
 //! the modelled `CacheCluster` / `CacheSubnetGroup` shapes, so the six handlers
 //! agree on one implementation instead of carrying copies that can drift.
 //!
+//! The serverless cache is ElastiCache's other cache resource:
+//! `CreateServerlessCache` mints one and `DescribeServerlessCaches` reports it.
+//! Its record and its projection into the modelled `ServerlessCache` shape live
+//! here too, so `ModifyServerlessCache` / `DeleteServerlessCache` and the
+//! serverless snapshot operations — still scaffolded 501s, each with its own gap
+//! issue — write the same copy the reader reads instead of introducing a second
+//! one.
+//!
 //! A snapshot is a copy of a cluster as of the time it was taken:
 //! `CreateSnapshot` mints one from a stored cluster and `DescribeSnapshots`
 //! reports it, so [`SnapshotRecord`] below is the one copy both read.
@@ -1642,6 +1650,8 @@ impl CacheClusterRecord {
             self.nodes.push(node);
             added += 1;
         }
+        // The count stored is the clamped target, which is also the number of
+        // nodes the loop above left in place, so the two cannot disagree.
         self.num_cache_nodes = target;
     }
 
