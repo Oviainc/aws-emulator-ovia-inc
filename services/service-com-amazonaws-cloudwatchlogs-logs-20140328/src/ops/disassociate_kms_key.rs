@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DisassociateKmsKey
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DisassociateKmsKey`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Implemented: clears the KMS key from the target the request names — one log group, or
+//! the account's stored query-insights results — in the shared store, so
+//! `DescribeLogGroups` stops reporting `LogGroup$kmsKeyId` for that group. This is the
+//! ONLY file to touch for this operation.
 //!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
 //! broken". Replace the `Err(..)` in [`DisassociateKmsKey::handle`] with real behaviour and
@@ -182,18 +183,62 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DisassociateKmsKey` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DisassociateKmsKeyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DisassociateKmsKey"))
+        // `ctx` carries only request metadata; this operation needs none of it.
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DisassociateKmsKeyError::from(
+                DisassociateKmsKeyErrorModeled::ServiceUnavailableException(
+                    ServiceUnavailableException {
+                        message: Some("the log store is unavailable".to_string()),
+                    },
+                ),
+            )
+        })?;
+        let mut store = state.lock();
+
+        let invalid = |message: String| {
+            DisassociateKmsKeyError::from(
+                DisassociateKmsKeyErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(message),
+                    },
+                ),
+            )
+        };
+
+        // "you specify either the logGroupName parameter or the resourceIdentifier
+        // parameter. You can't specify both of those parameters in the same operation."
+        let target = crate::state::resolve_kms_key_target(
+            input.log_group_name.as_deref(),
+            input.resource_identifier.as_deref(),
+        )
+        .map_err(invalid)?;
+
+        match target {
+            // "Specify the logGroupName parameter to stop using the KMS key to encrypt
+            // future log events ingested and stored in the log group." A group that has
+            // no key associated is already in that state, so the disassociate is a no-op
+            // on it rather than a failure.
+            crate::state::KmsKeyTarget::LogGroup(name) => {
+                let Some(group) = store.log_groups.get_mut(&name) else {
+                    return Err(DisassociateKmsKeyErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: Some("The specified log group does not exist".to_string()),
+                        },
+                    )
+                    .into());
+                };
+                group.kms_key_id = None;
+            }
+            // "Specify the resourceIdentifier parameter with the query-result resource to
+            // stop using the KMS key to encrypt the results of all future StartQuery
+            // operations in the account."
+            crate::state::KmsKeyTarget::QueryResults => {
+                store.query_results_kms_key_id = None;
+            }
+        }
+
+        Ok(DisassociateKmsKeyOutput)
     }
 }

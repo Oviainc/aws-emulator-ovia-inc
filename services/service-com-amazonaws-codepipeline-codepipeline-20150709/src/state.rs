@@ -824,7 +824,8 @@ impl ActionTypeKey {
 }
 
 /// One action type as this service holds it: everything `ActionType` reports beside
-/// its id (which is the key it is stored under), plus the Region it is available in.
+/// its id (which is the key it is stored under), plus the Region it is available in
+/// and the tags a create applied to it.
 #[derive(Debug, Clone, Default)]
 pub struct ActionTypeRecord {
     /// URLs that tell a user about this action type, when it has any.
