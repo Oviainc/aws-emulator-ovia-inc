@@ -1,15 +1,29 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartSearchResultExportJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartSearchResultExportJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Mints an EXPORT JOB for a search job whose results have settled and PERSISTS it in
+//! [`crate::state`]: an opaque `ExportJobIdentifier`, the `export-job/<id>` ARN built
+//! from it, the server clock's `CreationTime`, the submitted `ExportSpecification`,
+//! `RoleArn` and `Tags`, the search job's identifier and ARN, and `Status = RUNNING`.
+//! The members it answers with are read back out of that record, so
+//! `GetSearchResultExportJob` reports the same values.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartSearchResultExportJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! An export transmits a search job's RESULTS, so it is accepted only while that job is
+//! in one of the statuses export permits
+//! ([`crate::state::EXPORTABLE_SEARCH_JOB_STATES`]): a job still scanning is refused 400
+//! naming the status it is in and the ones export permits. A `SearchJobIdentifier` that
+//! names no job is a `ResourceNotFoundException` (404), and past the store's export-job
+//! cap the call is refused with the modelled `ServiceQuotaExceededException` (402).
+//!
+//! `ClientToken` is idempotent: the same token with the same body answers with the
+//! export job the first call minted, and the same token with a different body is a
+//! `ConflictException` (409).
+//!
+//! What this emulator does NOT do is write the .csv to the destination bucket: that
+//! object lives in another service and nothing here transmits it. So the export's own
+//! lifecycle is recorded honestly — an export of an EMPTY result set has nothing to
+//! transmit and the clock owes it `COMPLETED`, while an export that would have to
+//! transmit items ends in the modelled `FAILED` status whose `StatusMessage` says why.
 //!
 //! ## Shape of an operation
 //!
@@ -91,6 +105,9 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::{ExportJob, EXPORT_JOB_RESOURCE, SEARCH_JOB_RESOURCE};
+use std::time::SystemTime;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -102,12 +119,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-backupsearch-cryobackup
 // here — hence the `StartSearchResultExportJobError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.backupsearch#StartSearchResultExportJob")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.backupsearch#StartSearchResultExportJob",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum StartSearchResultExportJobErrorModeled {
     ConflictException(ConflictException),
     ResourceNotFoundException(ResourceNotFoundException),
     ServiceQuotaExceededException(ServiceQuotaExceededException),
+    /// Declared on the service, not on this operation: the store this emulator keeps
+    /// its jobs in could not be reached, which is a server fault.
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -161,18 +184,187 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartSearchResultExportJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartSearchResultExportJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartSearchResultExportJob"))
+        let now = SystemTime::now();
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(store_unavailable());
+        };
+        let mut state = state.lock();
+        // A search job whose scan the clock has already finished is COMPLETED before
+        // this call judges whether its results can be exported.
+        state.settle(now);
+
+        let fingerprint = crate::state::request_fingerprint(
+            super::types::START_SEARCH_RESULT_EXPORT_JOB_INPUT_SCHEMA,
+            &input,
+        )
+        .map_err(|reason| {
+            StartSearchResultExportJobError::from(
+                StartSearchResultExportJobErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: format!(
+                            "could not record the StartSearchResultExportJob request: {reason}"
+                        ),
+                        retry_after_seconds: None,
+                    },
+                ),
+            )
+        })?;
+
+        // `ClientToken` idempotency: the same token with the same body answers with the
+        // export job the first call minted and creates nothing; with a different body it
+        // is a conflict, because that token already names another export job.
+        if let Some(token) = input.client_token.as_deref() {
+            if let Some(job) = state.export_job_by_client_token(token) {
+                if job.request_fingerprint != fingerprint {
+                    return Err(StartSearchResultExportJobErrorModeled::ConflictException(
+                        ConflictException {
+                            message: format!(
+                                "ClientToken '{token}' was already used for a different \
+                                 StartSearchResultExportJob request"
+                            ),
+                            resource_id: job.identifier.clone(),
+                            resource_type: EXPORT_JOB_RESOURCE.to_string(),
+                        },
+                    )
+                    .into());
+                }
+                return Ok(StartSearchResultExportJobOutput {
+                    export_job_arn: Some(job.arn.clone()),
+                    export_job_identifier: job.identifier.clone(),
+                });
+            }
+        }
+
+        // The export is of ONE search job's results, so that job has to exist and its
+        // result set has to have settled.
+        let identifier = input.search_job_identifier.clone();
+        let (search_job_arn, search_job_status, results_to_export) = {
+            let search_job = state.job(&identifier).ok_or_else(|| {
+                StartSearchResultExportJobError::from(
+                    StartSearchResultExportJobErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: crate::state::RESOURCE_NOT_FOUND.to_string(),
+                            resource_id: identifier.clone(),
+                            resource_type: SEARCH_JOB_RESOURCE.to_string(),
+                        },
+                    ),
+                )
+            })?;
+            (
+                search_job.arn.clone(),
+                search_job.status.clone(),
+                search_job.results.len(),
+            )
+        };
+        if !crate::state::EXPORTABLE_SEARCH_JOB_STATES.contains(&search_job_status.as_str()) {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "search job '{identifier}' is {search_job_status}; its results can only be \
+                 exported once it is {}",
+                crate::state::EXPORTABLE_SEARCH_JOB_STATES.join(" or ")
+            )));
+        }
+
+        // The tags this export job would be stored with have to fit the caps bounding
+        // one record, so a create cannot grow a stored job without bound.
+        let tags = input.tags.clone().unwrap_or_default();
+        for (key, value) in &tags {
+            crate::state::check_tag_entry(key, value)
+                .map_err(crate::scaffolded::Scaffolded::validation)?;
+        }
+        crate::state::check_tag_count(tags.len())
+            .map_err(crate::scaffolded::Scaffolded::validation)?;
+
+        // This store holds its export jobs for the life of the process and only this
+        // operation adds one, so it is capped: past the cap the service's own quota error
+        // is the honest answer (`crate::state::MAX_EXPORT_JOBS`).
+        if state.export_jobs_full() {
+            return Err(
+                StartSearchResultExportJobErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: format!(
+                            "this account already holds the maximum of {} export jobs",
+                            crate::state::MAX_EXPORT_JOBS
+                        ),
+                        resource_id: ::engine::emulator_account_id().to_string(),
+                        resource_type: EXPORT_JOB_RESOURCE.to_string(),
+                        service_code: ctx.identity().signing_name().to_string(),
+                        // AWS publishes no quota code for this limit; this names the
+                        // quota the emulator enforces.
+                        quota_code: "ExportJobsPerAccount".to_string(),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let export_identifier = state.mint_export_identifier();
+        let arn = crate::state::export_job_arn(
+            ctx.identity().signing_name(),
+            &crate::state::request_region(ctx),
+            &export_identifier,
+        );
+
+        // The status the clock owes this export, and the message that status comes with.
+        // Writing the .csv into the destination bucket is a transmission this emulator
+        // cannot perform, so an export that would have to transmit items ends in the
+        // service's own modelled FAILED status saying so, rather than reporting a
+        // transfer nothing ran. An export of an empty result set transmits nothing, so it
+        // has nothing left to do and the clock owes it COMPLETED. The message travels
+        // WITH the owed status, so the record cannot report failure text while RUNNING.
+        let (owed_status, owed_message) = if results_to_export == 0 {
+            (crate::state::COMPLETED, None)
+        } else {
+            (
+                crate::state::FAILED,
+                Some(format!(
+                    "this emulator cannot transmit the {results_to_export} result(s) of search \
+                     job '{identifier}' to the destination bucket"
+                )),
+            )
+        };
+
+        let job = ExportJob {
+            identifier: export_identifier.clone(),
+            arn,
+            search_job_identifier: identifier,
+            search_job_arn,
+            // A new export job is RUNNING; the clock owes it the status above once the
+            // export's span has passed (`crate::state::TRANSITION_DELAY`).
+            status: crate::state::RUNNING.to_string(),
+            creation_time: crate::state::timestamp(now),
+            completion_time: None,
+            status_message: None,
+            export_specification: input.export_specification.clone(),
+            role_arn: input.role_arn.clone(),
+            tags,
+            client_token: input.client_token.clone(),
+            request_fingerprint: fingerprint,
+            next_status_due: Some((
+                now + crate::state::TRANSITION_DELAY,
+                owed_status,
+                owed_message,
+            )),
+        };
+        state.insert_export_job(job);
+
+        // Answer out of the STORED record, so this response cannot differ from what
+        // GetSearchResultExportJob reports for the same export job.
+        let stored = state
+            .export_job(&export_identifier)
+            .ok_or_else(store_unavailable)?;
+        Ok(StartSearchResultExportJobOutput {
+            export_job_arn: Some(stored.arn.clone()),
+            export_job_identifier: stored.identifier.clone(),
+        })
     }
+}
+
+/// The server fault to answer with when this emulator's job store cannot be reached: a
+/// 500 the caller is told to retry, never an empty success.
+fn store_unavailable() -> StartSearchResultExportJobError {
+    StartSearchResultExportJobErrorModeled::InternalServerException(InternalServerException {
+        message: crate::state::STORE_UNAVAILABLE.to_string(),
+        retry_after_seconds: None,
+    })
+    .into()
 }

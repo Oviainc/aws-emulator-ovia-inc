@@ -7,6 +7,10 @@
 //! ends it, and `TagResource`/`ListTagsForResource` reach its tags through its ARN.
 //! Every one of those answers is computed from the record held here.
 //!
+//! Its second resource is the EXPORT JOB ([`ExportJob`]): `StartSearchResultExportJob`
+//! mints one for a search job whose results have settled, and
+//! `GetSearchResultExportJob` reports exactly that record.
+//!
 //! ## The clock, not the reader, moves a status
 //!
 //! A search job AWS returns is `RUNNING` — a non-terminal status — so the service owes
@@ -22,7 +26,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use ::aws_smithy_types::DateTime;
 
 use crate::ops::types::{
-    CurrentSearchProgress, ItemFilters, ResultItem, SearchScope, SearchScopeSummary,
+    CurrentSearchProgress, ExportSpecification, ItemFilters, ResultItem, SearchScope,
+    SearchScopeSummary,
 };
 
 /// The `SearchJobState` values the model declares, so no handler spells one as a bare
@@ -41,15 +46,28 @@ pub const FAILED: &str = "FAILED";
 /// or a scan that failed. `RUNNING` and `STOPPING` are the two transient ones.
 pub const TERMINAL_STATES: &[&str] = &[COMPLETED, STOPPED, FAILED];
 
+/// The search-job statuses an export may be started from.
+///
+/// An export transmits the RESULTS of a search job, so the scan has to have finished
+/// producing them: a search job still scanning (`RUNNING`) or still winding down
+/// (`STOPPING`) has no settled result set to export, and `FAILED` is terminal but
+/// produced none. AWS documents no precondition, so this set is the emulator's own rule,
+/// chosen so that an export is only ever started from a status the job never leaves and
+/// that produced results; a start from any other status is refused rather than accepted
+/// into a success nothing could back.
+pub const EXPORTABLE_SEARCH_JOB_STATES: &[&str] = &[COMPLETED, STOPPED];
+
 /// How long after the call that starts a transition the clock owes the next status
 /// (`RUNNING` -> `COMPLETED` after `StartSearchJob`, `STOPPING` -> `STOPPED` after
-/// `StopSearchJob`).
+/// `StopSearchJob`, and an export job's `RUNNING` -> `COMPLETED` after
+/// `StartSearchResultExportJob`).
 ///
-/// AWS documents no duration for either — how long a scan takes depends on the backups
-/// in scope — so this span is CHOSEN, not modelled: 500 ms, inside the project's
-/// 250-750 ms band. It is deliberately non-zero, so a caller acting straight after
-/// `StartSearchJob` still observes `RUNNING` and `StopSearchJob` can still accept it.
-/// Nothing sleeps for it: the due instant is stored and compared against the clock.
+/// AWS documents no duration for any of them — how long a scan or an export takes
+/// depends on the backups in scope — so this span is CHOSEN, not modelled: 500 ms,
+/// inside the project's 250-750 ms band. It is deliberately non-zero, so a caller acting
+/// straight after `StartSearchJob` still observes `RUNNING` and `StopSearchJob` can still
+/// accept it. Nothing sleeps for it: the due instant is stored and compared against the
+/// clock.
 pub const TRANSITION_DELAY: Duration = Duration::from_millis(500);
 
 /// `MaxResults`'s modelled `@default(1000)`, shared by `ListSearchJobs` and
@@ -92,9 +110,33 @@ pub const MAX_TAG_VALUE_LENGTH: usize = 256;
 /// The ARN resource segment of a search job: `search-job/<SearchJobIdentifier>`.
 pub const SEARCH_JOB_RESOURCE: &str = "search-job";
 
+/// The ARN resource segment of an export job: `export-job/<ExportJobIdentifier>`.
+pub const EXPORT_JOB_RESOURCE: &str = "export-job";
+
+/// The ceiling on how many export jobs this store holds, for the same reason as
+/// [`MAX_SEARCH_JOBS`]: `StartSearchResultExportJob` is the only thing that adds one and
+/// nothing evicts them, so the operation that grows the store refuses past this cap with
+/// the modelled `ServiceQuotaExceededException` (HTTP 402) the model declares on it. The
+/// number is the emulator's own bound, not a published AWS default.
+pub const MAX_EXPORT_JOBS: usize = 5_000;
+
 /// The one wording of the server fault every handler answers with when this emulator's
 /// search-job store cannot be reached, so the text cannot drift between operations.
 pub const STORE_UNAVAILABLE: &str = "the search job store is unavailable";
+
+/// The text this service's `ResourceNotFoundException` carries when a job identifier
+/// names nothing.
+///
+/// The model documents the member only as "Request references a resource which does not
+/// exist", so it states no text — but the service's own recordings do: the SAME
+/// request-independent sentence comes back from `GetSearchJob`, `ListSearchJobResults`,
+/// `StopSearchJob` and `GetSearchResultExportJob` for a well-formed identifier naming
+/// nothing. Being byte-identical across operations and carrying none of the request's
+/// data is what makes it the service's fixed not-found template rather than one call's
+/// example text, so every job-identifier lookup here refuses with it and none echoes the
+/// identifier back. (The tag APIs, which resolve a resource by ARN, are recorded with a
+/// different refusal and keep their own.)
+pub const RESOURCE_NOT_FOUND: &str = "Resource is not found";
 
 /// The Region an unsigned request is attributed to.
 pub const DEFAULT_REGION: &str = "us-east-1";
@@ -112,6 +154,15 @@ pub fn search_job_arn(signing_name: &str, region: &str, identifier: &str) -> Str
         signing_name,
         region,
         &format!("{SEARCH_JOB_RESOURCE}/{identifier}"),
+    )
+}
+
+/// An `ExportJobArn`: `arn:aws:backup-search:<region>:<account>:export-job/<id>`.
+pub fn export_job_arn(signing_name: &str, region: &str, identifier: &str) -> String {
+    ::engine::emulator_arn(
+        signing_name,
+        region,
+        &format!("{EXPORT_JOB_RESOURCE}/{identifier}"),
     )
 }
 
@@ -181,6 +232,60 @@ impl SearchJob {
     }
 }
 
+/// One persisted export job: the record `StartSearchResultExportJob` writes and
+/// `GetSearchResultExportJob` reports. Every member of a modelled response is read from
+/// here; nothing is recomputed from the request.
+#[derive(Debug, Clone)]
+pub struct ExportJob {
+    pub identifier: String,
+    pub arn: String,
+    /// The search job whose results this export transmits.
+    pub search_job_identifier: String,
+    pub search_job_arn: String,
+    /// One of the modelled `ExportJobStatus` values ([`RUNNING`], [`COMPLETED`],
+    /// [`FAILED`]).
+    pub status: String,
+    pub creation_time: DateTime,
+    pub completion_time: Option<DateTime>,
+    /// The text a `FAILED` export carries, as the model documents the member. Written
+    /// only once the export has actually reached that status — the text the clock owes
+    /// lives in [`ExportJob::next_status_due`] until then.
+    pub status_message: Option<String>,
+    pub export_specification: ExportSpecification,
+    /// The `RoleArn` the start call carried, if any — stored so the record says which
+    /// role the export was started under.
+    pub role_arn: Option<String>,
+    pub tags: HashMap<String, String>,
+    /// The `ClientToken` the call that minted this export job carried, if any.
+    pub client_token: Option<String>,
+    /// Canonical form of the `StartSearchResultExportJob` body this job was created
+    /// from: a repeat under the same `ClientToken` is idempotent, a different body under
+    /// that token is a conflict.
+    pub request_fingerprint: String,
+    /// The status the clock owes this export job, the instant it is owed from, and the
+    /// `StatusMessage` that status comes with (`None` for one that needs no message).
+    /// `None` once it has reached a status it never leaves.
+    pub next_status_due: Option<(SystemTime, &'static str, Option<String>)>,
+}
+
+impl ExportJob {
+    /// Apply the owed status transition if the clock has already made it due.
+    fn settle(&mut self, now: SystemTime) {
+        let Some((due, next, message)) = self.next_status_due.clone() else {
+            return;
+        };
+        if now < due {
+            return;
+        }
+        self.status = next.to_string();
+        self.next_status_due = None;
+        self.completion_time = Some(timestamp(due));
+        // The status and the message it comes with are written together, so a record can
+        // never report a failure's text while it is still RUNNING.
+        self.status_message = message;
+    }
+}
+
 /// Per-service state for com-amazonaws-backupsearch-cryobackupsearchservice. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsBackupsearchCryobackupsearchserviceState {
@@ -190,6 +295,15 @@ pub struct ComAmazonawsBackupsearchCryobackupsearchserviceState {
     pub job_order: Vec<String>,
     /// How many identifiers this store has minted; the next one is the one after.
     minted: u64,
+    /// Every export job, keyed by its `ExportJobIdentifier`.
+    pub export_jobs: HashMap<String, ExportJob>,
+    /// Export-job identifiers in creation order, kept by `insert_export_job` so a
+    /// listing can page deterministically. NOTHING reads it yet —
+    /// `ListSearchResultExportJobs` is still a scaffold stub and owns its own issue — so
+    /// this is the order the store has recorded, not live ordering any response uses.
+    pub export_job_order: Vec<String>,
+    /// How many export-job identifiers this store has minted.
+    minted_export_jobs: u64,
 }
 
 impl ComAmazonawsBackupsearchCryobackupsearchserviceState {
@@ -198,6 +312,9 @@ impl ComAmazonawsBackupsearchCryobackupsearchserviceState {
     /// owed at `now` whether or not anyone called.
     pub fn settle(&mut self, now: SystemTime) {
         for job in self.search_jobs.values_mut() {
+            job.settle(now);
+        }
+        for job in self.export_jobs.values_mut() {
             job.settle(now);
         }
     }
@@ -263,6 +380,43 @@ impl ComAmazonawsBackupsearchCryobackupsearchserviceState {
     pub fn mint_identifier(&mut self) -> String {
         self.minted = self.minted.saturating_add(1);
         format!("searchjob-{:012}", self.minted)
+    }
+
+    /// The export job `identifier` names, or `None` when this account holds no such
+    /// export job.
+    pub fn export_job(&self, identifier: &str) -> Option<&ExportJob> {
+        self.export_jobs.get(identifier)
+    }
+
+    /// The export job the `StartSearchResultExportJob` call carrying `token` minted, if
+    /// that call was made. Read off the records themselves, so the idempotency index
+    /// cannot outgrow [`MAX_EXPORT_JOBS`].
+    pub fn export_job_by_client_token(&self, token: &str) -> Option<&ExportJob> {
+        self.export_jobs
+            .values()
+            .find(|job| job.client_token.as_deref() == Some(token))
+    }
+
+    /// Whether this store is already holding [`MAX_EXPORT_JOBS`] export jobs, which is
+    /// when `StartSearchResultExportJob` must refuse rather than mint another.
+    pub fn export_jobs_full(&self) -> bool {
+        self.export_jobs.len() >= MAX_EXPORT_JOBS
+    }
+
+    /// Store a newly minted export job, keeping the creation order.
+    pub fn insert_export_job(&mut self, job: ExportJob) {
+        self.export_job_order.push(job.identifier.clone());
+        self.export_jobs.insert(job.identifier.clone(), job);
+    }
+
+    /// A fresh `ExportJobIdentifier` no export job in this store holds.
+    ///
+    /// Minted exactly like [`mint_identifier`](Self::mint_identifier): `GenericId`
+    /// carries no pattern, so the member promises only an opaque, unique string, and no
+    /// part of it comes from the request. The caller STORES what this returns.
+    pub fn mint_export_identifier(&mut self) -> String {
+        self.minted_export_jobs = self.minted_export_jobs.saturating_add(1);
+        format!("exportjob-{:012}", self.minted_export_jobs)
     }
 }
 
@@ -378,6 +532,55 @@ pub fn check_tag_count(count: usize) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// A canonical rendering of one request's body, stored with the record it created so a
+/// later call under the same `ClientToken` can be told apart: the same body is a repeat,
+/// a different body is a conflict.
+///
+/// The body is re-serialized with the protocol's own JSON codec — so exactly the
+/// modelled members are compared, however the client sent them — with every object's
+/// members put in key order, because a JSON object's member order is not part of the
+/// request while a list's order is. Shared by every operation that takes a
+/// `ClientToken`, so two of them cannot disagree about what "the same body" means.
+pub fn request_fingerprint(
+    schema: &'static ::aws_smithy_schema::Schema,
+    input: &dyn ::aws_smithy_schema::serde::SerializableStruct,
+) -> Result<String, String> {
+    use ::aws_smithy_schema::codec::{Codec, FinishSerializer};
+    use ::aws_smithy_schema::serde::ShapeSerializer;
+
+    let mut serializer =
+        ::aws_smithy_schema_server::json::JsonCodec::rest_json().create_serializer();
+    serializer
+        .write_struct(schema, input)
+        .map_err(|error| error.to_string())?;
+    let json = serializer.finish();
+    let value: ::serde_json::Value =
+        ::serde_json::from_slice(&json).map_err(|error| error.to_string())?;
+    ::serde_json::to_string(&key_ordered(&value)).map_err(|error| error.to_string())
+}
+
+/// `value` rebuilt with every object's members in key order, so two bodies differing
+/// only in member order render identically.
+///
+/// The ordering is imposed here rather than left to `serde_json::Map`, whose iteration
+/// order is sorted only while nothing in the build enables the crate's `preserve_order`
+/// feature; inserting in sorted order is correct either way.
+fn key_ordered(value: &::serde_json::Value) -> ::serde_json::Value {
+    match value {
+        ::serde_json::Value::Object(members) => {
+            let ordered: ::std::collections::BTreeMap<String, ::serde_json::Value> = members
+                .iter()
+                .map(|(name, member)| (name.clone(), key_ordered(member)))
+                .collect();
+            ::serde_json::Value::Object(ordered.into_iter().collect())
+        }
+        ::serde_json::Value::Array(elements) => {
+            ::serde_json::Value::Array(elements.iter().map(key_ordered).collect())
+        }
+        scalar => scalar.clone(),
+    }
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

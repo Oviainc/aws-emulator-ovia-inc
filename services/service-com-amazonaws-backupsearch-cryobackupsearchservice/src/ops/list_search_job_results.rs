@@ -168,10 +168,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ListSearchJobResultsError::from(
                 ListSearchJobResultsErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: format!(
-                            "no search job with identifier '{}' exists",
-                            input.search_job_identifier
-                        ),
+                        message: crate::state::RESOURCE_NOT_FOUND.to_string(),
                         resource_id: input.search_job_identifier.clone(),
                         resource_type: SEARCH_JOB_RESOURCE.to_string(),
                     },
