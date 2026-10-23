@@ -855,12 +855,33 @@ impl ApprovalRuleTemplateRecord {
             last_modified_user: Some(self.last_modified_user.clone()),
         }
     }
+
+    /// Replace this template's content, recording who changed it and when.
+    ///
+    /// The one place a stored template's content is overwritten, so every updater
+    /// attributes the change the same way: the content (and with it the
+    /// `ruleContentSha256` derived from it) is what the caller supplied, while the
+    /// template's id, name, description and creation date are untouched.
+    pub fn replace_content(&mut self, content: String, by: String, at: SystemTime) {
+        self.content = content;
+        self.last_modified_user = by;
+        self.last_modified_date = at;
+    }
 }
 
 /// The SHA-256 hash signature CodeCommit reports for a template's content
 /// (`ruleContentSha256`): the digest of the content bytes, hex encoded.
 pub fn content_sha256(content: &str) -> String {
     ::hex::encode(Sha256::digest(content.as_bytes()))
+}
+
+/// Could `value` be a `RuleContentSha256` at all — the hex form [`content_sha256`]
+/// reports, 64 hex characters for a 256-bit digest?
+///
+/// A value outside that form is not a signature of any content, which is what the
+/// operations report as `InvalidRuleContentSha256Exception`.
+pub fn is_content_sha256(value: &str) -> bool {
+    value.len() == Sha256::output_size() * 2 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 /// The repository's opaque id: an RFC 9562 version-8 (custom) UUID whose 122

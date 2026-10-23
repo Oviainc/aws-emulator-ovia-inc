@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateApprovalRuleTemplateContent
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateApprovalRuleTemplateContent`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateApprovalRuleTemplateContent::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Replaces a stored approval rule template's content, optionally guarded by the
+//! SHA-256 signature of the content the caller believes is stored, and reports the
+//! stored template as it now is.
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +157,139 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateApprovalRuleTemplateContent` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateApprovalRuleTemplateContentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateApprovalRuleTemplateContent"))
+        // `approvalRuleTemplateName`'s and `newRuleContent`'s lengths are modelled,
+        // so the boundary validator already refused anything outside them. What is
+        // left are the rules the model cannot express — the same ones
+        // `CreateApprovalRuleTemplate` applies, because the content this call stores
+        // is the content that call stores.
+
+        // "Template names must be between 1 and 100 valid characters in length." A
+        // name of nothing but whitespace names no template, and neither does one
+        // carrying a control character.
+        if input.approval_rule_template_name.trim().is_empty()
+            || input
+                .approval_rule_template_name
+                .chars()
+                .any(char::is_control)
+        {
+            return Err(
+                UpdateApprovalRuleTemplateContentErrorModeled::InvalidApprovalRuleTemplateNameException(
+                    InvalidApprovalRuleTemplateNameException {
+                        message: Some(format!(
+                            "the approval rule template name {} is not valid",
+                            input.approval_rule_template_name
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "The content for the approval rule template is empty. You must provide
+        // some content for an approval rule template." The modelled minimum length
+        // is 1, so whitespace-only content reaches here.
+        if input.new_rule_content.trim().is_empty() {
+            return Err(
+                UpdateApprovalRuleTemplateContentErrorModeled::ApprovalRuleTemplateContentRequiredException(
+                    ApprovalRuleTemplateContentRequiredException {
+                        message: Some(
+                            "the content for the approval rule template is empty".to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The content is an approval rule JSON document, not free text, and
+        // "content statements must be complete": the replacement stands on its own.
+        if let Err(reason) =
+            crate::state::validate_approval_rule_template_content(&input.new_rule_content)
+        {
+            return Err(
+                UpdateApprovalRuleTemplateContentErrorModeled::InvalidApprovalRuleTemplateContentException(
+                    InvalidApprovalRuleTemplateContentException {
+                        message: Some(format!(
+                            "the content of the approval rule template is not valid: {reason}"
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // `existingRuleContentSha256` is the signature of the content the caller
+        // believes is stored. A value that is not a SHA-256 signature at all states
+        // nothing about any content, so it is refused before the store is read.
+        if let Some(supplied) = &input.existing_rule_content_sha256 {
+            if !crate::state::is_content_sha256(supplied) {
+                return Err(
+                    UpdateApprovalRuleTemplateContentErrorModeled::InvalidRuleContentSha256Exception(
+                        InvalidRuleContentSha256Exception {
+                            message: Some(format!(
+                                "the SHA-256 hash signature for the rule content is not valid: \
+                                 {supplied}"
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // An unreachable store is an internal mounting fault, not a modelled
+            // CodeCommit failure; every handler in this crate refuses it this way.
+            crate::scaffolded::Scaffolded::validation("the repository store is unavailable")
+        })?;
+        let mut store = state.lock();
+
+        let template = store
+            .approval_rule_templates
+            .get_mut(&input.approval_rule_template_name)
+            .ok_or_else(|| {
+                UpdateApprovalRuleTemplateContentErrorModeled::ApprovalRuleTemplateDoesNotExistException(
+                    ApprovalRuleTemplateDoesNotExistException {
+                        message: Some(format!(
+                            "the approval rule template {} does not exist",
+                            input.approval_rule_template_name
+                        )),
+                    },
+                )
+            })?;
+
+        // That signature is a claim about what is stored: when it does not match the
+        // stored content's signature, the content is not what the caller read, so the
+        // update is refused rather than overwriting a change it never saw.
+        if let Some(supplied) = &input.existing_rule_content_sha256 {
+            let stored = crate::state::content_sha256(&template.content);
+            if !supplied.eq_ignore_ascii_case(&stored) {
+                return Err(
+                    UpdateApprovalRuleTemplateContentErrorModeled::InvalidRuleContentSha256Exception(
+                        InvalidRuleContentSha256Exception {
+                            message: Some(format!(
+                                "the SHA-256 hash signature for the rule content is not valid: \
+                                 the content stored for {} has signature {stored}",
+                                input.approval_rule_template_name
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // The content replaces what was stored; every other field of the template —
+        // its id, name, description and creation date — is untouched, and the change
+        // is attributed to this caller at this instant.
+        template.replace_content(
+            input.new_rule_content.clone(),
+            crate::state::caller_identity_arn(ctx.parts()),
+            std::time::SystemTime::now(),
+        );
+
+        Ok(UpdateApprovalRuleTemplateContentOutput {
+            approval_rule_template: template.to_modeled(),
+        })
     }
 }
