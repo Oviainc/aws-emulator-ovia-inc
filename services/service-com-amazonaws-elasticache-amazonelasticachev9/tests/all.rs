@@ -54,3 +54,10 @@ mod update_actions;
 mod snapshot_lifecycle;
 #[path = "all/harness.rs"]
 mod harness;
+
+// Appended for the same reason: these two are the `DescribeUsers` describe-axis
+// suite and the page walk that calls through its helpers.
+#[path = "all/users.rs"]
+mod users;
+#[path = "all/describe_users.rs"]
+mod describe_users;

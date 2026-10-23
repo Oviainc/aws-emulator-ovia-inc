@@ -22,8 +22,9 @@ use crate::wire::{call, error_code, error_message, medialive};
 
 /// `StopMultiplex`'s binding (`smithy_query(query="operation",
 /// operation="StopMultiplex")`: `POST /prod/multiplexes/{MultiplexId}/stop`,
-/// success 202).
-async fn stop_multiplex(router: &MultiServiceRouter, id: &str) -> (u16, Value) {
+/// success 202). Shared with the multiplex DELETION suite, which stops a
+/// multiplex to make it deletable.
+pub(crate) async fn stop_multiplex(router: &MultiServiceRouter, id: &str) -> (u16, Value) {
     call(router, "POST", &format!("{MULTIPLEXES}/{id}/stop"), None).await
 }
 

@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateEnvironment
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateEnvironment`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateEnvironment::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A PATCH over the stored environment: every member the request carries replaces the
+//! stored one, every member it omits is left exactly as it was, and the answer is read
+//! back out of the updated record — including `State`, which no caller sets and only
+//! the clock moves.
 //!
 //! ## Shape of an operation
 //!
@@ -151,20 +147,75 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateEnvironment` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateEnvironmentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateEnvironment"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateEnvironmentErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("AppConfig state is not reachable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+        let now = std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // An environment only exists under an application, so the parent is resolved
+        // first and whichever level is missing is the resource the 404 names.
+        let Some(application) = store.applications.get_mut(&input.application_id) else {
+            return Err(UpdateEnvironmentErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "No application with id {} exists.",
+                        input.application_id
+                    )),
+                    resource_name: Some(input.application_id),
+                },
+            )
+            .into());
+        };
+        let Some(environment) = application.environments.get_mut(&input.environment_id) else {
+            return Err(UpdateEnvironmentErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "No environment with id {} exists in application {}.",
+                        input.environment_id, input.application_id
+                    )),
+                    resource_name: Some(input.environment_id),
+                },
+            )
+            .into());
+        };
+
+        // `State` is the clock's to move, never this call's: an environment is
+        // DEPLOYING exactly while one of its deployments is still rolling out or
+        // baking, and both of those end at instants fixed when the deployment started.
+        // Materialising here is what makes the `State` this answer reports the same one
+        // `GetEnvironment` reports at the same instant.
+        environment.materialize(now);
+
+        // A PATCH over the stored record: a member the request carries replaces the
+        // stored one, a member it omits leaves the stored one alone. An empty
+        // `Description` or `Monitors` is a value the caller sent, not an omission, so it
+        // clears what was there.
+        if let Some(name) = input.name {
+            environment.name = name;
+        }
+        if let Some(description) = input.description {
+            environment.description = Some(description);
+        }
+        if let Some(monitors) = input.monitors {
+            environment.monitors = monitors;
+        }
+
+        // Answered out of the updated record, so a later read reports the same thing.
+        Ok(UpdateEnvironmentOutput {
+            application_id: Some(environment.application_id.clone()),
+            id: Some(environment.id.clone()),
+            name: Some(environment.name.clone()),
+            description: environment.description.clone(),
+            state: Some(environment.state.clone()),
+            monitors: (!environment.monitors.is_empty()).then(|| environment.monitors.clone()),
+        })
     }
 }

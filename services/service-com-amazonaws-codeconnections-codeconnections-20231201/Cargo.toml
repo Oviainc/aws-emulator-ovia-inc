@@ -8,6 +8,10 @@ build = "build.rs"
 
 [dependencies]
 engine = { workspace = true }
+# `rpc_target`: the one reading of an `awsJson` `X-Amz-Target` — which service and which
+# operation it names — which this service's routing seams read because its published
+# target prefix carries dots of its own.
+service-common = { path = "../common" }
 smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }
 aws-smithy-schema-server = { workspace = true }

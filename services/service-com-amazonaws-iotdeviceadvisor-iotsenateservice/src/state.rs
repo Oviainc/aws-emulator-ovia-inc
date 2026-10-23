@@ -11,7 +11,7 @@
 //! and endpoint shapes, the version-string sequence, and the clock-owed suite-run status
 //! transitions ([`SuiteRun::materialize_due`]).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime};
 
 use sha2::{Digest, Sha256};
@@ -70,15 +70,15 @@ pub fn is_terminal(status: &str) -> bool {
 /// real service refuses a creation past its account quota.
 pub const MAX_SUITE_DEFINITIONS: usize = 100;
 
-/// How many configuration versions the store retains per suite definition.
+/// How many configuration version LABELS the store retains per suite definition.
 ///
 /// The same occupancy bound as [`MAX_RUNS_PER_DEFINITION`], and again a RETENTION policy
-/// rather than a refusal: every `UpdateSuiteDefinition` records one more snapshot of a
-/// definition's configuration, so without a bound a caller could grow one definition's
-/// record without limit. [`SuiteDefinition::record_version`] drops the LOWEST-ordinal
-/// versions once a definition would hold more than this, so the most recent versions — the
-/// ones a read or a run names — stay addressable, and an aged-out version reads as the
-/// modelled "no such version" exactly as a version that never existed does.
+/// rather than a refusal: every `UpdateSuiteDefinition` hands out one more version label,
+/// so without a bound a caller could grow one definition's record without limit.
+/// [`SuiteDefinition::record_version`] drops the LOWEST-ordinal labels once a definition
+/// would hold more than this, so the most recent versions — the ones a read or a run names
+/// — stay addressable, and an aged-out version reads as the modelled "no such version"
+/// exactly as a version that never existed does.
 pub const MAX_VERSIONS_PER_DEFINITION: usize = 50;
 
 /// How many suite runs the store retains per definition.
@@ -169,47 +169,64 @@ pub fn parse_resource_arn(arn: &str) -> Result<TaggedResource, String> {
     }
 }
 
-/// A stored suite definition: its identity, every configuration version, and its tags.
+/// The smallest step a write stamp advances by when the clock has not visibly moved.
+///
+/// Timestamps leave this service as epoch seconds in an f64, whose mantissa resolves an
+/// epoch instant to about a microsecond: that is the finest difference a client can
+/// observe, so it is the step [`SuiteDefinition::write_stamp`] uses to keep successive
+/// write stamps strictly increasing.
+const WRITE_STAMP_TICK: Duration = Duration::from_micros(1);
+
+/// A stored suite definition: its identity, its ONE live configuration, the version labels
+/// it has handed out, and its timestamps.
+///
+/// Device Advisor keeps exactly one live configuration per `suiteDefinitionId`: an update
+/// hands out a new version label and REPLACES that configuration, so the versions are
+/// pointers into the definition's history rather than snapshots of it. Hence a label SET
+/// beside a single [`configuration`](Self::configuration), not a label -> configuration map.
 #[derive(Debug, Clone)]
 pub struct SuiteDefinition {
     /// The minted `suiteDefinitionId` (a UUID, so inside the modelled 12..36 length).
     pub id: String,
     /// `arn:aws:iotdeviceadvisor:<region>:<account>:suitedefinition/<id>`.
     pub arn: String,
-    /// The version recorded last — the one an unqualified read answers with. Tracked
-    /// explicitly rather than derived from [`versions`](Self::versions), whose keys order
+    /// The version recorded last — the one an unqualified read echoes. Tracked explicitly
+    /// rather than derived from [`versions`](Self::versions), whose members order
     /// lexicographically (`v10` before `v2`).
     pub latest_version: String,
-    /// version string -> the configuration snapshot that version holds.
-    pub versions: BTreeMap<String, SuiteDefinitionConfiguration>,
+    /// Every version label this definition has handed out and still accepts on a read: a
+    /// pointer set, holding no configuration of its own.
+    pub versions: BTreeSet<String>,
+    /// The ONE live configuration, as the last create or update left it. Every read of
+    /// this definition — version-qualified or not — answers with this one, since a
+    /// definition keeps no per-version snapshots.
+    pub configuration: SuiteDefinitionConfiguration,
     pub created_at: SystemTime,
     pub last_modified_at: SystemTime,
 }
 
 impl SuiteDefinition {
-    /// The configuration snapshot for `version`, or for [`latest_version`](Self::latest_version)
-    /// when the caller named none. `None` means the caller named a version this definition
-    /// never had.
-    pub fn configuration(&self, version: Option<&str>) -> Option<&SuiteDefinitionConfiguration> {
-        self.versions
-            .get(version.unwrap_or(self.latest_version.as_str()))
+    /// True when `version` is a label this definition has handed out and still retains —
+    /// the one check a version-qualified read or run makes before serving the live
+    /// configuration. See [`MAX_VERSIONS_PER_DEFINITION`] for what "still retains" drops.
+    pub fn holds_version(&self, version: &str) -> bool {
+        self.versions.contains(version)
     }
 
-    /// `suiteDefinitionName` as the STORED configuration of the latest version holds it.
+    /// `suiteDefinitionName` as the STORED live configuration holds it.
     pub fn name(&self) -> &str {
-        self.configuration(None)
-            .map_or("", |config| config.suite_definition_name.as_str())
+        self.configuration.suite_definition_name.as_str()
     }
 
-    /// Record `configuration` as this definition's NEXT version and hand back that
-    /// version's label.
+    /// Make `configuration` this definition's live one under a NEW version label, and hand
+    /// that label back.
     ///
-    /// A new version is APPENDED: every snapshot already stored keeps both its label and
-    /// its bytes, so a read naming an older version still answers the configuration that
-    /// version was recorded with. The next ordinal is one past the highest this definition
-    /// holds — not `versions.len()`, which would collide with a surviving label once
-    /// retention has dropped an older one — and
-    /// [`latest_version`](Self::latest_version) and `last_modified_at` move with it.
+    /// The label set grows; the configuration is REPLACED, because a definition has exactly
+    /// one live configuration and no per-version snapshots. The next ordinal is one past the
+    /// highest this definition holds — not `versions.len()`, which would collide with a
+    /// surviving label once retention has dropped an older one. BOTH timestamps move to the
+    /// write instant: for the one live record `createdAt` behaves as a last-write stamp,
+    /// just as `lastModifiedAt` does.
     pub fn record_version(
         &mut self,
         configuration: SuiteDefinitionConfiguration,
@@ -217,19 +234,34 @@ impl SuiteDefinition {
     ) -> String {
         let highest = self
             .versions
-            .keys()
+            .iter()
             .filter_map(|label| version_ordinal(label))
             .max()
             .unwrap_or(0);
         let label = version_label(highest + 1);
-        self.versions.insert(label.clone(), configuration);
+        self.versions.insert(label.clone());
         self.latest_version = label.clone();
-        self.last_modified_at = now;
+        self.configuration = configuration;
+        let stamp = self.write_stamp(now);
+        self.created_at = stamp;
+        self.last_modified_at = stamp;
         self.prune_versions(MAX_VERSIONS_PER_DEFINITION);
         label
     }
 
-    /// Retain at most `keep` versions, dropping the lowest-ordinal (oldest) ones.
+    /// The instant to stamp a write with: `now`, never at or before the stamp this record
+    /// already carries.
+    ///
+    /// A write stamp is what orders a definition's writes, so two writes must not read as
+    /// one: when the clock has not visibly advanced since the last write (a coarse clock,
+    /// or two calls inside the same tick) the stamp moves on by [`WRITE_STAMP_TICK`]
+    /// instead of standing still.
+    fn write_stamp(&self, now: SystemTime) -> SystemTime {
+        let previous = self.last_modified_at.max(self.created_at);
+        now.max(previous + WRITE_STAMP_TICK)
+    }
+
+    /// Retain at most `keep` version labels, dropping the lowest-ordinal (oldest) ones.
     ///
     /// See [`MAX_VERSIONS_PER_DEFINITION`]. The current latest version is never dropped:
     /// it carries the highest ordinal, and `keep` is at least one.
@@ -238,10 +270,10 @@ impl SuiteDefinition {
         if self.versions.len() <= keep {
             return;
         }
-        // Oldest first by ORDINAL, not by the keys' lexicographic order (`v10` < `v2`).
+        // Oldest first by ORDINAL, not by the labels' lexicographic order (`v10` < `v2`).
         let mut labels: Vec<(usize, String)> = self
             .versions
-            .keys()
+            .iter()
             .map(|label| (version_ordinal(label).unwrap_or(0), label.clone()))
             .collect();
         labels.sort();

@@ -16,10 +16,10 @@
 //! Five opt-in seams are yours to change; every one defaults to the framework's
 //! own behaviour, so an unedited service still routes and answers correctly:
 //!
-//! - `can_handle` — which requests this service claims. The default matches the
-//!   request's resolved route key against this service's signing name. Edit it
-//!   for anything the model does not express: a signing name shared by several
-//!   services, or routing that keys on the access-key id.
+//! - `can_handle` — which requests this service claims. EDITED HERE: the framework's
+//!   default (the request's resolved route key equals this service's signing name),
+//!   plus a request whose `X-Amz-Target` names this service, which the framework's
+//!   routing-key fallback misreads for this service's dotted target prefix.
 //! - `override_operation` — which operation serves a request. EDITED HERE: the
 //!   operation is resolved from the LAST segment of `x-amz-target`, so a client whose
 //!   target prefix carries dots of its own (this service's absolute shape id, which is
@@ -65,6 +65,14 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
             entry: crate::ServiceDefinition::new(engine),
         }
     }
+
+    /// This service's model shape id, as the generated identity states it
+    /// (`com.amazonaws.codeconnections#CodeConnections_20231201`), whose LOCAL name is
+    /// the last segment of every `X-Amz-Target` prefix a client writes for it. Read off
+    /// the model rather than written out, so it cannot drift from it.
+    fn shape_id(&self) -> &str {
+        self.entry.identity().shape_id()
+    }
 }
 
 impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
@@ -79,10 +87,22 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // Claim a request whose resolved route key is this service's signing
         // name. Edit this for anything the model does not express — a signing
         // name shared by several services, or access-key-id-based routing.
-        match smithy_server_runtime::resolve_route_key(parts) {
-            Some(key) => key == self.entry.identity().signing_name(),
-            None => false,
+        if smithy_server_runtime::resolve_route_key(parts)
+            .is_some_and(|key| key == self.entry.identity().signing_name())
+        {
+            return true;
         }
+        // A request that carries no SigV4 credential scope is routed by its
+        // `X-Amz-Target` before its `Host`, and the framework reads that signal as the
+        // segment before the FIRST dot — which, for this service's dotted target prefix,
+        // is a namespace label (`com`) that names no service, so such a request would
+        // reach nobody and answer `404 UnknownService`. The target still names THIS
+        // service, read by the same rule the operation below is read by:
+        // `service_common::rpc_target`, this emulator's one statement of the target rule
+        // (the service is the last segment of the prefix, the operation the segment
+        // after it). A target naming another service is still not claimed, signed or not.
+        service_common::rpc_target::target_operation_of(&parts.headers, self.shape_id())
+            .is_some()
     }
 
     fn override_operation(
@@ -103,16 +123,16 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // the prefix in front of it, so that is the segment resolved here; it is the
         // same answer for the short prefix (`CodeConnections_20231201.<Operation>`), so
         // one rule serves both forms. A target whose final segment names no modeled
-        // operation resolves to `None` and is left to the generated routing table,
-        // which renders the protocol's own routing failure.
+        // operation, or whose prefix names another service, resolves to `None` and is
+        // left to the generated routing table, which renders the protocol's own routing
+        // failure.
         //
-        // The rule is protocol-general rather than service-specific, so it belongs in
-        // the framework's own `routing_key_from_x_amz_target`; `vendor/` is read-only
-        // here, so the gap is filed as
-        // `issues/things-that-do-not-work/20261023T000000Z-gap-smithy-schema-server-x-amz-target-split-at-the-first-dot.md`
-        // and this override should be deleted once that lands.
-        let target = req.headers().get("x-amz-target")?;
-        let operation = target.rsplit_once('.').map_or(target, |(_, op)| op);
+        // The rule is protocol-general rather than service-specific, so it is stated
+        // ONCE, in `service_common::rpc_target`, and read from there by every service in
+        // this emulator whose published prefix carries dots. It belongs further down
+        // still — in the framework's own `routing_key_from_x_amz_target` — but `vendor/`
+        // is read-only here, so this seam is where the emulator can hold it.
+        let operation = service_common::rpc_target::requested_operation(req, self.shape_id())?;
         self.entry.routing_table().get(operation)
     }
 

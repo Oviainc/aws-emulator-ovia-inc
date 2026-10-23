@@ -27,6 +27,8 @@ mod resource_sync_status;
 mod state_roundtrip;
 #[path = "all/sync_blocker_summary.rs"]
 mod sync_blocker_summary;
+#[path = "all/target_prefix_forms.rs"]
+mod target_prefix_forms;
 #[path = "all/target_probe.rs"]
 mod target_probe;
 #[path = "all/wire_target_routing.rs"]

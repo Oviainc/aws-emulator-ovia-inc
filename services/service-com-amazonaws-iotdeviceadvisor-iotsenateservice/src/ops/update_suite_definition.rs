@@ -2,13 +2,13 @@
 
 //! @op UpdateSuiteDefinition
 //!
-//! Records the given configuration as the suite definition's NEXT version in
-//! [`crate::state`] and advances `latestVersion` to it. The versions already stored keep
-//! their bytes, so a `GetSuiteDefinition` naming an earlier version still answers the
-//! configuration that version was recorded with, while an unqualified read answers the
-//! one this call stored. `createdAt` is the definition's own creation instant (an update
-//! never moves it) and `lastUpdatedAt` is the instant this call recorded. An id the store
-//! does not hold is refused as not found.
+//! Makes the given configuration the suite definition's live one under its NEXT version
+//! label in [`crate::state`] and advances `latestVersion` to it. A definition holds exactly
+//! one live configuration, so an earlier version stays READABLE (it is still a label the
+//! definition handed out) but answers that live configuration, not the content it was
+//! recorded with. For this one live record both timestamps are last-write stamps: this call
+//! moves `createdAt` and `lastUpdatedAt` to the update instant. An id the store does not
+//! hold is refused as not found.
 //!
 //! ## Shape of an operation
 //!

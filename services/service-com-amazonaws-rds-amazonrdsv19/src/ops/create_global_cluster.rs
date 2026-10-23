@@ -437,18 +437,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             tags,
         };
         let global_cluster = record.to_wire();
-        store.global_clusters.insert(identifier.clone(), record);
         // The adopted cluster now BELONGS to this global database, which is what
-        // `DBCluster$GlobalClusterIdentifier` reports for it: the reference is written on
-        // both records under the one lock, so a later describe of either cannot disagree
-        // with the other.
+        // `DBCluster$GlobalClusterIdentifier` reports for it: both records are written
+        // under the one lock, so a later describe of either cannot disagree with the
+        // other. The cluster's reference goes FIRST and a re-lookup that finds nothing
+        // refuses the whole create with the modelled not-found fault — so neither record
+        // can be stored without the other, and no request-controlled input can abort the
+        // task.
         if let Some(source) = &inherited {
-            store
+            let Some(cluster) = store
                 .db_clusters
-                .get_mut(&(region.clone(), source.identifier.clone()))
-                .expect("the source cluster resolved under this same lock")
-                .global_cluster_identifier = Some(identifier);
+                .get_mut(&(region.to_string(), source.identifier.clone()))
+            else {
+                return Err(CreateGlobalClusterErrorModeled::DBClusterNotFoundFault(
+                    DBClusterNotFoundFault {
+                        message: Some(format!(
+                            "The source cluster could not be found or cannot be accessed: {}",
+                            source.identifier
+                        )),
+                    },
+                )
+                .into());
+            };
+            cluster.global_cluster_identifier = Some(identifier.clone());
         }
+        store.global_clusters.insert(identifier, record);
 
         Ok(CreateGlobalClusterOutput {
             global_cluster: Some(global_cluster),

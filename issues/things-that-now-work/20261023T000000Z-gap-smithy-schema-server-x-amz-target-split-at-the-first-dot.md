@@ -50,7 +50,7 @@ Every awsJson1_0 / awsJson1_1 service whose published `X-Amz-Target` prefix cont
 dot. The emulator's own in-process tests do not reveal it, because a hand-built test
 request usually carries the short `<ServiceShapeName>.<Operation>` form, which routes.
 
-## Fix
+## Fix (as filed)
 
 In `routing_key_from_x_amz_target`, take the segment after the LAST dot
 (`header.rsplit_once('.')`), which is unchanged for a single-segment prefix and correct
@@ -59,18 +59,39 @@ or its fully qualified id, so a foreign prefix is refused rather than routed —
 function has no access to the service identity today, so that part needs the caller to
 pass it.
 
-This cannot be done from inside the emulator repo: `vendor/` is read-only here and the
-merge gate refuses a change to it, so it needs a change to the vendored core library.
+That part cannot be done from inside the emulator repo: `vendor/` is read-only here and
+the merge gate refuses a change to it, so the vendored reader still splits at the first
+dot. What the emulator CAN hold, and now does, is below.
 
-## Current workaround, and why it should be removed
+## Resolution
 
-`services/service-com-amazonaws-codeconnections-codeconnections-20231201/src/service.rs`
-works around it in the one seam the framework offers, `Service::override_operation`: it
-takes the segment after the last dot of the routing key and looks that up in the
-generated routing table, declining to `None` for a key that names no modelled operation
-so the protocol-correct routing refusal still stands. That is a per-service copy of a
-router rule, and every other affected awsJson service has to repeat it. It should be
-deleted once `routing_key_from_x_amz_target` resolves the operation itself.
+The rule — on the awsJson protocols the operation is the segment after the target's LAST
+dot and the service is the last dot-separated segment of what precedes it, because the
+target prefix is opaque SDK text that may carry dots while a Smithy shape name never can
+— is stated ONCE for the emulator, in `services/common/src/rpc_target.rs`, and read from
+there by both halves of routing:
+
+* `services/common/src/lib.rs`'s shared claim rule (`claims_request`) reads the target's
+  SERVICE through `rpc_target::names_service` instead of the framework's first-dot
+  `emulator_server::service_from_target`. That half is fixed for EVERY service that
+  claims through this crate, not only the dotted ones: before, a service whose published
+  prefix carries dots was named `com` by that reader and claimed none of its own traffic.
+* the two services whose published prefix is dotted today — CloudTrail
+  (`com.amazonaws.cloudtrail.v20131101.CloudTrail_20131101`) and CodeConnections
+  (`com.amazonaws.codeconnections.CodeConnections_20231201`) — resolve the OPERATION
+  through `rpc_target::requested_operation` in the one seam the framework offers,
+  `Service::override_operation`, and recognise their own unsigned traffic through
+  `rpc_target::target_operation_of` in `Service::can_handle`. The per-service copies of
+  the rule they each carried are gone, and a third such service needs one call, not
+  another copy.
+
+The shared reader takes the service identity, so the issue's optional half is in: a
+target whose prefix names another service resolves to `None` and gets the protocol's own
+routing refusal rather than being routed by its last segment.
+
+Still owed by the core library: `routing_key_from_x_amz_target` resolving the operation
+itself, which would let the `override_operation` seams be deleted (the claim half stays
+here either way).
 
 ## Evidence
 
@@ -78,7 +99,16 @@ deleted once `routing_key_from_x_amz_target` resolves the operation itself.
 `split_once('.')`, whose doc comment states the assumption ("AWS RPC protocols use the
 header `x-amz-target: ServiceName.OperationName`. This function returns the substring
 after the dot.").
+`vendor/server/src/lib.rs` — `service_from_target`'s `target.split('.').next()`, the same
+first-dot read on the claim side.
+`services/common/src/rpc_target.rs` — the rule, with unit tables over the prefix forms
+and both halves of it.
+`services/service-com-amazonaws-codeconnections-codeconnections-20231201/tests/all/target_prefix_forms.rs`
+— the whole modelled operation surface reached behind five prefix forms, one store behind
+all of them, unsigned requests routed by the service their target names, and the targets
+that must still be refused.
+`services/service-com-amazonaws-cloudtrail-cloudtrail-20131101/tests/all/target_prefix_dispatch.rs`
+— the same, for 60 operations under three prefix forms, signed and unsigned.
 `services/service-com-amazonaws-codeconnections-codeconnections-20231201/tests/all/repository_link_lifecycle.rs`
 — `both_target_prefix_forms_route_to_the_same_operation` drives the whole repository-link
-lifecycle under both prefix forms and fails on the fully qualified one without the
-workaround.
+lifecycle under both prefix forms and fails on the fully qualified one without the rule.
