@@ -48,7 +48,7 @@ const MAX_CRITERIA_VALUES: usize = 50;
 
 /// A `policyDocument` the type admits, so a case about `selectionCriteria` is refused for
 /// its criteria and nothing else.
-fn document_for(policy_type: &str) -> String {
+pub(crate) fn document_for(policy_type: &str) -> String {
     match policy_type {
         "SUBSCRIPTION_FILTER_POLICY" => subscription_filter_document(
             "arn:aws:lambda:eu-west-2:000000000000:function:criteria-sink",

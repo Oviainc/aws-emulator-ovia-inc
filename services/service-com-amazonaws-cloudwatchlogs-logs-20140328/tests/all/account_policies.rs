@@ -1091,7 +1091,7 @@ fn prefix_criteria_of_bytes(bytes: usize, filler: char) -> String {
 /// type: `LogGroupName NOT IN [...]` for a subscription filter policy, a
 /// `LogGroupNamePrefix` filter for the others. Each `index` names a disjoint subset, so no
 /// two of them select the same log groups.
-fn scoped_criteria(policy_type: &str, index: usize) -> String {
+pub(crate) fn scoped_criteria(policy_type: &str, index: usize) -> String {
     if policy_type == "SUBSCRIPTION_FILTER_POLICY" {
         format!(r#"LogGroupName NOT IN ["/aws/mixed-{index}"]"#)
     } else {
