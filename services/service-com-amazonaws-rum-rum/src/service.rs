@@ -40,10 +40,72 @@
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
 
+use aws_smithy_schema_server::constraints::{Violation, ViolationKind};
 use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service,
 };
 use std::sync::Arc;
+
+/// The error code RUM words a refused TAG call with: `BadRequestException`.
+///
+/// The ARN-addressed tagging operations are served by a different frontend from this
+/// service's app-monitor operations, with its own error vocabulary: the recorded corpus
+/// unit `rum.untag-resource-unknown-resource-rejected` sends a `ResourceArn` that is not
+/// an ARN and records `err["Code"] == "BadRequestException"`, where an app-monitor call
+/// refused on a modelled constraint answers `ValidationException`. The STATUS is the same
+/// 400 either way; the code a client branches on is not.
+const TAGGING_BAD_REQUEST_CODE: &str = "BadRequestException";
+
+/// The whole message that frontend reports a `ResourceArn` which is not an ARN with.
+///
+/// It carries nothing from the request — not the value, not the member, not the pattern —
+/// so it is a constant rather than a format string, and it is the same sentence for every
+/// value that fails `Arn`'s syntax. Recorded in the same corpus unit, which sends a
+/// `ResourceArn` of `not-an-arn-at-all` and pins this message. A refusal of any OTHER tag
+/// member keeps the framework's request-derived sentence: the frontend's wording for those
+/// is not known, and naming the member and the constraint it failed is what a caller needs
+/// to fix the request.
+const INVALID_RESOURCE_ARN_MESSAGE: &str = "Invalid input resource arn: bad syntax";
+
+/// The dotted lowerCamel path a violation on the tagging operations' `ResourceArn`
+/// member reports.
+const RESOURCE_ARN_MEMBER_PATH: &str = "resourceArn";
+
+/// The input members only RUM's tagging operations declare: `ResourceArn` (`TagResource`,
+/// `UntagResource`, `ListTagsForResource`) and `TagKeys` (`UntagResource`), as the dotted
+/// lowerCamel paths a violation reports.
+///
+/// Source: `smithy_query(query="operation",
+/// operation="TagResource,UntagResource,ListTagsForResource")` against this service's
+/// model, and the service digest for the rest — every other operation here names its
+/// resource by `Name` or by `Id`. `Tags` is deliberately NOT in the list: `TagResource`
+/// and `CreateAppMonitor` both declare it, so a violation about it does not say which
+/// frontend refused the call.
+const TAGGING_MEMBER_PATHS: [&str; 2] = [RESOURCE_ARN_MEMBER_PATH, "tagKeys"];
+
+/// Whether these violations are about a request to one of the tagging operations.
+///
+/// [`Refusal`] describes WHAT was refused, not which operation was called, so the member
+/// is the discriminator: a violation on one of [`TAGGING_MEMBER_PATHS`] can only have come
+/// from a tag call. A path is dotted, so a violation inside a member starts with that
+/// member's name followed by a `.`.
+fn is_tagging_refusal(violations: &[Violation]) -> bool {
+    violations.iter().any(|violation| {
+        TAGGING_MEMBER_PATHS.iter().any(|member| {
+            violation.path == *member || violation.path.starts_with(&format!("{member}."))
+        })
+    })
+}
+
+/// Whether one of these violations says the `ResourceArn` is not an ARN: a `@pattern`
+/// violation on that member, which is the one refusal the tagging frontend has its own
+/// sentence for ([`INVALID_RESOURCE_ARN_MESSAGE`]).
+fn is_resource_arn_syntax_violation(violations: &[Violation]) -> bool {
+    violations.iter().any(|violation| {
+        violation.path == RESOURCE_ARN_MEMBER_PATH
+            && matches!(violation.kind, ViolationKind::Pattern(_))
+    })
+}
 
 /// The `com-amazonaws-rum-rum` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -99,14 +161,28 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // The centralized walk calls this on a framework-level refusal (an absent
         // required member, or a value outside a declared bound) to let this
         // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // wording, which is what every operation but the tagging ones uses: an
+        // app-monitor call refused on a modelled constraint answers
+        // `ValidationException`, the code this service's model declares.
+        //
+        // A refused TAG call is the one exception (see [`TAGGING_BAD_REQUEST_CODE`]):
+        // its code is `BadRequestException`, and a `ResourceArn` that is not an ARN gets
+        // that frontend's own sentence for it. Any other tag refusal keeps the
+        // framework's request-derived envelope, which names the member and the constraint
+        // it failed, under the tag frontend's code.
+        match refusal {
+            Refusal::Invalid(violations) if is_tagging_refusal(violations) => Some(Refused {
+                code: TAGGING_BAD_REQUEST_CODE.to_string(),
+                message: if is_resource_arn_syntax_violation(violations) {
+                    INVALID_RESOURCE_ARN_MESSAGE.to_string()
+                } else {
+                    aws_smithy_schema_server::constraints::envelope(violations)?
+                },
+            }),
+            // Every other refusal, including an unauthenticated caller, keeps the
+            // framework's protocol-correct default.
+            _ => None,
+        }
     }
 
     fn override_routing_error(
