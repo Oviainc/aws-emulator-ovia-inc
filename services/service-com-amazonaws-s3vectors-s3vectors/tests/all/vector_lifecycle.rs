@@ -17,7 +17,7 @@ use smithy_server_runtime::MultiServiceRouter;
 /// (the router's `resolve_route_key`) and the region the ARNs it mints carry. The
 /// signature itself is not verified: this router runs with request authentication
 /// off, which is the default for an in-process emulator.
-const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
+pub(crate) const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
 Credential=AKIDTESTS3VECTORS/20260101/us-east-1/s3vectors/aws4_request, \
 SignedHeaders=host;x-amz-date, Signature=0000";
 
@@ -33,7 +33,7 @@ pub(crate) fn expected_bucket_arn(bucket: &str) -> String {
 }
 
 /// The ARN a vector index of this name must carry, per `IndexArn`'s pattern.
-fn expected_index_arn(bucket: &str, index: &str) -> String {
+pub(crate) fn expected_index_arn(bucket: &str, index: &str) -> String {
     format!(
         "arn:aws:s3vectors:{REGION}:{}:bucket/{bucket}/index/{index}",
         engine::EMULATOR_ACCOUNT_ID

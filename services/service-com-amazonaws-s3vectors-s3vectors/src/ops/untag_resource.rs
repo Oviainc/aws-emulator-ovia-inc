@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UntagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UntagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UntagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -89,9 +80,13 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-s3vectors-s3vectors.jso
 // here — hence the `UntagResourceError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.s3vectors#UntagResource")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.s3vectors#UntagResource",
+    extra_errors = ["ValidationException"]
+)]
 #[derive(Debug)]
 pub enum UntagResourceErrorModeled {
+    ValidationException(ValidationException),
     ConflictException(ConflictException),
     NotFoundException(NotFoundException),
     ServiceUnavailableException(ServiceUnavailableException),
@@ -148,18 +143,51 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UntagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UntagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UntagResource"))
+        // Nothing about the removal depends on request metadata: the resource is
+        // named by an ARN, which already carries its region and account.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UntagResourceErrorModeled::ServiceUnavailableException(
+                ServiceUnavailableException {
+                    message: crate::state::STATE_UNAVAILABLE.to_string(),
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+        // The resource must exist for its tags to be removed: an ARN naming a vector
+        // bucket or vector index this store does not hold is the modelled 404, which
+        // is what an ARN of an already deleted resource answers too.
+        let arn = store
+            .tagged_resource_arn("resourceArn", &input.resource_arn)
+            .map_err(refusal)?;
+
+        // Removal is BY KEY and idempotent (the operation carries `@idempotent`): a
+        // key the resource does not carry is simply not there rather than a failure,
+        // and the keys the request does not name are left exactly as they were.
+        let mut emptied = false;
+        if let Some(tags) = store.tags.get_mut(&arn) {
+            for key in &input.tag_keys {
+                tags.remove(key);
+            }
+            emptied = tags.is_empty();
+        }
+        if emptied {
+            // A resource with no tags left holds no entry — the same shape a create
+            // that named no `tags` leaves behind.
+            store.tags.remove(&arn);
+        }
+
+        Ok(UntagResourceOutput {})
+    }
+}
+
+/// Lift a refusal from `crate::state` into this operation's modelled error channel.
+fn refusal(error: crate::state::LookupError) -> UntagResourceError {
+    if error.is_not_found() {
+        UntagResourceErrorModeled::NotFoundException(error.not_found_exception()).into()
+    } else {
+        UntagResourceErrorModeled::ValidationException(error.validation_exception()).into()
     }
 }
