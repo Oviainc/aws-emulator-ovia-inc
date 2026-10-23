@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateHub
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateHub`'s real behaviour. Implement it here — this is
+//! IMPLEMENTED: registers a hub in `crate::state` under its `HubName`, minting the
+//! `HubArn` from the request's region, storing every optional member the request
+//! carried and starting the hub in `Creating` with the `InService` transition the clock
+//! owes. A name already in use is refused with the modelled `ResourceInUse`. This is
 //! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateHub::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -147,18 +143,61 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateHub` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateHubErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateHub"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        let region = crate::state::request_region(ctx);
+        let arn = crate::state::resource_arn(&region, "hub", &input.hub_name);
+
+        let mut store = state.lock();
+        // A name already in use is refused, never overwritten: otherwise the caller reads
+        // a 200 for a hub it did not create, and the hub it did create is gone. This
+        // operation models `ResourceInUse` for exactly that collision, and it is decided
+        // BEFORE the quota: a call that would add no record cannot be over the limit.
+        if store.hubs.contains_key(&input.hub_name) {
+            return Err(CreateHubErrorModeled::ResourceInUse(ResourceInUse {
+                message: Some(format!("Cannot create already existing hub \"{arn}\".")),
+            })
+            .into());
+        }
+        // The store is bounded, so a caller varying `HubName` cannot grow it without end.
+        // `ResourceLimitExceeded` is the limit failure this operation models.
+        if !store.hubs_below_quota() {
+            return Err(CreateHubErrorModeled::ResourceLimitExceeded(ResourceLimitExceeded {
+                message: Some(format!(
+                    "The account-level service limit for hubs is {}, with current \
+                     utilization of {} and a request delta of 1.",
+                    crate::state::HUB_QUOTA,
+                    store.hubs.len()
+                )),
+            })
+            .into());
+        }
+
+        let now = ::std::time::SystemTime::now();
+        store.hubs.insert(
+            input.hub_name.clone(),
+            crate::state::Hub {
+                name: input.hub_name.clone(),
+                arn: arn.clone(),
+                description: input.hub_description,
+                display_name: input.hub_display_name,
+                search_keywords: input.hub_search_keywords,
+                s3_storage_config: input.s3_storage_config,
+                status: crate::state::STATUS_CREATING.to_string(),
+                // Nothing failed: `FailureReason` reports a failed hub-content import,
+                // which a hub this call has just registered cannot have had.
+                failure_reason: None,
+                tags: input.tags.unwrap_or_default(),
+                creation_time: now,
+                last_modified_time: now,
+                in_service_at: now + crate::state::HUB_IN_SERVICE_AFTER,
+            },
+        );
+        drop(store);
+
+        crate::state::record_state_change(Self::NAME, &arn, ctx);
+        Ok(CreateHubOutput { hub_arn: arn })
     }
 }
+

@@ -43,8 +43,9 @@ const HUB_IN_SERVICE: &str = "InService";
 /// This service's server-side page ceiling.
 const CEILING: usize = state::MAX_PAGE_SIZE as usize;
 
-/// One hub content version to seed.
-struct Seeded<'a> {
+/// One hub content version to seed. Exposed to the crate's other suites (see
+/// [`seed`]), which need a hub that holds content without re-deriving this record.
+pub(crate) struct Seeded<'a> {
     name: &'a str,
     /// A `HubContentType` member.
     content_type: &'a str,
@@ -60,7 +61,7 @@ struct Seeded<'a> {
 
 /// The seeded contents of `demo-hub`: three `Model` contents (one of them with three
 /// versions, one with two) plus one content of every other modelled `HubContentType`.
-const DEMO_HUB_CONTENTS: &[Seeded<'static>] = &[
+pub(crate) const DEMO_HUB_CONTENTS: &[Seeded<'static>] = &[
     Seeded {
         name: "alpha-model",
         content_type: "Model",
@@ -174,7 +175,7 @@ fn seeded_at(offset_secs: u64) -> SystemTime {
 }
 
 /// Write `hub` and its `contents` into the shared store the handler reads.
-fn seed(emulator: &Emulator, hub: &str, contents: &[Seeded<'_>]) {
+pub(crate) fn seed(emulator: &Emulator, hub: &str, contents: &[Seeded<'_>]) {
     let store = emulator
         .engine
         .state::<ComAmazonawsSagemakerSagemakerState>();
@@ -184,9 +185,20 @@ fn seed(emulator: &Emulator, hub: &str, contents: &[Seeded<'_>]) {
         Hub {
             name: hub.to_string(),
             arn: state::resource_arn(REGION, "hub", hub),
+            // The members `CreateHub` stores and `DescribeHub` replays: a seeded hub
+            // carries only the description `CreateHub` requires, which is what a hub
+            // created with its required members alone looks like.
+            description: format!("{hub} description"),
+            display_name: None,
+            search_keywords: None,
+            s3_storage_config: None,
             status: HUB_IN_SERVICE.to_string(),
+            failure_reason: None,
+            tags: Vec::new(),
             creation_time: seeded_at(0),
             last_modified_time: seeded_at(0),
+            // Seeded already `InService`, so the clock owes this hub no transition.
+            in_service_at: seeded_at(0),
         },
     );
     for content in contents {

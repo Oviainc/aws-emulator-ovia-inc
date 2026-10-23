@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteHub
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteHub`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteHub::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: releases the hub `CreateHub` registered, resolved by `HubName` or by
+//! hub ARN, refuses an unknown hub with the modelled `ResourceNotFound` and a hub that
+//! still holds hub content with the modelled `ResourceInUse`. This is the ONLY file to
+//! touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +148,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteHub` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteHubErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteHub"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        // `HubName` is modelled `HubNameOrArn`, so either form names the same record.
+        let name = crate::state::name_from_arn_or_name(&input.hub_name).to_string();
+
+        let mut store = state.lock();
+        let Some(arn) = store.hubs.get(&name).map(|hub| hub.arn.clone()) else {
+            return Err(DeleteHubErrorModeled::ResourceNotFound(ResourceNotFound {
+                message: Some(format!("Resource not found: hub \"{name}\".")),
+            })
+            .into());
+        };
+        // A hub that still holds content is in use: its content has to be released first
+        // (`DeleteHubContent` / `DeleteHubContentReference`), which is what `ResourceInUse`
+        // — the other error this operation models — reports. Refusing here is also what
+        // keeps the store consistent: releasing the hub while its content stayed behind
+        // would leave records a hub re-created under the same name would inherit.
+        let holds_content = store
+            .hub_contents
+            .keys()
+            .any(|key| key.hub_name == name);
+        if holds_content {
+            return Err(DeleteHubErrorModeled::ResourceInUse(ResourceInUse {
+                message: Some(format!(
+                    "Hub \"{name}\" cannot be deleted while it contains hub content."
+                )),
+            })
+            .into());
+        }
+        store.hubs.remove(&name);
+        drop(store);
+
+        crate::state::record_state_change(Self::NAME, &arn, ctx);
+        Ok(DeleteHubOutput)
     }
 }
+

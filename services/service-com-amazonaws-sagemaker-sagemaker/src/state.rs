@@ -699,22 +699,6 @@ pub use algorithms::*;
 // region every new resource slice is appended to.
 // ---------------------------------------------------------------------------
 
-/// A hub, as `DescribeHub` replays it and `ListHubContents` resolves it.
-///
-/// Only the hub's identity and lifecycle live here: `CreateHub` (its own open issue)
-/// extends this record with the description, display name, search keywords and S3
-/// storage configuration it stores.
-#[derive(Debug, Clone)]
-pub struct Hub {
-    pub name: String,
-    pub arn: String,
-    /// A `HubStatus` member (the model's enum: `InService`, `Creating`, `Updating`,
-    /// `Deleting`, `CreateFailed`, `UpdateFailed`, `DeleteFailed`).
-    pub status: String,
-    pub creation_time: SystemTime,
-    pub last_modified_time: SystemTime,
-}
-
 /// The identity of ONE stored hub content version.
 ///
 /// A hub content is identified by its hub, its `HubContentType` and its
@@ -793,6 +777,56 @@ pub struct Model {
     pub enable_network_isolation: Option<bool>,
     pub tags: Vec<Tag>,
     pub creation_time: SystemTime,
+}
+
+/// How long after `CreateHub` the clock owes the hub's `Creating` -> `InService`
+/// transition. `HubStatus` models `Creating` as well as `InService`, so a hub is not
+/// born ready: a caller that describes it straight after creating it still observes
+/// `Creating`, and one that waits observes `InService`. The span is the emulator's own
+/// compressed one, never zero.
+pub const HUB_IN_SERVICE_AFTER: Duration = Duration::from_millis(300);
+
+/// The most hubs the store holds, after which `CreateHub` is refused with the modelled
+/// `ResourceLimitExceeded`. The emulator's OWN bound, for the reason given on
+/// [`MODEL_QUOTA`]: every record it holds is released by `DeleteHub`.
+pub const HUB_QUOTA: usize = 1_000;
+
+/// A hub created by `CreateHub`, as `DescribeHub` replays it, `ListHubContents`
+/// resolves it and `DeleteHub` releases it.
+///
+/// `status` is a `HubStatus` member (the model's enum: `InService`, `Creating`,
+/// `Updating`, `Deleting`, `CreateFailed`, `UpdateFailed`, `DeleteFailed`).
+///
+/// `in_service_at` is the instant the clock owes the `Creating` -> `InService`
+/// transition; it is stored, never slept on, and materialised by whichever reporting
+/// call first runs at or after it.
+#[derive(Debug, Clone)]
+pub struct Hub {
+    pub name: String,
+    pub arn: String,
+    pub description: String,
+    pub display_name: Option<String>,
+    pub search_keywords: Option<Vec<String>>,
+    pub s3_storage_config: Option<crate::ops::types::HubS3StorageConfig>,
+    pub status: String,
+    pub failure_reason: Option<String>,
+    pub tags: Vec<Tag>,
+    pub creation_time: SystemTime,
+    pub last_modified_time: SystemTime,
+    pub in_service_at: SystemTime,
+}
+
+impl Hub {
+    /// Materialise the `Creating` -> `InService` transition the clock already owes; see
+    /// [`settle_creating`].
+    pub fn settle_status(&mut self, now: SystemTime) -> bool {
+        settle_creating(
+            &mut self.status,
+            &mut self.last_modified_time,
+            self.in_service_at,
+            now,
+        )
+    }
 }
 
 /// A training job, as `ListTrainingJobs` summarises it.
@@ -2259,6 +2293,11 @@ impl ComAmazonawsSagemakerSagemakerState {
     /// Whether another endpoint fits, i.e. the store is below [`ENDPOINT_QUOTA`].
     pub fn endpoints_below_quota(&self) -> bool {
         self.endpoints.len() < ENDPOINT_QUOTA
+    }
+
+    /// Whether another hub fits, i.e. the store is below [`HUB_QUOTA`].
+    pub fn hubs_below_quota(&self) -> bool {
+        self.hubs.len() < HUB_QUOTA
     }
 
     /// Whether another hyperparameter tuning job fits, i.e. the store is below

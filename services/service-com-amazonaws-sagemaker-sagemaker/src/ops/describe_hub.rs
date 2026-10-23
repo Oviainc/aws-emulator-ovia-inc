@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeHub
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeHub`'s real behaviour. Implement it here — this is
+//! IMPLEMENTED: replays the hub `CreateHub` stored — resolved by `HubName` or by hub
+//! ARN — materialising the `Creating` -> `InService` transition the clock already owes,
+//! and refuses an unknown hub with the modelled `ResourceNotFound`. This is
 //! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeHub::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +147,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeHub` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeHubErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeHub"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        // `HubName` is modelled `HubNameOrArn`, so either form names the same record.
+        let name = crate::state::name_from_arn_or_name(&input.hub_name).to_string();
+
+        let mut store = state.lock();
+        let Some(hub) = store.hubs.get_mut(&name) else {
+            return Err(DescribeHubErrorModeled::ResourceNotFound(ResourceNotFound {
+                message: Some(format!("Resource not found: hub \"{name}\".")),
+            })
+            .into());
+        };
+
+        // The only write a reporting call makes: the transition the clock already owed.
+        // It was due at the stored instant whether or not anybody described the hub, so a
+        // waiter terminates and no caller's read changes the outcome.
+        let settled = hub.settle_status(::std::time::SystemTime::now());
+
+        let output = DescribeHubOutput {
+            hub_name: hub.name.clone(),
+            hub_arn: hub.arn.clone(),
+            hub_display_name: hub.display_name.clone(),
+            // `HubDescription` is required on the create and optional here, so the stored
+            // description is always reported.
+            hub_description: Some(hub.description.clone()),
+            hub_search_keywords: hub.search_keywords.clone(),
+            s3_storage_config: hub.s3_storage_config.clone(),
+            hub_status: hub.status.clone(),
+            failure_reason: hub.failure_reason.clone(),
+            creation_time: crate::state::timestamp(hub.creation_time),
+            last_modified_time: crate::state::timestamp(hub.last_modified_time),
+        };
+        drop(store);
+
+        if settled {
+            // The transition is a state change, so it leaves the same record a create
+            // does rather than happening unobservably on a read path.
+            crate::state::record_state_change(Self::NAME, &output.hub_arn, ctx);
+        }
+        Ok(output)
     }
 }
+
