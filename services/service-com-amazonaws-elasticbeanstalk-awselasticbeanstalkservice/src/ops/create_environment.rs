@@ -380,6 +380,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let environment_id = store.next_environment_id();
+        // Creation order, so every report of this environment beside another one
+        // is ordered by when they were created rather than by their opaque ids.
+        let sequence = store.next_counter();
         // "If not specified, the CNAME is generated automatically by appending a
         // random alphanumeric string to the environment name" — the appended
         // string is this environment's own unique id body, so every environment
@@ -390,6 +393,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 environment_id.trim_start_matches("e-")
             )
         });
+        // A platform version is named by its ARN or by its solution stack name,
+        // and an environment reports BOTH for the version it runs: the one the
+        // request did not use is resolved from the service's published catalog,
+        // so a client can pass the returned `PlatformArn` to a later call. A
+        // name or an ARN the catalog does not publish resolves to nothing and
+        // the member stays absent rather than carrying a made-up value — a
+        // CUSTOM platform version, in particular, has no solution stack name
+        // this service can derive.
+        let resolved_stack = input
+            .solution_stack_name
+            .as_deref()
+            .and_then(crate::state::solution_stack_named)
+            .or_else(|| {
+                input
+                    .platform_arn
+                    .as_deref()
+                    .and_then(|arn| crate::state::managed_platform_version(&region, arn))
+            });
+        let platform_arn = input
+            .platform_arn
+            .clone()
+            .or_else(|| resolved_stack.map(|stack| stack.platform_arn(&region)));
+        let solution_stack_name = input
+            .solution_stack_name
+            .clone()
+            .or_else(|| resolved_stack.map(|stack| stack.name()));
         let created = crate::state::now();
         let environment = crate::state::Environment {
             environment_id: environment_id.clone(),
@@ -401,8 +430,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ),
             application_name: input.application_name.clone(),
             version_label: input.version_label.clone(),
-            solution_stack_name: input.solution_stack_name.clone(),
-            platform_arn: input.platform_arn.clone(),
+            solution_stack_name,
+            platform_arn,
             template_name: input.template_name.clone(),
             description: input.description.clone(),
             cname: crate::state::environment_cname(&cname_prefix, &region),
@@ -410,14 +439,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // of the instance". This emulator provisions neither, so there is no
             // endpoint to report and none is invented.
             endpoint_url: None,
-            // The default tier: a Standard-mode EC2-based web server, the two
-            // values the model documents for that tier. `Version` is the
-            // deprecated member, left to whatever the caller sent.
-            tier: Some(input.tier.clone().unwrap_or(EnvironmentTier {
-                name: Some("WebServer".to_string()),
-                r#type: Some("Standard".to_string()),
-                version: None,
-            })),
+            // The tier the request named, with every member it left out filled
+            // in from the defaults the model documents: a Standard-mode
+            // EC2-based web server at the latest compatible tier version.
+            tier: Some(crate::state::environment_tier_with_defaults(
+                input.tier.as_ref(),
+            )),
             option_settings: input.option_settings.clone().unwrap_or_default(),
             operations_role: input.operations_role.clone(),
             // "Launching: Environment is in the process of initial deployment."
@@ -430,6 +457,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             date_updated: created,
             date_terminated: None,
             tags: input.tags.clone().unwrap_or_default(),
+            sequence,
             // The launch the clock owes: `Launching` -> `Ready`.
             pending_status: Some(crate::state::PendingStatus::launch_completion(
                 &request_id,

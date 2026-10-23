@@ -29,3 +29,6 @@ handler returns an error, so it never has to construct a value.
 `smithy.api#Unit`, and `build.rs` wires the operation in from that file's
 `//! @op ListAvailableSolutionStacks` header like any other. The decline line above
 records only that the GENERATOR did not emit it.
+
+`CreateStorageLocation` is now hand-authored the same way in
+`src/ops/create_storage_location.rs`.

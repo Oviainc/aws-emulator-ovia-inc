@@ -174,7 +174,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // deleted after this date are displayed."
         let deleted_back_to = input.included_deleted_back_to.map(|at| at.secs());
 
-        let matching: Vec<&crate::state::Environment> = store
+        let mut matching: Vec<&crate::state::Environment> = store
             .environments
             .values()
             .filter(|environment| {
@@ -213,11 +213,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     })
             })
             .collect();
+        // An `EnvironmentId` is an opaque random id, so the store's key order
+        // says nothing about the environments: they are reported in the order
+        // they were CREATED, oldest first. The creation sequence is a total
+        // order even for two environments created inside one clock tick, so the
+        // order — and with it the page boundary below — is the same on every
+        // call.
+        matching.sort_by_key(|environment| environment.sequence);
 
         // "If no MaxRecords is specified, all available environments are
         // retrieved in a single response." The page boundary is the id of the
-        // first environment of the next page: the store is keyed by
-        // `EnvironmentId`, so that order is stable across calls.
+        // first environment of the next page, which identifies that environment
+        // within the same reported order on every later page.
         let offset = match input.next_token.as_deref() {
             Some(token) => matching
                 .iter()

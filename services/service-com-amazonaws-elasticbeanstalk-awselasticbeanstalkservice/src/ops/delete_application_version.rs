@@ -234,11 +234,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let _ = input.delete_source_bundle;
         store.application_versions.remove(&key);
 
-        // The activity this call performed, recorded for `DescribeEvents`.
-        store.record_event(
+        // The activity this call performed, recorded for `DescribeEvents`: the
+        // operation starting and the operation completing, under one request id.
+        // Nothing here names a deleted resource the way a create's
+        // `Created new <kind>: <id>` event does, so no third message is invented.
+        store.record_completed_activity(
             &crate::state::new_request_id(),
-            crate::state::SEVERITY_INFO,
-            "deleteApplicationVersion completed successfully.",
+            "deleteApplicationVersion",
+            None,
             crate::state::EventSubject {
                 application_name: Some(input.application_name.clone()),
                 version_label: Some(input.version_label.clone()),

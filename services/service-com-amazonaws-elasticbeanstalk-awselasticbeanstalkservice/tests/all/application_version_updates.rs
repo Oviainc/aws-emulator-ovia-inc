@@ -192,8 +192,8 @@ async fn an_update_writes_only_the_properties_the_request_supplies() {
         );
         assert_eq!(
             updated.expect("ApplicationVersion/Status", case.label),
-            "Unprocessed",
-            "case {:?}: an update processes nothing, so Status stays Unprocessed, got {}",
+            "UNPROCESSED",
+            "case {:?}: an update processes nothing, so Status stays UNPROCESSED, got {}",
             case.label,
             updated.body
         );
