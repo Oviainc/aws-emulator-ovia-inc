@@ -1,16 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! The workspace's rules-and-alerting logging configuration, end to end over HTTP:
-//! `CreateLoggingConfiguration` persists it and `DescribeLoggingConfiguration` reads
-//! that same record back.
+//! `CreateLoggingConfiguration` persists it, `UpdateLoggingConfiguration` points it at
+//! another log group, and `DescribeLoggingConfiguration` reads that same record back.
 //!
 //! The rule under test: a workspace holds at most ONE rules-and-alerting logging
 //! configuration, created against `/workspaces/{workspaceId}/logging` and reported from
 //! what was PERSISTED — whatever `logGroupArn` the request carried — starting in a
-//! transient `CREATING` status the clock owes a move to `ACTIVE`, and gone with the
-//! workspace it belongs to. Each test spans a SET of inputs: the rows differ in the log
-//! group's partition, region, name form and name length, and in whether the call carries
-//! an idempotency token.
+//! transient `CREATING` status the clock owes a move to `ACTIVE`, pointed at another log
+//! group by an update that is accepted only while the configuration and its workspace are
+//! `ACTIVE` (and that reports the transient `UPDATING` the clock owes a move back from),
+//! and gone with the workspace it belongs to. Each test spans a SET of inputs: the rows
+//! differ in the log group's partition, region, name form and name length, and in whether
+//! the call carries an idempotency token.
 //!
 //! Like `workspace_lifecycle.rs`, every suite drives the real request path —
 //! `MultiServiceRouter::dispatch` over this service mounted on one shared engine — so
@@ -21,7 +23,7 @@
 use bytes::Bytes;
 use service_com_amazonaws_amp_amazonprometheusservice::ops::types::LOGGING_CONFIGURATION_STATUS_CODE_VALUES;
 use service_com_amazonaws_amp_amazonprometheusservice::state::{
-    LOGGING_STATUS_ACTIVE, LOGGING_STATUS_CREATING, TRANSITION_DELAY,
+    LOGGING_STATUS_ACTIVE, LOGGING_STATUS_CREATING, LOGGING_STATUS_UPDATING, TRANSITION_DELAY,
 };
 use service_com_amazonaws_amp_amazonprometheusservice::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
@@ -133,6 +135,49 @@ impl Amp {
         .await
     }
 
+    /// `UpdateLoggingConfiguration`: `PUT /workspaces/{workspaceId}/logging`.
+    async fn update_logging(
+        &self,
+        region: &str,
+        workspace_id: &str,
+        log_group_arn: &str,
+        client_token: Option<&str>,
+    ) -> Reply {
+        let mut body = serde_json::json!({ "logGroupArn": log_group_arn });
+        if let Some(token) = client_token {
+            body["clientToken"] = serde_json::Value::String(token.to_string());
+        }
+        self.call(
+            "PUT",
+            &format!("/workspaces/{workspace_id}/logging"),
+            region,
+            &body.to_string(),
+        )
+        .await
+    }
+
+    /// A workspace holding an ACTIVE logging configuration on `log_group_arn` — the state
+    /// every update starts from, since an update is allowed only from there.
+    async fn active_logging(&self, region: &str, alias: &str, log_group_arn: &str) -> String {
+        let workspace_id = self.workspace(region, alias).await;
+        let created = self
+            .create_logging(region, &workspace_id, log_group_arn, None)
+            .await;
+        assert_eq!(
+            created.status, 202,
+            "case {alias:?}: the create must succeed, got {created:?}"
+        );
+        wait_for_due_transition();
+        let described = self.describe_logging(region, &workspace_id).await;
+        assert_eq!(
+            text(&described.body["loggingConfiguration"]["status"]["statusCode"]),
+            LOGGING_STATUS_ACTIVE,
+            "case {alias:?}: the configuration must settle ACTIVE before an update, \
+             got {described:?}"
+        );
+        workspace_id
+    }
+
     async fn delete_workspace(&self, region: &str, workspace_id: &str) -> Reply {
         self.call("DELETE", &format!("/workspaces/{workspace_id}"), region, "")
             .await
@@ -215,7 +260,11 @@ fn cases() -> Vec<Case> {
 /// catalog comes from the model, not from this test.
 #[test]
 fn reported_statuses_are_modelled_logging_configuration_status_codes() {
-    for status in [LOGGING_STATUS_CREATING, LOGGING_STATUS_ACTIVE] {
+    for status in [
+        LOGGING_STATUS_CREATING,
+        LOGGING_STATUS_ACTIVE,
+        LOGGING_STATUS_UPDATING,
+    ] {
         assert!(
             LOGGING_CONFIGURATION_STATUS_CODE_VALUES.contains(&status),
             "case {status:?}: not a modelled LoggingConfigurationStatusCode \
@@ -588,4 +637,324 @@ async fn deleting_the_workspace_takes_its_configuration_with_it() {
         "case \"after the workspace is gone\": the refusal must be a \
          ResourceNotFoundException, got {described:?}"
     );
+}
+
+/// The timestamp a reader reports, as epoch seconds.
+fn epoch_seconds(value: &serde_json::Value, case: &str) -> f64 {
+    value
+        .as_f64()
+        .unwrap_or_else(|| panic!("case {case:?}: expected a timestamp, got {value:?}"))
+}
+
+/// `UpdateLoggingConfiguration` points the PERSISTED configuration at the log group the
+/// request names and reports the stored record: one row per thing the rule generalises
+/// over — the target log group's partition, region, name form and name length, and the
+/// presence of an idempotency token. The update is transient (`UPDATING`) and the clock
+/// owes the move back to `ACTIVE`, which leaves the new log group in place.
+#[tokio::test]
+async fn an_update_points_the_stored_configuration_at_the_named_log_group() {
+    for case in cases() {
+        let amp = Amp::new();
+        let first = log_group_arn("aws", case.region, "/aws/prometheus/before-update");
+        let workspace_id = amp.active_logging(case.region, "updated", &first).await;
+        let target = log_group_arn(case.partition, case.region, &case.log_group_name);
+
+        let before = amp.describe_logging(case.region, &workspace_id).await;
+        let created_at = epoch_seconds(
+            &before.body["loggingConfiguration"]["createdAt"],
+            case.name,
+        );
+
+        let updated = amp
+            .update_logging(case.region, &workspace_id, &target, case.client_token)
+            .await;
+        assert_eq!(
+            updated.status, 202,
+            "case {:?}: UpdateLoggingConfiguration must answer 202, got {updated:?}",
+            case.name
+        );
+        assert_eq!(
+            text(&updated.body["status"]["statusCode"]),
+            LOGGING_STATUS_UPDATING,
+            "case {:?}: an accepted update reports UPDATING, got {updated:?}",
+            case.name
+        );
+        assert!(
+            updated.body["status"]["statusReason"].is_null(),
+            "case {:?}: nothing failed, so statusReason must be absent, got {updated:?}",
+            case.name
+        );
+
+        let described = amp.describe_logging(case.region, &workspace_id).await;
+        let metadata = &described.body["loggingConfiguration"];
+        assert_eq!(
+            text(&metadata["logGroupArn"]),
+            target,
+            "case {:?}: the stored configuration must publish to the named log group, \
+             got {described:?}",
+            case.name
+        );
+        assert_eq!(
+            text(&metadata["status"]["statusCode"]),
+            LOGGING_STATUS_UPDATING,
+            "case {:?}: the describe reports the stored transient status, got {described:?}",
+            case.name
+        );
+        assert_eq!(
+            epoch_seconds(&metadata["createdAt"], case.name),
+            created_at,
+            "case {:?}: an update must not change createdAt, got {described:?}",
+            case.name
+        );
+        assert!(
+            epoch_seconds(&metadata["modifiedAt"], case.name) >= created_at,
+            "case {:?}: the update changed the record, so modifiedAt must not go \
+             backwards, got {described:?}",
+            case.name
+        );
+
+        wait_for_due_transition();
+
+        let settled = amp.describe_logging(case.region, &workspace_id).await;
+        let settled_metadata = &settled.body["loggingConfiguration"];
+        assert_eq!(
+            text(&settled_metadata["status"]["statusCode"]),
+            LOGGING_STATUS_ACTIVE,
+            "case {:?}: the configuration must become ACTIVE once due, got {settled:?}",
+            case.name
+        );
+        assert_eq!(
+            text(&settled_metadata["logGroupArn"]),
+            target,
+            "case {:?}: settling must not change logGroupArn, got {settled:?}",
+            case.name
+        );
+        assert_eq!(
+            settled_metadata["modifiedAt"], metadata["modifiedAt"],
+            "case {:?}: the clock moving the status on is not a change to the \
+             configuration, got {settled:?}",
+            case.name
+        );
+    }
+}
+
+/// `UpdateLoggingConfiguration` is `@idempotent` and its `clientToken` is an
+/// `@idempotencyToken`: re-sending the call that last updated the configuration answers
+/// from the stored record rather than applying a second change — whatever log group the
+/// replay names. A call carrying a token nothing has used is a new request.
+#[tokio::test]
+async fn replaying_an_update_answers_from_the_stored_record() {
+    /// Each row: the log group the second call names, and whether it is the same call.
+    struct Replay {
+        name: &'static str,
+        token: Option<&'static str>,
+        same_log_group: bool,
+        replays: bool,
+    }
+
+    let region = "us-west-2";
+    let update_token = "update-token";
+    for row in [
+        Replay {
+            name: "same token, same log group",
+            token: Some(update_token),
+            same_log_group: true,
+            replays: true,
+        },
+        Replay {
+            name: "same token, another log group",
+            token: Some(update_token),
+            same_log_group: false,
+            replays: true,
+        },
+        Replay {
+            name: "a token nothing has used",
+            token: Some("other-token"),
+            same_log_group: false,
+            replays: false,
+        },
+        Replay {
+            name: "no token at all",
+            token: None,
+            same_log_group: false,
+            replays: false,
+        },
+    ] {
+        let amp = Amp::new();
+        let first = log_group_arn("aws", region, "/aws/prometheus/first");
+        let workspace_id = amp.active_logging(region, "replay", &first).await;
+        let second = log_group_arn("aws", region, "/aws/prometheus/second");
+        let third = log_group_arn("aws", region, "/aws/prometheus/third");
+
+        let updated = amp
+            .update_logging(region, &workspace_id, &second, Some(update_token))
+            .await;
+        assert_eq!(
+            updated.status, 202,
+            "case {:?}: the first update must succeed, got {updated:?}",
+            row.name
+        );
+        // A replay must not restart the span, so the stored record is read before and
+        // after; a NEW request is allowed to act only from ACTIVE.
+        if !row.replays {
+            wait_for_due_transition();
+        }
+        let before = amp.describe_logging(region, &workspace_id).await;
+
+        let target = if row.same_log_group { &second } else { &third };
+        let again = amp
+            .update_logging(region, &workspace_id, target, row.token)
+            .await;
+        assert_eq!(
+            again.status, 202,
+            "case {:?}: the second update must answer 202, got {again:?}",
+            row.name
+        );
+
+        let described = amp.describe_logging(region, &workspace_id).await;
+        let metadata = &described.body["loggingConfiguration"];
+        let expected_log_group = if row.replays { &second } else { target };
+        assert_eq!(
+            text(&metadata["logGroupArn"]),
+            *expected_log_group,
+            "case {:?}: a replay must change nothing and a new request must apply, \
+             got {described:?}",
+            row.name
+        );
+        assert_eq!(
+            text(&metadata["status"]["statusCode"]),
+            LOGGING_STATUS_UPDATING,
+            "case {:?}: the stored status must be the transient UPDATING, got {described:?}",
+            row.name
+        );
+        if row.replays {
+            assert_eq!(
+                metadata["modifiedAt"], before.body["loggingConfiguration"]["modifiedAt"],
+                "case {:?}: a replay is not a change, so modifiedAt must stand, \
+                 got {described:?}",
+                row.name
+            );
+        }
+    }
+}
+
+/// "Update/Deletion is disallowed until logging configuration is ACTIVE and workspace
+/// status is ACTIVE" (`LoggingConfigurationStatusCode`): an update from any other pair of
+/// statuses is the modelled `ConflictException` (409) and changes nothing. One row per way
+/// the pair can fail that rule.
+#[tokio::test]
+async fn an_update_is_refused_unless_the_configuration_and_its_workspace_are_active() {
+    let region = "eu-west-1";
+    for case in [
+        "the configuration is still CREATING",
+        "the configuration is still UPDATING",
+        "the workspace is DELETING",
+    ] {
+        let amp = Amp::new();
+        let first = log_group_arn("aws", region, "/aws/prometheus/gated");
+        let target = log_group_arn("aws", region, "/aws/prometheus/elsewhere");
+        let workspace_id = match case {
+            "the configuration is still CREATING" => {
+                // No wait: the create's span has not elapsed, so the configuration is
+                // still settling.
+                let workspace_id = amp.workspace(region, "gated").await;
+                let created = amp
+                    .create_logging(region, &workspace_id, &first, None)
+                    .await;
+                assert_eq!(
+                    created.status, 202,
+                    "case {case:?}: the create must succeed, got {created:?}"
+                );
+                workspace_id
+            }
+            "the configuration is still UPDATING" => {
+                let workspace_id = amp.active_logging(region, "gated", &first).await;
+                let updated = amp
+                    .update_logging(region, &workspace_id, &first, Some("settling"))
+                    .await;
+                assert_eq!(
+                    updated.status, 202,
+                    "case {case:?}: the first update must succeed, got {updated:?}"
+                );
+                workspace_id
+            }
+            _ => {
+                let workspace_id = amp.active_logging(region, "gated", &first).await;
+                let deleted = amp.delete_workspace(region, &workspace_id).await;
+                assert_eq!(
+                    deleted.status, 202,
+                    "case {case:?}: the workspace deletion must be accepted, got {deleted:?}"
+                );
+                workspace_id
+            }
+        };
+
+        let before = amp.describe_logging(region, &workspace_id).await;
+        let refused = amp
+            .update_logging(region, &workspace_id, &target, Some("refused-token"))
+            .await;
+        assert_eq!(
+            refused.status, 409,
+            "case {case:?}: the update must be refused with 409, got {refused:?}"
+        );
+        assert_eq!(
+            refused.error_code(),
+            "ConflictException",
+            "case {case:?}: the refusal must be a ConflictException, got {refused:?}"
+        );
+
+        let after = amp.describe_logging(region, &workspace_id).await;
+        assert_eq!(
+            text(&after.body["loggingConfiguration"]["logGroupArn"]),
+            text(&before.body["loggingConfiguration"]["logGroupArn"]),
+            "case {case:?}: a refused update must change nothing, got {after:?}"
+        );
+    }
+}
+
+/// An update needs a configuration to act on: a workspace that holds none, and an id
+/// naming no workspace at all, are both the modelled `ResourceNotFoundException` (404)
+/// rather than a configuration created out of an update.
+#[tokio::test]
+async fn an_update_without_a_stored_configuration_is_not_found() {
+    let region = "ap-northeast-1";
+    let amp = Amp::new();
+    let target = log_group_arn("aws", region, "/aws/prometheus/absent");
+
+    let empty = amp.workspace(region, "no-configuration").await;
+    wait_for_due_transition();
+    let refused = amp.update_logging(region, &empty, &target, None).await;
+    assert_eq!(
+        refused.status, 404,
+        "case \"workspace holds no configuration\": the update must answer 404, \
+         got {refused:?}"
+    );
+    assert_eq!(
+        refused.error_code(),
+        "ResourceNotFoundException",
+        "case \"workspace holds no configuration\": the refusal must be a \
+         ResourceNotFoundException, got {refused:?}"
+    );
+    // The update created nothing: the workspace still holds no configuration.
+    let described = amp.describe_logging(region, &empty).await;
+    assert_eq!(
+        described.status, 404,
+        "case \"workspace holds no configuration\": a refused update must persist \
+         nothing, got {described:?}"
+    );
+
+    for unknown in ["ws-00000000-0000-0000-0000-000000000000", "nope", "0"] {
+        let refused = amp.update_logging(region, unknown, &target, None).await;
+        assert_eq!(
+            refused.status, 404,
+            "case {unknown:?}: updating against an unknown workspace is a 404, \
+             got {refused:?}"
+        );
+        assert_eq!(
+            refused.error_code(),
+            "ResourceNotFoundException",
+            "case {unknown:?}: updating against an unknown workspace is a \
+             ResourceNotFoundException, got {refused:?}"
+        );
+    }
 }
