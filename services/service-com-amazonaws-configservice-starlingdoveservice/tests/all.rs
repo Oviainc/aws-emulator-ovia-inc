@@ -37,3 +37,10 @@ mod list_configuration_recorders;
 mod pending_aggregation_requests;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+
+// Declared after the sorted list on purpose: every new suite this crate gains is
+// inserted into the `config_*` block above, and a declaration added there conflicts
+// with the next one that lands. Fold this line into the sorted list whenever the
+// list is next touched for another reason.
+#[path = "all/config_custom_rule_policy.rs"]
+mod config_custom_rule_policy;

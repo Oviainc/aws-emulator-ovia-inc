@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetCustomRulePolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetCustomRulePolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the Guard policy body persisted for a Config Custom Policy rule.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetCustomRulePolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The body is the `Source.CustomPolicyDetails.PolicyText` that `PutConfigRule` stored
+//! for the named rule — the one member the describe path withholds, which is why this
+//! operation exists. A request that does not name a Custom Policy rule this account
+//! holds — no name at all, a name no rule carries, or the name of a rule whose source
+//! is not a Guard policy — is refused with `NoSuchConfigRuleException`, the one error
+//! the operation models, whose message names the `ConfigRuleName` the request sent and
+//! what to check about it.
+//!
+//! This is a pure READ: it writes nothing, so what a later caller sees is unchanged.
 //!
 //! ## Shape of an operation
 //!
@@ -102,6 +104,24 @@ impl From<GetCustomRulePolicyErrorModeled> for GetCustomRulePolicyError {
     }
 }
 
+/// How Config words `NoSuchConfigRuleException` for a request that named a rule which
+/// is not a Config Custom Policy rule, so it carries no Guard policy body. The one
+/// modelled error covers this case as well as an absent rule
+/// (`NoSuchConfigRuleException`: "Verify that the rule is an Config Process Check
+/// rule, that the rule name is correct"), so the message says WHICH of the two the
+/// request got wrong.
+///
+/// It lives here rather than beside [`crate::state::no_such_config_rule_message`]
+/// because this is the only operation that reads a rule's Guard policy body, and it
+/// is worded the same way as that sibling: BUILT FROM THE REQUEST, quoting the
+/// `ConfigRuleName` the caller sent and naming what to check.
+fn not_a_custom_policy_rule_message(name: &str) -> String {
+    format!(
+        "The ConfigRule '{name}' provided in the request is invalid. Please check that \
+         the rule is a Config Custom Policy rule."
+    )
+}
+
 /// The `GetCustomRulePolicy` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -138,18 +158,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetCustomRulePolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetCustomRulePolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetCustomRulePolicy"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE)
+        })?;
+
+        // `ConfigRuleName` is not a modelled required member, so a request can carry no
+        // name at all. Naming nothing names no Custom Policy rule either, so it is
+        // refused like any other name that selects none — the message just quotes the
+        // empty name the request carried.
+        let Some(name) = input.config_rule_name.as_deref() else {
+            return Err(GetCustomRulePolicyErrorModeled::NoSuchConfigRuleException(
+                NoSuchConfigRuleException {
+                    message: Some(crate::state::no_such_config_rule_message("")),
+                },
+            )
+            .into());
+        };
+        let store = state.lock();
+
+        let Some(rule) = store.config_rules.get(name) else {
+            return Err(GetCustomRulePolicyErrorModeled::NoSuchConfigRuleException(
+                NoSuchConfigRuleException {
+                    message: Some(crate::state::no_such_config_rule_message(name)),
+                },
+            )
+            .into());
+        };
+
+        // Only a Custom Policy rule carries a Guard policy body. A managed rule or a
+        // Custom Lambda rule is evaluated by something else entirely, so there is no
+        // policy to report and the request named the wrong kind of rule.
+        let policy = if rule.source.owner == crate::state::OWNER_CUSTOM_POLICY {
+            rule.source.custom_policy_details.as_ref()
+        } else {
+            None
+        };
+        let Some(policy) = policy else {
+            return Err(GetCustomRulePolicyErrorModeled::NoSuchConfigRuleException(
+                NoSuchConfigRuleException {
+                    message: Some(not_a_custom_policy_rule_message(name)),
+                },
+            )
+            .into());
+        };
+
+        Ok(GetCustomRulePolicyOutput {
+            policy_text: Some(policy.policy_text.clone()),
+        })
     }
 }
