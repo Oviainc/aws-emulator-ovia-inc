@@ -122,7 +122,7 @@ use crate::state::{
     OWNER_SELF, aws_account_id_is_well_formed, decode_page_token, dry_run_operation,
     encode_page_token, filter_value_matches, image_id_is_well_formed, image_is_deprecated,
     image_is_visible, invalid_ami_id_malformed, invalid_ami_id_not_found,
-    invalid_pagination_token, invalid_parameter_value, invalid_user_id_malformed,
+    invalid_pagination_token_for, invalid_parameter_value, invalid_user_id_malformed,
     require_service_state,
 };
 
@@ -293,7 +293,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // as an id.
         let start_at = match input.next_token.as_deref() {
             None => None,
-            Some(token) => Some(decode_page_token(token).ok_or_else(invalid_pagination_token)?),
+            Some(token) => {
+                Some(decode_page_token(token).ok_or_else(|| invalid_pagination_token_for(token))?)
+            }
         };
 
         let state = require_service_state(&*self.engine)?;

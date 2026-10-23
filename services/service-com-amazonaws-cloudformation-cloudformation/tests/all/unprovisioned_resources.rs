@@ -1,10 +1,180 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! What a stack reports for the resources its template declares: the rule lives
-//! in `stack_outputs.rs`, whose table this file's rows were folded into.
+//! What a stack claims about a resource NOTHING created.
 //!
-//! The EventBridge Scheduler fix added a row there for the resource types its
-//! issue's templates declare — `AWS::Scheduler::ScheduleGroup` and
-//! `AWS::Scheduler::Schedule`, neither of which the return-value catalogue
-//! carries — rather than keeping a second copy of that suite's harness here.
-//! This module is deliberately empty: one table for the rule beats two.
+//! The rule under test: **a stack reports a resource as created only where the service
+//! that owns it created it.** Two cases follow from that, and this suite pins both
+//! through the wire of a router carrying CloudFormation ALONE — so no owning service is
+//! reachable, which is exactly the shape of "the call did not happen":
+//!
+//! 1. A resource type this emulator PROVISIONS (an `AWS::KinesisFirehose::DeliveryStream`)
+//!    whose owning service does not answer leaves the stack in `CREATE_FAILED`, naming the
+//!    resource, instead of a `CREATE_COMPLETE` stack whose stream does not exist.
+//! 2. A resource type it has no provisioner for is DECLARED ONLY: nothing is called for
+//!    it, so the stack completes and its outputs still resolve from the identifiers
+//!    CloudFormation's documented naming rules give the resource — and the stack's
+//!    deletion, which has nothing to delete, completes too. (What those identifiers ARE is
+//!    `stack_outputs.rs`'s table; what this row adds is that no call was made for them and
+//!    that the stack's lifecycle completes anyway.)
+//!
+//! The same stack with the owning service mounted beside CloudFormation is
+//! `core/router/tests/all/cloudformation_provisions_stack_resources.rs`, which is where
+//! the create really happens.
+
+use std::time::Duration;
+
+use serde_json::json;
+use service_com_amazonaws_cloudformation_cloudformation::state::STATUS_TRANSITION_DELAY;
+
+use crate::stack_lifecycle::{call, member, xml_text, xml_texts};
+
+/// Wait past the instant a stack operation's terminal status becomes due.
+async fn wait_for_the_transition() {
+    tokio::time::sleep(STATUS_TRANSITION_DELAY + Duration::from_millis(250)).await;
+}
+
+/// Create a stack from `template` and answer the `DescribeStacks` body for it once its
+/// create has settled.
+async fn create_and_settle(
+    router: &smithy_server_runtime::MultiServiceRouter,
+    case: &str,
+    stack_name: &str,
+    template: &str,
+) -> String {
+    let (status, body) = call(
+        router,
+        "CreateStack",
+        &[
+            member("StackName", stack_name),
+            member("TemplateBody", template),
+        ],
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected HTTP 200 from CreateStack, got {status} with body {body}"
+    );
+    wait_for_the_transition().await;
+    let (status, body) = call(
+        router,
+        "DescribeStacks",
+        &[member("StackName", stack_name)],
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected HTTP 200 from DescribeStacks, got {status} with body {body}"
+    );
+    body
+}
+
+/// A resource whose owning service cannot be reached is not reported as created: the stack
+/// fails, naming the resource, and the failure carries what the call answered.
+#[tokio::test]
+async fn a_resource_whose_owning_service_does_not_answer_fails_the_stack() {
+    let router = crate::stack_lifecycle::router();
+    let case = "a Firehose stream with no Firehose service mounted";
+    let template = json!({
+        "Resources": {
+            "Stream": {
+                "Type": "AWS::KinesisFirehose::DeliveryStream",
+                "Properties": {
+                    "DeliveryStreamName": "unreachable-stream",
+                    "ExtendedS3DestinationConfiguration": {
+                        "BucketARN": "arn:aws:s3:::a-bucket",
+                        "RoleARN": "arn:aws:iam::000000000000:role/a-role"
+                    }
+                }
+            }
+        },
+        "Outputs": { "StreamName": { "Value": { "Ref": "Stream" } } }
+    })
+    .to_string();
+
+    let body = create_and_settle(&router, case, "unreachable-stack", &template).await;
+    assert_eq!(
+        xml_text(&body, "StackStatus").as_deref(),
+        Some("CREATE_FAILED"),
+        "case {case:?}: expected the stack to fail rather than report a stream nothing \
+         created, got {body}"
+    );
+    let reason = xml_text(&body, "StackStatusReason").unwrap_or_default();
+    assert!(
+        reason.contains("Stream"),
+        "case {case:?}: expected the reason to name the resource that failed, got {reason:?}"
+    );
+}
+
+/// A resource type this emulator has no provisioner for is declared only: nothing is
+/// called for it, the stack completes, its outputs resolve from the identifiers
+/// CloudFormation's documented naming rules give the resource, and the stack's deletion —
+/// which has nothing to delete anywhere — completes.
+#[tokio::test]
+async fn resource_types_with_no_provisioner_are_declared_only_and_the_stack_completes() {
+    let router = crate::stack_lifecycle::router();
+    let case = "a bucket and a role, neither of which this emulator provisions";
+    let stack_name = "declared-only-stack";
+    let template = json!({
+        "Resources": {
+            "Bucket": {
+                "Type": "AWS::S3::Bucket",
+                "Properties": { "BucketName": "declared-only-bucket" }
+            },
+            "Role": {
+                "Type": "AWS::IAM::Role",
+                "Properties": { "RoleName": "declared-only-role" }
+            }
+        },
+        "Outputs": {
+            "BucketName": { "Value": { "Ref": "Bucket" } },
+            "RoleArn": { "Value": { "Fn::GetAtt": ["Role", "Arn"] } }
+        }
+    })
+    .to_string();
+
+    let body = create_and_settle(&router, case, stack_name, &template).await;
+    assert_eq!(
+        xml_text(&body, "StackStatus").as_deref(),
+        Some("CREATE_COMPLETE"),
+        "case {case:?}: expected the stack to complete, got {body}"
+    );
+    let keys = xml_texts(&body, "OutputKey");
+    let values = xml_texts(&body, "OutputValue");
+    assert_eq!(
+        keys.len(),
+        2,
+        "case {case:?}: expected both declared outputs, got {keys:?} in {body}"
+    );
+    assert_eq!(
+        values,
+        vec![
+            "declared-only-bucket".to_string(),
+            "arn:aws:iam::000000000000:role/declared-only-role".to_string(),
+        ],
+        "case {case:?}: expected the documented Ref and Fn::GetAtt values, got {values:?}"
+    );
+
+    // Deleting the stack has nothing to delete in any service, so the deletion completes.
+    let (status, body) = call(
+        &router,
+        "DeleteStack",
+        &[member("StackName", stack_name)],
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected HTTP 200 from DeleteStack, got {status} with body {body}"
+    );
+    wait_for_the_transition().await;
+    let (status, body) = call(
+        &router,
+        "DescribeStacks",
+        &[member("StackName", stack_name)],
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "case {case:?}: expected the deleted stack to be unaddressable by name, got {status} \
+         with body {body}"
+    );
+}

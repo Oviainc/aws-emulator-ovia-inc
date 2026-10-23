@@ -219,7 +219,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 status_reason: environment.status_reason,
                 compute_resources: environment.compute_resources,
                 service_role: environment.service_role,
-                update_policy: None,
+                // The infrastructure update policy the last `UpdateComputeEnvironment`
+                // set, which AWS Batch reports back here; `None` until one sets it.
+                update_policy: environment.update_policy,
                 // `OrchestrationType`: EKS when the environment was created with an
                 // `eksConfiguration`, else ECS.
                 container_orchestration_type: Some(

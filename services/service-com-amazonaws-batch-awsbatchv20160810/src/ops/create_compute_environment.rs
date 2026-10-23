@@ -267,6 +267,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             uuid: state.new_uuid(),
             unmanagedv_cpus: input.unmanagedv_cpus,
             compute_resources: input.compute_resources,
+            // `CreateComputeEnvironment` models no `updatePolicy`; only
+            // `UpdateComputeEnvironment` sets one.
+            update_policy: None,
             service_role: input.service_role,
             eks_configuration: input.eks_configuration,
             ecs_settings: input.ecs_settings,

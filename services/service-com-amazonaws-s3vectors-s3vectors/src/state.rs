@@ -75,6 +75,15 @@ pub const MAX_METADATA_NODES: usize = 1024;
 /// nest. Bounding it at the write is also what gives the equality walk a later
 /// filter runs over the STORED document a known recursion bound.
 pub const MAX_METADATA_DEPTH: u32 = 32;
+/// See [`MAX_VECTOR_BUCKETS`]: how large a bucket policy document may be. The
+/// Amazon S3 User Guide's bucket policy limit — "bucket policies are limited to
+/// 20 KB in size" — is the bound a policy document is held to here.
+pub const MAX_POLICY_BYTES: usize = 20 * 1024;
+
+/// The two `Effect` values the IAM policy grammar allows in a statement.
+pub const POLICY_EFFECT_ALLOW: &str = "Allow";
+/// See [`POLICY_EFFECT_ALLOW`].
+pub const POLICY_EFFECT_DENY: &str = "Deny";
 
 /// Per-service state for com-amazonaws-s3vectors-s3vectors. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
@@ -97,6 +106,11 @@ pub struct VectorBucketRecord {
     /// `None` until PutVectorBucketDefaultIndexMode sets one; a new index
     /// inherits it.
     pub default_index_mode: Option<String>,
+    /// The bucket policy document, exactly as PutVectorBucketPolicy was given
+    /// it. `None` until a policy is put, and `None` again once
+    /// DeleteVectorBucketPolicy removes it; GetVectorBucketPolicy answers
+    /// `NotFoundException` while it is `None`.
+    pub policy: Option<String>,
     pub indexes: BTreeMap<String, VectorIndexRecord>,
 }
 
@@ -334,6 +348,84 @@ pub fn validate_resource_name(member: &str, value: &str) -> Result<(), LookupErr
              hyphens and dots, and must begin and end with a letter or a number: {value}"
         ),
     ))
+}
+
+/// Check a bucket policy document against the IAM resource-policy grammar.
+///
+/// `PutVectorBucketPolicy$policy` is "the JSON that defines the policy", and the
+/// AWS IAM reference gives that JSON's grammar: a policy is a JSON object whose
+/// optional `Version` is a string, whose `Id` is a string, and whose required
+/// `Statement` is one statement object or an array of them; every statement's
+/// `Effect` is exactly `Allow` or `Deny` and names an action through `Action` or
+/// `NotAction`. Anything that is not a policy document by that grammar —
+/// starting with text that is not JSON at all — is refused as invalid input,
+/// never stored: a stored non-policy would be handed back by
+/// GetVectorBucketPolicy as if the service had accepted it.
+///
+/// Only the grammar is checked here. Whether the principals, actions and
+/// resources a well-formed statement names exist is not a grammar question, and
+/// a policy may legitimately name a principal or a resource in another account.
+pub fn validate_bucket_policy(member: &str, policy: &str) -> Result<(), LookupError> {
+    let refuse = |detail: String| {
+        Err(LookupError::invalid(
+            member,
+            format!("`{member}` is not a valid policy document: {detail}"),
+        ))
+    };
+
+    if policy.len() > MAX_POLICY_BYTES {
+        return refuse(format!(
+            "a policy document is at most {MAX_POLICY_BYTES} bytes, and this one is {} bytes",
+            policy.len()
+        ));
+    }
+
+    let document: serde_json::Value = match serde_json::from_str(policy) {
+        Ok(document) => document,
+        Err(error) => return refuse(format!("it is not well-formed JSON ({error})")),
+    };
+    let Some(object) = document.as_object() else {
+        return refuse("a policy document is a JSON object".to_string());
+    };
+    for key in ["Version", "Id"] {
+        if object.get(key).is_some_and(|value| !value.is_string()) {
+            return refuse(format!("`{key}` is a string"));
+        }
+    }
+    let Some(statement) = object.get("Statement") else {
+        return refuse("a policy document has a `Statement`".to_string());
+    };
+    let statements: Vec<&serde_json::Value> = match statement {
+        serde_json::Value::Array(statements) => statements.iter().collect(),
+        other => vec![other],
+    };
+    if statements.is_empty() {
+        return refuse("`Statement` names at least one statement".to_string());
+    }
+    for (position, statement) in statements.iter().enumerate() {
+        let Some(statement) = statement.as_object() else {
+            return refuse(format!("statement {position} is a JSON object"));
+        };
+        match statement.get("Effect").and_then(serde_json::Value::as_str) {
+            Some(POLICY_EFFECT_ALLOW) | Some(POLICY_EFFECT_DENY) => {}
+            other => {
+                return refuse(format!(
+                    "statement {position}'s `Effect` is `{POLICY_EFFECT_ALLOW}` or \
+                     `{POLICY_EFFECT_DENY}`, not {}",
+                    match other {
+                        Some(effect) => format!("`{effect}`"),
+                        None => "absent".to_string(),
+                    }
+                ));
+            }
+        }
+        if !statement.contains_key("Action") && !statement.contains_key("NotAction") {
+            return refuse(format!(
+                "statement {position} names an `Action` or a `NotAction`"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Resolve the bucket a request names by `vectorBucketName` or `vectorBucketArn`.

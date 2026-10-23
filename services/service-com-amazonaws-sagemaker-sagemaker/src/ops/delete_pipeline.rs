@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeletePipeline
-//! IMPLEMENTED: starts the removal of the pipeline `crate::state` holds under the
-//! requested name — the record reports `PipelineStatus` `Deleting` until the clock
-//! owes its disappearance (`crate::state::PIPELINE_DELETED_AFTER`) — and refuses a name
-//! it does not hold with the modelled `ResourceNotFound`. This is the ONLY file to
-//! touch for this operation.
+//! IMPLEMENTED: removes the pipeline `crate::state` holds under the requested name, with
+//! the executions that belong to it, answering the ARN that pipeline carried — the record
+//! is GONE when the call returns, so the reader refuses the name afterwards and the name
+//! is free to create again — and refuses a name it does not hold with the modelled
+//! `ResourceNotFound`. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -145,34 +145,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = crate::state::service_state(&*self.engine)
             .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
 
-        let now = ::std::time::SystemTime::now();
-
         let mut store = state.lock();
-        // A removal the clock already owed has happened by now, so a second delete of
-        // the same pipeline reports it as gone rather than re-driving it.
-        store.settle_pipeline_deletions(now);
-
-        let Some(pipeline) = store.pipelines.get_mut(&input.pipeline_name) else {
+        // The delete is observable AS a delete: the record goes now — with the executions
+        // that belong to it — so the reader refuses the name from the next call on and a
+        // second delete of it reports it as gone rather than succeeding twice. Nothing of
+        // the pipeline is left behind for a later call to read, which is what makes the
+        // name reusable.
+        let Some(pipeline) = store.remove_pipeline(&input.pipeline_name) else {
             let arn = crate::state::resource_arn(
                 &crate::state::request_region(ctx),
                 "pipeline",
                 &input.pipeline_name,
             );
             return Err(DeletePipelineErrorModeled::ResourceNotFound(ResourceNotFound {
-                message: Some(format!("Pipeline {arn} does not exist.")),
+                message: Some(crate::state::does_not_exist(
+                    crate::state::PIPELINE_ENTITY,
+                    &arn,
+                )),
             })
             .into());
         };
-        let arn = pipeline.arn.clone();
-        // Deleting is asynchronous: the pipeline moves to `Deleting` now and is gone
-        // once the clock owes its removal. A delete of a pipeline already being
-        // deleted answers the same ARN and moves nothing — the first call's removal
-        // instant stands, so repeating the call cannot postpone it.
-        if pipeline.removal_due_at.is_none() {
-            pipeline.status = crate::state::PIPELINE_STATUS_DELETING.to_string();
-            pipeline.last_modified_time = now;
-            pipeline.removal_due_at = Some(now + crate::state::PIPELINE_DELETED_AFTER);
-        }
+        // The ARN the removed pipeline carried, so the caller reads back the same ARN
+        // `CreatePipeline` minted rather than one rebuilt from this request.
+        let arn = pipeline.arn;
         drop(store);
 
         crate::state::record_state_change(Self::NAME, &arn, ctx);

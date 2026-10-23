@@ -190,11 +190,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .is_none()
         {
             return Err(DeleteManagedThingErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!("Managed thing {} was not found", input.identifier)),
-                    resource_id: Some(input.identifier.clone()),
-                    resource_type: Some("ManagedThing".to_string()),
-                },
+                // A mutation states the reason from the identifier the request carried,
+                // through the one formatter the mutating managed-thing paths share.
+                crate::state::managed_thing_not_found_on_mutation(&input.identifier),
             )
             .into());
         }

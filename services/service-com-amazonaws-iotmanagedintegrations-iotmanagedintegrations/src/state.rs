@@ -5,7 +5,9 @@
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::ops::types::{CapabilityReport, CapabilitySchemaItem, WiFiSimpleSetupConfiguration};
+use crate::ops::types::{
+    CapabilityReport, CapabilitySchemaItem, ResourceNotFoundException, WiFiSimpleSetupConfiguration,
+};
 
 /// The region an ARN carries when the request names none (the emulator's default
 /// region, as documented on [`engine::emulator_arn`]).
@@ -502,6 +504,76 @@ pub fn request_region(parts: &::http::request::Parts) -> String {
     ::emulator_server::sigv4_credential_scope(&parts.headers)
         .map(|scope| scope.region)
         .unwrap_or_else(|| DEFAULT_REGION.to_string())
+}
+
+/// The `ResourceType` this service reports a managed thing under — the Smithy resource
+/// name, which is also what `ResourceNotFoundException`'s `ResourceType` member carries
+/// and what a mutation's reason names ([`identifier_not_found_message`]).
+pub const MANAGED_THING_RESOURCE_TYPE: &str = "ManagedThing";
+
+/// The managed-thing resource as a READ's reason names it — the resource's name in
+/// words, which is what that sentence states instead of the identifier
+/// ([`resource_not_found_message`]).
+pub const MANAGED_THING_RESOURCE_NAME: &str = "Managed Thing";
+
+/// How a MUTATION of this service states that the resource its `Identifier` named does
+/// not exist: the resource's type, the identifier the request carried, and that it was
+/// not found.
+///
+/// The text is BUILT FROM THE REQUEST, so it is part of the contract and not just an
+/// example: the recorded 404s of `UpdateManagedThing` and `DeleteManagedThing` for an
+/// absent managed thing both read `ManagedThing for identifier '<Identifier>' not found`.
+/// Every operation that MUTATES a resource it resolved by the identifier its request
+/// carries states its 404 through here, so one phrasing serves them all.
+pub fn identifier_not_found_message(resource_type: &str, identifier: &str) -> String {
+    format!("{resource_type} for identifier '{identifier}' not found")
+}
+
+/// How a READ of this service states the same thing: the resource's name in words and
+/// that no such resource exists, naming no identifier.
+///
+/// A read resolves the resource through this service's fetch path, which reports WHICH
+/// KIND of resource was not found rather than which one — recorded on `GetManagedThing`
+/// for an absent identifier as `Managed Thing resource not found.`, in the same fixture
+/// whose mutations carry the identifier-derived sentence above. The identifier the caller
+/// sent is still reported, on the `ResourceId` member the shape declares for it.
+pub fn resource_not_found_message(resource_name: &str) -> String {
+    format!("{resource_name} resource not found.")
+}
+
+/// The modelled `ResourceNotFoundException` a MUTATION answers for a managed thing the
+/// store does not hold under the identifier a request named: the reason
+/// ([`identifier_not_found_message`]) plus the `ResourceId` and `ResourceType` members
+/// the shape declares.
+pub fn managed_thing_not_found_on_mutation(identifier: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(identifier_not_found_message(
+            MANAGED_THING_RESOURCE_TYPE,
+            identifier,
+        )),
+        ..managed_thing_not_found(identifier)
+    }
+}
+
+/// The modelled `ResourceNotFoundException` a READ answers for the same absence: the same
+/// shape with the read path's reason ([`resource_not_found_message`]).
+pub fn managed_thing_not_found_on_read(identifier: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(resource_not_found_message(MANAGED_THING_RESOURCE_NAME)),
+        ..managed_thing_not_found(identifier)
+    }
+}
+
+/// The `ResourceId` and `ResourceType` half of a managed thing's 404, which both paths
+/// report the same way: the identifier the request carried, and the resource's type. The
+/// reason is the caller's to fill, so this is not public — reach it through
+/// [`managed_thing_not_found_on_read`] or [`managed_thing_not_found_on_mutation`].
+fn managed_thing_not_found(identifier: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: None,
+        resource_id: Some(identifier.to_string()),
+        resource_type: Some(MANAGED_THING_RESOURCE_TYPE.to_string()),
+    }
 }
 
 /// The ARN of a managed thing in `region`, as the `ManagedThingArn` pattern requires.
