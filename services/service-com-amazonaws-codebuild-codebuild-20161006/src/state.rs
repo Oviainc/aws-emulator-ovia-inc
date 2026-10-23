@@ -3,7 +3,8 @@
 //! Engine state for the com-amazonaws-codebuild-codebuild-20161006 service.
 //!
 //! Every implemented CodeBuild operation computes its answer from the records
-//! here: `CreateProject` writes a [`Project`], `CreateWebhook` writes that
+//! here: `CreateProject` writes a [`Project`], `CreateFleet` writes a
+//! [`StoredFleet`], `CreateWebhook` writes that
 //! project's [`crate::ops::types::Webhook`], `StartBuild` writes a
 //! [`StoredBuild`], `StartBuildBatch` writes a [`StoredBuildBatch`],
 //! `StartSandbox` writes a [`StoredSandbox`] and `StopSandbox` ends one,
@@ -11,9 +12,9 @@
 //! `ImportSourceCredentials` writes a [`StoredSourceCredentials`],
 //! `BatchDeleteBuilds` removes a build, and the reporting operations
 //! (`BatchGetProjects`, `BatchGetBuilds`, `BatchGetBuildBatches`,
-//! `BatchGetSandboxes`, `BatchGetReportGroups`, `ListProjects`,
-//! `ListBuildsForProject`, `ListSandboxes`, `ListSandboxesForProject`,
-//! `ListSourceCredentials`) only read them.
+//! `BatchGetFleets`, `BatchGetSandboxes`, `BatchGetReportGroups`,
+//! `ListProjects`, `ListBuildsForProject`, `ListSandboxes`,
+//! `ListSandboxesForProject`, `ListSourceCredentials`) only read them.
 //!
 //! The model shapes themselves are what is stored, so a read hands back exactly
 //! the structure the write persisted rather than a second, drifting copy of the
@@ -22,8 +23,8 @@
 use std::collections::BTreeMap;
 
 use crate::ops::types::{
-    Build, BuildArtifacts, BuildBatch, BuildBatchPhase, BuildPhase, EnvironmentVariable,
-    PhaseContext, Project, ProjectArtifacts, ReportGroup, Sandbox, SandboxSession,
+    Build, BuildArtifacts, BuildBatch, BuildBatchPhase, BuildPhase, EnvironmentVariable, Fleet,
+    FleetStatus, PhaseContext, Project, ProjectArtifacts, ReportGroup, Sandbox, SandboxSession,
     SandboxSessionPhase, SourceCredentialsInfo,
 };
 
@@ -106,6 +107,49 @@ pub const USERNAME_AUTH_TYPE: &str = "BASIC_AUTH";
 /// the same here, which is also the ceiling that stops `projects` growing without
 /// bound as requests arrive.
 pub const MAX_PROJECTS: usize = 5_000;
+
+/// Compute fleets this emulator holds for the account.
+///
+/// Real CodeBuild enforces an account quota on compute fleets per region and
+/// answers `AccountLimitExceededException` once it is reached; `CreateFleet` does
+/// the same here, which is also the ceiling that stops `fleets` growing without
+/// bound as requests arrive. THE NUMBER IS THIS EMULATOR'S: AWS publishes a
+/// per-region fleet quota that is adjustable per account, so there is no single
+/// documented value to copy, and this one is far above any emulated workload.
+pub const MAX_FLEETS: usize = 1_000;
+
+/// The smallest value a `FleetCapacity` member may take.
+///
+/// Every member of that shape counts machines — `baseCapacity` is "the initial
+/// number of machines allocated to the fleet" and `maxCapacity` "the maximum
+/// number of instances in the fleet when auto-scaling" — so a fleet of fewer
+/// than one machine cannot run a build. The model puts no `@range` on
+/// `FleetCapacity`, so the boundary validator passes a zero or negative count
+/// through and the service refuses it with the modelled
+/// `InvalidInputException`.
+pub const MIN_FLEET_CAPACITY: i32 = 1;
+
+/// How long after `CreateFleet` the clock owes a fleet's transition out of
+/// `CREATING`.
+///
+/// AWS does not document how long provisioning reserved capacity takes, so this
+/// span is CHOSEN, inside the 250-750 ms band this project fixes for an emulated
+/// transition. It is deliberately not zero: a caller that reads the fleet
+/// straight after creating it still observes `CREATING`. The due instant is
+/// stored, never slept on.
+pub const FLEET_SETTLE_MILLIS: i64 = 500;
+
+/// `FleetStatusCode` for a fleet whose capacity is still being provisioned.
+pub const FLEET_STATUS_CREATING: &str = "CREATING";
+
+/// `FleetStatusCode` for a fleet that finished provisioning and can take builds.
+pub const FLEET_STATUS_ACTIVE: &str = "ACTIVE";
+
+/// The `ComputeType` values AWS documents as requiring `computeConfiguration`:
+/// "This is only required if `computeType` is set to `ATTRIBUTE_BASED_COMPUTE` or
+/// `CUSTOM_INSTANCE_TYPE`" (`Fleet$computeConfiguration`).
+pub const COMPUTE_TYPES_NEEDING_CONFIGURATION: [&str; 2] =
+    ["ATTRIBUTE_BASED_COMPUTE", "CUSTOM_INSTANCE_TYPE"];
 
 /// Report groups this emulator holds for the account.
 ///
@@ -332,6 +376,8 @@ pub struct ComAmazonawsCodebuildCodebuild20161006State {
     pub next_build_numbers: BTreeMap<String, i64>,
     /// `StartBuild` idempotency tokens, keyed by (project name, token).
     pub start_build_tokens: BTreeMap<(String, String), StartBuildToken>,
+    /// Compute fleets, keyed by fleet name (names are unique per account).
+    pub fleets: BTreeMap<String, StoredFleet>,
     /// Batch builds, keyed by batch build id (`<projectName>:<uuid>`). Batch
     /// builds are their own resource — a batch id is never a build id — so they
     /// are held beside `builds` rather than mixed into it.
@@ -411,6 +457,24 @@ pub struct StoredBuild {
     pub start_millis: i64,
     /// Epoch millis at which this build's terminal transition became due.
     pub settle_due_millis: i64,
+}
+
+/// A persisted compute fleet: the modelled [`Fleet`] plus the instants its
+/// `created` / `lastModified` timestamps report and the instant at which the
+/// clock owes its move out of `CREATING`.
+#[derive(Debug, Clone)]
+pub struct StoredFleet {
+    /// The record every reader hands back.
+    pub fleet: Fleet,
+    /// Epoch millis the fleet was created at. Kept as the integer a list or sort
+    /// operation works on, the way [`StoredProject`]'s is; `ListFleets` and
+    /// `UpdateFleet`, which read and move it, are still scaffolded.
+    pub created_millis: i64,
+    /// Epoch millis the fleet was last changed at — written by `UpdateFleet`,
+    /// which is still scaffolded, so for now it is the creation instant.
+    pub last_modified_millis: i64,
+    /// Epoch millis at which this fleet's move to `ACTIVE` became due.
+    pub active_due_millis: i64,
 }
 
 /// A persisted batch build: the modelled [`BuildBatch`] plus the instant at
@@ -735,6 +799,36 @@ impl ComAmazonawsCodebuildCodebuild20161006State {
         (stored.report_group.arn.as_deref() == Some(arn)).then_some(stored)
     }
 
+    /// Read a fleet, first materialising the transition the clock already owes
+    /// it. Like [`Self::settled_build`] this is the only write a reporting
+    /// operation makes: the move out of `CREATING` was due at
+    /// `active_due_millis` whether or not anybody called, and it is computed
+    /// from the stored instants, so repeating it changes nothing.
+    ///
+    /// `BatchGetFleets$names` takes "the names or ARNs of the compute fleets",
+    /// so both forms resolve here. An identifier that is not an ARN is a fleet
+    /// name; an ARN is resolved the way [`Self::report_group_by_arn`] resolves a
+    /// report group's — the name comes out of the ARN's resource segment for the
+    /// map lookup, and the candidate is kept only if its STORED ARN is exactly
+    /// the one asked for, so an ARN for another partition, region, account,
+    /// resource type or fleet id can never resolve to a local record.
+    pub fn settled_fleet(&mut self, identifier: &str, now_millis: i64) -> Option<&StoredFleet> {
+        let by_arn = identifier.starts_with("arn:");
+        let name = if by_arn {
+            // `fleet/<name>:<uuid>`: the name is what the store is keyed by.
+            identifier.rsplit_once(":fleet/")?.1.split_once(':')?.0
+        } else {
+            identifier
+        }
+        .to_string();
+        let stored = self.fleets.get_mut(&name)?;
+        if by_arn && stored.fleet.arn.as_deref() != Some(identifier) {
+            return None;
+        }
+        stored.settle(now_millis);
+        Some(stored)
+    }
+
     /// Read a build, first materialising the transition the clock already owes
     /// it. This is the only write a reporting operation makes: the move out of
     /// `IN_PROGRESS` was due at `settle_due_millis` whether or not anybody
@@ -894,6 +988,34 @@ fn record_token<T: IssuedToken>(
             .map(|(key, _)| key.clone());
         let Some(oldest) = oldest else { break };
         tokens.remove(&oldest);
+    }
+}
+
+impl StoredFleet {
+    /// Materialise this fleet's `ACTIVE` status once its due instant has passed.
+    ///
+    /// Idempotent and purely a function of the stored instants: a fleet that is
+    /// not provisioning, or whose span has not elapsed, is left alone.
+    pub fn settle(&mut self, now_millis: i64) {
+        if now_millis < self.active_due_millis {
+            return;
+        }
+        let provisioning = self
+            .fleet
+            .status
+            .as_ref()
+            .and_then(|status| status.status_code.as_deref())
+            == Some(FLEET_STATUS_CREATING);
+        if !provisioning {
+            return;
+        }
+        self.fleet.status = Some(FleetStatus {
+            status_code: Some(FLEET_STATUS_ACTIVE.to_string()),
+            // An `ACTIVE` fleet carries no `FleetContextCode`: every value of
+            // that enum explains a failure or a pending deletion.
+            context: None,
+            message: None,
+        });
     }
 }
 
@@ -1091,6 +1213,23 @@ pub fn sandbox_session_uuid(sandbox_id: &str, session_number: i64, start_millis:
     derived_uuid("sandbox-session", sandbox_id, session_number, start_millis)
 }
 
+/// A compute fleet's unique identifier — the UUID AWS puts after `<fleetName>:`.
+///
+/// [`build_uuid`]'s derivation in its own namespace, over the values that already
+/// make a fleet unique: its name, which identifies one fleet per account at any
+/// instant, and the instant it was created. A fleet is addressed by that name
+/// rather than by a per-name sequence number, so it has none to derive from —
+/// which also means a name deleted and recreated inside the SAME millisecond
+/// derives the same id again; once `DeleteFleet` exists it needs a per-name
+/// counter here, the way `allocate_build_number` feeds [`build_uuid`].
+pub fn fleet_uuid(name: &str, created_millis: i64) -> String {
+    derived_uuid("fleet", name, NO_SEQUENCE_NUMBER, created_millis)
+}
+
+/// The `sequence` [`derived_uuid`] takes for a resource that has no per-name
+/// sequence number of its own, because its name already identifies it.
+const NO_SEQUENCE_NUMBER: i64 = 0;
+
 /// An RFC 9562 version-8 (custom, hash-based) UUID over the values that already make
 /// a resource unique: what KIND of resource it is, the name it belongs to, the
 /// sequence number allocated for it under the state lock, and the instant it was
@@ -1164,6 +1303,12 @@ pub fn project_arn(region: &str, name: &str) -> String {
 /// `arn:aws:codebuild:<region>:<account>:build/<id>`.
 pub fn build_arn(region: &str, id: &str) -> String {
     ::emulator_server::emulator_arn(ARN_NAMESPACE, region, &format!("build/{id}"))
+}
+
+/// `arn:aws:codebuild:<region>:<account>:fleet/<id>`, where `id` is a fleet's
+/// `<name>:<uuid>` identifier — the form `UpdateFleet` and `DeleteFleet` take.
+pub fn fleet_arn(region: &str, id: &str) -> String {
+    ::emulator_server::emulator_arn(ARN_NAMESPACE, region, &format!("fleet/{id}"))
 }
 
 /// The CodeBuild endpoint a project's webhook events are sent to, as
@@ -1257,6 +1402,8 @@ fn audit_field(value: &str) -> String {
 pub enum AuditOutcome {
     /// A report group was minted and stored.
     ReportGroupCreated,
+    /// A compute fleet was minted and stored.
+    FleetCreated,
     /// The request was refused as invalid (400 `InvalidInputException`).
     ValidationRefused,
     /// A resource of that name already exists (400
@@ -1272,6 +1419,7 @@ impl AuditOutcome {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::ReportGroupCreated => "report-group-created",
+            Self::FleetCreated => "fleet-created",
             Self::ValidationRefused => "validation-refused",
             Self::AlreadyExists => "already-exists",
             Self::QuotaExceeded => "quota-exceeded",

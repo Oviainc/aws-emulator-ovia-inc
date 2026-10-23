@@ -16,7 +16,7 @@ use serde_json::{json, Value};
 use crate::firewall_lifecycle::{error_code, is_uuid_form, string_at, Harness, ACCOUNT, REGION};
 
 /// A stateless rule group document with a single rule that matches anything.
-fn stateless_any() -> Value {
+pub(crate) fn stateless_any() -> Value {
     json!({
         "RulesSource": {
             "StatelessRulesAndCustomActions": {
@@ -30,7 +30,7 @@ fn stateless_any() -> Value {
 }
 
 /// A stateful rule group document with a single Suricata rule.
-fn stateful_one_rule() -> Value {
+pub(crate) fn stateful_one_rule() -> Value {
     json!({
         "RulesSource": {
             "StatefulRules": [{
@@ -50,7 +50,7 @@ fn stateful_one_rule() -> Value {
 }
 
 /// One stateless rule, built from the match settings a row wants to vary.
-fn stateless_rule(priority: i64, action: &str, match_attributes: Value) -> Value {
+pub(crate) fn stateless_rule(priority: i64, action: &str, match_attributes: Value) -> Value {
     json!({
         "Priority": priority,
         "RuleDefinition": { "Actions": [action], "MatchAttributes": match_attributes },
@@ -58,7 +58,7 @@ fn stateless_rule(priority: i64, action: &str, match_attributes: Value) -> Value
 }
 
 /// A stateless rule group document holding exactly `rules`.
-fn stateless_group(rules: Vec<Value>) -> Value {
+pub(crate) fn stateless_group(rules: Vec<Value>) -> Value {
     json!({
         "RulesSource": {
             "StatelessRulesAndCustomActions": { "StatelessRules": rules },
@@ -68,7 +68,7 @@ fn stateless_group(rules: Vec<Value>) -> Value {
 
 /// The members of a `CreateRuleGroup` request, with the row's specification
 /// members (`RuleGroup` and/or `Rules`) merged in.
-fn create_request(name: &str, group_type: &str, capacity: i64, specification: &Value) -> Value {
+pub(crate) fn create_request(name: &str, group_type: &str, capacity: i64, specification: &Value) -> Value {
     let mut request = json!({
         "RuleGroupName": name,
         "Type": group_type,
@@ -86,7 +86,7 @@ fn create_request(name: &str, group_type: &str, capacity: i64, specification: &V
 /// The ARN a rule group of this name and type must carry: the resource part is
 /// `<stateless|stateful>-rulegroup/<name>`, which is what makes the ARN alone
 /// enough to identify a rule group.
-fn expected_arn(name: &str, group_type: &str) -> String {
+pub(crate) fn expected_arn(name: &str, group_type: &str) -> String {
     let kind = if group_type == "STATELESS" {
         "stateless-rulegroup"
     } else {

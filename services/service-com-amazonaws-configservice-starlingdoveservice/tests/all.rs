@@ -19,6 +19,8 @@ mod config_compliance_by_config_rule;
 mod config_delivery_channel_status;
 #[path = "all/config_read_shape_and_compliance.rs"]
 mod config_read_shape_and_compliance;
+#[path = "all/config_remediation_configurations.rs"]
+mod config_remediation_configurations;
 #[path = "all/config_retention_configuration_lifecycle.rs"]
 mod config_retention_configuration_lifecycle;
 #[path = "all/config_setup_and_rule_loop.rs"]

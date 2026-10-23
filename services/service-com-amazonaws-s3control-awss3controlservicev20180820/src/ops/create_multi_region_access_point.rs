@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateMultiRegionAccessPoint
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateMultiRegionAccessPoint`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateMultiRegionAccessPoint::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Records a Multi-Region Access Point in this service's state, keyed by
+//! (account id, name), and the asynchronous request that created it, keyed by
+//! its request token ARN — so `GetMultiRegionAccessPoint`,
+//! `DescribeMultiRegionAccessPointOperation` and
+//! `DeleteMultiRegionAccessPoint` all serve the one record this call stored.
+//!
+//! The call is asynchronous: it returns a request token while the access point
+//! is still `CREATING`, and the clock — not a later call — is what moves it to
+//! `READY` once [`crate::state::MULTI_REGION_ACCESS_POINT_SETTLE_AFTER`] has
+//! elapsed.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +152,119 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateMultiRegionAccessPoint` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateMultiRegionAccessPointErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateMultiRegionAccessPoint"))
+        // A Multi-Region Access Point IS its set of associated buckets, and the
+        // model makes `Regions` required: a request naming none associates
+        // nothing, which no Multi-Region Access Point can be. The model can only
+        // say the member is present, so the refusal is here.
+        if input.details.regions.is_empty() {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "Details.Regions must name at least one bucket to associate with the \
+                 Multi-Region Access Point.",
+            ));
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::state_unavailable());
+        };
+
+        let region = crate::state::signing_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let request_token_arn = crate::state::async_request_token_arn(
+            &region,
+            crate::state::ASYNC_VERB_CREATE,
+            &input.account_id,
+            &input.client_token,
+            &crate::state::create_details_fingerprint(&input.details),
+        );
+
+        let mut store = state.lock();
+        store.settle_multi_region_access_points(now);
+
+        let request_key = (input.account_id.clone(), request_token_arn.clone());
+        if store.async_requests.contains_key(&request_key) {
+            // This exact request was already accepted: `ClientToken` is an
+            // `@idempotencyToken`, so the retry is handed the token the first
+            // call returned rather than creating a second resource or being
+            // refused as a duplicate name.
+            return Ok(CreateMultiRegionAccessPointOutput {
+                request_token_arn: Some(request_token_arn),
+            });
+        }
+
+        let access_point_key = (input.account_id.clone(), input.details.name.clone());
+        if store.multi_region_access_points.contains_key(&access_point_key) {
+            // A name identifies one Multi-Region Access Point within an account,
+            // so a create under a name the account already holds is a conflict —
+            // whichever of two racing creates reaches the store second sees it.
+            return Err(crate::state::multi_region_access_point_already_owned_by_you(
+                &input.details.name,
+            ));
+        }
+        // The store is bounded: past its quota a create is refused rather than
+        // adding another record, so a caller cannot grow this process's state
+        // without end by varying the account id or the name.
+        if store.multi_region_access_points.len() >= crate::state::MULTI_REGION_ACCESS_POINT_QUOTA {
+            return Err(crate::state::too_many_multi_region_access_points());
+        }
+
+        let due_at = now + crate::state::MULTI_REGION_ACCESS_POINT_SETTLE_AFTER;
+        let created_at = ::aws_smithy_types::DateTime::from(now);
+        // `RegionReport$Region` is the Region the associated bucket is in. A
+        // create request names each bucket WITHOUT its Region, and this emulator
+        // holds no bucket-to-Region directory (S3's own bucket state belongs to
+        // another service), so the Region reported for a bucket is the one its
+        // request was signed for — the only Region this service knows the
+        // association was made in.
+        let regions: Vec<RegionReport> = input
+            .details
+            .regions
+            .iter()
+            .map(|associated| RegionReport {
+                bucket: Some(associated.bucket.clone()),
+                region: Some(region.clone()),
+                bucket_account_id: associated.bucket_account_id.clone(),
+            })
+            .collect();
+
+        let record = crate::state::MultiRegionAccessPointRecord {
+            name: input.details.name.clone(),
+            account_id: input.account_id.clone(),
+            alias: crate::state::multi_region_access_point_alias(
+                &input.account_id,
+                &input.details.name,
+            ),
+            created_at,
+            public_access_block: input.details.public_access_block.clone(),
+            regions: regions.clone(),
+            // The create is asynchronous, so the access point is reported as
+            // `CREATING` until the clock owes it `READY`.
+            status: crate::state::multi_region_access_point_status(crate::state::STATUS_CREATING),
+            status_due_at: Some(due_at),
+        };
+
+        let request = crate::state::AsyncRequestRecord {
+            request_token_arn: request_token_arn.clone(),
+            account_id: input.account_id.clone(),
+            operation: crate::state::async_operation_name("CreateMultiRegionAccessPoint"),
+            creation_time: created_at,
+            request_parameters: AsyncRequestParameters {
+                create_multi_region_access_point_request: Some(input.details.clone()),
+                delete_multi_region_access_point_request: None,
+                put_multi_region_access_point_policy_request: None,
+            },
+            regions: regions
+                .iter()
+                .filter_map(|report| report.region.clone())
+                .collect(),
+            due_at,
+        };
+
+        store
+            .multi_region_access_points
+            .insert(access_point_key, record);
+        store.record_async_request(request);
+        Ok(CreateMultiRegionAccessPointOutput {
+            request_token_arn: Some(request_token_arn),
+        })
     }
 }

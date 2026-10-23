@@ -14,13 +14,14 @@
 //! (`ThrottlingException`, likewise). The emulator verifies request signatures in
 //! the framework, before any handler runs.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     ConflictException, CreateMonitorInput, CreateScopeInput, InternalServerException,
     MonitorLocalResource, MonitorRemoteResource, ResourceNotFoundException,
-    ServiceQuotaExceededException, TargetId, TargetResource, ValidationException,
+    ServiceQuotaExceededException, TargetId, TargetResource, UpdateMonitorInput,
+    ValidationException,
 };
 
 /// The Region an ARN carries when the request is unsigned, so no SigV4 credential
@@ -78,8 +79,37 @@ pub const MAX_SCOPES: usize = 100;
 
 /// The most monitors this emulator holds at once, for the same reason and with the
 /// same refusal. Deleting a monitor frees its slot (and the idempotency record
-/// that named it), so the store's size is bounded by the live resources.
+/// that named it), so the store's size is bounded by the live resources: at most
+/// `MAX_MONITORS` records, each holding at most [`MAX_MONITOR_RESOURCES`] entries
+/// per resource list and [`MAX_UPDATE_TOKENS`] remembered client tokens.
 pub const MAX_MONITORS: usize = 100;
+
+/// The most entries one monitor's `localResources` or `remoteResources` list
+/// holds, and the most entries one request may name in any ONE of its resource
+/// lists (`CreateMonitor`'s two, `UpdateMonitor`'s four).
+///
+/// Neither `MonitorLocalResources` nor `MonitorRemoteResources` carries a
+/// `@length`, so nothing before a handler caps how long these lists grow, and an
+/// entry's `identifier` is caller-chosen free text: without a ceiling here a
+/// caller repeating `UpdateMonitor` with fresh identifiers grows one record — and
+/// the work every later call does over it — without limit. A request that would
+/// leave a list past this ceiling is refused with the modelled
+/// `ValidationException` (HTTP 400, naming the member), which is the refusal both
+/// operations model for a member they will not accept. AWS publishes its own
+/// quota and it is not this number; this is the emulator's own ceiling, chosen
+/// well above what a client script needs.
+pub const MAX_MONITOR_RESOURCES: usize = 100;
+
+/// How many `clientToken`s of already-applied updates a monitor remembers, so a
+/// replayed `@idempotent` update is recognized as a replay instead of applying
+/// twice ([`Monitor::update_replayed`]).
+///
+/// AWS does not document how long a client token is remembered, so this window is
+/// chosen rather than cited: deep enough that a retry — even behind a few other
+/// updates to the same monitor — is still recognized, and bounded so that a caller
+/// issuing updates forever cannot grow this process's memory without limit. The
+/// oldest token is forgotten first.
+pub const MAX_UPDATE_TOKENS: usize = 64;
 
 /// `ScopeStatus`, the lifecycle status of a scope. The wire values are the model's
 /// (SUCCEEDED | IN_PROGRESS | FAILED | DEACTIVATING | DEACTIVATED); only the ones
@@ -199,6 +229,28 @@ pub struct Monitor {
     pub modified_at: SystemTime,
     /// When the clock owes this monitor its terminal status.
     pub active_at: SystemTime,
+    /// The `clientToken`s of the updates already applied to this monitor, each
+    /// with the fingerprint of the change it carried ([`update_fingerprint`]),
+    /// oldest first and at most [`MAX_UPDATE_TOKENS`] of them. A deque rather than
+    /// a map because the eviction order is what bounds it; the tokens go away with
+    /// the monitor.
+    pub update_tokens: VecDeque<(String, String)>,
+}
+
+/// What a `clientToken` on an `UpdateMonitor` request means for the monitor it
+/// addresses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpdateReplay {
+    /// No token, or a token this monitor has not applied: the request is a new
+    /// update and is applied.
+    New,
+    /// The token already applied THIS change: the request is a replay, answered
+    /// with the record as it stands without applying anything again.
+    Replay,
+    /// The token already applied a DIFFERENT change ("Don't reuse the same client
+    /// token for other API requests"), so the request is refused rather than
+    /// answered with a success for a write that was discarded.
+    Mismatch,
 }
 
 impl Monitor {
@@ -212,15 +264,105 @@ impl Monitor {
         }
     }
 
+    /// What `token` means for this monitor, given the change `fingerprint` the
+    /// request carries ([`update_fingerprint`]) — the check an `@idempotent`
+    /// replay makes before anything is changed, so a retried update neither
+    /// applies twice nor moves `modifiedAt` again. It compares the REQUEST against
+    /// the remembered update, the way [`Monitor::matches_create`] does for a
+    /// create, so a token reused for a different change is not answered with a
+    /// success for a write nothing applied. A request without a `clientToken` is
+    /// never a replay.
+    pub fn update_replay(&self, token: Option<&str>, fingerprint: &str) -> UpdateReplay {
+        let Some(token) = token else {
+            return UpdateReplay::New;
+        };
+        match self
+            .update_tokens
+            .iter()
+            .find(|(seen, _)| seen == token)
+            .map(|(_, applied)| applied == fingerprint)
+        {
+            None => UpdateReplay::New,
+            Some(true) => UpdateReplay::Replay,
+            Some(false) => UpdateReplay::Mismatch,
+        }
+    }
+
+    /// Remember `token` as having applied the change `fingerprint` describes,
+    /// forgetting the oldest once the window is full.
+    pub fn remember_update(&mut self, token: String, fingerprint: String) {
+        if self.update_tokens.iter().any(|(seen, _)| seen == &token) {
+            return;
+        }
+        if self.update_tokens.len() >= MAX_UPDATE_TOKENS {
+            self.update_tokens.pop_front();
+        }
+        self.update_tokens.push_back((token, fingerprint));
+    }
+
+    /// Apply an `UpdateMonitor` request's additions and removals to this monitor's
+    /// resource lists, answering whether the stored record actually changed (which
+    /// is what decides whether `modifiedAt` moves).
+    ///
+    /// Each list is edited as a SET keyed by an entry's identity (`type` +
+    /// `identifier`): the removals land first and then the additions, so one
+    /// request naming a resource in both ends with that resource present, and
+    /// repeating either is a no-op rather than a duplicate or an error.
+    ///
+    /// A request that would leave a stored list past [`MAX_MONITOR_RESOURCES`] is
+    /// refused: the answer is the member to name in a `ValidationException` and
+    /// the reason, and NOTHING is applied, so a refused update leaves the record
+    /// exactly as it was. The request's own list lengths are refused earlier, by
+    /// [`request_overflow`], before this monitor is touched or the request is
+    /// fingerprinted.
+    pub fn apply_update(
+        &mut self,
+        input: &UpdateMonitorInput,
+    ) -> Result<bool, (&'static str, String)> {
+        let local_to_add = input.local_resources_to_add.as_deref().unwrap_or_default();
+        let local_to_remove = input
+            .local_resources_to_remove
+            .as_deref()
+            .unwrap_or_default();
+        let remote_to_add = input.remote_resources_to_add.as_deref().unwrap_or_default();
+        let remote_to_remove = input
+            .remote_resources_to_remove
+            .as_deref()
+            .unwrap_or_default();
+
+        let local = merged_resources(&self.local_resources, local_to_remove, local_to_add);
+        if local.len() > MAX_MONITOR_RESOURCES {
+            return Err(("localResourcesToAdd", too_many_resources(local.len())));
+        }
+        let remote = merged_resources(&self.remote_resources, remote_to_remove, remote_to_add);
+        if remote.len() > MAX_MONITOR_RESOURCES {
+            return Err(("remoteResourcesToAdd", too_many_resources(remote.len())));
+        }
+
+        // "The last date and time that the monitor was modified": the record
+        // changed only if a list really ended up different, so a request whose
+        // removals and additions cancel out is a no-op.
+        let changed = !same_resources(&local, &self.local_resources)
+            || !same_resources(&remote, &self.remote_resources);
+        self.local_resources = local;
+        self.remote_resources = remote;
+        Ok(changed)
+    }
+
     /// The monitor counterpart of [`Scope::matches_create`], including the scope:
-    /// a token reused under a different scope is a mismatch, not a replay.
+    /// a token reused under a different scope is a mismatch, not a replay. The
+    /// request's lists are compared in the form a create STORES them (deduped), so
+    /// a replay of a request carrying a duplicate entry still matches its monitor.
     pub fn matches_create(&self, input: &CreateMonitorInput) -> bool {
         self.monitor_name == input.monitor_name
             && self.scope_arn == input.scope_arn
-            && same_resources(&self.local_resources, &input.local_resources)
+            && same_resources(
+                &self.local_resources,
+                &deduped_resources(&input.local_resources),
+            )
             && same_resources(
                 &self.remote_resources,
-                input.remote_resources.as_deref().unwrap_or_default(),
+                &deduped_resources(input.remote_resources.as_deref().unwrap_or_default()),
             )
             && self.tags == tags_of(input.tags.as_ref())
     }
@@ -291,8 +433,10 @@ fn same_targets(stored: &[TargetResource], requested: &[TargetResource]) -> bool
 ///
 /// `MonitorLocalResource` and `MonitorRemoteResource` are generated wire shapes
 /// that derive no `PartialEq` and share no trait, so this is how ONE comparison
-/// serves both lists (and any further resource list the service grows).
-trait MonitorResource {
+/// serves both lists (and any further resource list the service grows). It is
+/// `pub` only because the handlers' entry points ([`deduped_resources`]) are
+/// generic over it; nothing outside this module implements it.
+pub trait MonitorResource {
     /// The entry's `type` member.
     fn resource_type(&self) -> &str;
     /// The entry's `identifier` member.
@@ -319,14 +463,174 @@ impl MonitorResource for MonitorRemoteResource {
     }
 }
 
+/// The list `stored` becomes when a request's removals and additions are applied:
+/// every entry `to_remove` does not name, in its stored order, followed by every
+/// entry of `to_add` the result does not already hold. Entries are compared by
+/// identity ([`MonitorResource`]) through a `BTreeSet` of identities, so one call
+/// costs O((n + m) log n) rather than a scan per entry.
+///
+/// One function serves the local and the remote list — and any further monitor
+/// resource list the service grows — for the same reason [`same_resources`] does.
+/// It never grows the result past what it was asked to merge, so the caller bounds
+/// the stored list by checking the length it answers with.
+fn merged_resources<T: MonitorResource + Clone>(
+    stored: &[T],
+    to_remove: &[T],
+    to_add: &[T],
+) -> Vec<T> {
+    let removed: BTreeSet<(String, String)> = to_remove.iter().map(identity).collect();
+    let mut merged: Vec<T> = stored
+        .iter()
+        .filter(|entry| !removed.contains(&identity(*entry)))
+        .cloned()
+        .collect();
+    let mut present: BTreeSet<(String, String)> = merged.iter().map(identity).collect();
+    for addition in to_add {
+        if present.insert(identity(addition)) {
+            merged.push(addition.clone());
+        }
+    }
+    merged
+}
+
+/// The reason text of the modelled 400 for a resource list this service will not
+/// hold, built from the request so a caller can fix the request from it alone.
+/// `CreateMonitor` refuses its own two lists with it, `UpdateMonitor` its four.
+pub fn too_many_resources(named: usize) -> String {
+    format!(
+        "{named} resources, more than the {MAX_MONITOR_RESOURCES} one monitor list \
+         holds in this emulator"
+    )
+}
+
+/// Which member of an `UpdateMonitor` request this service will not accept on the
+/// request's own terms, and why — or `None` when every one of its four resource
+/// lists is within [`MAX_MONITOR_RESOURCES`].
+///
+/// This is the FIRST thing the handler checks, before it reads the monitor,
+/// fingerprints the request or merges anything: no list a monitor may hold can
+/// name more entries than a monitor holds, whether it adds them or removes them,
+/// so every later step — the work the merge does, and the digest the remembered
+/// `clientToken` keeps — is derived from a request this ceiling already bounds.
+pub fn request_overflow(input: &UpdateMonitorInput) -> Option<(&'static str, String)> {
+    [
+        (
+            "localResourcesToAdd",
+            input.local_resources_to_add.as_deref().unwrap_or_default().len(),
+        ),
+        (
+            "localResourcesToRemove",
+            input
+                .local_resources_to_remove
+                .as_deref()
+                .unwrap_or_default()
+                .len(),
+        ),
+        (
+            "remoteResourcesToAdd",
+            input
+                .remote_resources_to_add
+                .as_deref()
+                .unwrap_or_default()
+                .len(),
+        ),
+        (
+            "remoteResourcesToRemove",
+            input
+                .remote_resources_to_remove
+                .as_deref()
+                .unwrap_or_default()
+                .len(),
+        ),
+    ]
+    .into_iter()
+    .find(|(_, named)| *named > MAX_MONITOR_RESOURCES)
+    .map(|(member, named)| (member, too_many_resources(named)))
+}
+
+/// The list a create stores for the list a request carried: the same entries in
+/// the same order, with any entry naming a resource an earlier one already names
+/// dropped. A monitor's resource lists are sets keyed by `type` + `identifier`
+/// everywhere else, so they are sets from the moment the record is minted.
+pub fn deduped_resources<T: MonitorResource + Clone>(list: &[T]) -> Vec<T> {
+    merged_resources(&[], &[], list)
+}
+
+/// What an `UpdateMonitor` request asks for, as ONE fixed-size value a later
+/// replay can be compared against: the SHA-256 digest, hex encoded, of the
+/// identities of its four resource lists in request order.
+///
+/// A digest rather than the serialized lists themselves, because this value is
+/// retained in the store next to the `clientToken` that applied it
+/// ([`Monitor::update_tokens`]): the digest is 64 characters whatever the request
+/// carried, so what one remembered token costs the store does not depend on the
+/// size of the request that minted it. Each piece going into the digest is
+/// length-prefixed, so no identifier's own punctuation can make two different
+/// requests fingerprint alike.
+pub fn update_fingerprint(input: &UpdateMonitorInput) -> String {
+    use ::sha2::Digest;
+
+    let mut hasher = ::sha2::Sha256::new();
+    hash_list(
+        &mut hasher,
+        input.local_resources_to_add.as_deref().unwrap_or_default(),
+    );
+    hash_list(
+        &mut hasher,
+        input
+            .local_resources_to_remove
+            .as_deref()
+            .unwrap_or_default(),
+    );
+    hash_list(
+        &mut hasher,
+        input.remote_resources_to_add.as_deref().unwrap_or_default(),
+    );
+    hash_list(
+        &mut hasher,
+        input
+            .remote_resources_to_remove
+            .as_deref()
+            .unwrap_or_default(),
+    );
+    ::hex::encode(hasher.finalize())
+}
+
+/// Feed one resource list's length-prefixed identities into `hasher`.
+fn hash_list<T: MonitorResource>(hasher: &mut ::sha2::Sha256, list: &[T]) {
+    use ::sha2::Digest;
+
+    hasher.update(list.len().to_le_bytes());
+    for entry in list {
+        let (resource_type, identifier) = identity_ref(entry);
+        hasher.update(resource_type.len().to_le_bytes());
+        hasher.update(resource_type.as_bytes());
+        hasher.update(identifier.len().to_le_bytes());
+        hasher.update(identifier.as_bytes());
+    }
+}
+
+/// A resource list entry's identity: the two members that say WHICH resource it
+/// is, owned so it can be compared against a list that is being rebuilt.
+fn identity<T: MonitorResource>(entry: &T) -> (String, String) {
+    let (resource_type, identifier) = identity_ref(entry);
+    (resource_type.to_string(), identifier.to_string())
+}
+
+/// The same identity, borrowed: what the comparison paths use, so comparing two
+/// lists allocates nothing.
+fn identity_ref<T: MonitorResource>(entry: &T) -> (&str, &str) {
+    (entry.resource_type(), entry.identifier())
+}
+
 /// Whether two resource lists name the same resources in the same order, for the
 /// same reason as [`same_targets`].
 fn same_resources<T: MonitorResource>(stored: &[T], requested: &[T]) -> bool {
     stored.len() == requested.len()
-        && stored.iter().zip(requested).all(|(left, right)| {
-            left.resource_type() == right.resource_type()
-                && left.identifier() == right.identifier()
-        })
+        && stored
+            .iter()
+            .zip(requested)
+            .all(|(left, right)| identity_ref(left) == identity_ref(right))
 }
 
 /// Per-service state for com-amazonaws-networkflowmonitor-networkflowmonitor. A handler reaches it through [`service_state`].

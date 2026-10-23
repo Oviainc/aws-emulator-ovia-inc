@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateFleet
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateFleet`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateFleet::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates a compute fleet and persists it in [`crate::state`]: this is the ONLY file
+//! to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -157,6 +150,13 @@ impl From<CreateFleetErrorModeled> for CreateFleetError {
     }
 }
 
+/// This operation's name, as the audit record and the scaffold channel report it.
+///
+/// `Operation::NAME` below is the same string; this const is what the inherent
+/// [`CreateFleet::refuse`] helper uses, because the trait const is not reachable from
+/// an inherent impl that does not carry the trait's bounds.
+const OPERATION_NAME: &str = "CreateFleet";
+
 /// The `CreateFleet` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -183,7 +183,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     type Output = CreateFleetOutput;
     type Error = CreateFleetError;
 
-    const NAME: &'static str = "CreateFleet";
+    const NAME: &'static str = OPERATION_NAME;
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::CREATE_FLEET_INPUT_SCHEMA;
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::CREATE_FLEET_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
@@ -193,18 +193,224 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateFleet` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateFleetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateFleet"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable through the router, which always builds the shared
+            // `InMemoryEngine`: this service models no server fault, and 501 is the
+            // only honest answer for "this emulator cannot serve the call at all".
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "CreateFleet (this engine carries no CodeBuild state)",
+            ));
+        };
+
+        // Every `FleetCapacity` member this request carries counts machines, so a
+        // count below one describes a fleet that cannot run a build. The model puts
+        // no `@range` on `FleetCapacity`, so the boundary validator passed it
+        // through and the service refuses it here with its modelled input error.
+        for (member, capacity) in capacity_members(&input) {
+            if capacity < crate::state::MIN_FLEET_CAPACITY {
+                return Err(self.refuse(
+                    ctx,
+                    &input.name,
+                    format!(
+                        "Invalid input: {member} must be at least {}, got {capacity}",
+                        crate::state::MIN_FLEET_CAPACITY
+                    ),
+                ));
+            }
+        }
+
+        // `maxCapacity` is the ceiling auto-scaling may grow the fleet to, so it
+        // cannot sit below the capacity the fleet is provisioned at: that range is
+        // empty, and the fleet's own `desiredCapacity` (which starts at
+        // `baseCapacity`) would be outside it. INFERRED from what the two members
+        // mean, not quoted: unlike the `computeConfiguration` rule below, AWS does
+        // not state this one in the model docs this file's header carries.
+        if let Some(max) = input
+            .scaling_configuration
+            .as_ref()
+            .and_then(|scaling| scaling.max_capacity)
+        {
+            if max < input.base_capacity {
+                return Err(self.refuse(
+                    ctx,
+                    &input.name,
+                    format!(
+                        "Invalid input: scalingConfiguration.maxCapacity must be at least \
+                         baseCapacity ({}), got {max}",
+                        input.base_capacity
+                    ),
+                ));
+            }
+        }
+
+        // AWS documents `computeConfiguration` as required exactly for the compute
+        // types whose machine is described by attributes rather than named by the
+        // compute type itself.
+        if crate::state::COMPUTE_TYPES_NEEDING_CONFIGURATION.contains(&input.compute_type.as_str())
+            && input.compute_configuration.is_none()
+        {
+            return Err(self.refuse(
+                ctx,
+                &input.name,
+                format!(
+                    "Invalid input: computeConfiguration is required when computeType is {}",
+                    input.compute_type
+                ),
+            ));
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = crate::state::now_millis();
+        let created = crate::state::datetime(now);
+        let mut guard = state.lock();
+
+        // Fleet names are unique per account: a second create under a held name is
+        // refused rather than replacing the fleet builds may be running on.
+        if let Some(held) = guard.fleets.get(&input.name) {
+            let held_arn = held.fleet.arn.clone().unwrap_or_else(|| input.name.clone());
+            drop(guard);
+            crate::state::audit(
+                Self::NAME,
+                ctx.parts(),
+                crate::state::AuditOutcome::AlreadyExists,
+                Some(&held_arn),
+            );
+            return Err(CreateFleetErrorModeled::ResourceAlreadyExistsException(
+                ResourceAlreadyExistsException {
+                    message: Some(format!("Fleet already exists: {held_arn}")),
+                },
+            )
+            .into());
+        }
+
+        // The account's compute-fleet quota, which is also the ceiling that keeps
+        // the store from growing without bound as requests arrive.
+        if guard.fleets.len() >= crate::state::MAX_FLEETS {
+            drop(guard);
+            crate::state::audit(
+                Self::NAME,
+                ctx.parts(),
+                crate::state::AuditOutcome::QuotaExceeded,
+                Some(&input.name),
+            );
+            return Err(CreateFleetErrorModeled::AccountLimitExceededException(
+                AccountLimitExceededException {
+                    message: Some(format!(
+                        "Cannot have more than {} compute fleets in this account",
+                        crate::state::MAX_FLEETS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // `<name>:<uuid>`, the same shape a build id has, and what the fleet ARN
+        // carries after `fleet/`.
+        let id = format!(
+            "{}:{}",
+            input.name,
+            crate::state::fleet_uuid(&input.name, now)
+        );
+        let fleet = Fleet {
+            arn: Some(crate::state::fleet_arn(&region, &id)),
+            name: Some(input.name.clone()),
+            id: Some(id),
+            created: Some(created),
+            last_modified: Some(created),
+            // A fleet's capacity is provisioned, so a freshly created one is
+            // `CREATING` until the clock makes its move to `ACTIVE` due; a reader
+            // materialises that transition (`StoredFleet::settle`).
+            status: Some(FleetStatus {
+                status_code: Some(crate::state::FLEET_STATUS_CREATING.to_string()),
+                context: None,
+                message: None,
+            }),
+            base_capacity: Some(input.base_capacity),
+            environment_type: Some(input.environment_type),
+            compute_type: Some(input.compute_type),
+            compute_configuration: input.compute_configuration,
+            // `scalingConfiguration` comes in as `ScalingConfigurationInput` and is
+            // reported as `ScalingConfigurationOutput`, which adds the current
+            // `desiredCapacity`: at creation the fleet wants exactly the machines
+            // `baseCapacity` asked for. An absent configuration stays absent —
+            // nothing is scaling.
+            scaling_configuration: input.scaling_configuration.map(|scaling| {
+                ScalingConfigurationOutput {
+                    scaling_type: scaling.scaling_type,
+                    target_tracking_scaling_configs: scaling.target_tracking_scaling_configs,
+                    max_capacity: scaling.max_capacity,
+                    desired_capacity: Some(input.base_capacity),
+                }
+            }),
+            overflow_behavior: input.overflow_behavior,
+            vpc_config: input.vpc_config,
+            proxy_configuration: input.proxy_configuration,
+            image_id: input.image_id,
+            fleet_service_role: input.fleet_service_role,
+            tags: input.tags,
+        };
+
+        guard.fleets.insert(
+            input.name,
+            crate::state::StoredFleet {
+                fleet: fleet.clone(),
+                created_millis: now,
+                last_modified_millis: now,
+                active_due_millis: now + crate::state::FLEET_SETTLE_MILLIS,
+            },
+        );
+        // The lock is dropped before the audit record is written, so a log consumer
+        // can never hold this service's state.
+        drop(guard);
+
+        crate::state::audit(
+            Self::NAME,
+            ctx.parts(),
+            crate::state::AuditOutcome::FleetCreated,
+            fleet.arn.as_deref(),
+        );
+
+        Ok(CreateFleetOutput { fleet: Some(fleet) })
     }
+}
+
+impl<Eng> CreateFleet<Eng> {
+    /// Refuse the request with the modelled `InvalidInputException` (HTTP 400)
+    /// carrying `message`, recording the refusal in the audit log the way every
+    /// other outcome of this operation is recorded.
+    fn refuse(
+        &self,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
+        name: &str,
+        message: String,
+    ) -> CreateFleetError {
+        crate::state::audit(
+            OPERATION_NAME,
+            ctx.parts(),
+            crate::state::AuditOutcome::ValidationRefused,
+            Some(name),
+        );
+        CreateFleetErrorModeled::InvalidInputException(InvalidInputException {
+            message: Some(message),
+        })
+        .into()
+    }
+}
+
+/// Every `FleetCapacity` member this request carries, with the input path a
+/// refusal names it by.
+///
+/// `baseCapacity` is required; `scalingConfiguration.maxCapacity` is present only
+/// when the request configures auto-scaling. Both target the model's
+/// `FleetCapacity`, so both answer to the same lower bound.
+fn capacity_members(input: &CreateFleetInput) -> Vec<(&'static str, i32)> {
+    let mut members = vec![("baseCapacity", input.base_capacity)];
+    if let Some(max) = input
+        .scaling_configuration
+        .as_ref()
+        .and_then(|scaling| scaling.max_capacity)
+    {
+        members.push(("scalingConfiguration.maxCapacity", max));
+    }
+    members
 }

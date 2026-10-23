@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateMonitor
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateMonitor`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateMonitor::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Edits the resource lists of a monitor this service's store ([`crate::state`])
+//! already holds — "Update a monitor to add or remove local or remote resources" —
+//! and answers with the stored record, so the next `GetMonitor` reports exactly
+//! what this call answered. Each list is edited as a SET keyed by an entry's
+//! `type` + `identifier`: the request's removals land first and then its
+//! additions, and `modifiedAt` moves only when the record actually changed.
+//! `@idempotent` with an `@idempotencyToken`: a `clientToken` this monitor has
+//! already applied answers with the record unchanged.
 //!
 //! ## Shape of an operation
 //!
@@ -183,18 +183,103 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateMonitor` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateMonitorErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateMonitor"))
+        // This operation addresses an existing monitor by name (`PATCH
+        // /monitors/{monitorName}`) and mints nothing, so it needs no Region from
+        // the request: every ARN it reports was minted by the create.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateMonitorErrorModeled::InternalServerException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+
+        // Before this request reaches the store at all: no resource list a monitor
+        // may hold can name more entries than a monitor holds, whether it adds them
+        // or removes them. Refusing that first is what keeps every later step — the
+        // merge's work and the fixed-size digest a remembered `clientToken` keeps —
+        // derived from a bounded request.
+        if let Some((member, reason)) = crate::state::request_overflow(&input) {
+            return Err(UpdateMonitorErrorModeled::ValidationException(
+                crate::state::field_validation(member, reason),
+            )
+            .into());
+        }
+
+        let mut state = state.lock();
+        state.settle(now);
+
+        // "The request specifies a resource that doesn't exist": an update never
+        // creates a monitor, so a name the store does not hold is the modelled 404.
+        let Some(monitor) = state.monitors.get_mut(&input.monitor_name) else {
+            return Err(UpdateMonitorErrorModeled::ResourceNotFoundException(
+                crate::state::not_found(crate::state::MONITOR_RESOURCE, &input.monitor_name),
+            )
+            .into());
+        };
+
+        // The `@idempotent` replay, before anything else this request would change:
+        // a `clientToken` whose update this monitor already applied answers with
+        // the record as it stands, so a retry does not move `modifiedAt` again, and
+        // a token reused for a DIFFERENT change is refused rather than answered
+        // with a success for a write nothing applied ("Don't reuse the same client
+        // token for other API requests"). `UpdateMonitor` models no
+        // `ConflictException`, so the refusal is the modelled 400 naming the member.
+        let fingerprint = crate::state::update_fingerprint(&input);
+        match monitor.update_replay(input.client_token.as_deref(), &fingerprint) {
+            crate::state::UpdateReplay::Replay => return Ok(output(monitor)),
+            crate::state::UpdateReplay::Mismatch => {
+                return Err(UpdateMonitorErrorModeled::ValidationException(
+                    crate::state::field_validation(
+                        "clientToken",
+                        "this token already applied a different update to this monitor",
+                    ),
+                )
+                .into())
+            }
+            crate::state::UpdateReplay::New => {}
+        }
+
+        // "The last date and time that the monitor was modified" — so the timestamp
+        // moves for a request that changed the record, and a request whose
+        // additions and removals leave the lists as they were is a no-op. A result
+        // this monitor cannot hold is refused before anything is applied, so the
+        // record (and `modifiedAt`) is exactly as it was.
+        let changed = match monitor.apply_update(&input) {
+            Ok(changed) => changed,
+            Err((member, reason)) => {
+                return Err(UpdateMonitorErrorModeled::ValidationException(
+                    crate::state::field_validation(member, reason),
+                )
+                .into())
+            }
+        };
+        if changed {
+            monitor.modified_at = now;
+        }
+        if let Some(token) = input.client_token {
+            monitor.remember_update(token, fingerprint);
+        }
+
+        // The answer is read off the stored record, so it is the state rather than
+        // the request that came in.
+        Ok(output(monitor))
+    }
+}
+
+/// This operation's output for a stored monitor — every member read off the
+/// record, so an update answers exactly what the following `GetMonitor` answers.
+fn output(monitor: &crate::state::Monitor) -> UpdateMonitorOutput {
+    UpdateMonitorOutput {
+        monitor_arn: monitor.monitor_arn.clone(),
+        monitor_name: monitor.monitor_name.clone(),
+        monitor_status: monitor.monitor_status.as_wire().to_string(),
+        local_resources: monitor.local_resources.clone(),
+        remote_resources: monitor.remote_resources.clone(),
+        created_at: ::aws_smithy_types::DateTime::from(monitor.created_at),
+        modified_at: ::aws_smithy_types::DateTime::from(monitor.modified_at),
+        tags: crate::state::tags_for_output(&monitor.tags),
     }
 }

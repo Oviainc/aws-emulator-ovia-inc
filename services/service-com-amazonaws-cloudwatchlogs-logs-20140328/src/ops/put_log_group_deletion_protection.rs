@@ -192,7 +192,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 PutLogGroupDeletionProtectionErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some("The specified log group does not exist".to_string()),
+                        message: Some("The specified log group does not exist.".to_string()),
                     },
                 )
                 .into(),

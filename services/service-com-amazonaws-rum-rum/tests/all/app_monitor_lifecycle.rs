@@ -15,29 +15,17 @@
 //! changes one member per row and asserts every other member held still.
 
 use std::collections::{BTreeSet, HashSet};
-use std::sync::Arc;
 
-use bytes::Bytes;
 use serde_json::{json, Value};
 use service_com_amazonaws_rum_rum::ComAmazonawsRumRumState;
 use smithy_server_runtime::multi_service_router::MultiServiceRouter;
 
-/// A SigV4 `Authorization` header whose credential scope names this service's signing
-/// name (`rum`, per `OPERATIONS.md`'s `## Wire protocol`), which is what the router's
-/// `can_handle` routes on, and the region the ARN is derived from. Request
-/// authentication is switched off below, so only the scope's shape matters.
-fn authorization(region: &str) -> String {
-    format!(
-        "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20240101/{region}/rum/aws4_request, \
-         SignedHeaders=host, Signature=0000"
-    )
-}
-
-/// The region every case signs for unless it is testing the region itself.
-const REGION: &str = "us-east-1";
-
-/// The account id every emulated ARN carries (`engine::EMULATOR_ACCOUNT_ID`).
-const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
+// The ONE wire harness, shared with this crate's other suites: the signed-request
+// helpers, the raw `Reply`, and the two calls every suite sets a resource up with.
+use crate::support::{
+    call, call_in, create, emulator, get_app_monitor, is_modelled_app_monitor_id, tag_map,
+    ACCOUNT, REGION,
+};
 
 /// Every value `AppMonitorPlatform` admits.
 /// Source: `smithy_query(query="shape", shape="AppMonitorPlatform")`.
@@ -58,108 +46,6 @@ const TELEMETRIES: [&str; 3] = ["errors", "http", "performance"];
 /// The prefix a RUM app monitor's CloudWatch Logs group name carries.
 const CW_LOG_GROUP_PREFIX: &str = "/aws/vendedlogs/RUMService_";
 
-/// One emulator: a shared engine, the RUM service, and the router that dispatches to
-/// it. Authentication is off so a test needs no signing key. The engine is handed back
-/// as well, so a case can read the persisted record for the members no implemented
-/// operation reports yet (the ARN, and the event buffer `PutRumEvents` appends to).
-fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
-    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-    let mut router = MultiServiceRouter::new();
-    router.set_request_authentication(false);
-    router.register_service(service_com_amazonaws_rum_rum::EmulatedService::new(
-        Arc::clone(&engine),
-    ));
-    (router, engine)
-}
-
-/// One HTTP answer, kept as raw bytes so a case can assert on an EMPTY body as well as
-/// on JSON.
-struct Reply {
-    status: u16,
-    body: Bytes,
-}
-
-impl Reply {
-    fn json(&self, case: &str) -> Value {
-        serde_json::from_slice(&self.body).unwrap_or_else(|e| {
-            panic!(
-                "case {case:?}: expected a JSON body, got {:?} ({e})",
-                String::from_utf8_lossy(&self.body)
-            )
-        })
-    }
-
-    /// The wire error code: restJson1 carries it as the body's `__type`.
-    fn error_code(&self, case: &str) -> String {
-        self.json(case)["__type"]
-            .as_str()
-            .unwrap_or_else(|| panic!("case {case:?}: error body has no __type: {:?}", self.body))
-            .rsplit('#')
-            .next()
-            .unwrap_or_default()
-            .to_string()
-    }
-}
-
-async fn call_in(
-    router: &MultiServiceRouter,
-    region: &str,
-    method: &str,
-    path_and_query: &str,
-    body: Option<Value>,
-) -> Reply {
-    let body_bytes = match body {
-        Some(value) => Bytes::from(serde_json::to_vec(&value).expect("serializable request body")),
-        None => Bytes::new(),
-    };
-    let request = http::Request::builder()
-        .method(method)
-        .uri(format!("https://rum.{region}.amazonaws.com{path_and_query}"))
-        .header("authorization", authorization(region))
-        .header("content-type", "application/json")
-        .body(body_bytes)
-        .expect("a well-formed request");
-    let response = router.dispatch(request).await;
-    let status = response.status().as_u16();
-    Reply {
-        status,
-        body: response.into_body(),
-    }
-}
-
-async fn call(
-    router: &MultiServiceRouter,
-    method: &str,
-    path_and_query: &str,
-    body: Option<Value>,
-) -> Reply {
-    call_in(router, REGION, method, path_and_query, body).await
-}
-
-/// `AppMonitorId`'s modelled pattern: 36 characters,
-/// `^[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}$`.
-/// Source: `smithy_query(query="shape", shape="AppMonitor")`, member `Id`.
-///
-/// Also checks the two nibbles a version-4, RFC 4122 UUID fixes — the version digit and
-/// the variant digit — since that is the form the service mints.
-fn is_modelled_app_monitor_id(id: &str) -> bool {
-    let shaped = id.len() == 36
-        && id.split('-').map(str::len).eq([8, 4, 4, 4, 12])
-        && id.chars().all(|c| c == '-' || c.is_ascii_hexdigit());
-    let version = id.chars().nth(14) == Some('4');
-    let variant = matches!(id.chars().nth(19), Some('8' | '9' | 'a' | 'b'));
-    shaped && version && variant
-}
-
-/// The monitor's `Tags`, with an omitted member read as the empty map it stands for:
-/// restJson1 draws no distinction between an absent map member and an empty one.
-fn tag_map(monitor: &Value) -> Value {
-    match &monitor["Tags"] {
-        Value::Null => json!({}),
-        tags => tags.clone(),
-    }
-}
-
 /// `ISOTimestampString` is `@length(min: 19, max: 19)`: `YYYY-MM-DDTHH:MM:SS`.
 /// Source: `smithy_query(query="shape", shape="ISOTimestampString")`.
 fn is_modelled_iso_timestamp(text: &str) -> bool {
@@ -170,40 +56,6 @@ fn is_modelled_iso_timestamp(text: &str) -> bool {
             13 | 16 => c == ':',
             _ => c.is_ascii_digit(),
         })
-}
-
-/// Create one app monitor, returning the `Id` the call minted.
-async fn create(router: &MultiServiceRouter, case: &str, body: Value) -> String {
-    let reply = call(router, "POST", "/appmonitor", Some(body)).await;
-    assert_eq!(
-        reply.status,
-        200,
-        "case {case:?}: expected CreateAppMonitor to answer 200, got {} {:?}",
-        reply.status,
-        String::from_utf8_lossy(&reply.body)
-    );
-    let id = reply.json(case)["Id"]
-        .as_str()
-        .unwrap_or_else(|| panic!("case {case:?}: CreateAppMonitor returned no Id"))
-        .to_string();
-    assert!(
-        is_modelled_app_monitor_id(&id),
-        "case {case:?}: expected Id to match AppMonitorId's 36-character UUID pattern, got {id:?}"
-    );
-    id
-}
-
-/// The `AppMonitor` structure `GetAppMonitor` reports for `name`.
-async fn get_app_monitor(router: &MultiServiceRouter, case: &str, name: &str) -> Value {
-    let reply = call(router, "GET", &format!("/appmonitor/{name}"), None).await;
-    assert_eq!(
-        reply.status,
-        200,
-        "case {case:?}: expected GetAppMonitor to answer 200, got {} {:?}",
-        reply.status,
-        String::from_utf8_lossy(&reply.body)
-    );
-    reply.json(case)["AppMonitor"].clone()
 }
 
 /// A create request body spanning every member `CreateAppMonitor` accepts, so the

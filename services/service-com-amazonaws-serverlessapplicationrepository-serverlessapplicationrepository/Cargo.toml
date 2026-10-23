@@ -25,7 +25,8 @@ tracing = { workspace = true }
 # the key it names contains, and renders the bytes of a minted `StatementId`.
 hex = { workspace = true }
 # Digests the entropy behind the uuid-shaped `StatementId` PutApplicationPolicy mints
-# for a statement the request did not name one for (`state::new_statement_id`).
+# for a statement the request did not name one for, and the uuid `TemplateId`
+# CreateCloudFormationTemplate mints (`state::new_uuid`).
 sha2 = { workspace = true }
 
 [build-dependencies]

@@ -32,7 +32,7 @@ pub(crate) const ACCOUNT: &str = emulator_server::EMULATOR_ACCOUNT_ID;
 
 /// A minimal valid `FirewallPolicy`: the two members the model marks required
 /// (`StatelessDefaultActions`, `StatelessFragmentDefaultActions`).
-fn minimal_policy() -> Value {
+pub(crate) fn minimal_policy() -> Value {
     json!({
         "StatelessDefaultActions": ["aws:forward_to_sfe"],
         "StatelessFragmentDefaultActions": ["aws:forward_to_sfe"],
@@ -1134,6 +1134,36 @@ async fn a_policy_document_past_the_retained_size_bound_is_refused() {
     for (member, build) in builders {
         for (count, accepted) in [(bound, true), (bound + 1, false)] {
             let harness = Harness::new();
+            // A rule-group reference must resolve to a stored rule group, so the
+            // rule groups the reference rows name are created first: this test is
+            // about the size bound, not about resolution.
+            if member == "StatelessRuleGroupReferences" {
+                for index in 0..count {
+                    harness
+                        .ok(
+                            "CreateRuleGroup",
+                            &json!({
+                                "RuleGroupName": format!("rg{index}"),
+                                "Type": "STATELESS",
+                                "Capacity": 1,
+                                "RuleGroup": {
+                                    "RulesSource": {
+                                        "StatelessRulesAndCustomActions": {
+                                            "StatelessRules": [{
+                                                "Priority": 1,
+                                                "RuleDefinition": {
+                                                    "Actions": ["aws:pass"],
+                                                    "MatchAttributes": {},
+                                                },
+                                            }],
+                                        },
+                                    },
+                                },
+                            }),
+                        )
+                        .await;
+                }
+            }
             let mut document = minimal_policy();
             document[member] = build(count);
             let (status, body) = harness

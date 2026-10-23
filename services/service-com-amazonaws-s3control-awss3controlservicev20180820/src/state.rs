@@ -4,15 +4,21 @@
 //!
 //! Besides the state struct itself this module holds the derivations every
 //! handler shares — the access point ARN, alias, network origin and
-//! `ListAccessPoints` page token, the Storage Lens configuration ARN, and the
-//! refusals both resource lifecycles answer — so the handlers under `src/ops/`
+//! `ListAccessPoints` page token, the Multi-Region Access Point alias and the
+//! asynchronous request token ARN, the Storage Lens configuration ARN, and the
+//! refusals the resource lifecycles answer — so the handlers under `src/ops/`
 //! compute each one way instead of once per handler.
 
 use crate::ops::types::{
-    AccessPoint, PublicAccessBlockConfiguration, StorageLensConfiguration, StorageLensTag, Tag,
-    VpcConfiguration, NETWORK_ORIGIN_VALUES,
+    AccessPoint, AsyncOperation, AsyncRequestParameters, AsyncResponseDetails,
+    CreateMultiRegionAccessPointInput2, DeleteMultiRegionAccessPointInput2,
+    MultiRegionAccessPointRegionalResponse, MultiRegionAccessPointReport,
+    MultiRegionAccessPointsAsyncResponse, PublicAccessBlockConfiguration, RegionReport,
+    StorageLensConfiguration, StorageLensTag, Tag, VpcConfiguration, ASYNC_OPERATION_NAME_VALUES,
+    MULTI_REGION_ACCESS_POINT_STATUS_VALUES, NETWORK_ORIGIN_VALUES,
 };
 use std::collections::BTreeMap;
+use std::time::{Duration, SystemTime};
 
 /// One stored access point: everything `GetAccessPoint`, `ListAccessPoints` and
 /// `GetAccessPointPolicy` report, recorded by `CreateAccessPoint`.
@@ -144,6 +150,225 @@ pub const STORAGE_LENS_CONFIGURATION_QUOTA: usize = 1_000;
 /// maximum of 50 tags."
 pub const MAX_STORAGE_LENS_TAGS: usize = 50;
 
+// ---------------------------------------------------------------------------
+// Multi-Region Access Points, and the asynchronous requests that manage them.
+// ---------------------------------------------------------------------------
+
+/// How long a Multi-Region Access Point stays in the transient status an
+/// asynchronous request put it in before the clock owes it the settled outcome:
+/// `CREATING` becomes `READY`, and `DELETING` releases the record.
+///
+/// `CreateMultiRegionAccessPoint` and `DeleteMultiRegionAccessPoint` are
+/// documented as asynchronous ("you might receive a response before the command
+/// has completed"), and neither the model nor the documentation publishes how
+/// long the propagation takes — on the real service it is minutes. This span is
+/// therefore the emulator's OWN: long enough that a caller which reads straight
+/// after the call still observes the transient status, short enough that a
+/// request settles within one test, and owed by the clock alone, so it completes
+/// whether or not anybody calls again.
+pub const MULTI_REGION_ACCESS_POINT_SETTLE_AFTER: Duration = Duration::from_millis(500);
+
+/// The `MultiRegionAccessPointStatus` a create request leaves behind until
+/// [`MULTI_REGION_ACCESS_POINT_SETTLE_AFTER`] has elapsed — "a temporary state
+/// that exists while the request is propagating and being completed", per the
+/// member's documentation.
+pub const STATUS_CREATING: &str = "CREATING";
+
+/// The `MultiRegionAccessPointStatus` a created Multi-Region Access Point
+/// reaches once the clock owes it.
+pub const STATUS_READY: &str = "READY";
+
+/// The `MultiRegionAccessPointStatus` a delete request leaves behind until
+/// [`MULTI_REGION_ACCESS_POINT_SETTLE_AFTER`] has elapsed, after which the
+/// record is released.
+pub const STATUS_DELETING: &str = "DELETING";
+
+/// The `AsyncRequestStatus` an asynchronous request carries until the clock owes
+/// its work.
+///
+/// `AsyncRequestStatus` is an unconstrained string in the model, so these two
+/// values are this service's vocabulary for the two states a Multi-Region Access
+/// Point request can be in rather than a modelled enumeration.
+pub const ASYNC_REQUEST_IN_PROGRESS: &str = "INPROGRESS";
+
+/// The `AsyncRequestStatus` an asynchronous request carries once its work is
+/// due. See [`ASYNC_REQUEST_IN_PROGRESS`].
+pub const ASYNC_REQUEST_SUCCEEDED: &str = "SUCCEEDED";
+
+/// `wanted` as the generated enum list `values` spells it.
+///
+/// The spelling that goes on the wire is the model's, found by VALUE rather than
+/// by position: neither a reordering of the generated list nor a typo in the
+/// constant above can change what is returned.
+fn modelled_value(values: &[&'static str], wanted: &'static str) -> String {
+    values
+        .iter()
+        .copied()
+        .find(|value| *value == wanted)
+        .unwrap_or(wanted)
+        .to_string()
+}
+
+/// One of [`STATUS_CREATING`], [`STATUS_READY`] or [`STATUS_DELETING`], spelled
+/// as the model's `MultiRegionAccessPointStatus` enum carries it.
+pub fn multi_region_access_point_status(wanted: &'static str) -> String {
+    modelled_value(MULTI_REGION_ACCESS_POINT_STATUS_VALUES, wanted)
+}
+
+/// An `AsyncOperationName`, spelled as the model's enum carries it.
+pub fn async_operation_name(wanted: &'static str) -> String {
+    modelled_value(ASYNC_OPERATION_NAME_VALUES, wanted)
+}
+
+/// One stored Multi-Region Access Point: everything `GetMultiRegionAccessPoint`
+/// reports, recorded by `CreateMultiRegionAccessPoint`.
+#[derive(Debug, Clone)]
+pub struct MultiRegionAccessPointRecord {
+    pub name: String,
+    /// The account that owns it — the first half of the key, kept on the record
+    /// so a record passed on its own still names its owner.
+    pub account_id: String,
+    pub alias: String,
+    pub created_at: ::aws_smithy_types::DateTime,
+    pub public_access_block: Option<PublicAccessBlockConfiguration>,
+    /// The Regions and buckets the create request associated, in the order it
+    /// listed them.
+    pub regions: Vec<RegionReport>,
+    /// One of [`MULTI_REGION_ACCESS_POINT_STATUS_VALUES`].
+    pub status: String,
+    /// When the clock owes `status` its settled outcome, for the transient
+    /// statuses an asynchronous request leaves behind; `None` once nothing is
+    /// owed.
+    pub status_due_at: Option<SystemTime>,
+}
+
+impl MultiRegionAccessPointRecord {
+    /// The record as the `MultiRegionAccessPointReport` shape
+    /// `GetMultiRegionAccessPoint` returns.
+    pub fn report(&self) -> MultiRegionAccessPointReport {
+        MultiRegionAccessPointReport {
+            name: Some(self.name.clone()),
+            alias: Some(self.alias.clone()),
+            created_at: Some(self.created_at),
+            public_access_block: self.public_access_block.clone(),
+            status: Some(self.status.clone()),
+            regions: Some(self.regions.clone()),
+        }
+    }
+
+    /// Whether the clock has already released this record: a delete request's
+    /// span has elapsed, so the Multi-Region Access Point is gone whether or not
+    /// anybody called.
+    fn removal_due(&self, now: SystemTime) -> bool {
+        self.status == STATUS_DELETING && self.status_due_at.is_some_and(|due| now >= due)
+    }
+
+    /// Move `status` on if the clock already owes it: a creating access point
+    /// reaches `READY`. A record whose removal is due is dropped by
+    /// [`ComAmazonawsS3controlAwss3controlservicev20180820State::settle_multi_region_access_points`]
+    /// rather than here.
+    fn settle(&mut self, now: SystemTime) {
+        if self.status == STATUS_CREATING && self.status_due_at.is_some_and(|due| now >= due) {
+            self.status = multi_region_access_point_status(STATUS_READY);
+            self.status_due_at = None;
+        }
+    }
+}
+
+/// One asynchronous Multi-Region Access Point request, as
+/// `DescribeMultiRegionAccessPointOperation` reports it.
+#[derive(Debug, Clone)]
+pub struct AsyncRequestRecord {
+    /// The token the create or delete call handed its caller — this record's
+    /// identity, and the second half of its key.
+    pub request_token_arn: String,
+    /// The account the request was made for.
+    pub account_id: String,
+    /// One of [`ASYNC_OPERATION_NAME_VALUES`].
+    pub operation: String,
+    pub creation_time: ::aws_smithy_types::DateTime,
+    /// The parameters the call submitted, which the model reports back verbatim.
+    pub request_parameters: AsyncRequestParameters,
+    /// The Regions the request touches, in request order; each is reported with
+    /// its own status.
+    pub regions: Vec<String>,
+    /// When the clock owes this request's work — the same instant the Multi-Region
+    /// Access Point's transient status settles at.
+    pub due_at: SystemTime,
+}
+
+impl AsyncRequestRecord {
+    /// The record as the `AsyncOperation` shape, with the status the clock owes
+    /// at `now`.
+    pub fn operation_report(&self, now: SystemTime) -> AsyncOperation {
+        let status = if now >= self.due_at {
+            ASYNC_REQUEST_SUCCEEDED
+        } else {
+            ASYNC_REQUEST_IN_PROGRESS
+        };
+        AsyncOperation {
+            creation_time: Some(self.creation_time),
+            operation: Some(self.operation.clone()),
+            request_token_arn: Some(self.request_token_arn.clone()),
+            request_parameters: Some(self.request_parameters.clone()),
+            request_status: Some(status.to_string()),
+            response_details: Some(AsyncResponseDetails {
+                multi_region_access_point_details: Some(MultiRegionAccessPointsAsyncResponse {
+                    regions: Some(
+                        self.regions
+                            .iter()
+                            .map(|region| MultiRegionAccessPointRegionalResponse {
+                                name: Some(region.clone()),
+                                request_status: Some(status.to_string()),
+                            })
+                            .collect(),
+                    ),
+                }),
+                // Only a request that failed carries error details, and a
+                // request this service accepted is one it completes: the
+                // refusals this lifecycle has are answered to the create or
+                // delete call itself, not recorded as an async failure.
+                error_details: None,
+            }),
+        }
+    }
+
+    /// The pair this record is ordered by when the store evicts its oldest
+    /// retained request: when it was made, to the nanosecond.
+    fn made_at(&self) -> (i64, u32) {
+        (self.creation_time.secs(), self.creation_time.subsec_nanos())
+    }
+}
+
+/// How a stored Multi-Region Access Point is keyed: the owning account id and
+/// the name, which is the pair a name is unique within.
+pub type MultiRegionAccessPointKey = (String, String);
+
+/// How a stored asynchronous request is keyed: the account it was made for and
+/// its request token ARN.
+pub type AsyncRequestKey = (String, String);
+
+/// How many Multi-Region Access Points the store holds before
+/// `CreateMultiRegionAccessPoint` refuses to add another.
+///
+/// S3 publishes an adjustable quota on Multi-Region Access Points per account,
+/// and this emulator models neither Service Quotas nor an account's
+/// adjustments — so this is the emulator's OWN bound on the store rather than a
+/// claim about any account's limit. It is set far above any workflow an emulator
+/// serves, and it is what stops this part of the state growing without end:
+/// every record it holds is released by `DeleteMultiRegionAccessPoint`.
+pub const MULTI_REGION_ACCESS_POINT_QUOTA: usize = 1_000;
+
+/// How many asynchronous request records the store retains.
+///
+/// Unlike a Multi-Region Access Point, an asynchronous request is never deleted
+/// by a caller, so retention is what bounds it: recording the
+/// [`ASYNC_REQUESTS_RETAINED`]-th + 1 request releases the oldest one, exactly
+/// as the real service forgets a request long after it completed. A caller that
+/// then describes a forgotten token is answered the same not-found refusal as
+/// one that invents a token.
+pub const ASYNC_REQUESTS_RETAINED: usize = 1_000;
+
 /// Per-service state for com-amazonaws-s3control-awss3controlservicev20180820. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsS3controlAwss3controlservicev20180820State {
@@ -188,6 +413,62 @@ pub struct ComAmazonawsS3controlAwss3controlservicev20180820State {
     /// the document itself is length-bounded by the model.
     pub storage_lens_configurations:
         BTreeMap<StorageLensConfigurationKey, StorageLensConfigurationRecord>,
+
+    /// Multi-Region Access Points by (account id, name).
+    ///
+    /// A `BTreeMap` for the same reason as `access_points`:
+    /// `ListMultiRegionAccessPoints` is `@paginated`, and a page token can only
+    /// resume a scan whose order does not change between calls.
+    ///
+    /// BOUNDED: `CreateMultiRegionAccessPoint` refuses past
+    /// [`MULTI_REGION_ACCESS_POINT_QUOTA`] records, and every member of a record
+    /// is length-bounded by the model. `DeleteMultiRegionAccessPoint` releases a
+    /// record once the clock owes its removal.
+    pub multi_region_access_points:
+        BTreeMap<MultiRegionAccessPointKey, MultiRegionAccessPointRecord>,
+
+    /// The asynchronous Multi-Region Access Point requests
+    /// `DescribeMultiRegionAccessPointOperation` reports, by (account id,
+    /// request token ARN).
+    ///
+    /// BOUNDED by retention rather than by a caller's delete: see
+    /// [`ASYNC_REQUESTS_RETAINED`] and [`Self::record_async_request`].
+    pub async_requests: BTreeMap<AsyncRequestKey, AsyncRequestRecord>,
+}
+
+impl ComAmazonawsS3controlAwss3controlservicev20180820State {
+    /// Materialise every Multi-Region Access Point transition the clock already
+    /// owes at `now`: a creating access point reaches `READY`, and a deleting
+    /// one is released.
+    ///
+    /// Each of these was owed at `now` whether or not anybody called, so a
+    /// reporting operation runs it before reading: that is what makes a status a
+    /// caller observes the status the clock says it is, rather than the one the
+    /// last writer left behind.
+    pub fn settle_multi_region_access_points(&mut self, now: SystemTime) {
+        self.multi_region_access_points
+            .retain(|_, record| !record.removal_due(now));
+        for record in self.multi_region_access_points.values_mut() {
+            record.settle(now);
+        }
+    }
+
+    /// Retain `record`, releasing the oldest retained request first when the
+    /// store is already holding [`ASYNC_REQUESTS_RETAINED`] of them, so the
+    /// number of async request records a caller can accumulate is bounded.
+    pub fn record_async_request(&mut self, record: AsyncRequestRecord) {
+        while self.async_requests.len() >= ASYNC_REQUESTS_RETAINED {
+            let oldest = self
+                .async_requests
+                .iter()
+                .min_by_key(|(key, retained)| (retained.made_at(), (*key).clone()))
+                .map(|(key, _)| key.clone());
+            let Some(oldest) = oldest else { break };
+            self.async_requests.remove(&oldest);
+        }
+        let key = (record.account_id.clone(), record.request_token_arn.clone());
+        self.async_requests.insert(key, record);
+    }
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
@@ -301,6 +582,121 @@ pub fn encode_page_token(last_name: &str) -> String {
 pub fn decode_page_token(token: &str) -> Option<String> {
     let bytes = hex::decode(token).ok()?;
     String::from_utf8(bytes).ok()
+}
+
+// ---------------------------------------------------------------------------
+// The derivations the Multi-Region Access Point lifecycle shares.
+// ---------------------------------------------------------------------------
+
+/// The tail every Multi-Region Access Point alias ends in, per the modelled
+/// `MultiRegionAccessPointAlias` pattern `^[a-z][a-z0-9]*[.]mrap$`.
+const MRAP_ALIAS_TAIL: &str = ".mrap";
+
+/// How many characters of a Multi-Region Access Point alias precede
+/// [`MRAP_ALIAS_TAIL`]. Well inside the modelled 63-character maximum, so an
+/// alias never has to be truncated.
+const MRAP_ALIAS_BODY_LEN: usize = 16;
+
+/// The characters an alias body is drawn from: the first from the letters alone,
+/// because the modelled pattern requires an alias to START with `[a-z]`, the
+/// rest from letters and digits.
+const MRAP_ALIAS_LETTERS: &[u8] = b"abcdefghijklmnopqrstuvwxyz";
+const MRAP_ALIAS_ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+
+/// The alias of a Multi-Region Access Point: a service-assigned string of the
+/// form the modelled `MultiRegionAccessPointAlias` pattern admits, ending in
+/// `.mrap`.
+///
+/// Unlike an access point's alias, a Multi-Region Access Point's carries no part
+/// of the name — the model documents the two as distinct, and the pattern admits
+/// no hyphen. It is derived from the access point's identity (its owning account
+/// and name) rather than drawn at random, so it is one value per access point:
+/// stable across every later read, and different for a different access point.
+pub fn multi_region_access_point_alias(account_id: &str, name: &str) -> String {
+    use sha2::Digest;
+
+    let digest = sha2::Sha256::digest(format!("mrap/{account_id}/{name}").as_bytes());
+    let mut alias = String::with_capacity(MRAP_ALIAS_BODY_LEN + MRAP_ALIAS_TAIL.len());
+    for (position, byte) in digest.iter().take(MRAP_ALIAS_BODY_LEN).enumerate() {
+        let alphabet = if position == 0 {
+            MRAP_ALIAS_LETTERS
+        } else {
+            MRAP_ALIAS_ALPHABET
+        };
+        alias.push(alphabet[usize::from(*byte) % alphabet.len()] as char);
+    }
+    alias.push_str(MRAP_ALIAS_TAIL);
+    alias
+}
+
+/// The `async-request/mrap/create` path segment, and the `create` half of a
+/// request token ARN.
+pub const ASYNC_VERB_CREATE: &str = "create";
+
+/// The `delete` half of a request token ARN. See [`ASYNC_VERB_CREATE`].
+pub const ASYNC_VERB_DELETE: &str = "delete";
+
+/// How many hex characters of the digest a request token ARN carries.
+const ASYNC_REQUEST_ID_LEN: usize = 32;
+
+/// The ARN of an asynchronous Multi-Region Access Point request: the
+/// `async-request/mrap/<verb>/<id>` resource in this service's ARN namespace
+/// (`s3`, per the model's `awsService.arnNamespace`), which satisfies the
+/// modelled `AsyncRequestTokenARN` pattern `^arn:.+$`.
+///
+/// The id is a digest of the request's own identity — the verb, the account, the
+/// caller's `ClientToken` and the details it submitted — so one request has ONE
+/// token: a byte-identical retry is handed the token the first call returned,
+/// which is what an `@idempotencyToken` asks for ("guarantee that requests are
+/// unique"), and two different requests never share a token. The account segment
+/// comes from [`::emulator_server::emulator_arn`], the single source of truth
+/// for the canonical emulator account.
+pub fn async_request_token_arn(
+    region: &str,
+    verb: &str,
+    account_id: &str,
+    client_token: &str,
+    details: &str,
+) -> String {
+    use sha2::Digest;
+
+    let digest =
+        sha2::Sha256::digest(format!("{verb}\n{account_id}\n{client_token}\n{details}").as_bytes());
+    let id: String = hex::encode(digest)
+        .chars()
+        .take(ASYNC_REQUEST_ID_LEN)
+        .collect();
+    ::emulator_server::emulator_arn("s3", region, &format!("async-request/mrap/{verb}/{id}"))
+}
+
+/// A `CreateMultiRegionAccessPoint` request's details as one string, for
+/// [`async_request_token_arn`]: every member the caller submitted, so two
+/// requests that differ in any of them differ in their token.
+pub fn create_details_fingerprint(details: &CreateMultiRegionAccessPointInput2) -> String {
+    let mut fingerprint = format!("name={}", details.name);
+    for region in &details.regions {
+        fingerprint.push_str(&format!(
+            "|bucket={}@{}",
+            region.bucket,
+            region.bucket_account_id.as_deref().unwrap_or_default()
+        ));
+    }
+    if let Some(block) = &details.public_access_block {
+        fingerprint.push_str(&format!(
+            "|block={},{},{},{}",
+            block.block_public_acls,
+            block.ignore_public_acls,
+            block.block_public_policy,
+            block.restrict_public_buckets
+        ));
+    }
+    fingerprint
+}
+
+/// A `DeleteMultiRegionAccessPoint` request's details as one string, for
+/// [`async_request_token_arn`].
+pub fn delete_details_fingerprint(details: &DeleteMultiRegionAccessPointInput2) -> String {
+    format!("name={}", details.name)
 }
 
 // ---------------------------------------------------------------------------
@@ -449,6 +845,70 @@ pub fn too_many_storage_lens_configurations<E>() -> crate::scaffolded::Scaffolde
             "This emulator holds the maximum of {STORAGE_LENS_CONFIGURATION_QUOTA} \
              Storage Lens configurations."
         ),
+    )
+}
+
+/// `NoSuchMultiRegionAccessPoint` (HTTP 404): no Multi-Region Access Point of
+/// that name is owned by the account the request names.
+///
+/// S3 Control declares no error for these operations, so — exactly as for the
+/// access point refusals above — the refusal is carried in the S3-style XML
+/// `<Code>`/`<Message>` envelope, with the `NoSuch<Resource>` code and the 404
+/// this service answers a missing named resource with.
+pub fn no_such_multi_region_access_point<E>(name: &str) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_failure(
+        "NoSuchMultiRegionAccessPoint",
+        404,
+        format!("The specified Multi-Region Access Point does not exist: {name}"),
+    )
+}
+
+/// `MultiRegionAccessPointAlreadyOwnedByYou` (HTTP 409): the account already
+/// owns a Multi-Region Access Point of that name — including one still being
+/// created or deleted — so creating it again would be a second resource under
+/// one name.
+///
+/// The code follows the one this service already answers for the same conflict
+/// one resource down (`AccessPointAlreadyOwnedByYou`), and the 409 is the status
+/// a name conflict carries.
+pub fn multi_region_access_point_already_owned_by_you<E>(
+    name: &str,
+) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_failure(
+        "MultiRegionAccessPointAlreadyOwnedByYou",
+        409,
+        format!("A Multi-Region Access Point with the same name already exists: {name}"),
+    )
+}
+
+/// `TooManyMultiRegionAccessPoints` (HTTP 400): the store already holds
+/// [`MULTI_REGION_ACCESS_POINT_QUOTA`] Multi-Region Access Points, so another
+/// record would grow it without end. Released by
+/// `DeleteMultiRegionAccessPoint`.
+pub fn too_many_multi_region_access_points<E>() -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_failure(
+        "TooManyMultiRegionAccessPoints",
+        400,
+        format!(
+            "This emulator holds the maximum of {MULTI_REGION_ACCESS_POINT_QUOTA} \
+             Multi-Region Access Points."
+        ),
+    )
+}
+
+/// `NotFoundException` (HTTP 404): no asynchronous request with that token was
+/// made by the account the request names, or it was made so long ago that the
+/// store no longer retains it (see [`ASYNC_REQUESTS_RETAINED`]).
+///
+/// An asynchronous request is not an S3 resource with a `NoSuch<Resource>` code
+/// of its own, so the code and status here are this service's own modelled
+/// `NotFoundException` ("The requested resource could not be found", a 404),
+/// which this operation's model does not list.
+pub fn no_such_async_request<E>(request_token_arn: &str) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_failure(
+        "NotFoundException",
+        404,
+        format!("The specified request token names no asynchronous request: {request_token_arn}"),
     )
 }
 

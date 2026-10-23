@@ -1,10 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PurchaseReservedCacheNodesOffering
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PurchaseReservedCacheNodesOffering`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
 //! broken". Replace the `Err(..)` in [`PurchaseReservedCacheNodesOffering::handle`] with real behaviour and
 //! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
@@ -126,6 +122,17 @@ impl From<PurchaseReservedCacheNodesOfferingErrorModeled> for PurchaseReservedCa
     }
 }
 
+/// `message` as this operation's modelled `InvalidParameterValueException`:
+/// "the value for a parameter is invalid" (HTTP 400).
+fn invalid_parameter_value(message: String) -> PurchaseReservedCacheNodesOfferingError {
+    PurchaseReservedCacheNodesOfferingErrorModeled::InvalidParameterValueException(
+        InvalidParameterValueException {
+            message: Some(message),
+        },
+    )
+    .into()
+}
+
 /// The `PurchaseReservedCacheNodesOffering` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -162,18 +169,144 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PurchaseReservedCacheNodesOffering` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PurchaseReservedCacheNodesOfferingErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PurchaseReservedCacheNodesOffering"))
+        // "Allows you to purchase a reserved cache node offering": a MUTATION,
+        // which is what makes a reservation exist for
+        // `DescribeReservedCacheNodes` to report.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+
+        // `CacheNodeCount` is "the number of cache node instances to reserve.
+        // Default: 1" and carries no modelled `@range`, so a count that cannot
+        // be a number of nodes is refused here.
+        let cache_node_count = input
+            .cache_node_count
+            .unwrap_or(crate::state::DEFAULT_CACHE_NODE_COUNT);
+        if cache_node_count < 1 {
+            return Err(invalid_parameter_value(format!(
+                "Invalid value {cache_node_count} for CacheNodeCount: at least one cache node must \
+                 be reserved."
+            )));
+        }
+        // `ReservedCacheNodeId` is "a customer-specified identifier to track
+        // this reservation", so a value that cannot identify anything is
+        // refused rather than stored.
+        if input
+            .reserved_cache_node_id
+            .as_deref()
+            .is_some_and(str::is_empty)
+        {
+            return Err(invalid_parameter_value(
+                "Invalid value for ReservedCacheNodeId: a reservation identifier may not be empty."
+                    .to_string(),
+            ));
+        }
+
+        let tags = match crate::state::tag_pairs(input.tags) {
+            Ok(tags) => tags,
+            Err(crate::state::TagRefusal::TooMany(count)) => {
+                return Err(
+                    PurchaseReservedCacheNodesOfferingErrorModeled::TagQuotaPerResourceExceeded(
+                        TagQuotaPerResourceExceeded {
+                            message: Some(format!(
+                                "{count} tags were supplied; the maximum number of tags permitted \
+                                 on a resource is {}.",
+                                crate::state::MAX_TAGS_PER_RESOURCE
+                            )),
+                        },
+                    )
+                    .into(),
+                )
+            }
+            Err(crate::state::TagRefusal::MissingKey) => {
+                return Err(invalid_parameter_value(
+                    "Invalid value for Tags: a tag's Key may not be null.".to_string(),
+                ))
+            }
+        };
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // The offering has to be one the published catalog holds: "the ID of
+        // the reserved cache node offering to purchase", and an id it does not
+        // hold is the modelled "requested cache node offering does not exist".
+        // The offering is cloned out of the catalog so the reservation below is
+        // priced from the entry the store itself published.
+        let offering_id = input.reserved_cache_nodes_offering_id;
+        let Some(offering) = store.offering(&offering_id).cloned() else {
+            return Err(
+                PurchaseReservedCacheNodesOfferingErrorModeled::ReservedCacheNodesOfferingNotFoundFault(
+                    ReservedCacheNodesOfferingNotFoundFault {
+                        message: Some(format!(
+                            "ReservedCacheNodesOfferingId {offering_id} not found."
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The identifier is the reservation's identity, so one this account
+        // already holds a reservation under is the modelled "you already have a
+        // reservation with the given identifier" rather than a second record
+        // overwriting the first.
+        let reserved_cache_node_id = match input.reserved_cache_node_id {
+            Some(id) => {
+                if store.reserved_cache_nodes.contains_key(&id) {
+                    return Err(
+                        PurchaseReservedCacheNodesOfferingErrorModeled::ReservedCacheNodeAlreadyExistsFault(
+                            ReservedCacheNodeAlreadyExistsFault {
+                                message: Some(format!(
+                                    "ReservedCacheNode {id} already exists."
+                                )),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+                id
+            }
+            None => store.mint_reservation_id(now),
+        };
+
+        // The store is bounded: past its quota a purchase is refused rather
+        // than reserving another node, which is what
+        // `ReservedCacheNodeQuotaExceededFault` refuses.
+        let quota = i64::from(crate::state::RESERVED_CACHE_NODE_QUOTA);
+        if store.reserved_node_count() + i64::from(cache_node_count) > quota {
+            return Err(
+                PurchaseReservedCacheNodesOfferingErrorModeled::ReservedCacheNodeQuotaExceededFault(
+                    ReservedCacheNodeQuotaExceededFault {
+                        message: Some(format!(
+                            "Reserving {cache_node_count} more cache node(s) would exceed this \
+                             account's quota of {quota} reserved cache nodes."
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let record = crate::state::ReservedCacheNodeRecord::from_offering(
+            &offering,
+            crate::state::NewReservation {
+                reserved_cache_node_id,
+                cache_node_count,
+                region,
+                tags,
+                now,
+            },
+        );
+        // The response is read back out of the store, so it reports the
+        // reservation this service persisted rather than a copy beside it.
+        let stored = store.insert_reservation(record);
+
+        Ok(PurchaseReservedCacheNodesOfferingOutput {
+            reserved_cache_node: Some(stored.to_modeled()),
+        })
     }
 }

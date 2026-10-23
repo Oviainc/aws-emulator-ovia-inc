@@ -241,20 +241,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         };
 
-        // "Creates or updates a subscription filter and associates it with the specified
-        // log group": there is nothing to associate it with until that group exists.
-        let Some(group) = store.log_groups.get_mut(&input.log_group_name) else {
-            return Err(PutSubscriptionFilterErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some("The specified log group does not exist".to_string()),
-                },
-            )
-            .into());
-        };
+        // A member this operation parses as an ARN and was handed something that is not
+        // one is refused before anything is looked up, with the service's
+        // validation-error message naming the member and the value it could not parse.
+        for (member, value) in [
+            ("destinationArn", Some(input.destination_arn.as_str())),
+            ("roleArn", input.role_arn.as_deref()),
+        ] {
+            if let Some(message) =
+                value.and_then(|value| crate::state::unparsable_arn_message(member, value))
+            {
+                return Err(invalid(message));
+            }
+        }
+
+        // "To perform a PutSubscriptionFilter operation for any destination except a
+        // Lambda function, you must also have the iam:PassRole permission": every
+        // supported destination but a Lambda function is delivered to through a role
+        // CloudWatch Logs assumes, so a filter cannot be configured without one — apart
+        // from a logical destination owned by another account, which authorises the
+        // delivery with its own policy. The refusal names the vendor it was asked to
+        // deliver to.
+        //
+        // This runs BEFORE the destination-kind check below because that is the order the
+        // service answers in: a recorded put of a `logs`-vendor ARN that is not a logical
+        // destination, with no roleArn, is refused for the missing role rather than for
+        // the resource the ARN names.
+        if input.role_arn.is_none() {
+            if let Some(vendor) =
+                crate::state::subscription_role_required_vendor(&input.destination_arn)
+            {
+                return Err(invalid(format!(
+                    "destinationArn for vendor {vendor} cannot be used without roleArn"
+                )));
+            }
+        }
 
         // The destination has to be one of the kinds this operation documents as
         // supported; the `logs` one is a logical destination created with
-        // `PutDestination`, not a log group.
+        // `PutDestination`, not a log group. The ARN parses, so this is a refusal of the
+        // resource it names, not of its form.
         if !crate::state::is_subscription_destination_arn(&input.destination_arn) {
             return Err(invalid(format!(
                 "destinationArn must be the ARN of a {} resource",
@@ -265,6 +291,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .join(", ")
             )));
         }
+
+        // The filter pattern is parsed at configuration time, so a pattern that opens a
+        // bracketed form and never closes it is refused here rather than silently
+        // matching nothing once log events start flowing.
+        if let Err(message) = crate::state::validate_filter_pattern(&input.filter_pattern) {
+            return Err(invalid(message));
+        }
+
+        // "Creates or updates a subscription filter and associates it with the specified
+        // log group": there is nothing to associate it with until that group exists.
+        let Some(group) = store.log_groups.get_mut(&input.log_group_name) else {
+            return Err(PutSubscriptionFilterErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some("The specified log group does not exist.".to_string()),
+                },
+            )
+            .into());
+        };
 
         // "Valid values are @aws.account, @aws.region, and @source.log" — the modelled
         // `SystemField` is a plain string, so the boundary validator does not hold the
@@ -316,7 +360,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 filter_pattern: input.filter_pattern,
                 destination_arn: input.destination_arn,
                 role_arn: input.role_arn,
-                distribution: input.distribution,
+                // "By default, log data is grouped by log stream": a put that names no
+                // distribution configures the filter with the documented default, which
+                // is what a read of it reports.
+                distribution: input
+                    .distribution
+                    .unwrap_or_else(|| crate::state::DEFAULT_DISTRIBUTION.to_string()),
                 apply_on_transformed_logs: input.apply_on_transformed_logs,
                 field_selection_criteria: input.field_selection_criteria,
                 emit_system_fields: input.emit_system_fields,

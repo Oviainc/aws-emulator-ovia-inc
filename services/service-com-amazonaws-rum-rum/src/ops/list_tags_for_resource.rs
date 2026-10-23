@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTagsForResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTagsForResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Displays the tags associated with a CloudWatch RUM resource: the tag map of the stored
+//! app monitor whose ARN the request's `ResourceArn` is (app monitors are RUM's only
+//! taggable resource), read off the ONE record `CreateAppMonitor` seeds, `UntagResource`
+//! writes and `GetAppMonitor` reports. It writes nothing.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTagsForResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## How a `ResourceArn` is read
+//!
+//! The request names its resource ONLY by an ARN, and the WHOLE ARN is that resource's
+//! identity: resolution is [`crate::state::ComAmazonawsRumRumState::app_monitor_by_arn`],
+//! an exact comparison against the stored [`crate::state::AppMonitorRecord::arn`], so an
+//! ARN differing in any component — partition, service, region, account, resource type or
+//! name — names a resource this emulator does not hold and is refused with HTTP 404 under
+//! this frontend's own wire code (see `NOT_FOUND_ERROR_CODE`), exactly as the sibling
+//! `UntagResource` refuses it. A `ResourceArn` that is not an ARN at all fails the
+//! member's modelled pattern at the boundary and is reworded for every tagging operation
+//! in [`crate::service`] as that frontend's 400 `BadRequestException`.
 //!
 //! ## Shape of an operation
 //!
@@ -91,18 +98,101 @@ pub enum ListTagsForResourceErrorModeled {
     ValidationException(ValidationException),
 }
 
-/// This operation's error channel, as the generated `impl Operation` names it
-/// (`crate::ops::list_tags_for_resource::ListTagsForResourceError`). Wrapping the modeled enum is what
-/// lets a scaffolded operation answer 501 for one whose model declares no errors at all.
-pub type ListTagsForResourceError = crate::scaffolded::Scaffolded<ListTagsForResourceErrorModeled>;
+/// The error code RUM's tagging frontend names a resource it cannot find by on the wire.
+///
+/// The model declares `ResourceNotFoundException` for this operation, and that shape's
+/// `@httpError` 404 and its members are what the response carries — but the code the
+/// service puts in the body's `__type` for an ARN that resolves to nothing is the shorter
+/// `NotFoundException`, which the model does not declare at all. The recorded corpus unit
+/// `rum.untag-resource-unknown-resource-rejected` pins it (`err["Code"] ==
+/// "NotFoundException"`) for the sibling tagging operation, and it is specific to the
+/// ARN-addressed tagging operations: RUM's app-monitor operations, addressed by `Name`, do
+/// answer `ResourceNotFoundException`. A client branches on the code it is SENT, so this
+/// operation sends the one its frontend sends — the same one `UntagResource` sends, since
+/// one frontend cannot word one condition two ways.
+const NOT_FOUND_ERROR_CODE: &str = "NotFoundException";
 
-/// Lets `?` and `.into()` lift a modeled failure into the error channel, so an
-/// implemented handler writes `Err(SomeModeledError.into())` rather than naming the
-/// wrapper variant. See `crate::scaffolded` for how to drop the wrapper entirely once
-/// this operation is implemented.
+/// This operation's error channel, as the generated `impl Operation` names it
+/// (`crate::ops::list_tags_for_resource::ListTagsForResourceError`).
+///
+/// It is NOT `crate::scaffolded::Scaffolded` any more: this operation is implemented, so
+/// it needs neither the 501 (that variant is the stub signal) nor the framework's
+/// synthetic `ValidationException` (its own model declares one, and a malformed
+/// `ResourceArn` is reworded for every tagging operation in `crate::service`). What it
+/// does need, and what no generic wrapper can express, is the one wire code above — so the
+/// channel is the modelled enum plus that single refusal, exactly as
+/// [`crate::ops::untag_resource::UntagResourceError`] is built.
+#[derive(Debug)]
+pub enum ListTagsForResourceError {
+    /// One of the operation's modelled errors, rendered exactly as the model declares it.
+    Modeled(ListTagsForResourceErrorModeled),
+    /// "That ARN names no resource", carrying the modelled `ResourceNotFoundException`
+    /// payload and its 404 under the [`NOT_FOUND_ERROR_CODE`] the service answers with.
+    NotFound(ResourceNotFoundException),
+}
+
+/// Lets `?` and `.into()` lift a modeled failure into the error channel, so the handler
+/// writes `Err(SomeModeledError.into())` rather than naming the wrapper variant.
 impl From<ListTagsForResourceErrorModeled> for ListTagsForResourceError {
     fn from(modeled: ListTagsForResourceErrorModeled) -> Self {
-        crate::scaffolded::Scaffolded::Modeled(modeled)
+        Self::Modeled(modeled)
+    }
+}
+
+impl ::std::fmt::Display for ListTagsForResourceError {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        match self {
+            Self::Modeled(e) => write!(f, "{e}"),
+            Self::NotFound(e) => write!(f, "{NOT_FOUND_ERROR_CODE}: {}", e.message),
+        }
+    }
+}
+
+impl ::std::error::Error for ListTagsForResourceError {}
+
+/// Every method delegates to the modelled error, so a modelled failure is rendered
+/// exactly as `#[operation_error]` renders it. The `NotFound` variant differs in ONE
+/// respect — the wire code, which the framework reads from `shape_name` rather than from
+/// the schema — and is otherwise the modelled `ResourceNotFoundException`: its schema
+/// decides which members the body carries, and its `@httpError` is the status.
+impl ::smithy_server_runtime::OperationError for ListTagsForResourceError {
+    fn as_serializable(&self) -> &dyn ::aws_smithy_schema::serde::SerializableStruct {
+        match self {
+            Self::Modeled(e) => ::smithy_server_runtime::OperationError::as_serializable(e),
+            Self::NotFound(e) => e,
+        }
+    }
+
+    fn variant_schema(&self) -> &'static ::aws_smithy_schema::Schema {
+        match self {
+            Self::Modeled(e) => ::smithy_server_runtime::OperationError::variant_schema(e),
+            Self::NotFound(_) => &super::types::SCHEMA_RESOURCE_NOT_FOUND_EXCEPTION,
+        }
+    }
+
+    fn shape_name(&self) -> &'static str {
+        match self {
+            Self::Modeled(e) => ::smithy_server_runtime::OperationError::shape_name(e),
+            Self::NotFound(_) => NOT_FOUND_ERROR_CODE,
+        }
+    }
+
+    fn http_status(&self) -> u16 {
+        match self {
+            Self::Modeled(e) => ::smithy_server_runtime::OperationError::http_status(e),
+            // `ResourceNotFoundException`'s own modelled `@httpError`: the code on the
+            // wire changes, the status does not.
+            Self::NotFound(_) => 404,
+        }
+    }
+
+    fn query_error_code(&self) -> Option<&'static str> {
+        match self {
+            Self::Modeled(e) => ::smithy_server_runtime::OperationError::query_error_code(e),
+            // restJson1 is this service's only protocol, and the shape carries no
+            // `awsQueryError` trait to honour in any case.
+            Self::NotFound(_) => None,
+        }
     }
 }
 
@@ -142,18 +232,45 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTagsForResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTagsForResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTagsForResource"))
+        // `@readonly`: "Displays the tags associated with a CloudWatch RUM resource" — a
+        // report, so this writes nothing and a later caller sees exactly what it would
+        // have seen had this call never happened. `ctx` carries nothing this read needs:
+        // the resource is named by the ARN in the request, not by the signing region.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListTagsForResourceErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: crate::state::NO_STORE.to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+
+        let store = state.lock();
+        // "Displays the tags associated with a CloudWatch RUM resource": the resource is
+        // the one whose stored ARN the request names — the WHOLE ARN is the identity, so a
+        // value differing in any component (partition, region, account, resource type or
+        // name) names a resource this emulator does not hold and is refused with 404, the
+        // same resolution and the same refusal the sibling `UntagResource` answers with.
+        // That covers the deleted monitor too: a delete takes the record and its tags
+        // together, so its ARN resolves to nothing afterwards.
+        let Some(record) = store.app_monitor_by_arn(&input.resource_arn) else {
+            return Err(ListTagsForResourceError::NotFound(
+                crate::state::tagged_resource_not_found(&input.resource_arn),
+            ));
+        };
+
+        Ok(ListTagsForResourceOutput {
+            // The ARN the resolved monitor was created with, read off the record rather
+            // than echoed back, so what this reports is the same ARN every other reader
+            // of that monitor sees.
+            resource_arn: record.arn.clone(),
+            // `Tags` is required, and it is projected through the record's one
+            // `tag_map()` — the same projection `GetAppMonitor` reports `AppMonitor$Tags`
+            // through, so the two readers cannot disagree. A monitor carrying no tags is
+            // reported as the EMPTY map, never as an absent member.
+            tags: record.tag_map(),
+        })
     }
 }

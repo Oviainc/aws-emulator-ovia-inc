@@ -24,7 +24,7 @@ use service_com_amazonaws_opensearchserverless_opensearchserverless::EmulatedSer
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The account every ARN this emulator mints carries (`engine::emulator_account_id`).
-const ACCOUNT: &str = "000000000000";
+pub(crate) const ACCOUNT: &str = "000000000000";
 
 /// The `X-Amz-Target` prefix from this crate's `OPERATIONS.md` wire-protocol section.
 const TARGET_PREFIX: &str = "OpenSearchServerless";
@@ -39,7 +39,7 @@ const SETTLE_WAIT: Duration = Duration::from_millis(700);
 
 /// One emulator with an empty store: the shared engine the router builds in production,
 /// carrying only this service.
-fn emulator() -> MultiServiceRouter {
+pub(crate) fn emulator() -> MultiServiceRouter {
     emulator_with_engine().0
 }
 
@@ -64,7 +64,7 @@ fn authorization(region: &str) -> String {
 
 /// Call `operation` with `body`, signed for `region`; answer its HTTP status, the error
 /// code when it failed, and the parsed JSON body.
-async fn call_in(
+pub(crate) async fn call_in(
     router: &MultiServiceRouter,
     region: &str,
     operation: &str,
@@ -100,7 +100,11 @@ async fn call_in(
 }
 
 /// [`call_in`] in `us-east-1`.
-async fn call(router: &MultiServiceRouter, operation: &str, body: Value) -> (u16, String, Value) {
+pub(crate) async fn call(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: Value,
+) -> (u16, String, Value) {
     call_in(router, "us-east-1", operation, body).await
 }
 
@@ -117,7 +121,7 @@ fn shape_name(code: &str) -> String {
 }
 
 /// The member of `value` named by `path` (`"createCollectionDetail.id"`), or `Value::Null`.
-fn at<'a>(value: &'a Value, path: &str) -> &'a Value {
+pub(crate) fn at<'a>(value: &'a Value, path: &str) -> &'a Value {
     let mut current = value;
     for segment in path.split('.') {
         current = current.get(segment).unwrap_or(&Value::Null);
@@ -126,12 +130,13 @@ fn at<'a>(value: &'a Value, path: &str) -> &'a Value {
 }
 
 /// The string at `path`, or the empty string.
-fn text(value: &Value, path: &str) -> String {
+pub(crate) fn text(value: &Value, path: &str) -> String {
     at(value, path).as_str().unwrap_or_default().to_string()
 }
 
-/// True when `id` satisfies `CollectionId`'s modelled `^[a-z0-9]{3,40}$`.
-fn is_collection_id(id: &str) -> bool {
+/// True when `id` satisfies `CollectionId`'s modelled `^[a-z0-9]{3,40}$` — which is also
+/// `CollectionGroupId`'s own pattern and length, so the collection-group suite shares it.
+pub(crate) fn is_collection_id(id: &str) -> bool {
     (3..=40).contains(&id.len())
         && id
             .chars()

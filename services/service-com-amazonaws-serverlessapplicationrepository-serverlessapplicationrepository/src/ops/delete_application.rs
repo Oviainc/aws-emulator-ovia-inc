@@ -173,6 +173,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             store.name_index.remove(&name_key);
         }
+        // A prepared template is a sub-resource of the application it was prepared from,
+        // so the delete releases this application's templates with it rather than leaving
+        // records no operation can ever reach or expire out of the store.
+        store
+            .templates
+            .retain(|_, template| template.application_id != input.application_id);
 
         Ok(DeleteApplicationOutput)
     }

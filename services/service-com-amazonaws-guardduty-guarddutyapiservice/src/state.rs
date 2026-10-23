@@ -683,6 +683,17 @@ pub struct FindingRecord {
     pub archived: bool,
     /// True for a finding `CreateSampleFindings` generated.
     pub sample: bool,
+    /// `Service.UserFeedback` — "Feedback that was submitted about the finding"
+    /// (`smithy_query(shape="Service")`): the `Feedback` value of the latest
+    /// `UpdateFindingsFeedback` call that named this finding, and absent until one
+    /// does.
+    pub user_feedback: Option<String>,
+    /// The `Comments` submitted beside [`Self::user_feedback`] — "additional feedback
+    /// about the GuardDuty findings"
+    /// (`smithy_query(operation="UpdateFindingsFeedback")`). The member is
+    /// `@sensitive` and no modelled read reports it (`Service` has no comments
+    /// member), so it is kept with the feedback it arrived with rather than published.
+    pub feedback_comments: Option<String>,
 }
 
 /// One finding attribute, resolved for comparison or sorting.

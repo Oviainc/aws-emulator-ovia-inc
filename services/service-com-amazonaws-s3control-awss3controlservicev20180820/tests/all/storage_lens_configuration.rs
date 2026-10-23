@@ -41,7 +41,10 @@ const OTHER_REGION: &str = "eu-central-1";
 /// the document's root element (exclusive), and the element's text. An empty
 /// value is an element with no text at all (`<BucketLevel/>`), which is how an
 /// all-optional container is written.
-type Leaf = (String, String);
+///
+/// `pub(crate)` because the sibling suites in `tests/all/` read a nested answer
+/// through [`leaves_of`] rather than each writing a second XML reader.
+pub(crate) type Leaf = (String, String);
 
 /// One leaf, spelled for a table row.
 fn leaf(path: &str, value: &str) -> Leaf {
@@ -91,7 +94,7 @@ fn local_name(raw: &str) -> String {
 /// attributes, the empty form, and text carrying the five predefined entities —
 /// and PANICS on anything else rather than guessing, so a malformed body fails
 /// the test loudly instead of comparing as nothing.
-fn leaves_of(body: &str) -> Vec<Leaf> {
+pub(crate) fn leaves_of(body: &str) -> Vec<Leaf> {
     /// name, whether any child element was seen, accumulated text.
     type Open = (String, bool, String);
 

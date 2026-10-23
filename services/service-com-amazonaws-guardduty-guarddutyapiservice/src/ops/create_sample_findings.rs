@@ -239,6 +239,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 updated_at_millis: now,
                 archived: false,
                 sample: true,
+                // No feedback has been submitted about a finding GuardDuty has only
+                // just generated.
+                user_feedback: None,
+                feedback_comments: None,
                 r#type: finding_type,
             };
             if let Some(detector) = state.detector_in_mut(&region, &input.detector_id) {

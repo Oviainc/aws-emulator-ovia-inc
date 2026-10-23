@@ -212,7 +212,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(group) = store.log_groups.get_mut(&input.log_group_name) else {
             return Err(PutRetentionPolicyErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some("The specified log group does not exist".to_string()),
+                    message: Some("The specified log group does not exist.".to_string()),
                 },
             )
             .into());
