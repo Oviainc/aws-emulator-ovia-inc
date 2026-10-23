@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AssociateLibraryItemReview
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AssociateLibraryItemReview`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AssociateLibraryItemReview::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: associates the calling user's review with the library item
+//! `CreateLibraryItem` published under the request's `instance-id`, which is what
+//! increments that item's `ratingCount`. This is the ONLY file to touch for this
+//! operation.
 //!
 //! ## Shape of an operation
 //!
@@ -180,18 +175,89 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AssociateLibraryItemReview` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AssociateLibraryItemReviewErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AssociateLibraryItemReview"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            AssociateLibraryItemReviewErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the qapps store is unavailable".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+        })?;
+        // The review is associated with "the user submitting the request", so
+        // the caller's principal is the whole identity of the review this call
+        // records. It comes out of the `Authorization` header, which carries no
+        // length bound of its own: a value longer than an access key id can be
+        // is not one, so there is no user to attribute a review to.
+        let principal = crate::state::caller_principal(ctx);
+        if !crate::state::is_storable_principal(&principal) {
+            return Err(AssociateLibraryItemReviewErrorModeled::UnauthorizedException(
+                UnauthorizedException {
+                    message: format!(
+                        "the request's access key id is longer than the {} characters an \
+                         access key id carries, so this review has no user to be associated with",
+                        crate::state::MAX_PRINCIPAL_LENGTH
+                    ),
+                },
+            )
+            .into());
+        }
+
+        let mut store = state.lock();
+        let item = store
+            .library_item_mut(&input.instance_id, &input.library_item_id)
+            .ok_or_else(|| {
+                AssociateLibraryItemReviewErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!("library item {} was not found", input.library_item_id),
+                        resource_id: input.library_item_id.clone(),
+                        resource_type: "library-item".to_string(),
+                    },
+                )
+            })?;
+
+        // One review per user: the rating count is the number of users holding
+        // one, so a user who already rated this item has nothing left to
+        // associate — a conflict with the current state of the resource, not a
+        // second rating. The read and the write are one step under the store
+        // lock, so of N concurrent calls for one user exactly one wins, and a
+        // refused call leaves the item exactly as it was.
+        if item.is_rated_by(&principal) {
+            return Err(AssociateLibraryItemReviewErrorModeled::ConflictException(
+                ConflictException {
+                    message: format!(
+                        "library item {} is already rated by this user",
+                        input.library_item_id
+                    ),
+                    resource_id: input.library_item_id.clone(),
+                    resource_type: "library-item".to_string(),
+                },
+            )
+            .into());
+        }
+        // A review's identity is caller-chosen, so the reviews one item retains
+        // are capped the way every other store in this crate is, charged under
+        // the lock that inserts.
+        if item.raters.len() >= crate::state::MAX_REVIEWS_PER_LIBRARY_ITEM {
+            return Err(
+                AssociateLibraryItemReviewErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: format!(
+                            "library item {} already holds the maximum of {} reviews",
+                            input.library_item_id,
+                            crate::state::MAX_REVIEWS_PER_LIBRARY_ITEM
+                        ),
+                        resource_id: input.library_item_id.clone(),
+                        resource_type: "library-item".to_string(),
+                        service_code: "qapps".to_string(),
+                        quota_code: "ReviewsPerLibraryItem".to_string(),
+                    },
+                )
+                .into(),
+            );
+        }
+        item.raters.insert(principal);
+        drop(store);
+
+        Ok(AssociateLibraryItemReviewOutput)
     }
 }

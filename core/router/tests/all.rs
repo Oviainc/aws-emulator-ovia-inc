@@ -27,7 +27,7 @@ mod apigateway_signing_name_routing;
 mod appconfig_signing_name_routing;
 #[path = "all/aws_marketplace_signing_name_routing.rs"]
 mod aws_marketplace_signing_name_routing;
-// These three sit in the SORTED block rather than being appended below, deliberately: the
+// These sit in the SORTED block rather than being appended below, deliberately: the
 // appended region at the end of this file is where every concurrent suite lands, so a
 // line added there conflicts with every other suite in the same window. Here the
 // neighbouring lines are stable.
@@ -39,6 +39,8 @@ mod bedrock_agentcore_signing_name_routing;
 mod bedrock_agent_runtime_session_authorization;
 #[path = "all/bedrock_signing_name_routing.rs"]
 mod bedrock_signing_name_routing;
+#[path = "all/billingconductor_payer_account.rs"]
+mod billingconductor_payer_account;
 #[path = "all/boot_serve.rs"]
 mod boot_serve;
 #[path = "all/cloudformation_provisions_stack_resources.rs"]

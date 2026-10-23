@@ -67,8 +67,10 @@ use crate::ops::types::{
     ModelPackageStatusItem, ModelPackageValidationSpecification, NetworkConfig,
     ParallelismConfiguration, Parameter, ProcessingInput, ProcessingOutputConfig,
     ProcessingResources, ProcessingStoppingCondition, ProductionVariant, ProductionVariantSummary,
-    ResourceSpec, SelectiveExecutionConfig, SourceAlgorithmSpecification, Tag,
-    TransformInput, TransformOutput, TransformResources, UserContext, VpcConfig,
+    RecommendationJobInputConfig, RecommendationJobOutputConfig,
+    RecommendationJobStoppingConditions, ResourceSpec, SelectiveExecutionConfig,
+    SourceAlgorithmSpecification, Tag, TransformInput, TransformOutput, TransformResources,
+    UserContext, VpcConfig,
 };
 
 /// The cluster-policy slice of this state: HyperPod clusters and the cluster policies
@@ -988,6 +990,161 @@ impl ProcessingJob {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Inference Recommender: the recommendation jobs `CreateInferenceRecommendationsJob`
+// accepts and `DescribeInferenceRecommendationsJob` replays.
+// ---------------------------------------------------------------------------
+
+/// See [`MODEL_QUOTA`]. `DeleteInferenceRecommendationsJob` is the release path AWS
+/// documents for a recommendation job; it is still a scaffold stub in this emulator, so
+/// today nothing releases a record and this bound is what keeps the store finite.
+pub const INFERENCE_RECOMMENDATIONS_JOB_QUOTA: usize = 1_000;
+
+/// The `RecommendationJobStatus` members this emulator moves a recommendation job
+/// through (the modelled enum also carries `IN_PROGRESS`, `COMPLETED`, `STOPPING`,
+/// `STOPPED`, `DELETING` and `DELETED`, which this slice does not reach). Named once
+/// here so no handler compares a bare string literal.
+pub const RECOMMENDATION_JOB_STATUS_PENDING: &str = "PENDING";
+/// See [`RECOMMENDATION_JOB_STATUS_PENDING`].
+pub const RECOMMENDATION_JOB_STATUS_FAILED: &str = "FAILED";
+
+/// How long after `CreateInferenceRecommendationsJob` the clock owes the job's move out
+/// of `PENDING` into its terminal status.
+///
+/// A span chosen by this emulator (AWS documents no duration for a recommendation run),
+/// inside the 250–750 ms band the project fixes for a transition the clock owes. It is
+/// never zero, so a caller that describes the job straight after creating it still
+/// observes `PENDING`, and one that waits observes the terminal status, so a poller
+/// terminates.
+pub const RECOMMENDATION_JOB_SETTLES_AFTER: Duration = Duration::from_millis(400);
+
+/// `RecommendationJobInputConfig$JobDurationInSeconds`'s documented ceiling:
+/// "Specifies the maximum duration of the job, in seconds. The maximum value is 18,000
+/// seconds." The model constrains the member only from below (`range 1..`), so the
+/// ceiling is enforced in the handler.
+pub const MAX_RECOMMENDATION_JOB_DURATION_IN_SECONDS: i32 = 18_000;
+
+/// Why a recommendation job this emulator accepted ends in the modelled `FAILED` status.
+///
+/// An Inference Recommender job provisions endpoints, replays the job's sample payload
+/// against the model's inference container under the requested traffic pattern and
+/// reports the latency, throughput and cost it measured. This emulator runs no inference
+/// container and generates no load, so nothing is measured: reporting `COMPLETED` with
+/// `InferenceRecommendations` or `EndpointPerformances` would be metrics synthesised to
+/// look computed, which the engine contract (`vendor/engine/src/lib.rs`) forbids. The run
+/// therefore ends in the status the model carries for a job that produced no
+/// recommendation, with this reason saying why. Everything around the run — accepting the
+/// job, validating it, minting its ARN, replaying it, reporting its terminal status — is
+/// real.
+pub const NO_INFERENCE_BENCHMARK_REASON: &str =
+    "This emulator runs no model inference container and generates no benchmark traffic, so \
+     no load test was performed and no inference recommendation was measured.";
+
+/// An Inference Recommender job created by `CreateInferenceRecommendationsJob`, as
+/// `DescribeInferenceRecommendationsJob` replays it.
+///
+/// Every member mirrors what the create request carried, so a describe replays the
+/// request rather than a value invented on the read path. `ends_at` is the instant the
+/// clock owes the move out of `PENDING`; it is stored, never slept on, and materialised
+/// by whichever reporting call first runs at or after it (see
+/// [`InferenceRecommendationsJob::settle_status`]).
+///
+/// `output_config` and `tags` are stored because the create carried them, even though no
+/// implemented reader surfaces them yet (`DescribeInferenceRecommendationsJob` reports
+/// neither), the way [`CodeRepository`] stores its tags.
+///
+/// `recommendations` holds what the job MEASURED, which
+/// `GetScalingConfigurationRecommendation` computes a scaling configuration from. It is
+/// empty for a job this service accepted, because this emulator serves no model inference
+/// container and generates no benchmark traffic (see
+/// [`NO_INFERENCE_BENCHMARK_REASON`]); nothing synthesises an entry, and a reader with no
+/// entry to answer from refuses rather than inventing one.
+#[derive(Debug, Clone)]
+pub struct InferenceRecommendationsJob {
+    pub name: String,
+    pub arn: String,
+    pub job_type: String,
+    pub role_arn: String,
+    pub input_config: RecommendationJobInputConfig,
+    pub job_description: Option<String>,
+    pub stopping_conditions: Option<RecommendationJobStoppingConditions>,
+    pub output_config: Option<RecommendationJobOutputConfig>,
+    pub tags: Vec<Tag>,
+    pub status: String,
+    pub failure_reason: Option<String>,
+    pub creation_time: SystemTime,
+    pub last_modified_time: SystemTime,
+    pub completion_time: Option<SystemTime>,
+    pub ends_at: SystemTime,
+    pub recommendations: Vec<InferenceRecommendation>,
+}
+
+impl InferenceRecommendationsJob {
+    /// A job record whose benchmark results this store was GIVEN rather than measured:
+    /// the form a test (or a future reader of a seeded corpus) needs so
+    /// `GetScalingConfigurationRecommendation` has recommendations to compute from.
+    ///
+    /// The members a create request would have carried are left at their empty values,
+    /// and the job is terminal on arrival (`ends_at` is its `creation_time`), because no
+    /// create call accepted it and so no transition is owed for it.
+    pub fn seeded(
+        name: String,
+        arn: String,
+        status: String,
+        recommendations: Vec<InferenceRecommendation>,
+        creation_time: SystemTime,
+    ) -> Self {
+        Self {
+            name,
+            arn,
+            job_type: String::new(),
+            role_arn: String::new(),
+            input_config: RecommendationJobInputConfig::default(),
+            job_description: None,
+            stopping_conditions: None,
+            output_config: None,
+            tags: Vec::new(),
+            status,
+            failure_reason: None,
+            creation_time,
+            last_modified_time: creation_time,
+            completion_time: Some(creation_time),
+            ends_at: creation_time,
+            recommendations,
+        }
+    }
+    /// Materialise the move out of `PENDING` the clock already owes.
+    ///
+    /// This is the one write a reporting operation may make: the move was due at
+    /// `ends_at` whether or not anybody described the job, so the observer makes no
+    /// difference to the result. `LastModifiedTime` and `CompletionTime` take the instant
+    /// the move was due, not "now", so both are stable across later reads.
+    ///
+    /// The terminal status is [`RECOMMENDATION_JOB_STATUS_FAILED`] with
+    /// [`NO_INFERENCE_BENCHMARK_REASON`]: see that constant for why a job this emulator
+    /// accepted cannot end `COMPLETED`.
+    ///
+    /// Answers whether the transition happened on this call, so the caller can record it.
+    pub fn settle_status(&mut self, now: SystemTime) -> bool {
+        if self.status == RECOMMENDATION_JOB_STATUS_PENDING && now >= self.ends_at {
+            self.status = RECOMMENDATION_JOB_STATUS_FAILED.to_string();
+            self.failure_reason = Some(NO_INFERENCE_BENCHMARK_REASON.to_string());
+            self.completion_time = Some(self.ends_at);
+            self.last_modified_time = self.ends_at;
+            return true;
+        }
+        false
+    }
+}
+
+impl ComAmazonawsSagemakerSagemakerState {
+    /// Whether another recommendation job fits, i.e. the store is below
+    /// [`INFERENCE_RECOMMENDATIONS_JOB_QUOTA`].
+    pub fn inference_recommendations_jobs_below_quota(&self) -> bool {
+        self.inference_recommendations_jobs.len() < INFERENCE_RECOMMENDATIONS_JOB_QUOTA
+    }
+}
+
 /// A pipeline created by `CreatePipeline`, as `DescribePipeline` replays it until
 /// `DeletePipeline` removes it.
 ///
@@ -1557,22 +1714,6 @@ impl VolumeAttachment {
     }
 }
 
-/// An Inference Recommender job and the recommendations it benchmarked, which
-/// `GetScalingConfigurationRecommendation` computes a scaling configuration from.
-///
-/// `CreateInferenceRecommendationsJob` is still a scaffolded stub, and benchmarking an
-/// endpoint is work this emulator does not do, so nothing here synthesises a
-/// recommendation: `GetScalingConfigurationRecommendation` answers from the
-/// recommendations this store holds and refuses when it holds none for the request.
-#[derive(Debug, Clone)]
-pub struct InferenceRecommendationsJob {
-    pub name: String,
-    pub arn: String,
-    pub status: String,
-    pub recommendations: Vec<InferenceRecommendation>,
-    pub creation_time: SystemTime,
-}
-
 /// One benchmarked recommendation of an Inference Recommender job.
 #[derive(Debug, Clone)]
 pub struct InferenceRecommendation {
@@ -1889,7 +2030,9 @@ pub struct ComAmazonawsSagemakerSagemakerState {
     pub apps: BTreeMap<AppKey, App>,
     /// Keyed by `ModelPackageGroupName`.
     pub model_package_groups: BTreeMap<String, ModelPackageGroup>,
-    /// Keyed by `InferenceRecommendationsJobName`.
+    /// Keyed by `RecommendationJobName`, which AWS documents unique to the account in a
+    /// Region. See [`InferenceRecommendationsJob`], with the rest of the Inference
+    /// Recommender slice.
     pub inference_recommendations_jobs: BTreeMap<String, InferenceRecommendationsJob>,
     /// Keyed by [`model_package_key`], so an unversioned package and the versions of a
     /// group share one store and one stable order.

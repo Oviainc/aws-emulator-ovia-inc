@@ -55,6 +55,8 @@ mod hyperpod_cluster_audit_record;
 mod hyperpod_cluster_listing;
 #[path = "all/inference_deployment_lifecycle.rs"]
 mod inference_deployment_lifecycle;
+#[path = "all/inference_recommendations_jobs.rs"]
+mod inference_recommendations_jobs;
 #[path = "all/lineage_action_lifecycle.rs"]
 mod lineage_action_lifecycle;
 #[path = "all/lineage_associations.rs"]

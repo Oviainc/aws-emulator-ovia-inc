@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeInferenceRecommendationsJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeInferenceRecommendationsJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: replays the recommendation job `CreateInferenceRecommendationsJob`
+//! stored in `crate::state` under the requested `JobName`, materialising the move out of
+//! `PENDING` the clock already owes
+//! (`crate::state::InferenceRecommendationsJob::settle_status`) and refusing an unknown
+//! name with the modelled `ResourceNotFound`. This is the ONLY file to touch for this
+//! operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeInferenceRecommendationsJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `InferenceRecommendations` and `EndpointPerformances` stay absent: nothing ran the
+//! benchmark, so there are no measured metrics to report (see
+//! `crate::state::NO_INFERENCE_BENCHMARK_REASON`), and the job's terminal status carries
+//! the reason instead.
 //!
 //! ## Shape of an operation
 //!
@@ -168,18 +170,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeInferenceRecommendationsJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeInferenceRecommendationsJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeInferenceRecommendationsJob"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        let mut store = state.lock();
+        let Some(job) = store.inference_recommendations_jobs.get_mut(&input.job_name) else {
+            return Err(DescribeInferenceRecommendationsJobErrorModeled::ResourceNotFound(
+                ResourceNotFound {
+                    message: Some(format!(
+                        "Could not find inference recommendations job \"{}\".",
+                        input.job_name
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // The only write a reporting call makes: the move out of `PENDING` the clock
+        // already owed. It was due at the stored instant whether or not anybody described
+        // the job, so a poller terminates and no caller's read changes the outcome.
+        let job_arn = job.arn.clone();
+        let settled = job.settle_status(::std::time::SystemTime::now());
+
+        let output = DescribeInferenceRecommendationsJobOutput {
+            job_name: job.name.clone(),
+            job_arn: job_arn.clone(),
+            job_type: job.job_type.clone(),
+            role_arn: job.role_arn.clone(),
+            job_description: job.job_description.clone(),
+            input_config: job.input_config.clone(),
+            stopping_conditions: job.stopping_conditions.clone(),
+            status: job.status.clone(),
+            failure_reason: job.failure_reason.clone(),
+            creation_time: crate::state::timestamp(job.creation_time),
+            last_modified_time: crate::state::timestamp(job.last_modified_time),
+            completion_time: job.completion_time.map(crate::state::timestamp),
+            // No benchmark ran, so there is no measured recommendation and no measured
+            // endpoint performance to report. Both members are absent rather than empty:
+            // `InferenceRecommendations` is modelled `len 1..10`, so an empty list would
+            // not even satisfy the model.
+            inference_recommendations: None,
+            endpoint_performances: None,
+        };
+        drop(store);
+
+        if settled {
+            // The transition is a state change, so it leaves the same record a create
+            // does rather than happening unobservably on a read path.
+            crate::state::record_state_change(Self::NAME, &job_arn, ctx);
+        }
+        Ok(output)
     }
 }

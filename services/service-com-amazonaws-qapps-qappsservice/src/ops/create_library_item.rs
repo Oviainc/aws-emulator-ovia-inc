@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateLibraryItem
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateLibraryItem`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateLibraryItem::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: publishes a stored Q App version to the instance's library,
+//! minting the library item the catalog operations read back and moving the app
+//! itself to `PUBLISHED`. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -173,18 +167,196 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateLibraryItem` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateLibraryItemErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateLibraryItemErrorModeled::InternalServerException(InternalServerException {
+                message: "the qapps store is unavailable".to_string(),
+                retry_after_seconds: None,
+            })
+        })?;
+        let principal = crate::state::caller_principal(ctx);
+        // The publisher is stored on the item (`createdBy`), and it comes out of
+        // the `Authorization` header, which carries no length bound of its own:
+        // a value longer than an access key id can be is not one, so there is no
+        // user to record as the publisher.
+        if !crate::state::is_storable_principal(&principal) {
+            return Err(CreateLibraryItemErrorModeled::UnauthorizedException(
+                UnauthorizedException {
+                    message: format!(
+                        "the request's access key id is longer than the {} characters an \
+                         access key id carries, so this library item has no publisher",
+                        crate::state::MAX_PRINCIPAL_LENGTH
+                    ),
+                },
+            )
+            .into());
+        }
+        let created_at = crate::state::now();
+
+        // `categories` is the SET of categories the item is filed under, so two
+        // entries cannot name the same one: a repeated id would file the item
+        // twice under one category and count it twice in that category's
+        // `appCount`.
+        let mut seen: Vec<&str> = Vec::with_capacity(input.categories.len());
+        for category_id in &input.categories {
+            if seen.contains(&category_id.as_str()) {
+                return Err(CreateLibraryItemErrorModeled::ValidationException(
+                    ValidationException {
+                        message: format!(
+                            "categories contains more than one entry with id {category_id}"
+                        ),
+                    },
+                )
+                .into());
+            }
+            seen.push(category_id);
+        }
+
+        let mut store = state.lock();
+
+        // A library item is a snapshot of ONE version of a stored Q App, so the
+        // app and that version of it must both exist in this instance; a version
+        // the app never had (or no longer retains) is as absent as an unknown
+        // app.
+        let app = store
+            .app(&input.instance_id, &input.app_id)
+            .ok_or_else(|| {
+                CreateLibraryItemErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!("Q App {} was not found", input.app_id),
+                        resource_id: input.app_id.clone(),
+                        resource_type: "qapp".to_string(),
+                    },
+                )
+            })?;
+        if !app.versions.contains_key(&input.app_version) {
+            return Err(CreateLibraryItemErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!(
+                        "Q App {} has no version {}",
+                        input.app_id, input.app_version
+                    ),
+                    resource_id: input.app_id.clone(),
+                    resource_type: "qapp".to_string(),
+                },
+            )
+            .into());
+        }
+
+        // The categories an item is filed under are the instance's own category
+        // resources (`BatchCreateCategory` mints them, `ListCategories` pages
+        // them), so an id this instance's catalog does not hold names no
+        // resource.
+        for category_id in &input.categories {
+            if store
+                .library_category(&input.instance_id, category_id)
+                .is_none()
+            {
+                return Err(CreateLibraryItemErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!("category {category_id} was not found"),
+                        resource_id: category_id.clone(),
+                        resource_type: "category".to_string(),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // The same guardrails on this emulator's memory the apps carry, charged
+        // under the lock that inserts: per instance, and in total because
+        // `instanceId` is caller-chosen and unconstrained.
+        if store.library_item_count(&input.instance_id) >= crate::state::MAX_LIBRARY_ITEMS_PER_INSTANCE
+        {
+            return Err(CreateLibraryItemErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "instance {} already holds the maximum of {} library items",
+                        input.instance_id,
+                        crate::state::MAX_LIBRARY_ITEMS_PER_INSTANCE
+                    ),
+                    resource_id: input.instance_id.clone(),
+                    resource_type: "library-item".to_string(),
+                    service_code: "qapps".to_string(),
+                    quota_code: "LibraryItemsPerInstance".to_string(),
+                },
+            )
+            .into());
+        }
+        if store.total_library_item_count() >= crate::state::MAX_LIBRARY_ITEMS_TOTAL {
+            return Err(CreateLibraryItemErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "this endpoint already holds the maximum of {} library items",
+                        crate::state::MAX_LIBRARY_ITEMS_TOTAL
+                    ),
+                    resource_id: input.instance_id.clone(),
+                    resource_type: "library-item".to_string(),
+                    service_code: "qapps".to_string(),
+                    quota_code: "LibraryItems".to_string(),
+                },
+            )
+            .into());
+        }
+
+        let library_item_id = crate::state::mint_uuid();
+        let item = crate::state::LibraryItem {
+            library_item_id: library_item_id.clone(),
+            app_id: input.app_id.clone(),
+            app_version: input.app_version,
+            categories: input.categories.clone(),
+            status: crate::state::LibraryItemStatus::Published,
+            created_at,
+            created_by: principal,
+            // Nobody has revised the item yet, so it reports no update;
+            // `UpdateLibraryItem` is what moves these.
+            updated_at: None,
+            updated_by: None,
+            // A fresh item carries no reviews, so `ratingCount` is 0 until
+            // `AssociateLibraryItemReview` adds one.
+            raters: ::std::collections::BTreeSet::new(),
+            // Verification is an administrative act on the published item, not
+            // something publishing confers.
+            is_verified: false,
+        };
+
+        let output = CreateLibraryItemOutput {
+            library_item_id: item.library_item_id.clone(),
+            status: item.status.as_wire().to_string(),
+            created_at: item.created_at,
+            created_by: item.created_by.clone(),
+            updated_at: item.updated_at,
+            updated_by: item.updated_by.clone(),
+            rating_count: item.rating_count(),
+            is_verified: Some(item.is_verified),
+        };
+
+        // Publishing a Q App to the library is what takes it out of DRAFT: the
+        // app is now discoverable by the instance's other users. Only the
+        // status moves — the definition and its `appVersion` are
+        // `UpdateQApp`'s to revise.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateLibraryItem"))
+        // The app was found above under THIS lock, which has not been released
+        // since, so the lookup cannot miss; a miss would mean the store changed
+        // under the lock, which is a server fault rather than a publication that
+        // quietly skipped the status move.
+        let app = store
+            .apps
+            .get_mut(&(input.instance_id.clone(), input.app_id.clone()))
+            .ok_or_else(|| {
+                CreateLibraryItemErrorModeled::InternalServerException(InternalServerException {
+                    message: format!(
+                        "Q App {} disappeared from the store while it was being published",
+                        input.app_id
+                    ),
+                    retry_after_seconds: None,
+                })
+            })?;
+        app.status = crate::state::AppStatus::Published;
+
+        let key = (input.instance_id.clone(), library_item_id);
+        store.library_items.insert(key, item);
+        drop(store);
+
+        Ok(output)
     }
 }

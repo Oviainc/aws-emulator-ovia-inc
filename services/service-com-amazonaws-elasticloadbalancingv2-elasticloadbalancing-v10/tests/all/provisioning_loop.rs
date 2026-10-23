@@ -1150,6 +1150,13 @@ async fn a_repeat_with_the_same_settings_is_idempotent_and_a_different_one_is_a_
     form.push(p("LoadBalancerArn", &first));
     form.push(p("Protocol", "HTTPS"));
     form.push(p("Port", "80"));
+    // An HTTPS listener carries the default certificate the model brackets for it, so
+    // this row reaches the duplicate check rather than the certificate refusal pinned
+    // in `listener_tls_certificates.rs`.
+    form.push(p(
+        "Certificates.member.1.CertificateArn",
+        "arn:aws:acm:us-west-2:000000000000:certificate/dup-listener",
+    ));
     form.push(p("DefaultActions.member.1.Type", "forward"));
     form.push(p("DefaultActions.member.1.TargetGroupArn", &tg_first));
     let conflict = call(&router, &form).await;

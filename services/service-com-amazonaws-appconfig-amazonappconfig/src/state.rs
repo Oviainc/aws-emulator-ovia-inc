@@ -1115,11 +1115,34 @@ impl ComAmazonawsAppconfigAmazonappconfigState {
         true
     }
 
-    /// Forget an extension this account created. Nothing calls this yet —
-    /// `DeleteExtension` is still a stub, and this is the hook it needs so deleting an
-    /// extension frees its slot.
+    /// Forget an extension this account created, with every version it holds.
+    /// `DeleteExtension` is the caller this exists for, and removing the record is what
+    /// frees its slot.
     pub fn remove_extension(&mut self, extension_id: &str) -> Option<Extension> {
         self.extensions.remove(extension_id)
+    }
+
+    /// Forget ONE version of an extension this account created, answering the version
+    /// that was removed, or `None` when no extension answers to `extension_id` or it
+    /// holds no such version.
+    ///
+    /// An extension exists only as its versions — the id and the name are properties of
+    /// the set, and the description, actions, parameters and tags belong to a version —
+    /// so an extension whose last version is removed is itself gone, and
+    /// [`Self::resolve_extension`] stops answering for it. That is the same bookkeeping
+    /// [`Self::remove_extension`] does, reached one version at a time, so a deleted
+    /// version never leaves an extension that answers with nothing.
+    pub fn remove_extension_version(
+        &mut self,
+        extension_id: &str,
+        version_number: i32,
+    ) -> Option<ExtensionVersion> {
+        let extension = self.extensions.get_mut(extension_id)?;
+        let removed = extension.versions.remove(&version_number)?;
+        if extension.versions.is_empty() {
+            self.extensions.remove(extension_id);
+        }
+        Some(removed)
     }
 
     /// Resolve a deployment strategy id to the strategy it names: one this account
@@ -1153,9 +1176,10 @@ impl ComAmazonawsAppconfigAmazonappconfigState {
         true
     }
 
-    /// Forget a deployment strategy this account created. Nothing calls this yet —
-    /// `DeleteDeploymentStrategy` is still a stub, and this is the hook it needs so
-    /// deleting a strategy frees its slot.
+    /// Forget a deployment strategy this account created, answering the record that was
+    /// removed, or `None` when this account created no strategy under `id`.
+    /// `DeleteDeploymentStrategy` is the caller this exists for, and removing the record
+    /// frees its slot.
     pub fn remove_strategy(&mut self, id: &str) -> Option<DeploymentStrategy> {
         self.deployment_strategies.remove(id)
     }
