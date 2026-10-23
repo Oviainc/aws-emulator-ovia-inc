@@ -264,6 +264,20 @@
 //! `not-applicable`, the value the model documents for "no checks with `Aggregation` set
 //! to `included` apply to the instance", and no two operations can disagree about one
 //! instance's status.
+//!
+//! ## VM import tasks
+//!
+//! [`ComAmazonawsEc2Amazonec2State::import_image_tasks`] holds the import image tasks
+//! `ImportImage` starts as [`ImportImageTaskRecord`]s: the modelled [`ImportImageTask`]
+//! `DescribeImportImageTasks` reports, plus the instant the clock owes the task its
+//! `active` -> `completed` move. Keyed by `ImportTaskId` in a [`BTreeMap`], the same
+//! stable order the other stores are kept in, so a pagination token can name the id the
+//! next page starts at. A task AWS hands back is `active`, so the completion — the AMI the
+//! import creates, and the snapshot id of each imported disk — is owed by the clock and
+//! applied once by
+//! [`ComAmazonawsEc2Amazonec2State::complete_due_import_image_tasks`]; only the PERCENTAGE
+//! of progress an active task reports is derived per read, being a fact of elapsed time
+//! that no store could hold.
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -1072,6 +1086,14 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// module docs. Ordered by endpoint id, which is the order
     /// `DescribeVpcEndpointConnections` reports and pages over.
     pub vpc_endpoint_connections: BTreeMap<String, VpcEndpointConnection>,
+    /// Every import image task the account has started, by `ImportTaskId` — see the module
+    /// docs. Ordered by id, which is the order `DescribeImportImageTasks` reports and pages
+    /// over.
+    pub import_image_tasks: BTreeMap<String, ImportImageTaskRecord>,
+    /// An `ImportImage` `ClientToken` and the import task id it minted, so a repeat of the
+    /// same request answers with that task instead of starting a second import: "The token
+    /// to enable idempotency for VM import requests" (`ImportImageRequest$ClientToken`).
+    pub import_image_task_client_tokens: HashMap<String, String>,
     /// The state of the account's *block public access for snapshots* setting — see the
     /// module docs.
     ///
@@ -1127,6 +1149,8 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             dedicated_hosts: BTreeMap::new(),
             dedicated_host_client_tokens: HashMap::new(),
             vpc_endpoint_connections: BTreeMap::new(),
+            import_image_tasks: BTreeMap::new(),
+            import_image_task_client_tokens: HashMap::new(),
             // "Public sharing is not blocked" is where an account that has never called
             // `EnableSnapshotBlockPublicAccess` sits.
             snapshot_block_public_access: SNAPSHOT_BLOCK_PUBLIC_ACCESS_UNBLOCKED,
@@ -2083,6 +2107,10 @@ impl ComAmazonawsEc2Amazonec2State {
     /// cleanup a disable started, and a `pending-deprovision` BYOIP range reaching the end
     /// of its release — leaving the account, or landing in `failed-deprovision` when
     /// addresses are still allocated from it.
+    ///
+    /// An `active` import image task becoming `completed` with the AMI it created is one of
+    /// them too; it is documented on [`Self::complete_due_import_image_tasks`], which this
+    /// calls.
     pub fn materialize_due_transitions(&mut self) {
         let now = Instant::now();
         for instance in self.instances.values_mut() {
@@ -2228,6 +2256,7 @@ impl ComAmazonawsEc2Amazonec2State {
                 }
             }
         });
+        self.complete_due_import_image_tasks(now);
     }
 
     /// The modelled `Instance` for one stored instance.
@@ -2995,14 +3024,38 @@ enum FilterToken {
 #[derive(Clone, Debug)]
 pub struct FilterPattern {
     tokens: Vec<FilterToken>,
+    /// Whether the value was longer than [`MAX_FILTER_PATTERN_TOKENS`], in which case it
+    /// was not compiled at all and matches nothing — see [`Self::compile`].
+    oversize: bool,
 }
+
+/// How many tokens one compiled filter value may hold.
+///
+/// A filter value is request-controlled text compiled one token per character, and the
+/// matcher's cost is the product of the pattern's length and the candidate's, so the token
+/// count is the one factor of that product a caller could otherwise make unbounded. The
+/// ceiling is [`MAX_FILTER_VALUE_BYTES`], the size every describe of this service already
+/// refuses a filter value above, so a value within the documented bound always compiles
+/// whole and only one that no handler would have accepted is capped here.
+pub const MAX_FILTER_PATTERN_TOKENS: usize = MAX_FILTER_VALUE_BYTES;
 
 impl FilterPattern {
     /// Compile one filter value.
+    ///
+    /// A value of more than [`MAX_FILTER_PATTERN_TOKENS`] tokens is NOT compiled: the
+    /// pattern it would build is what makes one comparison arbitrarily expensive, so such a
+    /// value matches nothing instead of being truncated to a pattern that would match MORE
+    /// than the caller asked for.
     pub fn compile(pattern: &str) -> Self {
         let mut tokens: Vec<FilterToken> = Vec::new();
         let mut chars = pattern.chars();
         while let Some(c) = chars.next() {
+            if tokens.len() >= MAX_FILTER_PATTERN_TOKENS {
+                return Self {
+                    tokens: Vec::new(),
+                    oversize: true,
+                };
+            }
             match c {
                 '\\' => match chars.next() {
                     // A trailing backslash escapes nothing, so it is itself a literal.
@@ -3014,7 +3067,10 @@ impl FilterPattern {
                 other => tokens.push(FilterToken::Literal(other)),
             }
         }
-        Self { tokens }
+        Self {
+            tokens,
+            oversize: false,
+        }
     }
 
     /// Does this filter value match `value`?
@@ -3029,7 +3085,21 @@ impl FilterPattern {
     ///
     /// Answers `false` as soon as the budget is spent; the caller tells that apart
     /// from a genuine non-match with [`MatchBudget::exhausted`].
+    ///
+    /// EVERY path through this charges at least one step: the comparison itself on entry,
+    /// one per character of the candidate the loop walks, and one per token of the pattern
+    /// the trailing check walks. So no shape of filter value — an empty candidate value, a
+    /// pattern that is all `*` — can do request-scaled work for free, which is what makes
+    /// the budget a bound on the PRODUCT of candidates, filters, values and pattern length
+    /// rather than on the candidates alone.
     pub fn matches_within(&self, value: &str, budget: &mut MatchBudget) -> bool {
+        if !budget.spend() {
+            return false;
+        }
+        // A value no handler would have accepted was never compiled, so it matches nothing.
+        if self.oversize {
+            return false;
+        }
         let tokens = &self.tokens;
         let value: Vec<char> = value.chars().collect();
         // Greedy match with one backtrack point per `*`, which is all a pattern with no
@@ -3062,10 +3132,18 @@ impl FilterPattern {
                 return false;
             }
         }
-        // The value is exhausted: what is left of the pattern must match nothing.
-        tokens[token.min(tokens.len())..]
-            .iter()
-            .all(|token| *token == FilterToken::Many)
+        // The value is exhausted: what is left of the pattern must match nothing. Each
+        // remaining token is charged, so a long all-`*` tail costs what it walks even when
+        // the candidate's value was empty and the loop above never ran.
+        for remaining in &tokens[token.min(tokens.len())..] {
+            if !budget.spend() {
+                return false;
+            }
+            if *remaining != FilterToken::Many {
+                return false;
+            }
+        }
+        true
     }
 }
 
@@ -3525,6 +3603,462 @@ pub fn invalid_volume_id_not_found<E>(volume_id: &str) -> crate::scaffolded::Sca
         400,
         format!("The volume '{volume_id}' does not exist."),
     )
+}
+
+// ---------------------------------------------------------------------------
+// VM import: the import image tasks `ImportImage` starts
+// ---------------------------------------------------------------------------
+
+// The modelled shapes this slice reads, named HERE rather than in the module's shared
+// `use crate::ops::types::{..}` list at the top: that list is edited by every store this
+// crate gains, so naming them beside the code that uses them keeps this slice off a line
+// nothing else of it touches.
+use crate::ops::types::{ImportImageOutput, ImportImageTask};
+
+/// The resource type an `ImportImage` `TagSpecification` may name: "The tags to apply to
+/// the import image task during creation" (`ImportImageRequest$TagSpecifications`), which
+/// the modelled `ResourceType` enum spells `import-image-task`.
+pub const IMPORT_IMAGE_TASK_TAGGABLE_RESOURCE: &str = "import-image-task";
+
+/// The id prefix of an import image task, the form `ImportImageTask$ImportTaskId` carries.
+pub const IMPORT_IMAGE_TASK_ID_PREFIX: &str = "import-ami";
+
+/// [`IMPORT_IMAGE_TASK_ID_PREFIX`] and the hyphen that separates it from the id's hex
+/// suffix, as one static, so recognising an id allocates nothing on the request path.
+pub const IMPORT_IMAGE_TASK_ID_PREFIX_WITH_HYPHEN: &str = "import-ami-";
+
+/// How many disk containers one `ImportImage` request may name.
+///
+/// CHOSEN, like [`MAX_SECURITY_GROUPS_PER_INSTANCE`]: neither the model nor the request
+/// parsers bound the length of `DiskContainers` (the list carries no `@length` and the
+/// query parser bounds nesting depth only), while every container retains a
+/// `SnapshotDetail` on the stored task for the process's lifetime. It is well above the
+/// disks of any VM a test would import.
+pub const MAX_IMPORT_DISK_CONTAINERS: usize = 32;
+
+/// How many license configurations one `ImportImage` request may name, for the same reason
+/// and in the same style as [`MAX_IMPORT_DISK_CONTAINERS`]: the modelled list is unbounded
+/// and every entry is retained on the stored task.
+pub const MAX_IMPORT_LICENSE_SPECIFICATIONS: usize = 32;
+
+/// What one element of a stored import task's caller-chosen lists costs against the store's
+/// byte budget beyond the strings it carries.
+///
+/// A `SnapshotDetail` or a license specification whose every string is empty still retains
+/// a record, so charging string lengths alone would let a request store many elements for
+/// nothing. The number is the order of the stored struct, not a measurement of it — it only
+/// has to make the per-element cost non-zero.
+pub const IMPORT_TASK_ELEMENT_OVERHEAD_BYTES: usize = 256;
+
+/// The state of an import task that is still running.
+///
+/// Source for this and the three below: `DescribeImportImageTasksRequest$Filters` —
+/// "Filter tasks using the task-state filter and one of the following values: active,
+/// completed, deleting, or deleted."
+pub const IMPORT_TASK_STATE_ACTIVE: &str = "active";
+
+/// The state of an import task whose AMI has been created.
+pub const IMPORT_TASK_STATE_COMPLETED: &str = "completed";
+
+/// The state of an import task a cancel is working through.
+pub const IMPORT_TASK_STATE_DELETING: &str = "deleting";
+
+/// The state of an import task a cancel has finished with.
+pub const IMPORT_TASK_STATE_DELETED: &str = "deleted";
+
+/// Every state an import task reports, the catalog the `task-state` filter selects over.
+pub const IMPORT_TASK_STATES: [&str; 4] = [
+    IMPORT_TASK_STATE_ACTIVE,
+    IMPORT_TASK_STATE_COMPLETED,
+    IMPORT_TASK_STATE_DELETING,
+    IMPORT_TASK_STATE_DELETED,
+];
+
+/// The architectures `ImportImage` accepts: "Valid values: i386 | x86_64"
+/// (`ImportImageRequest$Architecture`).
+pub const IMPORT_IMAGE_ARCHITECTURES: [&str; 2] = ["i386", "x86_64"];
+
+/// The target hypervisors `ImportImage` accepts: "Valid values: xen"
+/// (`ImportImageRequest$Hypervisor`), which is therefore also the one a task that named
+/// none reports.
+pub const IMPORT_IMAGE_HYPERVISORS: [&str; 1] = [IMAGE_HYPERVISOR_XEN];
+
+/// The operating systems `ImportImage` accepts: "Valid values: Windows | Linux"
+/// (`ImportImageRequest$Platform`).
+pub const IMPORT_IMAGE_PLATFORMS: [&str; 2] = ["Linux", IMAGE_PLATFORM_WINDOWS];
+
+/// The license type that replaces the source-system license: "Specify AWS to replace the
+/// source-system license with an Amazon Web Services license" (`ImportImageRequest$LicenseType`).
+pub const IMPORT_IMAGE_LICENSE_TYPE_AWS: &str = "AWS";
+
+/// The license type that retains the source-system license: "or BYOL to retain the
+/// source-system license" (`ImportImageRequest$LicenseType`).
+pub const IMPORT_IMAGE_LICENSE_TYPE_BYOL: &str = "BYOL";
+
+/// The license types `ImportImage` accepts.
+pub const IMPORT_IMAGE_LICENSE_TYPES: [&str; 2] = [
+    IMPORT_IMAGE_LICENSE_TYPE_AWS,
+    IMPORT_IMAGE_LICENSE_TYPE_BYOL,
+];
+
+/// The disk image formats a disk container may carry: "Valid values: OVA | VHD | VHDX |
+/// VMDK | RAW" (`ImageDiskContainer$Format`).
+pub const IMPORT_DISK_IMAGE_FORMATS: [&str; 5] = ["OVA", "VHD", "VHDX", "VMDK", "RAW"];
+
+/// The status message an import image task carries while its disks are being converted,
+/// which is the whole of the window this emulator's import takes.
+pub const IMPORT_TASK_STATUS_MESSAGE_CONVERTING: &str = "converting";
+
+/// The highest percentage an ACTIVE import task reports: a task that has not finished has
+/// not reached 100, and 100 is only ever read off a `completed` one.
+pub const MAX_ACTIVE_IMPORT_PROGRESS: u64 = 99;
+
+/// How many import image tasks this emulator stores before `ImportImage` is refused.
+///
+/// CHOSEN, like [`MAX_STORED_VOLUMES`] and for the same reason: nothing in this emulator
+/// reclaims a finished task, so the store needs a ceiling that is not the process's
+/// memory. A count ceiling is not a memory bound on its own — see [`MAX_STORED_BYTES`] —
+/// so the caller-chosen bytes of each task are charged against that budget too
+/// ([`import_image_task_payload_bytes`]).
+pub const MAX_STORED_IMPORT_IMAGE_TASKS: usize = 4_096;
+
+/// EC2's generic resource-count quota code, which a refusal to store another resource of a
+/// kind with no quota code of its own answers with.
+pub const RESOURCE_COUNT_EXCEEDED: &str = "ResourceCountExceeded";
+
+/// EC2's code for a conversion (import) task id it cannot resolve — the code
+/// `DescribeImportImageTasks` answers for an `ImportTaskIds` entry that is not an import
+/// task id, and for one no task of the account has.
+pub const INVALID_CONVERSION_TASK_ID: &str = "InvalidConversionTaskId";
+
+/// One stored import image task: the modelled [`ImportImageTask`] every operation that
+/// reports one answers with, plus the window the import takes.
+///
+/// The stored view is the truth about the task: its `Status` starts at
+/// [`IMPORT_TASK_STATE_ACTIVE`] and the clock-owed completion is written onto it ONCE by
+/// [`ComAmazonawsEc2Amazonec2State::complete_due_import_image_tasks`], because completing
+/// MINTS resources (the AMI, and a snapshot id per imported disk) that have to be the same
+/// in every later read. Only the progress PERCENTAGE is derived per read
+/// ([`Self::view_at`]): it is a fact of elapsed time, so no stored value could be right
+/// twice.
+#[derive(Debug, Clone)]
+pub struct ImportImageTaskRecord {
+    /// The task as the model shapes it, with `Progress` left for [`Self::view_at`] to fill
+    /// while the task is active.
+    pub view: ImportImageTask,
+    /// When the import started, which progress is measured from.
+    pub started_at: Instant,
+    /// The instant from which this task's `active` -> `completed` move is due. Monotonic
+    /// ([`Instant`]), because it is only ever compared against the clock and never
+    /// reported, so a wall-clock adjustment cannot move a task back to `active`.
+    pub completed_at: Instant,
+}
+
+impl ImportImageTaskRecord {
+    /// This task as of `now`: the stored view, with the percentage of progress an active
+    /// import has made by `now` on the task and on each of its disks. A read observes it
+    /// without writing anything.
+    pub fn view_at(&self, now: Instant) -> ImportImageTask {
+        let mut view = self.view.clone();
+        // A task that is no longer active has no progress left to report: "The percentage
+        // of progress of the import image task" (`ImportImageTask$Progress`).
+        if view.status.as_deref() != Some(IMPORT_TASK_STATE_ACTIVE) {
+            return view;
+        }
+        let progress = self.progress_at(now);
+        for detail in view.snapshot_details.iter_mut().flatten() {
+            detail.progress = Some(progress.clone());
+        }
+        view.progress = Some(progress);
+        view
+    }
+
+    /// The percentage of progress this import has made by `now`, as the string the
+    /// `Progress` members carry.
+    ///
+    /// Derived from the share of the import's window that has elapsed, and held below
+    /// [`MAX_ACTIVE_IMPORT_PROGRESS`] because a task still reporting progress has not
+    /// finished.
+    pub fn progress_at(&self, now: Instant) -> String {
+        let window = self
+            .completed_at
+            .saturating_duration_since(self.started_at)
+            .as_nanos();
+        let elapsed = now
+            .saturating_duration_since(self.started_at)
+            .as_nanos()
+            .min(window);
+        let percent = elapsed
+            .saturating_mul(100)
+            .checked_div(window)
+            .and_then(|percent| u64::try_from(percent).ok())
+            .unwrap_or(MAX_ACTIVE_IMPORT_PROGRESS)
+            .min(MAX_ACTIVE_IMPORT_PROGRESS);
+        percent.to_string()
+    }
+
+    /// This task as `ImportImage` reports it: [`Self::view_at`] through the members
+    /// `ImportImageResult` declares, which are the task's own minus the `BootMode` that
+    /// shape carries no member for.
+    pub fn import_response(&self, now: Instant) -> ImportImageOutput {
+        let view = self.view_at(now);
+        ImportImageOutput {
+            architecture: view.architecture,
+            description: view.description,
+            encrypted: view.encrypted,
+            hypervisor: view.hypervisor,
+            image_id: view.image_id,
+            import_task_id: view.import_task_id,
+            kms_key_id: view.kms_key_id,
+            license_type: view.license_type,
+            platform: view.platform,
+            progress: view.progress,
+            snapshot_details: view.snapshot_details,
+            status: view.status,
+            status_message: view.status_message,
+            license_specifications: view.license_specifications,
+            tags: view.tags,
+            usage_operation: view.usage_operation,
+        }
+    }
+}
+
+/// The caller-chosen bytes one stored import image task holds: its description, the KMS
+/// key and usage operation the request named, its tags, the license configuration ARNs,
+/// the per-disk strings of its snapshot details, and the `ClientToken` the token map keeps
+/// for it. Everything else on the record — the ids, the states, the architecture, the
+/// platform and the license type — is derived here or drawn from a closed catalog, so it
+/// is fixed-size.
+///
+/// Each ELEMENT of the two caller-chosen lists is charged
+/// [`IMPORT_TASK_ELEMENT_OVERHEAD_BYTES`] beyond the strings it carries, so a request of
+/// many empty-string disk containers cannot store a record per container for a zero-byte
+/// charge — the same reason [`launch_template_payload_bytes`] charges the rendered size of
+/// a nested caller structure rather than the string lengths inside it.
+///
+/// The ONE definition of that charge: `ImportImage` asks it before the write and charges
+/// exactly it.
+pub fn import_image_task_payload_bytes(view: &ImportImageTask, client_token: Option<&str>) -> usize {
+    let snapshot_bytes: usize = view
+        .snapshot_details
+        .iter()
+        .flatten()
+        .map(|detail| {
+            IMPORT_TASK_ELEMENT_OVERHEAD_BYTES
+                + detail.description.as_ref().map_or(0, String::len)
+                + detail.device_name.as_ref().map_or(0, String::len)
+                + detail.url.as_ref().map_or(0, String::len)
+                + detail.user_bucket.as_ref().map_or(0, |bucket| {
+                    bucket.s3_bucket.as_ref().map_or(0, String::len)
+                        + bucket.s3_key.as_ref().map_or(0, String::len)
+                })
+        })
+        .sum();
+    let license_bytes: usize = view
+        .license_specifications
+        .iter()
+        .flatten()
+        .map(|specification| {
+            IMPORT_TASK_ELEMENT_OVERHEAD_BYTES
+                + specification
+                    .license_configuration_arn
+                    .as_ref()
+                    .map_or(0, String::len)
+        })
+        .sum();
+    view.description
+        .as_ref()
+        .map_or(0, String::len)
+        .saturating_add(view.kms_key_id.as_ref().map_or(0, String::len))
+        .saturating_add(view.usage_operation.as_ref().map_or(0, String::len))
+        .saturating_add(tag_list_bytes(view.tags.as_deref().unwrap_or_default()))
+        .saturating_add(snapshot_bytes)
+        .saturating_add(license_bytes)
+        .saturating_add(client_token.map_or(0, str::len))
+}
+
+/// Whether `id` is a well-formed import image task id.
+///
+/// An import image task id is `import-ami-` followed by 8 or 17 lowercase hexadecimal
+/// digits — the short and the long id form every EC2 resource id takes.
+pub fn import_image_task_id_is_well_formed(id: &str) -> bool {
+    let Some(suffix) = id.strip_prefix(IMPORT_IMAGE_TASK_ID_PREFIX_WITH_HYPHEN) else {
+        return false;
+    };
+    matches!(suffix.len(), 8 | 17)
+        && suffix
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Refuse an `ImportTaskIds` entry that is not an import image task id at all: HTTP 400
+/// [`INVALID_CONVERSION_TASK_ID`], EC2's code for a conversion task id it cannot resolve.
+///
+/// Only a MALFORMED id is refused. A well-formed id no task of the account has is not an
+/// error: `DescribeImportImageTasks` answers "a list of zero or more import image tasks"
+/// (`DescribeImportImageTasksResult$ImportImageTasks`), so such an id simply selects no
+/// row — which is what the real service does with one.
+pub fn require_well_formed_import_image_task_id<E>(
+    task_id: &str,
+) -> Result<(), crate::scaffolded::Scaffolded<E>> {
+    if import_image_task_id_is_well_formed(task_id) {
+        return Ok(());
+    }
+    Err(crate::scaffolded::Scaffolded::service_error(
+        INVALID_CONVERSION_TASK_ID,
+        400,
+        format!("Invalid id: '{task_id}'"),
+    ))
+}
+
+/// Refuse a create that would take the store past a ceiling of its own:
+/// HTTP 400 [`RESOURCE_COUNT_EXCEEDED`].
+pub fn resource_count_exceeded<E>(message: impl Into<String>) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_error(RESOURCE_COUNT_EXCEEDED, 400, message)
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// Whether another import image task fits inside the store's ceiling
+    /// ([`MAX_STORED_IMPORT_IMAGE_TASKS`]).
+    ///
+    /// The same contract as [`Self::has_vpc_capacity`]: a create asks first and refuses
+    /// instead of growing the store past its ceiling.
+    pub fn has_import_image_task_capacity(&self) -> bool {
+        self.import_image_tasks.len() < MAX_STORED_IMPORT_IMAGE_TASKS
+    }
+
+    /// Complete every import image task whose `active` -> `completed` move the clock owed
+    /// by `now`.
+    ///
+    /// Reached only through [`Self::materialize_due_transitions`], so a reporting operation
+    /// observes the completion without having caused it: the move was owed at this instant
+    /// whether or not anybody called. It is a WRITE rather than a derive because completing
+    /// an import MINTS resources — "the ID of the Amazon Machine Image (AMI) of the
+    /// imported virtual machine" (`ImportImageTask$ImageId`) and "the snapshot ID of the
+    /// disk being imported" (`SnapshotDetail$SnapshotId`) — which every later read has to
+    /// agree on.
+    pub fn complete_due_import_image_tasks(&mut self, now: Instant) {
+        let due: Vec<String> = self
+            .import_image_tasks
+            .iter()
+            .filter(|(_, record)| {
+                record.view.status.as_deref() == Some(IMPORT_TASK_STATE_ACTIVE)
+                    && now >= record.completed_at
+            })
+            .map(|(task_id, _)| task_id.clone())
+            .collect();
+        for task_id in due {
+            // The AMI the import creates is an image of this store like any other, so it is
+            // stored through the one writer of an image rather than beside it.
+            let Some(spec) = self.imported_image_spec(&task_id) else {
+                continue;
+            };
+            // No room for the AMI means the import cannot produce one at all, so it ends in
+            // the state a failed import ends in rather than staying `active` for ever: the
+            // task is `deleted` and its message says which ceiling stopped it.
+            if !self.has_image_capacity() {
+                if let Some(record) = self.import_image_tasks.get_mut(&task_id) {
+                    record.view.status = Some(IMPORT_TASK_STATE_DELETED.to_string());
+                    record.view.status_message = Some(format!(
+                        "This emulator holds {MAX_IMAGES} images, which is as many as it \
+                         stores, so the imported AMI could not be created"
+                    ));
+                    record.view.progress = None;
+                    for detail in record.view.snapshot_details.iter_mut().flatten() {
+                        detail.status = Some(IMPORT_TASK_STATE_DELETED.to_string());
+                        detail.progress = None;
+                    }
+                }
+                continue;
+            }
+            let image_id = self.insert_image(spec);
+            let disks = self
+                .import_image_tasks
+                .get(&task_id)
+                .map_or(0, |record| {
+                    record.view.snapshot_details.as_ref().map_or(0, Vec::len)
+                });
+            let snapshot_ids: Vec<String> = (0..disks).map(|_| self.next_id("snap")).collect();
+            if let Some(record) = self.import_image_tasks.get_mut(&task_id) {
+                record.view.status = Some(IMPORT_TASK_STATE_COMPLETED.to_string());
+                // The conversion is over, so there is no stage left to report and no
+                // percentage left to make.
+                record.view.status_message = None;
+                record.view.progress = None;
+                record.view.image_id = Some(image_id);
+                for (detail, snapshot_id) in record
+                    .view
+                    .snapshot_details
+                    .iter_mut()
+                    .flatten()
+                    .zip(snapshot_ids)
+                {
+                    detail.snapshot_id = Some(snapshot_id);
+                    detail.status = Some(IMPORT_TASK_STATE_COMPLETED.to_string());
+                    detail.progress = None;
+                }
+            }
+        }
+    }
+
+    /// The AMI a completed import image task created, as [`Self::insert_image`] takes it.
+    ///
+    /// Everything comes off the task: the AMI is named after the import that created it,
+    /// carries the architecture, platform and boot mode the request named, and its root
+    /// volume is as large as the largest disk the import converted. The task's own tags are
+    /// NOT copied onto it — "the tags to apply to the import image task during creation"
+    /// (`ImportImageRequest$TagSpecifications`) tags the task, not the image.
+    fn imported_image_spec(&self, task_id: &str) -> Option<ImageSpec> {
+        let record = self.import_image_tasks.get(task_id)?;
+        let windows = record.view.platform.as_deref() == Some(IMAGE_PLATFORM_WINDOWS);
+        let defaults = ImageSpec::default();
+        let default_architecture = defaults.architecture.clone();
+        let root_volume_size = record
+            .view
+            .snapshot_details
+            .iter()
+            .flatten()
+            .filter_map(|detail| detail.disk_image_size)
+            .filter(|size| size.is_finite() && *size >= 1.0)
+            .map(|size| i32::try_from(size.ceil() as i64).unwrap_or(i32::MAX))
+            .max()
+            .unwrap_or(if windows {
+                WINDOWS_ROOT_VOLUME_SIZE
+            } else {
+                LINUX_ROOT_VOLUME_SIZE
+            });
+        Some(ImageSpec {
+            name: task_id.to_string(),
+            description: record.view.description.clone().unwrap_or_default(),
+            architecture: record
+                .view
+                .architecture
+                .clone()
+                .unwrap_or(default_architecture),
+            platform: record.view.platform.clone().filter(|_| windows),
+            platform_details: if windows {
+                PLATFORM_DETAILS_WINDOWS.to_string()
+            } else {
+                PLATFORM_DETAILS_LINUX.to_string()
+            },
+            usage_operation: record.view.usage_operation.clone().unwrap_or_else(|| {
+                if windows {
+                    USAGE_OPERATION_WINDOWS.to_string()
+                } else {
+                    USAGE_OPERATION_LINUX.to_string()
+                }
+            }),
+            boot_mode: record.view.boot_mode.clone(),
+            root_device_name: if windows {
+                WINDOWS_ROOT_DEVICE_NAME.to_string()
+            } else {
+                LINUX_ROOT_DEVICE_NAME.to_string()
+            },
+            root_volume_size,
+            state: IMAGE_STATE_AVAILABLE.to_string(),
+            ..defaults
+        })
+    }
 }
 
 /// Refuse a request that named a snapshot id no snapshot of the account has, the way

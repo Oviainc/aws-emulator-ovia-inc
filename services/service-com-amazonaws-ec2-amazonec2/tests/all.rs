@@ -50,6 +50,8 @@ mod fast_launch_images;
 mod get_password_data;
 #[path = "all/images.rs"]
 mod images;
+#[path = "all/import_image_tasks.rs"]
+mod import_image_tasks;
 #[path = "all/instance_lifecycle.rs"]
 mod instance_lifecycle;
 #[path = "all/instance_type_offerings.rs"]

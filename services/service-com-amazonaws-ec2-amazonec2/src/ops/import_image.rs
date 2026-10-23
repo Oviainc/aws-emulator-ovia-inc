@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ImportImage
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ImportImage`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ImportImage::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: starts an import image task from the request's disk containers, stores it
+//! in [`crate::state`] as the modelled `ImportImageTask` `DescribeImportImageTasks`
+//! reports, and answers it back out of the store. The task is `active`, and the clock —
+//! not a caller — completes it with the AMI the import creates. This is the ONLY file to
+//! touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -200,18 +196,388 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ImportImage` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ImportImageErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ImportImage"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            ImportImageTaskRecord, import_image_task_payload_bytes, require_service_state, tag_list,
+            unresolvable_snapshot_id, validate_tag_size, resource_count_exceeded,
+            BOOT_MODE_UEFI_PREFERRED, IMAGE_PLATFORM_WINDOWS, IMPORT_DISK_IMAGE_FORMATS,
+            IMPORT_IMAGE_ARCHITECTURES, IMPORT_IMAGE_HYPERVISORS,
+            IMPORT_IMAGE_LICENSE_TYPE_AWS, IMPORT_IMAGE_LICENSE_TYPE_BYOL,
+            IMPORT_IMAGE_LICENSE_TYPES, IMPORT_IMAGE_PLATFORMS,
+            IMPORT_IMAGE_TASK_ID_PREFIX, IMPORT_IMAGE_TASK_TAGGABLE_RESOURCE,
+            IMPORT_TASK_STATE_ACTIVE, IMPORT_TASK_STATUS_MESSAGE_CONVERTING,
+            MAX_CLIENT_TOKEN_CHARS, MAX_IMPORT_DISK_CONTAINERS,
+            MAX_IMPORT_LICENSE_SPECIFICATIONS, MAX_KMS_KEY_ID_CHARS, MAX_STORED_BYTES,
+            MAX_STORED_IMPORT_IMAGE_TASKS, MAX_TAGS_PER_RESOURCE, TRANSITION_DELAY,
+        };
+
+        // `ctx` carries request metadata only; an import task names no Region (it carries
+        // no ARN and no zone), so this operation reads none of it. The store is reached
+        // through the engine held on `self`.
+        let _ = ctx;
+
+        // Each of the three values below is a closed catalog the model's own member
+        // documentation publishes, and the model declares no enum for any of them, so the
+        // handler is the only place a value outside the catalog can be refused.
+        if let Some(architecture) = input.architecture.as_deref() {
+            if !IMPORT_IMAGE_ARCHITECTURES.contains(&architecture) {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "Invalid value '{architecture}' for architecture. Valid values: {}",
+                    IMPORT_IMAGE_ARCHITECTURES.join(" | ")
+                )));
+            }
+        }
+        if let Some(hypervisor) = input.hypervisor.as_deref() {
+            if !IMPORT_IMAGE_HYPERVISORS.contains(&hypervisor) {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "Invalid value '{hypervisor}' for hypervisor. Valid values: {}",
+                    IMPORT_IMAGE_HYPERVISORS.join(" | ")
+                )));
+            }
+        }
+        if let Some(platform) = input.platform.as_deref() {
+            if !IMPORT_IMAGE_PLATFORMS.contains(&platform) {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "Invalid value '{platform}' for platform. Valid values: {}",
+                    IMPORT_IMAGE_PLATFORMS.join(" | ")
+                )));
+            }
+        }
+        if let Some(license_type) = input.license_type.as_deref() {
+            if !IMPORT_IMAGE_LICENSE_TYPES.contains(&license_type) {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "Invalid value '{license_type}' for licenseType. Valid values: {}",
+                    IMPORT_IMAGE_LICENSE_TYPES.join(" | ")
+                )));
+            }
+        }
+
+        // "The uefi-preferred boot mode isn't supported for importing images"
+        // (`ImportImageRequest$BootMode`). The modelled enum admits it, so refusing it is
+        // this handler's job; every other value of the enum is already checked for it.
+        if input.boot_mode.as_deref() == Some(BOOT_MODE_UEFI_PREFERRED) {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "Invalid value '{BOOT_MODE_UEFI_PREFERRED}' for bootMode. \
+                 The {BOOT_MODE_UEFI_PREFERRED} boot mode is not supported for importing images"
+            )));
+        }
+
+        // "If a KmsKeyId is specified, the Encrypted flag must also be set"
+        // (`ImportImageRequest$KmsKeyId`).
+        let encrypted = input.encrypted.unwrap_or(false);
+        if input.kms_key_id.is_some() && !encrypted {
+            return Err(Scaffolded::invalid_parameter_combination(
+                "kmsKeyId may be specified only when encrypted is true",
+            ));
+        }
+        // The model declares no `@length` on `KmsKeyId`, so the handler is the only place
+        // the bound AWS KMS publishes for a key identifier can be enforced.
+        if input
+            .kms_key_id
+            .as_ref()
+            .is_some_and(|key_id| key_id.chars().count() > MAX_KMS_KEY_ID_CHARS)
+        {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "kmsKeyId accepts at most {MAX_KMS_KEY_ID_CHARS} characters"
+            )));
+        }
+
+        // "Import single or multi-volume disk images or EBS snapshots into an Amazon
+        // Machine Image (AMI)" (`ImportImage`): the disk containers ARE what is imported,
+        // so a request that names none asks for an import of nothing.
+        let containers = input.disk_containers.as_deref().unwrap_or_default();
+        if containers.is_empty() {
+            return Err(Scaffolded::missing_parameter(
+                "diskContainers must name at least one disk image to import",
+            ));
+        }
+        // Neither the model nor the request parsers bound the LENGTH of `DiskContainers`,
+        // and every container retains a snapshot detail on the stored task for the
+        // process's lifetime, so the count is capped here — before any per-container work is
+        // done, and before anything is stored.
+        if containers.len() > MAX_IMPORT_DISK_CONTAINERS {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "diskContainers carries {} containers, above the maximum of \
+                 {MAX_IMPORT_DISK_CONTAINERS}",
+                containers.len()
+            )));
+        }
+        // "The size of the uploaded disk image, in GiB" (`ClientData$UploadSize`) describes
+        // ONE upload, so it sizes the disk only when the request imports exactly one.
+        let single_disk_size = input
+            .client_data
+            .as_ref()
+            .and_then(|client_data| client_data.upload_size)
+            .filter(|_| containers.len() == 1);
+
+        let mut snapshot_details: Vec<SnapshotDetail> = Vec::with_capacity(containers.len());
+        for container in containers {
+            // Each of the three members names a different source for the one disk this
+            // container describes — "the URL to the Amazon S3-based disk image being
+            // imported", "the S3 bucket for the disk image", "the ID of the EBS snapshot to
+            // be used for importing the snapshot" (`ImageDiskContainer`) — so a container
+            // carries exactly one of them.
+            let sources = usize::from(container.url.is_some())
+                + usize::from(container.user_bucket.is_some())
+                + usize::from(container.snapshot_id.is_some());
+            if sources > 1 {
+                return Err(Scaffolded::invalid_parameter_combination(
+                    "A disk container names its disk image by exactly one of url, \
+                     userBucket or snapshotId",
+                ));
+            }
+            if sources == 0 {
+                return Err(Scaffolded::missing_parameter(
+                    "A disk container must name its disk image by url, userBucket or \
+                     snapshotId",
+                ));
+            }
+            // This emulator stores no EBS snapshots — every snapshot operation is still a
+            // stub — so an id a caller names here can only be one no snapshot of the
+            // account has, which is the answer EC2 gives for it.
+            if let Some(snapshot_id) = container.snapshot_id.as_deref() {
+                return Err(unresolvable_snapshot_id(snapshot_id));
+            }
+            // "The format of the disk image being imported. Valid values: OVA | VHD | VHDX
+            // | VMDK | RAW" (`ImageDiskContainer$Format`): a disk image read from S3 cannot
+            // be interpreted without one. The catalog spelling is restored here so one
+            // format is reported one way however the request spelled it.
+            let Some(format) = container.format.as_deref() else {
+                return Err(Scaffolded::missing_parameter(
+                    "format is required for a disk container that names a disk image",
+                ));
+            };
+            let Some(canonical_format) = IMPORT_DISK_IMAGE_FORMATS
+                .iter()
+                .find(|known| known.eq_ignore_ascii_case(format))
+            else {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "Invalid value '{format}' for format. Valid values: {}",
+                    IMPORT_DISK_IMAGE_FORMATS.join(" | ")
+                )));
+            };
+            snapshot_details.push(SnapshotDetail {
+                description: container.description.clone(),
+                device_name: container.device_name.clone(),
+                disk_image_size: single_disk_size,
+                format: Some((*canonical_format).to_string()),
+                url: container.url.clone(),
+                user_bucket: container.user_bucket.as_ref().map(|bucket| {
+                    UserBucketDetails {
+                        s3_bucket: bucket.s3_bucket.clone(),
+                        s3_key: bucket.s3_key.clone(),
+                    }
+                }),
+                // Minted when the clock completes the import, not before: there is no
+                // snapshot of a disk that has not been converted yet.
+                snapshot_id: None,
+                status: Some(IMPORT_TASK_STATE_ACTIVE.to_string()),
+                // Derived from the import's window on every read.
+                progress: None,
+                // The conversion of this disk has not failed, so it has nothing to say
+                // beyond its status.
+                status_message: None,
+            });
+        }
+
+        // "The tags to apply to the import image task during creation"
+        // (`ImportImageRequest$TagSpecifications`): the task is the only resource this call
+        // creates, so a specification naming any other resource type is refused rather than
+        // accepted and discarded.
+        let mut tags: ::std::collections::BTreeMap<String, String> =
+            ::std::collections::BTreeMap::new();
+        for specification in input.tag_specifications.iter().flatten() {
+            match specification.resource_type.as_deref() {
+                Some(IMPORT_IMAGE_TASK_TAGGABLE_RESOURCE) | None => {}
+                Some(resource_type) => {
+                    return Err(Scaffolded::invalid_parameter_value(format!(
+                        "Invalid value '{resource_type}' for resourceType. \
+                         ImportImage tags the '{IMPORT_IMAGE_TASK_TAGGABLE_RESOURCE}' it creates"
+                    )));
+                }
+            }
+            for tag in specification.tags.iter().flatten() {
+                let key = tag.key.clone().unwrap_or_default();
+                let value = tag.value.clone().unwrap_or_default();
+                validate_tag_size(&key, &value)?;
+                tags.insert(key, value);
+            }
+        }
+        if tags.len() > MAX_TAGS_PER_RESOURCE {
+            return Err(Scaffolded::tag_limit_exceeded(format!(
+                "An import image task carries at most {MAX_TAGS_PER_RESOURCE} tags, not {}",
+                tags.len()
+            )));
+        }
+        if input
+            .client_token
+            .as_ref()
+            .is_some_and(|token| token.chars().count() > MAX_CLIENT_TOKEN_CHARS)
+        {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "clientToken accepts at most {MAX_CLIENT_TOKEN_CHARS} characters"
+            )));
+        }
+
+        // "Leaving this parameter undefined is the same as choosing AWS when importing a
+        // Windows Server operating system, and the same as choosing BYOL when importing a
+        // Windows client operating system … or a Linux operating system"
+        // (`ImportImageRequest$LicenseType`), so the task reports the license type the
+        // import runs under even when the request named none. A request that named no
+        // platform leaves it for the import to determine, and the task reports none.
+        let license_type = input.license_type.clone().or_else(|| {
+            match input.platform.as_deref() {
+                Some(IMAGE_PLATFORM_WINDOWS) => Some(IMPORT_IMAGE_LICENSE_TYPE_AWS.to_string()),
+                Some(_) => Some(IMPORT_IMAGE_LICENSE_TYPE_BYOL.to_string()),
+                None => None,
+            }
+        });
+
+        // "The name of the role to use when not using the default role, 'vmimport'"
+        // (`ImportImageRequest$RoleName`): nothing in the response reports the role, and
+        // this emulator reads no S3 object, so the member names no fact of the task.
+        let _ = input.role_name.as_deref();
+
+        let specifications = input.license_specifications.as_deref().unwrap_or_default();
+        // The same unbounded-list reason as `DiskContainers`: every entry is retained on the
+        // stored task, so the count is capped before the list is copied.
+        if specifications.len() > MAX_IMPORT_LICENSE_SPECIFICATIONS {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "licenseSpecifications carries {} entries, above the maximum of \
+                 {MAX_IMPORT_LICENSE_SPECIFICATIONS}",
+                specifications.len()
+            )));
+        }
+        let license_specifications: Vec<ImportImageLicenseConfigurationResponse> = specifications
+            .iter()
+            .map(|specification| ImportImageLicenseConfigurationResponse {
+                license_configuration_arn: specification.license_configuration_arn.clone(),
+            })
+            .collect();
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+        let now = ::std::time::Instant::now();
+
+        // The clock-owed completion of every import already due is applied before anything
+        // is read back, for the same reason `DescribeImportImageTasks` applies it: it was
+        // owed at this instant whether or not anybody called. Without it a `ClientToken`
+        // replay arriving after a task's span would answer the stale `active` view while the
+        // describe reported the same task `completed` with its AMI.
+        store.materialize_due_transitions();
+
+        // Idempotency: "The token to enable idempotency for VM import requests"
+        // (`ImportImageRequest$ClientToken`) — one token names the one task it started, so
+        // a replay reports that task and starts no second import. Read before the DryRun
+        // check, answered after it, because a replay stores nothing and so passes the
+        // ceilings a fresh import has to clear.
+        let replayed = input
+            .client_token
+            .as_deref()
+            .and_then(|token| store.import_image_task_client_tokens.get(token).cloned());
+
+        if replayed.is_none() && !store.has_import_image_task_capacity() {
+            return Err(resource_count_exceeded(format!(
+                "This emulator holds {MAX_STORED_IMPORT_IMAGE_TASKS} import image tasks, \
+                 which is as many as it stores"
+            )));
+        }
+
+        // The task as it will be stored, all but its id: the id is minted only after the
+        // DryRun and replay gates below, so neither a dry run (which "leaves state
+        // untouched") nor an idempotent replay (which stores nothing) consumes one from the
+        // store's counter. The id is fixed-size and uncharged, so the byte charge below does
+        // not need it.
+        let mut view = ImportImageTask {
+            import_task_id: None,
+            architecture: input.architecture.clone(),
+            description: input.description.clone(),
+            encrypted: Some(encrypted),
+            // "Valid values: xen" (`ImportImageRequest$Hypervisor`) is a one-value catalog,
+            // so a request that named none is importing onto that hypervisor.
+            hypervisor: Some(
+                input
+                    .hypervisor
+                    .clone()
+                    .unwrap_or_else(|| IMPORT_IMAGE_HYPERVISORS[0].to_string()),
+            ),
+            kms_key_id: input.kms_key_id.clone(),
+            license_type: license_type.clone(),
+            platform: input.platform.clone(),
+            boot_mode: input.boot_mode.clone(),
+            usage_operation: input.usage_operation.clone(),
+            snapshot_details: Some(snapshot_details),
+            license_specifications: Some(license_specifications),
+            tags: Some(tag_list(&tags)),
+            // A task AWS hands back is running: the AMI, the snapshot ids and the
+            // completion are owed by the clock, not by this call.
+            status: Some(IMPORT_TASK_STATE_ACTIVE.to_string()),
+            status_message: Some(IMPORT_TASK_STATUS_MESSAGE_CONVERTING.to_string()),
+            image_id: None,
+            // Derived from the import's window on every read.
+            progress: None,
+        };
+
+        // The caller-chosen bytes this import would retain for the process's lifetime,
+        // counted by the ONE definition of that charge. A COUNT ceiling admits gigabytes on
+        // its own, because each record holds strings the caller chose the length of.
+        let payload_bytes =
+            import_image_task_payload_bytes(&view, input.client_token.as_deref());
+        if replayed.is_none() && store.would_exceed_stored_bytes(payload_bytes) {
+            return Err(resource_count_exceeded(format!(
+                "This emulator holds {} of at most {MAX_STORED_BYTES} bytes of \
+                 caller-supplied data, so it cannot store {payload_bytes} more",
+                store.stored_bytes()
+            )));
+        }
+
+        // DryRun sits AFTER every parameter has been validated and BEFORE the first write:
+        // the flag asks whether the request WOULD have worked, so one that would have been
+        // refused is refused with that reason instead, and one that would have succeeded
+        // leaves state untouched.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        if let Some(task_id) = replayed {
+            return store
+                .import_image_tasks
+                .get(&task_id)
+                .map(|record| record.import_response(now))
+                .ok_or_else(|| {
+                    Scaffolded::internal_error(format!(
+                        "a client token names import task '{task_id}', which is not stored"
+                    ))
+                });
+        }
+
+        let task_id = store.next_id(IMPORT_IMAGE_TASK_ID_PREFIX);
+        view.import_task_id = Some(task_id.clone());
+        let record = ImportImageTaskRecord {
+            view,
+            started_at: now,
+            // An import AWS hands back is `active` and reaches `completed` without anyone
+            // asking: the same clock-owed span every other transition in this crate takes.
+            completed_at: now + TRANSITION_DELAY,
+        };
+        if let Some(token) = input.client_token.clone() {
+            store
+                .import_image_task_client_tokens
+                .insert(token, task_id.clone());
+        }
+        store.add_stored_bytes(payload_bytes);
+        store.import_image_tasks.insert(task_id.clone(), record);
+
+        // Read the response back OUT of the store, so the caller sees what a later
+        // DescribeImportImageTasks will see rather than the request object.
+        store
+            .import_image_tasks
+            .get(&task_id)
+            .map(|record| record.import_response(now))
+            .ok_or_else(|| {
+                Scaffolded::internal_error(format!(
+                    "import task '{task_id}' was not stored by this request"
+                ))
+            })
     }
 }
