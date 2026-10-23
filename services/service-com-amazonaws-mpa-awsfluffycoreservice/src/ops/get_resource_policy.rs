@@ -13,12 +13,18 @@
 //! The order of the refusals is the order the request is decided in:
 //!
 //! * a `ResourceArn` that is not a well-formed ARN (the member carries no modelled
-//!   pattern, so the boundary validator passes one) names no resource a policy can be
-//!   attached to: `InvalidParameterException` (400);
+//!   pattern, so the boundary validator passes one) is refused by this service's own ARN
+//!   rule, with the one message it states for the malformed-ARN class
+//!   ([`crate::state::invalid_arn`]): `ValidationException` (400);
 //! * an ARN outside the caller's own account is denied BEFORE the resource is resolved
 //!   ([`crate::state::authorize_resource_arn`]): `AccessDeniedException` (403);
-//! * a triple that names no recorded attachment — no resource under that ARN, or no
-//!   policy of that name and type attached to it: `ResourceNotFoundException` (404).
+//! * a `ResourceArn` this store records no resource under
+//!   ([`crate::state::ComAmazonawsMpaAwsfluffycoreserviceState::records_resource`]) fails
+//!   the RESOURCE lookup, before any policy-name or policy-type matching is reached, so
+//!   the answer to an unrecorded resource does not depend on either:
+//!   `ResourceNotFoundException` (404) with this service's constant not-found message;
+//! * a recorded resource carrying no policy of that name and type is the same 404 with
+//!   the same message.
 //!
 //! `@readonly`: this handler writes nothing of its own. It calls
 //! [`crate::state::ComAmazonawsMpaAwsfluffycoreserviceState::materialize_due`] first,
@@ -175,17 +181,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
         // `ResourceArn` is a plain `String` with `length(max: 1000)` and NO modelled
-        // pattern, so the boundary validator passes a value that is not an ARN at all.
-        // Such a value names no resource a policy can be attached to, so the request is
-        // refused for the parameter it is wrong in rather than resolved against state.
+        // pattern, so the boundary validator passes a value that is not an ARN at all —
+        // and so the service's own ARN rule is applied here, with the one message this
+        // service refuses a malformed ARN with (`crate::state::invalid_arn`), the same
+        // refusal `crate::service`'s seam states for the ARN members whose grammar the
+        // model DOES declare.
         if !crate::state::is_well_formed_arn(&input.resource_arn) {
-            return Err(GetResourcePolicyErrorModeled::InvalidParameterException(
-                InvalidParameterException {
-                    message: format!(
-                        "ResourceArn '{}' is not a valid Amazon Resource Name.",
-                        input.resource_arn
-                    ),
-                },
+            return Err(GetResourcePolicyErrorModeled::ValidationException(
+                crate::state::invalid_arn(),
             )
             .into());
         }
@@ -195,6 +198,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // ARN outside the caller's account is refused whatever is stored under it.
         crate::state::authorize_resource_arn(Self::NAME, &input.resource_arn)
             .map_err(GetResourcePolicyErrorModeled::AccessDeniedException)?;
+
+        // The one answer for every request that resolves to no recorded attachment: a
+        // resource this store does not record, and a recorded resource carrying no
+        // policy of the name and type asked for, are the same 404 to a caller — with
+        // this service's one constant not-found message, which names nothing the
+        // request carried.
+        let not_found =
+            || GetResourcePolicyErrorModeled::ResourceNotFoundException(
+                crate::state::resource_not_found(),
+            );
+
+        // This operation models no server error (its errors are `AccessDenied`,
+        // `InvalidParameter`, `ResourceNotFound`, `Throttling` and `Validation`), and
+        // the store is unreachable only on an engine that holds no state at all —
+        // where nothing is recorded, so for a READ the truthful answer is the same 404.
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(not_found().into());
+        };
+        let mut state = store.lock();
+        state.materialize_due(::std::time::SystemTime::now());
+
+        // `ResourceArn` is resolved against the resource store FIRST: a resource this
+        // store does not record fails here, so the answer to an unrecorded ARN never
+        // depends on the `PolicyName` or `PolicyType` the request named — no
+        // policy-name matching is reached at all.
+        if !state.records_resource(&input.resource_arn) {
+            return Err(not_found().into());
+        }
 
         // `PolicyType` targets the `PolicyType` enum, so the boundary validator has
         // already refused every token that enum does not declare. A value that reaches
@@ -210,34 +241,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-
-        // The one answer for every triple that names no recorded attachment: a resource
-        // this store does not record, and a recorded resource carrying no policy of
-        // this name and type, are the same 404 to a caller.
-        //
-        // The message is BUILT FROM THE REQUEST — the triple that resolved to nothing —
-        // as this service's other not-found refusals are (`GetApprovalTeam` names the
-        // ARN it could not resolve). The requirement for this refusal is the 404 and
-        // the `ResourceNotFoundException` code; neither AWS nor this service's model
-        // states the text of the message itself, so a recorded one is an example.
-        let not_found = || {
-            GetResourcePolicyErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: format!(
-                    "No {} policy named '{}' is attached to resource '{}'.",
-                    input.policy_type, input.policy_name, input.resource_arn
-                ),
-            })
-        };
-
-        // This operation models no server error (its errors are `AccessDenied`,
-        // `InvalidParameter`, `ResourceNotFound`, `Throttling` and `Validation`), and
-        // the store is unreachable only on an engine that holds no state at all —
-        // where nothing is recorded, so for a READ the truthful answer is the same 404.
-        let Some(store) = crate::state::service_state(&*self.engine) else {
-            return Err(not_found().into());
-        };
-        let mut state = store.lock();
-        state.materialize_due(::std::time::SystemTime::now());
 
         let Some(policy) =
             state.resource_policy(&input.resource_arn, &input.policy_name, policy_type)

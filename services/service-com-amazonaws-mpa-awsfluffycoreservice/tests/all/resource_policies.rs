@@ -8,10 +8,11 @@
 //! an approval team's `Policies` references are its attached resource policies,
 //! resolved through the policy catalog, with `$DEFAULT` resolving to the policy's
 //! current default version — and refuses every triple that names no recorded
-//! attachment with `ResourceNotFoundException` (404), a `ResourceArn` that is not a
-//! well-formed ARN with `InvalidParameterException` (400) and an ARN outside the
-//! caller's account with `AccessDeniedException` (403), the last decided before the
-//! resource is resolved.
+//! attachment with `ResourceNotFoundException` (404) carrying this service's constant
+//! not-found message, a `ResourceArn` that is not a well-formed ARN with
+//! `ValidationException` (400) carrying its constant malformed-ARN message, and an ARN
+//! outside the caller's account with `AccessDeniedException` (403), the last decided
+//! before the resource is resolved.
 //!
 //! The tables below span the class each rule generalises over rather than one recorded
 //! shape: the attachment table varies the catalog entry (including the one a fresh
@@ -512,14 +513,12 @@ async fn a_triple_that_names_no_attachment_is_not_found() {
             "ResourceNotFoundException",
             "case {case:?}: expected ResourceNotFoundException, got {body:?}"
         );
-        // The refusal is built from the request: the triple that resolved to nothing.
-        // The 404 and the error code are the requirement; the text is this service's.
+        // The refusal names NOTHING the request carried: one service-wide constant for
+        // every resource-lookup failure, so the answer does not vary with the
+        // `PolicyName`, the `PolicyType` or the ARN asked for.
         assert_eq!(
             text(&body, "Message"),
-            format!(
-                "No {policy_type} policy named '{policy_name}' is attached to resource \
-                 '{resource_arn}'."
-            ),
+            state::RESOURCE_NOT_FOUND_MESSAGE,
             "case {case:?}: wrong refusal message in {body:?}"
         );
     }
@@ -531,11 +530,13 @@ async fn a_triple_that_names_no_attachment_is_not_found() {
     }
 }
 
-/// A `ResourceArn` that is not a well-formed ARN is `InvalidParameterException` (400):
-/// the member carries no modelled pattern, so this operation is where the value is
-/// refused.
+/// A `ResourceArn` that is not a well-formed ARN is this service's malformed-ARN
+/// refusal — `ValidationException` (400) with [`state::INVALID_ARN_MESSAGE`]: the member
+/// carries no modelled pattern, so this operation is where the value is refused, and the
+/// refusal is the same one the boundary seam states for the ARN members that do carry a
+/// pattern.
 #[tokio::test]
-async fn a_resource_arn_that_is_not_an_arn_is_an_invalid_parameter() {
+async fn a_resource_arn_that_is_not_an_arn_is_the_malformed_arn_refusal() {
     let harness = Harness::new();
     let team_arn = team_with_every_policy(&harness, "policy-reader").await;
 
@@ -584,8 +585,13 @@ async fn a_resource_arn_that_is_not_an_arn_is_an_invalid_parameter() {
         assert_eq!(status, 400, "case {case:?}: expected HTTP 400, got {status} with {body:?}");
         assert_eq!(
             error_code(&body),
-            "InvalidParameterException",
-            "case {case:?}: expected InvalidParameterException, got {body:?}"
+            "ValidationException",
+            "case {case:?}: expected ValidationException, got {body:?}"
+        );
+        assert_eq!(
+            text(&body, "Message"),
+            state::INVALID_ARN_MESSAGE,
+            "case {case:?}: wrong malformed-ARN message in {body:?}"
         );
     }
 }

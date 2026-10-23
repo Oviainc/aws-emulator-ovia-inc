@@ -191,10 +191,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         state.materialize_due(::std::time::SystemTime::now());
 
         let Some(team) = state.team(&input.arn) else {
+            // The one message this service answers every resource lookup that
+            // resolves to nothing with: a service constant that names neither the
+            // operation nor the ARN asked for (`crate::state::resource_not_found`).
             return Err(GetApprovalTeamErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: format!("No approval team found for ARN '{}'.", input.arn),
-                },
+                crate::state::resource_not_found(),
             )
             .into());
         };

@@ -60,11 +60,26 @@
 //! * [`ComAmazonawsMpaAwsfluffycoreserviceState::is_management_account`] /
 //!   [`not_management_account`] — an operation an organization restricts to its
 //!   management account is refused the same way for any other caller.
+//!
+//! # How this service words a rejection
+//!
+//! A rejection's wording is part of this service's contract, so the ones MPA states with
+//! a FIXED sentence are built here and nowhere else, and every handler raises them
+//! through these constructors instead of formatting prose of its own:
+//!
+//! * [`resource_not_found`] — the one message every ARN-addressed resource lookup in
+//!   this service answers with ([`RESOURCE_NOT_FOUND_MESSAGE`]).
+//! * [`tagged_resource_not_found`] — the tag family's not-found, whose message IS the
+//!   `ResourceArn` the request sent.
+//! * [`invalid_arn`] / [`INVALID_ARN_MESSAGE`] — the one message a member that should
+//!   carry an Amazon Resource Name and does not is refused with, raised by a handler for
+//!   a member the model gives no ARN `@pattern` and by `crate::service`'s refusal seam
+//!   ([`is_malformed_arn_violation`]) for the members it does.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
 
-use crate::ops::types::AccessDeniedException;
+use crate::ops::types::{AccessDeniedException, ResourceNotFoundException, ValidationException};
 
 /// Region stamped into a minted ARN when the request carries no SigV4 credential
 /// scope to read one from.
@@ -854,6 +869,18 @@ impl ComAmazonawsMpaAwsfluffycoreserviceState {
         self.team(arn).map(|team| &team.tags)
     }
 
+    /// Whether this store records a RESOURCE under `arn`.
+    ///
+    /// The one place an operation addressing a resource by ARN decides whether it
+    /// exists, so the tagging and the resource-policy operations agree on it. The
+    /// approval team is the only resource this service stores, so an ARN naming anything
+    /// else names no resource; when another resource type is added here, every operation
+    /// that resolves a resource ARN picks it up from this one function.
+    #[must_use]
+    pub fn records_resource(&self, arn: &str) -> bool {
+        self.team(arn).is_some()
+    }
+
     /// The tags of the resource `arn` names, for update. Same resolution as
     /// [`ComAmazonawsMpaAwsfluffycoreserviceState::resource_tags`].
     pub fn resource_tags_mut(&mut self, arn: &str) -> Option<&mut BTreeMap<String, String>> {
@@ -1109,6 +1136,87 @@ pub fn not_management_account() -> AccessDeniedException {
         message: "Action can only be performed by an organization\u{2019}s management account."
             .to_string(),
     }
+}
+
+/// The one message every resource-lookup failure of this service answers with.
+///
+/// `ResourceNotFoundException$Message` is `@required` with `@length(max: 1000)` and the
+/// model fixes no text for it, so the rule is RECORDED behaviour: four ARN-addressed
+/// operations (`GetApprovalTeam`, `StartActiveApprovalTeamDeletion`, `ListPolicyVersions`,
+/// `GetResourcePolicy`) answer one and the same sentence for an ARN that resolves to
+/// nothing, independent of the operation and of the ARN supplied. It is therefore a
+/// SERVICE CONSTANT: the refusal names no value the request carried.
+pub const RESOURCE_NOT_FOUND_MESSAGE: &str = "The requested resource does not exist.";
+
+/// The `ResourceNotFoundException` an ARN-addressed lookup answers with when nothing is
+/// recorded under the ARN it was given: 404, and [`RESOURCE_NOT_FOUND_MESSAGE`].
+///
+/// The tag family is the one exception — see [`tagged_resource_not_found`].
+#[must_use]
+pub fn resource_not_found() -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: RESOURCE_NOT_FOUND_MESSAGE.to_string(),
+    }
+}
+
+/// The `ResourceNotFoundException` the TAG FAMILY (`TagResource`, `UntagResource`,
+/// `ListTagsForResource`) answers with for a `ResourceArn` no stored resource carries.
+///
+/// Its message is BUILT FROM THE REQUEST and is the `ResourceArn` member verbatim, with
+/// no surrounding prose: on this family the not-found message IS the identifier of the
+/// resource that was not found, which is what a caller reads out of it. `ResourceArn` is
+/// `@length(max: 1000)` here — exactly the bound on `ResourceNotFoundException$Message`
+/// — so the value always fits the message it becomes and is never cut.
+#[must_use]
+pub fn tagged_resource_not_found(resource_arn: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: resource_arn.to_string(),
+    }
+}
+
+/// The one message this service refuses a malformed Amazon Resource Name with.
+///
+/// `ValidationException$Message` is `@required` and the model fixes no text for it, so
+/// the rule is RECORDED behaviour: a value that is not a well-formed MPA ARN is refused
+/// with 400 `ValidationException` and this one sentence, on every member that carries an
+/// ARN (`GetPolicyVersion$PolicyVersionArn`, and the `ResourceArn` of the tag family,
+/// `GetResourcePolicy` and `ListResourcePolicies`). It names neither the member nor the
+/// grammar: the malformed-ARN class is one service-level rule, not a per-member
+/// constraint report.
+pub const INVALID_ARN_MESSAGE: &str = "Invalid Resource Arn";
+
+/// The `ValidationException` (400) a member that should carry an ARN and does not is
+/// refused with: [`INVALID_ARN_MESSAGE`].
+#[must_use]
+pub fn invalid_arn() -> ValidationException {
+    ValidationException {
+        message: INVALID_ARN_MESSAGE.to_string(),
+    }
+}
+
+/// Whether `pattern` is an ARN grammar.
+///
+/// Every ARN-valued member of this model anchors its `@pattern` on the literal `arn:`
+/// prefix an Amazon Resource Name starts with — `ApprovalTeamArn`
+/// (`^arn:aws(-[^:]+)?:mpa:…:approval-team/…$`), `SessionArn` and `QualifiedPolicyArn`
+/// (`^arn:.{1,63}:mpa:::aws:policy/…$`), from
+/// `smithy_query(query="shape",shape="ApprovalTeamArn,SessionArn,QualifiedPolicyArn")` —
+/// and no member whose value is not an ARN does. So the prefix is what tells a failed
+/// ARN grammar from any other failed pattern, without naming a member.
+#[must_use]
+pub fn is_arn_pattern(pattern: &str) -> bool {
+    pattern.starts_with("^arn:")
+}
+
+/// Whether `violation` is a value that should have been an ARN failing the ARN grammar
+/// its member's `@pattern` declares — the malformed-ARN class this service answers with
+/// [`invalid_arn`] rather than with the framework's per-member constraint report.
+#[must_use]
+pub fn is_malformed_arn_violation(violation: &::aws_smithy_schema_server::Violation) -> bool {
+    matches!(
+        &violation.kind,
+        ::aws_smithy_schema_server::ViolationKind::Pattern(pattern) if is_arn_pattern(pattern)
+    )
 }
 
 /// `message` cut to the `AccessDeniedException$Message` bound

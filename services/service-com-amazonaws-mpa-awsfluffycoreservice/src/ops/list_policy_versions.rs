@@ -197,10 +197,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = store.lock();
 
         let Some(policy) = state.policy(&input.policy_arn) else {
+            // The one message this service answers every resource lookup that
+            // resolves to nothing with (`crate::state::resource_not_found`).
             return Err(ListPolicyVersionsErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: format!("No policy found for ARN '{}'.", input.policy_arn),
-                },
+                crate::state::resource_not_found(),
             )
             .into());
         };

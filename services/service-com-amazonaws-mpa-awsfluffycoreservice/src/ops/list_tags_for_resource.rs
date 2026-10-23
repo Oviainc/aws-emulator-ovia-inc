@@ -154,6 +154,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
+        // `ResourceArn` is a plain `String` with `length(max: 1000)` and NO modelled
+        // pattern, so the boundary validator passes a value that is not an ARN at all:
+        // this service's own ARN rule refuses it here, with the one message it states
+        // for the malformed-ARN class (`crate::state::invalid_arn`, 400).
+        if !crate::state::is_well_formed_arn(&input.resource_arn) {
+            return Err(ListTagsForResourceErrorModeled::ValidationException(
+                crate::state::invalid_arn(),
+            )
+            .into());
+        }
         // The account boundary is evaluated BEFORE the resource is resolved: an ARN
         // outside the caller's account is refused with the modelled
         // `AccessDeniedException` (403) whatever is stored under it, so a client can
@@ -173,10 +183,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         state.materialize_due(::std::time::SystemTime::now());
 
         let Some(tags) = state.resource_tags(&input.resource_arn) else {
+            // The tag family's not-found message IS the `ResourceArn` that was sent,
+            // verbatim (`crate::state::tagged_resource_not_found`).
             return Err(ListTagsForResourceErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: format!("No resource found for ARN '{}'.", input.resource_arn),
-                },
+                crate::state::tagged_resource_not_found(&input.resource_arn),
             )
             .into());
         };

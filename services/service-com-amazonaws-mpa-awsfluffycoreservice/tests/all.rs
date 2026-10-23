@@ -23,6 +23,8 @@ mod policy_catalog;
 mod policy_version_detail;
 #[path = "all/policy_versions.rs"]
 mod policy_versions;
+#[path = "all/rejection_wording.rs"]
+mod rejection_wording;
 #[path = "all/resource_policies.rs"]
 mod resource_policies;
 #[path = "all/resource_tags.rs"]
