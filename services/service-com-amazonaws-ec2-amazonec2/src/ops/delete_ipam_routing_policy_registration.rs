@@ -1,15 +1,30 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteIpamRoutingPolicyRegistration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteIpamRoutingPolicyRegistration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: withdraws the Route Origin Authorization (ROA) the request names — the
+//! routing policy registration one IPAM internet registry association holds for one CIDR
+//! prefix — by moving it into the transient `delete-in-progress` state with the clock owing
+//! it `delete-complete`, and answers the delta that records the change. This is the ONLY
+//! file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteIpamRoutingPolicyRegistration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The refusals, in the order the service answers them: something that is not an
+//! `IpamInternetRegistryAssociationId` at all is
+//! `InvalidIpamInternetRegistryAssociationId.Malformed` and a `Cidr` that is not an address
+//! prefix is `InvalidParameterValue`, both before there is anything to look up; a `DryRun`
+//! request a caller holds the permissions for is `DryRunOperation` and writes nothing,
+//! because the flag asks whether the CALLER MAY make the request ("without actually making
+//! the request", `DryRun`) rather than anything about the named resources; then a
+//! well-formed association id this account holds no association for is
+//! `InvalidIpamInternetRegistryAssociationId.NotFound`, a prefix that association holds no
+//! registration for is `InvalidCidr.NotFound`, and a registration whose deletion has
+//! already been asked for is `IncorrectState`.
+//!
+//! "Forces the deletion even if it conflicts with an announced route. Default: false"
+//! (`Force`): the announced routes this emulator knows about are the account's own BYOIP
+//! address ranges in the `advertised` state, so deleting the authorization for a prefix
+//! AWS is currently announcing is refused with `OperationNotPermitted` unless `Force` is
+//! set — withdrawing a ROA under a live announcement is exactly the conflict that sentence
+//! names.
 //!
 //! ## Shape of an operation
 //!
@@ -74,6 +89,50 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state;
+
+/// The `action` a delete records in the delta's JSON specification.
+///
+/// "The JSON specification describing the changes applied in this delta"
+/// (`IpamRoutingPolicyRegistrationDelta$DeltaJson`) carries no documented schema, so the
+/// one this crate writes is the registration's own members under the change that was
+/// applied — built from the STORED registration and the request's `Force`, never from a
+/// recording.
+const DELTA_ACTION_DELETE: &str = "delete";
+
+/// The JSON specification of the change this delete applies: the prefix whose authorization
+/// is being withdrawn, as the stored registration described it, and whether the caller
+/// forced the deletion.
+fn delete_delta_json(view: &IpamRoutingPolicyRegistration, force: bool) -> String {
+    let mut change = ::serde_json::Map::new();
+    change.insert(
+        "action".to_string(),
+        ::serde_json::Value::from(DELTA_ACTION_DELETE),
+    );
+    if let Some(cidr) = view.cidr.as_deref() {
+        change.insert("cidr".to_string(), ::serde_json::Value::from(cidr));
+    }
+    if let Some(asns) = view.asns.as_deref() {
+        change.insert(
+            "asns".to_string(),
+            ::serde_json::Value::from(asns.to_vec()),
+        );
+    }
+    if let Some(max_length) = view.max_length {
+        change.insert(
+            "maxLength".to_string(),
+            ::serde_json::Value::from(max_length),
+        );
+    }
+    if let Some(permit) = view.permit_more_specific_announcements {
+        change.insert(
+            "permitMoreSpecificAnnouncements".to_string(),
+            ::serde_json::Value::from(permit),
+        );
+    }
+    change.insert("force".to_string(), ::serde_json::Value::from(force));
+    ::serde_json::Value::Object(change).to_string()
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -142,18 +201,186 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteIpamRoutingPolicyRegistration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteIpamRoutingPolicyRegistrationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteIpamRoutingPolicyRegistration"))
+        // `ctx` carries request metadata only; this operation reads none of it — the
+        // association and the prefix are both named in the request, and a registration
+        // carries no Region member of its own. The store is reached through the engine held
+        // on `self`.
+        let _ = ctx;
+
+        let association_id = input.ipam_internet_registry_association_id.as_str();
+        // The request's own FORM first, before anything is resolved: "not an id of this
+        // kind" and "not an address prefix" are malformed requests rather than missing
+        // resources, and neither is answered by the DryRun arm below.
+        if !state::ipam_internet_registry_association_id_is_well_formed(association_id) {
+            return Err(state::invalid_ipam_internet_registry_association_id_malformed(
+                association_id,
+            ));
+        }
+        // "The IP address prefix in CIDR notation identifying the routing policy
+        // registration to delete" (`Cidr`): canonicalised by the one reader of a publicly
+        // routable prefix of either family, so a caller that names one prefix two ways
+        // ("192.0.2.0/24", "192.0.2.5/24") reaches the one registration.
+        let cidr = state::canonical_byoip_cidr(&input.cidr).map_err(|_| {
+            state::invalid_parameter_value(format!(
+                "Invalid value '{cidr}' for Cidr. It must be an address range in CIDR notation",
+                cidr = input.cidr,
+            ))
+        })?;
+        // "A unique, case-sensitive identifier to ensure that the operation completes no
+        // more than one time" (`ClientToken`): the token is retained for the process's
+        // lifetime, so its length is held to the bound every client token in this crate is.
+        if input
+            .client_token
+            .as_ref()
+            .is_some_and(|token| token.chars().count() > state::MAX_CLIENT_TOKEN_CHARS)
+        {
+            return Err(state::invalid_parameter_value(format!(
+                "clientToken accepts at most {} characters",
+                state::MAX_CLIENT_TOKEN_CHARS
+            )));
+        }
+
+        // "Checks whether you have the required permissions for the operation, without
+        // actually making the request" (`DryRun`): a question about the CALLER, answered
+        // once the request's own form has been checked and before anything is resolved or
+        // written; every caller of this emulator is permitted.
+        if input.dry_run == Some(true) {
+            return Err(state::dry_run_operation());
+        }
+
+        let handle = state::require_service_state(&*self.engine)?;
+        let mut store = handle.lock();
+        // The clock first: a registration whose `delete-complete` or a delta whose
+        // `published` has fallen due is already there, so every question below is asked of
+        // the state the store is ACTUALLY in. Each move was owed at this instant whether or
+        // not anybody called.
+        store.materialize_due_transitions();
+
+        // Idempotency: "If this token matches a previous request, the operation ignores the
+        // request, but does not return an error" (`ClientToken`) — one token names the one
+        // delta its call minted, so a replay answers that delta and changes nothing.
+        if let Some(delta_id) = input.client_token.as_deref().and_then(|token| {
+            store
+                .ipam_routing_policy_registration_delta_client_tokens
+                .get(token)
+                .cloned()
+        }) {
+            return store
+                .ipam_routing_policy_registration_delta(&delta_id)
+                .map(|record| DeleteIpamRoutingPolicyRegistrationOutput {
+                    ipam_routing_policy_registration_delta: Some(record.view.clone()),
+                })
+                .ok_or_else(|| {
+                    state::internal_error(format!(
+                        "a client token names the routing policy registration delta \
+                         '{delta_id}', which is not stored"
+                    ))
+                });
+        }
+
+        // The association the registration belongs to, then the registration itself: an id
+        // this account holds no association for is refused with the association's own
+        // `NotFound` code whatever the prefix turns out to be, so a client can tell "no such
+        // association" from "no registration for that prefix".
+        state::require_known_ipam_internet_registry_association(&store, association_id)?;
+        let registration = store
+            .ipam_routing_policy_registration(association_id, &cidr)
+            .cloned()
+            .ok_or_else(|| {
+                state::ipam_routing_policy_registration_not_found(association_id, &cidr)
+            })?;
+        // A registration a delete has already been asked for has no authorization left to
+        // withdraw, so a second delete is refused rather than minting a second delta.
+        if registration.is_deleting() {
+            return Err(state::incorrect_state(format!(
+                "The routing policy registration for the CIDR ({cidr}) is in state \
+                 '{state}', which is not a state it can be deleted from",
+                state = registration.state(),
+            )));
+        }
+
+        // "Forces the deletion even if it conflicts with an announced route. Default: false"
+        // (`Force`): the announcements this emulator knows of are the account's own BYOIP
+        // address ranges in the `advertised` state, and withdrawing the ROA for a prefix
+        // that is being announced is the conflict that sentence names.
+        let announced = store
+            .byoip_cidrs
+            .get(&cidr)
+            .is_some_and(|range| range.state() == state::BYOIP_CIDR_STATE_ADVERTISED);
+        if announced && !input.force.unwrap_or(false) {
+            return Err(crate::scaffolded::Scaffolded::operation_not_permitted(format!(
+                "The address range ({cidr}) is advertised from Amazon Web Services, so \
+                 deleting its routing policy registration conflicts with an announced \
+                 route. Set Force to delete it anyway."
+            )));
+        }
+
+        // The delta that RECORDS the change comes first, so the registration can name it:
+        // "The ID of the most recent delta that modified this registration"
+        // (`IpamRoutingPolicyRegistration$LatestDeltaId`).
+        let delta = store
+            .insert_ipam_routing_policy_registration_delta(
+                state::IpamRoutingPolicyRegistrationDeltaSpec {
+                    ipam_internet_registry_association_id: association_id.to_string(),
+                    cidr: cidr.clone(),
+                    delta_json: delete_delta_json(
+                        &registration.view,
+                        input.force.unwrap_or(false),
+                    ),
+                },
+            )
+            .ok_or_else(|| {
+                state::resource_limit_exceeded(format!(
+                    "This emulator holds {held} routing policy registration deltas, which is \
+                     as many as it stores",
+                    held = store.ipam_routing_policy_registration_deltas.len(),
+                ))
+            })?;
+        let delta_id = delta.delta_id.clone().ok_or_else(|| {
+            state::internal_error(
+                "the routing policy registration delta just minted carries no DeltaId",
+            )
+        })?;
+
+        // Now the registration's own move. "Deletes a routing policy registration for a
+        // specified CIDR prefix" is work AWS reports as under way — the registration state
+        // catalog carries both `delete-in-progress` and `delete-complete` — so the
+        // registration is left in the TRANSIENT state with the clock owing it the terminal
+        // one: the span is never zero, so a caller acting straight after this call still
+        // sees `delete-in-progress`.
+        let record = store
+            .ipam_internet_registry_associations
+            .get_mut(association_id)
+            .and_then(|association| association.registrations.get_mut(&cidr))
+            .ok_or_else(|| {
+                state::internal_error(format!(
+                    "the routing policy registration for ({cidr}) resolved a moment ago is \
+                     not in the store any more"
+                ))
+            })?;
+        record.view.latest_delta_id = Some(delta_id.clone());
+        record.view.state =
+            Some(state::IPAM_ROUTING_POLICY_REGISTRATION_STATE_DELETE_IN_PROGRESS.to_string());
+        record.pending = Some(state::PendingStateMove::starting_now(
+            state::IPAM_ROUTING_POLICY_REGISTRATION_STATE_DELETE_COMPLETE,
+        ));
+        // The delta id the registration now carries is stored text, charged like every other
+        // byte this store retains.
+        store.add_stored_bytes(delta_id.len());
+        if let Some(token) = input.client_token.clone() {
+            // The token's own bytes, charged for the same reason: nothing a caller chose the
+            // length of is stored uncharged.
+            store.add_stored_bytes(token.len());
+            store
+                .ipam_routing_policy_registration_delta_client_tokens
+                .insert(token, delta_id);
+        }
+
+        // "Information about the routing policy registration delta created by this deletion"
+        // (`IpamRoutingPolicyRegistrationDelta`): the delta as it was STORED, so the caller
+        // sees what a later report of the deltas will see rather than a value built here.
+        Ok(DeleteIpamRoutingPolicyRegistrationOutput {
+            ipam_routing_policy_registration_delta: Some(delta),
+        })
     }
 }

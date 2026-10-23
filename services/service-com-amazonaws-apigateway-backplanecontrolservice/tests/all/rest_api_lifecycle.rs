@@ -92,6 +92,22 @@ impl Gateway {
             body,
         }
     }
+
+    /// Dispatch a request BUILT BY THE CALLER through the same router, answering the whole
+    /// HTTP response.
+    ///
+    /// The `call` helpers above address the control plane — one host, one credential scope,
+    /// a JSON body — which is every modelled operation. The `execute-api` DATA plane is
+    /// addressed differently (the api's own invoke host, any verb, any headers, often no
+    /// credential at all) and is asserted on more than the JSON body (its status, its
+    /// content type, its headers), so `execute_api_data_plane` builds its own requests and
+    /// reads the raw answer, through this one seam rather than a second emulator.
+    pub(crate) async fn send(
+        &self,
+        request: http::Request<Bytes>,
+    ) -> http::Response<Bytes> {
+        self.router.dispatch(request).await
+    }
 }
 
 /// `CreateRestApi` for `name`, returning the API id and its root resource id.

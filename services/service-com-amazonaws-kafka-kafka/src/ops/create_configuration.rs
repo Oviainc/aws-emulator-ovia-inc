@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Stores a new MSK configuration and reports the identity it was given. The
+//! submitted `server.properties` body becomes revision 1 of the record, which is
+//! what every configuration reader renders; the configuration is usable at once,
+//! so it is stored `ACTIVE`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A configuration name identifies a configuration within an account and region,
+//! so a name already in use in the signing region is refused with the modelled
+//! `ConflictException`, and a create past the region's quota with
+//! `TooManyRequestsException`.
+//!
+//! Authentication and authorization are NOT this handler's business: the emulator
+//! verifies every request signature centrally (see `AGENTS.md`), so the modelled
+//! `UnauthorizedException`/`ForbiddenException` are raised by that path and never
+//! constructed here.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +163,127 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateConfiguration"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                CreateConfigurationErrorModeled::InternalServerErrorException(
+                    InternalServerErrorException {
+                        invalid_parameter: None,
+                        message: Some("the kafka service state is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let region = crate::state::request_region(ctx.parts());
+
+        // `Name` is the configuration's identity: it keys the (region, name)
+        // index and goes into the ARN, so a blank one names no resource and is
+        // refused rather than registered. Checked before the lock is taken: it
+        // depends on the request alone.
+        if input.name.trim().is_empty() {
+            return Err(
+                CreateConfigurationErrorModeled::BadRequestException(BadRequestException {
+                    invalid_parameter: Some("name".to_string()),
+                    message: Some("name must not be blank.".to_string()),
+                })
+                .into(),
+            );
+        }
+
+        let mut state = state.lock();
+
+        // A configuration name identifies it within an account and region, so a
+        // name already in use IN THIS REGION is a conflict; the same name in
+        // another region is a different configuration.
+        if let Some(existing) = state.configuration_arn_for_name(&region, &input.name) {
+            return Err(
+                CreateConfigurationErrorModeled::ConflictException(ConflictException {
+                    invalid_parameter: Some("name".to_string()),
+                    message: Some(format!(
+                        "A configuration with the name '{}' already exists: {existing}",
+                        input.name
+                    )),
+                })
+                .into(),
+            );
+        }
+
+        // The monotonic counter is what makes each configuration's ARN
+        // distinct; it advances whether or not anything else about the request
+        // repeats an earlier one.
+        let suffix = state.next_configuration_suffix;
+        state.next_configuration_suffix += 1;
+        let configuration = crate::state::ConfigurationRecord::created(
+            &region,
+            suffix,
+            std::time::SystemTime::now(),
+            input,
+        );
+
+        let latest = configuration.latest_revision();
+        let output = CreateConfigurationOutput {
+            arn: Some(configuration.arn.clone()),
+            creation_time: Some(::aws_smithy_types::DateTime::from(
+                configuration.creation_time,
+            )),
+            latest_revision: Some(ConfigurationRevision {
+                creation_time: ::aws_smithy_types::DateTime::from(latest.creation_time),
+                description: Some(latest.description.clone()),
+                revision: latest.revision,
+            }),
+            name: Some(configuration.name.clone()),
+            state: Some(configuration.state.clone()),
+        };
+        // The registry enforces its own ceilings on the one insertion path, so a
+        // create past them is refused there rather than growing the store by one
+        // more call. A refused create registers nothing, so the ordinal it
+        // reserved goes back: the counter counts configurations ever registered,
+        // not calls ever made.
+        if let Err(rejected) = state.register_configuration(configuration) {
+            state.next_configuration_suffix = suffix;
+            return Err(match rejected {
+                crate::state::RegisterRejected::RegionQuota => {
+                    CreateConfigurationErrorModeled::TooManyRequestsException(
+                        TooManyRequestsException {
+                            invalid_parameter: Some("name".to_string()),
+                            message: Some(format!(
+                                "The account has reached its limit of {} configurations in {region}.",
+                                crate::state::MAX_CONFIGURATIONS_PER_REGION
+                            )),
+                        },
+                    )
+                    .into()
+                }
+                // No request member is at fault for a process-wide backstop, so
+                // this one names none.
+                crate::state::RegisterRejected::RegistryCeiling => {
+                    CreateConfigurationErrorModeled::TooManyRequestsException(
+                        TooManyRequestsException {
+                            invalid_parameter: None,
+                            message: Some(format!(
+                                "This emulator holds its maximum of {} configurations.",
+                                crate::state::MAX_CONFIGURATIONS_IN_REGISTRY
+                            )),
+                        },
+                    )
+                    .into()
+                }
+                // Unreachable: the ordinal above is monotonic, so the ARN it
+                // mints is new. Reported as a server fault rather than
+                // overwriting a configuration.
+                crate::state::RegisterRejected::DuplicateArn => {
+                    CreateConfigurationErrorModeled::InternalServerErrorException(
+                        InternalServerErrorException {
+                            invalid_parameter: None,
+                            message: Some(
+                                "the minted configuration ARN is already registered".to_string(),
+                            ),
+                        },
+                    )
+                    .into()
+                }
+            });
+        }
+        Ok(output)
     }
 }

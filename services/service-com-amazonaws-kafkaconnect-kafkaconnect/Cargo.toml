@@ -7,6 +7,9 @@ publish = false
 build = "build.rs"
 
 [dependencies]
+# The ONE caller-supplied-ARN parse this emulator reads a `bucketArn` /
+# `serviceExecutionRoleArn` with, instead of a second copy per service.
+service-common = { path = "../common" }
 engine = { workspace = true }
 smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }
@@ -28,6 +31,11 @@ tracing = { workspace = true }
 sha2 = { workspace = true }
 # Encodes the opaque `nextToken` both list operations page with.
 hex = { workspace = true }
+# The Amazon S3 client `CreateCustomPlugin` resolves the custom plugin file at
+# `location.s3Location` with, over the in-process callback into this same
+# emulator (no network client feature is enabled: the transport is the
+# emulator's own).
+aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -39,6 +47,10 @@ percent-encoding = "2"
 # The tests wait out the clock-owed transitions, so they need tokio's timer on
 # top of the workspace's macros/runtime features.
 tokio = { workspace = true, features = ["time"] }
+# The custom-plugin-file suite mounts the S3 service beside kafkaconnect on one
+# engine, because `CreateCustomPlugin` resolves the plugin file it is given
+# against Amazon S3 before it stores anything.
+service-com-amazonaws-s3-amazons3 = { workspace = true }
 
 [lints]
 workspace = true

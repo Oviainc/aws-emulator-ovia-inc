@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListIdentitySources
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListIdentitySources`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Enumerates the identity sources stored in [`crate::state`], in creation order.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListIdentitySources::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Every member of a reported entry is read off the [`crate::state::IdentitySource`]
+//! record `CreateIdentitySource` wrote, so a listed source can never disagree with the
+//! one the store holds.
+//!
+//! `NextToken` is the creation-order sequence number of the last source the previous page
+//! returned, so the next page is every stored source ordered after it: a client paging
+//! with any `MaxResults` sees each source exactly once. A token that is not one this
+//! service issued earns `ValidationException` (400).
+//!
+//! `@readonly`: see the note in `get_approval_team.rs` for why
+//! [`crate::state::ComAmazonawsMpaAwsfluffycoreserviceState::materialize_due`] is not a write of this handler's own.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +160,84 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListIdentitySources` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListIdentitySourcesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListIdentitySources"))
+        let _ = ctx;
+        let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListIdentitySourcesError::Modeled(
+                ListIdentitySourcesErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the identity-source store is unavailable".to_string(),
+                    },
+                ),
+            )
+        })?;
+
+        // The token is this service's own: the creation-order position the next page
+        // starts after. Anything else never came from here.
+        let after = match input.next_token.as_deref().filter(|t| !t.is_empty()) {
+            None => 0u64,
+            Some(token) => token.parse::<u64>().map_err(|_| {
+                ListIdentitySourcesError::Modeled(
+                    ListIdentitySourcesErrorModeled::ValidationException(ValidationException {
+                        message: "NextToken is not a token this service issued.".to_string(),
+                    }),
+                )
+            })?,
+        };
+        // `MaxResults` is modelled `range(1..20)` with `default: 20`, so the boundary
+        // validator has already closed it; the clamp only keeps the slice width sane.
+        let page_size =
+            usize::try_from(input.max_results.clamp(1, crate::state::MAX_LIST_PAGE)).unwrap_or(1);
+
+        let mut state = store.lock();
+        state.materialize_due(::std::time::SystemTime::now());
+
+        let ordered = state.identity_sources_in_creation_order();
+        let remaining: Vec<&crate::state::IdentitySource> = ordered
+            .into_iter()
+            .filter(|source| source.seq > after)
+            .collect();
+        let page = &remaining[..remaining.len().min(page_size)];
+        let next_token = page
+            .last()
+            .filter(|_| remaining.len() > page.len())
+            .map(|source| source.seq.to_string());
+
+        Ok(ListIdentitySourcesOutput {
+            identity_sources: Some(page.iter().copied().map(summary).collect()),
+            next_token,
+        })
+    }
+}
+
+/// One `ListIdentitySources` entry for a stored identity source.
+fn summary(source: &crate::state::IdentitySource) -> IdentitySourceForList {
+    // The reported parameters are the ones the source's TYPE names, so the union member
+    // can never disagree with the `IdentitySourceType` reported beside it.
+    let parameters = match source.source_type {
+        crate::state::IdentitySourceType::IamIdentityCenter => {
+            IdentitySourceParametersForList::IamIdentityCenter(IamIdentityCenterForList {
+                instance_arn: Some(source.instance_arn.clone()),
+                // `ApprovalPortalUrl` is the address of the approval portal AWS hosts for
+                // the instance. This emulator serves no portal and the model fixes no
+                // form for the URL, so the member is omitted rather than reporting an
+                // address nothing answers.
+                approval_portal_url: None,
+                region: Some(source.instance_region.clone()),
+            })
+        }
+    };
+    IdentitySourceForList {
+        identity_source_type: Some(source.source_type.as_wire().to_string()),
+        identity_source_parameters: Some(parameters),
+        identity_source_arn: Some(source.arn.clone()),
+        creation_time: Some(::aws_smithy_types::DateTime::from(source.creation_time)),
+        status: Some(source.status.as_wire().to_string()),
+        // Every `IdentitySourceStatusCode` the model declares is a FAILURE reason
+        // (`ACCESS_DENIED`, `DELETION_FAILED`, `IDC_INSTANCE_NOT_FOUND`,
+        // `IDC_INSTANCE_NOT_VALID`) and `StatusMessage` explains one, so a source in a
+        // status this service reaches on its own (`CREATING`, then `ACTIVE`) carries
+        // neither.
+        status_code: None,
+        status_message: None,
     }
 }

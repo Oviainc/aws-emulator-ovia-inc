@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteLayerVersion
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteLayerVersion`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteLayerVersion::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes exactly one version of a layer from [`crate::state`], so a later
+//! `GetLayerVersion` of it answers the modelled 404 and no new function can be created
+//! against it. The layer's own record survives the deletion of its last version, because
+//! its highest-ever version number is what the next `PublishLayerVersion` counts from: a
+//! version number is never reused.
+//!
+//! The call is `@idempotent`, so a version the store does not hold is not an error — the
+//! post-condition ("this version is gone") already holds, and the modelled 204 is the
+//! answer.
 //!
 //! ## Shape of an operation
 //!
@@ -168,18 +169,58 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteLayerVersion` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteLayerVersionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteLayerVersion"))
+        // The version to delete is addressed by the layer name and the version number
+        // alone, so no request metadata takes part in it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteLayerVersionErrorModeled::ServiceException(ServiceException {
+                r#type: None,
+                message: Some("Lambda state is not reachable on this engine".to_string()),
+            })
+            .into());
+        };
+
+        // "The name or Amazon Resource Name (ARN) of the layer": both forms name the
+        // same record, exactly as they do on the publish and on the read.
+        let name = crate::state::parse_layer_name(&input.layer_name).ok_or_else(|| {
+            invalid_parameter(format!(
+                "1 validation error detected: Value '{}' at 'layerName' failed to satisfy \
+                 constraint: Member must satisfy one of the documented layer name formats \
+                 (name or layer ARN)",
+                input.layer_name
+            ))
+        })?;
+
+        let mut store = state.lock();
+        if let Some(record) = store.layers.get_mut(&name) {
+            // Only the version named goes. The layer's record stays even once it holds
+            // no version at all, because `latest_version` is the highest number ever
+            // published under this name and the next publish counts from it: a deleted
+            // number is never handed out a second time.
+            //
+            // Nothing else is touched. "To avoid breaking functions, a copy of the
+            // version remains in Lambda until no functions refer to it", and a function
+            // resolved its layers when it was configured, so a function already holding
+            // this version keeps reporting it; "deleted versions can no longer be viewed
+            // or added to functions", which is what dropping it from the store makes
+            // true of every later read and every later resolution.
+            record.versions.remove(&input.version_number);
+        }
+
+        // `@idempotent`: a layer, or a version of one, that the store does not hold
+        // leaves nothing to remove and is still a success, so this answers the modelled
+        // 204 either way.
+        Ok(DeleteLayerVersionOutput)
     }
+}
+
+/// The modelled 400 this operation answers a request it cannot satisfy with.
+fn invalid_parameter(message: String) -> DeleteLayerVersionError {
+    DeleteLayerVersionErrorModeled::InvalidParameterValueException(
+        InvalidParameterValueException {
+            r#type: None,
+            message: Some(message),
+        },
+    )
+    .into()
 }

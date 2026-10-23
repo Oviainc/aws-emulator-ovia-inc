@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteFile
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteFile`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteFile::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: removes the named path from the tree the branch tip holds and writes
+//! that tree as a new commit on the branch in `crate::state`, answering with the git
+//! object ids the deletion produced.
 //!
 //! ## Shape of an operation
 //!
@@ -230,18 +224,263 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteFile` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteFileErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteFile"))
+        // The canonical path first: `"/a/b.md"` and `"a/b.md"` address the same
+        // entry of a git tree, so the path this call deletes by, refuses by and
+        // reports is one form.
+        let file_path = match crate::state::normalize_path(&input.file_path) {
+            Ok(path) => path,
+            Err(crate::state::PathProblem::Missing) => {
+                return Err(DeleteFileErrorModeled::PathRequiredException(
+                    PathRequiredException {
+                        message: Some("a file path is required".to_string()),
+                    },
+                )
+                .into())
+            }
+            Err(crate::state::PathProblem::Invalid) => {
+                return Err(DeleteFileErrorModeled::InvalidPathException(InvalidPathException {
+                    message: Some(format!("the path {} is not valid", input.file_path)),
+                })
+                .into())
+            }
+        };
+
+        // `branchName` is `@required` and carries `BranchName`'s modelled length, so
+        // an absent or over-long name is already refused at the boundary as
+        // `BranchNameRequiredException` / `InvalidBranchNameException` (see
+        // `crate::service::refusal_for`). What reaches here is a name whose SHAPE the
+        // model does not express: a branch name is a git reference name, and a string
+        // that cannot be one names no branch in any repository — the same check
+        // `CreateBranch` and `DeleteBranch` apply.
+        if !crate::state::is_valid_branch_name(&input.branch_name) {
+            return Err(DeleteFileErrorModeled::InvalidBranchNameException(
+                InvalidBranchNameException {
+                    message: Some(format!(
+                        "the reference name {} is not valid",
+                        input.branch_name
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "The parent commit ID is not valid. The commit ID cannot be empty, and must
+        // match the head commit ID for the branch of the repository": the form is
+        // checked here, the "is the head" half once the branch is resolved below.
+        // `parentCommitId` is `@required`, so an ABSENT one is refused at the boundary
+        // as `ParentCommitIdRequiredException`.
+        if !crate::state::is_object_id(&input.parent_commit_id) {
+            return Err(DeleteFileErrorModeled::InvalidParentCommitIdException(
+                InvalidParentCommitIdException {
+                    message: Some(format!(
+                        "the parent commit id {} is not valid",
+                        input.parent_commit_id
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // An unreachable store is an internal mounting fault, not a modelled
+            // CodeCommit failure; every handler in this crate refuses it this way.
+            crate::scaffolded::Scaffolded::validation("the repository store is unavailable")
+        })?;
+        let mut store = state.lock();
+        let repository = store
+            .repositories
+            .get_mut(&input.repository_name)
+            .ok_or_else(|| {
+                DeleteFileErrorModeled::RepositoryDoesNotExistException(
+                    RepositoryDoesNotExistException {
+                        message: Some(crate::state::repository_does_not_exist_message(
+                            &input.repository_name,
+                        )),
+                    },
+                )
+            })?;
+
+        // The branch this deletion commits to. A name the repository holds only in
+        // its TAG namespace (`refs/tags/<name>`, which a git push writes) is a tag
+        // name rather than a branch name, which the model has its own error for;
+        // every other name the repository does not hold as a branch is simply no
+        // branch of it. Nothing is created here: unlike `PutFile`, which creates the
+        // branch of an empty repository, a deletion has nothing to delete from.
+        let tip = match repository.branches.get(&input.branch_name) {
+            Some(branch) => branch.commit_id.clone(),
+            None if repository.git_tags.contains_key(&input.branch_name) => {
+                return Err(DeleteFileErrorModeled::BranchNameIsTagNameException(
+                    BranchNameIsTagNameException {
+                        message: Some(format!(
+                            "the name {} is a tag name in the repository {}, not a branch name",
+                            input.branch_name, input.repository_name
+                        )),
+                    },
+                )
+                .into());
+            }
+            None => {
+                return Err(DeleteFileErrorModeled::BranchDoesNotExistException(
+                    BranchDoesNotExistException {
+                        message: Some(crate::state::BRANCH_DOES_NOT_EXIST_MESSAGE.to_string()),
+                    },
+                )
+                .into());
+            }
+        };
+
+        // "This must be the HEAD commit for the branch": a commit the repository
+        // holds but which is no longer the tip is an outdated parent, and one the
+        // repository does not hold at all does not exist.
+        if input.parent_commit_id != tip {
+            return if repository.commits.contains_key(&input.parent_commit_id) {
+                Err(DeleteFileErrorModeled::ParentCommitIdOutdatedException(
+                    ParentCommitIdOutdatedException {
+                        message: Some(format!(
+                            "the parent commit id {} is not the tip of the branch {}",
+                            input.parent_commit_id, input.branch_name
+                        )),
+                    },
+                )
+                .into())
+            } else {
+                Err(DeleteFileErrorModeled::ParentCommitDoesNotExistException(
+                    ParentCommitDoesNotExistException {
+                        message: Some(format!(
+                            "the parent commit id {} does not exist in the repository {}",
+                            input.parent_commit_id, input.repository_name
+                        )),
+                    },
+                )
+                .into())
+            };
+        }
+
+        // The tree this commit starts from: the parent's full snapshot. A tip the
+        // commit projection no longer holds is a commit this service cannot read, the
+        // same as one the repository never held (see `crate::state`'s retention note).
+        let mut files = repository
+            .commits
+            .get(&input.parent_commit_id)
+            .map(|commit| commit.files.clone())
+            .ok_or_else(|| {
+                DeleteFileErrorModeled::ParentCommitDoesNotExistException(
+                    ParentCommitDoesNotExistException {
+                        message: Some(format!(
+                            "the parent commit id {} does not exist in the repository {}",
+                            input.parent_commit_id, input.repository_name
+                        )),
+                    },
+                )
+            })?;
+
+        // "Deletes a specified file from a specified branch": the entry leaves the
+        // tree, and the blob it named is what the response reports. A path the tree
+        // does not hold is refused, so nothing is committed for a deletion that
+        // deletes nothing.
+        let removed = files.remove(&file_path).ok_or_else(|| {
+            DeleteFileErrorModeled::FileDoesNotExistException(FileDoesNotExistException {
+                message: Some(format!(
+                    "the file {file_path} does not exist in the branch {}",
+                    input.branch_name
+                )),
+            })
+        })?;
+
+        // By default the folders the deletion emptied are gone with it — a git tree
+        // holds no empty subtree — and `keepEmptyFolders` keeps the structure with
+        // the placeholder `crate::state::keep_empty_folders` writes, which is the
+        // same reading of that member `CreateCommit` applies.
+        let placeholders = if input.keep_empty_folders {
+            crate::state::keep_empty_folders(&mut files, [file_path.as_str()])
+        } else {
+            Vec::new()
+        };
+
+        // The emulator's own bounds on what one repository costs, charged BEFORE the
+        // write and with the same comparison `PutFile` and `CreateCommit` use. A
+        // deletion only shrinks the tree and the folder it emptied, so the only
+        // growth here is a kept-folder placeholder — which names the EMPTY blob, so
+        // it adds an object but no bytes.
+        if files.len() > crate::state::MAX_FILES_PER_TREE {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "this emulator holds at most {} files per repository tree",
+                crate::state::MAX_FILES_PER_TREE
+            )));
+        }
+        if !placeholders.is_empty()
+            && repository.objects.len().saturating_add(1)
+                > crate::state::MAX_OBJECTS_PER_REPOSITORY
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "the commit would take this repository past the {} objects this emulator holds",
+                crate::state::MAX_OBJECTS_PER_REPOSITORY
+            )));
+        }
+
+        let now = std::time::SystemTime::now();
+        // "If no name is specified, the user's ARN is used as the author name and
+        // committer name" — the caller this request was signed by — and "if no email
+        // address is specified, the email address is left blank".
+        let user = UserInfo {
+            name: Some(
+                input
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| crate::state::caller_identity_arn(ctx.parts())),
+            ),
+            email: input.email.clone(),
+            date: Some(crate::state::git_date(now)),
+        };
+        // "If no message is specified, a default message is used." AWS documents no
+        // text for it, so this is the emulator's own default, built from the path the
+        // commit deleted.
+        let commit_message = input
+            .commit_message
+            .clone()
+            .unwrap_or_else(|| format!("Deleted {file_path}"));
+
+        // A kept folder's placeholder names the empty blob, which has to be in the
+        // object store before the tree that points at it is encoded.
+        if !placeholders.is_empty() {
+            repository.insert_blob(Vec::new());
+        }
+        let (commit_id, tree_id) = repository
+            .commit_snapshot(
+                files,
+                vec![input.parent_commit_id.clone()],
+                user.clone(),
+                user,
+                Some(commit_message.as_str()),
+            )
+            .ok_or_else(|| {
+                // Every entry in the snapshot carries a `blobId` this store reported
+                // for a blob it holds, so the tree always encodes; a snapshot that did
+                // not is an internal inconsistency, refused the same way as an
+                // unreachable store.
+                crate::scaffolded::Scaffolded::validation(
+                    "the repository store holds a file whose blob id is not an object name",
+                )
+            })?;
+        // "A commit is created on the branch that contains the revision": the branch
+        // moves to it, and the commits earlier than it keep the file.
+        repository.branches.insert(
+            input.branch_name.clone(),
+            crate::state::Branch {
+                name: input.branch_name.clone(),
+                commit_id: commit_id.clone(),
+            },
+        );
+        repository.last_modified_date = now;
+        // Keep the history bounded: the oldest commits no ref reaches are dropped
+        // here, together with every git object no remaining ref reaches.
+        repository.prune_history();
+
+        Ok(DeleteFileOutput {
+            commit_id,
+            blob_id: removed.blob_id,
+            tree_id,
+            file_path,
+        })
     }
 }

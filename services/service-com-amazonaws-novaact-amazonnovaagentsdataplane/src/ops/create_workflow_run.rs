@@ -180,12 +180,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
         let not_found = |missing: crate::state::MissingResource| -> Self::Error {
-            CreateWorkflowRunErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: missing.message,
-                resource_id: missing.resource_id,
-                resource_type: missing.resource_type,
-            })
-            .into()
+            CreateWorkflowRunErrorModeled::ResourceNotFoundException(missing.not_found(&region))
+                .into()
         };
 
         let mut state = state.lock();
@@ -264,6 +260,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let run_id = state.mint_uuid();
         let run = crate::state::WorkflowRun {
             run_id: run_id.clone(),
+            definition_name: input.workflow_definition_name.clone(),
             arn: crate::state::workflow_run_arn(
                 &region,
                 &input.workflow_definition_name,

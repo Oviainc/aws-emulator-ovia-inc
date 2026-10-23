@@ -25,13 +25,16 @@ use service_com_amazonaws_novaact_amazonnovaagentsdataplane::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
 /// One emulator, reached the way the router reaches it: one shared engine, one service.
-struct Emulator {
+///
+/// `pub(crate)` so the other suites in this test target drive the same harness rather
+/// than each building its own router.
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
     region: String,
 }
 
 impl Emulator {
-    fn new(region: &str) -> Self {
+    pub(crate) fn new(region: &str) -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // Signatures are not what these cases are about; the credential scope below is
@@ -46,7 +49,7 @@ impl Emulator {
 
     /// Dispatch one request and return its status and parsed body (`Value::Null` when the
     /// response has no body).
-    async fn call(&self, method: &str, path: &str, body: Option<Value>) -> (u16, Value) {
+    pub(crate) async fn call(&self, method: &str, path: &str, body: Option<Value>) -> (u16, Value) {
         let payload = match &body {
             Some(value) => Bytes::from(serde_json::to_vec(value).expect("serializable body")),
             None => Bytes::new(),
@@ -130,7 +133,7 @@ fn is_lowercase_uuid(value: &str) -> bool {
         })
 }
 
-fn text(body: &Value, member: &str) -> String {
+pub(crate) fn text(body: &Value, member: &str) -> String {
     body[member]
         .as_str()
         .unwrap_or_else(|| panic!("member {member} must be a string in {body}"))

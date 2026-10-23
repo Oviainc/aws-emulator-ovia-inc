@@ -22,10 +22,15 @@
 //!   `InvalidEventSelectorsException` and changes nothing;
 //! * both operations read a trail identifier as a bare name or a trail ARN and refuse a
 //!   malformed one as the form it was written in, while `PutEventSelectors` — unlike the
-//!   read — runs only in the trail's home Region.
+//!   read — runs only in the trail's home Region;
+//! * the selectors are configured on the ONE trail the identifier resolves to — every
+//!   other trail keeps what it carried — and re-applying a selector set changes
+//!   nothing (`PutEventSelectors` is idempotent).
 //!
 //! How an `X-Amz-Target` names an operation is pinned by this crate's
 //! `target_prefix_dispatch` / `target_routing` suites, not here.
+
+use std::collections::BTreeMap;
 
 use serde_json::{json, Value};
 
@@ -827,5 +832,158 @@ async fn put_event_selectors_runs_only_in_the_trail_home_region() {
             (default_selectors(), Value::Null),
             "case GetEventSelectors from {region}: expected the default selector, got {got:?}"
         );
+    }
+}
+
+/// One row of [`configuring_one_trail_leaves_every_other_trail_alone`]: the case name,
+/// the trail to configure, how the request addresses it, the selectors the request
+/// carries, and the `(EventSelectors, AdvancedEventSelectors)` every later read of that
+/// trail must report.
+type IsolationRow = (&'static str, &'static str, String, Value, (Value, Value));
+
+/// Event selectors belong to the ONE trail the request's identifier resolves to: a
+/// `PutEventSelectors` call writes that trail and no other, and applying the same
+/// request again reports the same configuration — the operation is idempotent, because
+/// it REPLACES what the trail carried rather than accumulating onto it.
+///
+/// Every row is checked against every trail in the registry, so a handler that wrote a
+/// registry-wide field instead of the resolved record, or that appended to the stored
+/// set, shows up as a changed read on a trail the row never named. The rows differ in
+/// the identifier FORM the request addresses the trail by (a bare name, a trail ARN), in
+/// the Region the trail is homed in, and in the KIND of selector configured.
+#[tokio::test]
+async fn configuring_one_trail_leaves_every_other_trail_alone() {
+    let emulator = Emulator::new();
+
+    // (trail name, the Region the trail is homed in): a plain name, one carrying the
+    // punctuation a trail name may hold, and one homed outside this emulator's default
+    // Region.
+    let trails = [
+        ("alpha-trail", HOME_REGION),
+        ("beta.trail", HOME_REGION),
+        ("west-trail", "us-west-2"),
+    ];
+    // trail name -> (its home Region, the ARN the service minted for it)
+    let mut homes: BTreeMap<&str, (&str, String)> = BTreeMap::new();
+    for (index, (name, region)) in trails.into_iter().enumerate() {
+        let arn = create_trail(
+            &emulator,
+            region,
+            &json!({"Name": name, "S3BucketName": format!("bucket-{index}")}),
+        )
+        .await;
+        homes.insert(name, (region, arn));
+    }
+
+    // (case, the trail to configure, how the request addresses it, the selectors it
+    //  carries, the expected (EventSelectors, AdvancedEventSelectors) of every read of
+    //  that trail afterwards)
+    let rows: Vec<IsolationRow> = vec![
+        (
+            "a bare name, basic management-event selectors",
+            "alpha-trail",
+            "alpha-trail".to_string(),
+            json!({"EventSelectors": [{"ReadWriteType": "ReadOnly"}]}),
+            (
+                json!([{
+                    "ReadWriteType": "ReadOnly",
+                    "IncludeManagementEvents": true,
+                    "DataResources": [],
+                    "ExcludeManagementEventSources": [],
+                }]),
+                Value::Null,
+            ),
+        ),
+        (
+            "the trail ARN, advanced selectors",
+            "beta.trail",
+            homes["beta.trail"].1.clone(),
+            json!({"AdvancedEventSelectors": [{
+                "Name": "management events",
+                "FieldSelectors": [{"Field": "eventCategory", "Equals": ["Management"]}],
+            }]}),
+            (
+                Value::Null,
+                json!([{
+                    "Name": "management events",
+                    "FieldSelectors": [{"Field": "eventCategory", "Equals": ["Management"]}],
+                }]),
+            ),
+        ),
+        (
+            "a trail homed in another Region, by bare name there, data-event selectors",
+            "west-trail",
+            "west-trail".to_string(),
+            json!({"EventSelectors": [{
+                "ReadWriteType": "WriteOnly",
+                "IncludeManagementEvents": false,
+                "DataResources": [{
+                    "Type": BASIC_DATA_RESOURCE_TYPES[0],
+                    "Values": ["arn:aws:dynamodb:us-west-2:000000000000:table/orders"],
+                }],
+            }]}),
+            (
+                json!([{
+                    "ReadWriteType": "WriteOnly",
+                    "IncludeManagementEvents": false,
+                    "DataResources": [{
+                        "Type": BASIC_DATA_RESOURCE_TYPES[0],
+                        "Values": ["arn:aws:dynamodb:us-west-2:000000000000:table/orders"],
+                    }],
+                    "ExcludeManagementEventSources": [],
+                }]),
+                Value::Null,
+            ),
+        ),
+    ];
+
+    // What each trail must report. Every trail starts out at the documented default,
+    // and a row moves exactly one entry.
+    let mut expected: BTreeMap<&str, (Value, Value)> = trails
+        .into_iter()
+        .map(|(name, _)| (name, (default_selectors(), Value::Null)))
+        .collect();
+
+    for (case, trail, identifier, selectors, configured) in rows {
+        let (region, arn) = homes[trail].clone();
+        let mut request = json!({"TrailName": identifier});
+        for (member, value) in selectors.as_object().expect("the row is an object") {
+            request[member] = value.clone();
+        }
+
+        // Applied TWICE: the second application is the idempotence case, and must
+        // report exactly what the first did.
+        for attempt in 1..=2 {
+            let put = emulator
+                .call_in("PutEventSelectors", region, &request)
+                .await;
+            let put = put
+                .expect_ok(&format!("PutEventSelectors attempt {attempt}: {case}"))
+                .clone();
+            assert_eq!(
+                (put["TrailARN"].clone(), selectors_of(&put)),
+                (json!(&arn), configured.clone()),
+                "case {case} (attempt {attempt}): expected PutEventSelectors to report \
+                 TrailARN {arn} carrying the selectors it was given, got {put:?}"
+            );
+        }
+        expected.insert(trail, configured);
+
+        // Every trail — the one just configured and the ones the row never named —
+        // reports its own configuration, read by ARN so no name resolution is in play.
+        for (name, _) in trails {
+            let (_, other_arn) = &homes[name];
+            let got = emulator
+                .call("GetEventSelectors", &json!({"TrailName": other_arn}))
+                .await;
+            let got = got
+                .expect_ok(&format!("GetEventSelectors {name}: {case}"))
+                .clone();
+            assert_eq!(
+                (got["TrailARN"].clone(), selectors_of(&got)),
+                (json!(other_arn), expected[name].clone()),
+                "case {case}: expected trail {name} to report its own selectors, got {got:?}"
+            );
+        }
     }
 }

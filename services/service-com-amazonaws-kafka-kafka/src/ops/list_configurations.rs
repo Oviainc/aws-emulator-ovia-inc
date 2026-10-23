@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListConfigurations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListConfigurations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Pages the stored MSK configurations, reporting each one as the `Configuration`
+//! shape. `ListConfigurations` is a REGIONAL api, so it reports only the
+//! configurations this endpoint's region holds — the same set the configuration
+//! name index is keyed by. `MaxResults` bounds the page (a value outside the
+//! modelled 1..100 range is refused at the boundary with this service's
+//! `BadRequestException`), and `NextToken` is an opaque encoding of the last
+//! ARN returned, resolved against the live registry — absent from the last page.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListConfigurations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A reporting operation: it only reads the registry. A configuration is created
+//! `ACTIVE`, so the clock owes none of them a transition for this reader to
+//! materialise.
+//!
+//! Authentication and authorization are NOT this handler's business: the emulator
+//! verifies every request signature centrally (see `AGENTS.md`), so the modelled
+//! `UnauthorizedException`/`ForbiddenException` are raised by that path and never
+//! constructed here.
 //!
 //! ## Shape of an operation
 //!
@@ -76,6 +83,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use std::ops::Bound;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -113,6 +121,20 @@ impl From<ListConfigurationsErrorModeled> for ListConfigurationsError {
     }
 }
 
+/// The largest page `MaxResults` may ask for, from that member's `range` in the
+/// model (`MaxResults`, 1..100); a request outside that range is refused at the
+/// boundary.
+const MAX_RESULTS_LIMIT: i32 = 100;
+
+/// The page size used when a request names no `MaxResults`. Named apart from the
+/// modelled bound because the two state different rules and need not coincide;
+/// this listing pages at the largest size the model allows.
+const DEFAULT_PAGE_SIZE: i32 = MAX_RESULTS_LIMIT;
+
+/// Marker that prefixes a token's plaintext, so a token minted for some other
+/// list cannot be mistaken for one of these.
+const NEXT_TOKEN_PREFIX: &str = "kafka:configurations:";
+
 /// The `ListConfigurations` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -149,18 +171,90 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListConfigurations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListConfigurationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListConfigurations"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListConfigurationsErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    invalid_parameter: None,
+                    message: Some("the kafka service state is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let region = crate::state::request_region(ctx.parts());
+
+        // `MaxResults` outside the modelled 1..100 range never reaches here: the
+        // boundary refuses it with this service's own `BadRequestException` (see
+        // `override_refusal` in `crate::service`), so a page size is never
+        // silently clamped to the nearest legal size behind the caller's back.
+
+        // A token names the ARN the previous page stopped at; the next page
+        // starts after it in the registry's own order, so a configuration
+        // created or deleted between pages shifts nothing already returned.
+        let resume_after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match crate::state::decode_page_token(NEXT_TOKEN_PREFIX, token) {
+                Some(arn) => Some(arn),
+                None => {
+                    return Err(ListConfigurationsErrorModeled::BadRequestException(
+                        BadRequestException {
+                            invalid_parameter: Some("nextToken".to_string()),
+                            message: Some("The pagination token is not valid.".to_string()),
+                        },
+                    )
+                    .into())
+                }
+            },
+        };
+
+        // Absent `MaxResults` pages at the largest size the model allows. The
+        // conversion is total rather than trusting the value: no caller of this
+        // handler may size an allocation from a number the boundary has not
+        // already bounded.
+        let page_size = usize::try_from(input.max_results.unwrap_or(DEFAULT_PAGE_SIZE))
+            .unwrap_or(MAX_RESULTS_LIMIT as usize)
+            .clamp(1, MAX_RESULTS_LIMIT as usize);
+
+        let state = state.lock();
+
+        // The registry is ordered by ARN, so a token resumes by SEEKING to its
+        // position rather than walking the keys already returned; the scan stops
+        // as soon as the page is full, and only entries belonging to another
+        // region are skipped past.
+        let resume_from = match resume_after.as_deref() {
+            Some(last) => Bound::Excluded(last),
+            None => Bound::Unbounded,
+        };
+        let mut page: Vec<Configuration> = Vec::with_capacity(page_size);
+        let mut last_key: Option<&String> = None;
+        let mut more_remain = false;
+        for (arn, configuration) in state
+            .configurations
+            .range::<str, _>((resume_from, Bound::Unbounded))
+        {
+            if configuration.region != region {
+                continue;
+            }
+            if page.len() == page_size {
+                more_remain = true;
+                break;
+            }
+            page.push(configuration.to_configuration());
+            last_key = Some(arn);
+        }
+
+        // The token is minted from the REGISTRY KEY the resume comparison uses,
+        // so the two can never disagree, and only a page that left something
+        // behind carries one: a full page that exhausted the registry closes the
+        // list.
+        let next_token = if more_remain {
+            last_key.map(|last| crate::state::encode_page_token(NEXT_TOKEN_PREFIX, last))
+        } else {
+            None
+        };
+
+        Ok(ListConfigurationsOutput {
+            configurations: Some(page),
+            next_token,
+        })
     }
 }

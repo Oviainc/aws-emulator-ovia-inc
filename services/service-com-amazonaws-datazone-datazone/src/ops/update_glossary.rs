@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateGlossary
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateGlossary`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateGlossary::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: a PATCH of one stored business glossary. The members the request
+//! carries replace the stored ones, the members it omits are left as they are, and the
+//! answer is rendered from the store — so the next `GetGlossary` reports exactly what
+//! this call wrote, and the glossary's `updatedBy`/`updatedAt` record who changed it.
 //!
 //! ## Shape of an operation
 //!
@@ -175,18 +170,133 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateGlossary` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateGlossaryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateGlossary"))
+        use crate::state::{
+            caller_principal, now_ms, GLOSSARY_STATUS_DISABLED, GLOSSARY_STATUS_ENABLED,
+        };
+
+        // `GlossaryStatus` is DISABLED | ENABLED (smithy_query shape="GlossaryStatus").
+        // The enum is modelled, so the boundary validator has already refused anything
+        // outside it; a value that reached here nonetheless names a status this service
+        // does not define, which is a bad request and not a missing implementation.
+        if let Some(status) = input.status.as_deref() {
+            if status != GLOSSARY_STATUS_ENABLED && status != GLOSSARY_STATUS_DISABLED {
+                return Err(UpdateGlossaryErrorModeled::ValidationException(
+                    ValidationException {
+                        message: format!(
+                            "status must be one of {GLOSSARY_STATUS_DISABLED}, \
+                             {GLOSSARY_STATUS_ENABLED}"
+                        ),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateGlossaryErrorModeled::InternalServerException(InternalServerException {
+                message: "the DataZone store is unavailable".to_string(),
+            })
+        })?;
+        let mut store = state.lock();
+        let now = now_ms();
+        store.settle_clock(now);
+
+        // The documented prerequisites, read under one lock before anything is written.
+        // A domain that is gone, or already on its way out, holds no glossary to update,
+        // and a glossary this domain does not hold is as absent as one nothing created —
+        // this operation DOES model `ResourceNotFoundException` (smithy_query
+        // operation="UpdateGlossary"), so that is the refusal, naming only the kind.
+        let name_clash = {
+            let domain = store.live_domain(&input.domain_identifier).ok_or_else(|| {
+                UpdateGlossaryErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message: crate::state::ResourceKind::Domain.not_found_message(),
+                })
+            })?;
+            if !domain.glossaries.contains_key(&input.identifier) {
+                return Err(UpdateGlossaryErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: crate::state::ResourceKind::Glossary.not_found_message(),
+                    },
+                )
+                .into());
+            }
+            // "When updating the name, the new name must be unique within the domain":
+            // ANOTHER glossary of this same domain already carrying the requested name
+            // conflicts, while this glossary re-asserting its own name does not, and the
+            // same name in another domain is a different namespace entirely — the very
+            // uniqueness scope `CreateGlossary` enforces.
+            input.name.as_deref().and_then(|name| {
+                domain
+                    .glossaries
+                    .values()
+                    .find(|glossary| glossary.name == name && glossary.id != input.identifier)
+                    .map(|glossary| glossary.id.clone())
+            })
+        };
+        if let Some(clash) = name_clash {
+            return Err(UpdateGlossaryErrorModeled::ConflictException(ConflictException {
+                message: format!(
+                    "Glossary {clash} in domain {} already uses this name",
+                    input.domain_identifier
+                ),
+            })
+            .into());
+        }
+
+        // Derived from the caller's own credential scope, never from the request body.
+        let principal = caller_principal(ctx);
+        // The glossary was found under this same lock a few lines up, so it is still
+        // there; an impossible disappearance is reported as a server fault rather than
+        // answered as though the update had been applied.
+        let glossary = store
+            .domains
+            .get_mut(&input.domain_identifier)
+            .and_then(|domain| domain.glossaries.get_mut(&input.identifier))
+            .ok_or_else(|| {
+                UpdateGlossaryErrorModeled::InternalServerException(InternalServerException {
+                    message: "the glossary disappeared while it was being updated".to_string(),
+                })
+            })?;
+
+        // PATCH semantics: a member the request carries replaces the stored value, a
+        // member it omits leaves the stored value untouched. `owningProjectId`,
+        // `usageRestrictions`, `createdBy` and `createdAt` belong to the create — this
+        // operation takes none of them, so each is reported exactly as stored.
+        if let Some(name) = input.name {
+            glossary.name = name;
+        }
+        if let Some(description) = input.description {
+            glossary.description = Some(description);
+        }
+        // `GlossaryStatus` was checked against its modelled members above, so a status
+        // the request carries is stored as it stands.
+        if let Some(status) = input.status {
+            glossary.status = status;
+        }
+        // The update is what sets `updatedBy`/`updatedAt`, which `GetGlossary` reports
+        // as absent until something updates the glossary. The operation is `@idempotent`
+        // and takes an `@idempotencyToken`, but a repeat of the same patch reaches the
+        // same stored state — there is no second resource for a retry to leave behind —
+        // so the token needs no record here.
+        glossary.updated_by = Some(principal);
+        glossary.updated_at_ms = Some(now);
+
+        Ok(glossary_output(glossary))
+    }
+}
+
+/// Render a stored glossary as this operation's response.
+fn glossary_output(glossary: &crate::state::Glossary) -> UpdateGlossaryOutput {
+    UpdateGlossaryOutput {
+        domain_id: glossary.domain_id.clone(),
+        id: glossary.id.clone(),
+        name: glossary.name.clone(),
+        owning_project_id: glossary.owning_project_id.clone(),
+        description: glossary.description.clone(),
+        status: Some(glossary.status.clone()),
+        // `GlossaryUsageRestrictions` is a 1..1 list, so an empty one is not a value the
+        // model admits: a glossary created without one reports the member absent.
+        usage_restrictions: (!glossary.usage_restrictions.is_empty())
+            .then(|| glossary.usage_restrictions.clone()),
     }
 }

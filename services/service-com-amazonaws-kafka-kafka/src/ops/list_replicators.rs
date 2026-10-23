@@ -128,7 +128,8 @@ impl From<ListReplicatorsErrorModeled> for ListReplicatorsError {
 const MAX_RESULTS_LIMIT: i32 = 100;
 
 /// Marker that prefixes a token's plaintext, so a token minted for some other
-/// list cannot be mistaken for one of these.
+/// list cannot be mistaken for one of these. The encoding itself is the crate's
+/// one page-token codec ([`crate::state::encode_page_token`]).
 const NEXT_TOKEN_PREFIX: &str = "kafka:replicators:";
 
 /// Encode the ARN a page stopped at as a token. Base64 of a marked plaintext:
@@ -137,17 +138,13 @@ const NEXT_TOKEN_PREFIX: &str = "kafka:replicators:";
 /// against the keys of the caller's own registry, so a forged resume point can
 /// only skip or repeat entries the caller may already list.
 fn encode_next_token(last_arn: &str) -> String {
-    ::aws_smithy_types::base64::encode(format!("{NEXT_TOKEN_PREFIX}{last_arn}"))
+    crate::state::encode_page_token(NEXT_TOKEN_PREFIX, last_arn)
 }
 
 /// The ARN a token resumes after, or `None` when the token is not one this
 /// operation minted.
 fn decode_next_token(token: &str) -> Option<String> {
-    let decoded = ::aws_smithy_types::base64::decode(token).ok()?;
-    let decoded = String::from_utf8(decoded).ok()?;
-    decoded
-        .strip_prefix(NEXT_TOKEN_PREFIX)
-        .map(ToString::to_string)
+    crate::state::decode_page_token(NEXT_TOKEN_PREFIX, token)
 }
 
 /// The `ListReplicators` operation.

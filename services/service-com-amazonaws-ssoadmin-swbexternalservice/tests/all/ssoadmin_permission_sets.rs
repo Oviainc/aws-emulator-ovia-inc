@@ -155,6 +155,26 @@ pub(crate) async fn call_in_region(
     operation: &str,
     body: &Value,
 ) -> (u16, Value) {
+    call_raw(
+        router,
+        region,
+        operation,
+        &serde_json::to_string(body).expect("the request body serializes"),
+    )
+    .await
+}
+
+/// The same call, over a body given as the exact BYTES to send.
+///
+/// For a test whose subject is something a `serde_json::Value` cannot express, because a
+/// parsed `Value` holds its members in a sorted map: the ORDER a request carries its
+/// members in, or a member whose type the model does not declare.
+pub(crate) async fn call_raw(
+    router: &MultiServiceRouter,
+    region: &str,
+    operation: &str,
+    body: &str,
+) -> (u16, Value) {
     let request = http::Request::builder()
         .method("POST")
         .uri("/")
@@ -170,9 +190,7 @@ pub(crate) async fn call_in_region(
                  SignedHeaders=host;x-amz-date, Signature=0"
             ),
         )
-        .body(bytes::Bytes::from(
-            serde_json::to_vec(body).expect("the request body serializes"),
-        ))
+        .body(bytes::Bytes::from(body.to_owned()))
         .expect("a valid request");
     let response = router.dispatch(request).await;
     let status = response.status().as_u16();
