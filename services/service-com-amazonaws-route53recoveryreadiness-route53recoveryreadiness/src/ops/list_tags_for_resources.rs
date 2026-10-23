@@ -3,9 +3,10 @@
 //! @op ListTagsForResources
 //!
 //! Reports the tags of the resource the given ARN addresses, resolved through this
-//! service's ARN index, or the 404 `NotFoundException` this service's tagging
-//! operations answer when no stored resource carries that ARN. A report: it writes
-//! nothing.
+//! service's ARN index, or the `NotFoundException` this service's tagging operations
+//! answer — HTTP 400, not the modelled `ResourceNotFoundException`'s 404 (see
+//! [`crate::scaffolded::NOT_FOUND_EXCEPTION_STATUS`]) — when no stored resource carries
+//! that ARN. A report: it writes nothing.
 //!
 //! ## Shape of an operation
 //!

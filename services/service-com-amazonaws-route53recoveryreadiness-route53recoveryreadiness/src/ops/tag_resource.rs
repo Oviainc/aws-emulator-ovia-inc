@@ -4,8 +4,10 @@
 //!
 //! Adds tags to the resource the given ARN addresses, resolved through this service's
 //! ARN index. A tag is NOT attachable to a resource that was never created: an ARN no
-//! stored resource carries is refused with the 404 `NotFoundException` this service's
-//! tagging operations answer, before anything is written.
+//! stored resource carries is refused with the `NotFoundException` this service's
+//! tagging operations answer — HTTP 400, not the modelled
+//! `ResourceNotFoundException`'s 404 (see
+//! [`crate::scaffolded::NOT_FOUND_EXCEPTION_STATUS`]) — before anything is written.
 //!
 //! ## Shape of an operation
 //!

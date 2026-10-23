@@ -169,25 +169,30 @@ pub const SUPPORTED_RESOURCE_TYPES: &[&str] = &[
     "AWS::SQS::Queue",
 ];
 
-/// Refuse a resource-type filter this API does not support, in the wording AWS's
-/// boundary validator uses.
+/// The sentence a resource type this API has no readiness rules for is refused with.
+///
+/// A CONSTANT, resource-agnostic text, like this service's other refusals: the rejected
+/// value is NOT echoed back and the supported-type catalog is NOT enumerated. The
+/// member it refuses (`ListRules`' `ResourceType`) targets a plain `__string` — no
+/// `@enum`, no `@pattern`, no value list (`smithy_query(query="operation",
+/// operation="ListRules")`) — so the refusal is the OPERATION's own unknown-type check,
+/// not a boundary constraint report: a generated "Member must be one of …" clause would
+/// publish the emulator's own catalog as part of the wire contract, and a client reading
+/// the enumeration out of the message would learn a value set the service does not have.
+pub const UNKNOWN_RESOURCE_TYPE_MESSAGE: &str = "Unknown resource type.";
+
+/// Refuse a resource-type filter this API has no readiness rules for.
 ///
 /// A filter value outside [`SUPPORTED_RESOURCE_TYPES`] names no resource type this
 /// service has rules for, so it is refused rather than silently ignored — a filter that
 /// is honoured for supported values and dropped for unsupported ones would hand back
-/// the whole catalog for a typo.
-pub fn validate_resource_type(path: &str, value: &str) -> Result<(), String> {
+/// the whole catalog for a typo. The refusal carries
+/// [`UNKNOWN_RESOURCE_TYPE_MESSAGE`], which is the same whatever was asked for.
+pub fn validate_resource_type(value: &str) -> Result<(), &'static str> {
     if SUPPORTED_RESOURCE_TYPES.contains(&value) {
         return Ok(());
     }
-    Err(validation_message(
-        path,
-        value,
-        &format!(
-            "Member must be one of the supported resource types: {}",
-            SUPPORTED_RESOURCE_TYPES.join(", ")
-        ),
-    ))
+    Err(UNKNOWN_RESOURCE_TYPE_MESSAGE)
 }
 
 /// Longest prefix of a rejected value a validation message echoes back, so a

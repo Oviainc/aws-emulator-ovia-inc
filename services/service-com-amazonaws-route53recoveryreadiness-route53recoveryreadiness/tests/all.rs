@@ -26,6 +26,8 @@ mod cross_account_authorization_validation;
 mod cross_account_authorization;
 #[path = "all/cross_account_authorizations.rs"]
 mod cross_account_authorizations;
+#[path = "all/error_wire_contract.rs"]
+mod error_wire_contract;
 #[path = "all/readiness_check_lifecycle.rs"]
 mod readiness_check_lifecycle;
 #[path = "all/recovery_group_lifecycle.rs"]

@@ -247,11 +247,23 @@ impl SerializableStruct for ValidationError {
 ///
 /// The model declares `ResourceNotFoundException` on `ListTagsForResources`,
 /// `TagResource` and `UntagResource`, but the service answers those three with the code
-/// `NotFoundException` (404) — the resource-specific Get/Delete operations are the ones
+/// `NotFoundException` — the resource-specific Get/Delete operations are the ones
 /// that answer `ResourceNotFoundException`. The code is what a client branches on, so
 /// the recorded code is what this emulator sends; it is a shape no model declares,
 /// which is exactly what this wrapper exists for.
 pub const NOT_FOUND_EXCEPTION_NAME: &str = "NotFoundException";
+
+/// The HTTP status that same answer carries: **400**, not the 404 the model's
+/// `ResourceNotFoundException` declares.
+///
+/// The recorded answer of all three ARN-addressed tagging operations for a
+/// `ResourceArn` this account has no record of is HTTP 400 with the code
+/// [`NOT_FOUND_EXCEPTION_NAME`]: the status and the code are ONE wire contract, so
+/// neither of them is taken from the modelled `ResourceNotFoundException` those
+/// operations list. The NAME-addressed Get/Delete operations are unaffected — they
+/// answer the modelled `ResourceNotFoundException`, whose 404 the model declares and a
+/// recording confirms.
+pub const NOT_FOUND_EXCEPTION_STATUS: u16 = 400;
 
 /// The `message` member of the synthetic `NotFoundException` error shape.
 static NOT_FOUND_EXCEPTION_MESSAGE: Schema = Schema::new_member(
@@ -310,6 +322,80 @@ impl SerializableStruct for NotFoundException {
     }
 }
 
+/// The wire error code `CreateReadinessCheck`'s 403 DENIAL carries.
+///
+/// The model declares the shape `AccessDeniedException` (`@error client`,
+/// `@httpError 403`), and `CreateCell`, `CreateRecoveryGroup` and `CreateResourceSet`
+/// are each recorded answering their denial with that shape name as the code. The
+/// recorded `CreateReadinessCheck` denial carries `x-amzn-errortype: AccessDenied`
+/// instead — on restJson1 that header IS the error code, the value an SDK matches to
+/// pick the modelled exception, so it is the wire contract and not a rendering of the
+/// shape's name. The code therefore belongs to the OPERATION: an operation whose
+/// recorded code is its shape's name returns the modelled variant, and one whose
+/// recorded code differs returns this. The status is the modelled 403 either way.
+pub const ACCESS_DENIED_NAME: &str = "AccessDenied";
+
+/// The HTTP status of that denial, the one the `AccessDeniedException` shape's
+/// `@httpError` declares.
+pub const ACCESS_DENIED_STATUS: u16 = 403;
+
+/// The `message` member of the synthetic `AccessDenied` error shape.
+static ACCESS_DENIED_MESSAGE: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "smithy.framework#AccessDenied$message",
+        "smithy.framework",
+        "message",
+    ),
+    ShapeType::String,
+    "message",
+    0,
+)
+.with_xml_name("Message");
+
+/// Schema for the synthetic `AccessDenied` error shape, in the `smithy.framework`
+/// namespace for the same reason as the others here: the shape is in no service's model,
+/// so it must not collide with a modelled one.
+pub static ACCESS_DENIED_SCHEMA: Schema = Schema::new_struct(
+    ShapeId::from_static(
+        "smithy.framework#AccessDenied",
+        "smithy.framework",
+        "AccessDenied",
+    ),
+    ShapeType::Structure,
+    &[&ACCESS_DENIED_MESSAGE],
+);
+
+/// The payload of an `AccessDenied` failure: why the caller is not allowed to perform
+/// the action.
+#[derive(Debug, Clone)]
+pub struct AccessDenied {
+    pub message: String,
+}
+
+impl AccessDenied {
+    /// An `AccessDenied` failure carrying `message`.
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for AccessDenied {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{ACCESS_DENIED_NAME}: {}", self.message)
+    }
+}
+
+impl std::error::Error for AccessDenied {}
+
+impl SerializableStruct for AccessDenied {
+    fn serialize_members(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
+        s.write_string(&ACCESS_DENIED_MESSAGE, self.message.as_str())?;
+        Ok(())
+    }
+}
+
 /// An operation's error channel: either the synthetic scaffold signal, or one of the
 /// operation's own modeled errors.
 #[derive(Debug)]
@@ -329,15 +415,21 @@ pub enum Scaffolded<E> {
     /// `MalformedQueryString` rather than `ValidationException`, so a client
     /// matching on the error code there sees two codes for one logical failure.
     ValidationException(ValidationException),
-    /// The addressed resource does not exist. Renders as HTTP 404 with the error code
-    /// [`NOT_FOUND_EXCEPTION_NAME`] — the code this service's tagging operations
-    /// answer, which its model does not declare.
+    /// The addressed resource does not exist. Renders as
+    /// [`NOT_FOUND_EXCEPTION_STATUS`] with the error code
+    /// [`NOT_FOUND_EXCEPTION_NAME`] — the status and code this service's tagging
+    /// operations answer, neither of which its model declares.
     NotFoundException(NotFoundException),
     /// A submitted value was refused by a rule the service enforces but does not model.
     /// Renders as HTTP 400 with the error code [`VALIDATION_ERROR_NAME`] — the code the
     /// cross-account authorization grant's refusal is recorded with, which this
     /// service's model does not declare.
     ValidationError(ValidationError),
+    /// The caller may not perform this action. Renders as
+    /// [`ACCESS_DENIED_STATUS`] with the error code [`ACCESS_DENIED_NAME`] — the wire
+    /// code the operations recorded with it carry, which is not the name of the
+    /// `AccessDeniedException` shape their model declares.
+    AccessDenied(AccessDenied),
 }
 
 impl<E> Scaffolded<E> {
@@ -364,12 +456,12 @@ impl<E> Scaffolded<E> {
         Self::ValidationException(ValidationException::new(message))
     }
 
-    /// Refuse the request because the resource it addresses does not exist, with HTTP
-    /// 404 and the error code [`NOT_FOUND_EXCEPTION_NAME`].
+    /// Refuse the request because the resource it addresses does not exist, with
+    /// [`NOT_FOUND_EXCEPTION_STATUS`] and the error code [`NOT_FOUND_EXCEPTION_NAME`].
     ///
-    /// For the operations whose recorded error CODE is not the one their model names;
-    /// an operation that answers the modeled `ResourceNotFoundException` returns that
-    /// modeled variant instead.
+    /// For the operations whose recorded error CODE and STATUS are not the ones their
+    /// model names; an operation that answers the modeled `ResourceNotFoundException`
+    /// returns that modeled variant instead.
     pub fn not_found(message: impl Into<String>) -> Self {
         Self::NotFoundException(NotFoundException::new(message))
     }
@@ -379,6 +471,17 @@ impl<E> Scaffolded<E> {
     /// their model names.
     pub fn validation_error(message: impl Into<String>) -> Self {
         Self::ValidationError(ValidationError::new(message))
+    }
+
+    /// Deny the request with [`ACCESS_DENIED_STATUS`] and the error code
+    /// [`ACCESS_DENIED_NAME`].
+    ///
+    /// For the operations whose recorded 403 carries that code rather than the name of
+    /// the `AccessDeniedException` shape (`CreateReadinessCheck`); the ones recorded
+    /// with the shape name return the modelled variant instead. The status is the one
+    /// the shape's `@httpError` declares either way.
+    pub fn access_denied(message: impl Into<String>) -> Self {
+        Self::AccessDenied(AccessDenied::new(message))
     }
 }
 
@@ -390,6 +493,7 @@ impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
             Self::ValidationException(e) => write!(f, "{e}"),
             Self::NotFoundException(e) => write!(f, "{e}"),
             Self::ValidationError(e) => write!(f, "{e}"),
+            Self::AccessDenied(e) => write!(f, "{e}"),
         }
     }
 }
@@ -404,6 +508,7 @@ impl<E: std::error::Error + 'static> std::error::Error for Scaffolded<E> {
             Self::ValidationException(e) => e.source(),
             Self::NotFoundException(e) => e.source(),
             Self::ValidationError(e) => e.source(),
+            Self::AccessDenied(e) => e.source(),
         }
     }
 }
@@ -420,6 +525,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::ValidationException(e) => e,
             Self::NotFoundException(e) => e,
             Self::ValidationError(e) => e,
+            Self::AccessDenied(e) => e,
         }
     }
 
@@ -430,6 +536,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::ValidationException(_) => &VALIDATION_EXCEPTION_SCHEMA,
             Self::NotFoundException(_) => &NOT_FOUND_EXCEPTION_SCHEMA,
             Self::ValidationError(_) => &VALIDATION_ERROR_SCHEMA,
+            Self::AccessDenied(_) => &ACCESS_DENIED_SCHEMA,
         }
     }
 
@@ -448,6 +555,10 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             // The code the cross-account authorization refusal is recorded with. Keep
             // the literal: a client branches on it.
             Self::ValidationError(_) => VALIDATION_ERROR_NAME,
+            // The code this service's 403 denial is recorded with — NOT the name of the
+            // `AccessDeniedException` shape. Keep the literal: an SDK resolves the
+            // modelled exception from it.
+            Self::AccessDenied(_) => ACCESS_DENIED_NAME,
         }
     }
 
@@ -460,8 +571,12 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::NotImplemented(_) => 501,
             Self::Modeled(e) => e.http_status(),
             Self::ValidationException(_) => 400,
-            Self::NotFoundException(_) => 404,
+            // The status the tagging operations' recorded not-found carries, which is
+            // NOT the modelled `ResourceNotFoundException`'s 404. See
+            // [`NOT_FOUND_EXCEPTION_STATUS`].
+            Self::NotFoundException(_) => NOT_FOUND_EXCEPTION_STATUS,
             Self::ValidationError(_) => 400,
+            Self::AccessDenied(_) => ACCESS_DENIED_STATUS,
         }
     }
 
@@ -476,6 +591,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::ValidationException(_) => None,
             Self::NotFoundException(_) => None,
             Self::ValidationError(_) => None,
+            Self::AccessDenied(_) => None,
         }
     }
 }
