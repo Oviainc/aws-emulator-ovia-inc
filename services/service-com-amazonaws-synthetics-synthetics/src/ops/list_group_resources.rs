@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListGroupResources
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListGroupResources`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListGroupResources::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Pages over the canary ARNs associated with one group.
 //!
 //! ## Shape of an operation
 //!
@@ -82,6 +74,19 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::{PageStart, GROUP_NOT_FOUND, MAX_TOKEN_LEN, STORE_UNAVAILABLE};
+
+/// `ListGroupResourcesRequest$MaxResults`: "If you omit this parameter, the default of 20
+/// is used." (which is also `MaxGroupResults`' modelled `@range` maximum, so the boundary
+/// walk refuses anything outside 1..20 before this handler runs).
+const DEFAULT_MAX_RESULTS: usize = 20;
+
+/// This operation's own page-token prefix, so a token issued over a group's membership set
+/// does not decode over another collection. The token FORM, its length ceiling and the
+/// offset fallback are the service's shared ones:
+/// [`crate::state::encode_page_token`].
+const TOKEN_RESOURCE_PREFIX: &str = "rs#";
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -153,18 +158,80 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListGroupResources` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListGroupResourcesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListGroupResources"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListGroupResourcesError::from(
+                ListGroupResourcesErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(STORE_UNAVAILABLE.to_string()),
+                    },
+                ),
+            )
+        })?;
+
+        // Reporting only: a membership set has no transition the clock owes, so this call
+        // writes nothing. "Groups are a global resource", so the Region the request was
+        // signed for plays no part in resolving the group.
+        let guard = state.lock();
+        let group = guard
+            .group_by_identifier(&input.group_identifier)
+            .ok_or_else(|| {
+                ListGroupResourcesError::from(
+                    ListGroupResourcesErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            // The same fixed, identifier-free sentence every group reader
+                            // answers a miss with: see `state::GROUP_NOT_FOUND`.
+                            message: Some(GROUP_NOT_FOUND.to_string()),
+                        },
+                    ),
+                )
+            })?;
+
+        // The membership set is ARN-ordered, so this list has a total, stable order and a
+        // page boundary in it means the same thing on the next call.
+        let members: Vec<&String> = group.resources.iter().collect();
+
+        let start = match input.next_token.as_deref() {
+            None => PageStart::Offset(0),
+            Some(token) => crate::state::decode_page_token(
+                TOKEN_RESOURCE_PREFIX,
+                token,
+                members.len(),
+                // The only keys this operation ever puts in a token are the canary ARNs it
+                // paged over, and the shared encoder emits a key token only while the
+                // prefix and the key fit the modelled token length.
+                |arn| !arn.is_empty() && arn.len() <= MAX_TOKEN_LEN,
+            )
+            .ok_or_else(|| {
+                ListGroupResourcesError::from(ListGroupResourcesErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some("NextToken is not a token this operation issued".to_string()),
+                    },
+                ))
+            })?,
+        };
+        let page_size = crate::state::page_size(input.max_results, DEFAULT_MAX_RESULTS);
+
+        let from = match &start {
+            PageStart::Offset(offset) => (*offset).min(members.len()),
+            PageStart::Key(arn) => members
+                .iter()
+                .position(|member| member.as_str() >= arn.as_str())
+                .unwrap_or(members.len()),
+        };
+        let until = from.saturating_add(page_size).min(members.len());
+        let resources: Vec<String> = members[from..until]
+            .iter()
+            .map(|member| (*member).clone())
+            .collect();
+        // A token only when entries actually remain, so a client stops paging.
+        let next_token = members.get(until).map(|next| {
+            crate::state::encode_page_token(TOKEN_RESOURCE_PREFIX, until, next.as_str())
+        });
+
+        Ok(ListGroupResourcesOutput {
+            resources: Some(resources),
+            next_token,
+        })
     }
 }

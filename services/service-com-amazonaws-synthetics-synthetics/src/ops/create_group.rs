@@ -78,7 +78,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::SystemTime;
 
 use crate::state::{new_group_id, request_caller, StoredGroup, AUDIT_TARGET, MAX_GROUPS, STORE_UNAVAILABLE};
@@ -174,6 +174,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .unwrap_or_default()
                 .into_iter()
                 .collect::<BTreeMap<_, _>>(),
+            // A new group contains nothing; membership comes from `AssociateResource`.
+            resources: BTreeSet::new(),
         };
 
         // Claim the name and read the response back out of the stored record, under ONE

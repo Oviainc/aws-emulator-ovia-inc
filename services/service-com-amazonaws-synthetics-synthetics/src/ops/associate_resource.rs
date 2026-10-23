@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AssociateResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AssociateResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AssociateResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Associates one canary with one group, in this service's store.
 //!
 //! ## Shape of an operation
 //!
@@ -72,6 +64,12 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use std::time::SystemTime;
+
+use crate::state::{
+    group_not_found, CANARY_NOT_FOUND, MAX_CANARIES_PER_GROUP, MAX_GROUPS_PER_CANARY,
+    STORE_UNAVAILABLE,
+};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -145,18 +143,93 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AssociateResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AssociateResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AssociateResource"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(internal_error)?;
+        let now = SystemTime::now();
+
+        let mut guard = state.lock();
+        // Only what the clock already owed on the canary records (a canary that finished
+        // provisioning, a run whose outcome came due); the association itself is this
+        // call's own write.
+        guard.settle(now);
+
+        // Both sides of the association have to exist. The group is "a global resource",
+        // so it is resolved by name, ARN or id with no Region in play; the canary is
+        // resolved by the exact ARN the request names, which carries the Region it lives
+        // in — that is how "You must run this operation in the Region where the canary
+        // exists" holds here.
+        let group_key = guard
+            .group_key(&input.group_identifier)
+            .ok_or_else(|| not_found(group_not_found(&input.group_identifier)))?;
+        if guard.canary_by_arn(&input.resource_arn).is_none() {
+            return Err(not_found(CANARY_NOT_FOUND.to_string()));
+        }
+
+        // Membership is a set: a canary already in the group is already associated, so
+        // repeating the call succeeds and changes nothing — including the quotas below,
+        // which only a new membership can push past.
+        let already_associated = guard
+            .groups
+            .get(&group_key)
+            .is_some_and(|group| group.resources.contains(&input.resource_arn));
+        if already_associated {
+            return Ok(AssociateResourceOutput {});
+        }
+
+        // "Each group can contain as many as 10 canaries … Any single canary can be a
+        // member of up to 10 groups" — both bounds are checked under the same lock as the
+        // insert, so concurrent associates cannot both pass them.
+        let in_group = guard
+            .groups
+            .get(&group_key)
+            .map_or(0, |group| group.resources.len());
+        if in_group >= MAX_CANARIES_PER_GROUP {
+            return Err(quota_exceeded(format!(
+                "Maximum number of canaries in a group reached: {MAX_CANARIES_PER_GROUP} \
+                 canaries per group"
+            )));
+        }
+        if guard.membership_count(&input.resource_arn) >= MAX_GROUPS_PER_CANARY {
+            return Err(quota_exceeded(format!(
+                "Maximum number of groups for a canary reached: {MAX_GROUPS_PER_CANARY} groups \
+                 per canary"
+            )));
+        }
+
+        let group = guard.groups.get_mut(&group_key).ok_or_else(internal_error)?;
+        group.resources.insert(input.resource_arn);
+        // The group's membership changed, which is a change to the group: `GetGroup`
+        // reports it through `Group$LastModifiedTime`, "the date and time that the group
+        // was most recently updated".
+        group.last_modified = now;
+        Ok(AssociateResourceOutput {})
     }
+}
+
+/// The modelled 404 for a resource this store does not hold. The message is the sentence
+/// the service answers that lookup with: `state::group_not_found` for a group, which names
+/// the identifier as supplied, and the fixed `state::CANARY_NOT_FOUND` for a canary, which
+/// is request-independent.
+fn not_found(message: String) -> AssociateResourceError {
+    AssociateResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The modelled 402 for a documented group quota the request would push past.
+fn quota_exceeded(message: String) -> AssociateResourceError {
+    AssociateResourceErrorModeled::ServiceQuotaExceededException(ServiceQuotaExceededException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The modelled 500 for a store that cannot be reached. Never a fresh engine: a private
+/// store would accept the write and drop it when the request returns.
+fn internal_error() -> AssociateResourceError {
+    AssociateResourceErrorModeled::InternalServerException(InternalServerException {
+        message: Some(STORE_UNAVAILABLE.to_string()),
+    })
+    .into()
 }
