@@ -163,12 +163,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let store = state.lock();
         let tags = store.tags_of(&input.resource_arn).ok_or_else(|| {
-            ListTagsForResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: format!("{} {} does not exist", parts.kind, parts.id),
-                resource_id: parts.id.to_string(),
-                resource_type: parts.kind.to_string(),
-                context: None,
-            })
+            ListTagsForResourceErrorModeled::ResourceNotFoundException(
+                crate::state::resource_not_found(parts.kind, parts.id),
+            )
         })?;
 
         // A taggable resource always has a tag list, empty when it carries no tags.

@@ -11,13 +11,17 @@
 //! contain a dot, which is why the operation is the segment after the LAST dot and the
 //! service is the segment before it.
 //!
-//! The wire behaviour this rule produces is asserted end-to-end in
+//! The rule itself is `service_common::rpc_target::operation_for_service`, stated once
+//! there for every service whose published prefix carries dots (this one and
+//! CodeConnections today) and read here under this service's own shape name. The wire
+//! behaviour it produces is asserted end-to-end in
 //! `tests/all/target_prefix_dispatch.rs`; what is pinned here is the reader itself, over
 //! a table of prefix forms.
 
-use super::operation_from_target;
+use service_common::rpc_target::operation_for_service;
 
-/// The local name of this service's model shape, as `shape_name` derives it.
+/// The local name of this service's model shape, which the shared reader matches the
+/// target's prefix against.
 const SHAPE: &str = "CloudTrail_20131101";
 
 #[test]
@@ -82,7 +86,7 @@ fn the_operation_is_the_segment_after_the_last_dot() {
     ];
 
     for (case, target, expected) in rows {
-        let actual = operation_from_target(target, SHAPE);
+        let actual = operation_for_service(target, SHAPE);
         assert_eq!(
             actual, expected,
             "case {case:?}: expected {expected:?} from target {target:?}, got {actual:?}"

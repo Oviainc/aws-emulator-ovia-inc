@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListEngagements
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListEngagements`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListEngagements::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Lists the stored engagements, optionally narrowed to one `IncidentId` and to the
+//! engagements whose `StartTime` falls inside `TimeRangeValue`. A read: it writes nothing.
+//!
+//! The order is the store's own, by `EngagementArn` — the model documents no order for
+//! `Engagements`, and a total order is what lets the opaque `NextToken` carry nothing but
+//! the ARN the page ended on.
+//!
+//! Unlike the resource-addressed calls in this service it is NOT gated on the account's
+//! Incident Manager replication set
+//! ([`crate::state::ComAmazonawsSsmcontactsSsmcontactsState::require_active_replication_set`]):
+//! a list resolves no resource, it reports the caller's own set of engagements, and the
+//! recorded corpus shows the call served (an empty list) for an account that has no
+//! replication set, where `StopEngagement` on the same account is refused.
+//!
+//! Paging is the service's shared codec ([`crate::state::encode_next_token`]): the opaque
+//! `NextToken` names the engagement the page ended on, and the last page carries none.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +160,86 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListEngagements` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListEngagementsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListEngagements"))
+        use crate::state::{
+            decode_next_token, engagement_summary, invalid_next_token_message, page_size,
+            take_page, TOKEN_SCOPE_ENGAGEMENTS,
+        };
+
+        let _ = ctx;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListEngagementsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "this service is mounted on an engine that holds no state"
+                        .to_string(),
+                    retry_after_seconds: 0,
+                },
+            )
+            .into());
+        };
+
+        // The resume point: every engagement strictly after the ARN the last page ended
+        // on, in this list's own order.
+        let after = match input.next_token.as_deref().filter(|token| !token.is_empty()) {
+            Some(token) => Some(
+                decode_next_token(TOKEN_SCOPE_ENGAGEMENTS, token)
+                    .ok_or_else(|| validation(invalid_next_token_message(token)))?,
+            ),
+            None => None,
+        };
+
+        // `TimeRange` bounds are inclusive and independently optional, so a range naming
+        // only one end is a half-open filter.
+        let (start_bound, end_bound) = match input.time_range_value.as_ref() {
+            Some(range) => (
+                range.start_time.map(|at| at.as_secs_f64()),
+                range.end_time.map(|at| at.as_secs_f64()),
+            ),
+            None => (None, None),
+        };
+
+        let state = state.lock();
+        let matching: Vec<Engagement> = state
+            .engagements
+            .iter()
+            .filter(|(arn, _)| after.as_deref().is_none_or(|last| arn.as_str() > last))
+            .map(|(_, record)| record)
+            .filter(|record| {
+                input
+                    .incident_id
+                    .as_deref()
+                    .is_none_or(|wanted| record.incident_id.as_deref() == Some(wanted))
+            })
+            .map(engagement_summary)
+            .filter(|engagement| {
+                let started = engagement
+                    .start_time
+                    .map_or(f64::NEG_INFINITY, |at| at.as_secs_f64());
+                start_bound.is_none_or(|from| started >= from)
+                    && end_bound.is_none_or(|to| started <= to)
+            })
+            .collect();
+
+        let (page, next_token) = take_page(
+            matching,
+            page_size(input.max_results),
+            TOKEN_SCOPE_ENGAGEMENTS,
+            |engagement| engagement.engagement_arn.clone(),
+        );
+
+        Ok(ListEngagementsOutput {
+            next_token,
+            engagements: page,
+        })
     }
+}
+
+/// This operation's modelled `ValidationException`, carrying `message`.
+fn validation(message: impl Into<String>) -> ListEngagementsError {
+    ListEngagementsErrorModeled::ValidationException(ValidationException {
+        message: message.into(),
+        reason: Some("FIELD_VALIDATION_FAILED".to_string()),
+        fields: None,
+    })
+    .into()
 }

@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateContext
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateContext`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateContext::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: registers a lineage context in `crate::state` under the `ContextArn` it
+//! mints from the request's Region and the `ContextName` (the key
+//! `crate::state::context_key` resolves a request to), and refuses a name already in use
+//! in that Region. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +143,72 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateContext` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateContextErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateContext"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        let region = crate::state::request_region(ctx);
+        let arn = crate::state::resource_arn(&region, crate::state::CONTEXT_KIND, &input.context_name);
+        // One instant for both stamps: a context nobody has updated reports the same
+        // `CreationTime` and `LastModifiedTime`, and `UpdateContext` moves only the latter.
+        let now = ::std::time::SystemTime::now();
+        // The identity behind this call, stored once so a later read reports the caller
+        // that created the context rather than the one reading it.
+        let created_by = crate::state::caller_user_context(ctx);
+
+        let mut store = state.lock();
+        // `ContextName` must be unique to the account in the Region (the member's own
+        // docs), and the ARN that keys the store carries both — so a name already in use
+        // IN THIS REGION is refused rather than overwritten (otherwise the caller reads a
+        // 200 for a context it did not create and loses the one it did), while the same
+        // name in another Region is a different context and is accepted. Checked BEFORE
+        // the quota, so re-creating an existing name is refused for being in use whatever
+        // the store's occupancy, and the limit failure is reserved for a request that
+        // would really add a record.
+        if store.contexts.contains_key(&arn) {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "Cannot create already existing context \"{arn}\"."
+            )));
+        }
+        // The store is bounded, so a caller varying `ContextName` cannot grow it without
+        // end. `ResourceLimitExceeded` is the only limit failure this operation models.
+        if !store.contexts_below_quota() {
+            return Err(CreateContextErrorModeled::ResourceLimitExceeded(ResourceLimitExceeded {
+                message: Some(format!(
+                    "The account-level service limit for contexts is {}, with current \
+                     utilization of {} and a request delta of 1.",
+                    crate::state::CONTEXT_QUOTA,
+                    store.contexts.len()
+                )),
+            })
+            .into());
+        }
+
+        store.contexts.insert(
+            arn.clone(),
+            crate::state::Context {
+                name: input.context_name.clone(),
+                arn: arn.clone(),
+                region: region.clone(),
+                source: input.source,
+                context_type: input.context_type,
+                description: input.description,
+                // Kept as given: an absent `Properties` and an empty one are different
+                // requests, so they are stored differently and read back differently.
+                properties: input
+                    .properties
+                    .map(|properties| properties.into_iter().collect()),
+                created_by: created_by.clone(),
+                last_modified_by: created_by,
+                tags: input.tags.unwrap_or_default(),
+                creation_time: now,
+                last_modified_time: now,
+            },
+        );
+        drop(store);
+
+        crate::state::record_state_change(Self::NAME, &arn, ctx);
+        Ok(CreateContextOutput {
+            context_arn: Some(arn),
+        })
     }
 }

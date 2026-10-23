@@ -2,7 +2,7 @@
 
 //! @op DeleteSuiteDefinition
 //!
-//! Removes the definition, its version snapshots, its runs and their tag records from the
+//! Removes the definition with its version labels, its runs and their tag records from the
 //! store, so a later `GetSuiteDefinition` answers `ResourceNotFoundException` and the
 //! definition is gone from `ListSuiteDefinitions`.
 //!

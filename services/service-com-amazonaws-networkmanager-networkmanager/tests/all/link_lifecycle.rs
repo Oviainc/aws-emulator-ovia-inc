@@ -155,7 +155,12 @@ async fn create_link(emulator: &Emulator, network: &str, site: &str, body: &Valu
 }
 
 /// `CreateLink` that must succeed, answering the minted `LinkId`.
-async fn create_link_ok(emulator: &Emulator, network: &str, site: &str, body: &Value) -> String {
+pub(crate) async fn create_link_ok(
+    emulator: &Emulator,
+    network: &str,
+    site: &str,
+    body: &Value,
+) -> String {
     let (status, created) = create_link(emulator, network, site, body).await;
     assert_eq!(
         status, 200,
@@ -168,7 +173,7 @@ async fn create_link_ok(emulator: &Emulator, network: &str, site: &str, body: &V
 }
 
 /// A link body carrying just the required `Bandwidth`, for tests about something else.
-fn plain_link() -> Value {
+pub(crate) fn plain_link() -> Value {
     json!({ "Bandwidth": { "UploadSpeed": 10, "DownloadSpeed": 20 } })
 }
 

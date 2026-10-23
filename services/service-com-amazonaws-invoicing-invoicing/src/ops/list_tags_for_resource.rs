@@ -150,9 +150,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let store = state.lock();
 
-        // The tag plane answers for the resources that EXIST: a unit a delete has
-        // retired is history kept for point-in-time reads, and its tags went with it.
-        if store.live_invoice_unit(&input.resource_arn).is_none() {
+        // The tag plane answers for the resources that EXIST, of every kind this
+        // service's ARNs name: a unit a delete has retired is history kept for
+        // point-in-time reads, and its tags went with it (see
+        // `crate::state::resource_exists`).
+        if !store.resource_exists(&input.resource_arn) {
             return Err(ListTagsForResourceErrorModeled::ResourceNotFoundException(
                 crate::state::no_such_resource(&input.resource_arn),
             )

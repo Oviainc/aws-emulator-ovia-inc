@@ -12,8 +12,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    Bandwidth, GlobalNetwork, Link, Location, Site, Tag, ValidationException,
-    ValidationExceptionField,
+    Bandwidth, GlobalNetwork, Link, Location, ResourceNotFoundException, Site, Tag,
+    ValidationException, ValidationExceptionField,
 };
 
 /// Members of `GlobalNetworkState` / `SiteState` / `LinkState` this slice uses. All three
@@ -56,6 +56,69 @@ pub const LIMIT_SITES_PER_GLOBAL_NETWORK: &str = "sites-per-global-network";
 pub const LIMIT_LINKS_PER_SITE: &str = "links-per-site";
 /// See [`LIMIT_GLOBAL_NETWORKS_PER_ACCOUNT`]; the quota [`MAX_TAGS_PER_RESOURCE`] bounds.
 pub const LIMIT_TAGS_PER_RESOURCE: &str = "tags-per-resource";
+
+/// The message every `ResourceNotFoundException` this service raises carries.
+///
+/// The model declares the member required but states no text. Two independent recordings
+/// of different resources through different operations — `UpdateGlobalNetwork` on a
+/// deleted global-network id and `TagResource` on the ARN of a deleted site — both answer
+/// the identical string, so the message is a fixed, resource-INDEPENDENT constant: the
+/// identifying detail travels in the shape's required `ResourceId` and `ResourceType`,
+/// never in the prose. Every not-found refusal of this service is built by
+/// [`resource_not_found`], so no handler can reintroduce per-request text.
+pub const RESOURCE_NOT_FOUND_MESSAGE: &str = "Resource not found.";
+
+/// The modelled `ResourceNotFoundException` (HTTP 404) for the resource `kind` and `id`
+/// name: the constant [`RESOURCE_NOT_FOUND_MESSAGE`] plus the identifying detail in
+/// `ResourceId` / `ResourceType`.
+///
+/// `kind` is one of the ARN resource types this service mints ([`GLOBAL_NETWORK_KIND`],
+/// [`SITE_KIND`], [`LINK_KIND`]), which is also the `ResourceType` AWS reports.
+pub fn resource_not_found(kind: &str, id: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: RESOURCE_NOT_FOUND_MESSAGE.to_string(),
+        resource_id: id.to_string(),
+        resource_type: kind.to_string(),
+        context: None,
+    }
+}
+
+/// Every value a `ResourceType` member of this service's network-resource operations
+/// accepts, in lexicographic order so a paginated listing of them is stable.
+///
+/// The set is the enumeration in the member's own documentation (`smithy_query
+/// query="doc" shape="GetNetworkResourceCountsRequest" member="ResourceType"`): three
+/// Direct Connect types (`dxcon`, `dx-gateway`, `dx-vif`), eight Network Manager types
+/// (`attachment`, `connect-peer`, `connection`, `core-network`, `device`, `link`,
+/// `peering`, `site`) and six Amazon VPC types (`customer-gateway`, `transit-gateway`,
+/// `transit-gateway-attachment`, `transit-gateway-connect-peer`,
+/// `transit-gateway-route-table`, `vpn-connection`). The modelled `ConstrainedString`
+/// carries only a length and a permissive pattern, so a value outside this set is refused
+/// here rather than by the schema.
+pub const NETWORK_RESOURCE_TYPES: [&str; 17] = [
+    "attachment",
+    "connect-peer",
+    "connection",
+    "core-network",
+    "customer-gateway",
+    "device",
+    "dx-gateway",
+    "dx-vif",
+    "dxcon",
+    "link",
+    "peering",
+    "site",
+    "transit-gateway",
+    "transit-gateway-attachment",
+    "transit-gateway-connect-peer",
+    "transit-gateway-route-table",
+    "vpn-connection",
+];
+
+/// Whether `resource_type` is one of the values [`NETWORK_RESOURCE_TYPES`] lists.
+pub fn is_network_resource_type(resource_type: &str) -> bool {
+    NETWORK_RESOURCE_TYPES.contains(&resource_type)
+}
 
 /// The tag-key prefix AWS reserves for its own tags.
 ///
@@ -292,6 +355,30 @@ impl ComAmazonawsNetworkmanagerNetworkmanagerState {
             .filter(|site| site.global_network_id == global_network_id)
             .map(|site| site.id.clone())
             .collect()
+    }
+
+    /// How many links the global network `global_network_id` holds, across all its sites.
+    pub fn link_count_of_network(&self, global_network_id: &str) -> usize {
+        self.links
+            .values()
+            .filter(|link| link.global_network_id == global_network_id)
+            .count()
+    }
+
+    /// How many resources of `resource_type` the global network `global_network_id`
+    /// holds, for the network-resource inventory.
+    ///
+    /// `resource_type` must be one of [`NETWORK_RESOURCE_TYPES`] (the caller refuses
+    /// anything else). Only the kinds this service stores can be non-zero; a kind whose
+    /// creating operation is still a scaffold stub is held nowhere, so the count reported
+    /// for it is the zero the store really holds, not a placeholder.
+    pub fn network_resource_count(&self, global_network_id: &str, resource_type: &str) -> i32 {
+        let held = match resource_type {
+            SITE_KIND => self.site_count_of(global_network_id),
+            LINK_KIND => self.link_count_of_network(global_network_id),
+            _ => 0,
+        };
+        i32::try_from(held).unwrap_or(i32::MAX)
     }
 
     /// How many links `site_id` holds, for the per-site quota.

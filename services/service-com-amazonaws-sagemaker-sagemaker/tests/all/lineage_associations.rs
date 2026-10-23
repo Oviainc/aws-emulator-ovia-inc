@@ -34,13 +34,15 @@ const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
 /// Source: `AssociationEntityArn`'s modelled pattern
 /// (`^arn:aws[a-z\-]*:sagemaker:[a-z0-9\-]*:[0-9]{12}:(experiment|experiment-trial-component|artifact|action|context)/`)
 /// intersected with the operations this crate implements — `CreateArtifact`,
-/// `CreateAction` and `CreateTrialComponent`. The two remaining kinds (`experiment`,
-/// `context`) are covered as not-found rows below, because nothing can create one yet.
-const IMPLEMENTED_KINDS: &[&str] = &["artifact", "action", "experiment-trial-component"];
+/// `CreateAction`, `CreateTrialComponent`, `CreateContext` and `CreateExperiment` — every
+/// kind the pattern admits, so each is covered with a STORED end as well as a not-found one.
+const IMPLEMENTED_KINDS: &[&str] =
+    &["artifact", "action", "experiment-trial-component", "context", "experiment"];
 
 /// The entity kinds the ARN pattern admits but no implemented create mints, so no ARN of
-/// one names a stored entity. Same source as [`IMPLEMENTED_KINDS`].
-const UNIMPLEMENTED_KINDS: &[&str] = &["experiment", "context"];
+/// one names a stored entity. Same source as [`IMPLEMENTED_KINDS`]: empty now that every
+/// kind has a create, and kept so a kind added to the model ahead of its create has a home.
+const UNIMPLEMENTED_KINDS: &[&str] = &[];
 
 /// Every member of the modelled `AssociationEdgeType` enum, in the order the model lists
 /// them (`smithy_query(query="shape", shape="AssociationEdgeType")`, mirrored by the
@@ -198,6 +200,26 @@ async fn create_entity(emulator: &Emulator, region: &str, kind: &str, label: &st
                 )
                 .await,
             "TrialComponentArn",
+        ),
+        "context" => str_field(
+            &emulator
+                .ok_in(
+                    region,
+                    "CreateContext",
+                    &json!({
+                        "ContextName": label,
+                        "Source": { "SourceUri": format!("s3://bucket/{label}") },
+                        "ContextType": "Endpoint",
+                    }),
+                )
+                .await,
+            "ContextArn",
+        ),
+        "experiment" => str_field(
+            &emulator
+                .ok_in(region, "CreateExperiment", &json!({ "ExperimentName": label }))
+                .await,
+            "ExperimentArn",
         ),
         other => panic!("case {other}: no implemented create for this lineage entity kind"),
     }

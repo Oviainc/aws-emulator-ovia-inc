@@ -2,12 +2,11 @@
 
 //! `UpdateSuiteDefinition` over the wire: a definition's configuration VERSIONS.
 //!
-//! The rule under test: recording a configuration on an existing suite definition appends
-//! it as that definition's next version and advances `latestVersion` to it, leaving the
-//! definition's identity (id, ARN, `createdAt`) and every earlier version's bytes
-//! unchanged — so an unqualified read answers the configuration last recorded while a read
-//! naming an earlier version still answers the configuration that version was recorded
-//! with.
+//! The rule under test: recording a configuration on an existing suite definition hands out
+//! that definition's next version label, advances `latestVersion` to it and REPLACES the
+//! definition's one live configuration, leaving the definition's identity (id, ARN)
+//! unchanged — so every read of it, naming an earlier version or naming none, answers the
+//! configuration last recorded, while both of its timestamps move to the write instant.
 //!
 //! The table spans the configuration class the rule generalises over rather than one
 //! update: the rows of [`definition_rows`] (every `Protocol` the model enumerates, device
@@ -41,10 +40,11 @@ async fn get_definition(emulator: &Emulator, id: &str, version: Option<&str>) ->
     emulator.call("GET", &path, "us-east-1", None).await
 }
 
-/// Each update appends a version, advances `latestVersion`, and leaves every version
-/// already stored readable with the configuration it was recorded with.
+/// Each update hands out the next version label, advances `latestVersion`, and leaves
+/// every label already handed out readable — answering the definition's one LIVE
+/// configuration.
 #[tokio::test]
-async fn updating_appends_a_version_and_keeps_the_earlier_ones() {
+async fn updating_advances_the_version_and_every_label_serves_the_live_configuration() {
     let emulator = Emulator::new();
 
     let rows = definition_rows();
@@ -59,10 +59,14 @@ async fn updating_appends_a_version_and_keeps_the_earlier_ones() {
     );
     let id = created.string("suiteDefinitionId");
     let arn = created.string("suiteDefinitionArn");
-    let created_at = created.member("createdAt").clone();
+    // The write stamp observed before each update; an update must move it forward.
+    let mut previous_created_at = created
+        .member("createdAt")
+        .as_f64()
+        .unwrap_or_else(|| panic!("case {first_case:?}: expected a createdAt timestamp"));
 
-    // version label -> the configuration that version must answer with, forever.
-    let mut recorded: Vec<(String, Value)> = vec![("v1".to_string(), first_configuration)];
+    // Every version label handed out so far — each must stay readable.
+    let mut labels: Vec<String> = vec!["v1".to_string()];
 
     for (index, (case, configuration)) in rows.iter().enumerate().skip(1) {
         let updated = update_definition(&emulator, &id, configuration).await;
@@ -96,11 +100,16 @@ async fn updating_appends_a_version_and_keeps_the_earlier_ones() {
             "case {case:?}: suiteDefinitionName must come from the stored configuration, got {}",
             updated.body
         );
-        assert_eq!(
-            updated.member("createdAt"),
-            &created_at,
-            "case {case:?}: createdAt must stay the definition's creation instant, got {}",
-            updated.body
+        let updated_created_at = updated.member("createdAt").as_f64().unwrap_or_else(|| {
+            panic!(
+                "case {case:?}: expected a createdAt timestamp, got {}",
+                updated.body
+            )
+        });
+        assert!(
+            updated_created_at > previous_created_at,
+            "case {case:?}: an update must advance createdAt past {previous_created_at}, got \
+             {updated_created_at}"
         );
         let last_updated = updated.member("lastUpdatedAt").as_f64().unwrap_or_else(|| {
             panic!(
@@ -109,13 +118,13 @@ async fn updating_appends_a_version_and_keeps_the_earlier_ones() {
             )
         });
         assert!(
-            last_updated >= created_at.as_f64().unwrap_or_default(),
+            last_updated >= updated_created_at,
             "case {case:?}: lastUpdatedAt must not precede createdAt, got {last_updated}"
         );
 
-        recorded.push((expected_version.clone(), configuration.clone()));
+        labels.push(expected_version.clone());
 
-        // The unqualified read answers the version this update recorded.
+        // The unqualified read answers the configuration this update recorded.
         let latest = get_definition(&emulator, &id, None).await;
         assert_eq!(
             latest.status, 200,
@@ -135,15 +144,22 @@ async fn updating_appends_a_version_and_keeps_the_earlier_ones() {
              got {}",
             latest.body
         );
+        let read_created_at = latest.member("createdAt").as_f64().unwrap_or_else(|| {
+            panic!(
+                "case {case:?}: expected a createdAt timestamp, got {}",
+                latest.body
+            )
+        });
         assert_eq!(
-            latest.member("createdAt"),
-            &created_at,
-            "case {case:?}: createdAt must be stable across reads, got {}",
+            read_created_at, updated_created_at,
+            "case {case:?}: a read must report the write stamp the update minted, got {}",
             latest.body
         );
+        previous_created_at = read_created_at;
 
-        // Every version recorded so far still answers with its OWN configuration.
-        for (version, expected) in &recorded {
+        // Every label handed out so far still reads 200, echoes the version asked for, and
+        // answers the ONE live configuration — there are no per-version snapshots.
+        for version in &labels {
             let historic = get_definition(&emulator, &id, Some(version)).await;
             assert_eq!(
                 historic.status, 200,
@@ -152,15 +168,21 @@ async fn updating_appends_a_version_and_keeps_the_earlier_ones() {
             );
             assert_eq!(
                 historic.member("suiteDefinitionConfiguration"),
-                expected,
-                "case {case:?}: version {version} must answer the configuration it was \
-                 recorded with, got {}",
+                configuration,
+                "case {case:?}: version {version} must answer the CURRENT configuration, got {}",
                 historic.body
             );
             assert_eq!(
                 historic.string("suiteDefinitionVersion"),
                 *version,
                 "case {case:?}: a read naming {version} must report it, got {}",
+                historic.body
+            );
+            assert_eq!(
+                historic.string("latestVersion"),
+                expected_version,
+                "case {case:?}: latestVersion must be the newest version whichever version a \
+                 read names, got {}",
                 historic.body
             );
         }
@@ -339,9 +361,9 @@ async fn updates_outside_the_rules_are_refused() {
     );
 }
 
-/// A definition's version history is bounded: past the retention count the lowest-ordinal
-/// versions age out, the most recent ones stay addressable, and the labels keep counting
-/// by ORDINAL (so `v10` follows `v9`).
+/// A definition's version LABELS are bounded: past the retention count the lowest-ordinal
+/// labels age out, the most recent ones stay addressable (each answering the one live
+/// configuration), and the labels keep counting by ORDINAL (so `v10` follows `v9`).
 #[tokio::test]
 async fn version_history_is_bounded_and_counts_by_ordinal() {
     let emulator = Emulator::new();
@@ -387,7 +409,7 @@ async fn version_history_is_bounded_and_counts_by_ordinal() {
         latest.body
     );
 
-    // The oldest version aged out; every retained one still answers its own bytes.
+    // The oldest label aged out; every retained one still answers the live configuration.
     let aged_out = get_definition(&emulator, &id, Some("v1")).await;
     assert_eq!(
         (aged_out.status, aged_out.error_code.as_deref()),
@@ -409,8 +431,8 @@ async fn version_history_is_bounded_and_counts_by_ordinal() {
         );
         assert_eq!(
             historic.member("suiteDefinitionConfiguration"),
-            &configuration(n),
-            "case {:?}: version v{n} must answer the configuration it was recorded with, got {}",
+            &configuration(keep + 1),
+            "case {:?}: version v{n} must answer the CURRENT configuration, got {}",
             "bounded history",
             historic.body
         );
@@ -426,7 +448,7 @@ async fn version_history_is_bounded_and_counts_by_ordinal() {
         .unwrap_or_default();
     assert_eq!(
         held, keep,
-        "case {:?}: the store must retain at most {keep} versions, it holds {held}",
+        "case {:?}: the store must retain at most {keep} version labels, it holds {held}",
         "bounded history"
     );
 }

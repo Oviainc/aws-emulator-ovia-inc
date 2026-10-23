@@ -12,6 +12,9 @@
 //! Both resource maps are `BTreeMap`s, so a `List*` enumerates in a stable order and an
 //! opaque `NextToken` only has to carry the ARN the last page ended on.
 //!
+//! `engagements` is keyed by `EngagementArn` for the same reason: `StopEngagement` and
+//! `DescribeEngagement` both name an engagement by its ARN.
+//!
 //! Besides the state itself this module holds the helpers more than one operation needs —
 //! ARN minting, the page/token codec, the shared enum check and the output-shape
 //! rebuilders — so the handlers of the contact/channel lifecycle cannot drift apart. The
@@ -23,7 +26,10 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::SystemTime;
 
-use crate::ops::types::{Contact, ContactChannel, ContactChannelAddress, Plan, Tag};
+use crate::ops::types::{
+    Contact, ContactChannel, ContactChannelAddress, DescribeEngagementOutput, Engagement, Plan,
+    Tag,
+};
 
 /// What `CreateContact` persists, and what `GetContact`/`ListContacts` rebuild their
 /// responses from.
@@ -91,6 +97,41 @@ pub struct AccountReplicationSet {
     pub active: bool,
 }
 
+/// An engagement as it is persisted: the message `StartEngagement` sent to a contact or
+/// escalation plan, plus when it started and — once `StopEngagement` has run — when it
+/// stopped.
+///
+/// `DescribeEngagement` rebuilds its whole response from this record, so every modelled
+/// member of that response is held here rather than recomputed. `StartEngagement` (still
+/// a scaffold stub, with its own issue) is the operation that inserts one.
+#[derive(Debug, Clone)]
+pub struct EngagementRecord {
+    /// The `EngagementArn`, which is also this record's key in [`engagements`].
+    ///
+    /// [`engagements`]: ComAmazonawsSsmcontactsSsmcontactsState::engagements
+    pub arn: String,
+    /// The `ContactArn` of the contact or escalation plan being engaged.
+    pub contact_arn: String,
+    pub sender: String,
+    pub subject: String,
+    pub content: String,
+    pub public_subject: Option<String>,
+    pub public_content: Option<String>,
+    pub incident_id: Option<String>,
+    pub start_time: SystemTime,
+    /// When `StopEngagement` stopped the engagement. While it is `None` the engagement is
+    /// still running and the escalation plan keeps engaging further contacts; once it is
+    /// set the engagement is finished, which is what `DescribeEngagement$StopTime`
+    /// reports.
+    pub stop_time: Option<SystemTime>,
+    /// The `Reason` the `StopEngagement` that stopped it carried.
+    ///
+    /// No modelled response member exposes it (`DescribeEngagement` reports the times, not
+    /// the reason), but `StopEngagement` is the only call that can carry it, so it is
+    /// persisted with the stop rather than dropped.
+    pub stop_reason: Option<String>,
+}
+
 /// Per-service state for com-amazonaws-ssmcontacts-ssmcontacts. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsSsmcontactsSsmcontactsState {
@@ -110,6 +151,14 @@ pub struct ComAmazonawsSsmcontactsSsmcontactsState {
     /// channels created with the same name under the same contact are still two
     /// resources with two ARNs.
     pub channels_created: u64,
+    /// Engagements, keyed by `EngagementArn`. `StartEngagement` inserts, `StopEngagement`
+    /// stops and `DescribeEngagement` reports; nothing in this service removes one, since
+    /// the model has no delete for an engagement.
+    ///
+    /// Unbounded by any constant here because the only operation that can insert into it
+    /// is `StartEngagement`, which is still a scaffold stub: the bound belongs with the
+    /// create, the way [`MAX_CONTACTS`] sits with `CreateContact`.
+    pub engagements: BTreeMap<String, EngagementRecord>,
     /// `(operation, IdempotencyToken)` -> the ARN that token's first call minted, so a
     /// retried create answers with the same resource instead of minting a second one.
     ///
@@ -351,6 +400,41 @@ pub fn contact_channel_summary(record: &ContactChannelRecord) -> ContactChannel 
     }
 }
 
+/// The `DescribeEngagement` response for a stored engagement.
+///
+/// `StopTime` is present exactly when the engagement has been stopped, so a caller reads
+/// the stop `StopEngagement` recorded rather than a value derived from this request.
+pub fn engagement_details(record: &EngagementRecord) -> DescribeEngagementOutput {
+    DescribeEngagementOutput {
+        contact_arn: record.contact_arn.clone(),
+        engagement_arn: record.arn.clone(),
+        sender: record.sender.clone(),
+        subject: record.subject.clone(),
+        content: record.content.clone(),
+        public_subject: record.public_subject.clone(),
+        public_content: record.public_content.clone(),
+        incident_id: record.incident_id.clone(),
+        start_time: Some(::aws_smithy_types::DateTime::from(record.start_time)),
+        stop_time: record.stop_time.map(::aws_smithy_types::DateTime::from),
+    }
+}
+
+/// The `Engagement` summary `ListEngagements` returns for a stored record.
+///
+/// Deliberately smaller than [`engagement_details`]: the modelled `Engagement` shape
+/// carries the ARNs, the sender, the incident and the two times, so the message bodies are
+/// reached through `DescribeEngagement`.
+pub fn engagement_summary(record: &EngagementRecord) -> Engagement {
+    Engagement {
+        engagement_arn: record.arn.clone(),
+        contact_arn: record.contact_arn.clone(),
+        sender: record.sender.clone(),
+        incident_id: record.incident_id.clone(),
+        start_time: Some(::aws_smithy_types::DateTime::from(record.start_time)),
+        stop_time: record.stop_time.map(::aws_smithy_types::DateTime::from),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Pagination
 // ---------------------------------------------------------------------------
@@ -403,6 +487,9 @@ pub const TOKEN_SCOPE_CONTACTS: &str = "contacts";
 
 /// The `NextToken` scope `ListContactChannels` issues and accepts.
 pub const TOKEN_SCOPE_CONTACT_CHANNELS: &str = "contact-channels";
+
+/// The `NextToken` scope `ListEngagements` issues and accepts.
+pub const TOKEN_SCOPE_ENGAGEMENTS: &str = "engagements";
 
 /// Cut `items` (already filtered, in key order, and already positioned past any
 /// `NextToken`) down to one page.

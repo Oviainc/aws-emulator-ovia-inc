@@ -11,7 +11,13 @@
 //! the matching `Create*` stored. The Studio AppImageConfig registry, the Git
 //! repositories `CreateCodeRepository` registers and the processing jobs
 //! `CreateProcessingJob` accepts are kept the same way, keyed by `AppImageConfigName`,
-//! `CodeRepositoryName` and `ProcessingJobName`.
+//! `CodeRepositoryName` and `ProcessingJobName`, and so is the model-package-group
+//! registry.
+//!
+//! The lineage entities (context, artifact) are keyed by their ARN instead: SageMaker
+//! documents their names as unique to an account IN A REGION (and an artifact need not
+//! have a name at all), so the ARN — which carries the Region and the account beside the
+//! name — is what identifies one of them.
 //!
 //! Studio apps live here too, keyed by the [`AppKey`] their five input members name
 //! rather than by a bare name, because that tuple — domain, owning user profile or
@@ -1363,6 +1369,10 @@ pub struct ComAmazonawsSagemakerSagemakerState {
     pub endpoint_configs: BTreeMap<String, EndpointConfig>,
     /// Keyed by `EndpointName`.
     pub endpoints: BTreeMap<String, Endpoint>,
+    /// Lineage contexts, keyed by `ContextArn`: `ContextName` is documented unique to an
+    /// account in a Region, so the ARN — which carries the Region beside the name — is
+    /// what identifies one context. See [`context_key`].
+    pub contexts: BTreeMap<String, Context>,
     /// Keyed by `PipelineName`.
     pub pipelines: BTreeMap<String, Pipeline>,
     /// Pipeline executions, keyed by `PipelineExecutionArn` — the one identifier
@@ -2784,19 +2794,10 @@ impl ComAmazonawsSagemakerSagemakerState {
 
     /// The key [`ComAmazonawsSagemakerSagemakerState::actions`] holds an action under,
     /// for an identifier the caller gave as either a name or an ARN (the lineage
-    /// readers' `ExperimentEntityNameOrArn`).
-    ///
-    /// The store is keyed by `ActionArn`, which carries both the Region the name is
-    /// unique within and the name itself — so a bare name is resolved against `region`,
-    /// the Region this request signed for, while an ARN is matched as a WHOLE: it
-    /// addresses the one action that ARN names, and one differing in the entity kind,
-    /// the account, the partition or the Region addresses a different action.
+    /// readers' `ExperimentEntityNameOrArn`). See [`lineage_entity_key`], which the
+    /// context slice resolves its own key with too.
     pub fn action_key(region: &str, identifier: &str) -> String {
-        if identifier.starts_with("arn:") {
-            identifier.to_string()
-        } else {
-            resource_arn(region, ACTION_KIND, identifier)
-        }
+        lineage_entity_key(region, ACTION_KIND, identifier)
     }
 }
 
@@ -2957,6 +2958,54 @@ impl AIBenchmarkJob {
         }
         false
     }
+}
+
+// ---------------------------------------------------------------------------
+// The lineage-context slice: `CreateContext`, `DescribeContext`, `UpdateContext` and
+// `DeleteContext`. Kept together at the end of this module, rather than spread through
+// the blocks above, so this one resource kind reads as one slice (the same shape the
+// AI-benchmarking slice above uses).
+// ---------------------------------------------------------------------------
+
+/// The ARN resource kind a lineage context carries, i.e. the `<kind>` in [`resource_arn`].
+/// Fixed by `ContextArn`'s modelled pattern
+/// (`^arn:aws[a-z\-]*:sagemaker:[a-z0-9\-]*:[0-9]{12}:context/`), and named once here so
+/// the create, the reader, the update and the delete mint and match the same ARN.
+pub const CONTEXT_KIND: &str = "context";
+
+/// See [`MODEL_QUOTA`]. Bounds the lineage-context store the same way, and is what
+/// `CreateContext` answers `ResourceLimitExceeded` past; every record it holds is released
+/// by `DeleteContext`.
+pub const CONTEXT_QUOTA: usize = 1_000;
+
+/// A lineage context created by `CreateContext`, as `DescribeContext` replays it and
+/// `UpdateContext` edits it.
+///
+/// `properties` keeps the caller's map as given — `None` for an absent member and
+/// `Some(empty)` for an empty one — so a reader cannot tell them apart only because the
+/// store flattened them. It is a `BTreeMap` so the map serialises in one stable order
+/// whatever order the request arrived in. `created_by` / `last_modified_by` are stored by
+/// the call that set them rather than rebuilt per read, so every later read reports the
+/// identity that actually created or last edited the context.
+#[derive(Debug, Clone)]
+pub struct Context {
+    pub name: String,
+    pub arn: String,
+    /// The Region the ARN names, i.e. the one the creating request signed for. Held
+    /// separately so a read does not have to parse the ARN to report the Region's lineage
+    /// group.
+    pub region: String,
+    pub source: crate::ops::types::ContextSource,
+    pub context_type: String,
+    pub description: Option<String>,
+    pub properties: Option<BTreeMap<String, String>>,
+    pub created_by: UserContext,
+    pub last_modified_by: UserContext,
+    /// Stored so a later `ListTags` reports what the create carried; no implemented
+    /// operation surfaces it yet (`AddTags` and `ListTags` are still scaffolds).
+    pub tags: Vec<Tag>,
+    pub creation_time: SystemTime,
+    pub last_modified_time: SystemTime,
 }
 
 // ---------------------------------------------------------------------------
@@ -3187,6 +3236,51 @@ pub struct TrialComponent {
     pub tags: Vec<Tag>,
     pub creation_time: SystemTime,
     pub last_modified_time: SystemTime,
+}
+
+/// The store key one lineage entity of `kind` is held under, for an identifier the caller
+/// gave as either a bare name or a full ARN (the lineage members'
+/// `ExperimentEntityNameOrArn` / `ContextNameOrArn`).
+///
+/// Every lineage store in this module is keyed by the entity's ARN, which carries both the
+/// Region the name is unique within and the name itself — SageMaker documents these names
+/// as unique to an account IN A REGION. So a bare name is resolved against `region`, the
+/// Region this request signed for, while an ARN is matched as a WHOLE: it addresses the one
+/// entity that ARN names, and one differing in the entity kind, the account, the partition
+/// or the Region addresses a different entity (and so, here, none). A name can never be
+/// mistaken for an ARN: no lineage name pattern admits a `:`.
+///
+/// Shared by the action slice ([`ComAmazonawsSagemakerSagemakerState::action_key`]) and the
+/// context slice ([`context_key`]) so both resolve an identifier the same way.
+pub fn lineage_entity_key(region: &str, kind: &str, identifier: &str) -> String {
+    if identifier.starts_with("arn:") {
+        identifier.to_string()
+    } else {
+        resource_arn(region, kind, identifier)
+    }
+}
+
+/// The store key for the context a request addresses: that context's ARN, resolved by
+/// [`lineage_entity_key`] against the Region the request signed for.
+///
+/// `CreateContext`'s `ContextName` is documented unique to an account in a Region, so the
+/// name alone does not identify a context — the ARN, which carries the Region and the
+/// account beside the name, does. `DescribeContext`'s `ContextNameOrArn` is what lets a
+/// caller spell either; `UpdateContext` and `DeleteContext` take a plain `ContextName`,
+/// whose pattern admits no `:`, so for them only the name branch is ever reached.
+pub fn context_key(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    name_or_arn: &str,
+) -> String {
+    lineage_entity_key(&request_region(ctx), CONTEXT_KIND, name_or_arn)
+}
+
+impl ComAmazonawsSagemakerSagemakerState {
+    /// Whether another context fits, i.e. the store is below [`CONTEXT_QUOTA`]. A second
+    /// inherent `impl` block, beside this slice's own types rather than in the one above.
+    pub fn contexts_below_quota(&self) -> bool {
+        self.contexts.len() < CONTEXT_QUOTA
+    }
 }
 
 impl ComAmazonawsSagemakerSagemakerState {
@@ -3538,9 +3632,9 @@ impl ComAmazonawsSagemakerSagemakerState {
     /// experiment-trial-component, artifact, action and context. Each is resolved against
     /// the store the matching create writes to, through
     /// [`entity_name_from_name_or_arn`], so an ARN naming another partition, service,
-    /// Region or account names no entity here. The context store does not exist yet —
-    /// `CreateContext` is still a scaffold answering 501, so nothing was ever created for
-    /// a `context/...` ARN to name and such an ARN names no entity.
+    /// Region or account names no entity here. All five kinds now have an implemented
+    /// create, so each is decided by whether its own store holds the ARN rather than by
+    /// the kind being unreachable.
     pub fn lineage_entity_exists(&self, region: &str, arn: &str) -> bool {
         // Every `AssociationEntityArn` IS an ARN (its pattern starts `^arn:`), so the
         // bare-name branch of `entity_name_from_name_or_arn` is unreachable from an
@@ -3556,6 +3650,11 @@ impl ComAmazonawsSagemakerSagemakerState {
         }
         if entity_name_from_name_or_arn(arn, region, ACTION_KIND).is_some() {
             return self.actions.contains_key(arn);
+        }
+        if entity_name_from_name_or_arn(arn, region, CONTEXT_KIND).is_some() {
+            // The context store is keyed by the whole ARN too (see [`context_key`]), so a
+            // context `CreateContext` really stored is an end an association may point at.
+            return self.contexts.contains_key(arn);
         }
         if let Some(name) = entity_name_from_name_or_arn(arn, region, TRIAL_COMPONENT_KIND) {
             // The trial-component store is keyed by the case-folded NAME (the name "is

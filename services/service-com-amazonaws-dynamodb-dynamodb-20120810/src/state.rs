@@ -156,6 +156,16 @@ pub const MAX_GLOBAL_SECONDARY_INDEXES: usize = 20;
 /// never be added later, so this is the only place the count is checked.
 pub const MAX_LOCAL_SECONDARY_INDEXES: usize = 5;
 
+/// The most `HASH` and the most `RANGE` elements a TABLE's primary key may carry: "A
+/// simple primary key would be represented by one `KeySchemaElement` (for the partition
+/// key). A composite primary key would require one `KeySchemaElement` for the partition
+/// key, and another `KeySchemaElement` for the sort key" (the `KeySchemaElement` doc).
+pub const MAX_TABLE_PARTITION_KEYS: usize = 1;
+pub const MAX_TABLE_SORT_KEYS: usize = 1;
+
+/// The most key elements a table's primary key may carry, from the two counts above.
+pub const MAX_TABLE_KEY_ELEMENTS: usize = MAX_TABLE_PARTITION_KEYS + MAX_TABLE_SORT_KEYS;
+
 /// The most `HASH` and the most `RANGE` elements one global secondary index's key
 /// schema may carry: "Each global secondary index supports up to 4 partition keys and
 /// up to 4 sort keys" (`CreateTable$GlobalSecondaryIndexes`).
@@ -173,7 +183,7 @@ pub const MAX_INDEX_KEY_ELEMENTS: usize = MAX_INDEX_PARTITION_KEYS + MAX_INDEX_S
 /// `RANGE`) plus those of its indexes. A request declaring more than that is already
 /// invalid, and clamping it up front is what bounds the work matching definitions
 /// against key schemas: both counts come from the request body.
-pub const MAX_ATTRIBUTE_DEFINITIONS: usize = 2
+pub const MAX_ATTRIBUTE_DEFINITIONS: usize = MAX_TABLE_KEY_ELEMENTS
     + MAX_GLOBAL_SECONDARY_INDEXES * MAX_INDEX_KEY_ELEMENTS
     + MAX_LOCAL_SECONDARY_INDEXES * MAX_INDEX_KEY_ELEMENTS;
 

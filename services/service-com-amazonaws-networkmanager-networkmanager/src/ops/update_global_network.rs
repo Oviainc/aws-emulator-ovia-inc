@@ -142,15 +142,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .get_mut(&input.global_network_id)
             .ok_or_else(|| {
                 UpdateGlobalNetworkErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: format!(
-                            "global network {} does not exist",
-                            input.global_network_id
-                        ),
-                        resource_id: input.global_network_id.clone(),
-                        resource_type: crate::state::GLOBAL_NETWORK_KIND.to_string(),
-                        context: None,
-                    },
+                    crate::state::resource_not_found(
+                        crate::state::GLOBAL_NETWORK_KIND,
+                        &input.global_network_id,
+                    ),
                 )
             })?;
 

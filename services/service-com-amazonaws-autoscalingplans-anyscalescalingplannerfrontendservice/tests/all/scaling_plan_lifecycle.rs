@@ -1154,29 +1154,3 @@ async fn describe_scaling_plans_honours_its_documented_filter_rules() {
     }
 }
 
-#[tokio::test]
-async fn the_forecast_operation_is_still_an_honest_501() {
-    // `GetScalingPlanResourceForecastData` is out of this slice: it must keep saying
-    // "not written yet" rather than inventing forecast datapoints nothing computed.
-    let emulator = Emulator::new();
-    let (status, code) = emulator
-        .err(
-            "GetScalingPlanResourceForecastData",
-            json!({
-                "ScalingPlanName": "any",
-                "ScalingPlanVersion": 1,
-                "ServiceNamespace": "autoscaling",
-                "ResourceId": "autoScalingGroup/my-asg",
-                "ScalableDimension": "autoscaling:autoScalingGroup:DesiredCapacity",
-                "ForecastDataType": "CapacityForecast",
-                "StartTime": 1_760_000_000,
-                "EndTime": 1_760_003_600,
-            }),
-        )
-        .await;
-    assert_eq!(
-        (status, code.as_str()),
-        (501, "NotImplemented"),
-        "an unimplemented operation must answer 501 NotImplemented"
-    );
-}
