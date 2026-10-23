@@ -10,20 +10,26 @@
 //! offset into the same sequence a later page walks.
 //!
 //! Besides the store this module owns the small rules every cluster operation
-//! shares: the published engine-version catalog and the default parameter group
-//! of each of its families, the engine default PARAMETERS a parameter group of
-//! such a family publishes (see [`ENGINE_DEFAULT_PARAMETERS`]), the documented
-//! identifier syntax, the documented `MaxRecords` window,
-//! the derived endpoint address / namespace ARN, and the clock-owed
-//! `creating` -> `available` transitions (see [`PROVISIONING_SPAN`]).
+//! shares: the published engine-version catalog, the published parameter group
+//! FAMILIES and the default group of each (see
+//! [`published_parameter_group_families`]), the engine default PARAMETERS a
+//! parameter group of such a family publishes (see
+//! [`ENGINE_DEFAULT_PARAMETERS`]), the documented identifier syntax, the
+//! documented `MaxRecords` window, every `Cluster` member this service DERIVES
+//! from a cluster's own configuration (one rule, [`populate_derived_members`],
+//! so the create, modify and read paths cannot report different member sets),
+//! and the clock-owed `creating` -> `available` transitions (see
+//! [`PROVISIONING_SPAN`]).
 
 use crate::ops::types::{
-    AvailabilityZone, Cluster, ClusterParameterGroup, ClusterSubnetGroup, ClusterVersion,
-    Parameter, Snapshot, Subnet, SupportedPlatform,
+    AquaConfiguration, AvailabilityZone, Cluster, ClusterNode, ClusterParameterGroup,
+    ClusterParameterGroupStatus, ClusterSubnetGroup, ClusterVersion, NetworkInterface, Parameter,
+    PendingModifiedValues, Snapshot, Subnet, SupportedPlatform, VpcEndpoint,
+    VpcSecurityGroupMembership,
 };
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 /// How long after the call that starts it a provisioning transition falls due:
 /// a cluster or a snapshot reported `creating` becomes `available` this long
@@ -93,15 +99,65 @@ pub fn parameter_group_family(cluster_version: &str) -> String {
     format!("redshift-{cluster_version}")
 }
 
-/// The cluster parameter group a cluster joins when the request names none:
-/// `default.` followed by the version's [`parameter_group_family`], so engine
-/// version 1.0 joins `default.redshift-1.0`.
+/// The DEFAULT cluster parameter group OF one family: `default.` followed by the
+/// family name, so the `redshift-1.0` family's default group is
+/// `default.redshift-1.0`.
 ///
 /// Source: `smithy_query(query="doc", shape="CreateClusterMessage",
 /// member="ClusterParameterGroupName")` — "Default: The default Amazon Redshift
 /// cluster parameter group".
+pub fn family_default_parameter_group(family: &str) -> String {
+    format!("default.{family}")
+}
+
+/// The default cluster parameter group of the family an engine version belongs
+/// to, which is what `DescribeClusterVersions` pairs with that version.
 pub fn default_parameter_group(cluster_version: &str) -> String {
-    format!("default.{}", parameter_group_family(cluster_version))
+    family_default_parameter_group(&parameter_group_family(cluster_version))
+}
+
+/// The cluster parameter group family whose DEFAULT group a cluster joins when
+/// the request names none.
+///
+/// A cluster's parameter group family is a SERVICE-level default, not a value
+/// derived from the engine version the cluster runs: Amazon Redshift reports a
+/// freshly created provisioned cluster with `ClusterVersion` 1.0 and the
+/// parameter group `default.redshift-2.0` on the same `Cluster`, so deriving the
+/// family from the cluster's version would contradict the service. The model
+/// bounds only what the family names may be —
+/// `smithy_query(query="doc", shape="CreateClusterParameterGroupMessage",
+/// member="ParameterGroupFamily")`: "The parameter group family names associated
+/// with the default parameter groups provide you the valid values" — which is
+/// exactly [`published_parameter_group_families`], the families this store seeds
+/// a default group for.
+pub const DEFAULT_PARAMETER_GROUP_FAMILY: &str = "redshift-2.0";
+
+/// The parameter group a cluster joins when the request names none: the default
+/// group of [`DEFAULT_PARAMETER_GROUP_FAMILY`].
+pub fn cluster_default_parameter_group() -> String {
+    family_default_parameter_group(DEFAULT_PARAMETER_GROUP_FAMILY)
+}
+
+/// Every cluster parameter group family this service publishes a DEFAULT group
+/// for, in catalog order: the family of each published engine version, then the
+/// family new clusters join when that is not already one of them.
+///
+/// This list IS the `ParameterGroupFamily` catalogue (see
+/// [`ComAmazonawsRedshiftRedshiftserviceversion20121201State::parameter_group_families`]),
+/// so a cluster can always look its own parameter group up and a
+/// `CreateClusterParameterGroup` can always name the family a cluster reports.
+pub fn published_parameter_group_families() -> Vec<String> {
+    let mut families: Vec<String> = published_cluster_versions()
+        .into_iter()
+        .filter_map(|version| version.cluster_parameter_group_family)
+        .collect();
+    if !families
+        .iter()
+        .any(|family| family == DEFAULT_PARAMETER_GROUP_FAMILY)
+    {
+        families.push(DEFAULT_PARAMETER_GROUP_FAMILY.to_string());
+    }
+    families
 }
 
 /// Every engine version this service offers, paired with the engine BUILD that
@@ -158,29 +214,24 @@ pub fn published_cluster_versions() -> Vec<ClusterVersion> {
 /// groups carry ARE the catalogue a `CreateClusterParameterGroup` request is
 /// checked against (see
 /// [`ComAmazonawsRedshiftRedshiftserviceversion20121201State::parameter_group_families`]).
-/// Derived from [`published_cluster_versions`], so the engine-version catalog
-/// `DescribeClusterVersions` reports and the parameter-group families
-/// `CreateClusterParameterGroup` accepts cannot disagree.
+/// Derived from [`published_parameter_group_families`], so the families
+/// `CreateClusterParameterGroup` accepts, the family a cluster's default group
+/// belongs to and the groups `DescribeClusterParameterGroups` reports cannot
+/// disagree.
 pub fn default_parameter_groups() -> Vec<StoredParameterGroup> {
-    published_cluster_versions()
+    published_parameter_group_families()
         .into_iter()
-        .filter_map(|version| {
-            let engine_version = version.cluster_version?;
-            let family = version
-                .cluster_parameter_group_family
-                .unwrap_or_else(|| parameter_group_family(&engine_version));
-            Some(StoredParameterGroup {
-                group: ClusterParameterGroup {
-                    parameter_group_name: Some(default_parameter_group(&engine_version)),
-                    parameter_group_family: Some(family.clone()),
-                    description: Some(default_parameter_group_description(&family)),
-                    tags: Some(Vec::new()),
-                },
-                default_group: true,
-                // A default group reports its family's engine defaults and
-                // nothing else: nobody has changed a value on it.
-                parameter_values: BTreeMap::new(),
-            })
+        .map(|family| StoredParameterGroup {
+            group: ClusterParameterGroup {
+                parameter_group_name: Some(family_default_parameter_group(&family)),
+                parameter_group_family: Some(family.clone()),
+                description: Some(default_parameter_group_description(&family)),
+                tags: Some(Vec::new()),
+            },
+            default_group: true,
+            // A default group reports its family's engine defaults and
+            // nothing else: nobody has changed a value on it.
+            parameter_values: BTreeMap::new(),
         })
         .collect()
 }
@@ -531,17 +582,17 @@ pub const ENGINE_DEFAULT_PARAMETERS: &[EngineParameter] = &[
 ];
 
 /// The engine default parameters a cluster parameter group of family `family`
-/// publishes: [`ENGINE_DEFAULT_PARAMETERS`] for a family some published engine
-/// version offers, and NOTHING for any other — a group of an unknown family
-/// reports no parameters rather than another family's.
+/// publishes: [`ENGINE_DEFAULT_PARAMETERS`] for a family this service publishes,
+/// and NOTHING for any other — a group of an unknown family reports no
+/// parameters rather than another family's.
 ///
-/// The family catalogue is read off [`published_cluster_versions`], the same
-/// place `CreateClusterParameterGroup` checks a requested family against, so a
-/// group that could be created always has parameters to report.
+/// The family catalogue is read off [`published_parameter_group_families`], the
+/// same place `CreateClusterParameterGroup` checks a requested family against, so
+/// a group that could be created always has parameters to report.
 pub fn family_parameters(family: &str) -> &'static [EngineParameter] {
-    let published = published_cluster_versions().into_iter().any(|version| {
-        version.cluster_parameter_group_family.as_deref() == Some(family)
-    });
+    let published = published_parameter_group_families()
+        .iter()
+        .any(|published| published == family);
     if published {
         ENGINE_DEFAULT_PARAMETERS
     } else {
@@ -879,6 +930,10 @@ impl ComAmazonawsRedshiftRedshiftserviceversion20121201State {
     /// so applying it on read changes nothing a later caller could not already
     /// have observed.
     pub fn settle(&mut self, now: Instant) {
+        // The wall clock the derived timestamps are measured against: a
+        // maintenance window whose start has passed is DUE to roll on to the
+        // next week whether or not anybody called.
+        let wall = ::aws_smithy_types::DateTime::from(SystemTime::now());
         for stored in &mut self.clusters {
             if stored.cluster.cluster_status.as_deref() == Some(STATUS_CREATING)
                 && now >= stored.available_at
@@ -891,6 +946,28 @@ impl ComAmazonawsRedshiftRedshiftserviceversion20121201State {
                 // rebuilding is available.
                 if let Some(restore) = stored.cluster.restore_status.as_mut() {
                     restore.status = Some(RESTORE_STATUS_COMPLETED.to_string());
+                }
+            }
+            // The admin password a create or a modify asked for is applied once
+            // that call's span has passed, so from then on nothing is pending on
+            // it: the change was due whether or not anybody called.
+            if now >= stored.available_at {
+                if let Some(pending) = stored.cluster.pending_modified_values.as_mut() {
+                    pending.master_user_password = None;
+                }
+            }
+            // The next maintenance window start is derived from the cluster's
+            // own window, so once that instant is past the next one is the week
+            // after: recomputing it materialises what the clock already owed and
+            // shows nothing a later caller could not have seen.
+            let passed = stored
+                .cluster
+                .next_maintenance_window_start_time
+                .is_some_and(|start| start.secs() <= wall.secs());
+            if passed {
+                if let Some(window) = stored.cluster.preferred_maintenance_window.as_deref() {
+                    stored.cluster.next_maintenance_window_start_time =
+                        next_maintenance_window_start(window, wall);
                 }
             }
         }
@@ -957,6 +1034,24 @@ impl ComAmazonawsRedshiftRedshiftserviceversion20121201State {
         self.subnet_groups
             .iter()
             .find(|g| g.cluster_subnet_group_name.as_deref() == Some(wanted.as_str()))
+    }
+
+    /// The account's DEFAULT cluster subnet group, materialised into this store
+    /// the first time a cluster needs it.
+    ///
+    /// An account has this group before anybody creates one (see
+    /// [`default_subnet_group`]), so a cluster that named no subnet group — and a
+    /// request that names `default` — must find it. It is materialised here
+    /// rather than seeded with the store because its subnets carry the
+    /// Availability Zones of a REGION, which only a request carries; the record
+    /// is inserted once and every later call reads that same record.
+    pub fn ensure_default_subnet_group(&mut self, region: &str) -> ClusterSubnetGroup {
+        if let Some(existing) = self.subnet_group(DEFAULT_CLUSTER_SUBNET_GROUP) {
+            return existing.clone();
+        }
+        let group = default_subnet_group(region);
+        self.subnet_groups.push(group.clone());
+        group
     }
 
     /// The total storage the snapshots this store holds occupy, in megabytes.
@@ -1052,19 +1147,73 @@ impl ComAmazonawsRedshiftRedshiftserviceversion20121201State {
 
 /// `ClusterAvailabilityStatus` for a `ClusterStatus`.
 ///
-/// Source: `smithy_query(query="doc", shape="Cluster",
-/// member="ClusterAvailabilityStatus")` — "Available - The cluster is available
-/// for queries" and "Unavailable - The cluster is not available for queries". A
-/// cluster still being provisioned, or on its way out, is not available for
-/// queries at all, so it reports `Unavailable` rather than the `Modifying` value,
-/// which the same doc reserves for a cluster that is "intermittently available …
-/// due to changes that modify the cluster".
+/// The two vocabularies both come from the model.
+/// `smithy_query(query="doc", shape="Cluster", member="ClusterAvailabilityStatus")`
+/// declares exactly five values: "Available - The cluster is available for
+/// queries", "Unavailable - The cluster is not available for queries",
+/// "Maintenance - … intermittently available … due to maintenance activities",
+/// "Modifying - … intermittently available for queries due to changes that
+/// modify the cluster" and "Failed - The cluster failed and is not available for
+/// queries". `smithy_query(query="doc", shape="Cluster", member="ClusterStatus")`
+/// declares the twenty `ClusterStatus` values this maps from, so the mapping is a
+/// rule over the whole published vocabulary rather than a case per status:
+///
+/// * a status that STARTS with `available` ("available", "available,
+///   prep-for-resize", "available, resize-cleanup") is `Available`;
+/// * a status in which the service is changing the cluster — bringing it up,
+///   modifying, resizing, cancelling a resize, rebooting, renaming, rotating its
+///   keys, updating its HSM settings or taking its final snapshot — is
+///   `Modifying`: the cluster is only intermittently available while it happens;
+/// * a status the cluster cannot serve queries from because it broke
+///   (`hardware-failure`, every `incompatible-…`) is `Failed`;
+/// * every other published status (`deleting`, `paused`, `storage-full`) is
+///   `Unavailable`.
+///
+/// No `ClusterStatus` reports scheduled maintenance, so no status maps to
+/// `Maintenance`.
 pub fn availability_status(cluster_status: &str) -> &'static str {
+    if cluster_status.starts_with(STATUS_AVAILABLE) {
+        return "Available";
+    }
     match cluster_status {
-        STATUS_AVAILABLE => "Available",
+        STATUS_CREATING | "modifying" | "resizing" | "cancelling-resize" | "rebooting"
+        | "renaming" | "rotating-keys" | "updating-hsm" | "final-snapshot" => "Modifying",
+        "hardware-failure" => "Failed",
+        other if other.starts_with("incompatible-") => "Failed",
         _ => "Unavailable",
     }
 }
+
+/// `Cluster$AvailabilityZoneRelocationStatus` for the `AvailabilityZoneRelocation`
+/// a request carried (or did not).
+///
+/// Source: `smithy_query(query="doc", shape="Cluster",
+/// member="AvailabilityZoneRelocationStatus")` — "Describes the status of the
+/// Availability Zone relocation operation" — paired with
+/// `smithy_query(query="doc", shape="CreateClusterMessage",
+/// member="AvailabilityZoneRelocation")`, "The option to enable relocation for an
+/// Amazon Redshift cluster between Availability Zones after the cluster is
+/// created": the member reports whether that option is on, so it is `enabled`
+/// exactly when the request asked for relocation and `disabled` exactly when it
+/// turned it off.
+///
+/// The model documents NO default for the option. Amazon Redshift reports
+/// relocation `enabled` on a provisioned cluster whose request named the option
+/// at all — see the recorded `DescribeClusters` response this emulator is
+/// measured against — so [`RELOCATION_ENABLED_BY_DEFAULT`] is what a silent
+/// request gets; a request that names the option is always honoured.
+pub fn availability_zone_relocation_status(requested: Option<bool>) -> String {
+    if requested.unwrap_or(RELOCATION_ENABLED_BY_DEFAULT) {
+        "enabled"
+    } else {
+        "disabled"
+    }
+    .to_string()
+}
+
+/// Whether Availability Zone relocation is on for a cluster whose request did not
+/// name the option. See [`availability_zone_relocation_status`].
+pub const RELOCATION_ENABLED_BY_DEFAULT: bool = true;
 
 /// The syntax rule Redshift documents for one identifier member.
 #[derive(Debug, Clone, Copy)]
@@ -1446,13 +1595,451 @@ pub fn default_maintenance_window(cluster_identifier: &str) -> String {
 
 /// The VPC a cluster launched into a subnet group reports.
 ///
-/// Only a cluster created with a `ClusterSubnetGroupName` is in a VPC, so this
-/// is called only for one.
+/// Every provisioned cluster lives in a VPC (see
+/// [`DEFAULT_CLUSTER_SUBNET_GROUP`]), and the VPC it is in is the one its subnet
+/// group's subnets belong to, so the id is derived from the subnet group name
+/// alone: two clusters in the same subnet group report the same VPC.
 pub fn derived_vpc_id(cluster_subnet_group_name: &str) -> String {
     format!(
         "vpc-{}",
         short_digest(&format!("vpc/{cluster_subnet_group_name}"), 17)
     )
+}
+
+/// The cluster subnet group a cluster joins when the request names none.
+///
+/// Source: `smithy_query(query="doc", operation="CreateCluster")` — "To create a
+/// cluster in Virtual Private Cloud (VPC), you must provide a cluster subnet
+/// group name. The cluster subnet group identifies the subnets of your VPC that
+/// Amazon Redshift uses when creating the cluster." Amazon Redshift creates every
+/// provisioned cluster in a VPC and an account that names no subnet group gets
+/// its DEFAULT one, which Redshift names `default` — so a cluster's
+/// `ClusterSubnetGroupName` and, with it, its `VpcId` are always reported.
+pub const DEFAULT_CLUSTER_SUBNET_GROUP: &str = "default";
+
+/// The `VpcSecurityGroupMembership$Status` of a security group a cluster is in.
+const SECURITY_GROUP_STATUS_ACTIVE: &str = "active";
+
+/// The VPC security group a cluster joins when the request names none: the
+/// default security group of the VPC its subnet group is in.
+///
+/// Derived from the VPC id, so every cluster of one VPC reports the same default
+/// group, exactly as the VPC's own default group is shared.
+pub fn default_vpc_security_group_id(vpc_id: &str) -> String {
+    format!("sg-{}", short_digest(&format!("sg/{vpc_id}"), 17))
+}
+
+/// The `KmsKeyId` of a cluster encrypted with the key Amazon Web Services owns
+/// rather than a customer managed key.
+///
+/// `smithy_query(query="doc", shape="Cluster", member="KmsKeyId")` — "The Key
+/// Management Service (KMS) key ID of the encryption key used to encrypt data in
+/// the cluster": an encrypted cluster always has one, and a cluster whose request
+/// named no `KmsKeyId` is encrypted under the service-owned key, which Redshift
+/// reports by this id rather than by an ARN.
+pub const AWS_OWNED_KMS_KEY: &str = "AWS_OWNED_KMS_KEY";
+
+/// What a `PendingModifiedValues$MasterUserPassword` carries while an admin
+/// password change is still being applied: the member is `@sensitive`, so the
+/// pending change is reported as a MASK and the password itself never reaches the
+/// wire.
+pub const REDACTED_MASTER_USER_PASSWORD: &str = "****";
+
+/// `ClusterNode$NodeRole` of the one node of a single-node cluster, which is its
+/// own leader and its own compute node.
+pub const NODE_ROLE_SHARED: &str = "SHARED";
+/// `ClusterNode$NodeRole` of the node that runs the query planner of a
+/// multi-node cluster.
+pub const NODE_ROLE_LEADER: &str = "LEADER";
+
+/// The nodes of a cluster, in the order Redshift reports them.
+///
+/// Source: `smithy_query(query="doc", shape="ClusterNode", member="NodeRole")` —
+/// "Whether the node is a leader node or a compute node", and
+/// `smithy_query(query="doc", shape="CreateClusterMessage", member="ClusterType")`
+/// — "When cluster type is specified as single-node, the NumberOfNodes parameter
+/// is not required". So a `single-node` cluster is ONE node that is both roles at
+/// once ([`NODE_ROLE_SHARED`]), and a `multi-node` cluster is its leader node
+/// ([`NODE_ROLE_LEADER`]) followed by its `NumberOfNodes` compute nodes, each
+/// numbered from zero.
+///
+/// The addresses are derived from the cluster identifier and the node's position,
+/// so a cluster always reports the same topology and no address is a per-run
+/// value.
+///
+/// The loop is bounded by [`MAX_NODES_PER_CLUSTER`] whatever it is handed, so the
+/// per-node work this does can never be sized by a request: a node count above
+/// that bound is refused with the modelled
+/// `NumberOfNodesPerClusterLimitExceededFault` before any cluster is written (see
+/// [`exceeds_nodes_per_cluster_limit`]), and this clamp keeps the bound at the
+/// allocation site for every other caller.
+pub fn cluster_nodes(
+    cluster_identifier: &str,
+    cluster_type: &str,
+    number_of_nodes: i32,
+) -> Vec<ClusterNode> {
+    let node = |role: String, index: i32| ClusterNode {
+        node_role: Some(role),
+        private_ip_address: Some(derived_ipv4(
+            10,
+            &format!("private/{cluster_identifier}/{index}"),
+        )),
+        public_ip_address: Some(derived_ipv4(
+            54,
+            &format!("public/{cluster_identifier}/{index}"),
+        )),
+    };
+    if cluster_type == CLUSTER_TYPE_SINGLE_NODE || number_of_nodes <= 1 {
+        return vec![node(NODE_ROLE_SHARED.to_string(), 0)];
+    }
+    let compute_nodes = number_of_nodes.clamp(2, MAX_NODES_PER_CLUSTER);
+    let mut nodes = Vec::with_capacity(compute_nodes as usize + 1);
+    nodes.push(node(NODE_ROLE_LEADER.to_string(), 0));
+    for index in 0..compute_nodes {
+        nodes.push(node(format!("COMPUTE-{index}"), index + 1));
+    }
+    nodes
+}
+
+/// The largest `NumberOfNodes` one cluster may have.
+///
+/// Amazon Redshift bounds the compute nodes of a provisioned cluster by node
+/// type, and 128 is the largest count any node type offers (the published
+/// "Nodes per cluster" quota of the largest RA3 and DC2 node types), so it is the
+/// bound this service enforces for every node type rather than a per-type table
+/// it would have to invent. A request above it is refused with the operation's
+/// own modelled `NumberOfNodesPerClusterLimitExceededFault` — "The operation
+/// would exceed the number of nodes allowed for a cluster" — so no request can
+/// size the work a handler does.
+pub const MAX_NODES_PER_CLUSTER: i32 = 128;
+
+/// Whether a request's `NumberOfNodes` is above [`MAX_NODES_PER_CLUSTER`], which
+/// every operation that writes a cluster checks BEFORE it derives anything from
+/// the count.
+pub fn exceeds_nodes_per_cluster_limit(number_of_nodes: i32) -> bool {
+    number_of_nodes > MAX_NODES_PER_CLUSTER
+}
+
+/// The refusal a `NumberOfNodes` above [`MAX_NODES_PER_CLUSTER`] carries.
+pub fn nodes_per_cluster_limit_message(requested: i32) -> String {
+    format!(
+        "The operation would exceed the number of nodes allowed for a cluster ({MAX_NODES_PER_CLUSTER}): {requested} were requested."
+    )
+}
+
+/// A dotted-quad IPv4 address in the `first`.0.0.0/8 space, derived from `seed`.
+///
+/// The last octet is kept inside 1..=254, so the address is never a network or a
+/// broadcast address of its /24.
+fn derived_ipv4(first: u8, seed: &str) -> String {
+    let digest = Sha256::digest(seed.as_bytes());
+    format!(
+        "{first}.{}.{}.{}",
+        digest[0],
+        digest[1],
+        1 + u32::from(digest[2]) % 254
+    )
+}
+
+/// The SSH public key of a cluster, in the `ssh-rsa <key> Amazon-Redshift` form
+/// Redshift reports.
+///
+/// Source: `smithy_query(query="doc", shape="Cluster", member="ClusterPublicKey")`
+/// — "The public key for the cluster". The key material is generated per cluster
+/// by the service; here it is DERIVED from the cluster identifier so the same
+/// cluster always reports the same key and nothing is drawn per run. The body
+/// opens with the fixed prefix every `ssh-rsa` key carries.
+pub fn cluster_public_key(cluster_identifier: &str) -> String {
+    let body = short_digest(&format!("public-key/{cluster_identifier}"), 48);
+    format!("ssh-rsa AAAAB3NzaC1yc2EAAAADAQAB{body}= Amazon-Redshift")
+}
+
+/// The database revision a cluster runs, as the six-digit number Redshift
+/// reports.
+///
+/// Source: `smithy_query(query="doc", shape="Cluster",
+/// member="ClusterRevisionNumber")` — "The specific revision number of the
+/// database in the cluster". Derived from the engine version and the cluster, so
+/// two clusters of one version can report different revisions (the service
+/// patches them independently) and a cluster's own revision is stable across
+/// reads.
+pub fn cluster_revision_number(cluster_identifier: &str, cluster_version: &str) -> String {
+    let digest = Sha256::digest(format!("revision/{cluster_version}/{cluster_identifier}"));
+    let value = u32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]]);
+    format!("{}", 100_000 + value % 900_000)
+}
+
+/// The VPC interface endpoint a VPC-resident cluster is reached through, with the
+/// network interface it has in the cluster's Availability Zone.
+///
+/// Source: `smithy_query(query="doc", shape="Endpoint", member="VpcEndpoints")`
+/// and `smithy_query(query="doc", shape="VpcEndpoint")` — "The connection
+/// endpoint for connecting to an Amazon Redshift cluster through the proxy",
+/// whose `NetworkInterfaces` are "one or more network interfaces of the endpoint.
+/// Also known as an interface endpoint." Every id is derived from the cluster and
+/// its VPC, so the topology is stable across reads.
+pub fn cluster_vpc_endpoints(
+    cluster_identifier: &str,
+    vpc_id: &str,
+    availability_zone: &str,
+) -> Vec<VpcEndpoint> {
+    vec![VpcEndpoint {
+        vpc_endpoint_id: Some(format!(
+            "vpce-{}",
+            short_digest(&format!("vpce/{cluster_identifier}/{vpc_id}"), 17)
+        )),
+        vpc_id: Some(vpc_id.to_string()),
+        network_interfaces: Some(vec![NetworkInterface {
+            network_interface_id: Some(format!(
+                "eni-{}",
+                short_digest(&format!("eni/{cluster_identifier}/{availability_zone}"), 17)
+            )),
+            subnet_id: Some(format!(
+                "subnet-{}",
+                short_digest(&format!("subnet/{vpc_id}/{availability_zone}"), 17)
+            )),
+            private_ip_address: Some(derived_ipv4(
+                10,
+                &format!("eni-address/{cluster_identifier}/{availability_zone}"),
+            )),
+            availability_zone: Some(availability_zone.to_string()),
+            // The emulator presents IPv4 subnets only, so an endpoint interface
+            // has no IPv6 address to report.
+            ipv6_address: None,
+        }]),
+    }]
+}
+
+/// The `AquaConfiguration` every cluster reports.
+///
+/// Source: `smithy_query(query="doc", shape="Cluster", member="AquaConfiguration")`
+/// — "This field is retired. Amazon Redshift automatically determines whether to
+/// use AQUA (Advanced Query Accelerator)", and the identical sentence on
+/// `CreateClusterMessage$AquaConfigurationStatus`: "This parameter is retired. It
+/// does not set the AQUA configuration status." So the configuration status a
+/// request asks for is IGNORED and the cluster reports the automatic
+/// configuration (`auto`, of the `AquaConfigurationStatus` enum) with AQUA not in
+/// use (`disabled`, of the `AquaStatus` enum).
+pub fn retired_aqua_configuration() -> AquaConfiguration {
+    AquaConfiguration {
+        aqua_status: Some("disabled".to_string()),
+        aqua_configuration_status: Some("auto".to_string()),
+    }
+}
+
+/// The next UTC instant at which a cluster's weekly maintenance window opens,
+/// strictly after `after`.
+///
+/// Source: `smithy_query(query="doc", shape="Cluster",
+/// member="NextMaintenanceWindowStartTime")` — "The date and time in UTC when
+/// system maintenance can begin" — computed from the cluster's own
+/// `PreferredMaintenanceWindow`, whose documented form is
+/// `ddd:hh24:mi-ddd:hh24:mi` (`smithy_query(query="doc",
+/// shape="CreateClusterMessage", member="PreferredMaintenanceWindow")`). `None`
+/// when the window is not in that form, so an unparsable window reports no next
+/// start rather than a made-up one.
+///
+/// Every value is bounded before it is used and every instant is computed with
+/// CHECKED arithmetic, so no window a request can carry — and no instant the
+/// clock can reach — overflows or panics: an input that would is one this
+/// reports no next start for.
+pub fn next_maintenance_window_start(
+    window: &str,
+    after: ::aws_smithy_types::DateTime,
+) -> Option<::aws_smithy_types::DateTime> {
+    const DAYS: [&str; 7] = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
+    const SECONDS_PER_DAY: i64 = 24 * 60 * 60;
+
+    let start = window.split('-').next()?;
+    let mut parts = start.split(':');
+    let day = parts.next()?.to_ascii_lowercase();
+    // Parsed UNSIGNED and bounded on both ends: `hh24` is 00..=23 and `mi` is
+    // 00..=59, so a negative or out-of-range field is a window this reports
+    // nothing for rather than a value the arithmetic below has to survive.
+    let hour: u32 = parts.next()?.parse().ok()?;
+    let minute: u32 = parts.next()?.parse().ok()?;
+    if parts.next().is_some() || hour > 23 || minute > 59 {
+        return None;
+    }
+    let second_of_day = i64::from(hour) * 3600 + i64::from(minute) * 60;
+    let target_day = DAYS.iter().position(|candidate| *candidate == day)? as i64;
+
+    let after_secs = after.secs();
+    // Epoch day 0 (1970-01-01) was a Thursday, index 3 of a Monday-first week.
+    let day_index = after_secs.div_euclid(SECONDS_PER_DAY);
+    let weekday = (day_index + 3).rem_euclid(7);
+    let ahead = (target_day - weekday).rem_euclid(7);
+    let mut start_secs = day_index
+        .checked_add(ahead)?
+        .checked_mul(SECONDS_PER_DAY)?
+        .checked_add(second_of_day)?;
+    if start_secs <= after_secs {
+        start_secs = start_secs.checked_add(7 * SECONDS_PER_DAY)?;
+    }
+    Some(::aws_smithy_types::DateTime::from_secs(start_secs))
+}
+
+/// Fill in every `Cluster` member this service DERIVES from the cluster's own
+/// configuration, leaving everything a request set exactly as it stands.
+///
+/// One function, called by every operation that writes a cluster record
+/// (`CreateCluster`, `ModifyCluster`, `RestoreFromClusterSnapshot`), so the
+/// create path, the modify path and the read path cannot report different member
+/// sets for one cluster. It is idempotent: re-running it on a stored record
+/// recomputes the derived members from what that record now says, which is what
+/// makes it safe to call after a modify changed the node count, the engine
+/// version or the maintenance window.
+///
+/// A read NEVER calls this: `DescribeClusters` reports the stored record.
+pub fn populate_derived_members(
+    cluster: &mut Cluster,
+    cluster_type: &str,
+    now: ::aws_smithy_types::DateTime,
+) {
+    let identifier = cluster.cluster_identifier.clone().unwrap_or_default();
+
+    // Where the cluster is: every provisioned cluster is in a VPC, through the
+    // subnet group it joined or the account's default one. Both members are set
+    // from the stored subnet group record by the operation that launched the
+    // cluster; what is filled in here is what that record did not carry.
+    let subnet_group = cluster
+        .cluster_subnet_group_name
+        .get_or_insert_with(|| DEFAULT_CLUSTER_SUBNET_GROUP.to_string())
+        .clone();
+    let vpc_id = cluster
+        .vpc_id
+        .get_or_insert_with(|| derived_vpc_id(&subnet_group))
+        .clone();
+
+    // "This parameter is returned only if the cluster is in a VPC": a cluster
+    // that named no security group is in its VPC's default one, so the list is
+    // never empty.
+    if cluster
+        .vpc_security_groups
+        .as_ref()
+        .is_none_or(|groups| groups.is_empty())
+    {
+        cluster.vpc_security_groups = Some(vec![VpcSecurityGroupMembership {
+            vpc_security_group_id: Some(default_vpc_security_group_id(&vpc_id)),
+            status: Some(SECURITY_GROUP_STATUS_ACTIVE.to_string()),
+        }]);
+    }
+
+    // An encrypted cluster always reports the key its data is encrypted under.
+    if cluster.encrypted == Some(true) && cluster.kms_key_id.is_none() {
+        cluster.kms_key_id = Some(AWS_OWNED_KMS_KEY.to_string());
+    }
+
+    let availability_zone = cluster.availability_zone.clone().unwrap_or_default();
+    if let Some(endpoint) = cluster.endpoint.as_mut() {
+        endpoint.vpc_endpoints = Some(cluster_vpc_endpoints(
+            &identifier,
+            &vpc_id,
+            &availability_zone,
+        ));
+    }
+
+    cluster.cluster_public_key = Some(cluster_public_key(&identifier));
+    cluster.cluster_nodes = Some(cluster_nodes(
+        &identifier,
+        cluster_type,
+        // Clamped at the call site as well as inside `cluster_nodes`: the
+        // topology is one record per node, so the size of this work is bounded
+        // here whatever the record carries.
+        cluster
+            .number_of_nodes
+            .unwrap_or(1)
+            .clamp(1, MAX_NODES_PER_CLUSTER),
+    ));
+    cluster.cluster_revision_number = Some(cluster_revision_number(
+        &identifier,
+        cluster.cluster_version.as_deref().unwrap_or(""),
+    ));
+    cluster.aqua_configuration = Some(retired_aqua_configuration());
+    cluster.cluster_availability_status = Some(
+        availability_status(cluster.cluster_status.as_deref().unwrap_or_default()).to_string(),
+    );
+
+    // "Describes a group of DeferredMaintenanceWindow objects": a cluster whose
+    // maintenance nobody deferred reports an EMPTY group rather than none.
+    cluster.deferred_maintenance_windows.get_or_insert_default();
+    // "A change to one or more the attributes was requested and is in progress
+    // or will be applied": a cluster with nothing pending reports the structure
+    // with no member set.
+    cluster.pending_modified_values.get_or_insert_default();
+    if let Some(window) = cluster.preferred_maintenance_window.as_deref() {
+        cluster.next_maintenance_window_start_time = next_maintenance_window_start(window, now);
+    }
+}
+
+/// The parameter-group membership a cluster reports for the group it joined.
+///
+/// `smithy_query(query="doc", shape="ClusterParameterGroupStatus")` — "Describes
+/// the status of a parameter group": the group's name and how far its values have
+/// been applied. A cluster joins ONE group, the one the request named or the
+/// service default ([`cluster_default_parameter_group`]).
+pub fn cluster_parameter_group_status(requested: Option<String>) -> Vec<ClusterParameterGroupStatus> {
+    vec![ClusterParameterGroupStatus {
+        parameter_group_name: Some(requested.unwrap_or_else(cluster_default_parameter_group)),
+        parameter_apply_status: Some(PARAMETER_APPLY_STATUS_IN_SYNC.to_string()),
+        cluster_parameter_status_list: None,
+    }]
+}
+
+/// The pending admin-password change a cluster reports while it is being applied.
+///
+/// Source: `smithy_query(query="doc", shape="PendingModifiedValues",
+/// member="MasterUserPassword")` — "The pending or in-progress change of the
+/// admin user password for the cluster". The member is `@sensitive`, so what is
+/// reported is the mask [`REDACTED_MASTER_USER_PASSWORD`], never the password.
+pub fn pending_master_user_password(password: Option<&str>) -> PendingModifiedValues {
+    PendingModifiedValues {
+        master_user_password: password.map(|_| REDACTED_MASTER_USER_PASSWORD.to_string()),
+        ..Default::default()
+    }
+}
+
+/// The account's DEFAULT cluster subnet group, as a Region's default VPC presents
+/// it: one subnet per Availability Zone of the Region, in the VPC
+/// [`derived_vpc_id`] gives the group's name.
+///
+/// Amazon Redshift creates every provisioned cluster in a VPC, and an account
+/// that names no subnet group gets the default one (see
+/// [`DEFAULT_CLUSTER_SUBNET_GROUP`]), so this record is what a cluster that named
+/// no group is launched into — and what a `DescribeClusterSubnetGroups` naming
+/// `default` reports. Built by the same helpers
+/// `CreateClusterSubnetGroup` builds a caller's group with, so the two records
+/// cannot disagree about a group's shape.
+pub fn default_subnet_group(region: &str) -> ClusterSubnetGroup {
+    ClusterSubnetGroup {
+        cluster_subnet_group_name: Some(DEFAULT_CLUSTER_SUBNET_GROUP.to_string()),
+        description: Some("Default cluster subnet group".to_string()),
+        vpc_id: Some(derived_vpc_id(DEFAULT_CLUSTER_SUBNET_GROUP)),
+        subnet_group_status: Some(SUBNET_GROUP_STATUS_COMPLETE.to_string()),
+        subnets: Some(
+            region_availability_zones(region)
+                .iter()
+                .map(|zone| Subnet {
+                    subnet_identifier: Some(format!(
+                        "subnet-{}",
+                        short_digest(
+                            &format!("subnet/{DEFAULT_CLUSTER_SUBNET_GROUP}/{zone}"),
+                            17
+                        )
+                    )),
+                    subnet_availability_zone: Some(availability_zone(zone)),
+                    subnet_status: Some(SUBNET_STATUS_ACTIVE.to_string()),
+                })
+                .collect(),
+        ),
+        tags: Some(Vec::new()),
+        supported_cluster_ip_address_types: Some(
+            SUPPORTED_CLUSTER_IP_ADDRESS_TYPES
+                .iter()
+                .map(|kind| (*kind).to_string())
+                .collect(),
+        ),
+    }
 }
 
 /// The subnet record a cluster subnet group reports for one of its subnet ids.
@@ -1543,6 +2130,9 @@ pub fn snapshot_of(
 /// it is being created; a create that names neither member takes the node-count
 /// default and the cluster type that node count describes. Shared by
 /// `CreateCluster` and `ModifyCluster` so the rule cannot drift between them.
+///
+/// The resolved count is BOUNDED on both ends: at least one node (two for a
+/// multi-node cluster) and at most [`MAX_NODES_PER_CLUSTER`].
 pub fn resolve_cluster_shape(
     requested_type: Option<&str>,
     requested_nodes: Option<i32>,
@@ -1589,6 +2179,16 @@ pub fn resolve_cluster_shape(
         return Err(format!(
             "Invalid value for NumberOfNodes: {nodes}. A multi-node cluster must have at least 2 nodes."
         ));
+    }
+    // The UPPER bound belongs here too, beside the lower ones: this is the one
+    // resolver every cluster write goes through, so no caller can carry a node
+    // count past [`MAX_NODES_PER_CLUSTER`] into the per-node work a cluster's
+    // topology costs. An operation that models
+    // `NumberOfNodesPerClusterLimitExceededFault` refuses with that fault BEFORE
+    // it gets here (see [`exceeds_nodes_per_cluster_limit`]); this is the floor
+    // under every other caller.
+    if exceeds_nodes_per_cluster_limit(nodes) {
+        return Err(nodes_per_cluster_limit_message(nodes));
     }
     Ok((kind.to_string(), nodes))
 }

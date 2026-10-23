@@ -233,12 +233,14 @@ async fn a_restore_rebuilds_the_captured_configuration_under_the_new_identifier(
         "case restore {target}: expected ClusterStatus=creating, got {:?}",
         restored.text("ClusterStatus")
     );
-    assert_eq!(
-        restored.text("Status").as_deref(),
-        Some(state::RESTORE_STATUS_RESTORING),
-        "case restore {target}: expected RestoreStatus={}, got {:?}",
+    // Several `Cluster` members carry a `Status` element of their own (the VPC
+    // security group membership, the HSM status), so the restore's own status is
+    // asserted over every `Status` the body holds rather than the first one.
+    assert!(
+        all_text(&restored.body, "Status").contains(&state::RESTORE_STATUS_RESTORING.to_string()),
+        "case restore {target}: expected a RestoreStatus={}, got {:?}",
         state::RESTORE_STATUS_RESTORING,
-        restored.text("Status")
+        all_text(&restored.body, "Status")
     );
 
     for (member, expected) in captured_configuration() {
@@ -252,7 +254,7 @@ async fn a_restore_rebuilds_the_captured_configuration_under_the_new_identifier(
 
     // The documented exception: security and parameter groups are the account's
     // defaults, never the source cluster's.
-    let default_group = state::default_parameter_group(state::DEFAULT_CLUSTER_VERSION);
+    let default_group = state::cluster_default_parameter_group();
     assert_eq!(
         restored.text("ParameterGroupName").as_deref(),
         Some(default_group.as_str()),
@@ -336,18 +338,16 @@ async fn a_restore_rebuilds_the_captured_configuration_under_the_new_identifier(
     tokio::time::sleep(state::PROVISIONING_SPAN + Duration::from_millis(250)).await;
     let settled = describe(&emulator, target).await;
     assert_eq!(
-        (
-            settled.text("ClusterStatus").as_deref(),
-            settled.text("Status").as_deref()
-        ),
-        (
-            Some(state::STATUS_AVAILABLE),
-            Some(state::RESTORE_STATUS_COMPLETED)
-        ),
-        "case settled {target}: expected available / {}, got {:?} / {:?}",
+        settled.text("ClusterStatus").as_deref(),
+        Some(state::STATUS_AVAILABLE),
+        "case settled {target}: expected available, got {:?}",
+        settled.text("ClusterStatus")
+    );
+    assert!(
+        all_text(&settled.body, "Status").contains(&state::RESTORE_STATUS_COMPLETED.to_string()),
+        "case settled {target}: expected a RestoreStatus={}, got {:?}",
         state::RESTORE_STATUS_COMPLETED,
-        settled.text("ClusterStatus"),
-        settled.text("Status")
+        all_text(&settled.body, "Status")
     );
 }
 
