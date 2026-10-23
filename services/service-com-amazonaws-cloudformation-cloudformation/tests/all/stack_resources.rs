@@ -34,12 +34,12 @@ use smithy_server_runtime::MultiServiceRouter;
 /// Read member by member rather than tag by tag, so each resource's logical id stays
 /// paired with its own physical id, status and timestamp.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct WireResource {
+pub(crate) struct WireResource {
     stack_name: Option<String>,
     stack_id: Option<String>,
-    logical_id: Option<String>,
-    physical_id: Option<String>,
-    resource_type: Option<String>,
+    pub(crate) logical_id: Option<String>,
+    pub(crate) physical_id: Option<String>,
+    pub(crate) resource_type: Option<String>,
     status: Option<String>,
     status_reason: Option<String>,
     timestamp: Option<String>,
@@ -47,7 +47,10 @@ struct WireResource {
 }
 
 /// Every `StackResource` in a `DescribeStackResources` response, in wire order.
-fn wire_resources(xml: &str) -> Vec<WireResource> {
+///
+/// Shared with `ecs_elbv2_stack_identifiers.rs`, which reads the physical id a stack
+/// reports for a resource out of the same response.
+pub(crate) fn wire_resources(xml: &str) -> Vec<WireResource> {
     let Some(start) = xml.find("<StackResources>") else {
         return Vec::new();
     };
@@ -106,7 +109,7 @@ async fn describe_stack_resources(
 }
 
 /// `DescribeStackResources` for one stack, the common case.
-async fn resources_of(router: &MultiServiceRouter, name_or_id: &str) -> (u16, String) {
+pub(crate) async fn resources_of(router: &MultiServiceRouter, name_or_id: &str) -> (u16, String) {
     describe_stack_resources(router, &[member("StackName", name_or_id)]).await
 }
 
