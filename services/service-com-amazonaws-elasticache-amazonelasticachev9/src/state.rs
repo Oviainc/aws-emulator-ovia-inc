@@ -11,12 +11,15 @@
 //! agree on one implementation instead of carrying copies that can drift.
 //!
 //! The serverless cache is ElastiCache's other cache resource:
-//! `CreateServerlessCache` mints one and `DescribeServerlessCaches` reports it.
-//! Its record and its projection into the modelled `ServerlessCache` shape live
-//! here too, so `ModifyServerlessCache` / `DeleteServerlessCache` and the
-//! serverless snapshot operations — still scaffolded 501s, each with its own gap
-//! issue — write the same copy the reader reads instead of introducing a second
-//! one.
+//! `CreateServerlessCache` mints one, `DescribeServerlessCaches` reports it and
+//! `DeleteServerlessCache` takes it away. Its record and its projection into the
+//! modelled `ServerlessCache` shape live here too, so `ModifyServerlessCache`
+//! and the serverless snapshot operations — still scaffolded 501s, each with its
+//! own gap issue — write the same copy the reader reads instead of introducing a
+//! second one. A deleted cache does not vanish at the call: it answers
+//! `DELETING` and the clock owes its removal
+//! ([`ServerlessCacheRecord::pending_deletion`]), the same way a created one is
+//! owed `AVAILABLE`.
 //!
 //! A snapshot is a copy of a cluster as of the time it was taken:
 //! `CreateSnapshot` mints one from a stored cluster and `DescribeSnapshots`
@@ -77,10 +80,10 @@
 //! operation belongs to one of those resources, the comment beside it says so.
 //!
 //! The serverless cache is another customer-created resource this store holds:
-//! `CreateServerlessCache` mints one and `DescribeServerlessCaches` reports it.
-//! `ModifyServerlessCache` / `DeleteServerlessCache` and the serverless
-//! snapshot operations are still scaffolded 501s with their own gap issues, and
-//! they read and write the SAME record rather than a copy beside it.
+//! `CreateServerlessCache` mints one, `DescribeServerlessCaches` reports it and
+//! `DeleteServerlessCache` removes it. `ModifyServerlessCache` and the
+//! serverless snapshot operations are still scaffolded 501s with their own gap
+//! issues, and they read and write the SAME record rather than a copy beside it.
 //!
 //! A replication group is the other resource this state holds:
 //! `CreateReplicationGroup` mints one together with the member cache clusters it
@@ -4219,15 +4222,20 @@ impl CacheEngineVersionRecord {
 /// `ServerlessCache$Status`'s values this slice writes and reads: "The current
 /// status of the serverless cache. The allowed values are CREATING, AVAILABLE,
 /// DELETING, CREATE-FAILED and MODIFYING." The member is a plain `String`
-/// rather than an enum, so these are the spellings. `DELETING` / `MODIFYING`
-/// belong to `DeleteServerlessCache` / `ModifyServerlessCache`, which are still
-/// scaffolded 501s, so they are spelled where those land rather than here.
+/// rather than an enum, so these are the spellings. `MODIFYING` belongs to
+/// `ModifyServerlessCache`, which is still a scaffolded 501, so it is spelled
+/// where that lands rather than here.
 pub const SERVERLESS_STATUS_CREATING: &str = "CREATING";
 /// See [`SERVERLESS_STATUS_CREATING`].
 pub const SERVERLESS_STATUS_AVAILABLE: &str = "AVAILABLE";
+/// See [`SERVERLESS_STATUS_CREATING`]. What a cache answers between the
+/// `DeleteServerlessCache` that started its deletion and the removal the clock
+/// owes it ([`ServerlessCacheRecord::pending_deletion`]).
+pub const SERVERLESS_STATUS_DELETING: &str = "DELETING";
 
 /// How long a serverless cache stays `CREATING` before the clock owes it
-/// `AVAILABLE` — the same span a cache cluster's transitions take; see
+/// `AVAILABLE`, and how long one stays `DELETING` before the clock owes its
+/// removal — the same span a cache cluster's transitions take; see
 /// [`CLUSTER_TRANSITION`] for why it is a chosen, non-zero span.
 pub const SERVERLESS_CACHE_TRANSITION: Duration = CLUSTER_TRANSITION;
 
@@ -4493,6 +4501,13 @@ pub struct ServerlessCacheRecord {
     pub status: String,
     /// The status change the clock owes this cache, if any.
     pub pending_status: Option<PendingTransition>,
+    /// The instant the clock owes this cache's REMOVAL from the store, set by
+    /// the `DeleteServerlessCache` that put it in `DELETING`. A deletion is not
+    /// instant at AWS either — the call answers with the cache reporting
+    /// `DELETING` — so the record outlives the call by
+    /// [`SERVERLESS_CACHE_TRANSITION`] and is swept by
+    /// [`ComAmazonawsElasticacheAmazonelasticachev9State::purge_deleted_serverless_caches`].
+    pub pending_deletion: Option<SystemTime>,
     pub created_at: SystemTime,
     /// The usage limits as the request set them, persisted unchanged.
     pub cache_usage_limits: Option<CacheUsageLimits>,
@@ -4549,6 +4564,21 @@ impl ServerlessCacheRecord {
         self.status = pending.status.clone();
         self.pending_status = None;
         Some(settled)
+    }
+
+    /// Put this cache into `DELETING` and record the removal the clock now owes
+    /// it, [`SERVERLESS_CACHE_TRANSITION`] from `now`.
+    ///
+    /// The status change a delete makes is immediate (the call answers with the
+    /// cache reporting `DELETING`), so it is NOT a pending transition; what the
+    /// clock owes is the record's disappearance, which
+    /// [`ComAmazonawsElasticacheAmazonelasticachev9State::purge_deleted_serverless_caches`]
+    /// materialises. Any status change that was still pending is dropped: a
+    /// cache on its way out is not owed `AVAILABLE` any more.
+    pub fn begin_deletion(&mut self, now: SystemTime) {
+        self.status = SERVERLESS_STATUS_DELETING.to_string();
+        self.pending_status = None;
+        self.pending_deletion = Some(now + SERVERLESS_CACHE_TRANSITION);
     }
 
     /// This record as the modelled `ServerlessCache`.
@@ -6476,6 +6506,9 @@ impl ComAmazonawsElasticacheAmazonelasticachev9State {
                 due: new.now + SERVERLESS_CACHE_TRANSITION,
                 status: SERVERLESS_STATUS_AVAILABLE.to_string(),
             }),
+            // Nothing owes a just-created cache its removal; only
+            // `DeleteServerlessCache` sets this.
+            pending_deletion: None,
             created_at: new.now,
             cache_usage_limits: new.cache_usage_limits,
             storage_encryption_type: if new.kms_key_id.is_some() {
@@ -6640,6 +6673,66 @@ impl ComAmazonawsElasticacheAmazonelasticachev9State {
         }
     }
 
+    /// The serverless cache `name` names (the stored, lowercased name), with
+    /// every change the clock owes it already materialised: a removal a delete
+    /// made due, and then any status change — the serverless counterpart of
+    /// [`Self::settled_cluster_mut`], so an operation that branches on a cache's
+    /// status reads the status it is owed at this instant, and a cache whose
+    /// deletion has completed is reported as gone.
+    pub fn settled_serverless_cache_mut(
+        &mut self,
+        name: &str,
+        now: SystemTime,
+    ) -> Option<&mut ServerlessCacheRecord> {
+        self.purge_deleted_serverless_caches(now);
+        // Deliberately two lookups, for the reason
+        // [`Self::settled_cluster_mut`] gives: the first ends the record's
+        // borrow so the transition's event can be written to the log beside it.
+        let settled = {
+            let cache = self.serverless_caches.get_mut(name)?;
+            cache.settle(now).map(|settled| (cache.name.clone(), settled))
+        };
+        if let Some((cache_name, settled)) = settled {
+            self.record_transition(
+                SOURCE_TYPE_SERVERLESS_CACHE,
+                &cache_name,
+                "Serverless cache",
+                &settled,
+            );
+        }
+        self.serverless_caches.get_mut(name)
+    }
+
+    /// Drop every serverless cache whose removal the clock already owes — the
+    /// caches a `DeleteServerlessCache` put into `DELETING` at least
+    /// [`SERVERLESS_CACHE_TRANSITION`] ago.
+    ///
+    /// Owed by the clock alone (due at this instant whether or not anybody
+    /// called), so a reporting operation materialises it too, the same way it
+    /// materialises a status change. A user group reports the caches it serves,
+    /// so a removed cache leaves that list with it rather than outliving itself
+    /// there.
+    pub fn purge_deleted_serverless_caches(&mut self, now: SystemTime) {
+        let due: Vec<String> = self
+            .serverless_caches
+            .values()
+            .filter(|cache| cache.pending_deletion.is_some_and(|at| now >= at))
+            .map(|cache| cache.name.clone())
+            .collect();
+        for name in due {
+            let Some(cache) = self.serverless_caches.remove(&name) else {
+                continue;
+            };
+            if let Some(id) = cache.user_group_id {
+                if let Some(group) = self.user_groups.get_mut(&id) {
+                    group
+                        .serverless_cache_names
+                        .retain(|served| served != &name);
+                }
+            }
+        }
+    }
+
     /// The cluster `id` names, with any status change the clock owes it already
     /// materialised.
     pub fn settled_cluster_mut(
@@ -6684,6 +6777,9 @@ impl ComAmazonawsElasticacheAmazonelasticachev9State {
     /// Materialise every status change the clock owes, for a caller that is
     /// about to report on all of them.
     pub fn settle_all(&mut self, now: SystemTime) {
+        // A deletion the clock has carried through removes the record before
+        // anything is reported from it.
+        self.purge_deleted_serverless_caches(now);
         let mut settled: Vec<(String, SettledTransition)> = Vec::new();
         for cluster in self.cache_clusters.values_mut() {
             if let Some(transition) = cluster.settle(now) {

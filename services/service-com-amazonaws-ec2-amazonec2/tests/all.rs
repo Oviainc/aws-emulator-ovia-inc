@@ -144,3 +144,6 @@ mod vpn_connection_device_types;
 // Reading one VPC back out of an ec2Query response, on top of `ec2_query`'s plumbing.
 #[path = "all/wire.rs"]
 mod wire;
+// Stopping the advertisement of a BYOIP address range, and what that refuses.
+#[path = "all/withdraw_byoip_cidr.rs"]
+mod withdraw_byoip_cidr;

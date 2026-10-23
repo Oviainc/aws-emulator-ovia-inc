@@ -419,6 +419,12 @@ pub struct TrustStoreRecord {
     /// stubs, so the shape is read off this field rather than restated: it follows the
     /// store the day a revocation can be added.
     pub total_revoked_entries: i64,
+    /// The tags on this trust store, which `DescribeTags` reports. A trust store is a
+    /// taggable Elastic Load Balancing resource — `AddTags`/`RemoveTags` both model
+    /// `TrustStoreNotFoundException` — so the tags live on the record beside every
+    /// other taggable resource's, and a read answers what is stored rather than
+    /// assuming a trust store can carry none.
+    pub tags: HashMap<String, String>,
 }
 
 impl TrustStoreRecord {
@@ -520,6 +526,44 @@ fn action_summary(actions: &[Action]) -> Vec<(String, Option<i32>, Vec<String>)>
         .collect()
 }
 
+/// The kind of Elastic Load Balancing resource an ARN names.
+///
+/// Every taggable resource of this service has its own `NotFound` error, so an ARN that
+/// names nothing is refused with the one belonging to the kind the ARN itself declares
+/// — which is the resource segment of the ARN, not anything the store holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaggableResource {
+    LoadBalancer,
+    TargetGroup,
+    Listener,
+    Rule,
+    TrustStore,
+}
+
+/// The kind of resource `arn` names, read from the resource TYPE of the ARN — the
+/// segments AWS publishes for this service's ARNs (`loadbalancer/<type>/<name>/<id>`,
+/// `targetgroup/<name>/<id>`, `listener/<type>/<name>/<lb-id>/<id>`,
+/// `listener-rule/<type>/<name>/<lb-id>/<listener-id>/<id>`, `truststore/<name>/<id>`),
+/// which are the forms the create handlers in `src/ops/` mint.
+///
+/// The ARN itself is read through `service_common::arn`, the workspace's ONE parse of a
+/// caller-supplied resource ARN, narrowed to this service's own vendor: an ARN of
+/// another vendor, or a value that is not a well-formed ARN, names nothing this API can
+/// address, which is a malformed request rather than a missing resource — so this
+/// answers `None` for it. The partition, Region and account are deliberately NOT
+/// checked: an ARN of another Region is well formed and simply names no resource this
+/// store holds.
+pub fn taggable_resource(arn: &str) -> Option<TaggableResource> {
+    match ::service_common::arn::parse_of(arn, SERVICE_NAMESPACE)?.resource_type() {
+        "loadbalancer" => Some(TaggableResource::LoadBalancer),
+        "targetgroup" => Some(TaggableResource::TargetGroup),
+        "listener" => Some(TaggableResource::Listener),
+        "listener-rule" => Some(TaggableResource::Rule),
+        "truststore" => Some(TaggableResource::TrustStore),
+        _ => None,
+    }
+}
+
 /// The ARN segment AWS uses for each load balancer type: `app` for an Application
 /// Load Balancer, `net` for a Network Load Balancer, `gwy` for a Gateway Load
 /// Balancer. Both load balancer and listener ARNs carry it.
@@ -610,6 +654,22 @@ impl ComAmazonawsElasticloadbalancingv2ElasticloadbalancingV10State {
                 store.status = TRUST_STORE_ACTIVE.to_string();
             }
         }
+    }
+
+    /// The tags stored on the resource `arn` names, or `None` when this store holds no
+    /// resource with that ARN.
+    ///
+    /// Every taggable resource keeps its tags on its own record, so one lookup per store
+    /// finds them whatever kind the ARN names. A listener rule is never found: this
+    /// service's `CreateRule` is still a scaffold stub, so the store holds no rule for
+    /// any ARN — the day it does, its record's tags join the chain below.
+    pub fn tags_of(&self, arn: &str) -> Option<&HashMap<String, String>> {
+        self.load_balancers
+            .get(arn)
+            .map(|record| &record.tags)
+            .or_else(|| self.target_groups.get(arn).map(|record| &record.tags))
+            .or_else(|| self.listeners.get(arn).map(|record| &record.tags))
+            .or_else(|| self.trust_stores.get(arn).map(|record| &record.tags))
     }
 
     /// Load balancers in a stable order (oldest first, ARN breaking ties), which is

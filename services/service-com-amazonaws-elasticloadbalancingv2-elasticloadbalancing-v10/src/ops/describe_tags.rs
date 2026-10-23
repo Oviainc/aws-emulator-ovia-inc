@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeTags
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeTags`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the tags stored on each Elastic Load Balancing resource the request names.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeTags::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! One `TagDescription` per distinct requested ARN, carrying that resource's persisted
+//! tags; an ARN whose kind this service knows but whose resource the store does not hold
+//! is refused with the `NotFound` error modelled for that kind, and a string that is not
+//! an Elastic Load Balancing resource ARN is refused as a malformed request.
 //!
 //! ## Shape of an operation
 //!
@@ -72,6 +69,15 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use crate::state::TaggableResource;
+use std::collections::HashMap;
+
+/// How many resources one call may name: "You can specify up to 20 resources in a single
+/// call" (the model's own documentation of `DescribeTagsInput$ResourceArns`, quoted in
+/// this file's header). The model declares no length constraint for it, so the bound is
+/// enforced here instead of at the boundary.
+const MAX_RESOURCES_PER_CALL: usize = 20;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -145,18 +151,115 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeTags` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeTagsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeTags"))
+        // A pure report: nothing here writes, and no tag of any resource depends on the
+        // clock, so the store is only read.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // Only reachable on an engine that is not the shared `InMemoryEngine`,
+            // which this service has no store on — so nothing is implemented for it.
+            crate::scaffolded::Scaffolded::not_implemented("DescribeTags")
+        })?;
+
+        // `ResourceArns` is modelled required, so a call that names no resource at all
+        // is a malformed request rather than a report of nothing.
+        if input.resource_arns.is_empty() {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                "ResourceArns must name at least one resource",
+            ));
+        }
+        if input.resource_arns.len() > MAX_RESOURCES_PER_CALL {
+            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+                "ResourceArns can name at most {MAX_RESOURCES_PER_CALL} resources in a single call, got {}",
+                input.resource_arns.len()
+            )));
+        }
+
+        // One description per resource, in the order the request named them: an ARN
+        // repeated in one call names one resource, as it does for every other read in
+        // this crate.
+        let mut wanted: Vec<&String> = Vec::new();
+        for arn in &input.resource_arns {
+            if !wanted.contains(&arn) {
+                wanted.push(arn);
+            }
+        }
+
+        // The whole request is read before any resource is resolved, so a value that is
+        // not a resource ARN of this service is refused wherever it sits in the list
+        // rather than being masked by an earlier missing resource — and the store is
+        // locked only for the lookups.
+        let mut resolved: Vec<(&String, TaggableResource)> = Vec::with_capacity(wanted.len());
+        for arn in wanted {
+            let Some(kind) = crate::state::taggable_resource(arn) else {
+                return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+                    "'{arn}' in ResourceArns is not the ARN of an Elastic Load Balancing resource"
+                )));
+            };
+            resolved.push((arn, kind));
+        }
+
+        let guard = state.lock();
+        let mut descriptions = Vec::with_capacity(resolved.len());
+        for (arn, kind) in resolved {
+            let Some(tags) = guard.tags_of(arn) else {
+                return Err(not_found(kind, arn));
+            };
+            descriptions.push(TagDescription {
+                resource_arn: Some(arn.clone()),
+                tags: Some(tag_list(tags)),
+            });
+        }
+
+        Ok(DescribeTagsOutput {
+            tag_descriptions: Some(descriptions),
+        })
     }
+}
+
+/// The stored tags as the modelled list, by key — the store is a map, so a stable order
+/// is this read's own, and a resource carrying no tag reports an empty list rather than
+/// a tag nobody set.
+fn tag_list(tags: &HashMap<String, String>) -> Vec<Tag> {
+    let mut list: Vec<Tag> = tags
+        .iter()
+        .map(|(key, value)| Tag {
+            key: key.clone(),
+            value: Some(value.clone()),
+        })
+        .collect();
+    list.sort_by(|left, right| left.key.cmp(&right.key));
+    list
+}
+
+/// The modelled refusal for an ARN this store holds no resource for: the `NotFound`
+/// error of the resource kind the ARN names.
+fn not_found(kind: TaggableResource, arn: &str) -> DescribeTagsError {
+    match kind {
+        TaggableResource::LoadBalancer => DescribeTagsErrorModeled::LoadBalancerNotFoundException(
+            LoadBalancerNotFoundException {
+                message: Some(format!("Load balancer '{arn}' not found")),
+            },
+        ),
+        TaggableResource::TargetGroup => DescribeTagsErrorModeled::TargetGroupNotFoundException(
+            TargetGroupNotFoundException {
+                message: Some(format!("Target group '{arn}' not found")),
+            },
+        ),
+        TaggableResource::Listener => {
+            DescribeTagsErrorModeled::ListenerNotFoundException(ListenerNotFoundException {
+                message: Some(format!("Listener '{arn}' not found")),
+            })
+        }
+        TaggableResource::Rule => {
+            DescribeTagsErrorModeled::RuleNotFoundException(RuleNotFoundException {
+                message: Some(format!("Rule '{arn}' not found")),
+            })
+        }
+        TaggableResource::TrustStore => {
+            DescribeTagsErrorModeled::TrustStoreNotFoundException(TrustStoreNotFoundException {
+                message: Some(format!("Trust store '{arn}' not found")),
+            })
+        }
+    }
+    .into()
 }

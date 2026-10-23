@@ -11,9 +11,10 @@
 //! delete answers from the one record rather than from the request that is being served.
 //!
 //! The same holds for every other resource kind this store carries — a key value store, a
-//! response headers policy: each record is put there by the call that creates it and is
-//! what every later read of that resource answers from. A response headers policy has no
-//! status member and no propagation deadline, so nothing about one is owed by the clock.
+//! response headers policy, an origin request policy: each record is put there by the call
+//! that creates it and is what every later read of that resource answers from. Neither a
+//! response headers policy nor an origin request policy has a status member or a
+//! propagation deadline, so nothing about one is owed by the clock.
 //!
 //! Two things in here are owed by the CLOCK rather than by a call:
 //!
@@ -48,8 +49,10 @@ use crate::ops::types::{
     FunctionAssociations, GeoRestriction, Invalidation, InvalidationBatch, InvalidationSummary,
     InvalidTagging, KGKeyPairIds, KeyPairIds, KeyValueStore, LambdaFunctionAssociations,
     LoggingConfig, ManagedCertificateRequest, NoSuchCloudFrontOriginAccessIdentity,
-    NoSuchDistribution, NoSuchInvalidation, NoSuchResource, NoSuchResponseHeadersPolicy, Origin,
-    OriginSslProtocols, Parameter, ParameterDefinition, Paths, ResponseHeadersPolicy,
+    NoSuchDistribution, NoSuchInvalidation, NoSuchOriginRequestPolicy, NoSuchResource,
+    NoSuchResponseHeadersPolicy, Origin, OriginRequestPolicy, OriginRequestPolicyAlreadyExists,
+    OriginRequestPolicyConfig, OriginSslProtocols, Parameter, ParameterDefinition, Paths,
+    ResponseHeadersPolicy,
     ResponseHeadersPolicyAlreadyExists, ResponseHeadersPolicyConfig, Restrictions, Signer,
     StringSchemaConfig, Tag, Tags, TrustedKeyGroups, TrustedSigners, ViewerCertificate,
 };
@@ -310,6 +313,17 @@ pub const S3_CANONICAL_USER_ID_LEN: usize = 64;
 /// quota that can be raised and the model states no number, so this bound is the
 /// emulator's rather than a claim about the service.
 pub const MAX_RESPONSE_HEADERS_POLICIES: usize = 1_000;
+
+/// The most origin request policies this emulator holds.
+///
+/// CHOSEN by this emulator, for the same reason as [`MAX_RESPONSE_HEADERS_POLICIES`]: a
+/// policy record is what a later read answers from, so it cannot be evicted, and the
+/// create path is refused at this entry count with the modelled
+/// `TooManyOriginRequestPolicies` ("You have reached the maximum number of origin request
+/// policies for this Amazon Web Services account") instead of growing further.
+/// CloudFront's own ceiling is an account quota that can be raised and the model states no
+/// number, so this bound is the emulator's rather than a claim about the service.
+pub const MAX_ORIGIN_REQUEST_POLICIES: usize = 1_000;
 
 /// The `PriceClass` reported for a distribution whose stored configuration names none:
 /// the class that covers every CloudFront edge location, which is what
@@ -1195,6 +1209,44 @@ impl StoredResponseHeadersPolicy {
     }
 }
 
+/// One CloudFront origin request policy, as this emulator persists it.
+///
+/// The record is the single source of truth for the policy's id, the configuration it was
+/// created with, its `LastModifiedTime` and its version token, so the create and every
+/// later read answer from it rather than from the request being served.
+///
+/// Nothing in here is owed by the CLOCK: the model's `OriginRequestPolicy` is `Id`,
+/// `LastModifiedTime` and `OriginRequestPolicyConfig` only — a policy carries no status and
+/// no propagation deadline, so a policy this service accepts is immediately complete.
+#[derive(Debug, Clone)]
+pub struct StoredOriginRequestPolicy {
+    /// `OriginRequestPolicy$Id` — the identifier minted when the policy was created, and
+    /// the key the policy is held under.
+    pub id: String,
+    /// The configuration as submitted — "An origin request policy configuration." Stored
+    /// whole, so a read reports what was stored rather than re-deriving anything from a
+    /// request, down to the members the create left out.
+    pub config: OriginRequestPolicyConfig,
+    /// `OriginRequestPolicy$LastModifiedTime` — "The date and time when the origin request
+    /// policy was last modified."
+    pub last_modified_time: SystemTime,
+    /// The version token the last mutation handed back, and the single source of truth for
+    /// every `If-Match` check against this policy.
+    pub etag: String,
+}
+
+impl StoredOriginRequestPolicy {
+    /// The `OriginRequestPolicy` projection every origin request policy operation returns,
+    /// read from the one stored record.
+    pub fn to_origin_request_policy(&self) -> OriginRequestPolicy {
+        OriginRequestPolicy {
+            id: self.id.clone(),
+            last_modified_time: ::aws_smithy_types::DateTime::from(self.last_modified_time),
+            origin_request_policy_config: self.config.clone(),
+        }
+    }
+}
+
 /// Per-service state for com-amazonaws-cloudfront-cloudfront2020-05-31. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsCloudfrontCloudfront20200531State {
@@ -1232,6 +1284,11 @@ pub struct ComAmazonawsCloudfrontCloudfront20200531State {
     /// for the same reason as `distributions`: one stable total order for a listing to
     /// page through.
     pub response_headers_policies: BTreeMap<String, StoredResponseHeadersPolicy>,
+    /// Every origin request policy this emulator holds, keyed by its minted id — the
+    /// identifier every origin request policy operation addresses one by. A `BTreeMap`
+    /// for the same reason as `distributions`: one stable total order for a listing to
+    /// page through.
+    pub origin_request_policies: BTreeMap<String, StoredOriginRequestPolicy>,
 }
 
 impl ComAmazonawsCloudfrontCloudfront20200531State {
@@ -1347,6 +1404,27 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
         name: &str,
     ) -> Option<&StoredResponseHeadersPolicy> {
         self.response_headers_policies
+            .values()
+            .find(|policy| policy.config.name == name)
+    }
+
+    /// The origin request policy `id` names, or `None` when the store holds none.
+    pub fn origin_request_policy(&self, id: &str) -> Option<&StoredOriginRequestPolicy> {
+        self.origin_request_policies.get(id)
+    }
+
+    /// The origin request policy whose STORED configuration carries `name`, or `None`.
+    ///
+    /// `OriginRequestPolicyConfig$Name` is "A unique name to identify the origin request
+    /// policy", and the create models `OriginRequestPolicyAlreadyExists` for a name
+    /// another policy already holds — so at most one policy answers, and this is what
+    /// makes a repeated name a conflict rather than a second policy. The comparison is
+    /// against the stored configuration, never against a request.
+    pub fn origin_request_policy_named(
+        &self,
+        name: &str,
+    ) -> Option<&StoredOriginRequestPolicy> {
+        self.origin_request_policies
             .values()
             .find(|policy| policy.config.name == name)
     }
@@ -1593,6 +1671,22 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
         loop {
             let candidate = self.mint_uuid();
             if !self.response_headers_policies.contains_key(&candidate) {
+                break candidate;
+            }
+        }
+    }
+
+    /// Allocate an origin request policy id no stored policy holds.
+    ///
+    /// `OriginRequestPolicy$Id` is the identifier every origin request policy operation
+    /// addresses one by, and CloudFront mints a UUID for one (the same shape its cache and
+    /// response headers policy ids take), so this renders one draw of
+    /// [`ComAmazonawsCloudfrontCloudfront20200531State::mint_uuid`] — distinct draws render
+    /// distinctly, so the mint never repeats an id.
+    pub fn allocate_origin_request_policy_id(&mut self) -> String {
+        loop {
+            let candidate = self.mint_uuid();
+            if !self.origin_request_policies.contains_key(&candidate) {
                 break candidate;
             }
         }
@@ -2028,6 +2122,12 @@ pub fn origin_access_identity_path(id: &str) -> String {
 /// resource is addressed by ID, as `GetResponseHeadersPolicy`'s `{Id}` label is.
 pub fn response_headers_policy_path(id: &str) -> String {
     format!("/2020-05-31/response-headers-policy/{id}")
+}
+
+/// The path of an origin request policy resource under this service's API version. The
+/// resource is addressed by ID, as `GetOriginRequestPolicy`'s `{Id}` label is.
+pub fn origin_request_policy_path(id: &str) -> String {
+    format!("/2020-05-31/origin-request-policy/{id}")
 }
 
 /// The fully qualified URI a `Location` header reports for `path`.
@@ -2833,6 +2933,48 @@ pub fn response_headers_policy_quantity_mismatch(
         .find_map(|(label, quantity, len)| quantity_disagreement(label, *quantity, *len))
 }
 
+/// The modelled `InconsistentQuantities` message for the first list wrapper in an origin
+/// request policy configuration whose `Quantity` disagrees with the length of its `Items`,
+/// or `None` when every wrapper agrees.
+///
+/// The SAME rule [`config_quantity_mismatch`] and
+/// [`response_headers_policy_quantity_mismatch`] apply: every CloudFront list travels in a
+/// wrapper stating its own length beside the list itself, and the service refuses a
+/// request where the two disagree. An `OriginRequestPolicyConfig` reaches exactly three of
+/// them — the optional `Headers`, `Cookies` and `QueryStrings` lists its three behaviour
+/// configurations carry.
+pub fn origin_request_policy_quantity_mismatch(
+    config: &OriginRequestPolicyConfig,
+) -> Option<String> {
+    let mut counts: Vec<(&'static str, i32, usize)> = Vec::new();
+
+    if let Some(headers) = &config.headers_config.headers {
+        counts.push((
+            "HeadersConfig.Headers",
+            headers.quantity,
+            items_len(&headers.items),
+        ));
+    }
+    if let Some(cookies) = &config.cookies_config.cookies {
+        counts.push((
+            "CookiesConfig.Cookies",
+            cookies.quantity,
+            items_len(&cookies.items),
+        ));
+    }
+    if let Some(query_strings) = &config.query_strings_config.query_strings {
+        counts.push((
+            "QueryStringsConfig.QueryStrings",
+            query_strings.quantity,
+            items_len(&query_strings.items),
+        ));
+    }
+
+    counts
+        .iter()
+        .find_map(|(label, quantity, len)| quantity_disagreement(label, *quantity, *len))
+}
+
 /// The modelled `InconsistentQuantities` message for an invalidation batch whose
 /// `Paths.Quantity` disagrees with the number of paths it carries, or `None`.
 pub fn batch_quantity_mismatch(batch: &InvalidationBatch) -> Option<String> {
@@ -3074,6 +3216,35 @@ pub fn response_headers_policy_already_exists(name: &str) -> ResponseHeadersPoli
             "A response headers policy with the name {name} already exists in this account. You \
              must provide a unique name. To modify an existing response headers policy, use \
              UpdateResponseHeadersPolicy."
+        )),
+    }
+}
+
+/// The modelled `NoSuchOriginRequestPolicy` (HTTP 404) for an origin request policy id the
+/// store does not hold.
+///
+/// The sentence is the one the model states on the shape itself — "The origin request
+/// policy does not exist." — a property of the store rather than of the request, so
+/// nothing from the request belongs in the text.
+pub fn no_such_origin_request_policy() -> NoSuchOriginRequestPolicy {
+    NoSuchOriginRequestPolicy {
+        message: Some(NO_SUCH_ORIGIN_REQUEST_POLICY_MESSAGE.to_string()),
+    }
+}
+
+/// `NoSuchOriginRequestPolicy`'s message, as the model documents the shape.
+pub const NO_SUCH_ORIGIN_REQUEST_POLICY_MESSAGE: &str = "The origin request policy does not exist.";
+
+/// The modelled `OriginRequestPolicyAlreadyExists` (HTTP 409) for a policy name that is
+/// already taken — "An origin request policy with this name already exists. You must
+/// provide a unique name. To modify an existing origin request policy, use
+/// UpdateOriginRequestPolicy."
+pub fn origin_request_policy_already_exists(name: &str) -> OriginRequestPolicyAlreadyExists {
+    OriginRequestPolicyAlreadyExists {
+        message: Some(format!(
+            "An origin request policy with the name {name} already exists in this account. You \
+             must provide a unique name. To modify an existing origin request policy, use \
+             UpdateOriginRequestPolicy."
         )),
     }
 }

@@ -256,16 +256,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             percentage_complete: Some(deployment.percentage_complete),
             started_at: Some(crate::state::to_date_time(deployment.started_at)),
             completed_at: deployment.completed_at.map(crate::state::to_date_time),
-            // `AppliedExtensions` and `KmsKeyArn` are deliberately left unset, not
-            // overlooked: the first lists the extensions the deployment invoked, which
-            // this emulator does not run (extension associations are still a 501 of
-            // their own), and the second is the ARN of the key `KmsKeyIdentifier`
-            // resolves to, which this emulator does not resolve. Any value here would
-            // be fabricated rather than read from state.
-            applied_extensions: None,
+            // `AppliedExtensions` and `Type` are read off the stored record like every
+            // other member; see their fields in `crate::state`. `KmsKeyArn` is
+            // deliberately left unset, not overlooked: it is the ARN of the key
+            // `KmsKeyIdentifier` resolves to, which this emulator does not resolve, so
+            // any value here would be fabricated rather than read from state.
+            applied_extensions: Some(deployment.applied_extensions.clone()),
             kms_key_arn: None,
             kms_key_identifier: deployment.kms_key_identifier.clone(),
             version_label: deployment.version_label.clone(),
+            r#type: Some(deployment.deployment_type.clone()),
         })
     }
 }

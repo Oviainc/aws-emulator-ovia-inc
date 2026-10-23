@@ -63,9 +63,10 @@ impl Emulator {
         self.send("GET", &uri, None).await
     }
 
-    /// The tags persisted under `arn`, read straight out of the store: no
-    /// implemented operation reports tags yet (`ListTagsForResource` is still a
-    /// 501 stub), so this is the only way to assert create persisted them.
+    /// The tags persisted under `arn`, read straight out of the store. This
+    /// suite asserts what CREATE persisted, so it reads the record rather than
+    /// going through `ListTagsForResource` — the tagging suite
+    /// (`tests/all/resource_tags.rs`) covers that operation's own reporting.
     fn stored_tags(&self, arn: &str) -> Option<Vec<(String, String)>> {
         let state = self
             .engine
@@ -296,8 +297,8 @@ async fn create_persists_the_record_a_get_reports() {
             case.case
         );
 
-        // Tags are persisted now even though no implemented operation reports
-        // them: the record is what a later tagging slice reads.
+        // Tags are persisted on the configuration record, which is what
+        // `ListTagsForResource` and `TagResource` read and write.
         let mut expected_tags: Vec<(String, String)> = case
             .tags
             .iter()

@@ -14,6 +14,13 @@
 //! here named after an operation would make that operation's own module name
 //! ambiguous inside `ops` (`E0659`).
 
+// The schema/serializer macros the `Deployment` and `DeploymentEvent` shapes use, because
+// the vendored codegen drops `@timestampFormat("date-time")` from the member schemas it
+// builds. Hand-added, not generated; see the module's own note. `#[macro_use]`, and
+// declared FIRST, so the macros are in the textual scope of every `*_types` module below.
+#[macro_use]
+pub mod deployment_wire;
+
 pub mod create_application_types;
 pub mod create_configuration_profile_types;
 pub mod create_deployment_strategy_types;

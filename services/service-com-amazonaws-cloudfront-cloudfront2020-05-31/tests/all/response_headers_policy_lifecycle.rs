@@ -306,7 +306,10 @@ fn wrapper(name: &str, item: &str, values: &[String]) -> String {
 }
 
 /// Escape the five entities XML predefines, so a value may carry any text.
-fn escape(text: &str) -> String {
+///
+/// `pub(crate)` so a sibling suite escapes a submitted value the same way rather than
+/// growing a copy of this.
+pub(crate) fn escape(text: &str) -> String {
     text.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
@@ -504,7 +507,10 @@ fn policy_table() -> Vec<Policy> {
 
 /// Whether `value` has the shape of the UUID CloudFront mints as a policy id: five
 /// lowercase-hex groups of 8-4-4-4-12 characters.
-fn is_policy_id(value: &str) -> bool {
+///
+/// `pub(crate)`: every CloudFront policy kind is identified by a UUID in this shape, so a
+/// sibling suite checks one the same way rather than growing a copy of this.
+pub(crate) fn is_policy_id(value: &str) -> bool {
     let groups: Vec<&str> = value.split('-').collect();
     groups.len() == 5
         && groups
@@ -533,7 +539,9 @@ fn is_version_token(value: &str) -> bool {
 }
 
 /// The text at `path` under `node`, or a panic naming the case.
-fn text(node: &Node, path: &str, case: &str, context: &str, raw: &str) -> String {
+///
+/// `pub(crate)` so a sibling suite reads one member of an answer the same way.
+pub(crate) fn text(node: &Node, path: &str, case: &str, context: &str, raw: &str) -> String {
     node.text_at(path)
         .unwrap_or_else(|| panic!("case {case} ({context}): the answer carries no {path}: {raw}"))
         .to_string()
@@ -541,7 +549,9 @@ fn text(node: &Node, path: &str, case: &str, context: &str, raw: &str) -> String
 
 /// Assert the element at `path` is absent: a member the request left out is not invented
 /// by the service.
-fn assert_absent(node: &Node, path: &str, case: &str, context: &str) {
+///
+/// `pub(crate)` so a sibling suite asserts the same thing the same way.
+pub(crate) fn assert_absent(node: &Node, path: &str, case: &str, context: &str) {
     assert!(
         node.at(path).is_none(),
         "case {case} ({context}): expected no {path} element, got {:?}",

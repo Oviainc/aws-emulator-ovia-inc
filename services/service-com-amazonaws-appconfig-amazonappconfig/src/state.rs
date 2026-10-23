@@ -22,8 +22,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    Action, DeletionProtectionSettings, DeploymentEvent, Monitor, Parameter, Validator,
-    VendedMetricsSettings,
+    Action, AppliedExtension, DeletionProtectionSettings, DeploymentEvent, Monitor, Parameter,
+    Validator, VendedMetricsSettings,
 };
 
 pub mod feature_flags;
@@ -83,6 +83,13 @@ pub const EVENT_PERCENTAGE_UPDATED: &str = "PERCENTAGE_UPDATED";
 pub const EVENT_BAKE_TIME_STARTED: &str = "BAKE_TIME_STARTED";
 /// See [`EVENT_DEPLOYMENT_STARTED`].
 pub const EVENT_DEPLOYMENT_COMPLETED: &str = "DEPLOYMENT_COMPLETED";
+
+/// The `DeploymentType` value of a deployment a caller started with `StartDeployment`,
+/// from `DEPLOYMENT_TYPE_VALUES` in `crate::ops::types` (the model's `DeploymentType`
+/// enum, `USER | MANAGED`). The other value is for a deployment AppConfig starts on its
+/// own behalf, which this emulator never does: every deployment it holds was asked for by
+/// a caller.
+pub const DEPLOYMENT_TYPE_USER: &str = "USER";
 
 /// `TriggeredBy` values, from `TRIGGERED_BY_VALUES` in `crate::ops::types`.
 pub const TRIGGERED_BY_USER: &str = "USER";
@@ -464,15 +471,24 @@ pub fn parse_resource_arn(resource_arn: &str) -> Option<TaggedResource<'_>> {
     }
 }
 
-/// The floor on a deployment's rollout window.
+
+/// The description of each `DeploymentEvent` this service records.
 ///
-/// `AppConfig.AllAtOnce` has a deployment duration of 0 minutes, so its rollout would
-/// otherwise be owed at the very instant the deployment started and `StartDeployment`
-/// would answer a deployment that had already left `DEPLOYING`. The window is floored
-/// here instead, so a caller reading straight after the start call still observes the
-/// deployment rolling out. The length is chosen (AWS documents no floor); every
-/// strategy whose deployment duration is at least a minute is unaffected by it.
-const MINIMUM_ROLLOUT: Duration = Duration::from_millis(500);
+/// AppConfig's own wording, which the model documents only by example ("Descriptions
+/// include, but are not limited to, the following",
+/// `smithy_query(query="doc",shape="DeploymentEvent",member="Description")`): the start and
+/// completion texts are the recorded service's, which carry no trailing stop, and the
+/// bake and percentage texts follow the same form.
+const DESCRIPTION_DEPLOYMENT_STARTED: &str = "Deployment started";
+/// See [`DESCRIPTION_DEPLOYMENT_STARTED`].
+const DESCRIPTION_DEPLOYMENT_COMPLETED: &str = "Deployment completed";
+/// See [`DESCRIPTION_DEPLOYMENT_STARTED`]. A deployment whose completion falls due at the
+/// instant it was asked for took no time at all, which is what its event says.
+const DESCRIPTION_DEPLOYMENT_COMPLETED_INSTANTLY: &str = "Deployment completed instantly";
+
+/// The percentage of targets a finished rollout has reached, and the ceiling every growth
+/// step is capped at: the maximum of the model's `Percentage` shape (`range 1..100`).
+const FULL_PERCENTAGE: f32 = 100.0;
 
 /// The most growth steps a rollout is split into.
 ///
@@ -836,6 +852,22 @@ pub struct Deployment {
     pub final_bake_time_in_minutes: i32,
     pub state: String,
     pub percentage_complete: f32,
+    /// The `DeploymentType` this deployment reports: [`DEPLOYMENT_TYPE_USER`], because
+    /// every deployment this service holds was started by a caller's own
+    /// `StartDeployment` call.
+    pub deployment_type: String,
+    /// The extensions this deployment invoked, which the `Deployment` document reports as
+    /// `AppliedExtensions`: "the extensions that were previously associated to the
+    /// configuration profile, environment, or the application when `StartDeployment` was
+    /// called".
+    ///
+    /// Recorded when the deployment starts, so a later read reports what was applied THEN
+    /// rather than what is associated now. It is empty for every deployment this emulator
+    /// starts, and that is a computed fact rather than a placeholder: an extension reaches
+    /// a deployment only through an extension ASSOCIATION, and every operation that writes
+    /// one (`CreateExtensionAssociation`, `UpdateExtensionAssociation`) still answers 501,
+    /// so no association exists for a deployment to invoke.
+    pub applied_extensions: Vec<AppliedExtension>,
     pub started_at: SystemTime,
     pub completed_at: Option<SystemTime>,
     pub event_log: Vec<DeploymentEvent>,
@@ -865,9 +897,12 @@ pub struct NewDeployment {
 impl Deployment {
     /// Start a deployment at `started_at`, paced by `strategy`.
     ///
-    /// The deployment begins `DEPLOYING` with its first growth step applied and one
-    /// `DEPLOYMENT_STARTED` event; every later state, percentage and event is owed by
-    /// the clock and materialised by [`Deployment::materialize`].
+    /// The deployment begins at 0% of its targets with one `DEPLOYMENT_STARTED` event,
+    /// because nothing has rolled out yet at the instant it was asked for; every later
+    /// state, percentage and event is owed by the clock and materialised by
+    /// [`Deployment::materialize`], which is called once here so a strategy whose rollout
+    /// window and bake time are both zero — which has nothing left to wait for — is
+    /// already `COMPLETE` when `StartDeployment` answers.
     pub fn start(new: NewDeployment, strategy: &DeploymentStrategy, started_at: SystemTime) -> Self {
         let mut deployment = Self {
             deployment_number: new.deployment_number,
@@ -885,20 +920,24 @@ impl Deployment {
             final_bake_time_in_minutes: strategy.final_bake_time_in_minutes,
             state: DEPLOYMENT_DEPLOYING.to_string(),
             percentage_complete: 0.0,
+            deployment_type: DEPLOYMENT_TYPE_USER.to_string(),
+            // Nothing to apply: see the field's own note.
+            applied_extensions: Vec::new(),
             started_at,
             completed_at: None,
             event_log: vec![deployment_event(
                 EVENT_DEPLOYMENT_STARTED,
                 TRIGGERED_BY_USER,
-                "Deployment started.".to_string(),
+                DESCRIPTION_DEPLOYMENT_STARTED.to_string(),
                 started_at,
             )],
             kms_key_identifier: new.kms_key_identifier,
             version_label: new.version_label,
             tags: new.tags,
         };
-        // The first growth step is due at the start instant, so the deployment is
-        // never reported as having reached 0% of its targets.
+        // Whatever the clock already owes this deployment at the instant it started: for a
+        // strategy with a rollout window that is nothing at all, and for one with none it
+        // is the whole deployment.
         deployment.materialize(started_at);
         deployment
     }
@@ -912,11 +951,14 @@ impl Deployment {
         )
     }
 
-    /// How long the rollout itself lasts: the strategy's deployment duration, floored
-    /// at [`MINIMUM_ROLLOUT`].
+    /// How long the rollout itself lasts: the strategy's deployment duration.
+    ///
+    /// Not floored: a strategy declaring a duration of 0 minutes (`AppConfig.AllAtOnce`,
+    /// or any created strategy with `DeploymentDurationInMinutes` 0) reaches every target
+    /// at the instant the deployment starts, which is what AppConfig answers for one —
+    /// with no bake time to follow, `StartDeployment` reports it `COMPLETE`.
     fn rollout_duration(&self) -> Duration {
-        let duration = Duration::from_secs(60 * self.deployment_duration_in_minutes.max(0) as u64);
-        duration.max(MINIMUM_ROLLOUT)
+        Duration::from_secs(60 * self.deployment_duration_in_minutes.max(0) as u64)
     }
 
     /// How long AppConfig monitors the deployment after the rollout before completing
@@ -940,9 +982,11 @@ impl Deployment {
     ///
     /// `LINEAR` adds `GrowthFactor` percent of targets per step; `EXPONENTIAL` reaches
     /// `GrowthFactor * 2^N` percent at step `N`, the formula the model's `GrowthType`
-    /// documentation gives. The steps are spread evenly across the rollout window with
-    /// the first one due at the start instant, so `AppConfig.Linear50PercentEvery30`
-    /// `Seconds` reaches 50% at the start and 100% thirty seconds in.
+    /// documentation gives. A step is one INTERVAL of the rollout window, so the steps
+    /// are spread evenly across that window with the first one due at the END of the
+    /// first interval and the last exactly at the window's end:
+    /// `AppConfig.Linear50PercentEvery30Seconds` reaches 50% thirty seconds in and 100% at
+    /// sixty, and a deployment just started has reached nobody yet.
     ///
     /// The step count is bounded by [`MAX_ROLLOUT_STEPS`] and the loop runs over a
     /// fixed range, so this terminates whatever the stored growth factor is — a growth
@@ -952,9 +996,9 @@ impl Deployment {
         // A growth factor that is not a finite percentage cannot pace anything, so it
         // is normalised to a single-step rollout before it reaches the loop below.
         let growth_factor = if self.growth_factor.is_finite() {
-            self.growth_factor.clamp(1.0, 100.0)
+            self.growth_factor.clamp(1.0, FULL_PERCENTAGE)
         } else {
-            100.0
+            FULL_PERCENTAGE
         };
 
         let mut percentages: Vec<f32> = Vec::with_capacity(MAX_ROLLOUT_STEPS);
@@ -966,9 +1010,9 @@ impl Deployment {
                 // Step `n` has added the growth factor `n + 1` times.
                 step as f32 + 1.0
             };
-            let reached = (growth_factor * multiplier).min(100.0);
+            let reached = (growth_factor * multiplier).min(FULL_PERCENTAGE);
             percentages.push(reached);
-            if reached >= 100.0 {
+            if reached >= FULL_PERCENTAGE {
                 break;
             }
         }
@@ -979,7 +1023,7 @@ impl Deployment {
             .into_iter()
             .enumerate()
             .map(|(index, reached)| {
-                let due = self.started_at + rollout.mul_f64(index as f64 / steps);
+                let due = self.started_at + rollout.mul_f64((index as f64 + 1.0) / steps);
                 (due, reached)
             })
             .collect()
@@ -995,19 +1039,27 @@ impl Deployment {
             return;
         }
 
+        // A `PERCENTAGE_UPDATED` event records a growth interval that ELAPSED, so a step
+        // falling due at the start instant itself — every step of a strategy with no
+        // rollout window at all — records none.
         for (due, reached) in self.rollout_schedule() {
-            if due <= now && reached > self.percentage_complete {
+            if due > self.started_at && due <= now && reached > self.percentage_complete {
                 self.percentage_complete = reached;
                 self.event_log.push(deployment_event(
                     EVENT_PERCENTAGE_UPDATED,
                     TRIGGERED_BY_APPCONFIG,
-                    format!("The configuration reached {reached}% of deployment targets."),
+                    format!("Configuration available to {reached}% of clients"),
                     due,
                 ));
             }
         }
 
         let rollout_end = self.rollout_end();
+        if now >= rollout_end {
+            // The rollout window is over, so every target holds the configuration —
+            // including when the window was empty and no interval elapsed on the way.
+            self.percentage_complete = FULL_PERCENTAGE;
+        }
         if self.state == DEPLOYMENT_DEPLOYING
             && now >= rollout_end
             && !self.bake_duration().is_zero()
@@ -1017,7 +1069,7 @@ impl Deployment {
                 EVENT_BAKE_TIME_STARTED,
                 TRIGGERED_BY_APPCONFIG,
                 format!(
-                    "The deployment is baking for {} minute(s).",
+                    "Deployment bake time started for {} minute(s)",
                     self.final_bake_time_in_minutes
                 ),
                 rollout_end,
@@ -1028,10 +1080,17 @@ impl Deployment {
         if now >= completion_due {
             self.state = DEPLOYMENT_COMPLETE.to_string();
             self.completed_at = Some(completion_due);
+            // A deployment whose completion falls due at the instant it was asked for
+            // took no time at all, which is what its event says.
+            let description = if completion_due == self.started_at {
+                DESCRIPTION_DEPLOYMENT_COMPLETED_INSTANTLY
+            } else {
+                DESCRIPTION_DEPLOYMENT_COMPLETED
+            };
             self.event_log.push(deployment_event(
                 EVENT_DEPLOYMENT_COMPLETED,
                 TRIGGERED_BY_APPCONFIG,
-                "Deployment completed.".to_string(),
+                description.to_string(),
                 completion_due,
             ));
         }

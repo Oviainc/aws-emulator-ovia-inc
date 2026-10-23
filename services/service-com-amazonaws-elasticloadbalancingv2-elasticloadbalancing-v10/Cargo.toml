@@ -8,6 +8,15 @@ build = "build.rs"
 
 [dependencies]
 engine = { workspace = true }
+# `service-common` carries two readers this crate needs.
+# `arn`: the ONE parse of a caller-supplied resource ARN (the six fields, the vendor and
+# the resource field), which this service reads every ARN a tagging call names through to
+# decide which kind of resource it addresses.
+# `query_error_envelope`: the `<RequestId>` element an awsQuery `<ErrorResponse>` carries
+# beside its `<Error>`, which no model declares and the framework's error renderers do not
+# write. Shared with the Classic Elastic Load Balancing crate, which serves this model on
+# the endpoint the two share, so one endpoint cannot answer two envelopes.
+service-common = { path = "../common" }
 smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }
 aws-smithy-schema-server = { workspace = true }
@@ -21,11 +30,6 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
-# `query_error_envelope`: the `<RequestId>` element an awsQuery `<ErrorResponse>` carries
-# beside its `<Error>`, which no model declares and the framework's error renderers do not
-# write. Shared with the Classic Elastic Load Balancing crate, which serves this model on
-# the endpoint the two share, so one endpoint cannot answer two envelopes.
-service-common = { path = "../common" }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
