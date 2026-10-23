@@ -10,12 +10,16 @@
 //! page token `GetRecommendationPreferences` round-trips — so no two handlers can drift
 //! from each other's view of the same record.
 //!
-//! The analysis output this service REPORTS lives here too, in its own store
-//! ([`IdleRecommendationStore`]): no operation of this API creates an idle resource
-//! recommendation — Compute Optimizer's own analysis of an observed workload does — so the
-//! store is what `GetIdleRecommendations` filters, orders and pages over, and the rules it
-//! applies to a stored recommendation (the filter vocabulary, the sort dimensions, the ARN
-//! -> resource-type catalog) are stated once, here.
+//! The analysis output this service REPORTS lives here too. The FINDINGS CATALOG holds one
+//! row per resource Compute Optimizer has analysed for the account (its finding, its reason
+//! codes, its performance risk, what it costs and what the recommendation would cost), part
+//! of the store's initial value so every findings reader aggregates the same rows without
+//! any of them writing to the store. Idle resource recommendations have their own store
+//! ([`IdleRecommendationStore`]): no operation of this API creates one — Compute Optimizer's
+//! own analysis of an observed workload does — so the store is what `GetIdleRecommendations`
+//! filters, orders and pages over, and the rules it applies to a stored recommendation (the
+//! filter vocabulary, the sort dimensions, the ARN -> resource-type catalog) are stated
+//! once, here.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -499,6 +503,124 @@ pub fn decode_page_token(token: &str) -> Option<PreferenceKey> {
     })
 }
 
+/// The currency every monetary figure in the findings catalog is denominated in, one of
+/// the model's `Currency` values (`crate::ops::types::CURRENCY_VALUES`).
+pub const CURRENCY_USD: &str = "USD";
+
+/// The `CurrentPerformanceRisk` values (`crate::ops::types::CURRENT_PERFORMANCE_RISK_VALUES`),
+/// named so the catalog and the rating counts read as the model's own vocabulary.
+pub const PERFORMANCE_RISK_VERY_LOW: &str = "VeryLow";
+/// See [`PERFORMANCE_RISK_VERY_LOW`].
+pub const PERFORMANCE_RISK_LOW: &str = "Low";
+/// See [`PERFORMANCE_RISK_VERY_LOW`].
+pub const PERFORMANCE_RISK_MEDIUM: &str = "Medium";
+/// See [`PERFORMANCE_RISK_VERY_LOW`].
+pub const PERFORMANCE_RISK_HIGH: &str = "High";
+
+/// The `Finding` values (`crate::ops::types::FINDING_VALUES`).
+pub const FINDING_UNDERPROVISIONED: &str = "Underprovisioned";
+/// See [`FINDING_UNDERPROVISIONED`].
+pub const FINDING_OVERPROVISIONED: &str = "Overprovisioned";
+/// See [`FINDING_UNDERPROVISIONED`].
+pub const FINDING_OPTIMIZED: &str = "Optimized";
+/// See [`FINDING_UNDERPROVISIONED`].
+pub const FINDING_NOT_OPTIMIZED: &str = "NotOptimized";
+
+/// The `RecommendationSourceType` values the findings catalog holds resources of
+/// (`crate::ops::types::RECOMMENDATION_SOURCE_TYPE_VALUES`).
+pub const SOURCE_TYPE_EC2_INSTANCE: &str = "Ec2Instance";
+/// See [`SOURCE_TYPE_EC2_INSTANCE`].
+pub const SOURCE_TYPE_AUTO_SCALING_GROUP: &str = "AutoScalingGroup";
+/// See [`SOURCE_TYPE_EC2_INSTANCE`].
+pub const SOURCE_TYPE_EBS_VOLUME: &str = "EbsVolume";
+/// See [`SOURCE_TYPE_EC2_INSTANCE`].
+pub const SOURCE_TYPE_LAMBDA_FUNCTION: &str = "LambdaFunction";
+/// See [`SOURCE_TYPE_EC2_INSTANCE`].
+pub const SOURCE_TYPE_ECS_SERVICE: &str = "EcsService";
+/// See [`SOURCE_TYPE_EC2_INSTANCE`].
+pub const SOURCE_TYPE_RDS_DB_INSTANCE: &str = "RdsDBInstance";
+/// See [`SOURCE_TYPE_EC2_INSTANCE`].
+pub const SOURCE_TYPE_LICENSE: &str = "License";
+
+/// The `Finding` values a summary of `resource_type` reports a count for, from the
+/// `GetRecommendationSummaries` documentation: "It returns the number of: Amazon EC2
+/// instances in an account that are Underprovisioned, Overprovisioned, or Optimized.
+/// EC2 Auto Scaling groups in an account that are NotOptimized, or Optimized. Amazon EBS
+/// volumes in an account that are NotOptimized, or Optimized. Lambda functions in an
+/// account that are NotOptimized, or Optimized. Amazon ECS services in an account that
+/// are Underprovisioned, Overprovisioned, or Optimized. Commercial software licenses in
+/// an account that are InsufficientMetrics, NotOptimized or Optimized. Amazon Aurora and
+/// Amazon RDS databases in an account that are Underprovisioned, Overprovisioned,
+/// Optimized, or NotOptimized."
+///
+/// Every value here is one of the model's `Finding` enum, because that is what
+/// `Summary$name` targets: the one documented finding outside it — a license's
+/// `InsufficientMetrics`, which belongs to `LicenseFinding` — is therefore not a count a
+/// `Summary` can carry, so a `License` summary reports the two findings `Finding` holds.
+///
+/// An empty slice for a resource type whose findings this emulator does not summarise, so
+/// a reader reports no summary for it rather than an invented vocabulary.
+pub fn findings_reported_for(resource_type: &str) -> &'static [&'static str] {
+    match resource_type {
+        SOURCE_TYPE_EC2_INSTANCE | SOURCE_TYPE_ECS_SERVICE => &[
+            FINDING_UNDERPROVISIONED,
+            FINDING_OVERPROVISIONED,
+            FINDING_OPTIMIZED,
+        ],
+        SOURCE_TYPE_AUTO_SCALING_GROUP
+        | SOURCE_TYPE_EBS_VOLUME
+        | SOURCE_TYPE_LAMBDA_FUNCTION
+        | SOURCE_TYPE_LICENSE => &[FINDING_NOT_OPTIMIZED, FINDING_OPTIMIZED],
+        SOURCE_TYPE_RDS_DB_INSTANCE => &[
+            FINDING_UNDERPROVISIONED,
+            FINDING_OVERPROVISIONED,
+            FINDING_OPTIMIZED,
+            FINDING_NOT_OPTIMIZED,
+        ],
+        _ => &[],
+    }
+}
+
+/// One resource Compute Optimizer has analysed for an account: the optimization finding
+/// it carries, what it costs today, what the recommended configuration would cost, and
+/// the risk its current configuration runs. This is the row the findings readers report
+/// and `GetRecommendationSummaries` aggregates, so every figure a summary carries is
+/// computed from these and not stated twice.
+#[derive(Debug, Clone)]
+pub struct AnalysedResource {
+    /// The account that owns the resource.
+    pub account_id: String,
+    /// The `RecommendationSourceType` the resource is analysed as.
+    pub resource_type: String,
+    /// The resource's ARN.
+    pub resource_arn: String,
+    /// The `Finding` the analysis reached for it.
+    pub finding: String,
+    /// The `FindingReasonCode`s behind that finding; empty where the finding has none.
+    pub finding_reason_codes: Vec<String>,
+    /// The `CurrentPerformanceRisk` the current configuration runs.
+    pub current_performance_risk: String,
+    /// What the resource costs per month in its current configuration.
+    pub current_monthly_cost: f64,
+    /// What the recommended configuration would cost per month. Equal to
+    /// [`Self::current_monthly_cost`] for a resource whose configuration the analysis
+    /// would not change, and higher for one it would grow.
+    pub recommended_monthly_cost: f64,
+    /// The `InferredWorkloadType`s running on the resource; empty where none was inferred.
+    pub inferred_workload_types: Vec<String>,
+}
+
+impl AnalysedResource {
+    /// The monthly saving of adopting the recommendation for this resource: what it costs
+    /// today less what the recommended configuration costs, and NOTHING where the
+    /// recommendation does not cost less — an underprovisioned resource is recommended a
+    /// larger configuration, which saves no money.
+    pub fn monthly_savings(&self) -> f64 {
+        (self.current_monthly_cost - self.recommended_monthly_cost).max(0.0)
+    }
+
+}
+
 // ---------------------------------------------------------------------------
 // Idle resource recommendations
 //
@@ -758,7 +880,7 @@ pub fn decode_idle_page_token(token: &str) -> Option<IdlePageCursor> {
 }
 
 /// Per-service state for com-amazonaws-computeoptimizer-computeoptimizerservice. A handler reaches it through [`service_state`].
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
     /// The account's enrollment record, written by `UpdateEnrollmentStatus` and reported
     /// by `GetEnrollmentStatus`.
@@ -766,10 +888,199 @@ pub struct ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
     /// Every stored recommendation preference, ordered by key so a page boundary is
     /// stable across calls.
     pub preferences: BTreeMap<PreferenceKey, PreferenceRecord>,
+    /// The resources Compute Optimizer has analysed, in catalog order. Part of the
+    /// store's initial value rather than something a reader writes on first use, so every
+    /// findings reader serves the same rows and none of them mutates the store.
+    pub analysed_resources: Vec<AnalysedResource>,
     /// The idle resource recommendations this service holds, which
     /// `GetIdleRecommendations` reports. See [`IdleRecommendationStore`]: no operation of
     /// this API writes one.
     pub idle_recommendations: IdleRecommendationStore,
+}
+
+impl Default for ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
+    /// The store's initial value: the account is not opted in, nobody has written a
+    /// preference, the findings catalog this emulator analysed, and no idle resource
+    /// recommendation (only an analysis records one).
+    fn default() -> Self {
+        Self {
+            enrollment: Enrollment::default(),
+            preferences: BTreeMap::new(),
+            analysed_resources: seed_analysed_resources(),
+            idle_recommendations: IdleRecommendationStore::default(),
+        }
+    }
+}
+
+/// The findings catalog, built once when the store is created.
+///
+/// This emulator observes no real workloads, so WHICH resources it holds is a fixed set
+/// rather than something derived from traffic; every figure a summary reports is
+/// nevertheless computed from the costs, findings, reason codes and risks stored here, so
+/// the counts, the savings and the percentage always agree with each other and with the
+/// rows a per-resource findings reader would report.
+///
+/// The catalog spans the finding, reason-code, performance-risk and inferred-workload
+/// vocabularies of several resource types so an aggregate over it is not a single row
+/// restated: it holds a resource whose recommendation saves money, one the analysis would
+/// GROW (so it saves none), and one it leaves alone.
+fn seed_analysed_resources() -> Vec<AnalysedResource> {
+    let account = ::engine::emulator_account_id();
+    let east = "us-east-1";
+    let west = "us-west-2";
+    let row = |resource_type: &str,
+               resource_arn: String,
+               finding: &str,
+               finding_reason_codes: &[&str],
+               current_performance_risk: &str,
+               current_monthly_cost: f64,
+               recommended_monthly_cost: f64,
+               inferred_workload_types: &[&str]| AnalysedResource {
+        account_id: account.to_string(),
+        resource_type: resource_type.to_string(),
+        resource_arn,
+        finding: finding.to_string(),
+        finding_reason_codes: finding_reason_codes
+            .iter()
+            .map(|code| (*code).to_string())
+            .collect(),
+        current_performance_risk: current_performance_risk.to_string(),
+        current_monthly_cost,
+        recommended_monthly_cost,
+        inferred_workload_types: inferred_workload_types
+            .iter()
+            .map(|workload| (*workload).to_string())
+            .collect(),
+    };
+
+    vec![
+        // An over-provisioned instance: the recommendation is smaller, so it saves.
+        row(
+            SOURCE_TYPE_EC2_INSTANCE,
+            ::engine::emulator_arn("ec2", east, "instance/i-0a1b2c3d4e5f60001"),
+            FINDING_OVERPROVISIONED,
+            &[METRIC_REASON_MEMORY_OVERPROVISIONED],
+            PERFORMANCE_RISK_VERY_LOW,
+            280.32,
+            140.16,
+            &["PostgreSql"],
+        ),
+        // An under-provisioned instance: the recommendation is LARGER, so it saves
+        // nothing even though its configuration changes.
+        row(
+            SOURCE_TYPE_EC2_INSTANCE,
+            ::engine::emulator_arn("ec2", east, "instance/i-0a1b2c3d4e5f60002"),
+            FINDING_UNDERPROVISIONED,
+            &[METRIC_REASON_MEMORY_UNDERPROVISIONED],
+            PERFORMANCE_RISK_HIGH,
+            70.08,
+            140.16,
+            &["Redis"],
+        ),
+        // An optimized instance: nothing to change, nothing to save.
+        row(
+            SOURCE_TYPE_EC2_INSTANCE,
+            ::engine::emulator_arn("ec2", west, "instance/i-0a1b2c3d4e5f60003"),
+            FINDING_OPTIMIZED,
+            &[],
+            PERFORMANCE_RISK_VERY_LOW,
+            140.16,
+            140.16,
+            &[],
+        ),
+        row(
+            SOURCE_TYPE_AUTO_SCALING_GROUP,
+            ::engine::emulator_arn(
+                "autoscaling",
+                east,
+                "autoScalingGroup:12345678-1234-1234-1234-123456789012:\
+                 autoScalingGroupName/web-tier",
+            ),
+            FINDING_NOT_OPTIMIZED,
+            &[],
+            PERFORMANCE_RISK_LOW,
+            560.64,
+            420.48,
+            &[],
+        ),
+        row(
+            SOURCE_TYPE_EBS_VOLUME,
+            ::engine::emulator_arn("ec2", east, "volume/vol-00112233445566001"),
+            FINDING_NOT_OPTIMIZED,
+            &[],
+            PERFORMANCE_RISK_VERY_LOW,
+            50.0,
+            40.0,
+            &[],
+        ),
+        // A volume the analysis leaves alone: optimized, so there is nothing to save on
+        // it, and the EbsVolume summary counts a resource at each of its two findings.
+        row(
+            SOURCE_TYPE_EBS_VOLUME,
+            ::engine::emulator_arn("ec2", east, "volume/vol-00112233445566002"),
+            FINDING_OPTIMIZED,
+            &[],
+            PERFORMANCE_RISK_VERY_LOW,
+            25.0,
+            25.0,
+            &[],
+        ),
+        row(
+            SOURCE_TYPE_LAMBDA_FUNCTION,
+            ::engine::emulator_arn("lambda", west, "function:invoice-renderer"),
+            FINDING_NOT_OPTIMIZED,
+            &[METRIC_REASON_MEMORY_OVERPROVISIONED],
+            PERFORMANCE_RISK_VERY_LOW,
+            18.0,
+            12.0,
+            &[],
+        ),
+        row(
+            SOURCE_TYPE_ECS_SERVICE,
+            ::engine::emulator_arn("ecs", east, "service/payments/checkout"),
+            FINDING_OVERPROVISIONED,
+            &[METRIC_REASON_MEMORY_OVERPROVISIONED],
+            PERFORMANCE_RISK_VERY_LOW,
+            120.0,
+            80.0,
+            &[],
+        ),
+        row(
+            SOURCE_TYPE_RDS_DB_INSTANCE,
+            ::engine::emulator_arn("rds", east, "db:orders-primary"),
+            FINDING_OVERPROVISIONED,
+            &[],
+            PERFORMANCE_RISK_MEDIUM,
+            300.0,
+            225.0,
+            &[],
+        ),
+    ]
+}
+
+/// The `FindingReasonCode` values (`crate::ops::types::FINDING_REASON_CODE_VALUES`) — the
+/// only two `ReasonCodeSummary$name` can carry.
+pub const METRIC_REASON_MEMORY_OVERPROVISIONED: &str = "MemoryOverprovisioned";
+/// See [`METRIC_REASON_MEMORY_OVERPROVISIONED`].
+pub const METRIC_REASON_MEMORY_UNDERPROVISIONED: &str = "MemoryUnderprovisioned";
+
+/// The opaque `nextToken` `GetRecommendationSummaries` hands out: the
+/// `RecommendationSourceType` the next page starts at, hex-encoded so a client can
+/// neither read nor construct one. A token from the other paginated reader decodes to
+/// nothing here (and this one to nothing there), so neither can resume the other's walk.
+pub fn encode_summary_page_token(resource_type: &str) -> String {
+    ::hex::encode(::serde_json::json!({ "summariesFrom": resource_type }).to_string())
+}
+
+/// The resource type a `nextToken` this operation issued stands for, or `None` for a
+/// token it did not.
+pub fn decode_summary_page_token(token: &str) -> Option<String> {
+    let bytes = ::hex::decode(token).ok()?;
+    let decoded = ::serde_json::from_slice::<::serde_json::Value>(&bytes).ok()?;
+    decoded
+        .get("summariesFrom")?
+        .as_str()
+        .map(ToString::to_string)
 }
 
 impl ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
@@ -798,6 +1109,30 @@ impl ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
             .collect();
         applicable.sort_by_key(|(rank, _)| *rank);
         applicable.into_iter().map(|(_, record)| record).collect()
+    }
+
+    /// The analysed resources `account_id` owns, grouped by `RecommendationSourceType` and
+    /// keyed by it, so a reader walks the groups in one stable order whatever the catalog's
+    /// own order is.
+    ///
+    /// This emulator presents exactly one account ([`engine::emulator_account_id`]), so a
+    /// request that asks for any other account's findings — which only an organization's
+    /// management account may do — selects nothing rather than someone else's resources.
+    pub fn analysed_resources_by_type(
+        &self,
+        account_id: &str,
+    ) -> BTreeMap<&str, Vec<&AnalysedResource>> {
+        let mut grouped: BTreeMap<&str, Vec<&AnalysedResource>> = BTreeMap::new();
+        for resource in &self.analysed_resources {
+            if resource.account_id != account_id {
+                continue;
+            }
+            grouped
+                .entry(resource.resource_type.as_str())
+                .or_default()
+                .push(resource);
+        }
+        grouped
     }
 }
 
