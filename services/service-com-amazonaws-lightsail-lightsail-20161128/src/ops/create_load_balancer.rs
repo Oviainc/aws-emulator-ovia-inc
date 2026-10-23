@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateLoadBalancer
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateLoadBalancer`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Inserts one load balancer record into this service's store and answers the
+//! operation log entry that records the create.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateLoadBalancer::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -193,18 +188,192 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateLoadBalancer` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateLoadBalancerErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // A load balancer is a REGIONAL resource — its own documentation caps
+        // them "per AWS Region in your account" — so the region the request is
+        // signed for is part of the record's identity.
+        let region = crate::state::request_region(ctx.parts());
+
+        // `loadBalancerName` and `instancePort` are modelled `@required`
+        // members, the name carries the modelled `ResourceName` pattern and the
+        // port the modelled -1..65535 range, so the centralized walk refused
+        // anything outside them before this body ran. What is left is what the
+        // model cannot express: the certificate members have to come as a pair,
+        // a health check path has to be one the load balancer could report, the
+        // caller-sized collections have to be within their bounds, the name must
+        // still be free in this Region and the Region must have room. Every one
+        // of those is checked BEFORE the first write, so a refused request
+        // creates nothing.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateLoadBalancer"))
+        // "If you specify certificateDomainName, then certificateName is
+        // required (and vice-versa)": one without the other describes no
+        // certificate.
+        let certificate = match (
+            input.certificate_name.clone(),
+            input.certificate_domain_name.clone(),
+        ) {
+            (Some(name), Some(domain_name)) => Some((name, domain_name)),
+            (None, None) => None,
+            (Some(_), None) => {
+                return Err(invalid(
+                    "certificateDomainName is required when certificateName is given: a \
+                     certificate names the domain it is associated with"
+                        .to_string(),
+                ))
+            }
+            (None, Some(_)) => {
+                return Err(invalid(
+                    "certificateName is required when certificateDomainName is given: a \
+                     certificate is addressed by its name"
+                        .to_string(),
+                ))
+            }
+        };
+        // The alternative names are "the optional alternative domains and
+        // subdomains to use with your SSL/TLS certificate", so with no
+        // certificate there is nothing for them to be used with.
+        let alternative_names = input.certificate_alternative_names.clone().unwrap_or_default();
+        if certificate.is_none() && !alternative_names.is_empty() {
+            return Err(invalid(
+                "certificateAlternativeNames requires certificateName and \
+                 certificateDomainName: the alternative names belong to a certificate"
+                    .to_string(),
+            ));
+        }
+        // `LoadBalancer$healthCheckPath` is a `NonEmptyString` (pattern `\S`),
+        // so a blank path is not one this load balancer could ever report; an
+        // ABSENT one gets the documented root path instead.
+        let health_check_path = match input.health_check_path.as_deref() {
+            None => crate::state::DEFAULT_HEALTH_CHECK_PATH.to_string(),
+            Some(path) if path.trim().is_empty() => {
+                return Err(invalid(
+                    "healthCheckPath must carry a non-whitespace path, or be omitted to use \
+                     the root path of the website"
+                        .to_string(),
+                ))
+            }
+            Some(path) => path.to_string(),
+        };
+        let tags = input.tags.clone().unwrap_or_default();
+        if tags.len() > crate::state::MAX_TAGS {
+            return Err(invalid(format!(
+                "tags carries {} entries, more than the {} this service accepts",
+                tags.len(),
+                crate::state::MAX_TAGS
+            )));
+        }
+        // `ipAddressType` targets the modelled enum, so the walk already refused
+        // anything but its three members; an absent one gets the documented
+        // default.
+        let ip_address_type = input
+            .ip_address_type
+            .clone()
+            .unwrap_or_else(|| crate::state::DEFAULT_IP_ADDRESS_TYPE.to_string());
+
+        let name = input.load_balancer_name;
+        let location = crate::state::StoredLocation::regional(&region);
+        let now = crate::state::now_ms();
+
+        crate::state::with_state(&*self.engine, |store| {
+            // A load balancer name addresses one load balancer in its Region, so
+            // creating one that is already there is refused rather than silently
+            // replacing the record instances may already be attached to.
+            if store.load_balancer(&region, &name).is_some() {
+                return Err(invalid(format!(
+                    "a load balancer named '{name}' already exists in {region}"
+                )));
+            }
+            if store.load_balancers_in(&region).len()
+                >= crate::state::MAX_LOAD_BALANCERS_PER_REGION
+            {
+                return Err(invalid(format!(
+                    "this account already holds the {} load balancers it may create per \
+                     Amazon Web Services Region, and {region} is full",
+                    crate::state::MAX_LOAD_BALANCERS_PER_REGION
+                )));
+            }
+
+            let id = store.mint_uuid();
+            // A new load balancer is not serving yet: the clock owes it
+            // `active`, which is why a read straight after this call still
+            // reports `provisioning`, exactly as it does against AWS.
+            let due =
+                crate::state::DueNamedState::after(now, crate::state::LOAD_BALANCER_STATE_ACTIVE);
+            store.insert_load_balancer(crate::state::StoredLoadBalancer {
+                name: name.clone(),
+                arn: crate::state::load_balancer_arn(&region, &id),
+                support_code: crate::state::support_code(&id),
+                created_at_ms: now,
+                location: location.clone(),
+                tags,
+                dns_name: crate::state::load_balancer_dns_name(&region, &name, &id),
+                state: crate::state::LOAD_BALANCER_STATE_PROVISIONING,
+                due: Some(due),
+                instance_port: input.instance_port,
+                health_check_path,
+                ip_address_type,
+                tls_policy_name: input.tls_policy_name.clone(),
+                // The certificate the request asked for exists, but is NOT
+                // attached: Lightsail validates it first and
+                // `AttachLoadBalancerTlsCertificate` is what attaches it — which
+                // is why a load balancer created with a certificate still serves
+                // plain `HTTP`.
+                certificate: certificate.map(|(certificate_name, domain_name)| {
+                    crate::state::StoredLoadBalancerCertificate {
+                        name: certificate_name,
+                        domain_name,
+                        alternative_names,
+                        is_attached: false,
+                    }
+                }),
+                // Nothing is registered with a load balancer this call just
+                // created: `AttachInstancesToLoadBalancer` is what registers an
+                // instance with it.
+                attached_instances: Vec::new(),
+                // Neither stickiness nor HTTPS redirection is a create
+                // parameter: "To change additional load balancer settings, use
+                // the UpdateLoadBalancerAttribute operation."
+                session_stickiness_enabled: false,
+                session_stickiness_cookie_duration_seconds:
+                    crate::state::DEFAULT_SESSION_STICKINESS_COOKIE_DURATION_SECONDS,
+                https_redirection_enabled: false,
+            });
+            // `operations` is a list because other Lightsail creates act on
+            // several resources at once; `CreateLoadBalancer` creates exactly
+            // one load balancer, so it answers exactly one entry, left
+            // non-terminal until the provisioning the clock owes it is due.
+            let operation = store.start_operation(
+                now,
+                crate::state::OPERATION_TYPE_CREATE_LOAD_BALANCER,
+                crate::state::RESOURCE_TYPE_LOAD_BALANCER,
+                &name,
+                &location,
+                Some(due.at_ms),
+            );
+            Ok(CreateLoadBalancerOutput {
+                operations: Some(vec![operation.view()]),
+            })
+        })
+        .ok_or_else(unavailable)?
     }
+}
+
+/// This operation's 400 refusal for a request the model admits but the service
+/// does not: the modelled `InvalidInputException`, whose message names the member
+/// that is wrong and the constraint it broke.
+fn invalid(message: String) -> CreateLoadBalancerError {
+    CreateLoadBalancerErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message),
+        ..Default::default()
+    })
+    .into()
+}
+
+/// The store is unreachable — the engine is not the shared in-memory one. A
+/// modelled server fault, never a fresh engine.
+fn unavailable() -> CreateLoadBalancerError {
+    CreateLoadBalancerErrorModeled::ServiceException(ServiceException {
+        message: Some("the Lightsail load balancer store is unavailable".to_string()),
+        ..Default::default()
+    })
+    .into()
 }
