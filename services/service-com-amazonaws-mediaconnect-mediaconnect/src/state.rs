@@ -14,9 +14,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    AddMediaStreamRequest, AddOutputRequest, DestinationConfiguration, EncodingConfig,
-    EncodingParameters, Encryption, Entitlement, FailoverConfig, Flow, FlowTransitEncryption,
-    Gateway, GatewayNetwork, GrantEntitlementRequest, Interface, ListedFlow, ListedGateway,
+    AddBridgeOutputRequest, AddBridgeSourceRequest, AddMediaStreamRequest, AddOutputRequest,
+    Bridge, BridgeFlowSource, BridgeNetworkOutput, BridgeNetworkSource, BridgeOutput, BridgeSource,
+    DestinationConfiguration, EgressGatewayBridge, EncodingConfig, EncodingParameters, Encryption,
+    Entitlement, FailoverConfig, Flow, FlowTransitEncryption, Gateway, GatewayNetwork,
+    GrantEntitlementRequest, IngressGatewayBridge, Interface, ListedFlow, ListedGateway,
     Maintenance, MediaStream, MediaStreamAttributes, MediaStreamAttributesRequest,
     MediaStreamOutputConfiguration, MediaStreamOutputConfigurationRequest, MonitoringConfig,
     NdiConfig, Output, SetSourceRequest, Source, Transport, VpcInterface, VpcInterfaceAttachment,
@@ -43,6 +45,17 @@ pub const STATUS_DELETING: &str = "DELETING";
 pub const GATEWAY_STATE_CREATING: &str = "CREATING";
 /// See [`GATEWAY_STATE_CREATING`].
 pub const GATEWAY_STATE_ACTIVE: &str = "ACTIVE";
+
+/// The `BridgeState` enum the model declares for a bridge
+/// (`smithy_query(query="shape",shape="BridgeState")`: CREATING | STANDBY | STARTING |
+/// DEPLOYING | ACTIVE | STOPPING | DELETING | DELETED | START_FAILED | START_PENDING |
+/// STOP_FAILED | UPDATING). Only the two a bridge's creation reaches are named here; the
+/// rest belong to operations that are still scaffolded (UpdateBridgeState, DeleteBridge).
+pub const BRIDGE_STATE_CREATING: &str = "CREATING";
+/// See [`BRIDGE_STATE_CREATING`]. A bridge that finished being created is not running
+/// yet: it waits in `STANDBY` until UpdateBridgeState asks for a desired state
+/// (`DesiredState`: ACTIVE | DELETED | STANDBY).
+pub const BRIDGE_STATE_STANDBY: &str = "STANDBY";
 
 /// `SourceType` (`smithy_query(query="shape",shape="SourceType")`): a source that
 /// originated in this account is `OWNED`; one reached through another account's
@@ -199,6 +212,29 @@ pub const MAX_GATEWAY_NETWORKS: usize = 4;
 /// `BadRequestException`, the error the model describes as the one for "a semantic error"
 /// in the request.
 pub const MAX_GATEWAY_EGRESS_CIDR_BLOCKS: usize = MAX_FLOW_COLLECTION_ENTRIES;
+
+/// The ceiling on how many bridges this store holds, for the same reason as
+/// [`MAX_GATEWAYS`]: nothing evicts a bridge and DescribeBridge must still answer what
+/// CreateBridge created, so the store needs a maximum entry count. CreateBridge refuses
+/// past it with the service's own modelled `CreateBridge420Exception`, "raised by
+/// Elemental MediaConnect when creating the bridge" and declared on CreateBridge alone
+/// (never on a read). The number is the emulator's own bound, not a published AWS
+/// default, and it is high enough that no ordinary workflow meets it.
+pub const MAX_BRIDGES: usize = 1_000;
+
+/// The ceiling on how many sources one bridge carries.
+///
+/// AWS publishes no count for a bridge's sources and the model puts no `@length` on
+/// `__listOfAddBridgeSourceRequest`, so the bound is the one this crate already applies to
+/// a request-sized collection ([`MAX_FLOW_COLLECTION_ENTRIES`]), named through that
+/// constant so the two cannot drift. CreateBridge refuses past it with
+/// `BadRequestException`, the error the model describes as the one for "a semantic error"
+/// in the request.
+pub const MAX_BRIDGE_SOURCES: usize = MAX_FLOW_COLLECTION_ENTRIES;
+
+/// The ceiling on how many outputs one bridge carries, for the same reason as
+/// [`MAX_BRIDGE_SOURCES`].
+pub const MAX_BRIDGE_OUTPUTS: usize = MAX_FLOW_COLLECTION_ENTRIES;
 
 /// The most tags one resource carries, checked against the MERGED set a tag write would
 /// leave on the resource, so repeated tag writes cannot grow a resource's tag map past
@@ -372,10 +408,12 @@ pub const ASSIGNED_RECOVERY_WINDOW_MS: i32 = 200;
 
 /// `config` with the members MediaConnect assigns itself resolved.
 ///
-/// Every operation that writes a flow's `SourceFailoverConfig` (CreateFlow's
-/// `SourceFailoverConfig`, UpdateFlow's merge of `UpdateFailoverConfig`) stores the
-/// config through this function, so a flow's failover settings never depend on which
-/// call wrote them.
+/// Every operation that writes a `SourceFailoverConfig` (CreateFlow's
+/// `SourceFailoverConfig`, UpdateFlow's merge of `UpdateFailoverConfig`, CreateBridge's
+/// `SourceFailoverConfig` — all three target the same `FailoverConfig` shape, whose
+/// `RecoveryWindow` member carries the same documentation wherever it appears) stores the
+/// config through this function, so failover settings never depend on which call wrote
+/// them.
 pub fn resolved_failover_config(config: FailoverConfig) -> FailoverConfig {
     FailoverConfig {
         recovery_window: Some(
@@ -1065,6 +1103,158 @@ impl StoredGateway {
     }
 }
 
+/// The modelled `BridgeSource` a request entry configures, or `None` when the entry
+/// names neither a flow source nor a network source.
+///
+/// `AddBridgeSourceRequest` carries two optional members — `FlowSource` ("the source of
+/// the flow") and `NetworkSource` ("the source of the network") — which are the two kinds
+/// a `BridgeSource` reports, so one entry materialises exactly one of them. Every
+/// operation that stores a bridge source (CreateBridge's `Sources`, and AddBridgeSources
+/// once it is implemented) materialises it HERE, so one request entry always becomes the
+/// same stored source.
+pub fn materialise_bridge_source(request: &AddBridgeSourceRequest) -> Option<BridgeSource> {
+    match (&request.flow_source, &request.network_source) {
+        (Some(flow_source), None) => Some(BridgeSource {
+            flow_source: Some(BridgeFlowSource {
+                flow_arn: flow_source.flow_arn.clone(),
+                flow_vpc_interface_attachment: flow_source.flow_vpc_interface_attachment.clone(),
+                name: flow_source.name.clone(),
+                // `BridgeFlowSource$OutputArn` is "the Amazon Resource Number (ARN) of the
+                // output" MediaConnect creates on the cloud flow for this bridge. This
+                // emulator creates no output on the flow a bridge names — the flow's
+                // outputs are what AddFlowOutputs / RemoveFlowOutput own — so the optional
+                // member stays absent rather than carrying an ARN that addresses nothing.
+                output_arn: None,
+            }),
+            network_source: None,
+        }),
+        (None, Some(network_source)) => Some(BridgeSource {
+            flow_source: None,
+            network_source: Some(BridgeNetworkSource {
+                multicast_ip: network_source.multicast_ip.clone(),
+                multicast_source_settings: network_source.multicast_source_settings.clone(),
+                name: network_source.name.clone(),
+                network_name: network_source.network_name.clone(),
+                port: network_source.port,
+                protocol: network_source.protocol.clone(),
+            }),
+        }),
+        _ => None,
+    }
+}
+
+/// The modelled `BridgeOutput` a request entry configures, or `None` when the entry names
+/// no network output.
+///
+/// `AddBridgeOutputRequest` carries one optional member, `NetworkOutput` ("the network
+/// output of the bridge. A network output is delivered to your premises"), so an entry
+/// that names none configures no output at all. A `BridgeOutput` can also be a
+/// `BridgeFlowOutput`, which no request shape in this model configures: a bridge's flow
+/// output is the one a cloud flow creates when it takes the bridge as its source
+/// (`SetGatewayBridgeSourceRequest`), never one a create or add request carries.
+pub fn materialise_bridge_output(request: &AddBridgeOutputRequest) -> Option<BridgeOutput> {
+    let network_output = request.network_output.as_ref()?;
+    Some(BridgeOutput {
+        flow_output: None,
+        network_output: Some(BridgeNetworkOutput {
+            ip_address: network_output.ip_address.clone(),
+            name: network_output.name.clone(),
+            network_name: network_output.network_name.clone(),
+            port: network_output.port,
+            protocol: network_output.protocol.clone(),
+            ttl: network_output.ttl,
+        }),
+    })
+}
+
+/// The name of a stored bridge source: the flow source's or the network source's `Name`,
+/// the one a bridge addresses that source by.
+pub fn bridge_source_name(source: &BridgeSource) -> &str {
+    match (&source.flow_source, &source.network_source) {
+        (Some(flow_source), _) => &flow_source.name,
+        (None, Some(network_source)) => &network_source.name,
+        (None, None) => "",
+    }
+}
+
+/// The name of a stored bridge output: the flow output's or the network output's `Name`.
+pub fn bridge_output_name(output: &BridgeOutput) -> &str {
+    match (&output.flow_output, &output.network_output) {
+        (Some(flow_output), _) => &flow_output.name,
+        (None, Some(network_output)) => &network_output.name,
+        (None, None) => "",
+    }
+}
+
+/// Whether `name` can name a source or an output of a bridge.
+///
+/// RemoveBridgeSource / UpdateBridgeSource take `SourceName` and RemoveBridgeOutput /
+/// UpdateBridgeOutput take `OutputName` as an `@httpLabel` (`OPERATIONS.md`), so the name
+/// must not be empty and must not carry the URI path separator — otherwise the stored
+/// entry could never be addressed again.
+pub fn is_valid_bridge_member_name(name: &str) -> bool {
+    !name.is_empty() && !name.contains('/')
+}
+
+/// A bridge, as the service holds it between calls. Every bridge operation's response is
+/// computed from this record.
+#[derive(Debug, Clone)]
+pub struct StoredBridge {
+    pub bridge_arn: String,
+    pub name: String,
+    /// `Bridge$PlacementArn`: "the placement Amazon Resource Number (ARN) of the bridge" —
+    /// the gateway the bridge is placed on (`ListedBridge$PlacementArn`: "the ARN of the
+    /// gateway associated with the bridge").
+    pub placement_arn: String,
+    pub bridge_state: String,
+    /// The state change the clock owes, if any. See [`TRANSITION_SPAN`].
+    pub pending: Option<PendingStatus>,
+    /// Set on a cloud-to-ground bridge, exclusive with [`Self::ingress_gateway_bridge`].
+    pub egress_gateway_bridge: Option<EgressGatewayBridge>,
+    /// Set on a ground-to-cloud bridge, exclusive with [`Self::egress_gateway_bridge`].
+    pub ingress_gateway_bridge: Option<IngressGatewayBridge>,
+    pub source_failover_config: Option<FailoverConfig>,
+    pub sources: Vec<BridgeSource>,
+    pub outputs: Vec<BridgeOutput>,
+}
+
+impl StoredBridge {
+    /// Materialise the state change the clock already made due, if it is due at `now`.
+    ///
+    /// As for a flow (see [`StoredFlow::settle`]) this is the only write a reporting
+    /// operation performs: the change was owed at `due_at` whether or not anybody called.
+    pub fn settle(&mut self, now: SystemTime) {
+        if let Some(pending) = self.pending.take() {
+            if now >= pending.due_at {
+                self.bridge_state = pending.status;
+            } else {
+                self.pending = Some(pending);
+            }
+        }
+    }
+
+    /// The modelled `Bridge` for this record.
+    pub fn to_bridge(&self) -> Bridge {
+        Bridge {
+            bridge_arn: self.bridge_arn.clone(),
+            // `Bridge.BridgeMessages` carries "messages with details about the bridge"; a
+            // bridge this emulator serves reports none, so the member stays absent rather
+            // than being an empty list.
+            bridge_messages: None,
+            bridge_state: self.bridge_state.clone(),
+            egress_gateway_bridge: self.egress_gateway_bridge.clone(),
+            ingress_gateway_bridge: self.ingress_gateway_bridge.clone(),
+            name: self.name.clone(),
+            // `Bridge.Outputs` / `Bridge.Sources` are optional lists, so a bridge that
+            // holds none reports no member at all rather than an empty one.
+            outputs: (!self.outputs.is_empty()).then(|| self.outputs.clone()),
+            placement_arn: self.placement_arn.clone(),
+            source_failover_config: self.source_failover_config.clone(),
+            sources: (!self.sources.is_empty()).then(|| self.sources.clone()),
+        }
+    }
+}
+
 /// Per-service state for com-amazonaws-mediaconnect-mediaconnect. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsMediaconnectMediaconnectState {
@@ -1080,6 +1270,12 @@ pub struct ComAmazonawsMediaconnectMediaconnectState {
     /// uniqueness rule in the model, and the gateway id in the ARN is what keeps two
     /// same-named gateways apart.
     pub gateways: BTreeMap<String, StoredGateway>,
+    /// Every live bridge, keyed by its ARN. Ordered, so ListBridges pages stably.
+    ///
+    /// There is no index by name beside it, for the same reason as [`Self::gateways`]:
+    /// the model puts no uniqueness rule on `Bridge$Name`, and the bridge id in the ARN
+    /// is what keeps two same-named bridges apart.
+    pub bridges: BTreeMap<String, StoredBridge>,
     /// Monotonic counter minting the unique fragment of every flow / source / output /
     /// entitlement ARN and of the addresses and ports the service assigns.
     pub next_arn_suffix: u64,
@@ -1110,13 +1306,17 @@ impl ComAmazonawsMediaconnectMediaconnectState {
         self.flows.get_mut(resource_arn).map(|flow| &mut flow.tags)
     }
 
-    /// Settle every flow and gateway whose status change the clock already made due.
+    /// Settle every flow, gateway and bridge whose status change the clock already made
+    /// due.
     pub fn settle_due_transitions(&mut self, now: SystemTime) {
         for flow in self.flows.values_mut() {
             flow.settle(now);
         }
         for gateway in self.gateways.values_mut() {
             gateway.settle(now);
+        }
+        for bridge in self.bridges.values_mut() {
+            bridge.settle(now);
         }
     }
 }
@@ -1166,6 +1366,17 @@ pub fn derived_flow_description(
 /// (`smithy_query(query="shape",shape="GatewayArn")`: `^arn:.+:mediaconnect.+:gateway:.+$`).
 pub fn gateway_resource_fragment(suffix: u64, name: &str) -> String {
     format!("gateway:1-{suffix:08x}:{name}")
+}
+
+/// The resource fragment of a bridge ARN: `bridge:<bridge id>:<name>`.
+///
+/// Shaped like [`gateway_resource_fragment`] — the id is the ARN counter in zero-padded
+/// hex, so the fragment is unique per bridge even when two bridges share a name. The
+/// model puts no pattern on `BridgeArn` (`smithy_query(query="shape",shape="BridgeArn")`:
+/// a plain string carrying an `@arnReference` to `AWS::MediaConnect::Bridge`), so the form
+/// is this service's own, shaped like every other ARN it mints.
+pub fn bridge_resource_fragment(suffix: u64, name: &str) -> String {
+    format!("bridge:1-{suffix:08x}:{name}")
 }
 
 /// The resource fragment of an output ARN: `output:<output id>:<name>`.
@@ -1385,16 +1596,37 @@ pub fn is_valid_flow_name(name: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
+/// Whether `name` can be the last segment of an ARN this service mints.
+///
+/// The one encoding of what minting an ADDRESSABLE ARN requires, shared by
+/// [`is_valid_gateway_name`] and [`is_valid_bridge_name`] so the two cannot drift apart:
+/// the name is the last segment of the ARN the service mints for the resource, and that
+/// ARN travels as an `@httpLabel` on the operations that address it — so it must not be
+/// empty and must not carry the ARN segment separator `:` or the URI path separator `/`.
+fn is_addressable_resource_name(name: &str) -> bool {
+    !name.is_empty() && !name.contains(':') && !name.contains('/')
+}
+
 /// Whether `name` can be a gateway name.
 ///
 /// The model puts no pattern or length on a gateway's `Name`
 /// (`smithy_query(query="shape",shape="Gateway")`: `Name` targets `String`), so this is
-/// only what minting an ADDRESSABLE ARN requires: the name is the last segment of the
-/// `GatewayArn` the service mints, and that ARN travels as an `@httpLabel` on
-/// DescribeGateway and DeleteGateway — so it must not be empty and must not carry the
-/// ARN segment separator `:` or the URI path separator `/`.
+/// only what [`is_addressable_resource_name`] requires of the last segment of the
+/// `GatewayArn` the service mints, which travels as an `@httpLabel` on DescribeGateway and
+/// DeleteGateway.
 pub fn is_valid_gateway_name(name: &str) -> bool {
-    !name.is_empty() && !name.contains(':') && !name.contains('/')
+    is_addressable_resource_name(name)
+}
+
+/// Whether `name` can be a bridge name.
+///
+/// Like [`is_valid_gateway_name`]: the model puts no pattern or length on `Bridge$Name`
+/// (`smithy_query(query="shape",shape="Bridge")`: `Name` targets `String`), and the name
+/// is the last segment of the `BridgeArn` the service mints, which travels as an
+/// `@httpLabel` on DescribeBridge, UpdateBridge, DeleteBridge and every bridge
+/// source/output operation.
+pub fn is_valid_bridge_name(name: &str) -> bool {
+    is_addressable_resource_name(name)
 }
 
 /// Whether the leading segments of a colon-split ARN are those this service mints for
@@ -1444,6 +1676,27 @@ pub fn is_mintable_gateway_arn(arn: &str) -> bool {
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'-')
         && is_valid_gateway_name(gateway_name)
+}
+
+/// Whether `arn` is a bridge ARN this service could have minted: the prefix
+/// [`has_mintable_arn_prefix`] describes for the `bridge` resource type, then the bridge
+/// id [`bridge_resource_fragment`] mints and a name [`is_valid_bridge_name`] accepts.
+///
+/// The model puts no pattern on `BridgeArn`, so this is the crate's own encoding of the
+/// form CreateBridge mints — the integration test asserts minted ARNs through it, and
+/// ListBridges' `NextToken` (still scaffolded) will resume from one.
+pub fn is_mintable_bridge_arn(arn: &str) -> bool {
+    let segments: Vec<&str> = arn.split(':').collect();
+    let [.., bridge_id, bridge_name] = segments.as_slice() else {
+        return false;
+    };
+    segments.len() == 8
+        && has_mintable_arn_prefix(&segments, "bridge")
+        && !bridge_id.is_empty()
+        && bridge_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        && is_valid_bridge_name(bridge_name)
 }
 
 /// Whether `arn` is a flow ARN this service could have minted.

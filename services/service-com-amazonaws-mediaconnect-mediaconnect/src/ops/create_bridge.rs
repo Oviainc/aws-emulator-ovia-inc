@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateBridge
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateBridge`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateBridge::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Stores one bridge and answers with the stored record: the bridge DescribeBridge
+//! reports afterwards is this one, read back out of [`crate::state`].
 //!
 //! ## Shape of an operation
 //!
@@ -95,6 +89,19 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::{StoredBridge, SERVICE_NAMESPACE};
+
+/// Refuse the request with the service's own client-input error, `BadRequestException`
+/// (HTTP 400): "thrown if the request contains a semantic error". `detail` states what was
+/// unacceptable; the message carries it inside this service's refusal envelope
+/// ([`crate::state::validation_failed_message`]).
+fn bad_request(detail: impl Into<String>) -> CreateBridgeError {
+    CreateBridgeErrorModeled::BadRequestException(BadRequestException {
+        message: crate::state::validation_failed_message(&detail.into()),
+    })
+    .into()
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -169,18 +176,212 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateBridge` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateBridgeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateBridge"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateBridgeErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: "the mediaconnect bridge store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        // The bridge name is the last segment of the ARN this operation mints, and that
+        // ARN addresses the bridge as an `@httpLabel` afterwards.
+        if !crate::state::is_valid_bridge_name(&input.name) {
+            return Err(bad_request(format!(
+                "Invalid bridge name {:?}. A bridge name must not be empty and must not \
+                 contain ':' or '/'.",
+                input.name
+            )));
+        }
+
+        // `PlacementArn` is a REQUIRED member naming "the bridge placement Amazon Resource
+        // Number (ARN)" — the gateway the bridge is placed on
+        // (`ListedBridge$PlacementArn`: "the ARN of the gateway associated with the
+        // bridge") — so an empty one places the bridge nowhere. The gateway it names is NOT
+        // required to be one this store holds: the model constrains the member to a plain
+        // string and CreateBridge declares no `NotFoundException`, so the placement is
+        // stored as given and resolved by the operations that address the gateway.
+        if input.placement_arn.is_empty() {
+            return Err(bad_request(
+                "A create bridge request must name the bridge placement ARN.",
+            ));
+        }
+
+        // A bridge is EITHER a cloud-to-ground (egress) bridge or a ground-to-cloud
+        // (ingress) bridge: the two members are alternatives ("an egress bridge is a
+        // cloud-to-ground bridge … an ingress bridge is a ground-to-cloud bridge") and
+        // `ListedBridge$BridgeType` reports exactly one type per bridge, so a request that
+        // names both, or neither, describes no bridge at all.
+        let bridge_type_members = usize::from(input.egress_gateway_bridge.is_some())
+            + usize::from(input.ingress_gateway_bridge.is_some());
+        if bridge_type_members != 1 {
+            return Err(bad_request(
+                "A create bridge request must name exactly one of EgressGatewayBridge \
+                 (a cloud-to-ground bridge) and IngressGatewayBridge (a ground-to-cloud \
+                 bridge).",
+            ));
+        }
+
+        // "Creates a new bridge. The request must include one source."
+        if input.sources.is_empty() || input.sources.len() > crate::state::MAX_BRIDGE_SOURCES {
+            return Err(bad_request(format!(
+                "A create bridge request must include at least one source and at most {}; \
+                 this one has {}.",
+                crate::state::MAX_BRIDGE_SOURCES,
+                input.sources.len()
+            )));
+        }
+
+        // Each entry configures ONE kind of source, and a source is addressed by its name:
+        // `AddBridgeNetworkSourceRequest$Name` / `AddBridgeFlowSourceRequest$Name` "is used
+        // to reference the source and must be unique among sources in this bridge".
+        let mut sources: Vec<BridgeSource> = Vec::with_capacity(input.sources.len());
+        let mut source_names: ::std::collections::BTreeSet<String> =
+            ::std::collections::BTreeSet::new();
+        for request in &input.sources {
+            let Some(source) = crate::state::materialise_bridge_source(request) else {
+                return Err(bad_request(
+                    "Each entry of Sources must name exactly one of FlowSource and \
+                     NetworkSource.",
+                ));
+            };
+            let name = crate::state::bridge_source_name(&source);
+            if !crate::state::is_valid_bridge_member_name(name) {
+                return Err(bad_request(format!(
+                    "Invalid bridge source name {name:?}. A source name must not be empty \
+                     and must not contain '/'."
+                )));
+            }
+            if !source_names.insert(name.to_string()) {
+                return Err(bad_request(format!(
+                    "A source name must be unique among the sources of one bridge; {name:?} \
+                     appears more than once."
+                )));
+            }
+            sources.push(source);
+        }
+
+        // The same two rules for the outputs the request optionally carries
+        // (`AddBridgeNetworkOutputRequest$Name` "must be unique among outputs in this
+        // bridge").
+        let requested_outputs: &[AddBridgeOutputRequest] = input.outputs.as_deref().unwrap_or(&[]);
+        if requested_outputs.len() > crate::state::MAX_BRIDGE_OUTPUTS {
+            return Err(bad_request(format!(
+                "A create bridge request may include at most {} outputs; this one has {}.",
+                crate::state::MAX_BRIDGE_OUTPUTS,
+                requested_outputs.len()
+            )));
+        }
+        let mut outputs: Vec<BridgeOutput> = Vec::with_capacity(requested_outputs.len());
+        let mut output_names: ::std::collections::BTreeSet<String> =
+            ::std::collections::BTreeSet::new();
+        for request in requested_outputs {
+            let Some(output) = crate::state::materialise_bridge_output(request) else {
+                return Err(bad_request("Each entry of Outputs must name a NetworkOutput."));
+            };
+            let name = crate::state::bridge_output_name(&output);
+            if !crate::state::is_valid_bridge_member_name(name) {
+                return Err(bad_request(format!(
+                    "Invalid bridge output name {name:?}. An output name must not be empty \
+                     and must not contain '/'."
+                )));
+            }
+            if !output_names.insert(name.to_string()) {
+                return Err(bad_request(format!(
+                    "An output name must be unique among the outputs of one bridge; \
+                     {name:?} appears more than once."
+                )));
+            }
+            outputs.push(output);
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // The bridge store is bounded: nothing evicts a bridge and DescribeBridge must
+        // still answer what this operation created, so the create refuses once the store is
+        // full rather than growing it without limit. See `crate::state::MAX_BRIDGES`.
+        if store.bridges.len() >= crate::state::MAX_BRIDGES {
+            return Err(CreateBridgeErrorModeled::CreateBridge420Exception(
+                CreateBridge420Exception {
+                    message: format!(
+                        "This account already holds the maximum of {} bridges in this Region. \
+                         Delete a bridge before creating another one.",
+                        crate::state::MAX_BRIDGES
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // Nothing in the model makes a bridge name unique, and the bridge id in the ARN
+        // keeps two same-named bridges apart, so a name already in use is NOT refused:
+        // each create mints its own bridge.
+        let suffix = store.next_suffix();
+        let bridge_arn = ::engine::emulator_arn(
+            SERVICE_NAMESPACE,
+            &region,
+            &crate::state::bridge_resource_fragment(suffix, &input.name),
+        );
+
+        store.bridges.insert(
+            bridge_arn.clone(),
+            StoredBridge {
+                bridge_arn: bridge_arn.clone(),
+                name: input.name.clone(),
+                placement_arn: input.placement_arn.clone(),
+                // A new bridge is not ready yet: it answers the create in the non-terminal
+                // `CREATING` state, which the clock settles into `STANDBY` once
+                // `crate::state::TRANSITION_SPAN` has passed — a created bridge is not
+                // running until UpdateBridgeState asks for a desired state.
+                bridge_state: crate::state::BRIDGE_STATE_CREATING.to_string(),
+                pending: Some(crate::state::PendingStatus {
+                    status: crate::state::BRIDGE_STATE_STANDBY.to_string(),
+                    due_at: now + crate::state::TRANSITION_SPAN,
+                }),
+                // `EgressGatewayBridge$InstanceId` / `IngressGatewayBridge$InstanceId` is
+                // "the ID of the instance running this bridge". A bridge this emulator
+                // creates runs on no gateway instance (none is registered, and the bridge
+                // is not started), so the optional member stays absent.
+                egress_gateway_bridge: input.egress_gateway_bridge.as_ref().map(|requested| {
+                    EgressGatewayBridge {
+                        instance_id: None,
+                        max_bitrate: requested.max_bitrate,
+                    }
+                }),
+                ingress_gateway_bridge: input.ingress_gateway_bridge.as_ref().map(|requested| {
+                    IngressGatewayBridge {
+                        instance_id: None,
+                        max_bitrate: requested.max_bitrate,
+                        max_outputs: requested.max_outputs,
+                    }
+                }),
+                source_failover_config: input
+                    .source_failover_config
+                    .clone()
+                    .map(crate::state::resolved_failover_config),
+                sources,
+                outputs,
+            },
+        );
+
+        // The response is the STORED record, read back out of the store, not the request.
+        let bridge = store
+            .bridges
+            .get(&bridge_arn)
+            .map(StoredBridge::to_bridge)
+            .ok_or_else(|| {
+                CreateBridgeError::from(CreateBridgeErrorModeled::InternalServerErrorException(
+                    InternalServerErrorException {
+                        message: "the bridge could not be read back after it was stored"
+                            .to_string(),
+                    },
+                ))
+            })?;
+        Ok(CreateBridgeOutput {
+            bridge: Some(bridge),
+        })
     }
 }
