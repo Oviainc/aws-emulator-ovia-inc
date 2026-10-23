@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CloseInstancePublicPorts
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CloseInstancePublicPorts`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CloseInstancePublicPorts::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Closes one inbound rule of an instance's firewall and logs the operation. The
+//! rule is identified by its port range and protocol — the addresses the request
+//! carries select nothing, because closing a port closes it to everyone — and
+//! every other rule the firewall holds is left alone.
+//!
+//! The request is nonetheless checked in FULL, addresses included, by the same
+//! `crate::state::port_rule_from_request` an open goes through: all three
+//! public-ports operations carry the same modelled `PortInfo`, so a malformed
+//! address is a malformed request whichever of them carries it. That is
+//! deliberate — a close naming a rule the firewall holds IS refused when its
+//! address members are malformed, even though the close itself would ignore
+//! them.
 //!
 //! ## Shape of an operation
 //!
@@ -166,18 +170,88 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CloseInstancePublicPorts` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CloseInstancePublicPortsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CloseInstancePublicPorts"))
+        // `ctx` carries request metadata only: the firewall this call changes is
+        // the one of the instance the request names, wherever that instance is.
+        let _ = ctx;
+
+        // Every modelled constraint on this input — the two `@required` members,
+        // the `ResourceName` pattern and the ports' `@range` — was refused by the
+        // centralized walk before this body ran. What is left is what the model
+        // cannot express, and `crate::state::port_rule_from_request` checks it.
+        let name = input.instance_name;
+        let now = crate::state::now_ms();
+
+        crate::state::with_state(&*self.engine, |store| {
+            let location = {
+                let Some(instance) = store.instance_mut(&name) else {
+                    return Err(not_found(&name));
+                };
+                // The request is checked the same way an open is, DELIBERATELY:
+                // all three public-ports operations carry the same modelled
+                // `PortInfo`, so a malformed address is a malformed request
+                // whichever of them carries it, and one check keeps one rule.
+                // Only the rule's own key — its ports and protocol — decides
+                // what is closed; the addresses select nothing, because closing
+                // a port closes it to everyone.
+                let rule = crate::state::port_rule_from_request(
+                    "portInfo",
+                    &input.port_info,
+                    &instance.ip_address_type,
+                )
+                .map_err(invalid)?;
+                // Closing a port that is not open is not a failure: what the
+                // request asks for — that those ports are not open — already
+                // holds, so the firewall is left as it is and the call is still
+                // logged. Whether a rule was there is of no interest to the
+                // caller either: the answer is the same operation.
+                let _was_open = instance.close_port(rule.from_port, rule.to_port, &rule.protocol);
+                instance.location.clone()
+            };
+            // The firewall change is applied by the time this call answers, so
+            // its operation is terminal rather than one the clock still owes.
+            let operation = store.start_operation(
+                now,
+                crate::state::OPERATION_TYPE_CLOSE_INSTANCE_PUBLIC_PORTS,
+                crate::state::RESOURCE_TYPE_INSTANCE,
+                &name,
+                &location,
+                None,
+            );
+            Ok(CloseInstancePublicPortsOutput {
+                operation: Some(operation.view()),
+            })
+        })
+        .ok_or_else(unavailable)?
     }
+}
+
+/// No instance of that name is stored: Lightsail's `DoesNotExist` rejection —
+/// HTTP 400, wire error `NotFoundException`, body `code` `DoesNotExist` and a
+/// message naming the resource type and the requested name.
+fn not_found(name: &str) -> CloseInstancePublicPortsError {
+    crate::scaffolded::Scaffolded::resource_does_not_exist(
+        crate::state::RESOURCE_TYPE_INSTANCE,
+        name,
+    )
+}
+
+/// This operation's 400 refusal for a request the model admits but the service
+/// does not: the modelled `InvalidInputException`, whose message names the member
+/// that is wrong and the constraint it broke.
+fn invalid(message: String) -> CloseInstancePublicPortsError {
+    CloseInstancePublicPortsErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message),
+        ..Default::default()
+    })
+    .into()
+}
+
+/// The store is unreachable — the engine is not the shared in-memory one. A
+/// modelled server fault, never a fresh engine.
+fn unavailable() -> CloseInstancePublicPortsError {
+    CloseInstancePublicPortsErrorModeled::ServiceException(ServiceException {
+        message: Some("the Lightsail instance store is unavailable".to_string()),
+        ..Default::default()
+    })
+    .into()
 }

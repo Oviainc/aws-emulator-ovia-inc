@@ -978,6 +978,26 @@ async fn a_request_outside_what_the_service_creates_is_refused() {
             member: "preferredBackupWindow",
         },
         Case {
+            // `hh24:mi` is two digits and a colon: a signed component is not
+            // that form, whatever the number it would read as.
+            case: "a backup window whose hour carries a sign",
+            patch: vec![("preferredBackupWindow", json!("-1:00-01:30"))],
+            member: "preferredBackupWindow",
+        },
+        Case {
+            case: "a backup window whose minute carries a sign",
+            patch: vec![("preferredBackupWindow", json!("01:-5-02:00"))],
+            member: "preferredBackupWindow",
+        },
+        Case {
+            case: "a maintenance window whose hour carries a sign",
+            patch: vec![(
+                "preferredMaintenanceWindow",
+                json!("Tue:-3:00-Tue:04:00"),
+            )],
+            member: "preferredMaintenanceWindow",
+        },
+        Case {
             case: "a backup window shorter than 30 minutes",
             patch: vec![("preferredBackupWindow", json!("16:00-16:15"))],
             member: "preferredBackupWindow",
