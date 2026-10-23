@@ -10,7 +10,8 @@
 //! (`ListReviewTemplateAnswers`) are backed entirely by the maps below, so a create is
 //! visible to the next request on the same engine. The custom lenses `ImportLens`
 //! imports, the versions `CreateLensVersion` publishes from them and the content
-//! `ExportLens` reads back are backed the same way. The record types and their
+//! `ExportLens` reads back are backed the same way, and `ListLenses` pages over those
+//! lenses beside the AWS-official lens this emulator ships. The record types and their
 //! projections live here rather than in a handler because several operations reach them.
 //!
 //! The one lens definition this emulator ships itself — the AWS-official Well-Architected
@@ -29,7 +30,8 @@ use std::time::{Duration, SystemTime};
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    Choice, ConflictException, Milestone, MilestoneSummary, ResourceNotFoundException,
+    Choice, ConflictException, LensSummary, Milestone, MilestoneSummary,
+    ResourceNotFoundException,
     ReviewTemplate, ShareInvitationSummary, Workload, WorkloadDiscoveryConfig,
     WorkloadJiraConfigurationInput, WorkloadJiraConfigurationOutput, WorkloadShareSummary,
     WorkloadSummary, QUESTION_VALUES, RISK_VALUES,
@@ -74,6 +76,96 @@ pub const DEFAULT_TRUSTED_ADVISOR_INTEGRATION_STATUS: &str = "DISABLED";
 /// or by its ARN, whose resource part ends in `lens/<alias>`
 /// (`smithy_query(query="shape", shape="LensAlias")`).
 pub const FRAMEWORK_LENS_ALIAS: &str = "wellarchitected";
+
+/// The `LensSummary$Description` of the AWS-official Well-Architected Framework lens —
+/// what the one lens definition this emulator ships ([`FRAMEWORK_LENS_QUESTIONS`]) asks
+/// about, within `LensDescription`'s modelled 1..1024 characters
+/// (`smithy_query(query="shape", shape="LensSummary")`). Catalog content rather than a
+/// stored value, so it lives beside the question set it describes, next to that lens's
+/// name and version ([`FRAMEWORK_LENS_NAME`], [`FRAMEWORK_LENS_VERSION`]).
+pub const FRAMEWORK_LENS_DESCRIPTION: &str = "The Amazon Web Services Well-Architected \
+     Framework provides a consistent approach for customers and partners to evaluate \
+     architectures, and implement designs that scale over time.";
+
+/// When [`FRAMEWORK_LENS_VERSION`] was published, in seconds since the Unix epoch:
+/// `2023-10-03T00:00:00Z`, the date that version names.
+///
+/// `LensSummary$CreatedAt`/`UpdatedAt` are "The date and time when the lens was
+/// created"/"last updated", and for AWS's own lens that is when the version this
+/// emulator ships was published. Fixed, not read from the clock: a lens nobody changed
+/// must report the same instants to every caller.
+const FRAMEWORK_LENS_PUBLISHED_AT_EPOCH_SECONDS: u64 = 1_696_291_200;
+
+/// [`FRAMEWORK_LENS_PUBLISHED_AT_EPOCH_SECONDS`] as an instant.
+pub fn framework_lens_published_at() -> SystemTime {
+    SystemTime::UNIX_EPOCH + Duration::from_secs(FRAMEWORK_LENS_PUBLISHED_AT_EPOCH_SECONDS)
+}
+
+/// `LensSummary$LensStatus` for a lens whose current content no version has been
+/// published from.
+///
+/// "The new or updated lens will have a status of DRAFT. The lens cannot be applied to
+/// workloads or shared with other Amazon Web Services accounts until it's published with
+/// CreateLensVersion" (`ImportLens` doc) — so this is the status of a lens that has only
+/// been imported, and of one imported OVER after a version was published from it.
+///
+/// It is NOT a member of the modelled `LensStatus` enum, which publishes `CURRENT`,
+/// `NOT_CURRENT`, `DEPRECATED`, `DELETED` and `UNSHARED` (`smithy_query(query="shape",
+/// shape="LensStatus")`) — the version-currency vocabulary a workload's lens REVIEW
+/// reports, which is what [`LENS_STATUS_CURRENT`] is for. What a lens SUMMARY reports
+/// there is the lens's publication state, the vocabulary its own filter is defined over:
+/// `LensStatusType` is exactly `ALL`, `DRAFT` and `PUBLISHED`
+/// (`smithy_query(query="shape", shape="LensStatusType")`), so `ListLenses` filters on
+/// the member it is named after.
+pub const LENS_STATUS_DRAFT: &str = "DRAFT";
+
+/// `LensSummary$LensVersion` for a lens whose current content no version has been
+/// published from.
+///
+/// A custom lens's versions are named by the caller (`CreateLensVersion`'s `LensVersion`
+/// is an input), so an unpublished lens has no version NAME of its own; what it has is its
+/// draft, and that is what the service reports as the version of the content a caller
+/// would read — the same word `LensSummary$LensStatus` reports ([`LENS_STATUS_DRAFT`]),
+/// because both members speak about that one content.
+pub const LENS_VERSION_DRAFT: &str = "DRAFT";
+
+/// `LensSummary$LensStatus` for a lens a version HAS been published from — including the
+/// lenses Amazon Web Services publishes itself, whose content is the version they are
+/// published at. See [`LENS_STATUS_DRAFT`] for why these two and not the modelled
+/// `LensStatus` members.
+pub const LENS_STATUS_PUBLISHED: &str = "PUBLISHED";
+
+/// `LensType$AWS_OFFICIAL`: a lens Amazon Web Services publishes
+/// (`smithy_query(query="shape", shape="LensType")`).
+pub const LENS_TYPE_AWS_OFFICIAL: &str = "AWS_OFFICIAL";
+
+/// `LensType$CUSTOM_SELF`: a custom lens the CALLING account owns.
+pub const LENS_TYPE_CUSTOM_SELF: &str = "CUSTOM_SELF";
+
+/// `LensType$CUSTOM_SHARED`: a custom lens another account owns and shared with the
+/// caller.
+pub const LENS_TYPE_CUSTOM_SHARED: &str = "CUSTOM_SHARED";
+
+/// `LensStatusType$ALL`: every lens, whatever its publication state
+/// (`smithy_query(query="shape", shape="LensStatusType")`, which publishes `ALL`,
+/// `DRAFT` and `PUBLISHED`).
+///
+/// This is also what a `ListLenses` request that names NO `LensStatus` selects: the
+/// member filters the list, and a request that asks for no filtering gets none. An
+/// unpublished lens is still a lens the account has — `ImportLens` answers its ARN, and
+/// `ListLenses` is how a caller finds it again — so it is listed too, with the publication
+/// state of each reported lens being what `DRAFT` and `PUBLISHED` then narrow to.
+pub const LENS_STATUS_TYPE_ALL: &str = "ALL";
+
+/// `LensStatusType$DRAFT`: only lenses carrying content no version has been published
+/// from.
+pub const LENS_STATUS_TYPE_DRAFT: &str = "DRAFT";
+
+/// `LensStatusType$PUBLISHED`: only lenses a published version exists of — the lenses
+/// that can actually be applied to a workload, since a lens that has never been published
+/// "cannot be applied to workloads or shared with other Amazon Web Services accounts"
+/// (`ImportLens` doc).
+pub const LENS_STATUS_TYPE_PUBLISHED: &str = "PUBLISHED";
 
 /// The AWS Well-Architected Framework lens's pillars, in the order the framework
 /// presents them: the id each is named by on the wire, the name the framework publishes
@@ -954,16 +1046,104 @@ pub const MAX_CUSTOM_LENSES_PER_ACCOUNT_REGION: usize = 1_000;
 /// this ceiling answers, so this is what bounds a lens record's version map.
 pub const MAX_LENS_VERSIONS_PER_LENS: usize = 100;
 
-/// The most `ImportLens` idempotency tokens the store remembers.
+/// The most idempotency tokens ONE ledger remembers.
 ///
-/// A `ClientRequestToken` is caller-chosen, and an import that UPDATES an existing lens
-/// adds no lens, so the lens ceiling above does not bound this ledger: it carries its
-/// own, evicting the token remembered longest ago
-/// ([`ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState::remember_import_token`]),
-/// the convention this workspace uses for an idempotency ledger. A caller whose token
-/// has been forgotten gets a fresh import rather than a replay, which is also what AWS's
-/// own "the result of the original request is returned" window does once it closes.
-pub const MAX_REMEMBERED_IMPORT_TOKENS: usize = 10_000;
+/// A `ClientRequestToken` is caller-chosen and a replay of one creates no resource, so no
+/// resource quota bounds a ledger keyed by it: each carries its own ceiling, evicting the
+/// token remembered longest ago ([`TokenLedger::remember`]), the convention this workspace
+/// uses for an idempotency ledger. A caller whose token has been forgotten gets a fresh
+/// create rather than a replay, which is also what AWS's own "the result of the original
+/// request is returned" window does once it closes. It sits far above any realistic client
+/// workflow.
+pub const MAX_REMEMBERED_REQUEST_TOKENS: usize = 10_000;
+
+/// A BOUNDED ledger of what each `ClientRequestToken` a caller supplied resolved to.
+///
+/// Every idempotent operation of this service needs one, and caller input keys it — so it
+/// is this type, not a bare `HashMap`, that the state struct holds: there is no `insert`
+/// to reach, only [`Self::remember`], which holds the ledger at
+/// [`MAX_REMEMBERED_REQUEST_TOKENS`] by forgetting the token remembered longest ago. That
+/// is what keeps a stream of fresh tokens from growing the process without bound.
+#[derive(Debug)]
+pub struct TokenLedger<Token> {
+    remembered: HashMap<String, Token>,
+    /// The remembered tokens in insertion order, so the ledger evicts the one remembered
+    /// longest ago first. A `HashMap` alone cannot say which that is.
+    order: VecDeque<String>,
+}
+
+/// An empty ledger, whatever the token type: `#[derive(Default)]` would demand
+/// `Token: Default`, which a token record has no reason to be.
+impl<Token> Default for TokenLedger<Token> {
+    fn default() -> Self {
+        Self {
+            remembered: HashMap::new(),
+            order: VecDeque::new(),
+        }
+    }
+}
+
+impl<Token> TokenLedger<Token> {
+    /// What `client_request_token` resolved to, if the ledger still remembers it.
+    pub fn get(&self, client_request_token: &str) -> Option<&Token> {
+        self.remembered.get(client_request_token)
+    }
+
+    /// Whether the ledger still remembers `client_request_token`.
+    pub fn contains_key(&self, client_request_token: &str) -> bool {
+        self.remembered.contains_key(client_request_token)
+    }
+
+    /// How many tokens the ledger holds — at most [`MAX_REMEMBERED_REQUEST_TOKENS`].
+    pub fn len(&self) -> usize {
+        self.remembered.len()
+    }
+
+    /// Whether the ledger remembers nothing.
+    pub fn is_empty(&self) -> bool {
+        self.remembered.is_empty()
+    }
+
+    /// Remember what `client_request_token` resolved to, within
+    /// [`MAX_REMEMBERED_REQUEST_TOKENS`].
+    ///
+    /// Re-recording a token already held replaces its entry and evicts nothing: it names
+    /// the same request. A token the ledger has forgotten is not a replay, so the next
+    /// request carrying it acts afresh — which is what bounds a stream of fresh tokens,
+    /// caller-chosen as they are.
+    pub fn remember(&mut self, client_request_token: String, token: Token) {
+        if let Some(known) = self.remembered.get_mut(&client_request_token) {
+            *known = token;
+            return;
+        }
+        while self.order.len() >= MAX_REMEMBERED_REQUEST_TOKENS {
+            match self.order.pop_front() {
+                Some(oldest) => {
+                    self.remembered.remove(&oldest);
+                }
+                None => break,
+            }
+        }
+        self.remembered
+            .insert(client_request_token.clone(), token);
+        self.order.push_back(client_request_token);
+    }
+
+    /// Forget every token whose record `keep` rejects — what a delete of the resource a
+    /// token resolved to does to that token.
+    pub fn retain<Keep: Fn(&Token) -> bool>(&mut self, keep: Keep) {
+        self.remembered.retain(|_, token| keep(token));
+        self.order
+            .retain(|client_request_token| self.remembered.contains_key(client_request_token));
+    }
+
+    /// Forget ONE token: what a token resolving to a resource that is no longer stored
+    /// does to it, so the next request carrying it acts afresh.
+    pub fn forget(&mut self, client_request_token: &str) {
+        self.remembered.remove(client_request_token);
+        self.order.retain(|known| known != client_request_token);
+    }
+}
 
 /// The most tags one resource carries: `TagMap` is `@length(min: 1, max: 50)` wherever a
 /// request supplies one (`smithy_query(query="operation", operation="ImportLens")`), so
@@ -1494,6 +1674,150 @@ impl LensRecord {
             self.draft = self.pending.take().map(|pending| pending.content);
         }
     }
+
+    /// The version this lens's CURRENT content is published as, as `(LensVersion, that
+    /// published version)`, or `None` while that content is a draft nothing has been
+    /// published from — which is the lens being in DRAFT.
+    ///
+    /// "The new or updated lens will have a status of DRAFT. The lens cannot be applied to
+    /// workloads or shared with other Amazon Web Services accounts until it's published
+    /// with CreateLensVersion" (`ImportLens` doc), so the question is whether a version was
+    /// published FROM the content the lens now carries: a version qualifies when it was
+    /// published no earlier than that content was imported (publishing copies the content
+    /// current at that instant) AND carries that same document. The instant is what makes
+    /// an UPDATE a draft again even when the document it imports is byte-identical to a
+    /// published one; the document is what keeps a version published before a still
+    /// in-flight import landed from being read as this content's. An import still in flight
+    /// counts as the draft, since `ImportLens` has already accepted the document and
+    /// answered the lens's ARN.
+    pub fn published_version(&self, now: SystemTime) -> Option<(&str, &PublishedLensVersion)> {
+        let content = self.summary_content(now)?;
+        self.versions
+            .iter()
+            .filter(|(_, published)| {
+                published.published_at >= content.imported_at
+                    && published.content.json == content.json
+            })
+            // `LensVersion` is caller-chosen, so the version NAMES do not order the
+            // versions; when more than one carries this content, the one published last is
+            // the version the lens reports.
+            .max_by(|(left_name, left), (right_name, right)| {
+                left.published_at
+                    .cmp(&right.published_at)
+                    .then_with(|| left_name.cmp(right_name))
+            })
+            .map(|(version, published)| (version.as_str(), published))
+    }
+
+    /// The `LensType` of this lens, as the account that reaches it sees it.
+    ///
+    /// A custom lens is `CUSTOM_SELF` to the account that owns it and `CUSTOM_SHARED` to
+    /// an account it was shared with (`smithy_query(query="shape", shape="LensType")`);
+    /// every request this emulator serves is the one emulator account's
+    /// ([`::engine::emulator_account_id`]), so the owner recorded on the lens is what
+    /// tells the two apart.
+    pub fn lens_type(&self) -> &'static str {
+        if self.owner == ::engine::emulator_account_id() {
+            LENS_TYPE_CUSTOM_SELF
+        } else {
+            LENS_TYPE_CUSTOM_SHARED
+        }
+    }
+
+    /// The content a SUMMARY of this lens describes it by: its settled content when it has
+    /// any, and otherwise the document of the import still in flight.
+    ///
+    /// A lens EXISTS from the moment `ImportLens` accepts it — the operation answers its
+    /// ARN there and then — so a listing of the account's lenses reports it immediately,
+    /// named by the document that import carried. The import's instant gates the lens's
+    /// readable CONTENT ([`Self::settled_content`], what `ExportLens` returns), so an
+    /// UPDATE to a lens that already has content keeps describing the landed content until
+    /// the new import lands.
+    pub fn summary_content(&self, now: SystemTime) -> Option<&LensContent> {
+        self.settled_content(now)
+            .or(self.pending.as_ref().map(|pending| &pending.content))
+    }
+
+    /// The `LensSummary` projection of this lens as of `now`, or `None` for a record that
+    /// carries no content at all — which no import leaves behind.
+    pub fn to_summary(&self, now: SystemTime) -> Option<LensSummary> {
+        let content = self.summary_content(now)?;
+        // The version the content this summary describes is published as, if it is: both
+        // `LensVersion` and `LensStatus` speak about THAT content, so they cannot disagree.
+        let published = self.published_version(now);
+        Some(LensSummary {
+            lens_arn: Some(self.lens_arn.clone()),
+            // "For custom lenses, this is the lens ARN" (`LensAlias` doc), so the alias a
+            // summary reports is the ARN every other operation resolves the lens by.
+            lens_alias: Some(self.lens_arn.clone()),
+            lens_name: Some(content.definition.name.clone()),
+            lens_type: Some(self.lens_type().to_string()),
+            description: content.definition.description.clone(),
+            created_at: Some(::aws_smithy_types::DateTime::from(self.created_at)),
+            // "when the lens was last updated": the instant the content it is described
+            // by was imported.
+            updated_at: Some(::aws_smithy_types::DateTime::from(content.imported_at)),
+            // "The version of the lens": the version its content was published as, and
+            // [`LENS_VERSION_DRAFT`] while that content is a draft.
+            lens_version: Some(
+                published
+                    .map_or(LENS_VERSION_DRAFT, |(version, _)| version)
+                    .to_string(),
+            ),
+            owner: Some(self.owner.clone()),
+            lens_status: Some(
+                published
+                    .map_or(LENS_STATUS_DRAFT, |_| LENS_STATUS_PUBLISHED)
+                    .to_string(),
+            ),
+        })
+    }
+}
+
+/// The `LensSummary` of the one AWS-official lens this emulator ships, in the Region the
+/// request was signed for.
+///
+/// The framework lens's content is this emulator's own ([`FRAMEWORK_LENS_QUESTIONS`]), so
+/// its summary comes from that catalog rather than from the lens store, which holds only
+/// the custom lenses `ImportLens` imported. Its name and version come from
+/// [`lens_metadata`], the one projection of the shipped lens's metadata — so this summary
+/// cannot name the lens differently from the lens reviews that report the same lens — and
+/// only the description and the publication instant are facts the catalog adds here.
+///
+/// An official lens ARN names no owner account — "the lens ARN, such as
+/// `arn:aws:wellarchitected:us-east-1::lens/serverless`" (`LensAlias` doc), the same
+/// distinction [`is_aws_official_lens`] reads — so the summary reports no `Owner` either:
+/// AWS publishes the lens rather than an account owning it, and `Owner` is modelled an
+/// `AwsAccountId` (`^[0-9]{12}$`), which no placeholder would satisfy honestly.
+pub fn framework_lens_summary(region: &str) -> LensSummary {
+    let published_at = ::aws_smithy_types::DateTime::from(framework_lens_published_at());
+    let metadata = lens_metadata(FRAMEWORK_LENS_ALIAS);
+    LensSummary {
+        lens_arn: Some(official_lens_arn(region, FRAMEWORK_LENS_ALIAS)),
+        lens_alias: Some(FRAMEWORK_LENS_ALIAS.to_string()),
+        lens_name: metadata.map(|metadata| metadata.name.to_string()),
+        lens_type: Some(LENS_TYPE_AWS_OFFICIAL.to_string()),
+        description: Some(FRAMEWORK_LENS_DESCRIPTION.to_string()),
+        created_at: Some(published_at),
+        updated_at: Some(published_at),
+        lens_version: metadata.map(|metadata| metadata.version.to_string()),
+        owner: None,
+        // AWS's own lens is published content: its content IS the version it is published
+        // at.
+        lens_status: Some(LENS_STATUS_PUBLISHED.to_string()),
+    }
+}
+
+/// The stable enumeration key of one lens in the lens catalog `ListLenses` pages over:
+/// the AWS-official lenses this emulator ships first, then the custom lenses, each group
+/// in its own identifier order.
+///
+/// The model publishes no order for `LensSummaries`, so this is the emulator's own. What
+/// it has to be is TOTAL and stable — the `NextToken` carries the key of the last lens a
+/// page served, so a key that moved or repeated would serve a lens twice or skip it.
+pub fn lens_catalog_key(lens_type: &str, identifier: &str) -> String {
+    let rank = u8::from(lens_type != LENS_TYPE_AWS_OFFICIAL);
+    format!("{rank}/{identifier}")
 }
 
 /// What an `ImportLens` idempotency token resolves to: the lens the original request
@@ -2039,45 +2363,45 @@ pub struct ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
     /// `BTreeMap` because the next number is one past the highest already handed out.
     pub milestones: HashMap<String, BTreeMap<i32, MilestoneRecord>>,
     /// `CreateMilestone`'s `ClientRequestToken` -> what the original request recorded.
-    pub create_milestone_tokens: HashMap<String, CreateMilestoneToken>,
+    /// Caller input keys it, so it is a BOUNDED [`TokenLedger`].
+    pub create_milestone_tokens: TokenLedger<CreateMilestoneToken>,
     /// Every share recorded against a workload, keyed by `WorkloadId` then by `ShareId`.
     /// A `BTreeMap` because `ShareId` order is the stable order `ListWorkloadShares`
     /// pages over.
     pub workload_shares: HashMap<String, BTreeMap<String, WorkloadShareRecord>>,
     /// `CreateWorkloadShare`'s `ClientRequestToken` -> what the original request created.
-    pub create_workload_share_tokens: HashMap<String, CreateWorkloadShareToken>,
+    /// Caller input keys it, so it is a BOUNDED [`TokenLedger`].
+    pub create_workload_share_tokens: TokenLedger<CreateWorkloadShareToken>,
     /// Normalized workload name -> `WorkloadId`. Backs the documented "name must be
     /// unique within an account within a Region; spaces and capitalization are
     /// ignored" rule.
     pub workload_name_index: HashMap<String, String>,
     /// `CreateWorkload`'s `ClientRequestToken` -> what the original request created.
-    pub create_workload_tokens: HashMap<String, CreateWorkloadToken>,
+    /// Caller input keys it, so it is a BOUNDED [`TokenLedger`].
+    pub create_workload_tokens: TokenLedger<CreateWorkloadToken>,
     /// Every stored review template, keyed by its `TemplateArn` — the only identifier
     /// the modelled operations take for one (`GetReviewTemplate`,
     /// `UpdateReviewTemplate` and `DeleteReviewTemplate` all bind `TemplateArn` as the
     /// URI label).
     pub review_templates: HashMap<String, ReviewTemplateRecord>,
     /// `CreateReviewTemplate`'s `ClientRequestToken` -> what the original request
-    /// created.
-    pub create_review_template_tokens: HashMap<String, CreateReviewTemplateToken>,
+    /// created. Caller input keys it, so it is a BOUNDED [`TokenLedger`].
+    pub create_review_template_tokens: TokenLedger<CreateReviewTemplateToken>,
     /// Every stored custom lens, keyed by its 32-lowercase-hex lens id — the resource
     /// part of its ARN, which is how a `LensAlias` names it.
     pub lenses: HashMap<String, LensRecord>,
     /// `ImportLens`'s `ClientRequestToken` -> what the original request imported.
-    /// Caller input keys this map, so it is BOUNDED: write it through
-    /// [`Self::remember_import_token`], which holds it at
-    /// [`MAX_REMEMBERED_IMPORT_TOKENS`].
-    pub import_lens_tokens: HashMap<String, ImportLensToken>,
-    /// The remembered import tokens in insertion order, so the ledger above evicts the
-    /// one remembered longest ago first. A `HashMap` alone cannot say which that is.
-    import_lens_token_order: VecDeque<String>,
+    /// Caller input keys it, so it is a BOUNDED [`TokenLedger`]: write it through
+    /// [`TokenLedger::remember`], which holds it at
+    /// [`MAX_REMEMBERED_REQUEST_TOKENS`].
+    pub import_lens_tokens: TokenLedger<ImportLensToken>,
     /// `CreateLensVersion`'s `ClientRequestToken` -> the version the original request
-    /// published. Caller input keys this map, but only a request that PUBLISHED a
-    /// version records one, so it is bounded by the lens and version quotas
-    /// ([`MAX_CUSTOM_LENSES_PER_ACCOUNT_REGION`] times
-    /// [`MAX_LENS_VERSIONS_PER_LENS`]) rather than by the stream of tokens — the same
-    /// reasoning as the create-token ledgers of the workload operations above.
-    pub create_lens_version_tokens: HashMap<String, CreateLensVersionToken>,
+    /// published. Caller input keys it, so it is a BOUNDED [`TokenLedger`] like every
+    /// other ledger here — the lens and version quotas
+    /// ([`MAX_CUSTOM_LENSES_PER_ACCOUNT_REGION`] times [`MAX_LENS_VERSIONS_PER_LENS`])
+    /// bound what a publish can RECORD, not the stream of tokens a caller can spend
+    /// against it.
+    pub create_lens_version_tokens: TokenLedger<CreateLensVersionToken>,
     /// Monotonic input to [`Self::next_hex_id`]; never returned to a caller.
     id_counter: u64,
 }
@@ -2213,31 +2537,6 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
         alias_names_lens(alias, record).then_some(record)
     }
 
-    /// Remember what `client_request_token` imported, within
-    /// [`MAX_REMEMBERED_IMPORT_TOKENS`].
-    ///
-    /// Re-recording a token already held replaces its entry and evicts nothing: it names
-    /// the same import. A token the ledger has forgotten is not a replay, so the next
-    /// request carrying it imports afresh — which is what bounds a stream of fresh
-    /// tokens, caller-chosen as they are.
-    pub fn remember_import_token(&mut self, client_request_token: String, token: ImportLensToken) {
-        if let Some(known) = self.import_lens_tokens.get_mut(&client_request_token) {
-            *known = token;
-            return;
-        }
-        while self.import_lens_token_order.len() >= MAX_REMEMBERED_IMPORT_TOKENS {
-            match self.import_lens_token_order.pop_front() {
-                Some(oldest) => {
-                    self.import_lens_tokens.remove(&oldest);
-                }
-                None => break,
-            }
-        }
-        self.import_lens_tokens
-            .insert(client_request_token.clone(), token);
-        self.import_lens_token_order.push_back(client_request_token);
-    }
-
     /// The service's stable list order: workload name, then id to break ties between
     /// two names that normalize apart but sort equal.
     pub fn workload_order(&self) -> Vec<(String, String)> {
@@ -2257,16 +2556,16 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
         self.workload_name_index
             .remove(&normalize_unique_name(&record.workload_name));
         self.create_workload_tokens
-            .retain(|_, token| token.workload_id != workload_id);
+            .retain(|token| token.workload_id != workload_id);
         // A milestone belongs to its workload, so the whole set goes with it — and with
         // it every create token that resolved to one of them.
         self.milestones.remove(workload_id);
         self.create_milestone_tokens
-            .retain(|_, token| token.workload_id != workload_id);
+            .retain(|token| token.workload_id != workload_id);
         // A share shares THIS workload, so it cannot outlive it either.
         self.workload_shares.remove(workload_id);
         self.create_workload_share_tokens
-            .retain(|_, token| token.workload_id != workload_id);
+            .retain(|token| token.workload_id != workload_id);
         Some(record)
     }
 
@@ -2522,6 +2821,19 @@ pub fn self_share_exception() -> crate::ops::types::ValidationException {
         SHARED_WITH_MEMBER.to_string(),
         SELF_SHARE_MESSAGE.to_string(),
     )])
+}
+
+/// Encode a `ListLenses` cursor: the [`lens_catalog_key`] of the last lens the page
+/// served, in the same opaque scheme as [`encode_next_token`]. Its own key, so a cursor
+/// issued by another paginated operation is not a cursor here.
+pub fn encode_lens_next_token(key: &str) -> String {
+    encode_cursor(&::serde_json::json!({ "c": key }))
+}
+
+/// The [`lens_catalog_key`] a `ListLenses` `NextToken` points just past, or `None` when
+/// the token is not one this service issued.
+pub fn decode_lens_next_token(token: &str) -> Option<String> {
+    Some(decode_cursor(token)?.get("c")?.as_str()?.to_string())
 }
 
 /// Encode a cursor over a lens's questions: the `QuestionId` last served, in the same

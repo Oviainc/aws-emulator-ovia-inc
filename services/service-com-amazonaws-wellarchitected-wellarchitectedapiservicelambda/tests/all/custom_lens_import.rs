@@ -832,11 +832,12 @@ async fn an_import_is_idempotent_per_client_request_token() {
 }
 
 /// Rule 4, continued: the maps a CALLER keys stay bounded. The idempotency ledger holds
-/// at most `MAX_REMEMBERED_IMPORT_TOKENS` tokens, evicting the one remembered longest
+/// at most `MAX_REMEMBERED_REQUEST_TOKENS` tokens, evicting the one remembered longest
 /// ago — so a stream of fresh tokens cannot grow it — and a lens holds at most
 /// `MAX_TAGS_PER_RESOURCE` tags, so repeated imports over one lens cannot grow its tag
 /// map. A token the ledger has forgotten is not a replay: the next request carrying it
-/// imports afresh.
+/// imports afresh. (`super::token_ledgers` pins the same ceiling over every other
+/// caller-keyed ledger; this row is the import one, end to end over HTTP.)
 #[tokio::test]
 async fn the_token_ledger_and_a_lens_tag_map_stay_within_their_ceilings() {
     let client = Client::new();
@@ -855,8 +856,8 @@ async fn the_token_ledger_and_a_lens_tag_map_stay_within_their_ceilings() {
             .rsplit_once("lens/")
             .map(|(_, id)| id.to_string())
             .unwrap_or_default();
-        for index in 0..state::MAX_REMEMBERED_IMPORT_TOKENS + overflow {
-            store.remember_import_token(
+        for index in 0..state::MAX_REMEMBERED_REQUEST_TOKENS + overflow {
+            store.import_lens_tokens.remember(
                 format!("bulk-token-{index:08}"),
                 state::ImportLensToken {
                     lens_id: lens_id.clone(),
@@ -866,15 +867,15 @@ async fn the_token_ledger_and_a_lens_tag_map_stay_within_their_ceilings() {
         }
         assert_eq!(
             store.import_lens_tokens.len(),
-            state::MAX_REMEMBERED_IMPORT_TOKENS,
+            state::MAX_REMEMBERED_REQUEST_TOKENS,
             "case \"ledger\": the ledger must hold exactly {} tokens after {} inserts, got {}",
-            state::MAX_REMEMBERED_IMPORT_TOKENS,
-            state::MAX_REMEMBERED_IMPORT_TOKENS + overflow,
+            state::MAX_REMEMBERED_REQUEST_TOKENS,
+            state::MAX_REMEMBERED_REQUEST_TOKENS + overflow,
             store.import_lens_tokens.len()
         );
         let newest = format!(
             "bulk-token-{:08}",
-            state::MAX_REMEMBERED_IMPORT_TOKENS + overflow - 1
+            state::MAX_REMEMBERED_REQUEST_TOKENS + overflow - 1
         );
         assert!(
             store.import_lens_tokens.contains_key(&newest),

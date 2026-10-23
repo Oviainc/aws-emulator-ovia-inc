@@ -277,7 +277,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         );
         let (lens_id, lens_arn) = (record.lens_id.clone(), record.lens_arn.clone());
 
-        store.create_lens_version_tokens.insert(
+        // Written through the ledger's bounded `remember`, which holds the remembered
+        // tokens at `MAX_REMEMBERED_REQUEST_TOKENS` by forgetting the oldest: the token is
+        // caller-chosen, so the ledger cannot be allowed to grow with the stream of them.
+        store.create_lens_version_tokens.remember(
             input.client_request_token,
             crate::state::CreateLensVersionToken {
                 lens_id,
