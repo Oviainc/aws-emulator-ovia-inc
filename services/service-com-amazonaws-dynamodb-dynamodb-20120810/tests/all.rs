@@ -46,6 +46,9 @@ mod table_description_shape;
 #[path = "all/table_items.rs"]
 mod table_items;
 
+#[path = "all/table_scan.rs"]
+mod table_scan;
+
 #[path = "all/validation_message_wording.rs"]
 mod validation_message_wording;
 

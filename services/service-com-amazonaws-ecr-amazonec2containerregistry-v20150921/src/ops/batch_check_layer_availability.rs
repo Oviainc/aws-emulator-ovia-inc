@@ -1,9 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchCheckLayerAvailability
-//! Reports, for each digest a request names, the repository's own record of that blob:
+//! Reports, for each digest a request names, the repository's own record of that layer:
 //! a `Layer` marked `AVAILABLE` with the size and media type the repository stores for
-//! it, or a `LayerFailure` when no blob of the repository answers to that digest.
+//! it when the repository holds the layer, and a `Layer` marked `UNAVAILABLE` when it
+//! does not. A `LayerFailure` is reserved for a request entry that addresses no layer at
+//! all — `Layer$layerDigest` is a `LayerDigest`, which the model constrains to
+//! `<algorithm>:<hex>`, so a requested string outside that form cannot be reported as a
+//! layer.
 //!
 //! This is a REPORTING operation — "checks the availability of one or more image layers
 //! in a repository" — so it writes nothing: the same call made twice answers the same,
@@ -193,17 +197,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // references in the request", so every reference gets exactly one answer, in
         // the order it was asked about — a digest named twice is answered twice.
         for digest in &input.layer_digests {
+            // A request carries `BatchedOperationLayerDigest`, which the model gives no
+            // pattern, while a reported `Layer` carries `LayerDigest`, constrained to
+            // `^[a-zA-Z0-9-_+.]+:[a-fA-F0-9]+$`. An entry outside that form therefore
+            // addresses no layer and can only be answered as a failure: one that carries
+            // nothing at all is a missing digest, and one that carries something that is
+            // not a content digest is an invalid one.
             if !crate::state::is_layer_digest(digest) {
+                let (failure_code, failure_reason) = if digest.is_empty() {
+                    (
+                        crate::state::MISSING_LAYER_DIGEST_FAILURE,
+                        "this entry carries no layer digest".to_string(),
+                    )
+                } else {
+                    (
+                        crate::state::INVALID_LAYER_DIGEST_FAILURE,
+                        format!("'{digest}' is not a layer digest of the form <algorithm>:<hex>"),
+                    )
+                };
                 failures.push(LayerFailure {
                     layer_digest: Some(digest.clone()),
-                    failure_code: Some(crate::state::INVALID_LAYER_DIGEST_FAILURE.to_string()),
-                    failure_reason: Some(format!(
-                        "'{digest}' is not a layer digest of the form <algorithm>:<hex>"
-                    )),
+                    failure_code: Some(failure_code.to_string()),
+                    failure_reason: Some(failure_reason),
                 });
                 continue;
             }
             match held.get(digest) {
+                // Everything reported comes from the stored blob, including the digest
+                // it is filed under.
                 Some(blob) => layers.push(Layer {
                     layer_digest: Some(blob.digest.clone()),
                     layer_availability: Some(
@@ -212,14 +233,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     layer_size: blob.size,
                     media_type: blob.media_type.clone(),
                 }),
-                None => failures.push(LayerFailure {
+                // A content digest this repository holds no layer for is reported as
+                // that layer being unavailable here — "the availability status of the
+                // image layer" — which is what a push client reads to decide it must
+                // upload the blob. The repository knows no size or media type for a
+                // layer it does not hold, so neither is reported.
+                None => layers.push(Layer {
                     layer_digest: Some(digest.clone()),
-                    failure_code: Some(crate::state::MISSING_LAYER_DIGEST_FAILURE.to_string()),
-                    failure_reason: Some(format!(
-                        "The layer with digest '{digest}' does not exist within the \
-                         repository with name '{}' in the registry with id '{}'",
-                        repo.name, repo.registry_id
-                    )),
+                    layer_availability: Some(
+                        crate::state::UNAVAILABLE_LAYER_AVAILABILITY.to_string(),
+                    ),
+                    layer_size: None,
+                    media_type: None,
                 }),
             }
         }

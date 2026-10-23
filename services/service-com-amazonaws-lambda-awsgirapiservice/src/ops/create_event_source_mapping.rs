@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateEventSourceMapping
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateEventSourceMapping`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateEventSourceMapping::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Persists ONE event source mapping in [`crate::state`]: the event source the request
+//! names, the function it resolves, and every polling, filtering, destination and
+//! logging setting the request stated, under a UUID and an ARN minted once. The mapping
+//! answers `Creating`, and the move to the state its `Enabled` setting asks for is owed
+//! by the CLOCK (see [`crate::state::EventSourceMappingRecord::materialize`]).
 //!
 //! ## Shape of an operation
 //!
@@ -343,18 +339,254 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateEventSourceMapping` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateEventSourceMappingErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateEventSourceMapping"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateEventSourceMappingErrorModeled::ServiceException(
+                ServiceException {
+                    r#type: None,
+                    message: Some("Lambda state is not reachable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // "Creates a mapping between an event source and an Lambda Event Function." The
+        // event source is either a resource ARN (`EventSourceArn`) or a self-managed
+        // Apache Kafka cluster (`SelfManagedEventSource`: "The self-managed Apache Kafka
+        // cluster for your event source"), so one mapping names exactly one of them.
+        let event_source_arn = input.event_source_arn.clone().filter(|arn| !arn.is_empty());
+        let self_managed = input.self_managed_event_source.is_some();
+        if event_source_arn.is_some() == self_managed {
+            return Err(invalid_parameter(
+                "Exactly one of EventSourceArn and SelfManagedEventSource must be specified \
+                 to name the event source of the mapping"
+                    .to_string(),
+            ));
+        }
+
+        // Which service the event source belongs to is what the per-source defaults and
+        // requirements the model documents are keyed on.
+        let vendor = event_source_arn
+            .as_deref()
+            .and_then(crate::state::event_source_vendor)
+            .map(str::to_string);
+        let vendor = vendor.as_deref();
+        let shard_source = crate::state::is_shard_source(vendor);
+        let stream_source = crate::state::is_stream_source(vendor, self_managed);
+
+        let now = ::std::time::SystemTime::now();
+
+        // `StartingPosition` is "Required for Amazon Kinesis and Amazon DynamoDB Stream
+        // event sources".
+        if shard_source && input.starting_position.is_none() {
+            return Err(invalid_parameter(format!(
+                "StartingPosition must be specified for the event source '{}'",
+                event_source_arn.as_deref().unwrap_or_default()
+            )));
+        }
+        if input.starting_position.as_deref() == Some(crate::state::STARTING_POSITION_AT_TIMESTAMP)
+        {
+            // "AT_TIMESTAMP is supported only for Amazon Kinesis streams, Amazon
+            // DocumentDB, Amazon MSK, and self-managed Apache Kafka."
+            if !crate::state::supports_at_timestamp(vendor, self_managed) {
+                return Err(invalid_parameter(format!(
+                    "StartingPosition AT_TIMESTAMP is not supported for the event source '{}'",
+                    event_source_arn.as_deref().unwrap_or_default()
+                )));
+            }
+            // "With StartingPosition set to AT_TIMESTAMP, the time from which to start
+            // reading. StartingPositionTimestamp cannot be in the future."
+            let Some(timestamp) = input.starting_position_timestamp else {
+                return Err(invalid_parameter(
+                    "StartingPositionTimestamp must be specified when StartingPosition is \
+                     AT_TIMESTAMP"
+                        .to_string(),
+                ));
+            };
+            if timestamp.as_secs_f64() > ::aws_smithy_types::DateTime::from(now).as_secs_f64() {
+                return Err(invalid_parameter(
+                    "StartingPositionTimestamp cannot be in the future".to_string(),
+                ));
+            }
+        }
+
+        let region = crate::state::request_region(ctx);
+        let mut store = state.lock();
+
+        // The mapping invokes one function, so the `FunctionName` it names — in any of
+        // its documented forms, qualified or not — has to resolve to a record this store
+        // holds.
+        let (function, version) = match crate::state::resolve_function(
+            &mut store,
+            &input.function_name,
+            None,
+            &region,
+            now,
+        ) {
+            Ok(resolved) => resolved,
+            Err(crate::state::ResolveFailure::Malformed(message)) => {
+                return Err(invalid_parameter(message))
+            }
+            Err(crate::state::ResolveFailure::NotFound(message)) => {
+                return Err(
+                    CreateEventSourceMappingErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            r#type: None,
+                            message: Some(message),
+                        },
+                    )
+                    .into(),
+                )
+            }
+        };
+        let function_name = function.config.name.clone();
+        let function_arn = function.versioned_arn(&version);
+        // `$LATEST` is the function itself rather than one version or alias of it, so a
+        // reference to it is an unqualified reference.
+        let function_qualifier = (version != crate::state::VERSION_LATEST).then(|| version.clone());
+
+        // "The resource already exists, or another operation is in progress": one event
+        // source is polled for one function by at most one mapping, so a second create of
+        // the same pair conflicts rather than standing up a second poller over the same
+        // records.
+        if let Some(existing) = store.event_source_mappings.values().find(|mapping| {
+            mapping.event_source_arn.is_some()
+                && mapping.event_source_arn == event_source_arn
+                && mapping.function_arn == function_arn
+        }) {
+            return Err(
+                CreateEventSourceMappingErrorModeled::ResourceConflictException(
+                    ResourceConflictException {
+                        r#type: None,
+                        message: Some(format!(
+                            "An event source mapping of this event source and function already \
+                             exists. Update or delete the existing mapping with UUID {}",
+                            existing.uuid
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The store is in memory, so the slice refuses past its own ceiling rather than
+        // growing without bound. The model declares no limit error for this operation, so
+        // the refusal is the modelled throttle — what Lambda answers a request that
+        // exceeds an account quota with.
+        if store.event_source_mappings.len() >= crate::state::MAX_EVENT_SOURCE_MAPPINGS {
+            return Err(
+                CreateEventSourceMappingErrorModeled::TooManyRequestsException(
+                    TooManyRequestsException {
+                        retry_after_seconds: None,
+                        r#type: None,
+                        reason: None,
+                        message: Some(format!(
+                            "This account already holds the maximum of {} event source mappings.",
+                            crate::state::MAX_EVENT_SOURCE_MAPPINGS
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let uuid = crate::state::mint_event_source_mapping_uuid();
+        let record = crate::state::EventSourceMappingRecord {
+            arn: crate::state::event_source_mapping_arn(&region, &uuid),
+            uuid: uuid.clone(),
+            function_arn,
+            function_name,
+            function_qualifier,
+            event_source_arn,
+            // "When true, the event source mapping is active. When false, Lambda pauses
+            // polling and invocation. Default: True"
+            enabled: input.enabled.unwrap_or(true),
+            batch_size: input
+                .batch_size
+                .unwrap_or_else(|| crate::state::default_batch_size(vendor)),
+            maximum_batching_window_in_seconds: input
+                .maximum_batching_window_in_seconds
+                .or_else(|| crate::state::default_batching_window_seconds(vendor)),
+            // "(Kinesis and DynamoDB Streams only) The number of batches to process
+            // concurrently from each shard. The default value is 1."
+            parallelization_factor: input
+                .parallelization_factor
+                .or_else(|| shard_source.then_some(crate::state::DEFAULT_PARALLELIZATION_FACTOR)),
+            starting_position: input.starting_position.clone(),
+            starting_position_timestamp: input.starting_position_timestamp,
+            filter_criteria: input.filter_criteria.clone(),
+            kms_key_arn: input.kms_key_arn.clone(),
+            metrics_config: input.metrics_config.clone(),
+            logging_config: input.logging_config.clone(),
+            scaling_config: input.scaling_config.clone(),
+            destination_config: input.destination_config.clone(),
+            // The error-handling options the model scopes to stream sources, each with
+            // the default its own member documents: "The default value is -1, which sets
+            // the maximum age to infinite", the same for the retries, and "If the
+            // function returns an error, split the batch in two and retry. The default
+            // value is false."
+            maximum_record_age_in_seconds: input
+                .maximum_record_age_in_seconds
+                .or_else(|| stream_source.then_some(crate::state::INFINITE_RETENTION)),
+            maximum_retry_attempts: input
+                .maximum_retry_attempts
+                .or_else(|| stream_source.then_some(crate::state::INFINITE_RETENTION)),
+            bisect_batch_on_function_error: input
+                .bisect_batch_on_function_error
+                .or_else(|| stream_source.then_some(false)),
+            tumbling_window_in_seconds: input.tumbling_window_in_seconds,
+            topics: input.topics.clone(),
+            queues: input.queues.clone(),
+            source_access_configurations: input.source_access_configurations.clone(),
+            self_managed_event_source: input.self_managed_event_source.clone(),
+            function_response_types: input.function_response_types.clone(),
+            amazon_managed_kafka_event_source_config: input
+                .amazon_managed_kafka_event_source_config
+                .clone(),
+            self_managed_kafka_event_source_config: input
+                .self_managed_kafka_event_source_config
+                .clone(),
+            document_db_event_source_config: input.document_db_event_source_config.clone(),
+            provisioned_poller_config: input.provisioned_poller_config.clone(),
+            tags: input
+                .tags
+                .clone()
+                .unwrap_or_default()
+                .into_iter()
+                .collect(),
+            // This call only starts the mapping's poller up — the operation answers 202
+            // Accepted — so the mapping is `Creating`, and the move to `Enabled` or
+            // `Disabled` is owed by the clock at `settled_due`. Nothing waits for it.
+            state: crate::state::EVENT_SOURCE_MAPPING_STATE_CREATING.to_string(),
+            state_transition_reason: crate::state::EVENT_SOURCE_MAPPING_USER_INITIATED.to_string(),
+            settled_due: now + crate::state::EVENT_SOURCE_MAPPING_SETTLE_DELAY,
+            last_modified: now,
+        };
+        store.event_source_mappings.insert(uuid.clone(), record);
+
+        // Answered by reading the record back out of the store, so
+        // `GetEventSourceMapping` reports exactly what this call persisted.
+        let Some(stored) = store.event_source_mappings.get(&uuid) else {
+            return Err(CreateEventSourceMappingErrorModeled::ServiceException(
+                ServiceException {
+                    r#type: None,
+                    message: Some(
+                        "The created event source mapping could not be read back".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+        Ok(stored.reported())
     }
+}
+
+/// The modelled 400 this operation refuses a request it cannot satisfy with.
+fn invalid_parameter(message: String) -> CreateEventSourceMappingError {
+    CreateEventSourceMappingErrorModeled::InvalidParameterValueException(
+        InvalidParameterValueException {
+            r#type: None,
+            message: Some(message),
+        },
+    )
+    .into()
 }

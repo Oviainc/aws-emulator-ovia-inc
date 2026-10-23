@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeByoipCidrs
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeByoipCidrs`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeByoipCidrs::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the BYOIP address ranges this account has brought to AWS out of
+//! [`crate::state`], one `MaxResults`-sized page at a time. A reporting operation — the
+//! only write it makes is to materialise the state transitions the clock has ALREADY made
+//! due (a range's `pending-provision` -> `provisioned`, and the end of a release
+//! `DeprovisionByoipCidr` started), which were owed at the same instant whether or not
+//! anybody called.
 //!
 //! ## Shape of an operation
 //!
@@ -139,18 +137,92 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeByoipCidrs` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeByoipCidrsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeByoipCidrs"))
+        use crate::state;
+
+        // `ctx` carries request metadata only; this operation reads none of it. The store
+        // is reached through the engine held on `self`.
+        let _ = ctx;
+
+        // "Checks whether you have the required permissions for the action, without
+        // actually making the request, and provides an error response. If you have the
+        // required permissions, the error response is DryRunOperation"
+        // (`DescribeByoipCidrsRequest$DryRun`). Every caller of this emulator is permitted,
+        // so a dry run reports that outcome and reads nothing.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        // "The token for the next page of results" (`DescribeByoipCidrsRequest$NextToken`)
+        // — anything else is refused rather than read as a cursor, and it is refused before
+        // any other member is looked at, so whether a bogus token is caught never depends
+        // on the rest of the request.
+        let start_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(
+                state::decode_page_token(token).ok_or_else(state::invalid_pagination_token)?,
+            ),
+        };
+
+        // "The maximum number of results to return with a single call"
+        // (`DescribeByoipCidrsRequest$MaxResults`). The member is `@required` with
+        // `range 1..100`, and the boundary validator has already refused a request that
+        // leaves it out or carries a value outside that range, so what reaches here is a
+        // page size the model admits; it is still held to the published bounds rather than
+        // trusted, and a value that cannot even convert — a negative one, which only a
+        // boundary that stopped enforcing the range could pass — gets the SMALLEST page
+        // rather than the largest, so no conversion can widen a page.
+        let limit = usize::try_from(input.max_results)
+            .unwrap_or(1)
+            .clamp(1, MAX_RESULTS_CEILING);
+
+        let service_state = state::require_service_state(&*self.engine)?;
+        let mut store = service_state.lock();
+        // The clock-owed transitions this read is allowed to apply — the same call the VPC
+        // and instance describes make: a range `ProvisionByoipCidr` answered as
+        // `pending-provision` is provisioned once its due instant has passed, and a
+        // `pending-deprovision` range's release has ended, whether or not anybody called,
+        // so applying them here changes nothing a later caller would not have seen anyway.
+        store.materialize_due_transitions();
+
+        // "Information about your address ranges" (`DescribeByoipCidrsResult$ByoipCidrs`):
+        // every range the account has brought, in the store's own key order — the
+        // lexicographic order of the canonical CIDR, which is both the stable paging order
+        // and what the cursor names a position in, so a token naming the range the next
+        // page starts at always advances. One range beyond the page is taken, because that
+        // is what says whether another page follows.
+        let wanted = limit.saturating_add(1);
+        let page: Vec<(&String, &state::ByoipCidrRecord)> = match start_at {
+            None => store.byoip_cidrs.iter().take(wanted).collect(),
+            // The cursor is a position in the store's own key order, so the page starts
+            // at it in one ordered-map lookup rather than by scanning what precedes it.
+            Some(cursor) => store
+                .byoip_cidrs
+                .range(cursor..)
+                .take(wanted)
+                .collect(),
+        };
+
+        // "This value is null when there are no more results to return"
+        // (`DescribeByoipCidrsResult$NextToken`): a token only when a range follows this
+        // page.
+        let next_token = page
+            .get(limit)
+            .map(|(cidr, _)| state::encode_page_token(cidr));
+
+        Ok(DescribeByoipCidrsOutput {
+            byoip_cidrs: Some(
+                page.iter()
+                    .take(limit)
+                    .map(|(_, record)| record.byoip_cidr.clone())
+                    .collect(),
+            ),
+            next_token,
+        })
     }
 }
+
+/// The largest page `MaxResults` can ask for: the ceiling the model publishes
+/// (`DescribeByoipCidrsMaxResults`, `range 1..100`), which is also the most EC2 returns in
+/// one page. The member is `@required`, so this is a bound on what a request may ask for
+/// rather than a default for a request that asks for nothing.
+const MAX_RESULTS_CEILING: usize = 100;

@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/appconfig_workflow.rs"]
 mod appconfig_workflow;
+#[path = "all/control_plane_fidelity.rs"]
+mod control_plane_fidelity;
 #[path = "all/create_deployment_strategy.rs"]
 mod create_deployment_strategy;
 #[path = "all/environment_update.rs"]
