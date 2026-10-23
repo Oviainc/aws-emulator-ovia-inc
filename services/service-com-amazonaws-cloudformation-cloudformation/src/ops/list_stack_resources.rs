@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListStackResources
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListStackResources`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListStackResources::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: lists the resources the named stack has deployed, one
+//! `StackResourceSummary` per resource, in logical-id order and one bounded page at a
+//! time. Every member is the SAME stored record `DescribeStackResources` and
+//! `DescribeStackResource` report — one physical id per logical resource, as the
+//! deployment assigned it — so a resource's identity does not depend on which read a
+//! client uses. A `StackName` no live stack carries is refused with `ValidationError`; a
+//! deleted stack's resources are still listed by its stack id ("For deleted stacks,
+//! ListStackResources returns resource information for up to 90 days after the stack has
+//! been deleted").
 //!
 //! ## Shape of an operation
 //!
@@ -72,6 +72,44 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::{DeployedResource, StoredStack};
+
+/// One deployed resource as the modelled `StackResourceSummary` shape.
+///
+/// The summary is the same stored record `DescribeStackResources` reports as a
+/// `StackResource`, through the shape this list carries: the logical id and type the
+/// template declared, the physical id the deployment assigned the resource, the
+/// resource-level status the operation that last touched it left it in with the instant it
+/// reached that status (`LastUpdatedTimestamp`: "Time the status was updated"), and the
+/// resource's own drift result.
+///
+/// The members this emulator has nothing to report for are absent rather than invented,
+/// for exactly the reasons `ops::describe_stack_resources`'s `stack_resource_view` states
+/// once and in full — `ResourceStatusReason` and `ModuleInfo` — so the two readers of one
+/// record cannot drift apart.
+fn stack_resource_summary(deployed: &DeployedResource) -> StackResourceSummary {
+    StackResourceSummary {
+        logical_resource_id: deployed.resource.logical_id.clone(),
+        physical_resource_id: Some(deployed.resource.physical_resource_id.clone()),
+        resource_type: deployed.resource.resource_type.clone(),
+        last_updated_timestamp: crate::state::timestamp(deployed.status_timestamp),
+        resource_status: deployed.status.clone(),
+        resource_status_reason: None,
+        drift_information: crate::state::resource_drift_information_summary(deployed),
+        module_info: None,
+    }
+}
+
+/// The stack's resources in the order this list reports them: by LOGICAL ID, the same
+/// order `DescribeStackResources` answers in and for the same reason — a template reader
+/// yields a template's resources in the parsed object's iteration order, so the stored
+/// order is not one a client can depend on, while this one is the same on every build and
+/// makes the page boundaries stable.
+fn ordered_resources(stack: &StoredStack) -> Vec<&DeployedResource> {
+    let mut ordered: Vec<&DeployedResource> = stack.resources.iter().collect();
+    ordered.sort_by(|left, right| left.resource.logical_id.cmp(&right.resource.logical_id));
+    ordered
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -140,18 +178,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListStackResources` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListStackResourcesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListStackResources"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Not the shared in-memory engine: there is no stack store to read, so this
+            // answers 501 rather than an empty, truthful-looking list.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "ListStackResources",
+            ));
+        };
+
+        let mut store = state.lock();
+        // Reporting operation: the only write is materialising a status transition the
+        // clock had already made due, which was owed whether or not anyone called — and
+        // it is that transition which installs the resources a deployment produced.
+        store.settle(::std::time::SystemTime::now());
+
+        // "Running stacks: You can specify either the stack's name or its unique stack ID.
+        // Deleted stacks: You must specify the unique stack ID." A name that resolves to
+        // nothing is a `ValidationError`, as it is on every other read of a stack.
+        let stack = store.resolve(&input.stack_name).ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation_error(crate::state::stack_does_not_exist(
+                &input.stack_name,
+            ))
+        })?;
+
+        let summaries: Vec<StackResourceSummary> = ordered_resources(stack)
+            .into_iter()
+            .map(stack_resource_summary)
+            .collect();
+        // `@paginated(inputToken: NextToken, outputToken: NextToken, items:
+        // StackResourceSummaries)`: one response carries one bounded page, and the token
+        // resumes just past it.
+        let (stack_resource_summaries, next_token) = crate::state::paginate(
+            crate::state::PageOf::StackResourceSummaries,
+            summaries,
+            input.next_token.as_deref(),
+        )
+        .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+
+        Ok(ListStackResourcesOutput {
+            stack_resource_summaries: Some(stack_resource_summaries),
+            next_token,
+        })
     }
 }

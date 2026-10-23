@@ -1126,9 +1126,12 @@ pub fn inverted_window(
 }
 
 /// The listing a page token belongs to, so a token minted by one list is not
-/// accepted by another. `ListMonitors` is the only paginated list implemented
-/// today; `ListScopes` adds its own tag when it is.
+/// accepted by another: a `ListMonitors` token carries this tag.
 pub const MONITORS_PAGE_TAG: &str = "monitors/1:";
+
+/// The same, for `ListScopes`: its own tag, so a token one listing issued never
+/// resumes the other's walk.
+pub const SCOPES_PAGE_TAG: &str = "scopes/1:";
 
 /// The `nextToken` that resumes the `tag` listing at `key`.
 ///

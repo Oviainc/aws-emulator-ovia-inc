@@ -17,6 +17,13 @@
 //! * filter evaluation ([`ComAmazonawsHealthAwshealth20160804State::matching_events`],
 //!   [`ComAmazonawsHealthAwshealth20160804State::matching_entities`]); and
 //! * pagination ([`paginate`]) with server-issued, verifiable opaque tokens.
+//!
+//! It also owns the one ACCOUNT-level fact the whole API is gated on: the Amazon Web
+//! Services Support plan the account holds
+//! ([`ComAmazonawsHealthAwshealth20160804State::support_plan`]), which
+//! [`ComAmazonawsHealthAwshealth20160804State::health_api_allowed`] answers against
+//! the plans this service's documentation names ([`QUALIFYING_SUPPORT_PLANS`]) and
+//! `crate::service` reads ahead of every operation.
 
 use std::collections::BTreeMap;
 
@@ -30,6 +37,77 @@ use crate::ops::types::{
 /// (en) is the default and the only supported value at this time", so any other
 /// value is answered with `UnsupportedLocale`.
 pub const SUPPORTED_LOCALE: &str = "en";
+
+/// The Amazon Web Services Support plans an account may call the Health API with.
+///
+/// Source: this service's own documentation
+/// (`smithy_query(query="doc",shape="AWSHealth_20160804")`): "You must have a
+/// Business, Enterprise On-Ramp, or Enterprise Support plan from Amazon Web Services
+/// Support to use the Health API. If you call the Health API from an Amazon Web
+/// Services account that doesn't have a Business, Enterprise On-Ramp, or Enterprise
+/// Support plan, you receive a `SubscriptionRequiredException` error." Every plan the
+/// sentence does not name — Basic and Developer — does NOT qualify.
+///
+/// The last two entries are the CURRENT names of those same premium tiers, which the
+/// Support API's documentation spells out while the Health documentation above still
+/// names only the legacy ones: "You must have an Amazon Web Services Business
+/// Support+, Amazon Web Services Enterprise Support, or Amazon Web Services Unified
+/// Operations plan … or, if you haven't transitioned to one of these plans, … a
+/// Business, Enterprise On-Ramp, or Enterprise Support plan." An account is on one
+/// plan, so a tier that entitles it to the Support API must not be refused here under
+/// its new name alone (see the peer gate's `state::QUALIFYING_SUPPORT_PLANS` in
+/// `service-com-amazonaws-support-awssupport-20130415`).
+///
+/// Entries are in the form [`normalize_support_plan`] produces, so a caller compares
+/// through [`plan_qualifies`] rather than against this list directly.
+pub const QUALIFYING_SUPPORT_PLANS: &[&str] = &[
+    "business",
+    "businesssupport",
+    "enterprise",
+    "enterpriseonramp",
+    "enterpriseonrampsupport",
+    "enterprisesupport",
+    "businesssupport+",
+    "unifiedoperations",
+];
+
+/// The environment variable an operator uses to tell this emulated account which
+/// Amazon Web Services Support plan it holds. The Health API models no operation that
+/// changes one (`smithy_query(query="digest")` lists none — a plan is bought outside
+/// this API), so the only way one reaches the emulator is out of band, and it is read
+/// once when this service's store is created (`SUPPORT_PLAN="enterprise"`).
+///
+/// The name is the one the Support API's own gate reads, so ONE operator input decides
+/// the account's plan for every API that is gated on it rather than each service
+/// inventing its own switch.
+///
+/// UNSET means the account holds no Support plan, which is what a new Amazon Web
+/// Services account has — and then every operation of this API answers the documented
+/// `SubscriptionRequiredException` refusal rather than running.
+pub const SUPPORT_PLAN_ENV: &str = "SUPPORT_PLAN";
+
+/// A plan name reduced to what identifies the plan: ASCII lowercase, with every
+/// separator and the vendor prefix the documentation writes dropped. So
+/// `"Enterprise On-Ramp"`, `"enterprise_on_ramp"` and `"AWS Enterprise On-Ramp"` are
+/// one plan, while `"Business Support+"` keeps the `+` that names it.
+pub fn normalize_support_plan(plan: &str) -> String {
+    let squeezed: String = plan
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '+')
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+    let identifying = squeezed
+        .strip_prefix("amazonwebservices")
+        .or_else(|| squeezed.strip_prefix("aws"))
+        .unwrap_or(squeezed.as_str());
+    identifying.to_string()
+}
+
+/// Whether `plan` names one of the [`QUALIFYING_SUPPORT_PLANS`], i.e. whether an
+/// account holding it may call this API at all.
+pub fn plan_qualifies(plan: &str) -> bool {
+    QUALIFYING_SUPPORT_PLANS.contains(&normalize_support_plan(plan).as_str())
+}
 
 /// Whether `locale` is one this service can answer in.
 ///
@@ -161,6 +239,16 @@ impl HealthEntity {
 pub struct ComAmazonawsHealthAwshealth20160804State {
     pub events: BTreeMap<String, HealthEvent>,
     pub entities: BTreeMap<String, Vec<HealthEntity>>,
+    /// The Amazon Web Services Support plan this account holds, as
+    /// [`SUPPORT_PLAN_ENV`] named it at start-up — `None` when nothing named one,
+    /// which is an account with no Support plan.
+    ///
+    /// It is a field rather than a constant because the subscription is a property of
+    /// the ACCOUNT and nothing in THIS API changes it. One field serves every caller
+    /// because this emulator serves ONE account — the canonical emulator account every
+    /// stored record is built from. [`Self::health_api_allowed`] is what the dispatch
+    /// path reads.
+    pub support_plan: Option<String>,
 }
 
 impl Default for ComAmazonawsHealthAwshealth20160804State {
@@ -168,6 +256,7 @@ impl Default for ComAmazonawsHealthAwshealth20160804State {
         let mut state = Self {
             events: BTreeMap::new(),
             entities: BTreeMap::new(),
+            support_plan: ::std::env::var(SUPPORT_PLAN_ENV).ok(),
         };
         state.seed();
         state
@@ -184,6 +273,15 @@ type SeedEntityRow<'a> = (usize, &'a str, &'a str, &'a [(&'a str, &'a str)]);
 const SEED_EPOCH: i64 = 1_767_225_600;
 
 impl ComAmazonawsHealthAwshealth20160804State {
+    /// Whether this account may call the Health API at all: whether the plan it holds
+    /// is one of the [`QUALIFYING_SUPPORT_PLANS`]. False for an account with no plan
+    /// recorded, and false for one holding a plan that does not qualify (Basic,
+    /// Developer) — the account-level gate that fronts every operation of this
+    /// service, which `crate::service` reads before any handler runs.
+    pub fn health_api_allowed(&self) -> bool {
+        self.support_plan.as_deref().is_some_and(plan_qualifies)
+    }
+
     /// Install the deterministic event catalog.
     ///
     /// Health publishes events; a client cannot create one. Four events across two

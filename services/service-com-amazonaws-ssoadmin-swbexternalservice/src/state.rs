@@ -23,7 +23,7 @@ use crate::ops::types::{
     AccessControlAttribute, AccountAssignment, AccountAssignmentOperationStatus,
     ApplicationProvider, DisplayData, EncryptionConfigurationDetails,
     InstanceAccessControlAttributeConfiguration, InstanceMetadata, PermissionSet, RegionMetadata,
-    Tag, TrustedTokenIssuerConfiguration,
+    ResourceServerConfig, ResourceServerScopeDetails, Tag, TrustedTokenIssuerConfiguration,
 };
 
 /// The identity-store instance every `InstanceArn`-taking operation resolves against.
@@ -1045,29 +1045,138 @@ impl ComAmazonawsSsoadminSwbexternalserviceState {
 /// [`BuiltInApplicationProvider::to_shape`], so the two agree member for member.
 #[derive(Debug, Clone, Copy)]
 pub struct BuiltInApplicationProvider {
-    /// The last segment of the provider's ARN, e.g. `custom`.
+    /// Everything after `applicationProvider/` in the provider's ARN: the service slug of
+    /// an AWS managed provider (`glue`), or `catalog/<Name>` for one of the pre-integrated
+    /// applications of the IAM Identity Center application catalog. The model's
+    /// `ApplicationProviderArn` pattern admits `/` inside the id
+    /// (`applicationProvider/[a-zA-Z0-9-/]+`), which is what makes the `catalog/` form an
+    /// id and not a second path segment.
     pub id: &'static str,
     /// `ApplicationProvider$FederationProtocol` — "The protocol that the application
     /// provider uses to perform federation", one of the model's `FederationProtocol`
     /// enum values `SAML | OAUTH`.
     pub federation_protocol: &'static str,
     /// `DisplayData$DisplayName` — "The name of the application provider that appears in
-    /// the portal".
+    /// the portal" (`Name`, 1..100).
     pub display_name: &'static str,
+    /// `DisplayData$Description` — "The description of the application provider that
+    /// appears in the portal" (1..128) — when the provider carries wording of its own.
+    /// `None` for a catalog application, whose portal description is DERIVED from its
+    /// display name (see [`BuiltInApplicationProvider::description`]).
+    pub description: Option<&'static str>,
+    /// The access scopes `ApplicationProvider$ResourceServerConfig` reports for this
+    /// provider — empty for a provider that exposes no resource server, which is then
+    /// reported with no `ResourceServerConfig` at all rather than an empty one.
+    pub scopes: &'static [BuiltInAccessScope],
 }
 
+/// One IAM Identity Center access scope of a provider's resource server, as
+/// `ResourceServerConfig$Scopes` reports it: the scope NAME is the map key and the two
+/// `ResourceServerScopeDetails` members (both 1..128) its value.
+#[derive(Debug, Clone, Copy)]
+pub struct BuiltInAccessScope {
+    /// The map key: `<service>:<scope>`, the form IAM Identity Center publishes an access
+    /// scope under (the recorded catalog carries `glue:read_write` on the Glue provider).
+    pub name: &'static str,
+    /// `ResourceServerScopeDetails$DetailedTitle` — "The title of an access scope for a
+    /// resource server".
+    pub detailed_title: &'static str,
+    /// `ResourceServerScopeDetails$LongDescription` — "The description of an access scope
+    /// for a resource server".
+    pub long_description: &'static str,
+}
+
+impl BuiltInAccessScope {
+    /// This scope as the modeled `ResourceServerScopeDetails` shape.
+    pub fn to_shape(&self) -> ResourceServerScopeDetails {
+        ResourceServerScopeDetails {
+            detailed_title: Some(self.detailed_title.to_string()),
+            long_description: Some(self.long_description.to_string()),
+        }
+    }
+}
+
+/// The host every provider icon of the IAM Identity Center portal is served from.
+///
+/// SOURCE: recorded behavior — a catalog provider's `DisplayData$IconUrl` is an `https`
+/// URL under this static asset host (`https://<host>/app-<digest>/icons/default.png`).
+/// The digest in a recorded URL is environment detail, so it is DERIVED from the provider
+/// id here (see [`BuiltInApplicationProvider::icon_url`]) rather than copied.
+const PROVIDER_ICON_HOST: &str = "static.global.sso.amazonaws.com";
+
+/// The portal description of a catalog application: its display name followed by this
+/// word.
+///
+/// SOURCE: recorded behavior — the catalog entry whose `DisplayName` is `Statuspage`
+/// carries `Description` `Statuspage Application`, i.e. a pre-integrated application's
+/// portal description is its name as an application. An AWS managed provider carries
+/// wording of its own instead ([`BuiltInApplicationProvider::description`]).
+const CATALOG_DESCRIPTION_SUFFIX: &str = "Application";
+
+/// `FederationProtocol::SAML`, the protocol of a pre-integrated catalog application: the
+/// IAM Identity Center application catalog is a catalog of SAML 2.0 applications.
+const FEDERATION_SAML: &str = "SAML";
+
+/// `FederationProtocol::OAUTH`, the protocol of an AWS managed application provider that
+/// receives a propagated identity (trusted identity propagation).
+const FEDERATION_OAUTH: &str = "OAUTH";
+
 impl BuiltInApplicationProvider {
-    /// This provider's `DisplayData`.
-    ///
-    /// Only the display NAME is reported: `IconUrl` and `Description` are optional, and
-    /// an invented icon URL or blurb would be a value no AWS rule produces, so they are
-    /// absent rather than made up.
+    /// This provider's `DisplayData`, complete: every member the shape declares is
+    /// reported, because every provider of the catalog HAS all three — the display name
+    /// and the description from the record, the icon URL derived from the provider id.
     pub fn display_data(&self) -> DisplayData {
         DisplayData {
             display_name: Some(self.display_name.to_string()),
-            icon_url: None,
-            description: None,
+            icon_url: Some(self.icon_url()),
+            description: Some(self.description()),
         }
+    }
+
+    /// This provider's `DisplayData$Description`: its own wording when it carries one,
+    /// else the catalog rule — the display name as an application
+    /// ([`CATALOG_DESCRIPTION_SUFFIX`]). Truncated on a character boundary to the
+    /// modelled `Description` ceiling of 128, so no entry can put an over-long value on
+    /// the wire.
+    pub fn description(&self) -> String {
+        let description = match self.description {
+            Some(description) => description.to_string(),
+            None => format!("{} {CATALOG_DESCRIPTION_SUFFIX}", self.display_name),
+        };
+        truncate_chars(&description, 128)
+    }
+
+    /// This provider's `DisplayData$IconUrl`:
+    /// `https://<icon host>/app-<digest>/icons/default.png`.
+    ///
+    /// The digest is the first 16 hex digits of the SHA-256 of the provider ID — derived
+    /// from the provider, so it is stable across reads and distinct per provider, and
+    /// carries nothing from the request. The URL satisfies the modelled `IconUrl`
+    /// (`^(http|https)://.*$`, 1..768).
+    pub fn icon_url(&self) -> String {
+        use ::sha2::Digest as _;
+        let digest = ::hex::encode(::sha2::Sha256::digest(self.id.as_bytes()));
+        format!(
+            "https://{PROVIDER_ICON_HOST}/app-{}/icons/default.png",
+            &digest[..16]
+        )
+    }
+
+    /// This provider's `ResourceServerConfig`, or `None` when it exposes no resource
+    /// server: an empty `Scopes` map would claim a resource server with no scopes, which
+    /// is a different statement from having none.
+    pub fn resource_server_config(&self) -> Option<ResourceServerConfig> {
+        if self.scopes.is_empty() {
+            return None;
+        }
+        Some(ResourceServerConfig {
+            scopes: Some(
+                self.scopes
+                    .iter()
+                    .map(|scope| (scope.name.to_string(), scope.to_shape()))
+                    .collect(),
+            ),
+        })
     }
 
     /// This provider's ARN in the `aws` partition.
@@ -1085,16 +1194,54 @@ impl BuiltInApplicationProvider {
     /// This provider as the modeled `ApplicationProvider` shape — the member-for-member
     /// projection `ListApplicationProviders` reports, holding exactly what
     /// `DescribeApplicationProvider` reports for the same entry.
-    ///
-    /// `ResourceServerConfig` is absent: nothing holds a resource server for these
-    /// providers, and an invented scope map would be a value no AWS rule produces.
     pub fn to_shape(&self) -> ApplicationProvider {
         ApplicationProvider {
             application_provider_arn: self.arn(),
             federation_protocol: Some(self.federation_protocol.to_string()),
             display_data: Some(self.display_data()),
-            resource_server_config: None,
+            resource_server_config: self.resource_server_config(),
         }
+    }
+}
+
+/// `text`, cut to at most `max_chars` characters on a character boundary.
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    text.chars().take(max_chars).collect()
+}
+
+/// One AWS MANAGED application provider: an Amazon Web Services application that receives
+/// a propagated identity from IAM Identity Center, so it federates over OAuth 2.0 and
+/// carries its own portal description and — where it publishes one — its resource server's
+/// access scopes.
+const fn aws_managed_provider(
+    id: &'static str,
+    display_name: &'static str,
+    description: &'static str,
+    scopes: &'static [BuiltInAccessScope],
+) -> BuiltInApplicationProvider {
+    BuiltInApplicationProvider {
+        id,
+        federation_protocol: FEDERATION_OAUTH,
+        display_name,
+        description: Some(description),
+        scopes,
+    }
+}
+
+/// One PRE-INTEGRATED application of the IAM Identity Center application catalog: a SAML
+/// 2.0 application whose ARN id is `catalog/<Name>`, whose portal description follows the
+/// catalog rule ([`CATALOG_DESCRIPTION_SUFFIX`]) and which exposes no resource server of
+/// its own (the application is the relying party, not an API an identity propagates into).
+const fn catalog_application(
+    id: &'static str,
+    display_name: &'static str,
+) -> BuiltInApplicationProvider {
+    BuiltInApplicationProvider {
+        id,
+        federation_protocol: FEDERATION_SAML,
+        display_name,
+        description: None,
+        scopes: &[],
     }
 }
 
@@ -1103,44 +1250,213 @@ impl BuiltInApplicationProvider {
 /// SOURCE: the Smithy model carries no list of them — `ApplicationProviderArn` is only a
 /// pattern (`smithy_query(query="shape",shape="ApplicationProviderArn")`) and
 /// `ApplicationProvider` only the per-entry structure — so the catalog is written out
-/// here: `custom`, the provider for a customer-managed SAML 2.0 application, and the AWS
-/// services IAM Identity Center ships an OAuth provider for so they can receive a
-/// propagated identity (trusted identity propagation). The `id` of each is the lowercase
-/// service slug its `arn:aws:sso::aws:applicationProvider/<id>` ARN carries.
+/// here, from the two sets IAM Identity Center publishes:
+///
+/// * the AWS MANAGED providers ([`aws_managed_provider`]) — `custom`, the provider a
+///   customer managed application connects through, and the Amazon Web Services
+///   applications that receive a propagated identity (trusted identity propagation),
+///   whose id is the service slug its `arn:aws:sso::aws:applicationProvider/<slug>` ARN
+///   carries, and whose published access scopes are reported as its resource server;
+/// * the APPLICATION CATALOG ([`catalog_application`]) — the pre-integrated SAML 2.0
+///   applications of the IAM Identity Center application catalog, whose id is
+///   `catalog/<Name>` (recorded behavior: the recorded catalog holds entries such as
+///   `catalog/Statuspage`, `catalog/DuoNetworkGateway` and `catalog/DruvaInSync`
+///   alongside service providers such as `glue`).
+///
+/// The MEMBERSHIP is behavior, not model: AWS adds applications to its catalog over time,
+/// so this is the catalog the emulator publishes rather than a list any rule derives.
+/// What IS a rule — every entry carries a complete `DisplayData`, an id of one of the two
+/// forms above, and a `ResourceServerConfig` exactly when it publishes access scopes —
+/// holds for every entry here, and for any entry added to it.
 ///
 /// A provider exists in every partition the ARN pattern admits, so the lookup
 /// ([`built_in_application_provider`]) matches on the id and not on the whole ARN.
 pub const BUILT_IN_APPLICATION_PROVIDERS: &[BuiltInApplicationProvider] = &[
-    BuiltInApplicationProvider {
-        id: "custom",
-        federation_protocol: "SAML",
-        display_name: "Custom SAML 2.0 application",
-    },
-    BuiltInApplicationProvider {
-        id: "athena",
-        federation_protocol: "OAUTH",
-        display_name: "Amazon Athena",
-    },
-    BuiltInApplicationProvider {
-        id: "emr",
-        federation_protocol: "OAUTH",
-        display_name: "Amazon EMR",
-    },
-    BuiltInApplicationProvider {
-        id: "lakeformation",
-        federation_protocol: "OAUTH",
-        display_name: "AWS Lake Formation",
-    },
-    BuiltInApplicationProvider {
-        id: "quicksight",
-        federation_protocol: "OAUTH",
-        display_name: "Amazon QuickSight",
-    },
-    BuiltInApplicationProvider {
-        id: "redshift",
-        federation_protocol: "OAUTH",
-        display_name: "Amazon Redshift",
-    },
+    // ---- AWS managed providers -------------------------------------------------------
+    aws_managed_provider(
+        "custom",
+        "SSO Custom Application Provider",
+        "SSO Custom Application Provider",
+        &[],
+    ),
+    aws_managed_provider(
+        "athena",
+        "Amazon Athena",
+        "Interactive query service for data in Amazon S3",
+        &[],
+    ),
+    aws_managed_provider(
+        "emr",
+        "Amazon EMR",
+        "Managed cluster platform for big data frameworks",
+        &[],
+    ),
+    aws_managed_provider(
+        "emr-serverless",
+        "Amazon EMR Serverless",
+        "Serverless runtime for big data frameworks",
+        &[],
+    ),
+    aws_managed_provider(
+        "glue",
+        "AWS Glue",
+        "Serverless data integration service",
+        &[BuiltInAccessScope {
+            name: "glue:read_write",
+            detailed_title: "Read and write AWS Glue data",
+            long_description: "Grants access to read and write data through AWS Glue",
+        }],
+    ),
+    aws_managed_provider(
+        "lakeformation",
+        "AWS Lake Formation",
+        "Centrally governed permissions for a data lake",
+        &[BuiltInAccessScope {
+            name: "lakeformation:query",
+            detailed_title: "Query Lake Formation data",
+            long_description: "Grants access to query data governed by AWS Lake Formation",
+        }],
+    ),
+    aws_managed_provider(
+        "quicksight",
+        "Amazon QuickSight",
+        "Cloud-scale business intelligence service",
+        &[],
+    ),
+    aws_managed_provider(
+        "redshift",
+        "Amazon Redshift",
+        "Cloud data warehouse",
+        &[BuiltInAccessScope {
+            name: "redshift:connect",
+            detailed_title: "Connect to Amazon Redshift",
+            long_description: "Grants access to connect to an Amazon Redshift database",
+        }],
+    ),
+    aws_managed_provider(
+        "s3",
+        "Amazon S3",
+        "Object storage for any amount of data",
+        &[BuiltInAccessScope {
+            name: "s3:access_grants:read_write",
+            detailed_title: "Read and write Amazon S3 data",
+            long_description: "Grants access to read and write Amazon S3 data through access grants",
+        }],
+    ),
+    // ---- The application catalog -----------------------------------------------------
+    catalog_application("catalog/15Five", "15Five"),
+    catalog_application("catalog/AbsorbLMS", "Absorb LMS"),
+    catalog_application("catalog/Adobe", "Adobe"),
+    catalog_application("catalog/Airtable", "Airtable"),
+    catalog_application("catalog/Asana", "Asana"),
+    catalog_application("catalog/AtlassianCloud", "Atlassian Cloud"),
+    catalog_application("catalog/BambooHR", "BambooHR"),
+    catalog_application("catalog/BetterCloud", "BetterCloud"),
+    catalog_application("catalog/Bonusly", "Bonusly"),
+    catalog_application("catalog/Box", "Box"),
+    catalog_application("catalog/Bugsnag", "Bugsnag"),
+    catalog_application("catalog/Calendly", "Calendly"),
+    catalog_application("catalog/Canva", "Canva"),
+    catalog_application("catalog/CircleCI", "CircleCI"),
+    catalog_application("catalog/CiscoWebex", "Cisco Webex"),
+    catalog_application("catalog/CitrixShareFile", "Citrix ShareFile"),
+    catalog_application("catalog/ClickUp", "ClickUp"),
+    catalog_application("catalog/Cloudflare", "Cloudflare"),
+    catalog_application("catalog/Confluence", "Confluence"),
+    catalog_application("catalog/Coupa", "Coupa"),
+    catalog_application("catalog/CultureAmp", "Culture Amp"),
+    catalog_application("catalog/Databricks", "Databricks"),
+    catalog_application("catalog/Datadog", "Datadog"),
+    catalog_application("catalog/Deputy", "Deputy"),
+    catalog_application("catalog/Dialpad", "Dialpad"),
+    catalog_application("catalog/Docebo", "Docebo"),
+    catalog_application("catalog/DocuSign", "DocuSign"),
+    catalog_application("catalog/Domo", "Domo"),
+    catalog_application("catalog/DropboxBusiness", "Dropbox Business"),
+    catalog_application("catalog/DruvaInSync", "Druva inSync"),
+    catalog_application("catalog/DuoNetworkGateway", "Duo Network Gateway"),
+    catalog_application("catalog/DynamicSignal", "Dynamic Signal"),
+    catalog_application("catalog/Egnyte", "Egnyte"),
+    catalog_application("catalog/Envoy", "Envoy"),
+    catalog_application("catalog/Expensify", "Expensify"),
+    catalog_application("catalog/Figma", "Figma"),
+    catalog_application("catalog/Freshdesk", "Freshdesk"),
+    catalog_application("catalog/Freshservice", "Freshservice"),
+    catalog_application("catalog/GitHub", "GitHub"),
+    catalog_application("catalog/GitLab", "GitLab"),
+    catalog_application("catalog/Gong", "Gong"),
+    catalog_application("catalog/GoogleWorkspace", "Google Workspace"),
+    catalog_application("catalog/Greenhouse", "Greenhouse"),
+    catalog_application("catalog/Gusto", "Gusto"),
+    catalog_application("catalog/Hootsuite", "Hootsuite"),
+    catalog_application("catalog/HubSpot", "HubSpot"),
+    catalog_application("catalog/Igloo", "Igloo"),
+    catalog_application("catalog/Intercom", "Intercom"),
+    catalog_application("catalog/JFrogArtifactory", "JFrog Artifactory"),
+    catalog_application("catalog/JamfPro", "Jamf Pro"),
+    catalog_application("catalog/JiraCloud", "Jira Cloud"),
+    catalog_application("catalog/KeeperSecurity", "Keeper Security"),
+    catalog_application("catalog/Kisi", "Kisi"),
+    catalog_application("catalog/Lattice", "Lattice"),
+    catalog_application("catalog/LaunchDarkly", "LaunchDarkly"),
+    catalog_application("catalog/Lessonly", "Lessonly"),
+    catalog_application("catalog/Lever", "Lever"),
+    catalog_application("catalog/Looker", "Looker"),
+    catalog_application("catalog/Lucid", "Lucid"),
+    catalog_application("catalog/Mailchimp", "Mailchimp"),
+    catalog_application("catalog/Marketo", "Marketo"),
+    catalog_application("catalog/Microsoft365", "Microsoft 365"),
+    catalog_application("catalog/Miro", "Miro"),
+    catalog_application("catalog/Mode", "Mode"),
+    catalog_application("catalog/MongoDBAtlas", "MongoDB Atlas"),
+    catalog_application("catalog/Namely", "Namely"),
+    catalog_application("catalog/Netskope", "Netskope"),
+    catalog_application("catalog/NewRelic", "New Relic"),
+    catalog_application("catalog/Notion", "Notion"),
+    catalog_application("catalog/OneTrust", "OneTrust"),
+    catalog_application("catalog/Opsgenie", "Opsgenie"),
+    catalog_application("catalog/PagerDuty", "PagerDuty"),
+    catalog_application("catalog/Pingboard", "Pingboard"),
+    catalog_application("catalog/Pipedrive", "Pipedrive"),
+    catalog_application("catalog/Pluralsight", "Pluralsight"),
+    catalog_application("catalog/Postman", "Postman"),
+    catalog_application("catalog/Proxyclick", "Proxyclick"),
+    catalog_application("catalog/Qualtrics", "Qualtrics"),
+    catalog_application("catalog/Rollbar", "Rollbar"),
+    catalog_application("catalog/SAPConcur", "SAP Concur"),
+    catalog_application("catalog/Salesforce", "Salesforce"),
+    catalog_application("catalog/Sentry", "Sentry"),
+    catalog_application("catalog/ServiceNow", "ServiceNow"),
+    catalog_application("catalog/Showpad", "Showpad"),
+    catalog_application("catalog/Slack", "Slack"),
+    catalog_application("catalog/Smartsheet", "Smartsheet"),
+    catalog_application("catalog/Snowflake", "Snowflake"),
+    catalog_application("catalog/Splunk", "Splunk"),
+    catalog_application("catalog/Statuspage", "Statuspage"),
+    catalog_application("catalog/SugarCRM", "SugarCRM"),
+    catalog_application("catalog/SumoLogic", "Sumo Logic"),
+    catalog_application("catalog/Tableau", "Tableau"),
+    catalog_application("catalog/Talkdesk", "Talkdesk"),
+    catalog_application("catalog/Tanium", "Tanium"),
+    catalog_application("catalog/Teamwork", "Teamwork"),
+    catalog_application("catalog/TerraformCloud", "Terraform Cloud"),
+    catalog_application("catalog/Tipalti", "Tipalti"),
+    catalog_application("catalog/Torii", "Torii"),
+    catalog_application("catalog/Trello", "Trello"),
+    catalog_application("catalog/Twilio", "Twilio"),
+    catalog_application("catalog/Udemy", "Udemy"),
+    catalog_application("catalog/UserTesting", "UserTesting"),
+    catalog_application("catalog/Vanta", "Vanta"),
+    catalog_application("catalog/Vonage", "Vonage"),
+    catalog_application("catalog/Webflow", "Webflow"),
+    catalog_application("catalog/Workday", "Workday"),
+    catalog_application("catalog/WorkplaceByFacebook", "Workplace by Facebook"),
+    catalog_application("catalog/Wrike", "Wrike"),
+    catalog_application("catalog/Xero", "Xero"),
+    catalog_application("catalog/Zendesk", "Zendesk"),
+    catalog_application("catalog/Zoho", "Zoho"),
+    catalog_application("catalog/Zoom", "Zoom"),
+    catalog_application("catalog/Zscaler", "Zscaler"),
 ];
 
 /// The provider id an `ApplicationProviderArn` names, or `None` when the ARN is not an

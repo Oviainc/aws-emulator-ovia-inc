@@ -6,20 +6,22 @@
 //! `ApplicationProviderArn` pins the owner segment to the literal `aws`
 //! (`^arn:aws(-[a-z]{1,5}){0,3}:sso::aws:applicationProvider/[a-zA-Z0-9-/]+$`) and no
 //! operation of this service creates one — so `ListApplicationProviders` REPORTS the
-//! service's own catalogue ([`state::BUILT_IN_APPLICATION_PROVIDERS`], the same records
+//! service's application-provider catalogue
+//! ([`state::BUILT_IN_APPLICATION_PROVIDERS`], the same records
 //! `DescribeApplicationProvider` answers from): every entry exactly once, in
-//! `ApplicationProviderArn` order, each member projected from the catalogue record,
-//! paged by ANY `MaxResults` the model's `range(1..100)` admits with a `NextToken` that
-//! resumes strictly after the last entry of the previous page and is ABSENT on the last
-//! page. A `NextToken` this enumeration did not issue is refused with the modelled
-//! `ValidationException` (400), and it writes nothing.
+//! `ApplicationProviderArn` order, every entry carrying the COMPLETE `DisplayData` the
+//! shape declares (`DisplayName`, `Description` and an `https` `IconUrl`) and a
+//! `ResourceServerConfig` exactly when the entry publishes access scopes, paged by ANY
+//! `MaxResults` the model's `range(1..100)` admits with a `NextToken` reported whenever
+//! entries remain and ABSENT on the last page. A `NextToken` this enumeration did not
+//! issue is refused with the modelled `ValidationException` (400), and it writes nothing.
 //!
 //! The tables span what the rule generalises over: the page size (both published bounds,
-//! one past each bound, the catalogue size, sizes that divide it and sizes that do not,
-//! and the size omitted entirely), the catalogue ENTRY (every row of the catalogue, read
-//! from the crate so the test tracks it rather than restating it — `custom` is the entry
-//! the recorded cases cite, the rest are entries they do not), and the ways a cursor can
-//! be foreign.
+//! one past each bound, sizes that divide the catalogue and sizes that do not, and the
+//! size omitted entirely), the catalogue ENTRY (every row of the catalogue, read from the
+//! crate so the test tracks it rather than restating it — `custom` and
+//! `catalog/Statuspage` are the entries the recorded cases cite, the rest are entries
+//! they do not), and the ways a cursor can be foreign.
 //!
 //! Every call goes through `MultiServiceRouter::dispatch`, so the modelled constraints
 //! and the `X-Amz-Target` routing are exercised rather than bypassed. The harness is the
@@ -49,9 +51,9 @@ fn is_application_provider_arn(arn: &str) -> bool {
     let partition_parts: Vec<&str> = partition_suffix.split('-').skip(1).collect();
     let partition_ok = (partition_suffix.is_empty() || partition_suffix.starts_with('-'))
         && partition_parts.len() <= 3
-        && partition_parts
-            .iter()
-            .all(|part| (1..=5).contains(&part.len()) && part.chars().all(|c| c.is_ascii_lowercase()));
+        && partition_parts.iter().all(|part| {
+            (1..=5).contains(&part.len()) && part.chars().all(|c| c.is_ascii_lowercase())
+        });
     partition_ok
         && !id.is_empty()
         && id
@@ -86,25 +88,6 @@ fn expected_arns() -> Vec<String> {
     arns
 }
 
-/// Every provider of the catalogue, read in one unpaged call (the catalogue is far
-/// smaller than the model's 100 ceiling).
-async fn whole_catalogue(router: &MultiServiceRouter) -> Vec<Value> {
-    let (status, body) = list(router, &json!({})).await;
-    assert_eq!(
-        status, 200,
-        "ListApplicationProviders expected 200, got {status} {body}"
-    );
-    assert_eq!(
-        body["NextToken"],
-        Value::Null,
-        "the catalogue fits one default page, so no NextToken may be reported, got {body}"
-    );
-    body["ApplicationProviders"]
-        .as_array()
-        .unwrap_or_else(|| panic!("no ApplicationProviders in {body}"))
-        .clone()
-}
-
 /// The ARN of each provider in `providers`, in the order reported.
 fn arns(providers: &[Value]) -> Vec<String> {
     providers
@@ -120,17 +103,126 @@ fn arns(providers: &[Value]) -> Vec<String> {
         .collect()
 }
 
-/// RULE — one unpaged read reports exactly the catalogue, once per entry, ascending by
+/// Every entry of the catalogue, read by paging the enumeration to its end with
+/// `max_results` per page (or the service's own page size when `None`), plus the number
+/// of pages it took.
+async fn enumerate(
+    router: &MultiServiceRouter,
+    max_results: Option<i64>,
+    case: &str,
+) -> (Vec<Value>, usize) {
+    let mut entries: Vec<Value> = Vec::new();
+    let mut next_token: Option<String> = None;
+    let mut pages = 0usize;
+    let limit = max_results.unwrap_or(MAX_RESULTS_MAX) as usize;
+    loop {
+        let mut request = json!({});
+        if let Some(size) = max_results {
+            request["MaxResults"] = json!(size);
+        }
+        if let Some(token) = next_token.as_deref() {
+            request["NextToken"] = json!(token);
+        }
+        let (status, body) = list(router, &request).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: page {pages} expected 200, got {status} {body}"
+        );
+        let page = body["ApplicationProviders"]
+            .as_array()
+            .unwrap_or_else(|| panic!("case {case:?}: no ApplicationProviders in {body}"))
+            .clone();
+        assert!(
+            page.len() <= limit,
+            "case {case:?}: a page holds at most {limit} providers, got {} in {body}",
+            page.len()
+        );
+        entries.extend(page.iter().cloned());
+        pages += 1;
+        assert!(
+            pages <= state::BUILT_IN_APPLICATION_PROVIDERS.len() + 1,
+            "case {case:?}: paging did not terminate after {pages} pages"
+        );
+        match body["NextToken"].as_str() {
+            Some(token) => {
+                assert!(
+                    is_token(token),
+                    "case {case:?}: NextToken must satisfy the modelled Token pattern, \
+                     got {token:?}"
+                );
+                assert_eq!(
+                    page.len(),
+                    limit,
+                    "case {case:?}: a page that reports a NextToken is full, got {} of \
+                     {limit} in {body}",
+                    page.len()
+                );
+                next_token = Some(token.to_string());
+            }
+            None => break,
+        }
+    }
+    (entries, pages)
+}
+
+/// RULE — a full enumeration reports exactly the catalogue, once per entry, ascending by
 /// ARN.
 #[tokio::test]
 async fn the_catalogue_is_reported_once_per_entry_in_arn_order() {
     let router = router();
-    let reported = arns(&whole_catalogue(&router).await);
+    let (entries, _) = enumerate(&router, None, "the service's own page size").await;
+    let reported = arns(&entries);
     assert_eq!(
         reported,
         expected_arns(),
-        "the enumeration must report exactly the catalogue, ascending by ARN, got {reported:?}"
+        "the enumeration must report exactly the catalogue, ascending by ARN, got {} \
+         entries",
+        reported.len()
     );
+}
+
+/// RULE — the catalogue holds BOTH id forms the service publishes: AWS managed providers
+/// under a service slug, and the pre-integrated applications of the application catalogue
+/// under `catalog/<Name>`; and it is bigger than one page, so paging is observable.
+#[tokio::test]
+async fn the_catalogue_holds_both_provider_forms_and_more_than_one_page() {
+    let router = router();
+    let (entries, pages) = enumerate(&router, None, "the service's own page size").await;
+    let reported = arns(&entries);
+
+    let catalog_entries: Vec<&String> = reported
+        .iter()
+        .filter(|arn| arn.contains(":applicationProvider/catalog/"))
+        .collect();
+    let service_entries: Vec<&String> = reported
+        .iter()
+        .filter(|arn| !arn.contains(":applicationProvider/catalog/"))
+        .collect();
+    assert!(
+        catalog_entries.len() > 1,
+        "the catalogue must publish the pre-integrated applications under \
+         applicationProvider/catalog/<Name>, got {catalog_entries:?}"
+    );
+    assert!(
+        service_entries.len() > 1,
+        "the catalogue must publish the AWS managed providers under their service slug, \
+         got {service_entries:?}"
+    );
+    assert!(
+        pages > 1,
+        "the catalogue must span more than one page of {MAX_RESULTS_MAX} for pagination \
+         to be observable, got {pages} page(s) for {} entries",
+        reported.len()
+    );
+
+    // Entries the recorded cases cite, and entries they do not: both forms resolve.
+    for id in ["custom", "glue", "catalog/Statuspage", "catalog/Zoom"] {
+        let arn = format!("arn:aws:sso::aws:applicationProvider/{id}");
+        assert!(
+            reported.contains(&arn),
+            "case {id:?}: the catalogue must hold {arn}"
+        );
+    }
 }
 
 /// RULE — over every page size the model admits: paging enumerates exactly the
@@ -141,106 +233,50 @@ async fn paging_enumerates_the_whole_catalogue_once_for_every_page_size() {
     let expected = expected_arns();
     assert!(
         expected.len() >= 2,
-        "the catalogue must hold more than one entry for paging to be observable, got {expected:?}"
+        "the catalogue must hold more than one entry for paging to be observable"
     );
 
-    // The rows differ along the page size: both published bounds, a size that divides
-    // the catalogue, sizes that do not, the exact catalogue size, one either side of it,
-    // and the size omitted entirely.
+    // The rows differ along the page size: both published bounds, a size that divides the
+    // catalogue, sizes that do not, and the size omitted entirely.
     let count = expected.len() as i64;
+    let divides = (2..=MAX_RESULTS_MAX)
+        .find(|size| count % size == 0)
+        .unwrap_or(MAX_RESULTS_MIN);
     let sizes: Vec<Option<i64>> = vec![
         None,
         Some(MAX_RESULTS_MIN),
-        Some(2),
-        Some(3),
-        Some(count - 1),
-        Some(count),
-        Some(count + 1),
+        Some(7),
+        Some(divides),
+        Some(MAX_RESULTS_MAX - 1),
         Some(MAX_RESULTS_MAX),
     ];
 
     for size in sizes {
         let case = format!("MaxResults = {size:?}");
-        let mut seen: Vec<String> = Vec::new();
-        let mut next_token: Option<String> = None;
-        let mut pages = 0usize;
-        loop {
-            let mut request = json!({});
-            if let Some(size) = size {
-                request["MaxResults"] = json!(size);
-            }
-            if let Some(token) = next_token.as_deref() {
-                request["NextToken"] = json!(token);
-            }
-            let (status, body) = list(&router, &request).await;
-            assert_eq!(
-                status, 200,
-                "case {case:?}: page {pages} expected 200, got {status} {body}"
-            );
-            let page = body["ApplicationProviders"]
-                .as_array()
-                .unwrap_or_else(|| panic!("case {case:?}: no ApplicationProviders in {body}"))
-                .clone();
-            let limit = size.unwrap_or(MAX_RESULTS_MAX) as usize;
-            assert!(
-                page.len() <= limit,
-                "case {case:?}: a page holds at most MaxResults providers, got {} in {body}",
-                page.len()
-            );
-            seen.extend(arns(&page));
-            pages += 1;
-            assert!(
-                pages <= expected.len() + 1,
-                "case {case:?}: paging did not terminate after {pages} pages"
-            );
-
-            match body["NextToken"].as_str() {
-                Some(token) => {
-                    assert!(
-                        is_token(token),
-                        "case {case:?}: NextToken must satisfy the modelled Token pattern, \
-                         got {token:?}"
-                    );
-                    assert_eq!(
-                        page.len(),
-                        limit,
-                        "case {case:?}: a page that reports a NextToken is full, got {} of \
-                         {limit} in {body}",
-                        page.len()
-                    );
-                    next_token = Some(token.to_string());
-                }
-                None => break,
-            }
-        }
-
+        let (entries, _) = enumerate(&router, size, &case).await;
         assert_eq!(
-            seen, expected,
-            "case {case:?}: paging must report exactly the catalogue, in ARN order, got {seen:?}"
+            arns(&entries),
+            expected,
+            "case {case:?}: paging must report exactly the catalogue, in ARN order"
         );
     }
 }
 
-/// RULE — each listed entry carries the catalogue record's own values, and the listing
-/// agrees member for member with `DescribeApplicationProvider` on the same ARN: one
-/// catalogue, two projections. The table is every entry of the catalogue.
+/// RULE — each listed entry carries the catalogue record's own values and a COMPLETE
+/// `DisplayData`, and the listing agrees member for member with
+/// `DescribeApplicationProvider` on the same ARN: one catalogue, two projections. The
+/// table is every entry of the catalogue.
 #[tokio::test]
 async fn every_listed_entry_matches_the_catalogue_and_its_describe() {
     let router = router();
-    let listed = whole_catalogue(&router).await;
+    let (listed, _) = enumerate(&router, None, "the service's own page size").await;
 
     for provider in state::BUILT_IN_APPLICATION_PROVIDERS {
         let arn = format!("arn:aws:sso::aws:applicationProvider/{}", provider.id);
         let entry = listed
             .iter()
             .find(|entry| entry["ApplicationProviderArn"].as_str() == Some(arn.as_str()))
-            .unwrap_or_else(|| {
-                panic!(
-                    "case {:?}: the enumeration must list {arn}, got {:?}",
-                    provider.id,
-                    arns(&listed)
-                )
-            });
+            .unwrap_or_else(|| panic!("case {:?}: the enumeration must list {arn}", provider.id));
         assert!(
             is_application_provider_arn(arn.as_str()),
             "case {:?}: expected a modelled ApplicationProviderArn, got {arn:?}",
@@ -260,36 +296,8 @@ async fn every_listed_entry_matches_the_catalogue_and_its_describe() {
             provider.id,
             provider.federation_protocol
         );
-        assert_eq!(
-            entry["DisplayData"]["DisplayName"].as_str(),
-            Some(provider.display_name),
-            "case {:?}: expected DisplayName {:?}, got {entry}",
-            provider.id,
-            provider.display_name
-        );
-        // `DisplayData$DisplayName` is `Name`, 1..100 characters.
-        assert!(
-            (1..=100).contains(&provider.display_name.len()),
-            "case {:?}: DisplayName is 1..100 characters, got {:?}",
-            provider.id,
-            provider.display_name
-        );
-        // Nothing holds an icon, a blurb or a resource server for these providers, so
-        // none may be invented on the listing either.
-        for absent in ["IconUrl", "Description"] {
-            assert_eq!(
-                entry["DisplayData"][absent],
-                Value::Null,
-                "case {:?}: no {absent} is held, so none may be reported, got {entry}",
-                provider.id
-            );
-        }
-        assert_eq!(
-            entry["ResourceServerConfig"],
-            Value::Null,
-            "case {:?}: no resource server is held, so none may be reported, got {entry}",
-            provider.id
-        );
+        assert_display_data(&entry["DisplayData"], provider);
+        assert_resource_server_config(&entry["ResourceServerConfig"], provider);
 
         // The two reads of ONE record must agree member for member.
         let (status, described) = call(
@@ -321,8 +329,135 @@ async fn every_listed_entry_matches_the_catalogue_and_its_describe() {
     assert_eq!(
         listed.len(),
         state::BUILT_IN_APPLICATION_PROVIDERS.len(),
-        "the enumeration must report the catalogue and nothing else, got {:?}",
-        arns(&listed)
+        "the enumeration must report the catalogue and nothing else, got {} entries",
+        listed.len()
+    );
+}
+
+/// RULE — `DisplayData` is reported COMPLETE for every provider: the record's display
+/// name and description, and an `https` icon URL, each inside the member's modelled
+/// length (`DisplayName` 1..100, `Description` 1..128, `IconUrl` 1..768 matching
+/// `^(http|https)://.*$`).
+pub(crate) fn assert_display_data(
+    display_data: &Value,
+    provider: &state::BuiltInApplicationProvider,
+) {
+    let id = provider.id;
+    assert_eq!(
+        display_data["DisplayName"].as_str(),
+        Some(provider.display_name),
+        "case {id:?}: expected DisplayName {:?}, got {display_data}",
+        provider.display_name
+    );
+    assert!(
+        (1..=100).contains(&provider.display_name.chars().count()),
+        "case {id:?}: DisplayName is 1..100 characters, got {:?}",
+        provider.display_name
+    );
+
+    let description = display_data["Description"].as_str().unwrap_or_else(|| {
+        panic!("case {id:?}: a provider must carry a Description, got {display_data}")
+    });
+    assert_eq!(
+        description,
+        provider.description(),
+        "case {id:?}: expected the record's Description, got {description:?}"
+    );
+    assert!(
+        (1..=128).contains(&description.chars().count()),
+        "case {id:?}: Description is 1..128 characters, got {description:?}"
+    );
+    // A catalogue application's portal description is its display name as an
+    // application; an AWS managed provider carries wording of its own.
+    if id.starts_with("catalog/") {
+        assert_eq!(
+            description,
+            format!("{} Application", provider.display_name),
+            "case {id:?}: a catalogue application's Description is its display name as an \
+             application, got {description:?}"
+        );
+    }
+
+    let icon_url = display_data["IconUrl"].as_str().unwrap_or_else(|| {
+        panic!("case {id:?}: a provider must carry an IconUrl, got {display_data}")
+    });
+    assert!(
+        icon_url.starts_with("https://"),
+        "case {id:?}: IconUrl must match ^(http|https)://.*$, got {icon_url:?}"
+    );
+    assert!(
+        (1..=768).contains(&icon_url.chars().count()),
+        "case {id:?}: IconUrl is 1..768 characters, got {icon_url:?}"
+    );
+    assert_eq!(
+        icon_url,
+        provider.icon_url(),
+        "case {id:?}: expected the record's IconUrl, got {icon_url:?}"
+    );
+}
+
+/// RULE — `ResourceServerConfig` is reported exactly when the record publishes access
+/// scopes, with each scope's own title and description.
+pub(crate) fn assert_resource_server_config(
+    resource_server_config: &Value,
+    provider: &state::BuiltInApplicationProvider,
+) {
+    let id = provider.id;
+    if provider.scopes.is_empty() {
+        assert_eq!(
+            resource_server_config,
+            &Value::Null,
+            "case {id:?}: no resource server is published, so none may be reported, got \
+             {resource_server_config}"
+        );
+        return;
+    }
+    for scope in provider.scopes {
+        let details = &resource_server_config["Scopes"][scope.name];
+        assert_eq!(
+            details["DetailedTitle"].as_str(),
+            Some(scope.detailed_title),
+            "case {id:?}: expected scope {:?} with its title, got {resource_server_config}",
+            scope.name
+        );
+        assert_eq!(
+            details["LongDescription"].as_str(),
+            Some(scope.long_description),
+            "case {id:?}: expected scope {:?} with its description, got \
+             {resource_server_config}",
+            scope.name
+        );
+    }
+}
+
+/// RULE — a provider's icon URL is derived from the provider, so it is STABLE across
+/// reads and DISTINCT per provider: no two entries of the catalogue share one.
+#[tokio::test]
+async fn every_provider_has_its_own_stable_icon_url() {
+    let router = router();
+    let (first, _) = enumerate(&router, None, "first read").await;
+    let (second, _) = enumerate(&router, None, "second read").await;
+    assert_eq!(
+        first, second,
+        "two reads of the catalogue must report the identical icon URLs"
+    );
+
+    let mut urls: Vec<&str> = first
+        .iter()
+        .map(|entry| {
+            entry["DisplayData"]["IconUrl"]
+                .as_str()
+                .unwrap_or_else(|| panic!("an entry without an IconUrl: {entry}"))
+        })
+        .collect();
+    let total = urls.len();
+    urls.sort_unstable();
+    urls.dedup();
+    assert_eq!(
+        urls.len(),
+        total,
+        "each provider must have its own IconUrl, got {} distinct for {total} providers",
+        urls.len()
     );
 }
 
@@ -440,23 +575,16 @@ async fn listing_providers_changes_nothing() {
     );
     assert_eq!(
         first, second,
-        "two reads of the catalogue must report the identical records, got {first} then {second}"
+        "two reads of the catalogue must report the identical records"
     );
 
     // Paging through the catalogue consumes nothing either.
-    let mut next_token: Option<String> = None;
-    loop {
-        let mut request = json!({"MaxResults": 1});
-        if let Some(token) = next_token.as_deref() {
-            request["NextToken"] = json!(token);
-        }
-        let (status, body) = list(&router, &request).await;
-        assert_eq!(status, 200, "a page expected 200, got {status} {body}");
-        match body["NextToken"].as_str() {
-            Some(token) => next_token = Some(token.to_string()),
-            None => break,
-        }
-    }
+    let (_, pages) = enumerate(&router, Some(1), "one entry per page").await;
+    assert_eq!(
+        pages,
+        state::BUILT_IN_APPLICATION_PROVIDERS.len(),
+        "a page of one per entry takes one page per entry, got {pages}"
+    );
 
     // A write to an unrelated store does not alter the AWS-owned catalogue.
     let instance_arn = seeded_instance_arn(&router).await;
@@ -490,6 +618,6 @@ async fn listing_providers_changes_nothing() {
     );
     assert_eq!(
         first, after,
-        "a read must not change what a later caller sees, got {first} then {after}"
+        "a read must not change what a later caller sees"
     );
 }
