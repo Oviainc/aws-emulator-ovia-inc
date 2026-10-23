@@ -18,6 +18,11 @@
 //! the ones the model documents, and both are applied by every dashboard
 //! operation rather than copied into each.
 //!
+//! It owns the CloudTrail Lake **channel** registry on the same terms again: a channel
+//! identifier is a channel ARN or the bare id the service minted for it, and the refusal
+//! wording for an `arn:` value that is not a channel ARN, or for an identifier that names
+//! no channel, lives here so every channel operation refuses alike.
+//!
 //! The **tagging** rules live here for the same reason: a tagging call addresses its
 //! resource by ARN, and how that ARN resolves to a stored resource's tag set — plus
 //! how a malformed one and one naming nothing are refused — is shared by every
@@ -1210,6 +1215,12 @@ pub const MISSING_EVENT_DATA_STORE_CONFIGURATION_MESSAGE: &str =
 pub const MISSING_TRAIL_CONFIGURATION_MESSAGE: &str =
     "You must specify the aggregation configurations.";
 
+/// The CloudTrail Lake **channel** registry's own rules: how a channel identifier is
+/// read and how a channel operation refuses one. They live in their own module beside
+/// the registry they resolve against, the way `src/service/rpc_target.rs` holds the
+/// target reading `src/service.rs` applies.
+pub mod channels;
+
 /// Per-service state for com-amazonaws-cloudtrail-cloudtrail-20131101. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsCloudtrailCloudtrail20131101State {
@@ -1230,6 +1241,8 @@ pub struct ComAmazonawsCloudtrailCloudtrail20131101State {
     pub queries: BTreeMap<String, QueryRecord>,
     /// Every CloudTrail Lake dashboard in the account, keyed by [`DashboardKey`].
     pub dashboards: BTreeMap<DashboardKey, DashboardRecord>,
+    /// Every CloudTrail Lake channel in the account, keyed by [`channels::ChannelKey`].
+    pub channels: BTreeMap<channels::ChannelKey, channels::ChannelRecord>,
 }
 
 /// What a mutating operation found for the identifier it was given.
@@ -1432,6 +1445,7 @@ impl ComAmazonawsCloudtrailCloudtrail20131101State {
     }
 }
 
+// ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
 // CloudTrail Lake dashboards
 // ---------------------------------------------------------------------------

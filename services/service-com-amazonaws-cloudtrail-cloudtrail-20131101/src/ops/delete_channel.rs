@@ -1,15 +1,27 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteChannel
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteChannel`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteChannel::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Deletes one channel out of the channel registry [`crate::state::channels`] owns.
+//!
+//! A channel is addressed by its ARN or by the bare id CloudTrail minted for it
+//! (`DeleteChannelRequest$Channel`: "The ARN or the UUID value of the channel that you
+//! want to delete"), and the ARN carries the account that owns the channel and the Region
+//! it lives in — so a channel is deleted out of the Region that holds it, an id no
+//! channel carries names no channel, and an `arn:`-prefixed value that is not a channel
+//! ARN is refused as one. Both readings, and the refusal wording for either failure,
+//! live in `crate::state::channels` so `GetChannel`, `UpdateChannel` and `ListChannels`
+//! cannot
+//! drift from this handler.
+//!
+//! What this handler does NOT reach is the modelled `OperationNotPermittedException`:
+//! real CloudTrail refuses to delete a channel it manages on a customer's behalf (a
+//! service-linked channel, named `aws-service-channel/<service>/<suffix>` per the model
+//! doc for `Channel$Name`), and the registry records no provenance to tell one apart
+//! yet, because the only writer of a channel record will be `CreateChannel` — its own
+//! open issue, `20261022T230533Z-cloudtrail-createchannel-stub.md`. When provenance is
+//! stored, this handler answers that error for a channel the service owns, with the
+//! wording beside `channel_not_found_message` in `crate::state::channels`.
 //!
 //! ## Shape of an operation
 //!
@@ -108,6 +120,28 @@ impl From<DeleteChannelErrorModeled> for DeleteChannelError {
     }
 }
 
+/// The HTTP status this service answers a channel-not-found refusal with.
+///
+/// The model annotates `ChannelNotFoundException` `@httpError(404)`
+/// (`smithy_query(query="shape", shape="ChannelNotFoundException")`), but CloudTrail
+/// answers 400 for it on the wire: the recorded response for this very operation is
+/// `HTTP 400` with `__type` `ChannelNotFoundException`, and so is every other recorded
+/// channel refusal in the corpus (`GetChannel`, `UpdateChannel`, `ListTags`,
+/// `RemoveTags` on an unknown channel). The error CODE is the model's; only the status
+/// is stated here, through [`crate::scaffolded::Scaffolded::modeled_with_status`] — the
+/// same way `describe_query.rs` states it for the service's other not-found codes.
+const CHANNEL_NOT_FOUND_STATUS: u16 = 400;
+
+/// Refuse the request because the identifier named no stored channel.
+fn channel_not_found(identifier: &str) -> DeleteChannelError {
+    crate::scaffolded::Scaffolded::modeled_with_status(
+        DeleteChannelErrorModeled::ChannelNotFoundException(ChannelNotFoundException {
+            message: Some(crate::state::channels::channel_not_found_message(identifier)),
+        }),
+        CHANNEL_NOT_FOUND_STATUS,
+    )
+}
+
 /// The `DeleteChannel` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -144,18 +178,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteChannel` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteChannelErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteChannel"))
+        let region = crate::state::request_region(ctx.parts());
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteChannelErrorModeled::UnsupportedOperationException(UnsupportedOperationException {
+                message: Some(
+                    "DeleteChannel needs the CloudTrail channel registry, which this engine \
+                     does not carry"
+                        .to_string(),
+                ),
+            })
+        })?;
+        let mut store = state.lock();
+
+        // An `arn:`-prefixed identifier that is not a channel ARN cannot name a channel,
+        // so it is refused as a malformed ARN rather than reported absent. Anything else
+        // is a channel id, and an id no channel carries is an absent channel.
+        let address = store
+            .addressed_channel(&input.channel, &region)
+            .ok_or_else(|| {
+                DeleteChannelErrorModeled::ChannelARNInvalidException(ChannelARNInvalidException {
+                    message: Some(crate::state::channels::channel_arn_invalid_message(
+                        &input.channel,
+                    )),
+                })
+            })?;
+
+        // Deleting releases the record: the channel is gone from the Region the
+        // identifier addressed, and a second delete of the same channel is absent. An
+        // identifier naming another account addresses no record here, so it is absent
+        // too.
+        let released = match address {
+            crate::state::channels::ChannelAddress::Key(key) => {
+                store.channels.remove(&key).is_some()
+            }
+            crate::state::channels::ChannelAddress::AnotherAccount => false,
+        };
+        if released {
+            return Ok(DeleteChannelOutput {});
+        }
+        Err(channel_not_found(&input.channel))
     }
 }
