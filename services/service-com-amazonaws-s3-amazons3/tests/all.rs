@@ -47,6 +47,8 @@ mod object_listing_and_deletion;
 mod object_storage;
 #[path = "all/object_tagging.rs"]
 mod object_tagging;
+#[path = "all/object_tagging_on_put.rs"]
+mod object_tagging_on_put;
 #[path = "all/object_versioning.rs"]
 mod object_versioning;
 #[path = "all/object_write_and_read_back.rs"]
