@@ -12,7 +12,8 @@
 //! case:
 //!
 //! * a feed is MINTED and PERSISTED: the create response is built from the stored
-//!   record, and `GetFeed` returns that same record member for member;
+//!   record, and `GetFeed` returns that same record member for member — status included,
+//!   because a created feed is settled and `AVAILABLE` at once;
 //! * `ListFeeds` enumerates the persisted feeds in one stable order, at most
 //!   `maxResults` per page (10 when the request omits it), resuming from `nextToken`;
 //! * `UpdateFeed` overwrites the stored feed, so later reads report the new values,
@@ -170,8 +171,8 @@ async fn create_feed_persists_a_feed_that_get_feed_reports_member_for_member() {
         );
         assert_eq!(
             created["status"],
-            json!("CREATING"),
-            "case {label:?}: a feed accepted with 202 starts in CREATING, got {:?}",
+            json!("AVAILABLE"),
+            "case {label:?}: the created feed is AVAILABLE straight away, got {:?}",
             created["status"]
         );
         let endpoints = created["dataEndpoints"]
@@ -215,21 +216,16 @@ async fn create_feed_persists_a_feed_that_get_feed_reports_member_for_member() {
             created.get("association")
         );
 
-        // The round trip: everything but the status comes back from storage
-        // unchanged.
+        // The round trip: every member comes back from storage unchanged, the status
+        // included — the create answers out of the record it stored, so there is nothing
+        // for a later read to settle.
         let (status, fetched) = call(&router, "GET", &format!("/v1/feed/{id}"), None).await;
         assert_eq!(
             status, 200,
             "case {label:?}: GetFeed on the created id answers 200, got {status} with {fetched}"
         );
-        let strip_status = |body: &Value| {
-            let mut body = body.clone();
-            body.as_object_mut().unwrap().remove("status");
-            body
-        };
         assert_eq!(
-            strip_status(&fetched),
-            strip_status(&created),
+            fetched, created,
             "case {label:?}: GetFeed reports the stored feed, got {fetched}"
         );
     }
@@ -253,13 +249,14 @@ async fn create_feed_persists_a_feed_that_get_feed_reports_member_for_member() {
     );
 }
 
-/// A feed accepted in CREATING reaches AVAILABLE on the clock, and a caller reading it
-/// straight away still sees the transient status.
+/// A created feed is USABLE as soon as CreateFeed answers: a `GetFeed` taken in the
+/// very next request reports `AVAILABLE`, and it is still `AVAILABLE` later — nothing
+/// about the feed is waiting on a clock.
 #[tokio::test]
-async fn a_created_feed_settles_from_creating_to_available() {
+async fn a_created_feed_is_available_at_once_and_stays_available() {
     let router = router();
     let body = json!({
-        "name": "settling-feed",
+        "name": "settled-feed",
         "outputs": [{"name": "crop1", "outputConfig": output_config("cropping"), "status": "ENABLED"}]
     });
     let (_, created) = call(&router, "POST", "/v1/feed", Some(body)).await;
@@ -268,24 +265,25 @@ async fn a_created_feed_settles_from_creating_to_available() {
     let (_, immediately) = call(&router, "GET", &format!("/v1/feed/{id}"), None).await;
     assert_eq!(
         immediately["status"],
-        json!("CREATING"),
-        "case {id:?}: a feed read straight after creation is still CREATING, got {:?}",
+        json!("AVAILABLE"),
+        "case {id:?}: a feed read straight after creation is AVAILABLE, got {:?}",
         immediately["status"]
     );
 
     past_the_transition_span();
-    let (_, settled) = call(&router, "GET", &format!("/v1/feed/{id}"), None).await;
+    let (_, later) = call(&router, "GET", &format!("/v1/feed/{id}"), None).await;
     assert_eq!(
-        settled["status"],
+        later["status"],
         json!("AVAILABLE"),
-        "case {id:?}: once creation is due the feed is AVAILABLE, got {:?}",
-        settled["status"]
+        "case {id:?}: and it is still AVAILABLE once any clock-owed move would have \
+         fallen due, got {:?}",
+        later["status"]
     );
     let (_, listed) = call(&router, "GET", "/v1/feeds", None).await;
     assert_eq!(
         listed["feeds"][0]["status"],
         json!("AVAILABLE"),
-        "case {id:?}: ListFeeds reports the settled status too, got {listed}"
+        "case {id:?}: ListFeeds reports that same status, got {listed}"
     );
 }
 

@@ -23,6 +23,12 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 # SHA-256, for the stable per-record id in a load balancer's generated DNS name.
 sha2 = { workspace = true }
+# The ELBv2 model, whose operations this crate serves on the endpoint the two models
+# SHARE: an awsQuery envelope names the API version it is for, and `Version=2015-12-01`
+# is answered out of that model's own service over the one shared engine (see
+# `src/service/api_version.rs`). Reaching its operations needs its routing table, which
+# only its crate carries.
+service-com-amazonaws-elasticloadbalancingv2-elasticloadbalancing-v10 = { path = "../service-com-amazonaws-elasticloadbalancingv2-elasticloadbalancing-v10" }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

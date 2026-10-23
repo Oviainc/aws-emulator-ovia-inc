@@ -77,6 +77,9 @@ mod multiplex_start;
 #[path = "all/multiplex_stop.rs"]
 mod multiplex_stop;
 
+#[path = "all/rejection_messages.rs"]
+mod rejection_messages;
+
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 

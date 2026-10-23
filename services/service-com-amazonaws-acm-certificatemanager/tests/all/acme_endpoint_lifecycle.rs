@@ -34,16 +34,16 @@ use crate::certificate_lifecycle::{
 
 /// Every `PublicKeyAlgorithm` the model declares
 /// (`smithy_query(query="shape", shape="com.amazonaws.acm#PublicKeyAlgorithm")`).
-const PUBLIC_KEY_ALGORITHMS: &[&str] = &["RSA_2048", "EC_prime256v1", "EC_secp384r1"];
+pub(crate) const PUBLIC_KEY_ALGORITHMS: &[&str] = &["RSA_2048", "EC_prime256v1", "EC_secp384r1"];
 
 /// Every `AcmeContact` the model declares
 /// (`smithy_query(query="shape", shape="com.amazonaws.acm#AcmeContact")`); `REQUIRED`
 /// is also the member's modelled default.
-const CONTACTS: &[&str] = &["REQUIRED", "NOT_REQUIRED"];
+pub(crate) const CONTACTS: &[&str] = &["REQUIRED", "NOT_REQUIRED"];
 
 /// Every `AcmeAuthorizationBehavior` the model declares
 /// (`smithy_query(query="shape", shape="com.amazonaws.acm#AcmeAuthorizationBehavior")`).
-const AUTHORIZATION_BEHAVIORS: &[&str] = &["PRE_APPROVED"];
+pub(crate) const AUTHORIZATION_BEHAVIORS: &[&str] = &["PRE_APPROVED"];
 
 /// One `CreateAcmeEndpoint` case: what it exercises, the request body, and the
 /// `Contact` the stored endpoint must report (the request's, or the modelled default
@@ -51,7 +51,11 @@ const AUTHORIZATION_BEHAVIORS: &[&str] = &["PRE_APPROVED"];
 type EndpointCase<'a> = (&'a str, Value, &'a str);
 
 /// `CreateAcmeEndpoint`, asserted to succeed, returning the ARN it minted.
-async fn create_endpoint(router: &MultiServiceRouter, case: &str, body: &Value) -> String {
+pub(crate) async fn create_endpoint(
+    router: &MultiServiceRouter,
+    case: &str,
+    body: &Value,
+) -> String {
     let (status, response) = call(router, "CreateAcmeEndpoint", body).await;
     assert_eq!(
         status, 200,
@@ -64,7 +68,11 @@ async fn create_endpoint(router: &MultiServiceRouter, case: &str, body: &Value) 
 }
 
 /// `DescribeAcmeEndpoint`'s `AcmeEndpoint` member, asserted to succeed.
-async fn describe_endpoint(router: &MultiServiceRouter, case: &str, arn: &str) -> Value {
+pub(crate) async fn describe_endpoint(
+    router: &MultiServiceRouter,
+    case: &str,
+    arn: &str,
+) -> Value {
     let (status, response) = call(
         router,
         "DescribeAcmeEndpoint",
@@ -123,7 +131,7 @@ fn tag_pairs(tags: &Value) -> Vec<(String, String)> {
 /// materialised by `materialize_due` on the next request, exactly as in production. A
 /// test about the transient state therefore cannot be made flaky by the
 /// [`state::ACME_ENDPOINT_ACTIVATION_DELAY`] span elapsing mid-test.
-fn hold_activations(engine: &Arc<engine::InMemoryEngine>) {
+pub(crate) fn hold_activations(engine: &Arc<engine::InMemoryEngine>) {
     let store = engine.state::<state::ComAmazonawsAcmCertificatemanagerState>();
     let mut store = store.lock();
     let held = SystemTime::now() + Duration::from_secs(3600);
@@ -138,7 +146,7 @@ fn hold_activations(engine: &Arc<engine::InMemoryEngine>) {
 /// [`state::ACME_ENDPOINT_ACTIVATION_DELAY`] after the endpoint was created, which is
 /// the instant the handler itself stored. Answers the latest instant one of them falls
 /// due, so a caller can wait the real span out.
-fn restore_activations(engine: &Arc<engine::InMemoryEngine>) -> SystemTime {
+pub(crate) fn restore_activations(engine: &Arc<engine::InMemoryEngine>) -> SystemTime {
     let store = engine.state::<state::ComAmazonawsAcmCertificatemanagerState>();
     let mut store = store.lock();
     let mut latest = SystemTime::UNIX_EPOCH;
@@ -155,7 +163,7 @@ fn restore_activations(engine: &Arc<engine::InMemoryEngine>) -> SystemTime {
 /// Wait until `due` has passed on the real clock. The emulator never sleeps for a due
 /// instant — this is the test standing in for the time a caller would let pass before
 /// polling again.
-fn wait_until(due: SystemTime) {
+pub(crate) fn wait_until(due: SystemTime) {
     if let Ok(remaining) = due.duration_since(SystemTime::now()) {
         std::thread::sleep(remaining + Duration::from_millis(50));
     }

@@ -27,13 +27,18 @@
 //! operations answer out of it: a search reports the held fixtures its criteria select
 //! and nothing else, and `GetFixture` answers for an id the store holds.
 //!
-//! That store starts EMPTY and is filled only through the in-process seeding seam
-//! ([`ComAmazonawsElementalinferenceElementalinferenceState::seed_fixtures`]): this
-//! emulator reaches no sports data source, and no modelled operation admits an event
-//! into one, so there is nothing for it to hold until something hands it a record. A
-//! window the store holds no event in therefore reports an empty list ("The array is
-//! empty if no fixtures match", `SearchFixturesResponse$fixtures`) rather than a card
-//! of invented games, and no request mutates what a later caller sees.
+//! That store is FILLED when it is constructed, with the schedule this emulator's own
+//! data source holds ([`default_fixture_catalog`]): a client can only learn a
+//! `fixtureId` from a search, so a catalog holding nothing would make the whole
+//! fixtures pair unusable — every search empty whatever it asked for, `GetFixture`
+//! unreachable, and a clipping output with no event to name. The schedule covers the
+//! [`CATALOG_SPAN_DAYS`] days either side of the day the store is built, for each sport
+//! the `DataSourceSport` enum declares. A window OUTSIDE that span holds no event and
+//! so still reports an empty list ("The array is empty if no fixtures match",
+//! `SearchFixturesResponse$fixtures`), the in-process seam
+//! ([`ComAmazonawsElementalinferenceElementalinferenceState::seed_fixtures`] and
+//! [`ComAmazonawsElementalinferenceElementalinferenceState::clear_fixtures`]) still
+//! installs or drops records, and no request mutates what a later caller sees.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
@@ -68,16 +73,20 @@ const DICTIONARY_ID_LEN: usize = 19;
 const DICTIONARY_ID_ALPHABET: &[u8; 62] =
     b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
 
-/// How long a clock-owed transition takes: a feed's `CREATING` -> `AVAILABLE` and
-/// `DELETING` -> gone, and a dictionary's `CREATING` -> `AVAILABLE` and `DELETING` ->
-/// gone.
+/// How long a clock-owed transition takes: a feed's `DELETING` -> gone, and a
+/// dictionary's `CREATING` -> `AVAILABLE` and `DELETING` -> gone.
 ///
 /// AWS documents no duration for these, so this span is chosen rather than
 /// specified: it is non-zero, so a caller that reads a resource straight after
-/// creating it still observes the transient `CREATING` status the real service
+/// starting the transition still observes the transient status the real service
 /// reports, and it is short enough that no caller has to wait long for the settled
 /// state. The due instant is stored on the record and materialised on the next
 /// call — nothing ever sleeps for it.
+///
+/// A CREATED FEED owes no such transition: the recorded service answers `CreateFeed`
+/// with a feed that is already usable — a `GetFeed` taken immediately after reports
+/// `AVAILABLE`, and the association the caller makes in its very next request
+/// succeeds — so a feed is stored settled and this span never applies to it.
 pub const TRANSITION_SPAN: Duration = Duration::from_millis(400);
 
 /// The most feeds this emulator keeps at once.
@@ -104,17 +113,19 @@ pub const MAX_DICTIONARIES: usize = 100;
 
 /// The `FeedStatus` values this slice of the service produces.
 ///
-/// The model's enum also carries `DELETED` and `UPDATING`, and neither value is ever
-/// reported. A feed whose deletion has completed is removed from the store instead
-/// (`GetFeed` then answers `ResourceNotFoundException`). `UpdateFeed` answers HTTP
+/// The model's enum also carries `CREATING`, `DELETED` and `UPDATING`, and none of the
+/// three is ever reported. `CREATING` is not: the recorded service hands back a feed
+/// that is immediately usable, so `CreateFeed` stores it `AVAILABLE` and there is no
+/// window in which a caller is told to wait ("After creation of the feed has succeeded,
+/// the status will be AVAILABLE", `CreateFeedResponse$status`). A feed whose deletion
+/// has completed is removed from the store instead of reporting `DELETED` (`GetFeed`
+/// then answers `ResourceNotFoundException`). `UpdateFeed` answers HTTP
 /// 200 rather than 202 — "UpdateFeed is a PUT operation, which means that the payload
 /// that you specify completely overwrites the existing payload" and that overwrite is
 /// done when the call returns — so the update reports the feed's SETTLED status, as
 /// `AssociateFeed` (also 200) already does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FeedStatus {
-    /// The feed has been accepted and is not serviceable yet.
-    Creating,
     /// The feed is settled and serviceable, with no resource associated.
     Available,
     /// A resource (the source media) is associated with the feed: `AssociateFeed`
@@ -131,7 +142,6 @@ impl FeedStatus {
     /// The value this status takes on the wire, as spelled by the `FeedStatus` enum.
     pub fn as_wire(self) -> &'static str {
         match self {
-            Self::Creating => "CREATING",
             Self::Available => "AVAILABLE",
             Self::Active => "ACTIVE",
             Self::Deleting => "DELETING",
@@ -160,6 +170,15 @@ pub const NOT_FOUND_MESSAGE: &str = "Resource not found";
 /// validity (a member whose value violates its constraint, an identifier that resolved
 /// to nothing) names a value, and then it names the value the REQUEST supplied.
 ///
+/// The EXCEPTION is a refusal whose point is to report the state it was decided from:
+/// where the service's refusal states the status it observed or how many records held
+/// the request back, that figure is the information the refusal exists to give, so the
+/// message is BUILT from the store and tracks it ([`feed_not_associated_message`],
+/// [`dictionary_referenced_message`] — functions rather than constants for exactly that
+/// reason). A fixed sentence in their place tells a caller nothing it did not already
+/// know, and leaves tooling that reads the status or the count out of the refusal with
+/// nothing to read.
+///
 /// `AssociateFeed` on a feed that already holds an association: the recorded refusal is
 /// this sentence, naming neither the resource that holds the feed nor the feed's status.
 pub const FEED_ALREADY_ASSOCIATED_MESSAGE: &str = "The feed is already associated with a resource.";
@@ -178,10 +197,22 @@ pub const WRONG_ASSOCIATED_RESOURCE_MESSAGE: &str =
     "You can't disassociate this feed because it isn't associated with the resource you \
      specified. Specify the correct resource.";
 
-/// `DisassociateFeed` on a feed that holds no resource to release: again a property of
-/// the stored feed, so the sentence carries no status.
-pub const FEED_NOT_ASSOCIATED_MESSAGE: &str =
-    "You can't disassociate this feed because it isn't associated with a resource.";
+/// `DisassociateFeed` on a feed that holds no resource to release: the refusal REPORTS
+/// the status the feed was observed in, which is what decided it — recorded example,
+/// for a feed that was never associated: "You can't disassociate this feed. It has
+/// status AVAILABLE which indicate that it's not currently associated with a resource."
+///
+/// So the status is read from the stored feed on every call: a feed that is settled
+/// without a resource, one whose deletion has been accepted and one that has been
+/// released each report their own status, and a client diagnosing the refusal can tell
+/// which of them blocked it.
+pub fn feed_not_associated_message(status: FeedStatus) -> String {
+    format!(
+        "You can't disassociate this feed. It has status {} which indicate that it's not \
+         currently associated with a resource.",
+        status.as_wire()
+    )
+}
 
 /// `UpdateFeed` on a feed whose deletion has already been accepted: a property of the
 /// stored feed, so the sentence names neither the feed nor its status.
@@ -196,12 +227,22 @@ pub const DICTIONARY_BEING_DELETED_MESSAGE: &str =
 
 /// `DeleteDictionary` on a dictionary a feed references ("You cannot delete a dictionary
 /// that is referenced by a feed. You must first remove the dictionary reference from the
-/// feed's subtitling configuration."): the rule is a property of the stored resources,
-/// so the sentence names neither the dictionary nor the feeds that hold it — which also
-/// keeps one caller's refusal from disclosing another caller's feed.
-pub const DICTIONARY_REFERENCED_MESSAGE: &str =
-    "You can't delete this dictionary because it is referenced by a feed. Remove the \
-     dictionary from the feed's subtitling configuration and try again.";
+/// feed's subtitling configuration."): the refusal REPORTS how many feeds reference the
+/// dictionary, which is what decided it — recorded example, for a single referencing
+/// feed: "Cannot delete dictionary because it is referenced by 1 feed(s). Remove all
+/// references by delete or disable related feed output(s) before deleting dictionary."
+///
+/// So the count is derived from the feed store on every call
+/// ([`ComAmazonawsElementalinferenceElementalinferenceState::feeds_blocking_delete`]):
+/// a caller tearing a dictionary down learns how much is left to remove, while the
+/// refusal still names no feed, so it discloses no other caller's resource.
+pub fn dictionary_referenced_message(feed_count: usize) -> String {
+    format!(
+        "Cannot delete dictionary because it is referenced by {feed_count} feed(s). Remove \
+         all references by delete or disable related feed output(s) before deleting \
+         dictionary."
+    )
+}
 
 /// `SearchFixtures` with `endDate` before `startDate`: the rule is the ORDER of the two
 /// members, so the recorded refusal names the members and not the dates they carried.
@@ -468,7 +509,7 @@ impl Feed {
 }
 
 /// Per-service state for com-amazonaws-elementalinference-elementalinference. A handler reaches it through [`service_state`].
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ComAmazonawsElementalinferenceElementalinferenceState {
     /// Every live feed, keyed by its `FeedId`. `BTreeMap` so `ListFeeds` has one
     /// stable order to paginate over. BOUNDED at [`MAX_FEEDS`] entries: `CreateFeed`
@@ -489,7 +530,9 @@ pub struct ComAmazonawsElementalinferenceElementalinferenceState {
     /// `BTreeMap` so a search has ONE stable order to page over, which is what a
     /// `nextToken` names a position in.
     ///
-    /// EMPTY until something seeds it ([`Self::seed_fixtures`]): `SearchFixtures` and
+    /// Filled from [`default_fixture_catalog`] when the store is constructed (see the
+    /// module docs) and afterwards only through the in-process seam
+    /// ([`Self::seed_fixtures`], [`Self::clear_fixtures`]): `SearchFixtures` and
     /// `GetFixture` are the only operations that touch a fixture and both are
     /// `@readonly`, so no request adds, changes or removes an entry — which is also
     /// what BOUNDS this map, since nothing on the wire can grow it.
@@ -507,6 +550,31 @@ pub struct ComAmazonawsElementalinferenceElementalinferenceState {
     /// first id. Mixing this seed in is what makes a minted id unique across stores
     /// as well as within one.
     pub run_seed: Option<u64>,
+}
+
+/// A fresh store: no feeds, no dictionaries — and the data-source catalog already
+/// holding this emulator's schedule ([`default_fixture_catalog`]).
+///
+/// `engine::InMemoryEngine::state` builds a service's state with `Default` the first
+/// time a handler reaches it, so this is the ONE construction every store goes through,
+/// and it is why the fixture catalog is filled here: no modelled operation creates a
+/// fixture (AWS relays them from an external sports data source), so a store that came
+/// up holding none could never be given one over the wire, and both `SearchFixtures`
+/// and `GetFixture` would answer nothing for the life of the process.
+impl Default for ComAmazonawsElementalinferenceElementalinferenceState {
+    fn default() -> Self {
+        let mut state = Self {
+            feeds: BTreeMap::new(),
+            next_feed_seq: 0,
+            dictionaries: BTreeMap::new(),
+            next_dictionary_seq: 0,
+            fixtures: BTreeMap::new(),
+            earliest_due: None,
+            run_seed: None,
+        };
+        state.seed_fixtures(default_fixture_catalog(current_epoch_secs()));
+        state
+    }
 }
 
 impl ComAmazonawsElementalinferenceElementalinferenceState {
@@ -625,18 +693,26 @@ impl ComAmazonawsElementalinferenceElementalinferenceState {
             .collect()
     }
 
-    /// Whether a feed that is not already retiring references `dictionary_id`, i.e.
-    /// whether "you cannot delete a dictionary that is referenced by a feed" bites.
+    /// The ids of the feeds that are not already retiring and reference
+    /// `dictionary_id`, in feed-id order: the records that make "you cannot delete a
+    /// dictionary that is referenced by a feed" bite, and so both WHETHER
+    /// `DeleteDictionary` is refused and the count its refusal reports
+    /// ([`dictionary_referenced_message`]) — one derivation, so the figure a refusal
+    /// states and the fact that refused it cannot disagree.
     ///
     /// A feed whose deletion has been ACCEPTED (`DELETING`) is on its way out and so
     /// holds nothing back: the dictionary it names may go as soon as the feed's own
     /// deletion is accepted, which is what lets a caller tear down a feed and then its
     /// dictionary without waiting for the feed's removal to fall due. It is still a
     /// live record until then, so it stays in [`Self::feeds_referencing`].
-    pub fn delete_blocked_by_feed(&self, dictionary_id: &str) -> bool {
-        self.feeds.values().any(|feed| {
-            feed.status != FeedStatus::Deleting && feed.references_dictionary(dictionary_id)
-        })
+    pub fn feeds_blocking_delete(&self, dictionary_id: &str) -> Vec<String> {
+        self.feeds
+            .values()
+            .filter(|feed| {
+                feed.status != FeedStatus::Deleting && feed.references_dictionary(dictionary_id)
+            })
+            .map(|feed| feed.id.clone())
+            .collect()
     }
 
     /// Materialise every transition the clock already owes at `now`, for feeds and
@@ -661,18 +737,6 @@ impl ComAmazonawsElementalinferenceElementalinferenceState {
                 // A feed whose deletion has completed is gone, so a later GetFeed
                 // answers ResourceNotFoundException.
                 FeedStatus::Deleting => false,
-                FeedStatus::Creating => {
-                    // Where a transient lands depends on the feed's association, not
-                    // on which call started it: a feed claimed by AssociateFeed while
-                    // it was still settling becomes ACTIVE, an unclaimed one AVAILABLE.
-                    feed.status = if feed.association.is_some() {
-                        FeedStatus::Active
-                    } else {
-                        FeedStatus::Available
-                    };
-                    feed.transition_due_at = None;
-                    true
-                }
                 // A settled status owes the clock nothing; clear the stale instant.
                 FeedStatus::Available | FeedStatus::Active | FeedStatus::Archived => {
                     feed.transition_due_at = None;
@@ -1139,6 +1203,167 @@ pub fn fixture_start_secs(epoch_day: i64, hour: i64, minute: i64) -> Option<i64>
         .checked_mul(SECONDS_PER_DAY)?
         .checked_add(hour.checked_mul(3_600)?)?
         .checked_add(minute.checked_mul(60)?)
+}
+
+/// How many days either side of the day the catalog is built its schedule covers.
+///
+/// A search window is at most [`MAX_SEARCH_WINDOW_DAYS`] days wide, so a span of two
+/// weeks each way means every window a caller can ask for around the present day holds
+/// events, which is what the recorded service answers for a recent window. It also
+/// BOUNDS the catalog: the schedule is `2 * CATALOG_SPAN_DAYS + 1` days of
+/// [`FIXTURES_PER_SPORT_PER_DAY`] fixtures for each sport the `DataSourceSport` enum
+/// declares, and nothing on the wire can add to it.
+pub const CATALOG_SPAN_DAYS: i64 = 14;
+
+/// How many fixtures of one sport the schedule holds on one day: a double-header, so a
+/// single day's search reports more than one row and paging over a window has something
+/// to page.
+pub const FIXTURES_PER_SPORT_PER_DAY: usize = 2;
+
+/// The UTC hour the first fixture of a day starts at, and the gap to the next one.
+///
+/// The data source's own figures; they only have to put every fixture of a day ON that
+/// day, since the day is what a search window selects on.
+const FIRST_KICK_OFF_HOUR: i64 = 18;
+const KICK_OFF_SPACING_HOURS: i64 = 3;
+
+/// Now, in seconds since the Unix epoch — the instant the catalog is built around and
+/// the one a held fixture's status is decided against.
+pub fn current_epoch_secs() -> i64 {
+    ::std::time::SystemTime::now()
+        .duration_since(::std::time::UNIX_EPOCH)
+        .map(|since_epoch| since_epoch.as_secs() as i64)
+        .unwrap_or_default()
+}
+
+/// The teams of `sport`, as this emulator's data source holds them.
+///
+/// They are the EMULATOR's own clubs, not any real competition's: the modelled members
+/// they fill (`FixtureSummary$name` "as provided by the data source", `Competitor$name`)
+/// are free-form strings whose values belong to the data source, and this emulator
+/// reaches no sports data source to relay another's. Each sport has its own list, so no
+/// fixture pairs a basketball side against a football one, and both lists are long
+/// enough that the pairing below never has a team play itself.
+fn sport_teams(sport: DataSourceSport) -> &'static [&'static str] {
+    match sport {
+        DataSourceSport::Basketball => &[
+            "Harbor Hawks",
+            "Summit Suns",
+            "Delta Dynamos",
+            "Granite Giants",
+            "Cobalt Comets",
+            "Prairie Pumas",
+            "Ember Eagles",
+            "Lakeside Lynx",
+        ],
+        DataSourceSport::AmericanFootball => &[
+            "Ironside Bisons",
+            "Copper Cardinals",
+            "Northgate Nomads",
+            "Sandstone Stallions",
+            "Riverbend Rangers",
+            "Vantage Vipers",
+            "Quarry Quakes",
+            "Beacon Bulldogs",
+        ],
+    }
+}
+
+/// The competition `sport`'s fixtures belong to, for the fixtures the data source gives
+/// a group for ("The group that the fixture belongs to, such as the competition, league,
+/// or tournament", `FixtureSummary$fixtureGroup`).
+fn sport_competition(sport: DataSourceSport) -> &'static str {
+    match sport {
+        DataSourceSport::Basketball => "Continental Basketball League",
+        DataSourceSport::AmericanFootball => "Continental Gridiron League",
+    }
+}
+
+/// The (home, away) pairing the schedule gives slot `slot` of day `day`.
+///
+/// A rotation over the sport's teams, so the same day always yields the same pairing,
+/// two slots of one day are two different fixtures, and the away side is never the home
+/// side (the offset is drawn from `1..=len-1`, which cannot be a multiple of the team
+/// count).
+fn scheduled_pairing(
+    teams: &'static [&'static str],
+    day: i64,
+    slot: usize,
+) -> (&'static str, &'static str) {
+    let count = teams.len() as i64;
+    let index = day * FIXTURES_PER_SPORT_PER_DAY as i64 + slot as i64;
+    let home = index.rem_euclid(count);
+    let offset = index.div_euclid(count).rem_euclid(count - 1) + 1;
+    let away = (home + offset).rem_euclid(count);
+    (teams[home as usize], teams[away as usize])
+}
+
+/// The `FixtureId` the schedule gives slot `slot` of day `day` for `sport`.
+///
+/// Opaque, as a data source's id is, and derived from the three figures that identify
+/// the fixture (the same hash the data endpoints' label uses), so one fixture keeps one
+/// id for the life of the store while no two fixtures share one, and a client cannot
+/// read a date or a sport out of an id it was handed.
+fn catalog_fixture_id(sport: DataSourceSport, day: i64, slot: usize) -> String {
+    let mut seed = fnv1a64(format!("{}|{day}|{slot}", sport.as_wire()).as_bytes());
+    format!("{:016x}", splitmix64(&mut seed))
+}
+
+/// The schedule the data source holds at `now_secs`: for each sport the
+/// `DataSourceSport` enum declares, [`FIXTURES_PER_SPORT_PER_DAY`] fixtures on each UTC
+/// day within [`CATALOG_SPAN_DAYS`] of that instant's day.
+///
+/// This is the catalog a store comes up with (see [`Default`] on the state struct), and
+/// the reason a search of a recent window reports events rather than nothing: a client
+/// obtains a `fixtureId` only from a search, so a `GetFixture` and a clipping output's
+/// `dataSourceConfiguration` have nothing to name until a search can report one. A
+/// fixture that has already started carries [`FIXTURE_STATUS_COMPLETED`] and one still
+/// ahead [`FIXTURE_STATUS_SCHEDULED`] — the two statuses the model's own documentation
+/// names — so the catalog is the snapshot of the schedule as of the instant it was taken.
+pub fn default_fixture_catalog(now_secs: i64) -> Vec<Fixture> {
+    let center_day = now_secs.div_euclid(SECONDS_PER_DAY);
+    let mut catalog = Vec::new();
+    for sport in DataSourceSport::ALL.iter().copied() {
+        let teams = sport_teams(sport);
+        for day in (center_day - CATALOG_SPAN_DAYS)..=(center_day + CATALOG_SPAN_DAYS) {
+            for slot in 0..FIXTURES_PER_SPORT_PER_DAY {
+                let hour = FIRST_KICK_OFF_HOUR + slot as i64 * KICK_OFF_SPACING_HOURS;
+                // A day number the calendar does not have, or a kick-off past the end
+                // of the day, is no fixture at all rather than a panic.
+                let Some(scheduled_start_secs) = fixture_start_secs(day, hour, 0) else {
+                    continue;
+                };
+                let (home, away) = scheduled_pairing(teams, day, slot);
+                catalog.push(Fixture {
+                    id: catalog_fixture_id(sport, day, slot),
+                    sport,
+                    // "For example, the names of the two competing teams"
+                    // (`FixtureSummary$name`).
+                    name: format!("{away} at {home}"),
+                    // "The data source doesn't provide this information for every
+                    // fixture": the second fixture of a day carries no group.
+                    group: (slot == 0).then(|| sport_competition(sport).to_string()),
+                    scheduled_start_secs,
+                    status: if scheduled_start_secs <= now_secs {
+                        FIXTURE_STATUS_COMPLETED.to_string()
+                    } else {
+                        FIXTURE_STATUS_SCHEDULED.to_string()
+                    },
+                    competitors: vec![
+                        Competitor {
+                            name: Some(home.to_string()),
+                            is_home: Some(true),
+                        },
+                        Competitor {
+                            name: Some(away.to_string()),
+                            is_home: Some(false),
+                        },
+                    ],
+                });
+            }
+        }
+    }
+    catalog
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

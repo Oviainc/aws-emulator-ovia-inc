@@ -4,6 +4,12 @@
 //! Implements `DeleteDictionary`: the delete is ACCEPTED (202), the dictionary enters
 //! `DELETING`, and the clock removes it, after which `GetDictionary` answers 404.
 //!
+//! A dictionary a feed still references is refused with the modelled
+//! `ConflictException` (409), and that refusal REPORTS HOW MANY feeds reference it
+//! (`crate::state::dictionary_referenced_message`), derived from the feed store the
+//! decision itself is taken from — the count is what tells a caller tearing the
+//! dictionary down how much is left to remove.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -169,11 +175,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = state.lock();
         state.settle_due_transitions(now);
 
-        // Whether a feed holds this dictionary back, derived from the feed store: the
-        // same fact that makes a dictionary REFERENCED is what refuses its delete,
-        // except that a feed whose own deletion has already been accepted is on its way
-        // out and holds nothing back.
-        let blocked = state.delete_blocked_by_feed(&input.id);
+        // WHICH feeds hold this dictionary back, derived from the feed store: the same
+        // fact that makes a dictionary REFERENCED is what refuses its delete, except
+        // that a feed whose own deletion has already been accepted is on its way out and
+        // holds nothing back.
+        let blocking = state.feeds_blocking_delete(&input.id);
         let references = state.feeds_referencing(&input.id);
 
         let Some(dictionary) = state.dictionaries.get_mut(&input.id) else {
@@ -187,12 +193,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "You cannot delete a dictionary that is referenced by a feed. You must first
         // remove the dictionary reference from the feed's subtitling configuration." —
-        // the modelled ConflictException (HTTP 409). The rule is a property of the
-        // stored resources, so the refusal is that rule's invariant sentence and
-        // interpolates no value read out of state (no feed id).
-        if blocked {
+        // the modelled ConflictException (HTTP 409). The refusal REPORTS the number of
+        // feeds that hold it back, as the recorded one does ("referenced by 1 feed(s)"):
+        // that count is derived from the same feed store the refusal is decided from,
+        // and it still names no feed, so it discloses no other caller's resource.
+        if !blocking.is_empty() {
             return Err(DeleteDictionaryErrorModeled::ConflictException(ConflictException {
-                message: crate::state::DICTIONARY_REFERENCED_MESSAGE.to_string(),
+                message: crate::state::dictionary_referenced_message(blocking.len()),
             })
             .into());
         }

@@ -204,8 +204,6 @@ fn refused(
             template_ids,
         } => DeleteCloudWatchAlarmTemplateGroupErrorModeled::ConflictException(ConflictException {
             message: Some(crate::state::still_held_message(
-                "cloudwatch alarm template group",
-                identifier,
                 &signal_map_ids,
                 &template_ids,
             )),

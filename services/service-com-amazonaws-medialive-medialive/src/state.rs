@@ -877,8 +877,17 @@ pub fn is_ipv4_cidr(cidr: &str) -> bool {
     prefix_length <= 32 && address.parse::<::std::net::Ipv4Addr>().is_ok()
 }
 
+/// The message a request whose whitelist rules are not all valid IPv4 CIDRs is
+/// refused with — the fixed sentence of that rejection class, which states the
+/// rule the whole list must meet and interpolates nothing: the service refuses
+/// the request as a whole rather than offering a per-member error contract, so
+/// neither the index of the offending rule nor the value it carried is part of
+/// the message.
+pub const INVALID_WHITELIST_CIDR_MESSAGE: &str = "Every whitelist needs to have a valid IPv4 CIDR.";
+
 /// The `WhitelistRules` a request asks for, validated into the CIDR strings the
-/// store keeps, or the message naming the first entry that is not an IPv4 CIDR.
+/// store keeps, or the message a list carrying anything that is not a valid IPv4
+/// CIDR is refused with.
 ///
 /// ONE copy for every operation that writes a group's whitelist
 /// (`CreateInputSecurityGroup` and `UpdateInputSecurityGroup`), which document
@@ -886,21 +895,19 @@ pub fn is_ipv4_cidr(cidr: &str) -> bool {
 /// rule the two enforce cannot drift apart. The whole list is checked before the
 /// caller writes anything, so a refused request leaves the store untouched
 /// rather than applying a prefix of its rules.
+///
+/// A rule that names no CIDR at all fails the same rule and so carries the same
+/// message: every whitelist needs a valid IPv4 CIDR, and a missing one is not a
+/// valid one.
 pub fn whitelist_rules_from_request(
     requested: Vec<InputWhitelistRuleCidr>,
 ) -> Result<Vec<String>, String> {
     let mut cidrs: Vec<String> = Vec::with_capacity(requested.len());
-    for (index, rule) in requested.into_iter().enumerate() {
-        let Some(cidr) = rule.cidr else {
-            return Err(format!(
-                "WhitelistRules[{index}].Cidr is required: a whitelist rule must name an IPv4 CIDR to whitelist"
-            ));
+    for rule in requested {
+        let cidr = rule.cidr.filter(|cidr| is_ipv4_cidr(cidr));
+        let Some(cidr) = cidr else {
+            return Err(INVALID_WHITELIST_CIDR_MESSAGE.to_string());
         };
-        if !is_ipv4_cidr(&cidr) {
-            return Err(format!(
-                "WhitelistRules[{index}].Cidr must be an IPv4 CIDR with a prefix length of 0 to 32 (for example 10.0.0.0/16); got {cidr:?}"
-            ));
-        }
         cidrs.push(cidr);
     }
     Ok(cidrs)
@@ -1033,36 +1040,37 @@ pub enum TemplateGroupDeleteRefusal {
     },
 }
 
-/// The message a group delete's conflict carries: the resource type, the
-/// identifier the request named, what still holds it and the precondition both
-/// group deletes document ("You must detach this group from all signal maps and
-/// ensure its existing templates are moved to another group or deleted").
+/// The message a group delete refused because the group still holds templates
+/// carries — the fixed sentence of that rejection class, which states the
+/// precondition both group deletes document ("ensure its existing templates are
+/// moved to another group or deleted") and interpolates nothing: the group's
+/// identifier is in the request's own URI and the ids of the templates it still
+/// holds are state the caller did not supply.
+pub const TEMPLATE_GROUP_NOT_EMPTY_MESSAGE: &str = "Template group must be empty before deletion.";
+
+/// The message a group delete refused because a signal map still names the
+/// group carries: the other half of the precondition both group deletes
+/// document ("You must detach this group from all signal maps"), in the same
+/// fixed form as [`TEMPLATE_GROUP_NOT_EMPTY_MESSAGE`] and interpolating nothing
+/// for the same reason.
+pub const TEMPLATE_GROUP_STILL_ATTACHED_MESSAGE: &str =
+    "Template group must be detached from all signal maps before deletion.";
+
+/// The message a group delete's conflict carries: the unmet half of the
+/// precondition both group deletes document ("You must detach this group from
+/// all signal maps and ensure its existing templates are moved to another group
+/// or deleted"), as the fixed sentence of that rejection class.
 ///
-/// ONE builder, so the two group deletes cannot word the same refusal two ways,
-/// and each clause appears only when that list is non-empty.
-pub fn still_held_message(
-    resource_type: &str,
-    identifier: &str,
-    signal_map_ids: &[String],
-    template_ids: &[String],
-) -> String {
-    let mut held: Vec<String> = Vec::new();
-    if !signal_map_ids.is_empty() {
-        held.push(format!(
-            "is still attached to the signal maps {}",
-            signal_map_ids.join(", ")
-        ));
+/// ONE builder, so the two group deletes cannot word the same refusal two ways.
+/// The halves are reported in the order the documentation states them: a group a
+/// signal map still names must be detached first, and only then does its
+/// remaining content matter.
+pub fn still_held_message(signal_map_ids: &[String], template_ids: &[String]) -> String {
+    if signal_map_ids.is_empty() && !template_ids.is_empty() {
+        TEMPLATE_GROUP_NOT_EMPTY_MESSAGE.to_string()
+    } else {
+        TEMPLATE_GROUP_STILL_ATTACHED_MESSAGE.to_string()
     }
-    if !template_ids.is_empty() {
-        held.push(format!(
-            "still holds the templates {}",
-            template_ids.join(", ")
-        ));
-    }
-    format!(
-        "{resource_type} {identifier} {}; detach the group from all signal maps and move its existing templates to another group or delete them before deleting it",
-        held.join(" and ")
-    )
 }
 
 /// Per-service state for com-amazonaws-medialive-medialive. A handler reaches it through [`service_state`].
@@ -2773,20 +2781,39 @@ pub fn deleted_input_subject(input_id: &str) -> String {
 }
 
 /// The message a delete refused on an input a channel still attaches carries:
-/// the input, the channels that attach it, and that it cannot be deleted. One
-/// helper for the same reason as [`not_found_message`] — `DeleteInput` and
+/// the input the REQUEST named, and that it is busy and cannot be deleted.
+///
+/// The template is the service's own for this rejection class, and the only
+/// value it interpolates is the request's own `InputId`: which channels attach
+/// the input is state the caller did not name, so it is not part of the message
+/// (the attaching channels are what `DescribeInput`/`ListChannels` report).
+///
+/// One helper for the same reason as [`not_found_message`] — `DeleteInput` and
 /// `BatchDelete` refuse the same input, so they cannot word it two ways.
-pub fn attached_input_message(input_id: &str, channels: &[String]) -> String {
-    format!(
-        "Input {input_id} is attached to channel(s) {} and cannot be deleted",
-        channels.join(", ")
-    )
+pub fn busy_input_message(input_id: &str) -> String {
+    format!("Input {input_id} is busy, it cannot be deleted")
 }
 
+/// The message a channel delete refused because the channel has not stopped
+/// carries — the fixed sentence of that rejection class, naming the state the
+/// caller must reach rather than interpolating the channel's id or its current
+/// state (neither is something the caller supplied, and both are what
+/// `DescribeChannel` reports).
+///
+/// ONE constant, so `DeleteChannel` and `BatchDelete` — which refuse the same
+/// channel — cannot word the refusal two ways.
+pub const CHANNEL_NOT_STOPPED_MESSAGE: &str =
+    "Cannot delete a channel that has not been stopped yet. \
+     Please stop the channel and try again.";
+
 /// The message a delete refused on the resource's state carries: the resource,
-/// the state it is in, and the state a delete needs. One helper for the same
-/// reason as [`not_found_message`] — `DeleteChannel` and `BatchDelete` refuse
-/// the same channel, so they cannot word it two ways.
+/// the state it is in, and the state a delete needs.
+///
+/// This is the generic, request-composed wording, used for a resource whose
+/// class message this service does not know — the multiplex, whose
+/// not-stopped refusal only `BatchDelete` reaches. The CHANNEL delete has a
+/// known fixed message for the class and uses [`CHANNEL_NOT_STOPPED_MESSAGE`]
+/// instead.
 pub fn not_idle_message(resource_type: &str, identifier: &str, state: &str) -> String {
     format!(
         "{resource_type} {identifier} is in state {state} and must be \
@@ -2794,6 +2821,19 @@ pub fn not_idle_message(resource_type: &str, identifier: &str, state: &str) -> S
         channel_state::IDLE
     )
 }
+
+/// The message a create refused because the region already holds a monitor
+/// resource of that type under the requested `Name` carries.
+///
+/// Every monitor resource — the cloudwatch alarm template and its group, the
+/// eventbridge rule template and its group, and the signal map — documents the
+/// same uniqueness rule for `Name` ("Names must be unique within the scope of a
+/// resource type in a specific region"), so the name collision is ONE rejection
+/// class across all of them and this is the fixed sentence it carries. Nothing
+/// is interpolated: the colliding resource's internal id and the region are
+/// state the caller did not supply, and a caller matching on the message would
+/// be matching on this emulator's environment.
+pub const NAME_ALREADY_IN_USE_MESSAGE: &str = "Name already in use";
 
 /// One created input, as `CreateInput` stored it plus its lifecycle state.
 ///

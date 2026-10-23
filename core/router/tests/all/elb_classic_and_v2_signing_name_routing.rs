@@ -15,12 +15,15 @@
 //!
 //! * a signing name shared by several emulated services resolves to EXACTLY ONE of them —
 //!   here the Classic model, whose own identity IS that name;
-//! * that front door serves its OWN API version: a request whose awsQuery envelope names
-//!   another version is refused `400 InvalidAction` (the action/version pair it cannot
-//!   resolve) rather than answered out of the wrong model's shapes — which matters because
-//!   TEN action names are declared by both models with different inputs and outputs;
+//! * that front door serves BOTH API versions, as AWS's one Elastic Load Balancing
+//!   endpoint does: the awsQuery envelope's `Version` names the API, so a `2012-06-01`
+//!   request is answered out of the Classic model and a `2015-12-01` one out of the ELBv2
+//!   model — which matters because TEN action names are declared by both models with
+//!   different inputs and outputs — while a pair neither model resolves is refused `400
+//!   InvalidAction` naming the action and the version;
 //! * the ELBv2 model stays reachable under the routing key that names IT
-//!   (`elasticloadbalancingv2`), by credential scope or by host label;
+//!   (`elasticloadbalancingv2`), by credential scope or by host label, and both front doors
+//!   read and write the ONE ELBv2 store;
 //! * whatever the answer is, it is the serving model's own awsQuery XML and never a
 //!   router-level refusal.
 //!
@@ -100,7 +103,7 @@ fn classic_elb_and_elbv2_route_apart_under_one_signing_name() {
             // action — one only the Classic model declares, one only the ELBv2 model
             // declares, and `CreateLoadBalancer`/`DescribeLoadBalancers`, which BOTH
             // declare with different inputs and outputs.
-            let calls: [Call; 17] = [
+            let calls: [Call; 21] = [
                 Call {
                     // The request the issue reports as `500 AmbiguousService`: a Classic
                     // DescribeLoadBalancers on the shared signing name.
@@ -291,26 +294,107 @@ fn classic_elb_and_elbv2_route_apart_under_one_signing_name() {
                     expected_body_contains: &["<DescribeLoadBalancersResponse"],
                 },
                 Call {
-                    // The ELBv2 API version on the SHARED name: this front door serves the
-                    // 2012-06-01 API, and `CreateLoadBalancer` is one of the ten action
-                    // names both models declare — so the pair is refused rather than
-                    // answered out of the wrong model's shapes.
+                    // The ELBv2 API version on the SHARED name, for one of the ten action
+                    // names BOTH models declare: served out of the model whose version
+                    // the envelope names, in that model's own document — the ELBv2
+                    // `<LoadBalancers>` output and the `2015-12-01` namespace, not this
+                    // front door's own shapes.
                     case: "the ELBv2 API version on the shared signing name",
                     addressed: Addressed::Signed("elasticloadbalancing"),
                     action: "CreateLoadBalancer",
                     version: Some(V2_VERSION),
                     params: &[
-                        ("Name", "router-wrong-version"),
+                        ("Name", "router-shared-v2-elb"),
                         ("Subnets.member.1", "subnet-12345678"),
                     ],
+                    expected_status: 200,
+                    expected_code: None,
+                    expected_body_contains: &[
+                        "<CreateLoadBalancerResponse",
+                        "http://elasticloadbalancing.amazonaws.com/doc/2015-12-01/",
+                        "<LoadBalancers>",
+                        "<LoadBalancerName>router-shared-v2-elb</LoadBalancerName>",
+                    ],
+                },
+                Call {
+                    // The call the issue reports: an action only the ELBv2 model declares,
+                    // on the shared signing name every AWS SDK ELBv2 client signs.
+                    case: "CreateTargetGroup on the shared signing name",
+                    addressed: Addressed::Signed("elasticloadbalancing"),
+                    action: "CreateTargetGroup",
+                    version: Some(V2_VERSION),
+                    params: &[
+                        ("Name", "router-shared-tg"),
+                        ("Protocol", "HTTP"),
+                        ("Port", "80"),
+                        ("VpcId", "vpc-12345678"),
+                    ],
+                    expected_status: 200,
+                    expected_code: None,
+                    expected_body_contains: &[
+                        "<CreateTargetGroupResponse",
+                        "http://elasticloadbalancing.amazonaws.com/doc/2015-12-01/",
+                        "<TargetGroupName>router-shared-tg</TargetGroupName>",
+                    ],
+                },
+                Call {
+                    // The documented idempotent repeat — "if you attempt to create
+                    // multiple target groups with the same settings, each call succeeds" —
+                    // reported as the stored group, through the same front door.
+                    case: "the idempotent CreateTargetGroup replay on the shared name",
+                    addressed: Addressed::Signed("elasticloadbalancing"),
+                    action: "CreateTargetGroup",
+                    version: Some(V2_VERSION),
+                    params: &[
+                        ("Name", "router-shared-tg"),
+                        ("Protocol", "HTTP"),
+                        ("Port", "80"),
+                        ("VpcId", "vpc-12345678"),
+                    ],
+                    expected_status: 200,
+                    expected_code: None,
+                    expected_body_contains: &[
+                        "<TargetGroupName>router-shared-tg</TargetGroupName>",
+                        "<VpcId>vpc-12345678</VpcId>",
+                    ],
+                },
+                Call {
+                    // A repeat of the same NAME with different settings is the modelled
+                    // refusal, as its `awsQueryError` code.
+                    case: "a conflicting CreateTargetGroup replay on the shared name",
+                    addressed: Addressed::Signed("elasticloadbalancing"),
+                    action: "CreateTargetGroup",
+                    version: Some(V2_VERSION),
+                    params: &[
+                        ("Name", "router-shared-tg"),
+                        ("Protocol", "HTTPS"),
+                        ("Port", "80"),
+                        ("VpcId", "vpc-12345678"),
+                    ],
                     expected_status: 400,
-                    expected_code: Some("InvalidAction"),
-                    expected_body_contains: &["<ErrorResponse", V2_VERSION],
+                    expected_code: Some("DuplicateTargetGroupName"),
+                    expected_body_contains: &["<ErrorResponse"],
+                },
+                Call {
+                    // The two front doors serve ONE store: the group created on the shared
+                    // name is read back under the ELBv2 model's own routing key.
+                    case: "the ELBv2 key reads back the group created on the shared name",
+                    addressed: Addressed::Signed("elasticloadbalancingv2"),
+                    action: "DescribeTargetGroups",
+                    version: Some(V2_VERSION),
+                    params: &[("Names.member.1", "router-shared-tg")],
+                    expected_status: 200,
+                    expected_code: None,
+                    expected_body_contains: &[
+                        "<TargetGroupName>router-shared-tg</TargetGroupName>",
+                        "<VpcId>vpc-12345678</VpcId>",
+                    ],
                 },
                 Call {
                     // No `Version` at all, naming an action only the ELBv2 model declares:
-                    // the owner of the key has no such operation, so its own routing
-                    // refusal answers — in its awsQuery envelope, not the router's JSON.
+                    // a request that states no API version is served as this front door's
+                    // own, which has no such operation, so its own routing refusal answers
+                    // — in its awsQuery envelope, not the router's JSON.
                     case: "an ELBv2-only action on the shared name with no Version field",
                     addressed: Addressed::Signed("elasticloadbalancing"),
                     action: "DescribeTargetGroups",
@@ -318,7 +402,7 @@ fn classic_elb_and_elbv2_route_apart_under_one_signing_name() {
                     params: &[("Names.member.1", "router-v2-tg")],
                     expected_status: 400,
                     expected_code: Some("InvalidAction"),
-                    expected_body_contains: &["<ErrorResponse"],
+                    expected_body_contains: &["<ErrorResponse", CLASSIC_VERSION],
                 },
                 Call {
                     // A Classic action asked for at the ELBv2 version: refused on the

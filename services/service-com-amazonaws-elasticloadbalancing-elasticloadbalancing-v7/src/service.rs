@@ -43,12 +43,12 @@
 //! One of those seams is taken here, for ONE reason: this service's signing name is the
 //! endpoint prefix it SHARES with the ELBv2 model, so neither the claim nor the operation
 //! lookup can come from the model alone. [`api_version`] carries that whole rule — which
-//! API version the request's awsQuery envelope names, and what this front door does with
-//! an envelope naming another one.
+//! API version the request's awsQuery envelope names, which of the two models therefore
+//! serves it, and what happens to an envelope naming a version neither declares.
 
 pub mod api_version;
 
-use api_version::UnsupportedApiVersionOperation;
+use api_version::{ServingModel, UnsupportedApiVersionOperation, V2FrontDoor};
 use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service,
 };
@@ -61,9 +61,12 @@ use std::sync::Arc;
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
-    /// The refusal served for an envelope naming an API version this model does not
-    /// declare. Held in a field, built once, because `override_operation` hands back a
-    /// reference borrowed from `&self`.
+    /// The ELBv2 half of this shared endpoint, served for an envelope naming that
+    /// model's API version. Held in a field, built once over the same shared engine,
+    /// because `override_operation` hands back a reference borrowed from `&self`.
+    elbv2: V2FrontDoor<Eng>,
+    /// The refusal served for an envelope naming an API version NEITHER Elastic Load
+    /// Balancing model declares. Held in a field for the same reason.
     unsupported_api_version: UnsupportedApiVersionOperation,
 }
 
@@ -73,7 +76,8 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
-            entry: crate::ServiceDefinition::new(engine),
+            entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
+            elbv2: V2FrontDoor::new(engine),
             unsupported_api_version: UnsupportedApiVersionOperation,
         }
     }
@@ -99,8 +103,9 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // service owns it: its own identity IS that name (`sdkId: Elastic Load
         // Balancing`, `docId: elasticloadbalancing-2012-06-01`), while the other model's
         // is `Elastic Load Balancing v2`, which claims its own `elasticloadbalancingv2`
-        // key. An envelope naming THAT model's API version is refused here rather than
-        // answered out of this model's 2012-06-01 shapes (see [`api_version`]).
+        // key. Claiming the shared key is therefore claiming BOTH APIs' traffic: an
+        // envelope naming the ELBv2 model's API version is served out of THAT model, not
+        // out of this model's 2012-06-01 shapes (see [`api_version`]).
         //
         // Before this, both services claimed the key and the router answered every
         // Elastic Load Balancing request `500 AmbiguousService` — a code no AWS model
@@ -120,16 +125,22 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // names the API version it is for alongside the action, and the framework's
         // routing key reads the action alone — which matters here because TEN action
         // names are declared by this model AND by the ELBv2 model with different inputs
-        // and outputs. A request naming a version this model does not declare is refused
-        // rather than served as if it had named this one; the rule, and what it means for
-        // the ELBv2 model, is in [`api_version`].
-        if !api_version::serves_requested_version(req) {
-            return Some(&self.unsupported_api_version);
+        // and outputs. The version therefore chooses the MODEL that serves the request:
+        // this one, the ELBv2 one through its own front door, or neither. The whole rule
+        // is in [`api_version`].
+        match api_version::serving_model(req) {
+            // This model's own API version (or no `Version` field at all): the generated
+            // routing table resolves it, and an `Action` naming no modelled operation is
+            // the framework's own `400 InvalidAction` in this service's envelope.
+            ServingModel::Classic => None,
+            // The ELBv2 API version: served out of the ELBv2 model, over the one shared
+            // engine, which is how an AWS SDK ELBv2 client — signing the shared name and
+            // naming that version — reaches those operations at all.
+            ServingModel::V2 => Some(&self.elbv2),
+            // A version no Elastic Load Balancing model declares: an action/version pair
+            // nothing can resolve.
+            ServingModel::Unresolvable => Some(&self.unsupported_api_version),
         }
-        // Every other request resolves through the generated routing table, and an
-        // `Action` naming no modelled operation is the framework's own `400
-        // InvalidAction` in this service's envelope.
-        None
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
@@ -150,14 +161,17 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<aws_smithy_runtime_api::http::Response> {
-        // The router calls this when a request reached this service but named no
-        // modeled operation — neither `override_operation` nor the generated
-        // routing table resolved it. Returning `None` renders the protocol-correct
-        // default for this service's envelope (query -> 400 InvalidAction text/xml,
-        // awsJson -> 404, rpcv2Cbor -> 404, rest -> 501). Return `Some(resp)` to
-        // word that routing failure in your own envelope instead.
-        let _ = req;
-        None
+        // Reached when this model served the request (see `override_operation`) and its
+        // own routing table named no operation for the `Action`. That is the SAME
+        // unresolvable action/version pair the ELBv2 front door and the unknown-version
+        // refusal answer, so it is worded by the same renderer — `400 InvalidAction`
+        // naming the action and the version it could not be found for — rather than the
+        // framework's version-less default, which would word one refusal of this shared
+        // endpoint differently from the other two.
+        Some(api_version::unresolved_pair_response(
+            req,
+            api_version::CLASSIC_API_VERSION,
+        ))
     }
 
     fn override_framework_error(
