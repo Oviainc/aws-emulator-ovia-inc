@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdatePricingPlan
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdatePricingPlan`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdatePricingPlan::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Updates the stored pricing plan the request's `Arn` names: every member the request
+//! carries replaces the stored one, every member it omits keeps the value state already
+//! holds, `LastModifiedTime` moves to now, and the response reports the plan's whole
+//! state afterwards — including `Size`, the count of pricing rules currently associated
+//! with the plan, which is derived from the association rather than stored.
 //!
 //! ## Shape of an operation
 //!
@@ -165,18 +162,129 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdatePricingPlan` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdatePricingPlanErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdatePricingPlan"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdatePricingPlanErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the billingconductor store is unavailable".to_string(),
+                    retry_after_seconds: 0,
+                },
+            )
+            .into());
+        };
+        let mut state = state.lock();
+
+        // The `PricingPlanArn` pattern accepts the full ARN or the bare id, and both
+        // name the same stored plan.
+        let plan_arn = crate::state::normalize_pricing_plan_arn(&input.arn);
+
+        // The pattern also admits the plans Amazon Web Services owns
+        // (`BasicPricingPlan` / `Passthrough`, whose ARN carries the literal `aws`
+        // account segment). Those exist for every caller but belong to no account, so
+        // they are not a plan this account may modify — and this operation's modelled
+        // `ValidationException` enumerates exactly that reason. Answering 404 would
+        // contradict the rest of the service, which reports them as existing.
+        if crate::state::is_aws_managed_pricing_plan(&plan_arn) {
+            return Err(validation(
+                "MISMATCHED_PRICINGPLAN_ARN",
+                "Arn",
+                format!(
+                    "the pricing plan {plan_arn} is managed by Amazon Web Services and cannot \
+                     be updated"
+                ),
+            ));
+        }
+
+        let Some(stored) = state.pricing_plans.get(&plan_arn).cloned() else {
+            return Err(UpdatePricingPlanErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: "the pricing plan does not exist".to_string(),
+                    resource_id: plan_arn,
+                    resource_type: "pricingplan".to_string(),
+                },
+            )
+            .into());
+        };
+
+        // "The name must be unique to each pricing plan." Renaming a plan to the name
+        // it already carries is not a conflict: what the request asks for already holds.
+        if let Some(name) = input.name.as_deref() {
+            if let Some(owner) = state.conflicting_pricing_plan_name(name, &plan_arn) {
+                let owner = owner.to_string();
+                return Err(UpdatePricingPlanErrorModeled::ConflictException(
+                    ConflictException {
+                        message: "a pricing plan with this name already exists".to_string(),
+                        resource_id: owner,
+                        resource_type: "pricingplan".to_string(),
+                        reason: Some("RESOURCE_NAME_CONFLICT".to_string()),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // A member the request carries replaces the stored one; a member it omits keeps
+        // what state holds. Nothing else about the plan — its rule associations, its
+        // tags, its creation time — is this operation's to change.
+        let mut updated = stored.clone();
+        if let Some(name) = input.name.clone() {
+            updated.name = name;
+        }
+        if let Some(description) = input.description.clone() {
+            updated.description = Some(description);
+        }
+        updated.last_modified_time_millis = crate::state::now_millis();
+
+        // The name index follows the rename, so the old name frees up and the new one
+        // is taken by exactly this plan.
+        if updated.name != stored.name {
+            state.pricing_plan_names.remove(&stored.name);
+            state
+                .pricing_plan_names
+                .insert(updated.name.clone(), plan_arn.clone());
+        }
+        // `Size`: "The pricing rules count that's currently associated with this pricing
+        // plan list." Derived from the association the same state method every other
+        // reader of it uses, so the count cannot drift from the rules it counts — a plan
+        // that is associated with no rule counts 0, which is what this plan holds rather
+        // than the model's unenforced `@range(min: 1)` floor.
+        let size = state
+            .associated_pricing_rule_arns(&plan_arn)
+            .map(|arns| i64::try_from(arns.len()).unwrap_or(i64::MAX))
+            .unwrap_or_default();
+        let output = render(&updated, size);
+        state.pricing_plans.insert(plan_arn.clone(), updated);
+
+        // The audit record for a state-changing call: who asked, what changed and that
+        // it succeeded. Never a secret, and never a `@sensitive` member (the plan's name
+        // and description) — only the access key id the caller presented and the ARN it
+        // addressed.
+        ::tracing::info!(
+            operation = Self::NAME,
+            akid = %::engine::extract_akid(&ctx.parts().headers),
+            pricing_plan_arn = %plan_arn,
+            outcome = "updated",
+            "pricing plan updated"
+        );
+        Ok(output)
     }
+}
+
+/// The stored plan as this operation reports it. `Size` is passed in because it is
+/// derived from the plan's rule associations rather than held on the record.
+fn render(plan: &crate::state::PricingPlanRecord, size: i64) -> UpdatePricingPlanOutput {
+    UpdatePricingPlanOutput {
+        arn: Some(plan.arn.clone()),
+        name: Some(plan.name.clone()),
+        description: plan.description.clone(),
+        size,
+        last_modified_time: plan.last_modified_time_millis,
+    }
+}
+
+/// Refuse the request with this operation's modelled 400 `ValidationException`.
+fn validation(reason: &str, field: &str, message: String) -> UpdatePricingPlanError {
+    UpdatePricingPlanErrorModeled::ValidationException(crate::state::validation_exception(
+        reason, field, message,
+    ))
+    .into()
 }
