@@ -21,6 +21,8 @@ mod profiling_group_lifecycle;
 mod recommendations_analysis;
 #[path = "all/refusal_message_formats.rs"]
 mod refusal_message_formats;
+#[path = "all/refusal_message_rules.rs"]
+mod refusal_message_rules;
 #[path = "all/resource_policy.rs"]
 mod resource_policy;
 #[path = "all/resource_tags.rs"]

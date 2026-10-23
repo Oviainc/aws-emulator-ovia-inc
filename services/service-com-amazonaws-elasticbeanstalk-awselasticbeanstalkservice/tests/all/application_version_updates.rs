@@ -14,24 +14,12 @@
 //! the store: every value asserted is one the emulator answered over HTTP, and
 //! the stored state is read back through a later call.
 
-use crate::lifecycle::{account, Emulator, TEST_REGION};
+use crate::lifecycle::{account, instant, Emulator, TEST_REGION};
 
 /// The modelled maximum length of `Description`
 /// (`smithy_query(query="operation",operation="UpdateApplicationVersion")`:
 /// `Description` targets `Description` with `length { min: 0, max: 200 }`).
 const DESCRIPTION_MAX_LEN: usize = 200;
-
-/// `serialized` (an ISO 8601 timestamp the emulator answered) as the instant it
-/// denotes, so two timestamps are compared as instants rather than as strings.
-fn instant(serialized: &str, case: &str) -> ::aws_smithy_types::DateTime {
-    ::aws_smithy_types::DateTime::from_str(
-        serialized,
-        ::aws_smithy_types::date_time::Format::DateTime,
-    )
-    .unwrap_or_else(|error| {
-        panic!("case {case:?}: {serialized:?} must be an ISO 8601 timestamp: {error}")
-    })
-}
 
 /// One row of the description-update rule: what the version was created with,
 /// what the update supplies, and what the record must then report.

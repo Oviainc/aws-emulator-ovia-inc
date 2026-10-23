@@ -172,7 +172,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::PostedProfile::UnknownGroup => Err(
                 PostAgentProfileErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: crate::state::group_not_found_message(
+                        // The agent plane words a missing group its own way:
+                        // account-qualified, unlike every other operation's text.
+                        message: crate::state::agent_group_not_found_message(
                             &input.profiling_group_name,
                         ),
                     },

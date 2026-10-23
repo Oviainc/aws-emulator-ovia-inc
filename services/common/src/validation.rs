@@ -81,30 +81,35 @@
 //! no longer matches yields no leaf, so the framework's own text stands — but this module
 //! is to be deleted, not copied, once the core seam exists.
 //!
-//! # Still to migrate here (staged, not yet wired)
+//! # What of a validation message this module now owns, and what is still to come
 //!
-//! This module owns ONE part of a validation-exception message — which value a clause
-//! echoes. Three more parts are the same for EVERY service and still belong here:
+//! Three parts of a validation-exception message are the same for EVERY service, and two
+//! of them live here:
+//!
+//! * which value a clause echoes — the one the caller submitted ([`with_submitted_values`]),
+//!   and, for a clause stated at a collection member, the collection itself
+//!   ([`submitted_lists`]);
+//! * a `@pattern` printed as the expression a value has to satisfy, without the `^`/`$`
+//!   anchors a model writes to demand a whole-string match ([`unanchored`]) — LANDED here,
+//!   while ~26 service crates still carry their own inlined copy
+//!   (`grep -rln 'fn unanchored' services/*/src`), each pinned by that service's own
+//!   recordings and tests; deleting those copies in favour of this one is the migration's
+//!   own change, and nothing new should inline the rule again.
+//!
+//! Two parts still belong here and are not here yet:
 //!
 //! * the requirement half, read off the framework's own wording from a violation with NO
 //!   value attached and split at the LAST clause marker, so neither the rejected value
 //!   nor a caller-chosen map key in the member path can reach it;
 //! * the subject half: a service that reports a present-but-invalid value as
 //!   `Value at '<path>' …` without quoting it back, while an ABSENT member keeps
-//!   `Value null at '<path>' …`;
-//! * a `@pattern` printed as the expression a value has to satisfy, without the `^`/`$`
-//!   anchors a model writes to demand a whole-string match.
+//!   `Value null at '<path>' …`.
 //!
 //! How the clauses are then counted, ordered and joined into an envelope is a service
 //! DIALECT (`N validation error(s) detected: …,…` for Amazon EVS,
 //! `N validation errors detected: …; …` elsewhere, and `artifact` prints a `@pattern`
-//! WITH its anchors), so that half stays with the service. The three rules above are
-//! not a dialect, and the tree carries them inlined in ~24 service crates
-//! (`grep -rln 'fn unanchored' services/*/src`), each pinned by that service's own
-//! recordings and tests. Migrating them is one change of its own rather than a side
-//! effect of a single service's issue, so nothing is moved here by this module; the fix
-//! that owns that migration moves the rules here and calls them from the service crates.
-//! Nothing new should inline them again without leaving the same note.
+//! WITH its anchors), so that half stays with the service — as does which values an enum's
+//! value set lists and in which order.
 
 use std::collections::{HashMap, HashSet};
 
@@ -134,7 +139,37 @@ pub fn refusing_violations<O: Operation>(
     protocol: &dyn ServerHttpProtocol,
     req: &RtRequest,
 ) -> Vec<Violation> {
-    violations_in::<O>(protocol, req, Echoes::AsSubmitted)
+    violations_in::<O>(protocol, req, Echoes::Submitted).violations
+}
+
+/// As [`refusing_violations`], and with it every list of SCALAR elements the request
+/// carried — keyed by the member path the walk reports that list at, rendered as the value
+/// AWS states AT that member ([`submitted_lists`]).
+///
+/// For a service whose refusal states a constraint broken by a list's ELEMENTS at the LIST
+/// member: the framework reports such a violation at the element, while AWS reports it at
+/// the list and echoes the value that member holds — the whole list, which no violation
+/// carries. Collected together with the violations because both read the SAME built input,
+/// which is alive only inside this walk, and collected ONLY when a violation names a list
+/// element, so a request that satisfies the model pays for no second walk.
+///
+/// The map is EMPTY when the walk could not collect the request's leaves in full, so a
+/// clause can never state a list the caller did not send; see [`submitted_lists`].
+#[must_use]
+pub fn refusing_violations_with_lists<O: Operation>(
+    protocol: &dyn ServerHttpProtocol,
+    req: &RtRequest,
+) -> (Vec<Violation>, HashMap<String, String>) {
+    let refusing = violations_in::<O>(protocol, req, Echoes::SubmittedWithLists);
+    (refusing.violations, refusing.lists)
+}
+
+/// What one collecting walk found: the violations, and the request's lists when the caller
+/// asked for them ([`Echoes::SubmittedWithLists`]; otherwise empty).
+#[derive(Debug, Default)]
+pub(crate) struct Refusing {
+    pub(crate) violations: Vec<Violation>,
+    pub(crate) lists: HashMap<String, String>,
 }
 
 /// Whether a collected violation's value echo is restored to the bytes the caller sent.
@@ -145,9 +180,11 @@ pub fn refusing_violations<O: Operation>(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Echoes {
     /// Restore each echo through [`with_submitted_values`].
-    AsSubmitted,
+    Submitted,
     /// Leave the framework's own rendering in place.
-    AsRendered,
+    Rendered,
+    /// Restore each echo, and collect the request's lists too ([`submitted_lists`]).
+    SubmittedWithLists,
 }
 
 /// The ONE collecting walk this crate performs: every violation that refuses `req` before
@@ -162,9 +199,9 @@ pub(crate) fn violations_in<O: Operation>(
     protocol: &dyn ServerHttpProtocol,
     req: &RtRequest,
     echoes: Echoes,
-) -> Vec<Violation> {
+) -> Refusing {
     let Ok(mut deserializer) = protocol.deserialize_input(req, O::INPUT_SCHEMA) else {
-        return Vec::new();
+        return Refusing::default();
     };
     let read = <O::Input as DeserializableStruct>::deserialize(&mut *deserializer);
     drop(deserializer);
@@ -172,10 +209,30 @@ pub(crate) fn violations_in<O: Operation>(
         Ok(input) => {
             let violations = constraints::validate(&input, O::INPUT_SCHEMA);
             match echoes {
-                Echoes::AsSubmitted => {
-                    with_submitted_values(violations, &input, O::INPUT_SCHEMA)
+                Echoes::Submitted => Refusing {
+                    violations: with_submitted_values(violations, &input, O::INPUT_SCHEMA),
+                    lists: HashMap::new(),
+                },
+                Echoes::Rendered => Refusing {
+                    violations,
+                    lists: HashMap::new(),
+                },
+                Echoes::SubmittedWithLists => {
+                    // The lists are only ever READ for a violation found on a list
+                    // ELEMENT, so a request that broke no such constraint — which is every
+                    // request that satisfies the model — pays nothing for them.
+                    let wanted = violations
+                        .iter()
+                        .any(|violation| list_of_element(&violation.path).is_some());
+                    Refusing {
+                        violations: with_submitted_values(violations, &input, O::INPUT_SCHEMA),
+                        lists: if wanted {
+                            submitted_lists(&input, O::INPUT_SCHEMA)
+                        } else {
+                            HashMap::new()
+                        },
+                    }
                 }
-                Echoes::AsRendered => violations,
             }
         }
         // Absence is found while READING the request and a bad value while walking what
@@ -183,12 +240,15 @@ pub(crate) fn violations_in<O: Operation>(
         // is already a violation path in the spelling the constraint walk uses
         // (`aws_smithy_schema_server::missing_member` applies `path::member`, and each
         // enclosing member prepends its own segment), so it places identically.
-        Err(SerdeError::MissingMember { member_name }) => vec![Violation {
-            path: member_name,
-            kind: ViolationKind::MissingRequiredMember,
-            value: None,
-        }],
-        Err(_) => Vec::new(),
+        Err(SerdeError::MissingMember { member_name }) => Refusing {
+            violations: vec![Violation {
+                path: member_name,
+                kind: ViolationKind::MissingRequiredMember,
+                value: None,
+            }],
+            lists: HashMap::new(),
+        },
+        Err(_) => Refusing::default(),
     }
 }
 
@@ -337,13 +397,91 @@ fn rendered_list(elements: &[&str]) -> String {
     format!("[{}]", elements.join(", "))
 }
 
+/// `regex` without the whole-value anchors a model adds to express the match AWS's own
+/// pattern makes implicitly: the requirement a refusal states is the expression a value has
+/// to satisfy, and the `^` / `$` are how Smithy turns a find into a whole-string match
+/// rather than part of the character grammar — so a client that lifts the expression out of
+/// the message and re-validates locally gets the one the service advertises.
+///
+/// THE STAGED HOME for this rendering, which the module docs above list as one of the parts
+/// of a validation message that are AWS's rather than any one service's. ~26 service crates
+/// carry their own inlined copy (`grep -rln 'fn unanchored' services/*/src`), each pinned by
+/// that service's own recordings; those copies are to be DELETED in favour of this one by the
+/// change that owns that migration, and nothing new should inline the rule again.
+///
+/// The pair is dropped only when BOTH ends carry it AND the pair WRAPS the whole
+/// expression: a `^` alone, or a `$` alone, is an expression anchored at one end — a
+/// different expression, not an anchored spelling of this one — and in an alternation
+/// (`^a$|^b$`, `^a|b$`) the outer `^` and `$` govern only their own branch, so dropping
+/// them would state an expression the service never evaluated. Both are then emitted
+/// verbatim. A `$` that is ESCAPED is a literal dollar, not an anchor, so it stays. (The
+/// older per-crate copies drop a trailing `$` without either check, so this one is the
+/// stricter of the two renderings.)
+#[must_use]
+pub fn unanchored(regex: &str) -> String {
+    let Some(body) = regex.strip_prefix('^') else {
+        return regex.to_string();
+    };
+    match body.strip_suffix('$') {
+        Some(inner) if !ends_with_escape(inner) && wraps_whole_expression(inner) => {
+            inner.to_string()
+        }
+        _ => regex.to_string(),
+    }
+}
+
+/// Whether a `^`/`$` pair around `text` anchors the WHOLE expression, which is what a
+/// whole-value pattern's pair does.
+///
+/// It does not when `text` carries an anchor of its own (so the outer pair belongs to the
+/// branches of an alternation, `^a$|^b$`), nor when `text` alternates at the top level
+/// (`^a|b$`, where the `^` governs only the first branch and the `$` only the last). A `^`,
+/// `$` or `|` inside a character class is a literal or a negation marker rather than an
+/// anchor or an alternation, and one inside a group alternates only within that group
+/// (`^(a|b)$` IS wrapped), so the scan tracks class and group context. Escapes are honoured
+/// throughout.
+fn wraps_whole_expression(text: &str) -> bool {
+    let mut escaped = false;
+    let mut in_class = false;
+    let mut depth = 0_usize;
+    for character in text.chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match character {
+            '\\' => escaped = true,
+            '[' if !in_class => in_class = true,
+            ']' if in_class => in_class = false,
+            _ if in_class => {}
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            '^' | '$' => return false,
+            '|' if depth == 0 => return false,
+            _ => {}
+        }
+    }
+    true
+}
+
+/// Whether `text` ends in an escape — an odd number of trailing backslashes, so the
+/// character that followed them was escaped.
+fn ends_with_escape(text: &str) -> bool {
+    text.chars().rev().take_while(|c| *c == '\\').count() % 2 == 1
+}
+
 /// The list path a leaf is a SCALAR ELEMENT of, if it is one.
 ///
 /// A list element's path is `<list>.<1-based position>.member`
 /// ([`aws_smithy_schema_server::constraints::path::element`]), so the list is that path
 /// minus those two segments. Anything else — a struct member, a map entry value — belongs
 /// to no list's uniqueness check.
-fn list_of_element(leaf_path: &str) -> Option<&str> {
+///
+/// Public because a service that states a clause at the LIST member when one of its
+/// ELEMENTS failed has to recognise an element path to do it, and that spelling belongs
+/// with the walk that mirrors it rather than being re-derived per service.
+#[must_use]
+pub fn list_of_element(leaf_path: &str) -> Option<&str> {
     let head = leaf_path.strip_suffix(".member")?;
     let (list, position) = head.rsplit_once('.')?;
     let is_position = !position.is_empty() && position.bytes().all(|byte| byte.is_ascii_digit());
@@ -365,6 +503,54 @@ fn is_elision_of(stored: &str, submitted: &str) -> bool {
         .is_some_and(|prefix| prefix.len() < submitted.len() && submitted.starts_with(prefix))
 }
 
+/// Every list of SCALAR elements `input` carried, keyed by the member path the validating
+/// walk reports that list at, and rendered as the value AWS states AT that member: the
+/// elements in position order, comma-separated, in brackets ([`rendered_list`]).
+///
+/// What this is for: a constraint on a list's element shape is violated by ONE element and
+/// the framework reports it at that element (`eventPublishers.1.member`), while AWS reports
+/// it at the list member and echoes the value that member holds — the WHOLE list, which no
+/// violation carries. A service wording such a clause reads the list from here rather than
+/// rebuilding the walk, and never from a violation.
+///
+/// A list this walk could not collect in FULL is NOT offered, so a clause can never state
+/// a list the caller did not send. The leaf collection is bounded ([`MAX_RECORDED_LEAVES`],
+/// [`MAX_RESTORED_ECHO`], [`MAX_RECORDED_BYTES`]) and a leaf those bounds drop leaves a hole
+/// the leaves alone cannot reveal — a short list reads exactly like a short list the caller
+/// sent — so once ANY leaf has been dropped ([`SubmittedValues::skipped`]) nothing is
+/// offered at all and the framework's own echo stands. Within the bounds every rendering is
+/// covered by [`MAX_RECORDED_BYTES`], the budget the leaves themselves were collected
+/// under.
+///
+/// A list whose elements have no string rendering (a list of structures, a list of blobs)
+/// contributes no entry either, for the same reason: its elements are not recorded.
+#[must_use]
+pub fn submitted_lists(
+    input: &dyn SerializableStruct,
+    schema: &Schema,
+) -> HashMap<String, String> {
+    let (leaves, complete) = collected_leaves(input, schema);
+    if !complete {
+        return HashMap::new();
+    }
+    let mut elements: HashMap<&str, Vec<&str>> = HashMap::new();
+    let mut order: Vec<&str> = Vec::new();
+    for (leaf_path, value) in &leaves {
+        let Some(list) = list_of_element(leaf_path) else {
+            continue;
+        };
+        let held = elements.entry(list).or_default();
+        if held.is_empty() {
+            order.push(list);
+        }
+        held.push(value.as_str());
+    }
+    order
+        .into_iter()
+        .map(|list| (list.to_string(), rendered_list(&elements[list])))
+        .collect()
+}
+
 /// Every string-rendered leaf of `input` this walk is allowed to collect, in walk order,
 /// paired with the dotted member path the validating walk reports a violation on it at.
 ///
@@ -383,11 +569,25 @@ pub fn submitted_leaves(
     input: &dyn SerializableStruct,
     schema: &Schema,
 ) -> Vec<(String, String)> {
+    collected_leaves(input, schema).0
+}
+
+/// The collected leaves of `input`, and whether the collection is COMPLETE — false once any
+/// string-rendered leaf was dropped by one of the stated bounds (see
+/// [`SubmittedValues::skipped`]).
+///
+/// A caller that reads ONE named leaf does not care: a dropped leaf yields no candidate and
+/// the framework's own text stands. A caller that reads a whole COLLECTION does, because a
+/// hole in the leaves is invisible in the collection it renders.
+fn collected_leaves(
+    input: &dyn SerializableStruct,
+    schema: &Schema,
+) -> (Vec<(String, String)>, bool) {
     let mut walk = SubmittedValues::default();
     // The root input is a struct; drive it the way a codec — and the validating walk —
     // does.
     let _ = walk.write_struct(schema, input);
-    walk.leaves
+    (walk.leaves, !walk.skipped)
 }
 
 /// A frame of the collection stack, mirroring the one the validating walk keeps so a
@@ -428,12 +628,26 @@ struct SubmittedValues {
     path: Vec<String>,
     /// Active collection frames, innermost last.
     collections: Vec<Frame>,
+    /// Set once any string-rendered leaf was DROPPED rather than recorded — because the
+    /// leaf cap stopped the walk, or because one value was larger than
+    /// [`MAX_RESTORED_ECHO`], or because the byte budget was spent. The collection is then
+    /// no longer a faithful picture of the request, which matters to a caller that reads a
+    /// WHOLE collection out of it ([`submitted_lists`]) rather than one named leaf: with a
+    /// leaf missing, a list would render short, stating a value the caller never sent.
+    /// Restoring a single named echo is unaffected, since an absent leaf simply yields no
+    /// candidate.
+    skipped: bool,
 }
 
 impl SubmittedValues {
     /// True once no further leaf can be recorded, so the rest of the walk is skipped.
-    fn done(&self) -> bool {
-        self.leaves.len() >= MAX_RECORDED_LEAVES
+    ///
+    /// Reaching the cap also means a leaf the walk has not got to will be dropped, so it
+    /// records that the collection is incomplete.
+    fn done(&mut self) -> bool {
+        let done = self.leaves.len() >= MAX_RECORDED_LEAVES;
+        self.skipped |= done;
+        done
     }
 
     /// The lowerCamel path segment for `schema`, if it is a member schema.
@@ -491,10 +705,12 @@ impl SubmittedValues {
         };
         // A value no clause could carry anyway (see `MAX_RESTORED_ECHO`), or one that
         // does not fit what is left of the byte budget, is not copied at all. A later,
-        // smaller leaf can still be recorded, so this is not terminal.
+        // smaller leaf can still be recorded, so this is not terminal — but the collection
+        // now has a hole in it, which `skipped` records.
         let leaf_path = path::join(&self.path);
         let bytes = leaf_path.len() + value.len();
         if value.len() > MAX_RESTORED_ECHO || self.recorded + bytes > MAX_RECORDED_BYTES {
+            self.skipped = true;
             return;
         }
         self.recorded += bytes;
@@ -713,10 +929,82 @@ impl ShapeSerializer for SubmittedValues {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_elision_of, list_of_element, Submitted, MAX_RECORDED_BYTES, MAX_RECORDED_LEAVES,
-        MAX_RESTORED_ECHO, MAX_RESTORED_TOTAL,
+        is_elision_of, list_of_element, Submitted, SubmittedValues, MAX_RECORDED_BYTES,
+        MAX_RECORDED_LEAVES, MAX_RESTORED_ECHO, MAX_RESTORED_TOTAL,
     };
     use aws_smithy_schema_server::constraints::{Violation, ViolationKind};
+
+    /// RULE: the collection is COMPLETE only while every string-rendered leaf was
+    /// recorded; any leaf one of the stated bounds drops marks it incomplete, which is what
+    /// stops [`super::submitted_lists`] from offering a collection with a hole in it.
+    #[test]
+    fn a_leaf_a_bound_dropped_marks_the_collection_incomplete() {
+        // (case, the leaf values written in order, whether the walk stayed complete)
+        let rows: [(&str, Vec<String>, bool); 5] = [
+            ("nothing written at all", Vec::new(), true),
+            (
+                "two small leaves",
+                vec!["first".to_string(), "second".to_string()],
+                true,
+            ),
+            (
+                "a leaf at the per-value ceiling",
+                vec!["x".repeat(MAX_RESTORED_ECHO)],
+                true,
+            ),
+            (
+                "a leaf one byte past the per-value ceiling",
+                vec!["x".repeat(MAX_RESTORED_ECHO + 1)],
+                false,
+            ),
+            (
+                "leaves that exhaust the byte budget",
+                (0..=MAX_RECORDED_BYTES / MAX_RESTORED_ECHO)
+                    .map(|_| "y".repeat(MAX_RESTORED_ECHO))
+                    .collect(),
+                false,
+            ),
+        ];
+
+        for (case, values, expected) in rows {
+            let mut walk = SubmittedValues::default();
+            walk.path.push("member".to_string());
+            for value in &values {
+                walk.record(Some(value));
+            }
+            assert_eq!(
+                !walk.skipped, expected,
+                "case {case:?}: expected complete == {expected}, got {} (recorded {} leaves)",
+                !walk.skipped,
+                walk.leaves.len()
+            );
+        }
+    }
+
+    /// RULE: reaching the leaf cap also marks the collection incomplete — the walk stops
+    /// there, so a leaf beyond it is a leaf that was dropped.
+    #[test]
+    fn the_leaf_cap_marks_the_collection_incomplete() {
+        let mut walk = SubmittedValues::default();
+        walk.path.push("member".to_string());
+        assert!(
+            !walk.done() && !walk.skipped,
+            "case an empty walk: expected it to be complete and not done"
+        );
+        for index in 0..MAX_RECORDED_LEAVES {
+            walk.record(Some(&index.to_string()));
+        }
+        assert_eq!(
+            walk.leaves.len(),
+            MAX_RECORDED_LEAVES,
+            "case a full walk: expected the cap to be reached, got {} leaves",
+            walk.leaves.len()
+        );
+        assert!(
+            walk.done() && walk.skipped,
+            "case a full walk: expected it to be done and incomplete"
+        );
+    }
 
     /// RULE: a stored echo is the submitted value's elision when it is that value, or a
     /// proper prefix of it followed by the marker naming the value's byte count.

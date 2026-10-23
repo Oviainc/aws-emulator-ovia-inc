@@ -145,7 +145,8 @@ pub fn body_violations<O: Operation>(
     // find a different violation set from the framework's own; the echo is left as the
     // framework rendered it, because a front door's answer quotes no value. The narrowing
     // below is this module's own rule.
-    crate::validation::violations_in::<O>(protocol, req, crate::validation::Echoes::AsRendered)
+    crate::validation::violations_in::<O>(protocol, req, crate::validation::Echoes::Rendered)
+        .violations
         .into_iter()
         .filter(|violation| binds_to_body(O::INPUT_SCHEMA, &violation.path))
         .collect()

@@ -544,6 +544,12 @@ async fn every_other_group_scoped_operation_states_its_own_not_found_text() {
     // One row per IMPLEMENTED operation that resolves a profiling group by name, read
     // and write alike, over names that were never created. The method, the URI shape and
     // the body differ per row; the refusal does not.
+    //
+    // The AGENT plane — `ConfigureAgent` and `PostAgentProfile`, the two operations the
+    // model's own `ActionGroup` enum names as the agent APIs — is NOT here: a recorded
+    // `ConfigureAgent` refusal states an account-qualified sentence of its own
+    // ("Profiling group for <accountId>/<name> does not exist!"), which
+    // `refusal_message_rules.rs` pins over both of them.
     let names = ["never-created", "Absent_1", "a-b-c"];
     for name in names {
         let cases: Vec<(&str, &str, String, &str, Vec<u8>)> = vec![            (
@@ -562,20 +568,6 @@ async fn every_other_group_scoped_operation_states_its_own_not_found_text() {
                     "agentOrchestrationConfig": {"profilingEnabled": true}
                 }))
                 .expect("a serializable body"),
-            ),
-            (
-                "ConfigureAgent",
-                "POST",
-                format!("/profilingGroups/{name}/configureAgent"),
-                "application/json",
-                serde_json::to_vec(&serde_json::json!({})).expect("a serializable body"),
-            ),
-            (
-                "PostAgentProfile",
-                "POST",
-                format!("/profilingGroups/{name}/agentProfile?profileToken=tok-1"),
-                "application/json",
-                b"{\"profile\":\"payload\"}".to_vec(),
             ),
             (
                 "GetProfile",

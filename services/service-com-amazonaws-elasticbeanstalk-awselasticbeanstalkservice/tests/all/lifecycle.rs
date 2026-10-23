@@ -298,6 +298,25 @@ pub(crate) fn account() -> &'static str {
     engine::emulator_account_id()
 }
 
+/// A timestamp this service rendered, as the INSTANT it names.
+///
+/// Two timestamps are ordered as instants, never as text: the `date-time` rendering
+/// the query protocol uses carries a variable-width fractional second, so `Z` can
+/// land where a digit lands in the other string (`"…:05.2Z"` vs `"…:05.25Z"`, where
+/// `Z` sorts AFTER `5`) and a lexicographic comparison of two correctly ordered
+/// timestamps then fails. Shared, so every suite of this target orders a timestamp
+/// the one way.
+pub(crate) fn instant(rendered: &str, case: &str) -> f64 {
+    ::aws_smithy_types::DateTime::from_str(
+        rendered,
+        ::aws_smithy_types::date_time::Format::DateTime,
+    )
+    .unwrap_or_else(|error| {
+        panic!("case {case:?}: expected an ISO-8601 timestamp, got {rendered:?}: {error}")
+    })
+    .as_secs_f64()
+}
+
 // ---------------------------------------------------------------------------
 // The lifecycle, end to end
 // ---------------------------------------------------------------------------

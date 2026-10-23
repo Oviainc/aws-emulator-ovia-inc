@@ -757,6 +757,24 @@ pub fn profiling_group_arn(region: &str, name: &str) -> String {
     )
 }
 
+/// How the AGENT plane says that the profiling group a request names does not exist: its
+/// message is account-qualified, naming the account the group would belong to as well as
+/// the group — a different sentence from the one every other operation states
+/// ([`group_not_found_message`]).
+///
+/// The agent plane is `ConfigureAgent` and `PostAgentProfile` — the two operations the
+/// model's own `ActionGroup` enum names as the agent APIs ("Permission group type for Agent
+/// APIs - ConfigureAgent, PostAgentProfile",
+/// `smithy_query(query="shape", shape="com.amazonaws.codeguruprofiler#ActionGroup")`). The
+/// account is the emulator's canonical one, the same account every ARN this service mints
+/// carries.
+pub fn agent_group_not_found_message(name: &str) -> String {
+    format!(
+        "Profiling group for {}/{name} does not exist!",
+        ::engine::emulator_account_id()
+    )
+}
+
 /// Why a caller-supplied `resourceArn` that names no profiling group of this service is
 /// refused on the INPUT: it names the member and the form the member must take, so the
 /// caller can fix the request from the message alone.
