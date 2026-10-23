@@ -46,7 +46,15 @@ impl Emulator {
         router.register_service(
             service_com_amazonaws_ssmcontacts_ssmcontacts::EmulatedService::new(engine.clone()),
         );
-        Self { router, engine }
+        let emulator = Self { router, engine };
+        // Amazon SSM Contacts is fronted by the account's Incident Manager replication
+        // set: a contact resource lives in that set's Regions, so a write is refused
+        // until the account has an ACTIVE one (`tests/all/replication_set_precondition.rs`
+        // is the suite about that rule). This suite is about the contact lifecycle on an
+        // ONBOARDED account, so it installs the set through the one shared fixture every
+        // suite uses.
+        crate::contact_updates::onboard(&emulator);
+        emulator
     }
 
     /// How many entries the idempotency-replay ledger holds right now.

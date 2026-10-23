@@ -132,6 +132,8 @@ mod scheduler_execution_role;
 mod servicecatalog_signing_name_routing;
 #[path = "all/shared_signing_name_routing.rs"]
 mod shared_signing_name_routing;
+#[path = "all/ssm_contacts_replication_set.rs"]
+mod ssm_contacts_replication_set;
 #[path = "all/transcribe_signing_name_routing.rs"]
 mod transcribe_signing_name_routing;
 #[path = "all/transfer_user_with_iam_role.rs"]

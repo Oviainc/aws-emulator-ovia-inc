@@ -8,6 +8,12 @@
 //! engage the contact through", and `SendActivationCode`/`ActivateContactChannel` are
 //! what move it — so the create never activates one.
 //!
+//! The ACCOUNT-level Incident Manager precondition
+//! ([`crate::state::ComAmazonawsSsmcontactsSsmcontactsState::require_active_replication_set`])
+//! is evaluated FIRST: the channel lives in the Regions of the account's replication set,
+//! so an account with no ACTIVE one is refused with the modelled `ValidationException`
+//! (HTTP 400) before `ContactId` is resolved and before anything is minted.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -188,6 +194,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        let mut state = state.lock();
+
+        // The account gate comes FIRST: a contact channel lives in the Regions of the
+        // account's Incident Manager replication set, so until the account has an ACTIVE
+        // one there is no home Region to create it in and the call is refused rather than
+        // serviced — before `ContactId` is resolved, and before anything is written.
+        state
+            .require_active_replication_set()
+            .map_err(account_precondition_failed)?;
+
         // An enum SHAPE reaches a handler as a plain string, so the permitted set is
         // checked here against the model-derived value list.
         check_enum("type", &input.r#type, CHANNEL_TYPE_VALUES).map_err(validation)?;
@@ -204,8 +220,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ))
             }
         };
-
-        let mut state = state.lock();
 
         // The referenced contact is resolved BEFORE any replay: a token does not excuse a
         // `ContactId` that names nothing, so a retry pointed at a different or absent
@@ -291,7 +305,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// `ActivationStatus` value set.
 const NOT_ACTIVATED: &str = "NOT_ACTIVATED";
 
-/// This operation's modelled `ValidationException`, carrying `message`.
+/// The account precondition's refusal: this operation's modelled `ValidationException`,
+/// which the model classifies `client` with `httpError` 400.
+///
+/// `reason` carries `OTHER` (the account-level failure is none of the model's
+/// `CANNOT_PARSE`/`FIELD_VALIDATION_FAILED`/`UNKNOWN_OPERATION`) and `fields` is present
+/// but EMPTY, because no member of the request is at fault.
+fn account_precondition_failed(message: String) -> CreateContactChannelError {
+    CreateContactChannelErrorModeled::ValidationException(ValidationException {
+        message,
+        reason: Some("OTHER".to_string()),
+        fields: Some(Vec::new()),
+    })
+    .into()
+}
+
+/// A member-level refusal: this operation's modelled `ValidationException`, carrying
+/// `message`.
 fn validation(message: impl Into<String>) -> CreateContactChannelError {
     CreateContactChannelErrorModeled::ValidationException(ValidationException {
         message: message.into(),

@@ -17,11 +17,12 @@
 //!
 //! Besides the state itself this module holds the helpers more than one operation needs —
 //! ARN minting, the page/token codec, the shared enum check and the output-shape
-//! rebuilders — so the handlers of the contact/channel lifecycle cannot drift apart. The
-//! account-level Incident Manager precondition lives here too
+//! rebuilders — so the handlers of the contact/channel lifecycle cannot drift apart.
+//!
+//! The account-level Incident Manager precondition lives here too
 //! ([`ComAmazonawsSsmcontactsSsmcontactsState::require_active_replication_set`]): it is the
-//! same gate for every data-plane operation, so it is written once and consulted from each
-//! handler.
+//! same gate for every replication-set-scoped operation, so it is written once and
+//! consulted from each handler.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::SystemTime;
@@ -91,28 +92,6 @@ pub struct ContactChannelRecord {
     pub created_at: SystemTime,
 }
 
-/// The account's Incident Manager replication set, as the contact data plane sees it.
-///
-/// Amazon SSM Contacts is fronted by a per-account Incident Manager replication set: until
-/// the account has an ACTIVE one, contact resources have no home region and the contact
-/// data plane refuses the call — with the modelled `ValidationException`, BEFORE the named
-/// resource is resolved — rather than reporting the resource missing. The replication set
-/// is minted by Incident Manager's own `CreateReplicationSet`
-/// (`services/service-com-amazonaws-ssmincidents-ssmincidents/src/ops/create_replication_set.rs`),
-/// which AWS deprecated on 2025-11-07 and that handler refuses unconditionally, so in this
-/// emulator no call onboards an account and
-/// [`ComAmazonawsSsmcontactsSsmcontactsState::replication_set`] stays `None` — exactly what
-/// an account that was never onboarded sees from AWS today. The record is still read rather
-/// than assumed, so the serviced path is reachable whenever the store does hold one.
-#[derive(Debug, Clone)]
-pub struct AccountReplicationSet {
-    /// The replication-set ARN Incident Manager minted for this account.
-    pub arn: String,
-    /// Whether the set has finished replicating. Only an ACTIVE set opens the contact data
-    /// plane; a set still being created or deleted does not.
-    pub active: bool,
-}
-
 /// What `CreateRotation` persists, and what `ListRotations` rebuilds its summaries from.
 #[derive(Debug, Clone)]
 pub struct RotationRecord {
@@ -172,12 +151,30 @@ pub struct EngagementRecord {
     pub stop_reason: Option<String>,
 }
 
+/// The account's Incident Manager replication set, as the services FRONTED by it see it.
+///
+/// Amazon SSM Contacts is a global service whose contacts, escalation plans, on-call
+/// schedules and engagements live in the Regions of this per-account set, so it is what
+/// decides whether the account can reach the contact data plane at all. Only `active`
+/// opens it: a set that has not finished replicating is no home Region yet.
+#[derive(Debug, Clone)]
+pub struct AccountReplicationSet {
+    /// The `ssm-incidents` ARN of the set.
+    pub arn: String,
+    /// Whether the set has finished replicating (`ReplicationSetStatus` `ACTIVE`).
+    pub active: bool,
+}
+
 /// Per-service state for com-amazonaws-ssmcontacts-ssmcontacts. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsSsmcontactsSsmcontactsState {
-    /// The account's Incident Manager replication set, when it has one — the
-    /// account-level precondition every contact data-plane call is gated on. See
-    /// [`AccountReplicationSet`] for why the shipped value is `None`.
+    /// The account's Incident Manager replication set, when it has one.
+    ///
+    /// `None` is an account that was never onboarded, which is what an emulated account
+    /// normally is: Incident Manager's own `CreateReplicationSet` is the only call that
+    /// mints a set and AWS deprecated it on 2025-11-07, so nothing over the wire can
+    /// onboard one. Every replication-set-scoped operation consults it through
+    /// [`ComAmazonawsSsmcontactsSsmcontactsState::require_active_replication_set`].
     pub replication_set: Option<AccountReplicationSet>,
     /// Contacts and escalation plans, keyed by `ContactArn`.
     pub contacts: BTreeMap<String, ContactRecord>,
@@ -723,7 +720,7 @@ pub fn invalid_next_token_message(token: &str) -> String {
 /// Incident Manager replication set with.
 ///
 /// The refusal's REQUIREMENT is its class — HTTP 400 with the error code
-/// `ValidationException`, not a 404 — so the text here is the example AWS was recorded
+/// `ValidationException`, not a 404 — so the text is the example AWS was recorded
 /// answering with for exactly this precondition; it names the account rather than any
 /// member of the request, because no member is at fault.
 pub const ACCOUNT_NOT_FOUND_MESSAGE: &str =
