@@ -35,6 +35,8 @@ mod pii_entities_jobs;
 mod realtime_text_quotas;
 #[path = "all/request_validation.rs"]
 mod request_validation;
+#[path = "all/resource_tags.rs"]
+mod resource_tags;
 #[path = "all/sentiment_jobs.rs"]
 mod sentiment_jobs;
 #[path = "all/state_roundtrip.rs"]

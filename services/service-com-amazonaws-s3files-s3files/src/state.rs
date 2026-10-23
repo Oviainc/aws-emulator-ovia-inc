@@ -602,6 +602,112 @@ pub fn request_region(ctx: &smithy_server_runtime::OperationContext<'_>) -> Stri
         .unwrap_or_else(|| DEFAULT_REGION.to_string())
 }
 
+/// The S3 bucket name a `BucketArn` names.
+///
+/// `BucketArn` is `^(arn:aws[a-zA-Z0-9-]*:s3:::.+)$` (smithy_query: shape BucketArn): an
+/// S3 bucket ARN carries no region and no account, so the whole resource part — all of
+/// it, whichever partition the ARN names — is the bucket's name. `None` for a value that
+/// is not an S3 bucket ARN at all: nothing can be resolved from it, so no refusal may be
+/// grounded in it either.
+pub fn bucket_name_of(bucket_arn: &str) -> Option<&str> {
+    let (partition, name) = bucket_arn.split_once(":s3:::")?;
+    if !partition.starts_with("arn:aws") {
+        return None;
+    }
+    (!name.is_empty()).then_some(name)
+}
+
+/// The message S3 Files answers when the `bucket` ARN names a bucket that does not
+/// exist.
+///
+/// The HTTP 404 and the `ResourceNotFoundException` code are what a client branches on;
+/// this is the fixed sentence the service states the condition in (the wording AWS
+/// answers), and it carries no value out of the request.
+pub const BUCKET_NOT_FOUND_MESSAGE: &str = "The bucket you specified does not exist.";
+
+/// Whether S3 reports that the bucket named by the `bucket` ARN does not exist.
+///
+/// `CreateFileSystemRequest$bucket` documents the requirement — "The bucket must exist
+/// and be in the same Amazon Web Services Region as the file system" — so a file system
+/// may only be minted for a bucket the owning service actually holds. S3 is reached the
+/// way the framework documents a handler reaching another emulated service
+/// ([`smithy_server_runtime::OperationContext::callback`]): an AWS SDK client over the
+/// in-process callback's HTTP client and credentials provider, exactly as `scheduler`
+/// resolves a schedule's execution role against IAM. The question is put with
+/// `HeadBucket`, the operation S3 documents for it ("You can use this operation to
+/// determine if a bucket exists"). This crate therefore names no other service crate,
+/// and signing, addressing, encoding and the typed `NotFound` all come from the SDK.
+///
+/// `false` means the create may proceed. That INCLUDES every answer that is not S3
+/// reporting the bucket absent — a router with no S3 mounted, or any other failure to
+/// ask: nothing is then known about the bucket, and a refusal has to be grounded in what
+/// S3 answered, never assumed.
+pub async fn bucket_is_absent(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    bucket_arn: &str,
+) -> bool {
+    let Some(bucket) = bucket_name_of(bucket_arn) else {
+        return false;
+    };
+    let config = ::aws_sdk_s3::Config::builder()
+        .behavior_version(::aws_sdk_s3::config::BehaviorVersion::latest())
+        .http_client(ctx.callback().http_client())
+        .credentials_provider(ctx.callback().aws_credentials_provider())
+        .region(::aws_sdk_s3::config::Region::new(region.to_string()))
+        .endpoint_url(format!("https://s3.{region}.amazonaws.com"))
+        // The emulator serves one endpoint for every service, so the bucket travels in
+        // the path rather than in a per-bucket host the router could not resolve.
+        .force_path_style(true)
+        // The transport is in-process: there is nothing to retry, time out or watch for
+        // a stalled stream, and each of those would need a sleep implementation this
+        // client is not given. The same goes for caching the identity: the credentials
+        // are handed over directly.
+        .retry_config(::aws_sdk_s3::config::retry::RetryConfig::disabled())
+        .timeout_config(::aws_sdk_s3::config::timeout::TimeoutConfig::disabled())
+        .identity_cache(::aws_sdk_s3::config::IdentityCache::no_cache())
+        .stalled_stream_protection(
+            ::aws_sdk_s3::config::StalledStreamProtectionConfig::disabled(),
+        )
+        .build();
+    let answer = ::aws_sdk_s3::Client::from_conf(config)
+        .head_bucket()
+        .bucket(bucket)
+        .send()
+        .await;
+    match answer {
+        // S3 holds the bucket.
+        Ok(_) => false,
+        // S3 says this account holds no such bucket: the refusal is grounded.
+        Err(error) if bucket_reported_absent(&error) => true,
+        // Any other answer is this emulator failing to ask, not S3 reporting a missing
+        // bucket, so it refuses nothing — and it is worth a warning, because a
+        // deployment with no S3 to ask is one where this gate does not run.
+        Err(error) => {
+            ::tracing::warn!(
+                %bucket_arn,
+                error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
+                "the file system's bucket could not be resolved against S3"
+            );
+            false
+        }
+    }
+}
+
+/// Whether an S3 `HeadBucket` failure is S3 reporting that the bucket does not exist
+/// (`NotFound`, the only error that operation models), as opposed to the call not
+/// reaching S3.
+fn bucket_reported_absent(
+    error: &::aws_sdk_s3::error::SdkError<
+        ::aws_sdk_s3::operation::head_bucket::HeadBucketError,
+        ::aws_smithy_runtime_api::client::orchestrator::HttpResponse,
+    >,
+) -> bool {
+    error
+        .as_service_error()
+        .is_some_and(::aws_sdk_s3::operation::head_bucket::HeadBucketError::is_not_found)
+}
+
 /// A `FileSystemArn`: `arn:aws:s3files:<region>:<account>:file-system/<fileSystemId>`,
 /// the form the model documents on `CreateFileSystemResponse$fileSystemArn`.
 pub fn file_system_arn(region: &str, file_system_id: &str) -> String {

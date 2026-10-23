@@ -17,6 +17,8 @@ mod account_configuration;
 mod account_configuration_tokens;
 #[path = "all/acme_account_listing.rs"]
 mod acme_account_listing;
+#[path = "all/acme_directory_endpoint.rs"]
+mod acme_directory_endpoint;
 #[path = "all/acme_endpoint_lifecycle.rs"]
 mod acme_endpoint_lifecycle;
 #[path = "all/acme_endpoint_update.rs"]

@@ -11,6 +11,11 @@
 //! file system is reported `creating` and the clock owes it `available`
 //! ([`crate::state::PROVISIONING_SPAN`]).
 //!
+//! The `bucket` ARN names a resource of ANOTHER service, and the model documents that
+//! it "must exist", so it is resolved against S3 — through the in-process callback, see
+//! [`crate::state::bucket_is_absent`] — BEFORE anything is persisted; a bucket S3
+//! reports absent is the modelled 404 `ResourceNotFoundException`.
+//!
 //! Shared types live in `super::types`; the error channel in `crate::scaffolded`.
 //!
 //! ---
@@ -189,6 +194,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx);
+
+        // `bucket` names a resource of ANOTHER service, so it is resolved against that
+        // service before anything is written: "The bucket must exist and be in the same
+        // Amazon Web Services Region as the file system"
+        // (`CreateFileSystemRequest$bucket`). A bucket S3 does not hold is the modelled
+        // 404 `ResourceNotFoundException`, and because the refusal happens before the
+        // store is even locked, nothing is persisted — the bucket never shows up in a
+        // later `ListFileSystems(bucket=…)`.
+        if crate::state::bucket_is_absent(ctx, &region, &input.bucket).await {
+            return Err(CreateFileSystemErrorModeled::ResourceNotFoundException(
+                crate::state::not_found(crate::state::BUCKET_NOT_FOUND_MESSAGE),
+            )
+            .into());
+        }
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             CreateFileSystemErrorModeled::InternalServerException(

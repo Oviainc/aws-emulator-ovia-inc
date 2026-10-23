@@ -140,25 +140,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let guard = state.lock();
-        // An `UnknownResourceFault` message names the requested resource and nothing
-        // else, in the `WorkflowType=[name=.., version=..]` form every operation of this
-        // service that reports a missing workflow type uses.
-        let unknown = || {
+        // An `UnknownResourceFault` message names the resource the lookup failed on and
+        // nothing else: the domain when no domain is stored under that name, otherwise
+        // the requested type, in the `WorkflowType=[name=.., version=..]` form every
+        // operation of this service that reports a missing workflow type uses.
+        let unknown_type = || {
             DescribeWorkflowTypeErrorModeled::UnknownResourceFault(UnknownResourceFault {
-                message: Some(format!(
-                    "Unknown type: WorkflowType=[name={}, version={}]",
-                    input.workflow_type.name, input.workflow_type.version
+                message: Some(crate::state::unknown_workflow_type_message(
+                    &input.workflow_type.name,
+                    &input.workflow_type.version,
                 )),
             })
         };
-        let domain = guard.domains.get(&input.domain).ok_or_else(unknown)?;
+        let domain = guard.domains.get(&input.domain).ok_or_else(|| {
+            DescribeWorkflowTypeErrorModeled::UnknownResourceFault(UnknownResourceFault {
+                message: Some(format!("Unknown domain: {}", input.domain)),
+            })
+        })?;
         let workflow_type = domain
             .workflow_types
             .get(&(
                 input.workflow_type.name.clone(),
                 input.workflow_type.version.clone(),
             ))
-            .ok_or_else(unknown)?;
+            .ok_or_else(unknown_type)?;
 
         Ok(DescribeWorkflowTypeOutput {
             type_info: workflow_type.info(),

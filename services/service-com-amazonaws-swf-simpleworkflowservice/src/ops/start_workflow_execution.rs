@@ -274,9 +274,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(workflow_type) = domain.workflow_types.get(&type_key).cloned() else {
             return Err(StartWorkflowExecutionErrorModeled::UnknownResourceFault(
                 UnknownResourceFault {
-                    message: Some(format!(
-                        "Unknown type: WorkflowType=[name={}, version={}]",
-                        input.workflow_type.name, input.workflow_type.version
+                    message: Some(crate::state::unknown_workflow_type_message(
+                        &input.workflow_type.name,
+                        &input.workflow_type.version,
                     )),
                 },
             )

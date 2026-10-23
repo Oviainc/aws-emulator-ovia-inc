@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteActivityType
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteActivityType`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteActivityType::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: removes the ONE stored activity-type record its `(domain, name, version)`
+//! triple addresses, so every later reader of it (`DescribeActivityType`) answers
+//! `UnknownResourceFault` and the identity is free to be registered again. Deletion is
+//! available only once that record is `DEPRECATED` ("Prior to deletion, activity types
+//! must first be deprecated"): a `REGISTERED` record is the modelled
+//! `TypeNotDeprecatedFault` and nothing is removed. This is the ONLY file to touch for
+//! this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -170,20 +168,64 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteActivityType` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteActivityTypeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteActivityType"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteActivityTypeErrorModeled::OperationNotPermittedFault(
+                OperationNotPermittedFault {
+                    message: Some("the SWF domain store is unavailable".to_string()),
+                },
+            )
+        })?;
+
+        let mut guard = state.lock();
+        let Some(domain) = guard.domains.get_mut(&input.domain) else {
+            return Err(DeleteActivityTypeErrorModeled::UnknownResourceFault(
+                UnknownResourceFault {
+                    message: Some(format!("Unknown domain: {}", input.domain)),
+                },
+            )
+            .into());
+        };
+
+        let key = (
+            input.activity_type.name.clone(),
+            input.activity_type.version.clone(),
+        );
+        let Some(activity_type) = domain.activity_types.get(&key) else {
+            return Err(DeleteActivityTypeErrorModeled::UnknownResourceFault(
+                UnknownResourceFault {
+                    message: Some(crate::state::unknown_activity_type_message(
+                        &input.activity_type.name,
+                        &input.activity_type.version,
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // "Prior to deletion, activity types must first be deprecated": a record still on
+        // REGISTERED is the modelled `TypeNotDeprecatedFault` ("Returned when the resource
+        // type has not been deprecated"), and it stays in the store whole, so a refused
+        // delete changes nothing a later caller sees. Amazon SWF reports this state with
+        // one fixed sentence, naming no value out of the request — the same one
+        // `DeleteWorkflowType` reports for the identical condition.
+        if !activity_type.is_deprecated() {
+            return Err(DeleteActivityTypeErrorModeled::TypeNotDeprecatedFault(
+                TypeNotDeprecatedFault {
+                    message: Some(crate::state::TYPE_NOT_DEPRECATED_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // With the record gone the identity is unregistered: a reader of it answers
+        // `UnknownResourceFault` and `RegisterActivityType` may mint it afresh. Only the
+        // addressed record of the addressed domain is removed; activities already
+        // scheduled from it are unaffected ("Activities that started before the type was
+        // deleted will continue to run").
+        domain.activity_types.remove(&key);
+
+        Ok(DeleteActivityTypeOutput)
     }
 }
