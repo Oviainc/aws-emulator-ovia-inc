@@ -29,3 +29,5 @@ mod target_prefix_dispatch;
 mod target_routing;
 #[path = "all/trail_lifecycle.rs"]
 mod trail_lifecycle;
+#[path = "all/trail_update.rs"]
+mod trail_update;
