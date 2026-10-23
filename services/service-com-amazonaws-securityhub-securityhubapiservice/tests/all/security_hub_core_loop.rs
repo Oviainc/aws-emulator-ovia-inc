@@ -857,10 +857,6 @@ async fn date_filters_select_findings_inside_the_window_they_name() {
     old["CreatedAt"] = json!(iso8601_before_now(400 * DAY));
     old["UpdatedAt"] = json!(iso8601_before_now(399 * DAY));
 
-    // The recent finding's instants are relative to NOW, because the `DateRange` row
-    // below is: "OLDER_THAN one day" is measured back from the moment the request runs,
-    // so a hard-coded "recent" timestamp stops being recent once the wall clock passes
-    // it and the row starts selecting both findings.
     let mut recent = base_finding("date-recent");
     recent["CreatedAt"] = json!(iso8601_before_now(2 * HOUR));
     recent["UpdatedAt"] = json!(iso8601_before_now(HOUR));

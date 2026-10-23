@@ -641,7 +641,8 @@ async fn object_writes_and_reads_are_refused_outside_what_is_stored() {
 
     // Members whose semantics this emulator cannot carry out keep the scaffold's 501
     // rather than being stripped and answered as a plain success — and the request they
-    // were refused on changes nothing.
+    // were refused on changes nothing. `x-amz-tagging` is NOT one of them any more: the
+    // header's tag set is parsed and stored, which `object_tagging_on_put.rs` covers.
     for (case, headers) in [
         ("a conditional write", &[("if-none-match", "*")][..]),
         (
