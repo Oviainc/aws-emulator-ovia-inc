@@ -149,35 +149,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // boundary validator passed any string: a `resourceArn` that is not one of this
         // service's profiling-group ARNs names no resource of any kind, which is a bad
         // request rather than a missing resource.
-        if crate::state::profiling_group_name_from_arn(&input.resource_arn).is_none() {
-            return Err(UntagResourceErrorModeled::ValidationException(
-                ValidationException {
-                    message: format!(
-                        "resourceArn must be an {}:{}<name> ARN, got {}",
-                        crate::state::ARN_NAMESPACE,
-                        crate::state::PROFILING_GROUP_RESOURCE_PREFIX,
-                        input.resource_arn
-                    ),
-                },
-            )
-            .into());
-        }
-
-        let mut guard = state.lock();
-        let group = guard
-            .group_by_arn_mut(&input.resource_arn)
+        let name = crate::state::profiling_group_name_from_arn(&input.resource_arn)
             .ok_or_else(|| {
-                UntagResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                    // The only taggable resource of this service is a profiling group, so
-                    // this is the group-scoped not-found refusal, stated in the service's
-                    // own wording and naming the group the ARN names (the ARN parsed
-                    // above, so it has one).
-                    message: crate::state::group_not_found_message(
-                        crate::state::profiling_group_name_from_arn(&input.resource_arn)
-                            .unwrap_or(&input.resource_arn),
-                    ),
+                UntagResourceErrorModeled::ValidationException(ValidationException {
+                    message: crate::state::resource_arn_validation_message(&input.resource_arn),
                 })
             })?;
+
+        let mut guard = state.lock();
+        let group = guard.group_by_arn_mut(&input.resource_arn).ok_or_else(|| {
+            UntagResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                // The only taggable resource of this service is a profiling group, so
+                // this is the group-scoped not-found refusal, in the service's own
+                // wording and naming the group the ARN names (the ARN parsed above, so
+                // it has one).
+                message: crate::state::group_not_found_message(name),
+            })
+        })?;
 
         // Remove by KEY, whatever the stored value was, and ignore a key the resource
         // does not carry: the post-state a caller asked for — none of these keys present

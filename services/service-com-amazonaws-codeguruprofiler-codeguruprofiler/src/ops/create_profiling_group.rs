@@ -176,6 +176,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
+        // The tags a create stores go through the same check a `TagResource` does, so
+        // no path into this store can leave a resource past AWS's published tagging
+        // limits (count, key length, value length), and a refused create stores nothing.
+        if let Some(tags) = input.tags.as_ref() {
+            crate::state::validate_tags("tags", tags).map_err(|message| {
+                CreateProfilingGroupErrorModeled::ValidationException(ValidationException {
+                    message,
+                })
+            })?;
+        }
+
         let mut guard = state.lock();
 
         // Idempotency: the same `clientToken` that already created THIS name replays the

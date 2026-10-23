@@ -138,6 +138,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             ListTagsForResourceErrorModeled::InternalServerException(InternalServerException {
                 message: "the profiling-group store is unavailable".to_string(),
@@ -151,12 +152,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if crate::state::profiling_group_name_from_arn(&input.resource_arn).is_none() {
             return Err(ListTagsForResourceErrorModeled::ValidationException(
                 ValidationException {
-                    message: format!(
-                        "resourceArn must be an {}:{}<name> ARN, got {}",
-                        crate::state::ARN_NAMESPACE,
-                        crate::state::PROFILING_GROUP_RESOURCE_PREFIX,
-                        input.resource_arn
-                    ),
+                    message: crate::state::resource_arn_validation_message(&input.resource_arn),
                 },
             )
             .into());
@@ -165,7 +161,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let guard = state.lock();
         let group = guard.group_by_arn(&input.resource_arn).ok_or_else(|| {
             ListTagsForResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: format!("no resource with the arn {}", input.resource_arn),
+                message: crate::state::group_not_found_message(
+                    crate::state::profiling_group_name_from_arn(&input.resource_arn)
+                        .unwrap_or(&input.resource_arn),
+                ),
             })
         })?;
 
