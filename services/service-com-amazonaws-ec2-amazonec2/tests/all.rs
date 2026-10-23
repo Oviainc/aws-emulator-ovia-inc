@@ -11,6 +11,12 @@
 // `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` resolves to a SIBLING
 // (`tests/describe_vpcs.rs`) — which the layout check refuses. The `#[path]` is what
 // points it into `tests/all/`.
+// Declared FIRST rather than in sorted position: a new ec2 suite lands every few minutes
+// and inserts its two lines in sorted order, so the sorted neighbourhood of this suite is
+// the contended region of this file — this fix lost several serialized squash merges to
+// exactly that. The lines above are the file header, which no landing edits.
+#[path = "all/prefix_lists.rs"]
+mod prefix_lists;
 #[path = "all/address_transfers.rs"]
 mod address_transfers;
 #[path = "all/allowed_images_settings.rs"]

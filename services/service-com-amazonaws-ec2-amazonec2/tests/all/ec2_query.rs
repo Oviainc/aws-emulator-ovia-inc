@@ -104,6 +104,12 @@ pub async fn call_with_content_type(
     (status, content_type, String::from_utf8_lossy(response.body()).to_string())
 }
 
+/// `vec!["a".to_string(), …]` for a slice of string literals — a table's expected values,
+/// as owned `String`s, for comparing against the values a response reported.
+pub fn owned(values: &[&str]) -> Vec<String> {
+    values.iter().map(|value| (*value).to_string()).collect()
+}
+
 /// `ZoneName.N` / `VpcId.N` / `Filter.N.Name` form fields, as ec2Query flattens a list
 /// into indexed keys.
 pub fn indexed(prefix: &str, values: &[&str]) -> Vec<(String, String)> {

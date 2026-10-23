@@ -31,7 +31,7 @@
 
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::ec2_query::{element, filters, indexed, unescaped};
+use super::ec2_query::{element, filters, indexed, owned, unescaped};
 
 /// The emulator the tests drive, as [`super::ec2_query::emulator`] builds it. This
 /// operation reports facts of a Region and stores nothing, so the engine handle it hands
@@ -106,11 +106,6 @@ fn zones(case: &str, body: &str) -> Vec<Zone> {
 /// The zone names in a response, sorted.
 fn zone_names(case: &str, body: &str) -> Vec<String> {
     zones(case, body).into_iter().map(|zone| zone.name).collect()
-}
-
-/// `vec!["a".to_string(), …]` for a slice of string literals.
-fn owned(values: &[&str]) -> Vec<String> {
-    values.iter().map(|value| (*value).to_string()).collect()
 }
 
 /// One row of a selector table: the case name, the `ZoneNames` and `ZoneIds` the

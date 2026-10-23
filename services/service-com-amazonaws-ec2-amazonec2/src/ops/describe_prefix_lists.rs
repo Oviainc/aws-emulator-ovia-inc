@@ -1,15 +1,43 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribePrefixLists
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribePrefixLists`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribePrefixLists::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the Amazon Web Services service prefix lists of the Region this request was
+//! signed for: "describes available Amazon Web Services services in a prefix list
+//! format, which includes the prefix list name and prefix list ID of the service and
+//! the IP address range for the service" (the operation's own doc).
+//!
+//! Such a prefix list is a fact of a Region, not a resource a caller creates: no EC2
+//! operation adds or removes one, and a prefix list a caller DOES create is a managed
+//! prefix list, which `DescribeManagedPrefixLists` reports. So the lists come from
+//! [`service_prefix_lists_in_region`] below and this handler writes NOTHING:
+//! two calls in one Region report the same lists, with the same ids and ranges.
+//!
+//! What each list REPORTS is the name and the id of the service's prefix list, and the
+//! service's IP address ranges. AWS publishes those ranges per Region in its
+//! `ip-ranges.json` feed, which neither this service's model nor a request carries and
+//! this emulator holds no copy of, so a range reported here is DERIVED — a block of the
+//! range IANA reserves for benchmarking, so it can never be read as an address a real
+//! Amazon Web Services service answers on; see [`service_prefix_list_cidrs`] for what the
+//! derivation guarantees (stable across reads, distinct between the lists of one Region)
+//! and what it does not (the ranges AWS itself publishes today).
+//!
+//! What the request chooses is which of them are reported, and how many at a time:
+//!
+//! * `PrefixListIds` narrows the Region's lists to the ids named; an id that names no
+//!   prefix list is refused with `InvalidPrefixListID.NotFound` rather than reported as
+//!   an absent row, the way every other describe in this service answers an unknown id.
+//! * `Filters` (`prefix-list-id`, `prefix-list-name`) are ANDed with each other and
+//!   ORed over each filter's values, with EC2's `*` / `?` wildcards; a filter this
+//!   operation does not document is refused with `InvalidParameterValue`.
+//! * `MaxResults` and `NextToken` page the matching lists in `PrefixListName` order:
+//!   the token is the opaque cursor [`crate::state::encode_page_token`] mints, naming
+//!   the list the next page starts at, and the last page carries no token.
+//! * `DryRun` performs nothing and answers 412 `DryRunOperation`, the answer the real
+//!   service gives a caller that holds the action's permissions. It is answered after
+//!   every parameter has been validated but BEFORE the Region's lists are resolved, so a
+//!   dry run naming an unknown prefix list id reports the dry run rather than the
+//!   unknown id: the flag asks about permissions, which no resource lookup bears on.
 //!
 //! ## Shape of an operation
 //!
@@ -142,18 +170,392 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribePrefixLists` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribePrefixListsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribePrefixLists"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            CompiledFilter, MAX_FILTER_MATCH_STEPS, MAX_FILTER_VALUE_BYTES, MAX_FILTER_VALUES,
+            MAX_FILTERS, MAX_PAGE_SIZE, MAX_RESOURCE_IDS, MatchBudget, decode_page_token,
+            encode_page_token, invalid_pagination_token_for, request_region,
+        };
+
+        // A Region's prefix lists are derived, not stored, so this operation never
+        // reaches the engine on `self`.
+        let _ = &self.engine;
+
+        // "The maximum number of results to return with a single call"
+        // (`DescribePrefixListsRequest$MaxResults`). The model declares no `@range` on
+        // the member — it targets a plain `Integer` — so the handler is the only place
+        // the page size can be bounded: a page of none is not a page, and one above the
+        // most this service serves in a page is refused rather than silently cut down.
+        if let Some(max_results) = input.max_results {
+            if max_results < 1 {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "Invalid value '{max_results}' for maxResults. It must be at least 1"
+                )));
+            }
+            if usize::try_from(max_results).unwrap_or(usize::MAX) > MAX_PAGE_SIZE {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "Invalid value '{max_results}' for maxResults. \
+                     It must be at most {MAX_PAGE_SIZE}"
+                )));
+            }
+        }
+
+        // "One or more prefix list IDs" (`DescribePrefixListsRequest$PrefixListIds`).
+        // The model bounds the list's length nowhere and each id costs a comparison per
+        // candidate, so it is capped before any work proportional to it is done.
+        let requested_ids: &[String] = input.prefix_list_ids.as_deref().unwrap_or_default();
+        if requested_ids.len() > MAX_RESOURCE_IDS {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "PrefixListIds carries {} values, above the maximum of {MAX_RESOURCE_IDS}",
+                requested_ids.len()
+            )));
+        }
+
+        // A filter name this operation does not document is refused whether or not any
+        // prefix list would have matched it, so an unsupported filter can never read as
+        // "no results". "Filter names are case-sensitive" (`Filter$Name`), so the
+        // comparison is exact. Each filter's value count and value size are capped for
+        // the same reason the id list above is, and every comparison below is charged to
+        // one [`MatchBudget`], the way the store-scanning describes of this service bound
+        // their filtering.
+        let filters: &[Filter] = input.filters.as_deref().unwrap_or_default();
+        if filters.len() > MAX_FILTERS {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "The request carries {} filters, above the maximum of {MAX_FILTERS}",
+                filters.len()
+            )));
+        }
+        let mut selectors: Vec<CompiledFilter> = Vec::with_capacity(filters.len());
+        for filter in filters {
+            let name = filter.name.as_deref().unwrap_or_default();
+            if !PREFIX_LIST_FILTERS.contains(&name) {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "The filter '{name}' is invalid"
+                )));
+            }
+            let values = filter.values.as_deref().unwrap_or_default();
+            if values.len() > MAX_FILTER_VALUES {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "The filter '{name}' carries {} values, above the maximum of \
+                     {MAX_FILTER_VALUES}",
+                    values.len()
+                )));
+            }
+            if let Some(oversize) = values
+                .iter()
+                .find(|value| value.len() > MAX_FILTER_VALUE_BYTES)
+            {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "A value of the filter '{name}' carries {} bytes, above the maximum \
+                     of {MAX_FILTER_VALUE_BYTES}",
+                    oversize.len()
+                )));
+            }
+            // Each value is parsed into its pattern ONCE here, not once per candidate.
+            selectors.push(CompiledFilter::new(name.to_string(), values.to_vec()));
+        }
+
+        // "The token for the next page of results"
+        // (`DescribePrefixListsRequest$NextToken`) — anything else is refused rather
+        // than read as a cursor, with the refusal naming the token EC2 could not read
+        // (`crate::state::invalid_pagination_token_for`).
+        let start_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => {
+                Some(decode_page_token(token).ok_or_else(|| invalid_pagination_token_for(token))?)
+            }
+        };
+
+        // `DryRun` sits after every parameter has been validated: the flag asks whether
+        // the request WOULD have succeeded, so one that would have been refused for its
+        // own reason is refused with that reason instead. "If you have the required
+        // permissions, the error response is DryRunOperation"
+        // (`DescribePrefixListsRequest$DryRun`), and every caller of this emulator holds
+        // them, so nothing below runs.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        // EC2 is a regional service reached through a regional endpoint: the Region the
+        // caller signed for is the Region whose prefix lists it is asking about, and the
+        // Region is part of each list's name.
+        let region = request_region(ctx.parts());
+        let published = service_prefix_lists_in_region(&region);
+
+        // An id that names none of the Region's prefix lists is an error, not an absent
+        // row — the same answer `DescribeVpcs` gives for an unknown VPC id.
+        if let Some(unknown) = requested_ids.iter().find(|id| {
+            !published
+                .iter()
+                .any(|list| list.prefix_list_id == id.as_str())
+        }) {
+            return Err(invalid_prefix_list_id_not_found(unknown));
+        }
+
+        // "The default is to describe all your prefix lists": `PrefixListIds` narrows
+        // the Region's lists to the ids named, and every filter must then hold — the
+        // AND/OR evaluation EC2 defines for every `Filters` member, taken from
+        // `crate::state::matches_every_filter` so one spelling of that rule serves every
+        // describe of this service.
+        let mut budget = MatchBudget::new(MAX_FILTER_MATCH_STEPS);
+        let selected: Vec<&ServicePrefixListRecord> = published
+            .iter()
+            .filter(|list| {
+                requested_ids.is_empty()
+                    || requested_ids
+                        .iter()
+                        .any(|id| list.prefix_list_id == id.as_str())
+            })
+            .filter(|list| {
+                crate::state::matches_every_filter(&selectors, &mut budget, &|name| {
+                    list.filter_values(name)
+                })
+            })
+            .collect();
+        // A spent budget means the answer would be INCOMPLETE, which is not something to
+        // report as a result: the request asked for more filtering than one call will do,
+        // and is told so rather than given a silently narrowed page — the same answer
+        // `DescribeVpcEndpointConnections` gives.
+        if budget.exhausted() {
+            return Err(Scaffolded::request_limit_exceeded(format!(
+                "The request's filters would take more than {MAX_FILTER_MATCH_STEPS} \
+                 comparisons to evaluate; narrow them"
+            )));
+        }
+
+        // `service_prefix_lists_in_region` reports in `PrefixListName` order, which is
+        // the stable paging order and the cursor: a name is unique within a Region, so a
+        // token naming the list the next page starts at always advances.
+        let from = match start_at.as_deref() {
+            None => 0,
+            Some(cursor) => {
+                selected.partition_point(|list| list.prefix_list_name.as_str() < cursor)
+            }
+        };
+        let page = selected.get(from..).unwrap_or_default();
+
+        // A request that names no page size gets the largest page this service serves;
+        // one that names a size has already been refused outside `1..=MAX_PAGE_SIZE`
+        // above, so that check is the single place this bound lives.
+        let limit = input
+            .max_results
+            .and_then(|max_results| usize::try_from(max_results).ok())
+            .unwrap_or(MAX_PAGE_SIZE);
+
+        // "This value is null when there are no more results to return"
+        // (`DescribePrefixListsResult$NextToken`): a token only when a prefix list
+        // follows this page.
+        let next_token = page
+            .get(limit)
+            .map(|list| encode_page_token(&list.prefix_list_name));
+
+        Ok(DescribePrefixListsOutput {
+            prefix_lists: Some(
+                page.iter()
+                    .take(limit)
+                    .map(|list| list.to_prefix_list())
+                    .collect(),
+            ),
+            next_token,
+        })
     }
+}
+
+// ---------------------------------------------------------------------------
+// The Amazon Web Services service prefix lists of a Region
+// ---------------------------------------------------------------------------
+//
+// Only this operation reads them, so they live here rather than in `crate::state`,
+// which holds the data model several operations share. A prefix list a caller CREATES
+// is a managed prefix list: that one is a stored resource, and it belongs to
+// `CreateManagedPrefixList` / `DescribeManagedPrefixLists` and their own store.
+
+/// The services an Amazon Web Services service prefix list is published for in every
+/// Region.
+///
+/// `DescribePrefixLists` "describes available Amazon Web Services services in a prefix
+/// list format, which includes the prefix list name and prefix list ID of the service and
+/// the IP address range for the service" (the operation's own doc), so what it reports is
+/// one prefix list per service that HAS one — the services reachable through a gateway VPC
+/// endpoint, Amazon DynamoDB and Amazon S3 (Amazon VPC User Guide, "Gateway endpoints":
+/// "You can create a gateway endpoint ... Amazon S3, Amazon DynamoDB"), which is why this
+/// catalog names services rather than reading a store.
+///
+/// Each entry is the service component of the list's name, spelled the way a gateway
+/// endpoint's service name spells it: `com.amazonaws.<region>.<service>`.
+const AWS_SERVICE_PREFIX_LIST_SERVICES: [&str; 2] = ["dynamodb", "s3"];
+
+/// Every filter this operation documents, as its `Filters` member lists them
+/// (`smithy_query(query="doc",shape="DescribePrefixListsRequest",member="Filters")`:
+/// "prefix-list-id: The ID of a prefix list. prefix-list-name: The name of a prefix
+/// list."). Every entry must be answered by [`ServicePrefixListRecord::filter_values`].
+const PREFIX_LIST_FILTERS: [&str; 2] = ["prefix-list-id", "prefix-list-name"];
+
+/// The code EC2 refuses a request naming a prefix list id no prefix list has with,
+/// spelled the way this service spells its other id-not-found codes
+/// (`crate::state::INVALID_VPC_ID_NOT_FOUND`, `InvalidSubnetID.NotFound`).
+const INVALID_PREFIX_LIST_ID_NOT_FOUND: &str = "InvalidPrefixListID.NotFound";
+
+/// The first address of the range every derived prefix list CIDR is carved out of:
+/// `198.18.0.0/15`, which IANA reserves for benchmarking (RFC 2544) and no real service
+/// answers on. See [`service_prefix_list_cidrs`].
+const BENCHMARK_RANGE_BASE: u32 = u32::from_be_bytes([198, 18, 0, 0]);
+
+/// The prefix length of that reserved range.
+const BENCHMARK_RANGE_PREFIX_LENGTH: u32 = 15;
+
+/// The prefix length of each block carved out of it: one block is one prefix list's
+/// reported range.
+const PREFIX_LIST_BLOCK_PREFIX_LENGTH: u32 = 21;
+
+/// One Amazon Web Services service prefix list of one Region, as this describe reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ServicePrefixListRecord {
+    /// `pl-0123abcd` — the id [`service_prefix_list_id`] derives for this list.
+    prefix_list_id: String,
+    /// `com.amazonaws.us-east-1.s3` — the service's name in this Region.
+    prefix_list_name: String,
+    /// The IP address ranges of the service, from [`service_prefix_list_cidrs`].
+    cidrs: Vec<String>,
+}
+
+impl ServicePrefixListRecord {
+    /// This prefix list as the modelled `PrefixList` shape, whose three members are
+    /// exactly what the operation documents reporting: the name, the id and the ranges.
+    fn to_prefix_list(&self) -> PrefixList {
+        PrefixList {
+            prefix_list_id: Some(self.prefix_list_id.clone()),
+            prefix_list_name: Some(self.prefix_list_name.clone()),
+            cidrs: Some(self.cidrs.clone()),
+        }
+    }
+
+    /// The values the EC2 filter `name` compares against this prefix list.
+    ///
+    /// A name outside [`PREFIX_LIST_FILTERS`] compares against NO values, so it selects
+    /// nothing rather than everything — the handler refuses such a name before it gets
+    /// here. A filter carrying no value at all matches nothing for the same reason, there
+    /// being no value for the attribute to match: the answer `DescribeVpcs` and
+    /// `DescribeVpcEndpointConnections` give a valueless filter.
+    fn filter_values(&self, name: &str) -> Vec<::std::borrow::Cow<'_, str>> {
+        use ::std::borrow::Cow;
+
+        match name {
+            "prefix-list-id" => vec![Cow::Borrowed(self.prefix_list_id.as_str())],
+            "prefix-list-name" => vec![Cow::Borrowed(self.prefix_list_name.as_str())],
+            _ => Vec::new(),
+        }
+    }
+}
+
+/// The Amazon Web Services service prefix lists Region `region` publishes, in
+/// `PrefixListName` order — the order a `NextToken` walk resumes in, and unique by
+/// construction, one name per service of [`AWS_SERVICE_PREFIX_LIST_SERVICES`].
+///
+/// A prefix list of a service is a fact of a Region, not a resource a caller creates: no
+/// EC2 operation adds or withdraws one, so this derives them from the Region the same way
+/// `crate::state::availability_zones_in_region` derives its zones, and this operation
+/// writes nothing at all.
+fn service_prefix_lists_in_region(region: &str) -> Vec<ServicePrefixListRecord> {
+    let mut lists: Vec<ServicePrefixListRecord> = AWS_SERVICE_PREFIX_LIST_SERVICES
+        .iter()
+        .enumerate()
+        .map(|(index, service)| {
+            let prefix_list_name = format!("com.amazonaws.{region}.{service}");
+            ServicePrefixListRecord {
+                prefix_list_id: service_prefix_list_id(&prefix_list_name),
+                cidrs: service_prefix_list_cidrs(u32::try_from(index).unwrap_or(0)),
+                prefix_list_name,
+            }
+        })
+        .collect();
+    lists.sort_by(|left, right| left.prefix_list_name.cmp(&right.prefix_list_name));
+    // `PrefixListIds` selects by id, so two lists of one Region sharing one would make a
+    // request ambiguous. The ids are derived from distinct names, which the catalog's own
+    // entries keep distinct; the assertion pins that invariant if the catalog grows.
+    debug_assert!(
+        lists
+            .windows(2)
+            .all(|pair| pair[0].prefix_list_id != pair[1].prefix_list_id),
+        "two prefix lists of one Region must not share an id"
+    );
+    lists
+}
+
+/// The id of the prefix list named `prefix_list_name`.
+///
+/// AWS mints an opaque id of the form `pl-` followed by hexadecimal digits for every
+/// prefix list and keeps it for the life of the list, so the id here is DERIVED from the
+/// list's name — a pure function of it through [`stable_hash`] — which gives the same two
+/// properties without storing anything: every read of one Region's prefix list reports the
+/// same id, and two lists with different names get different ids.
+fn service_prefix_list_id(prefix_list_name: &str) -> String {
+    format!("pl-{:08x}", stable_hash(prefix_list_name) & 0xffff_ffff)
+}
+
+/// The IP address ranges this emulator reports for service number `service_index` of
+/// [`AWS_SERVICE_PREFIX_LIST_SERVICES`].
+///
+/// AWS publishes a service's real ranges per Region in its `ip-ranges.json` feed, which
+/// neither this service's model nor a request carries and this emulator holds no copy of.
+/// So a range reported here is DERIVED, and it is derived from the one thing a prefix list
+/// is scoped to within a Region — the service: one `/21` block of `198.18.0.0/15`, the
+/// range IANA reserves for benchmarking (RFC 2544), so a range this emulator reports can
+/// never be read as an address a real Amazon Web Services service answers on. Indexing the
+/// block by the service alone is what the two properties this derivation claims need, and
+/// no more: every read of one Region's list reports the same range, and two services of one
+/// Region never share a block. Two Regions DO report the same ranges for one service — the
+/// real ranges are the feed's, which this emulator does not hold, so nothing here
+/// distinguishes Regions by address.
+fn service_prefix_list_cidrs(service_index: u32) -> Vec<String> {
+    // How many blocks of [`PREFIX_LIST_BLOCK_PREFIX_LENGTH`] the reserved range holds. A
+    // catalog larger than that would have nothing left to stay inside, so the block number
+    // wraps — a derivation that keeps answering an address in the reserved range rather
+    // than a request-path panic — and the assertion catches the overgrown catalog in
+    // development, where two services would otherwise come to share a block.
+    let blocks = 1u32 << (PREFIX_LIST_BLOCK_PREFIX_LENGTH - BENCHMARK_RANGE_PREFIX_LENGTH);
+    debug_assert!(
+        u32::try_from(AWS_SERVICE_PREFIX_LIST_SERVICES.len()).unwrap_or(u32::MAX) <= blocks,
+        "the prefix list catalog must fit the blocks the reserved range holds"
+    );
+    let block = service_index % blocks;
+    let address = BENCHMARK_RANGE_BASE + block * (1u32 << (32 - PREFIX_LIST_BLOCK_PREFIX_LENGTH));
+    vec![format!(
+        "{}/{PREFIX_LIST_BLOCK_PREFIX_LENGTH}",
+        ::std::net::Ipv4Addr::from(address)
+    )]
+}
+
+/// Refuse a request that named a prefix list id no prefix list has, the way EC2 does:
+/// HTTP 400 [`INVALID_PREFIX_LIST_ID_NOT_FOUND`].
+///
+/// The refusal itself comes from [`crate::state::id_not_found`], the crate's one writer of
+/// an `Invalid<Kind>.NotFound`, so the wording of this operation's not-found answer cannot
+/// drift from the rest of the service's.
+fn invalid_prefix_list_id_not_found(prefix_list_id: &str) -> DescribePrefixListsError {
+    crate::state::id_not_found(
+        INVALID_PREFIX_LIST_ID_NOT_FOUND,
+        "prefix list ID",
+        prefix_list_id,
+    )
+}
+
+/// A deterministic digest of `value`, for deriving a prefix list's id from its name rather
+/// than storing it.
+///
+/// The standard library's hasher, seeded by its own default rather than randomly, so a
+/// digest is a pure function of its input: every read of one name answers the same value,
+/// which is what makes the derived id stable across calls. `DefaultHasher`'s output is not
+/// guaranteed stable ACROSS Rust versions, so a derived `pl-` id is stable within one build
+/// of the emulator, not across toolchains — which is all an opaque id a caller reads back
+/// from the same running emulator needs. Nothing here is a secret and nothing depends on a
+/// digest being unforgeable — the same reason `crate::state`'s page-token checksum uses the
+/// same hasher; this operation keeps its own copy rather than widening that module, since
+/// the derivation is this operation's alone.
+fn stable_hash(value: &str) -> u64 {
+    use ::std::hash::{Hash, Hasher};
+
+    let mut hasher = ::std::hash::DefaultHasher::new();
+    value.hash(&mut hasher);
+    hasher.finish()
 }
