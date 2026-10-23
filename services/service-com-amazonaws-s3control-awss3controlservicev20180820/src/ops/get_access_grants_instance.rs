@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetAccessGrantsInstance
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetAccessGrantsInstance`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetAccessGrantsInstance::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the S3 Access Grants instance `CreateAccessGrantsInstance` stored for
+//! the account the request names, in the Region the request was signed for — the
+//! one instance an account has per Region. Answers
+//! `AccessGrantsInstanceNotExistsError` when that account has no instance in
+//! that Region. A pure read: it writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +155,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetAccessGrantsInstance` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetAccessGrantsInstanceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetAccessGrantsInstance"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::state_unavailable());
+        };
+
+        // An S3 Access Grants instance is Region-scoped — one per Region per
+        // account — so the Region the request was signed for is half the
+        // resource's identity, exactly as it is for the create that recorded it.
+        let region = crate::state::signing_region(ctx.parts());
+        let key = (input.account_id.clone(), region.clone());
+        let store = state.lock();
+        let Some(record) = store.access_grants_instances.get(&key) else {
+            return Err(crate::state::no_such_access_grants_instance(
+                &input.account_id,
+                &region,
+            ));
+        };
+
+        Ok(GetAccessGrantsInstanceOutput {
+            access_grants_instance_arn: Some(record.arn.clone()),
+            access_grants_instance_id: Some(record.id.clone()),
+            // The deprecated `IdentityCenterArn` carries the Identity Center
+            // INSTANCE ARN: its pattern is
+            // `^arn:[^:]+:sso::(\d{12}){0,1}:instance/.*$`, which no application
+            // ARN matches, and the member it was replaced by
+            // (`IdentityCenterInstanceArn`) targets the same shape. Both are
+            // absent for an instance created without an association.
+            identity_center_arn: record.identity_center_instance_arn.clone(),
+            identity_center_instance_arn: record.identity_center_instance_arn.clone(),
+            identity_center_application_arn: record.identity_center_application_arn.clone(),
+            created_at: Some(record.created_at),
+        })
     }
 }
