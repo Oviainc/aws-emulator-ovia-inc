@@ -10,6 +10,11 @@
 //! created under it — so a create or update followed by a get, a list, a tag read or a
 //! delete answers from the one record rather than from the request that is being served.
 //!
+//! The same holds for every other resource kind this store carries — a key value store, a
+//! response headers policy: each record is put there by the call that creates it and is
+//! what every later read of that resource answers from. A response headers policy has no
+//! status member and no propagation deadline, so nothing about one is owed by the clock.
+//!
 //! Two things in here are owed by the CLOCK rather than by a call:
 //!
 //! * a distribution CloudFront has just created or reconfigured is `InProgress` until
@@ -40,8 +45,9 @@ use crate::ops::types::{
     Invalidation, InvalidationBatch, InvalidationSummary, InvalidTagging, KGKeyPairIds, KeyPairIds,
     KeyValueStore,
     LambdaFunctionAssociations, LoggingConfig, NoSuchDistribution, NoSuchInvalidation,
-    NoSuchResource, Origin, OriginSslProtocols, Paths, Restrictions, Signer, Tag, Tags,
-    TrustedKeyGroups, TrustedSigners, ViewerCertificate,
+    NoSuchResource, NoSuchResponseHeadersPolicy, Origin, OriginSslProtocols, Paths,
+    ResponseHeadersPolicy, ResponseHeadersPolicyAlreadyExists, ResponseHeadersPolicyConfig,
+    Restrictions, Signer, Tag, Tags, TrustedKeyGroups, TrustedSigners, ViewerCertificate,
 };
 
 /// `Distribution$Status` while a configuration is still propagating to the edge
@@ -191,6 +197,17 @@ pub const KVS_PROVISIONING_DELAY: Duration = Duration::from_millis(500);
 /// plane's own ceiling on distinct stores, so a store this service accepts is one that
 /// service can also hold.
 pub const MAX_KEY_VALUE_STORES: usize = 1_000;
+
+/// The most response headers policies this emulator holds.
+///
+/// CHOSEN by this emulator, for the same reason as [`MAX_KEY_VALUE_STORES`]: a policy
+/// record is what a later read answers from, so it cannot be evicted, and the create path
+/// is refused at this entry count with the modelled `TooManyResponseHeadersPolicies`
+/// ("You have reached the maximum number of response headers policies for this Amazon Web
+/// Services account") instead of growing further. CloudFront's own ceiling is an account
+/// quota that can be raised and the model states no number, so this bound is the
+/// emulator's rather than a claim about the service.
+pub const MAX_RESPONSE_HEADERS_POLICIES: usize = 1_000;
 
 /// The `PriceClass` reported for a distribution whose stored configuration names none:
 /// the class that covers every CloudFront edge location, which is what
@@ -854,6 +871,44 @@ impl StoredKeyValueStore {
     }
 }
 
+/// One CloudFront response headers policy, as this emulator persists it.
+///
+/// The record is the single source of truth for the policy's id, the configuration it
+/// was created with, its `LastModifiedTime` and its version token, so the create and
+/// every later read answer from it rather than from the request being served.
+///
+/// Nothing in here is owed by the CLOCK: the model's `ResponseHeadersPolicy` is `Id`,
+/// `LastModifiedTime` and `ResponseHeadersPolicyConfig` only — a policy carries no status
+/// and no propagation deadline, so a policy this service accepts is immediately complete.
+#[derive(Debug, Clone)]
+pub struct StoredResponseHeadersPolicy {
+    /// `ResponseHeadersPolicy$Id` — the identifier minted when the policy was created,
+    /// and the key the policy is held under.
+    pub id: String,
+    /// The configuration as submitted — "Contains metadata about the response headers
+    /// policy, and a set of configurations that specify the HTTP headers." Stored whole,
+    /// so a read reports what was stored rather than re-deriving anything from a request.
+    pub config: ResponseHeadersPolicyConfig,
+    /// `ResponseHeadersPolicy$LastModifiedTime` — "The date and time when the response
+    /// headers policy was last modified."
+    pub last_modified_time: SystemTime,
+    /// The version token the last mutation handed back, and the single source of truth
+    /// for every `If-Match` check against this policy.
+    pub etag: String,
+}
+
+impl StoredResponseHeadersPolicy {
+    /// The `ResponseHeadersPolicy` projection every response headers policy operation
+    /// returns, read from the one stored record.
+    pub fn to_response_headers_policy(&self) -> ResponseHeadersPolicy {
+        ResponseHeadersPolicy {
+            id: self.id.clone(),
+            last_modified_time: ::aws_smithy_types::DateTime::from(self.last_modified_time),
+            response_headers_policy_config: self.config.clone(),
+        }
+    }
+}
+
 /// Per-service state for com-amazonaws-cloudfront-cloudfront2020-05-31. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsCloudfrontCloudfront20200531State {
@@ -871,6 +926,11 @@ pub struct ComAmazonawsCloudfrontCloudfront20200531State {
     /// and a repeated name an `EntityAlreadyExists`. A `BTreeMap` for the same reason as
     /// `distributions`: one stable total order for a listing to page through.
     pub key_value_stores: BTreeMap<String, StoredKeyValueStore>,
+    /// Every response headers policy this emulator holds, keyed by its minted id — the
+    /// identifier every response headers policy operation addresses one by. A `BTreeMap`
+    /// for the same reason as `distributions`: one stable total order for a listing to
+    /// page through.
+    pub response_headers_policies: BTreeMap<String, StoredResponseHeadersPolicy>,
 }
 
 impl ComAmazonawsCloudfrontCloudfront20200531State {
@@ -892,6 +952,26 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
     /// The distribution `id` names, or `None` when the store holds none.
     pub fn distribution(&self, id: &str) -> Option<&StoredDistribution> {
         self.distributions.get(id)
+    }
+
+    /// The response headers policy `id` names, or `None` when the store holds none.
+    pub fn response_headers_policy(&self, id: &str) -> Option<&StoredResponseHeadersPolicy> {
+        self.response_headers_policies.get(id)
+    }
+
+    /// The response headers policy whose STORED configuration carries `name`, or `None`.
+    ///
+    /// `ResponseHeadersPolicyConfig$Name`: "The name must be unique for response headers
+    /// policies in this Amazon Web Services account" — so at most one policy answers,
+    /// and this is what makes a repeated name a conflict rather than a second policy.
+    /// The comparison is against the stored configuration, never against a request.
+    pub fn response_headers_policy_named(
+        &self,
+        name: &str,
+    ) -> Option<&StoredResponseHeadersPolicy> {
+        self.response_headers_policies
+            .values()
+            .find(|policy| policy.config.name == name)
     }
 
     /// The tag set of the resource `arn` names, across every resource kind this store
@@ -1064,17 +1144,7 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
     /// render distinctly, so the mint never repeats an id.
     pub fn allocate_key_value_store_id(&mut self) -> String {
         loop {
-            let high = self.mint_u64();
-            let low = self.mint_u64();
-            let hex = format!("{high:016x}{low:016x}");
-            let candidate = format!(
-                "{}-{}-{}-{}-{}",
-                &hex[..8],
-                &hex[8..12],
-                &hex[12..16],
-                &hex[16..20],
-                &hex[20..32]
-            );
+            let candidate = self.mint_uuid();
             if !self
                 .key_value_stores
                 .values()
@@ -1083,6 +1153,39 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
                 break candidate;
             }
         }
+    }
+
+    /// Allocate a response headers policy id no stored policy holds.
+    ///
+    /// `ResponseHeadersPolicy$Id` is the identifier every response headers policy
+    /// operation addresses one by, and CloudFront mints a UUID for one (the same shape
+    /// its cache and origin request policy ids take), so this renders one draw of
+    /// [`ComAmazonawsCloudfrontCloudfront20200531State::mint_uuid`] — distinct draws
+    /// render distinctly, so the mint never repeats an id.
+    pub fn allocate_response_headers_policy_id(&mut self) -> String {
+        loop {
+            let candidate = self.mint_uuid();
+            if !self.response_headers_policies.contains_key(&candidate) {
+                break candidate;
+            }
+        }
+    }
+
+    /// One fresh UUID from the mint: two draws (128 bits) rendered as the 8-4-4-4-12
+    /// lowercase hex a UUID takes. ONE rendering for every resource CloudFront identifies
+    /// by UUID, so no two of them mint ids in different shapes.
+    fn mint_uuid(&mut self) -> String {
+        let high = self.mint_u64();
+        let low = self.mint_u64();
+        let hex = format!("{high:016x}{low:016x}");
+        format!(
+            "{}-{}-{}-{}-{}",
+            &hex[..8],
+            &hex[8..12],
+            &hex[12..16],
+            &hex[16..20],
+            &hex[20..32]
+        )
     }
 
     /// Allocate the domain name a distribution is served on: a generated label under
@@ -1288,6 +1391,12 @@ pub fn key_value_store_arn(id: &str) -> String {
 /// resource is addressed by NAME, as `DescribeKeyValueStore`'s `{Name}` label is.
 pub fn key_value_store_path(name: &str) -> String {
     format!("/2020-05-31/key-value-store/{name}")
+}
+
+/// The path of a response headers policy resource under this service's API version. The
+/// resource is addressed by ID, as `GetResponseHeadersPolicy`'s `{Id}` label is.
+pub fn response_headers_policy_path(id: &str) -> String {
+    format!("/2020-05-31/response-headers-policy/{id}")
 }
 
 /// The fully qualified URI a `Location` header reports for `path`.
@@ -2015,6 +2124,68 @@ pub fn config_quantity_mismatch(config: &DistributionConfig) -> Option<String> {
         .find_map(|(label, quantity, len)| quantity_disagreement(label, *quantity, *len))
 }
 
+/// The modelled `InconsistentQuantities` message for the first list wrapper in a
+/// response headers policy configuration whose `Quantity` disagrees with the length of
+/// its `Items`, or `None` when every wrapper agrees.
+///
+/// The SAME rule [`config_quantity_mismatch`] applies to a distribution configuration:
+/// every CloudFront list travels in a wrapper stating its own length beside the list
+/// itself, and the service refuses a request where the two disagree. This walks all of
+/// the wrappers a `ResponseHeadersPolicyConfig` reaches — the three CORS lists that are
+/// required when `CorsConfig` is named, the optional exposed-headers list, and the
+/// custom-header and remove-header lists.
+pub fn response_headers_policy_quantity_mismatch(
+    config: &ResponseHeadersPolicyConfig,
+) -> Option<String> {
+    let mut counts: Vec<(&'static str, i32, usize)> = Vec::new();
+
+    if let Some(cors) = &config.cors_config {
+        let origins = &cors.access_control_allow_origins;
+        counts.push((
+            "CorsConfig.AccessControlAllowOrigins",
+            origins.quantity,
+            origins.items.len(),
+        ));
+        let headers = &cors.access_control_allow_headers;
+        counts.push((
+            "CorsConfig.AccessControlAllowHeaders",
+            headers.quantity,
+            headers.items.len(),
+        ));
+        let methods = &cors.access_control_allow_methods;
+        counts.push((
+            "CorsConfig.AccessControlAllowMethods",
+            methods.quantity,
+            methods.items.len(),
+        ));
+        if let Some(exposed) = &cors.access_control_expose_headers {
+            counts.push((
+                "CorsConfig.AccessControlExposeHeaders",
+                exposed.quantity,
+                items_len(&exposed.items),
+            ));
+        }
+    }
+    if let Some(custom) = &config.custom_headers_config {
+        counts.push((
+            "CustomHeadersConfig",
+            custom.quantity,
+            items_len(&custom.items),
+        ));
+    }
+    if let Some(remove) = &config.remove_headers_config {
+        counts.push((
+            "RemoveHeadersConfig",
+            remove.quantity,
+            items_len(&remove.items),
+        ));
+    }
+
+    counts
+        .iter()
+        .find_map(|(label, quantity, len)| quantity_disagreement(label, *quantity, *len))
+}
+
 /// The modelled `InconsistentQuantities` message for an invalidation batch whose
 /// `Paths.Quantity` disagrees with the number of paths it carries, or `None`.
 pub fn batch_quantity_mismatch(batch: &InvalidationBatch) -> Option<String> {
@@ -2124,6 +2295,36 @@ pub fn key_value_store_already_exists(name: &str) -> EntityAlreadyExists {
     EntityAlreadyExists {
         message: Some(format!(
             "A key value store with the name {name} already exists in this account"
+        )),
+    }
+}
+
+/// The modelled `NoSuchResponseHeadersPolicy` (HTTP 404) for a response headers policy
+/// id the store does not hold.
+///
+/// The sentence is the one the model states on the shape itself — "The response headers
+/// policy does not exist." — a property of the store rather than of the request, so
+/// nothing from the request belongs in the text.
+pub fn no_such_response_headers_policy() -> NoSuchResponseHeadersPolicy {
+    NoSuchResponseHeadersPolicy {
+        message: Some(NO_SUCH_RESPONSE_HEADERS_POLICY_MESSAGE.to_string()),
+    }
+}
+
+/// `NoSuchResponseHeadersPolicy`'s message, as the model documents the shape.
+pub const NO_SUCH_RESPONSE_HEADERS_POLICY_MESSAGE: &str =
+    "The response headers policy does not exist.";
+
+/// The modelled `ResponseHeadersPolicyAlreadyExists` (HTTP 409) for a policy name that is
+/// already taken — "A response headers policy with this name already exists. You must
+/// provide a unique name. To modify an existing response headers policy, use
+/// UpdateResponseHeadersPolicy."
+pub fn response_headers_policy_already_exists(name: &str) -> ResponseHeadersPolicyAlreadyExists {
+    ResponseHeadersPolicyAlreadyExists {
+        message: Some(format!(
+            "A response headers policy with the name {name} already exists in this account. You \
+             must provide a unique name. To modify an existing response headers policy, use \
+             UpdateResponseHeadersPolicy."
         )),
     }
 }
