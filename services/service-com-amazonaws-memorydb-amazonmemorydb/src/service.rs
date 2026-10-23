@@ -67,6 +67,59 @@ use std::sync::Arc;
 /// authentication refusal, which is the emulator's rather than this service's.
 const INVALID_PARAMETER_VALUE: &str = "InvalidParameterValueException";
 
+/// The members a request carries a MemoryDB RESOURCE NAME in, and the kind of resource
+/// each one names.
+///
+/// A violation states its member as the last segment of a dotted path, in lowerCamel
+/// (`UserName` → `userName`), so the lookup below matches the segment
+/// case-insensitively: how the framework re-cases an acronym-leading member
+/// (`ACLName`) is not a fact this list should have to know.
+const NAME_MEMBERS: &[(&str, crate::state::ResourceKind)] = &[
+    ("userName", crate::state::ResourceKind::User),
+    ("aclName", crate::state::ResourceKind::Acl),
+    ("clusterName", crate::state::ResourceKind::Cluster),
+    (
+        "parameterGroupName",
+        crate::state::ResourceKind::ParameterGroup,
+    ),
+    ("snapshotName", crate::state::ResourceKind::Snapshot),
+    ("subnetGroupName", crate::state::ResourceKind::SubnetGroup),
+    (
+        "multiRegionClusterName",
+        crate::state::ResourceKind::MultiRegionCluster,
+    ),
+    (
+        "multiRegionParameterGroupName",
+        crate::state::ResourceKind::MultiRegionParameterGroup,
+    ),
+];
+
+/// This service's own wording for a name the MODEL refused, or `None` when the
+/// violation is not about how a resource name is spelled.
+///
+/// MemoryDB has ONE name rule per resource and states it in one sentence
+/// (`crate::state::resource_name_rejection`), and the rule the model declares on a name
+/// member (`@pattern`, `@length`) is the LOOSER half of that same rule — so a name
+/// refused at the boundary has to read exactly as a name refused by the handler does,
+/// or a caller would learn which rule it broke only when the name happened to get past
+/// the model's half of it. The offending value comes from the violation, so the
+/// sentence is still built from the request.
+fn name_rule_message(violation: &smithy_server_runtime::Violation) -> Option<String> {
+    use smithy_server_runtime::ViolationKind;
+    // Only a constraint on how the value is SPELLED: a bound on another kind of
+    // member, or an absent one, says nothing about a name rule.
+    match violation.kind {
+        ViolationKind::Pattern(_) | ViolationKind::MinLength(_) | ViolationKind::MaxLength(_) => {}
+        _ => return None,
+    }
+    let value = violation.value.as_deref()?;
+    let member = violation.path.rsplit('.').next()?;
+    let (_, kind) = NAME_MEMBERS
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(member))?;
+    crate::state::resource_name_rejection(*kind, value)
+}
+
 /// The `com-amazonaws-memorydb-amazonmemorydb` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -148,10 +201,16 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
                     code: INVALID_PARAMETER_VALUE.to_string(),
                     // Each violation already states the member it refused and the
                     // requirement that member broke, so the message is those clauses
-                    // and nothing invented here.
+                    // and nothing invented here — except a RESOURCE NAME, which this
+                    // service states in its own one-sentence rule (see
+                    // [`name_rule_message`]) so that the boundary and the handler
+                    // refuse a name with the same words.
                     message: value_violations
                         .iter()
-                        .map(|violation| violation.message())
+                        .map(|violation| {
+                            name_rule_message(violation)
+                                .unwrap_or_else(|| violation.message())
+                        })
                         .collect::<Vec<_>>()
                         .join("; "),
                 })

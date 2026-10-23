@@ -161,7 +161,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx);
         // An ACL name is the same case-insensitive identifier a user name is, bounded
         // by the same rule, so it is checked and folded before anything is persisted.
-        if let Some(message) = crate::state::resource_name_rejection("ACLName", &input.acl_name) {
+        if let Some(message) = crate::state::resource_name_rejection(
+            crate::state::ResourceKind::Acl,
+            &input.acl_name,
+        ) {
             return Err(CreateACLErrorModeled::InvalidParameterValueException(
                 InvalidParameterValueException {
                     message: Some(message),
@@ -224,7 +227,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if state.acls.contains_key(&acl_name) {
             return Err(CreateACLErrorModeled::ACLAlreadyExistsFault(
                 ACLAlreadyExistsFault {
-                    message: Some(format!("ACL with name {acl_name} already exists.")),
+                    message: Some(crate::state::already_exists_message(
+                        crate::state::ResourceKind::Acl,
+                        &acl_name,
+                    )),
                 },
             )
             .into());

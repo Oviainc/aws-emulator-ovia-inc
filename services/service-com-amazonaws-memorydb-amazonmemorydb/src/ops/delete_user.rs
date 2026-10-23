@@ -163,13 +163,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         state.ensure_builtins(&region);
 
         // The user every MemoryDB account already has is the service's, not the
-        // caller's: it cannot be deleted.
-        if user_name == crate::state::DEFAULT_USER_NAME {
+        // caller's: it cannot be deleted. The refusal is built by the one rule every
+        // write path over a built-in resource reads.
+        if let Some(message) = crate::state::builtin_resource_rejection(
+            crate::state::ResourceKind::User,
+            &user_name,
+            crate::state::Mutation::Delete,
+        ) {
             return Err(DeleteUserErrorModeled::InvalidParameterValueException(
                 InvalidParameterValueException {
-                    message: Some(format!(
-                        "User {user_name} is a default user and cannot be deleted."
-                    )),
+                    message: Some(message),
                 },
             )
             .into());

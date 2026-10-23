@@ -25,6 +25,8 @@ mod events;
 mod parameter_groups;
 #[path = "all/parameters.rs"]
 mod parameters;
+#[path = "all/refusal_messages.rs"]
+mod refusal_messages;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/state_roundtrip.rs"]
