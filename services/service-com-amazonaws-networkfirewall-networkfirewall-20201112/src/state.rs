@@ -78,19 +78,45 @@ pub const IDENTIFIED_CONTAINS_TCP_FLAGS: &str = "STATELESS_RULE_CONTAINS_TCP_FLA
 /// destination", "aws:forward_to_sfe ... forwards it to the stateful rule engine").
 pub const STATELESS_FORWARDING_ACTIONS: [&str; 2] = ["aws:pass", "aws:forward_to_sfe"];
 
-/// The encryption settings a resource reports when the request named none.
+/// The encryption settings a resource reports, given what the request asked for.
 ///
-/// `EncryptionConfiguration`'s own documentation states the rule: "Your data is
-/// encrypted by default with an Amazon Web Services owned key that Amazon Web
+/// `EncryptionConfiguration`'s own documentation states the default: "Your data
+/// is encrypted by default with an Amazon Web Services owned key that Amazon Web
 /// Services owns and manages for you", so an absent member means the AWS-owned
-/// key and no `KeyId` — never "no encryption settings at all".
+/// key — never "no encryption settings at all".
+///
+/// Both members are then reported: `KeyId` names the key protecting the
+/// resource, and the identifier of the AWS-owned key is the
+/// [`ENCRYPTION_AWS_OWNED_KMS_KEY`] token itself (the model does not state this,
+/// so it is RECORDED behaviour: every recorded response for a resource created
+/// without an `EncryptionConfiguration` carries
+/// `{Type: "AWS_OWNED_KMS_KEY", KeyId: "AWS_OWNED_KMS_KEY"}`). A customer
+/// managed key keeps the identifier the request gave, which is the only key id
+/// the service can report for it.
 pub fn effective_encryption_configuration(
     requested: Option<EncryptionConfiguration>,
 ) -> EncryptionConfiguration {
-    requested.unwrap_or_else(|| EncryptionConfiguration {
+    let mut effective = requested.unwrap_or_else(|| EncryptionConfiguration {
         key_id: None,
         r#type: ENCRYPTION_AWS_OWNED_KMS_KEY.to_string(),
-    })
+    });
+    if effective.r#type == ENCRYPTION_AWS_OWNED_KMS_KEY && effective.key_id.is_none() {
+        effective.key_id = Some(ENCRYPTION_AWS_OWNED_KMS_KEY.to_string());
+    }
+    effective
+}
+
+/// The tag collection a response reports for a resource the call just REMOVED
+/// from state: the stored list, empty when the resource carries no tags.
+///
+/// A delete answers from the record it removed rather than echoing a request, so
+/// every collection on that record is projected — a tag list with no entries is
+/// reported as an empty list, not as an absent member. RECORDED behaviour: the
+/// `DeleteFirewallPolicy` response for a policy created with no `Tags` carries
+/// `Tags: []`, where the same policy's create response (which echoes the
+/// request's own optional `Tags` member) carries none.
+pub fn removed_resource_tags(stored: Option<Vec<Tag>>) -> Option<Vec<Tag>> {
+    Some(stored.unwrap_or_default())
 }
 
 /// The upper bound of `PaginationMaxResults` (`range 1..100`), and therefore the
