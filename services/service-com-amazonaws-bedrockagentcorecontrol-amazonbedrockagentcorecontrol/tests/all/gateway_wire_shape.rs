@@ -38,6 +38,7 @@ use smithy_server_runtime::MultiServiceRouter;
 use service_com_amazonaws_bedrockagentcorecontrol_amazonbedrockagentcorecontrol::ops::types::{
     AgentRuntime, CreateAgentRuntimeOutput, CreateGatewayOutput, CreateGatewayTargetOutput,
     GetAgentRuntimeOutput, GetGatewayOutput, GetGatewayTargetOutput, UpdateAgentRuntimeOutput,
+    UpdateGatewayOutput,
 };
 use service_com_amazonaws_bedrockagentcorecontrol_amazonbedrockagentcorecontrol::EmulatedService;
 
@@ -373,14 +374,16 @@ async fn every_reported_date_time_member_is_an_rfc3339_string() {
 #[test]
 fn every_reported_timestamp_member_schema_carries_the_date_time_format() {
     // Source: `smithy_query(query="shape",shape="CreateGatewayResponse,GetGatewayResponse,
-    // CreateGatewayTargetResponse,GetGatewayTargetResponse,CreateAgentRuntimeResponse,
-    // GetAgentRuntimeResponse,UpdateAgentRuntimeResponse,AgentRuntime")` — every member of
-    // these shapes targeting `DateTimestamp`.
+    // UpdateGatewayResponse,CreateGatewayTargetResponse,GetGatewayTargetResponse,
+    // CreateAgentRuntimeResponse,GetAgentRuntimeResponse,UpdateAgentRuntimeResponse,
+    // AgentRuntime")` — every member of these shapes targeting `DateTimestamp`.
     let date_time_members: Vec<(&str, &Schema)> = vec![
         ("CreateGatewayResponse$createdAt", &CreateGatewayOutput::M_CREATED_AT),
         ("CreateGatewayResponse$updatedAt", &CreateGatewayOutput::M_UPDATED_AT),
         ("GetGatewayResponse$createdAt", &GetGatewayOutput::M_CREATED_AT),
         ("GetGatewayResponse$updatedAt", &GetGatewayOutput::M_UPDATED_AT),
+        ("UpdateGatewayResponse$createdAt", &UpdateGatewayOutput::M_CREATED_AT),
+        ("UpdateGatewayResponse$updatedAt", &UpdateGatewayOutput::M_UPDATED_AT),
         (
             "CreateGatewayTargetResponse$createdAt",
             &CreateGatewayTargetOutput::M_CREATED_AT,

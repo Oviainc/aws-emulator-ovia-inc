@@ -214,6 +214,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let region = crate::state::request_region(ctx.parts());
         let created = ::std::time::SystemTime::now();
+        // The request's own tag count is charged BEFORE the store lock is taken, for
+        // the reason `crate::state::bound_tag_count` records: `TagList` carries no
+        // modelled `@length`, so the work a request can ask for inside the critical
+        // section has to be bounded by the per-resource quota up front.
+        if let Some(reason) = input
+            .tags
+            .as_ref()
+            .map(|tags| crate::state::bound_tag_count(tags.len()))
+            .and_then(Result::err)
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(reason));
+        }
         let mut store = state.lock();
 
         // The name is the bus's identity, so a name already stored is a resource
@@ -251,7 +263,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(|identifier| crate::state::kms_key_identifier(&region, identifier));
         bus.dead_letter_config = input.dead_letter_config;
         bus.log_config = input.log_config;
-        bus.tags = input.tags.unwrap_or_default();
+        // "Tags to associate with the event bus" (`Tags`): the tags a create names go
+        // through the same merge every tag write of this service uses, so one
+        // request's repeated key and the per-resource tag bound are resolved the same
+        // way here as in `TagResource`.
+        if let Err(reason) = crate::state::merge_tags(&mut bus.tags, input.tags.unwrap_or_default())
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(reason));
+        }
         store.buses.insert(input.name.clone(), bus);
 
         // Reported from the STORED record rather than from the request, so this

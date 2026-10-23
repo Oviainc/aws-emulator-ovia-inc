@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateGateway
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateGateway`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateGateway::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! WRITES the gateway's configuration through to the record in [`crate::state`] that
+//! `CreateGateway` persisted and `GetGateway` reads: every mutable member of the request
+//! replaces the stored one (`PUT /gateways/{gatewayIdentifier}/` replaces the
+//! configuration, so a member the request leaves out is cleared), the gateway's identity
+//! (its id, ARN, URL, creation instant, tags, workload identity and targets) is kept, and
+//! the `UPDATING` -> `READY` transition the clock owes it is stored.
 //!
 //! ## Shape of an operation
 //!
@@ -160,6 +158,11 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// `protocolType`'s modelled default: `GatewayProtocolType` has the single value `MCP`
+/// and the member carries `default: "MCP"` (`smithy_query operation=UpdateGateway`), so a
+/// request that names none still leaves the gateway reporting the protocol it speaks.
+const DEFAULT_PROTOCOL_TYPE: &str = "MCP";
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -234,18 +237,109 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateGateway` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateGatewayErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateGateway"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateGatewayErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the gateway store is unavailable".to_string()),
+            })
+        })?;
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // A gateway whose deletion the clock has already made due is gone before
+        // this call looks for it.
+        store.expire_deleted_gateways(now);
+
+        // The same prose rule `CreateGateway` carries, which the framework's
+        // constraint walk cannot refuse: "If you specify CUSTOM_JWT as the
+        // authorizerType, you must provide an authorizerConfiguration." It is a
+        // rule about the gateway's authorizer, so it holds for the call that
+        // REPLACES that authorizer just as it does for the one that sets it.
+        if input.authorizer_type == crate::state::AUTHORIZER_TYPE_CUSTOM_JWT
+            && input.authorizer_configuration.is_none()
+        {
+            return Err(UpdateGatewayErrorModeled::ValidationException(
+                crate::state::field_validation_failed(
+                    "authorizerConfiguration",
+                    &format!(
+                        "is required when authorizerType is {}",
+                        crate::state::AUTHORIZER_TYPE_CUSTOM_JWT
+                    ),
+                ),
+            )
+            .into());
+        }
+
+        // `gatewayIdentifier` is the `gatewayId` the create minted, which is how
+        // the store is keyed; an identifier naming no stored gateway is the
+        // modelled 404 rather than a gateway minted by an update.
+        let record = store
+            .gateways
+            .get_mut(&input.gateway_identifier)
+            .ok_or_else(|| {
+                UpdateGatewayErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message: Some(format!(
+                        "no gateway with identifier {} exists in this account",
+                        input.gateway_identifier
+                    )),
+                })
+            })?;
+
+        // `name` is `@required` on the request and the model states what it must
+        // carry: "This name must be the same as the one when the gateway was
+        // created." A different name would rename a resource whose id, ARN and URL
+        // are all derived from the original, so it is refused rather than stored.
+        if input.name != record.name {
+            return Err(UpdateGatewayErrorModeled::ValidationException(
+                crate::state::field_validation_failed(
+                    "name",
+                    &format!(
+                        "must be the name the gateway was created with ({}), got {}",
+                        record.name, input.name
+                    ),
+                ),
+            )
+            .into());
+        }
+
+        // A gateway whose deletion has been accepted is on its way out, so it is not
+        // a gateway an update can reconfigure, and neither is one the clock has not
+        // finished creating or updating yet: a gateway serves a mutation only in the
+        // terminal status it settles into.
+        let status = record.status_at(now).to_string();
+        if status != crate::state::STATUS_READY {
+            return Err(UpdateGatewayErrorModeled::ValidationException(
+                crate::state::gateway_status_conflict(Self::NAME, &status),
+            )
+            .into());
+        }
+
+        // Every mutable member of the gateway is replaced by what this request
+        // carries, and nothing else about the gateway changes: a member the
+        // request omits is cleared, because this is the whole configuration and
+        // not a patch of it.
+        record.description = input.description;
+        record.role_arn = input.role_arn;
+        record.protocol_type = Some(
+            input
+                .protocol_type
+                .unwrap_or_else(|| DEFAULT_PROTOCOL_TYPE.to_string()),
+        );
+        record.protocol_configuration = input.protocol_configuration;
+        record.authorizer_type = input.authorizer_type;
+        record.authorizer_configuration = input.authorizer_configuration;
+        record.kms_key_arn = input.kms_key_arn;
+        record.custom_transform_configuration = input.custom_transform_configuration;
+        record.interceptor_configurations = input.interceptor_configurations;
+        record.policy_engine_configuration = input.policy_engine_configuration;
+        record.exception_level = input.exception_level;
+        record.waf_configuration = input.waf_configuration;
+        record.updated_at = now;
+        // An updated gateway is not ready again at once: the transition back to
+        // READY is owed by the clock, not by this call.
+        record.transient_status = crate::state::STATUS_UPDATING.to_string();
+        record.settled_status = crate::state::STATUS_READY.to_string();
+        record.settles_at = now + crate::state::GATEWAY_SETTLE_DELAY;
+
+        Ok(record.update_output(now))
     }
 }

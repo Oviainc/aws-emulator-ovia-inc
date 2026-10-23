@@ -16,7 +16,7 @@ emulator-server = { workspace = true }
 emulator-telemetry = { workspace = true }
 aws-smithy-runtime-api = { workspace = true }
 aws-smithy-types = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["sync", "time"] }
 bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
@@ -26,6 +26,9 @@ tracing = { workspace = true }
 uuid = { version = "1", features = ["v4"] }
 # Encodes the opaque pagination tokens ListCollaborations/ListMemberships hand out.
 hex = { workspace = true }
+# Parses an analysis template's SQL so `AnalysisTemplate$schema.referencedTables` is
+# the relations the analysis really reads, rather than a hand-rolled text scan.
+sqlparser = { version = "0.59", features = ["visitor"] }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

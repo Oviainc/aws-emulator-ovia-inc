@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateCloudConnector
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateCloudConnector`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//!
+//! Inserts the C2C connector into `crate::state`'s `cloud_connectors` store under a
+//! freshly generated `CloudConnectorId`, and answers with that id. A replayed
+//! `ClientToken` (`@idempotencyToken`) answers with the connector the first call created
+//! instead of creating a second one.
 //!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateCloudConnector::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! broken".
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +155,88 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateCloudConnector` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateCloudConnectorErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateCloudConnector"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateCloudConnectorErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the cloud-connector store is unavailable".to_string()),
+            })
+        })?;
+
+        // `EndpointType` is a modelled enum, so a value outside the enum is a client
+        // error rather than a stored record. The model's own constraint walk refuses one
+        // before this handler runs; this second line states it through the SAME formatter,
+        // so the two cannot word one refusal two ways
+        // (`crate::service::enum_value_set_refusal`).
+        if let Some(endpoint_type) = input
+            .endpoint_type
+            .as_deref()
+            .filter(|value| !crate::state::ENDPOINT_TYPE_VALUES.contains(value))
+        {
+            return Err(CreateCloudConnectorErrorModeled::ValidationException(ValidationException {
+                message: Some(crate::service::enum_value_set_refusal(
+                    "endpointType",
+                    crate::state::ENDPOINT_TYPE_VALUES,
+                    endpoint_type,
+                )),
+            })
+            .into());
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+        let created_at = ::std::time::SystemTime::now();
+
+        // Retire the idempotency records the clock already made due, before anything
+        // reads them: a token past its TTL neither replays nor occupies the map.
+        store.retire_expired_idempotency_tokens(created_at);
+
+        // A retry with the same `ClientToken` answers with what the first call created,
+        // performing no further action. The connector the token replays into is resolved
+        // through this region's endpoint, as every read of a connector is.
+        let replayed = input.client_token.as_deref().and_then(|token| {
+            store.replayed_resource_id(crate::state::CLOUD_CONNECTOR_RESOURCE_TYPE, token)
+        });
+        if let Some(created) = replayed.and_then(|id| store.cloud_connector_in(&region, &id)) {
+            return Ok(CreateCloudConnectorOutput {
+                id: Some(created.id.clone()),
+            });
+        }
+
+        // The store is bounded: past its maximum a create is refused rather than grown
+        // into. The operation models no quota error, so the refusal is the modelled error
+        // closest to "this service will not take another one now".
+        if store.cloud_connectors.len() >= crate::state::MAX_CLOUD_CONNECTORS {
+            return Err(CreateCloudConnectorErrorModeled::ThrottlingException(ThrottlingException {
+                message: Some(format!(
+                    "this service holds the maximum of {} cloud connectors; delete one \
+                     before creating another",
+                    crate::state::MAX_CLOUD_CONNECTORS
+                )),
+            })
+            .into());
+        }
+
+        let id = crate::state::opaque_id(store.take_sequence());
+        let connector = crate::state::CloudConnector {
+            id: id.clone(),
+            region,
+            name: input.name,
+            description: input.description,
+            endpoint_config: input.endpoint_config,
+            endpoint_type: input.endpoint_type,
+            connector_type: crate::state::CREATED_CLOUD_CONNECTOR_TYPE.to_string(),
+        };
+
+        if let Some(token) = input.client_token {
+            store.record_idempotency_token(
+                crate::state::CLOUD_CONNECTOR_RESOURCE_TYPE,
+                &token,
+                &id,
+                created_at,
+            );
+        }
+        store.cloud_connector_order.push(id.clone());
+        store.cloud_connectors.insert(id.clone(), connector);
+
+        Ok(CreateCloudConnectorOutput { id: Some(id) })
     }
 }

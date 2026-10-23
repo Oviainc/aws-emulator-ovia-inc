@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op InitiateAuth
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `InitiateAuth`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`InitiateAuth::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Signs a user in without credentials of its own (this operation is `@optionalAuth`):
+//! `AuthFlow=USER_PASSWORD_AUTH` verifies the stored password and issues the token
+//! triple, `REFRESH_TOKEN_AUTH` / `REFRESH_TOKEN` exchange a refresh token this
+//! emulator issued for a fresh access and id token, and a user that still has to change
+//! its password gets the `NEW_PASSWORD_REQUIRED` challenge with a persisted `Session`.
+//! The app client's `ClientId` is what names the user pool, since this operation models
+//! no `UserPoolId`. The two admin flows are refused as the model documents, and every
+//! remaining `AuthFlow` answers 501 until it is implemented.
 //!
 //! ## Shape of an operation
 //!
@@ -287,20 +286,388 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `InitiateAuth` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(InitiateAuthErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("InitiateAuth"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_error());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let auth_parameters = input.auth_parameters.unwrap_or_default();
+        let mut guard = state.lock();
+
+        // `AuthFlow` is an enumerated member, so the boundary validator has already
+        // refused any value outside `AuthFlowType`.
+        match input.auth_flow.as_str() {
+            USER_PASSWORD_AUTH => {
+                password_sign_in(&mut guard, &input.client_id, &auth_parameters, now)
+            }
+            REFRESH_TOKEN_AUTH | REFRESH_TOKEN => refresh_sign_in(
+                &mut guard,
+                &input.client_id,
+                &auth_parameters,
+                &input.auth_flow,
+                now,
+            ),
+            // "`ADMIN_USER_PASSWORD_AUTH` is a flow type of `AdminInitiateAuth` and
+            // isn't valid for InitiateAuth. `ADMIN_NO_SRP_AUTH` is a legacy server-side
+            // username-password flow and isn't valid for InitiateAuth."
+            // (`InitiateAuth.AuthFlow` in this service's model.)
+            ADMIN_USER_PASSWORD_AUTH | ADMIN_NO_SRP_AUTH => Err(invalid_parameter(format!(
+                "{} is not a valid AuthFlow for InitiateAuth",
+                input.auth_flow
+            ))),
+            // The remaining flows need something this emulator does not perform — the
+            // SRP protocol, or the Lambda triggers a custom or choice-based flow runs —
+            // so they say so rather than answering a sign-in nothing performed.
+            _ => Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
+                "InitiateAuth with AuthFlow={}",
+                input.auth_flow
+            ))),
+        }
     }
+}
+
+/// This service's state, as the handler holds it under the lock.
+type State =
+    crate::state::ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState;
+
+/// `AuthFlowType`'s client-side username-password flow.
+const USER_PASSWORD_AUTH: &str = "USER_PASSWORD_AUTH";
+
+/// `AuthFlowType`'s refresh-token flow, and the alias the same enum carries for it.
+const REFRESH_TOKEN_AUTH: &str = "REFRESH_TOKEN_AUTH";
+const REFRESH_TOKEN: &str = "REFRESH_TOKEN";
+
+/// The two `AuthFlowType` members that belong to `AdminInitiateAuth`.
+const ADMIN_USER_PASSWORD_AUTH: &str = "ADMIN_USER_PASSWORD_AUTH";
+const ADMIN_NO_SRP_AUTH: &str = "ADMIN_NO_SRP_AUTH";
+
+/// The challenge a user that must change its password is answered with
+/// (`ChallengeNameType` in this service's model).
+const NEW_PASSWORD_REQUIRED: &str = "NEW_PASSWORD_REQUIRED";
+
+/// `AuthFlow=USER_PASSWORD_AUTH`: "Client-side username-password authentication with
+/// the password sent directly in the request" (`InitiateAuth.AuthFlow`), whose
+/// `AuthParameters` are `USERNAME` and `PASSWORD`, both documented "required".
+///
+/// The password is checked against the one STORED for the user, and the app client the
+/// request names is what resolves the pool.
+fn password_sign_in(
+    state: &mut State,
+    client_id: &str,
+    auth_parameters: &::std::collections::HashMap<String, String>,
+    now: ::std::time::SystemTime,
+) -> Result<InitiateAuthOutput, InitiateAuthError> {
+    let username = auth_parameters
+        .get("USERNAME")
+        .ok_or_else(|| missing_auth_parameter("USERNAME", USER_PASSWORD_AUTH))?;
+    let password = auth_parameters
+        .get("PASSWORD")
+        .ok_or_else(|| missing_auth_parameter("PASSWORD", USER_PASSWORD_AUTH))?;
+
+    let outcome = {
+        let pool = state
+            .pool_of_client(client_id)
+            .ok_or_else(|| client_not_found(client_id))?;
+        let client = pool
+            .clients
+            .get(client_id)
+            .ok_or_else(|| client_not_found(client_id))?;
+        if !client.allows_user_password_auth() {
+            return Err(invalid_parameter(format!(
+                "{USER_PASSWORD_AUTH} is not enabled for the client {client_id}"
+            )));
+        }
+        let hides_user_existence = client.hides_user_existence();
+        let session_validity = client.auth_session_validity();
+        let temporary_password_validity = pool.temporary_password_validity();
+        let user_pool_id = pool.id.clone();
+
+        let user = pool.user(username).ok_or_else(|| {
+            // `PreventUserExistenceErrors=ENABLED` "suppresses messages that might
+            // indicate a valid user exists"; `LEGACY` answers `UserNotFoundException`.
+            if hides_user_existence {
+                incorrect_credentials()
+            } else {
+                user_not_found(username)
+            }
+        })?;
+        // The stored credential, actually checked — and checked FIRST: every refusal
+        // below reports something about the user (disabled, `RESET_REQUIRED`,
+        // `UNCONFIRMED`, an expired temporary password), and a caller only learns that
+        // much once it has proved it holds the user's password. A wrong password is
+        // therefore answered the same way for every user state, which is also what
+        // `PreventUserExistenceErrors=ENABLED` asks of this operation: nothing in the
+        // answer distinguishes a user that exists from one that does not.
+        if user.password.as_deref() != Some(password.as_str()) {
+            return Err(incorrect_credentials());
+        }
+        refuse_unusable_user(user)?;
+        if user.temporary_password_expired(temporary_password_validity, now) {
+            return Err(not_authorized(
+                "Temporary password has expired and must be reset by an administrator.",
+            ));
+        }
+
+        if user.status == crate::state::UserStatus::ForceChangePassword {
+            Outcome::Challenge {
+                user_pool_id,
+                username: user.username.clone(),
+                required_attributes: pool.missing_required_attributes(user),
+                user_attributes: user.attributes.clone(),
+                session_validity,
+            }
+        } else {
+            Outcome::Authenticate {
+                user_pool_id,
+                username: user.username.clone(),
+            }
+        }
+    };
+
+    match outcome {
+        Outcome::Challenge {
+            user_pool_id,
+            username,
+            required_attributes,
+            user_attributes,
+            session_validity,
+        } => {
+            let session = state.start_session(
+                now,
+                crate::state::AuthSession {
+                    user_pool_id,
+                    client_id: client_id.to_string(),
+                    username: username.clone(),
+                    challenge_name: NEW_PASSWORD_REQUIRED.to_string(),
+                    expires_at: now + session_validity,
+                },
+            );
+            let mut challenge_parameters = ::std::collections::HashMap::new();
+            challenge_parameters.insert("USER_ID_FOR_SRP".to_string(), username);
+            challenge_parameters.insert(
+                "requiredAttributes".to_string(),
+                serde_json::Value::Array(
+                    required_attributes
+                        .into_iter()
+                        .map(|name| serde_json::Value::String(format!("userAttributes.{name}")))
+                        .collect(),
+                )
+                .to_string(),
+            );
+            challenge_parameters.insert(
+                "userAttributes".to_string(),
+                serde_json::Value::Object(
+                    user_attributes
+                        .into_iter()
+                        .map(|(name, value)| (name, serde_json::Value::String(value)))
+                        .collect(),
+                )
+                .to_string(),
+            );
+            Ok(InitiateAuthOutput {
+                challenge_name: Some(NEW_PASSWORD_REQUIRED.to_string()),
+                session: Some(session),
+                challenge_parameters: Some(challenge_parameters),
+                authentication_result: None,
+                available_challenges: None,
+            })
+        }
+        Outcome::Authenticate {
+            user_pool_id,
+            username,
+        } => {
+            let authentication_result = state
+                .issue_tokens(&user_pool_id, client_id, &username, now)
+                .ok_or_else(internal_error)?;
+            Ok(authenticated(authentication_result))
+        }
+    }
+}
+
+/// `AuthFlow=REFRESH_TOKEN_AUTH` and its `REFRESH_TOKEN` alias: "Receive new ID and
+/// access tokens when you pass a `REFRESH_TOKEN` parameter with a valid refresh token
+/// as the value" (`InitiateAuth.AuthFlow`), whose one required `AuthParameter` is
+/// `REFRESH_TOKEN`.
+///
+/// "Valid" is read off the token record this emulator wrote when it issued the token:
+/// it must be a refresh token, issued for the app client the request names, not revoked,
+/// and not past its expiry. `auth_flow` is the member the request actually named, so a
+/// refusal echoes `REFRESH_TOKEN_AUTH` or its `REFRESH_TOKEN` alias as submitted.
+fn refresh_sign_in(
+    state: &mut State,
+    client_id: &str,
+    auth_parameters: &::std::collections::HashMap<String, String>,
+    auth_flow: &str,
+    now: ::std::time::SystemTime,
+) -> Result<InitiateAuthOutput, InitiateAuthError> {
+    let refresh_token = auth_parameters
+        .get("REFRESH_TOKEN")
+        .ok_or_else(|| missing_auth_parameter("REFRESH_TOKEN", auth_flow))?;
+
+    let (user_pool_id, username) = {
+        let pool = state
+            .pool_of_client(client_id)
+            .ok_or_else(|| client_not_found(client_id))?;
+        let client = pool
+            .clients
+            .get(client_id)
+            .ok_or_else(|| client_not_found(client_id))?;
+        if !client.allows_refresh_token_auth() {
+            return Err(invalid_parameter(format!(
+                "{auth_flow} is not enabled for the client {client_id}"
+            )));
+        }
+        let user_pool_id = pool.id.clone();
+
+        let username = state
+            .token(refresh_token)
+            .filter(|record| {
+                record.kind == crate::state::TokenKind::Refresh
+                    && !record.revoked
+                    && record.expires_at > now
+                    && record.client_id == client_id
+                    && record.user_pool_id == user_pool_id
+            })
+            .ok_or_else(invalid_refresh_token)?
+            .username
+            .clone();
+
+        // The record is only a pointer into the pool: the user it names may have been
+        // disabled, reset or deleted since the token was issued.
+        let user = state
+            .pool(&user_pool_id)
+            .and_then(|pool| pool.user(&username))
+            .ok_or_else(invalid_refresh_token)?;
+        refuse_unusable_user(user)?;
+        (user_pool_id, user.username.clone())
+    };
+
+    let authentication_result = state
+        .refresh_tokens(&user_pool_id, client_id, &username, now)
+        .ok_or_else(internal_error)?;
+    Ok(authenticated(authentication_result))
+}
+
+/// The refusals a stored user's own state owes any sign-in flow, whatever the flow
+/// presented: a disabled user, one Amazon Cognito put in `RESET_REQUIRED`, and one that
+/// never confirmed its sign-up.
+fn refuse_unusable_user(user: &crate::state::User) -> Result<(), InitiateAuthError> {
+    if !user.enabled {
+        return Err(not_authorized("User is disabled."));
+    }
+    match user.status {
+        crate::state::UserStatus::ResetRequired => Err(password_reset_required()),
+        crate::state::UserStatus::Unconfirmed => Err(user_not_confirmed()),
+        _ => Ok(()),
+    }
+}
+
+/// A completed sign-in: the tokens, and none of the challenge members, which are "only
+/// returned if the user doesn't need to pass another challenge"
+/// (`InitiateAuthResponse.AuthenticationResult`).
+fn authenticated(authentication_result: AuthenticationResultType) -> InitiateAuthOutput {
+    InitiateAuthOutput {
+        challenge_name: None,
+        session: None,
+        challenge_parameters: None,
+        authentication_result: Some(authentication_result),
+        available_challenges: None,
+    }
+}
+
+/// What the stored state decided a password sign-in is, read under the state lock
+/// before anything is written.
+enum Outcome {
+    /// The password is right but the user must change it first.
+    Challenge {
+        user_pool_id: String,
+        username: String,
+        required_attributes: Vec<String>,
+        user_attributes: ::std::collections::BTreeMap<String, String>,
+        session_validity: ::std::time::Duration,
+    },
+    /// The password is right and the user may sign in.
+    Authenticate {
+        user_pool_id: String,
+        username: String,
+    },
+}
+
+/// This operation's `ResourceNotFoundException` for a `ClientId` no stored pool holds.
+fn client_not_found(client_id: &str) -> InitiateAuthError {
+    InitiateAuthErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("User pool client {client_id} does not exist.")),
+    })
+    .into()
+}
+
+/// This operation's `UserNotFoundException` for an absent user.
+fn user_not_found(username: &str) -> InitiateAuthError {
+    InitiateAuthErrorModeled::UserNotFoundException(UserNotFoundException {
+        message: Some(format!("User {username} does not exist.")),
+    })
+    .into()
+}
+
+/// The refusal for a wrong password: `NotAuthorizedException`, which is also what an
+/// absent user gets when the client hides user existence.
+fn incorrect_credentials() -> InitiateAuthError {
+    not_authorized("Incorrect username or password.")
+}
+
+/// The refusal for a `REFRESH_TOKEN` this emulator cannot resolve to a live refresh
+/// token of the app client the request names.
+fn invalid_refresh_token() -> InitiateAuthError {
+    not_authorized("Invalid Refresh Token.")
+}
+
+/// This operation's `NotAuthorizedException`, carrying `message`.
+fn not_authorized(message: &str) -> InitiateAuthError {
+    InitiateAuthErrorModeled::NotAuthorizedException(NotAuthorizedException {
+        message: Some(message.to_string()),
+    })
+    .into()
+}
+
+/// This operation's `PasswordResetRequiredException` for a user in `RESET_REQUIRED`.
+fn password_reset_required() -> InitiateAuthError {
+    InitiateAuthErrorModeled::PasswordResetRequiredException(PasswordResetRequiredException {
+        message: Some("Password reset required for the user.".to_string()),
+    })
+    .into()
+}
+
+/// This operation's `UserNotConfirmedException` for a user in `UNCONFIRMED`.
+fn user_not_confirmed() -> InitiateAuthError {
+    InitiateAuthErrorModeled::UserNotConfirmedException(UserNotConfirmedException {
+        message: Some("User is not confirmed.".to_string()),
+    })
+    .into()
+}
+
+/// The refusal for an `AuthParameters` entry this flow requires and the request did not
+/// carry.
+fn missing_auth_parameter(parameter: &str, auth_flow: &str) -> InitiateAuthError {
+    invalid_parameter(format!(
+        "Missing required parameter {parameter} in AuthParameters for AuthFlow {auth_flow}"
+    ))
+}
+
+/// This operation's `InvalidParameterException`, carrying `message`.
+fn invalid_parameter(message: String) -> InitiateAuthError {
+    InitiateAuthErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(message),
+        reason_code: None,
+    })
+    .into()
+}
+
+/// The modelled server error for an engine this service cannot reach.
+fn internal_error() -> InitiateAuthError {
+    InitiateAuthErrorModeled::InternalErrorException(InternalErrorException {
+        message: Some("the cognito-idp emulator could not reach its state store".to_string()),
+    })
+    .into()
 }

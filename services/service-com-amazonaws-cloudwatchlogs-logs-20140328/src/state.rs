@@ -190,6 +190,56 @@ pub const SELECTION_CRITERIA_POLICY_TYPES: [&str; 4] = [
     POLICY_TYPE_METRIC_EXTRACTION,
 ];
 
+/// How many values one `IN` or `NOT IN` list of a `selectionCriteria` may carry, from the
+/// metric extraction policy section of `PutAccountPolicy`: "The selection criteria supports
+/// filtering by LogGroupName and LogGroupNamePrefix using the operators IN and NOT IN. You
+/// can specify up to 50 values in each IN or NOT IN list." The sentence is stated for that
+/// type's criteria, so it is the bound that type's criteria is held to.
+pub const MAX_SELECTION_CRITERIA_VALUES: usize = 50;
+
+/// The `selectionCriteria` filter that selects log groups by their exact name, from
+/// `PutAccountPolicy$selectionCriteria` ("the only supported selectionCriteria filter is
+/// `LogGroupName NOT IN []`") and from the metric extraction formats `PutAccountPolicy`
+/// spells out (`LogGroupName IN ["log-group-1", "log-group-2"]`).
+pub const SELECTION_FIELD_LOG_GROUP_NAME: &str = "LogGroupName";
+
+/// The `selectionCriteria` filter that selects log groups by a prefix of their name, from
+/// the same two places (`LogGroupNamePrefix NOT IN ["/aws/prefix1", "/aws/prefix2"]`).
+pub const SELECTION_FIELD_LOG_GROUP_NAME_PREFIX: &str = "LogGroupNamePrefix";
+
+/// The `selectionCriteria` filter naming a data source, from
+/// `PutAccountPolicy$selectionCriteria`: a field index policy may "use either
+/// LogGroupNamePrefix by itself or DataSourceName and DataSourceType together".
+pub const SELECTION_FIELD_DATA_SOURCE_NAME: &str = "DataSourceName";
+
+/// The `selectionCriteria` filter naming a data source's type. See
+/// [`SELECTION_FIELD_DATA_SOURCE_NAME`].
+pub const SELECTION_FIELD_DATA_SOURCE_TYPE: &str = "DataSourceType";
+
+/// The member of a `METRIC_EXTRACTION_POLICY` document that says what the policy does to
+/// the Embedded Metrics Format. Such a policy exists to "disable EMF metric creation for
+/// your entire account or specific log groups" (`PutAccountPolicy`), and the recorded
+/// behaviour of the real service is that the document carries
+/// `EmbeddedMetricFormat.Status` and that the service "accepts only the exact string
+/// 'Disabled'", refusing anything else with `InvalidParameterException` and
+/// [`INVALID_JSON_POLICY_DOCUMENT_MESSAGE`].
+pub const METRIC_EXTRACTION_EMF_MEMBER: &str = "EmbeddedMetricFormat";
+
+/// The member of `EmbeddedMetricFormat` carrying the status. See
+/// [`METRIC_EXTRACTION_EMF_MEMBER`].
+pub const METRIC_EXTRACTION_STATUS_MEMBER: &str = "Status";
+
+/// The one `EmbeddedMetricFormat.Status` a metric extraction policy document may carry:
+/// EMF metric creation "is enabled for all log groups" by default and a policy only ever
+/// turns it off, so `Disabled` is the whole of what such a document can say. See
+/// [`METRIC_EXTRACTION_EMF_MEMBER`].
+pub const METRIC_EXTRACTION_STATUS_DISABLED: &str = "Disabled";
+
+/// How the real service words its refusal of a metric extraction policy document it does
+/// not accept, as the corpus recorded it: `('InvalidParameterException', 'Invalid json
+/// policy document')`. See [`METRIC_EXTRACTION_EMF_MEMBER`].
+pub const INVALID_JSON_POLICY_DOCUMENT_MESSAGE: &str = "Invalid json policy document";
+
 /// How many account-level policies of one type the account may hold when the policy being
 /// put is "scoped to a subset of log groups with the selectionCriteria parameter": for a
 /// transformer policy, "you can create as many as 20 account-level transformer policies",
@@ -830,9 +880,9 @@ pub fn check_account_policy_document(
             check_transformer_policy_document(document).map(|()| AccountPolicyShape::default())
         }
         // A metric extraction policy "controls whether CloudWatch Metrics can be created
-        // through the Embedded Metrics Format (EMF)"; the documentation states no members
-        // for its document, so the one rule left is that it is a policy in JSON.
-        _ => policy_object(document).map(|_| AccountPolicyShape::default()),
+        // through the Embedded Metrics Format (EMF)", and the one thing it can say is that
+        // EMF metric creation is off.
+        _ => check_metric_extraction_policy_document(document).map(|()| AccountPolicyShape::default()),
     }
 }
 
@@ -982,6 +1032,453 @@ fn check_transformer_policy_document(document: &str) -> Result<(), String> {
         return Err(expected);
     }
     Ok(())
+}
+
+/// Judge a `METRIC_EXTRACTION_POLICY` document.
+///
+/// Such a policy exists only to turn the Embedded Metrics Format off: "By default, EMF
+/// metric creation is enabled for all log groups. You can use metric extraction policies to
+/// disable EMF metric creation for your entire account or specific log groups." The
+/// document says so through [`METRIC_EXTRACTION_EMF_MEMBER`]'s
+/// [`METRIC_EXTRACTION_STATUS_MEMBER`], and the real service "accepts only the exact
+/// string" [`METRIC_EXTRACTION_STATUS_DISABLED`] there — a document that says anything
+/// else, including that EMF is enabled, is refused with
+/// [`INVALID_JSON_POLICY_DOCUMENT_MESSAGE`]. Any other member of the document is left
+/// alone: nothing documents one, so nothing is judged about it.
+fn check_metric_extraction_policy_document(document: &str) -> Result<(), String> {
+    let members = policy_object(document).map_err(|_| INVALID_JSON_POLICY_DOCUMENT_MESSAGE.to_string())?;
+    let status = members
+        .get(METRIC_EXTRACTION_EMF_MEMBER)
+        .and_then(serde_json::Value::as_object)
+        .and_then(|embedded_metric_format| embedded_metric_format.get(METRIC_EXTRACTION_STATUS_MEMBER))
+        .and_then(serde_json::Value::as_str);
+    if status != Some(METRIC_EXTRACTION_STATUS_DISABLED) {
+        return Err(INVALID_JSON_POLICY_DOCUMENT_MESSAGE.to_string());
+    }
+    Ok(())
+}
+
+/// One filter of a `selectionCriteria` string: the field it selects on, whether it is
+/// written with `NOT IN` rather than `IN`, and the values of its list.
+///
+/// The forms are the ones `PutAccountPolicy` spells out — `LogGroupName IN ["log-group-1",
+/// "log-group-2"]`, `LogGroupNamePrefix NOT IN ["/aws/prefix1", "/aws/prefix2"]` — and the
+/// filters are the ones `PutAccountPolicy$selectionCriteria` names per policy type
+/// ([`SELECTION_FIELD_LOG_GROUP_NAME`], [`SELECTION_FIELD_LOG_GROUP_NAME_PREFIX`],
+/// [`SELECTION_FIELD_DATA_SOURCE_NAME`], [`SELECTION_FIELD_DATA_SOURCE_TYPE`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectionClause {
+    /// The filter's field, as the criteria string spells it.
+    pub field: String,
+    /// `true` for a `NOT IN` list, `false` for an `IN` list.
+    pub negated: bool,
+    /// The values of the list, in the order written. Empty for the documented
+    /// `LogGroupName NOT IN []`.
+    pub values: Vec<String>,
+}
+
+impl SelectionClause {
+    /// One clause, from the text before its list and the values of that list; `None` when
+    /// the text is not `Field IN` or `Field NOT IN`.
+    fn parse(head: &str, values: Vec<String>) -> Option<Self> {
+        let mut tokens = head.split_whitespace();
+        let field = tokens.next()?.to_string();
+        let negated = match (tokens.next()?, tokens.next()) {
+            ("IN", None) => false,
+            ("NOT", Some("IN")) => true,
+            _ => return None,
+        };
+        if tokens.next().is_some() {
+            return None;
+        }
+        Some(Self {
+            field,
+            negated,
+            values,
+        })
+    }
+}
+
+/// A `selectionCriteria` string, parsed into its filters.
+///
+/// More than one clause is only the field index policy's `DataSourceName` AND
+/// `DataSourceType` pair — "you can use either LogGroupNamePrefix by itself or
+/// DataSourceName and DataSourceType together" — which is the one documented form that
+/// joins two filters.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SelectionCriteria {
+    /// The criteria's clauses, in the order written.
+    pub clauses: Vec<SelectionClause>,
+}
+
+impl SelectionCriteria {
+    /// This criteria's clause on `field`, when it carries one.
+    pub fn clause(&self, field: &str) -> Option<&SelectionClause> {
+        self.clauses.iter().find(|clause| clause.field == field)
+    }
+
+    /// Whether this criteria is exactly one clause on `field`, optionally with the
+    /// operator `negated` names.
+    fn is_single(&self, field: &str, negated: Option<bool>) -> bool {
+        match self.clauses.as_slice() {
+            [clause] => {
+                clause.field == field && negated.is_none_or(|negated| clause.negated == negated)
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether this criteria is the `DataSourceName` AND `DataSourceType` pair.
+    fn is_data_source_pair(&self) -> bool {
+        self.clauses.len() == 2
+            && self.clause(SELECTION_FIELD_DATA_SOURCE_NAME).is_some()
+            && self.clause(SELECTION_FIELD_DATA_SOURCE_TYPE).is_some()
+    }
+}
+
+/// One set of log groups a `selectionCriteria` value names.
+///
+/// A `LogGroupName` value names the one group called that; a `LogGroupNamePrefix` value
+/// names every group whose name starts with it. Both comparisons below follow from those
+/// two sets, which is what `PutAccountPolicy`'s overlap sentences are stated in terms of
+/// ("the set of log groups matching these prefixes would be a subset of the log groups
+/// matching the first policy's prefix, creating an overlap").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GroupSelector<'a> {
+    /// The group whose name is exactly this.
+    Name(&'a str),
+    /// Every group whose name starts with this.
+    Prefix(&'a str),
+}
+
+impl GroupSelector<'_> {
+    /// Whether the two sets of log groups share a member.
+    fn intersects(self, other: Self) -> bool {
+        match (self, other) {
+            (Self::Name(one), Self::Name(two)) => one == two,
+            (Self::Name(name), Self::Prefix(prefix)) | (Self::Prefix(prefix), Self::Name(name)) => {
+                name.starts_with(prefix)
+            }
+            (Self::Prefix(one), Self::Prefix(two)) => {
+                one.starts_with(two) || two.starts_with(one)
+            }
+        }
+    }
+
+    /// Whether this set of log groups is wholly inside `other` — "completely contained
+    /// within", the test `PutAccountPolicy` states for an `IN` value against a `NOT IN`
+    /// one. A prefix names groups a single name does not, so it is contained in no name.
+    fn contained_in(self, other: Self) -> bool {
+        match (self, other) {
+            (Self::Name(one), Self::Name(two)) => one == two,
+            (Self::Name(name), Self::Prefix(prefix)) => name.starts_with(prefix),
+            (Self::Prefix(one), Self::Prefix(two)) => one.starts_with(two),
+            (Self::Prefix(_), Self::Name(_)) => false,
+        }
+    }
+}
+
+/// What one criteria selects: a set of log groups, or a data source name and type
+/// combination. `None` for a criteria that selects neither, which nothing can overlap.
+enum CriteriaSelection<'a> {
+    /// The log groups the criteria's `LogGroupName` or `LogGroupNamePrefix` clause names,
+    /// and whether that clause excludes them (`NOT IN`) rather than selects them.
+    Groups {
+        negated: bool,
+        selectors: Vec<GroupSelector<'a>>,
+    },
+    /// The data source names and types of the criteria's `DataSourceName` AND
+    /// `DataSourceType` pair.
+    DataSource {
+        names: &'a [String],
+        types: &'a [String],
+    },
+}
+
+impl<'a> CriteriaSelection<'a> {
+    /// What `criteria` selects.
+    fn of(criteria: &'a SelectionCriteria) -> Option<Self> {
+        if let (Some(names), Some(types)) = (
+            criteria.clause(SELECTION_FIELD_DATA_SOURCE_NAME),
+            criteria.clause(SELECTION_FIELD_DATA_SOURCE_TYPE),
+        ) {
+            return Some(Self::DataSource {
+                names: &names.values,
+                types: &types.values,
+            });
+        }
+        let clause = criteria
+            .clause(SELECTION_FIELD_LOG_GROUP_NAME)
+            .or_else(|| criteria.clause(SELECTION_FIELD_LOG_GROUP_NAME_PREFIX))?;
+        let selectors = clause
+            .values
+            .iter()
+            .map(|value| {
+                if clause.field == SELECTION_FIELD_LOG_GROUP_NAME {
+                    GroupSelector::Name(value)
+                } else {
+                    GroupSelector::Prefix(value)
+                }
+            })
+            .collect();
+        Some(Self::Groups {
+            negated: clause.negated,
+            selectors,
+        })
+    }
+}
+
+/// Judge a `PutAccountPolicy$selectionCriteria` string against the filters that member
+/// documents for the `policyType` it is put with, answering the message to refuse it with,
+/// or the parsed criteria.
+///
+/// The filters are exactly the documented ones:
+///
+/// * `SUBSCRIPTION_FILTER_POLICY` — "the only supported selectionCriteria filter is
+///   `LogGroupName NOT IN []`";
+/// * `TRANSFORMER_POLICY` — "the only supported selectionCriteria filter is
+///   `LogGroupNamePrefix`";
+/// * `FIELD_INDEX_POLICY` — "you can use either `LogGroupNamePrefix` by itself or
+///   `DataSourceName` and `DataSourceType` together";
+/// * `METRIC_EXTRACTION_POLICY` — "The selection criteria supports filtering by
+///   `LogGroupName` and `LogGroupNamePrefix` using the operators `IN` and `NOT IN`. You can
+///   specify up to 50 values in each `IN` or `NOT IN` list."
+///
+/// Which operator a `LogGroupNamePrefix` filter is written with is not documented for a
+/// transformer or a field index policy, so both are accepted there.
+pub fn check_selection_criteria(policy_type: &str, criteria: &str) -> Result<SelectionCriteria, String> {
+    let parsed = SelectionCriteria {
+        clauses: parse_selection_clauses(criteria)?,
+    };
+    let supported = match policy_type {
+        POLICY_TYPE_SUBSCRIPTION_FILTER => {
+            parsed.is_single(SELECTION_FIELD_LOG_GROUP_NAME, Some(true))
+        }
+        POLICY_TYPE_TRANSFORMER => parsed.is_single(SELECTION_FIELD_LOG_GROUP_NAME_PREFIX, None),
+        POLICY_TYPE_FIELD_INDEX => {
+            parsed.is_single(SELECTION_FIELD_LOG_GROUP_NAME_PREFIX, None)
+                || parsed.is_data_source_pair()
+        }
+        POLICY_TYPE_METRIC_EXTRACTION => {
+            parsed.is_single(SELECTION_FIELD_LOG_GROUP_NAME, None)
+                || parsed.is_single(SELECTION_FIELD_LOG_GROUP_NAME_PREFIX, None)
+        }
+        // A data protection policy admits no criteria at all, and its caller refuses one
+        // before it gets here.
+        _ => false,
+    };
+    if !supported {
+        return Err(format!(
+            "selectionCriteria for a {policy_type} must be {}",
+            selection_criteria_forms(policy_type)
+        ));
+    }
+    if policy_type == POLICY_TYPE_METRIC_EXTRACTION
+        && parsed
+            .clauses
+            .iter()
+            .any(|clause| clause.values.len() > MAX_SELECTION_CRITERIA_VALUES)
+    {
+        return Err(format!(
+            "selectionCriteria can specify up to {MAX_SELECTION_CRITERIA_VALUES} values in each IN or NOT IN list"
+        ));
+    }
+    Ok(parsed)
+}
+
+/// The `selectionCriteria` filters one policy type admits, as a refusal names them. See
+/// [`check_selection_criteria`] for where each comes from.
+fn selection_criteria_forms(policy_type: &str) -> &'static str {
+    match policy_type {
+        POLICY_TYPE_SUBSCRIPTION_FILTER => "the filter LogGroupName NOT IN [...]",
+        POLICY_TYPE_TRANSFORMER => "a LogGroupNamePrefix IN [...] filter",
+        POLICY_TYPE_FIELD_INDEX => {
+            "a LogGroupNamePrefix IN [...] filter, or DataSourceName IN [...] AND DataSourceType IN [...] together"
+        }
+        POLICY_TYPE_METRIC_EXTRACTION => {
+            "a LogGroupName or LogGroupNamePrefix filter with the IN or NOT IN operator"
+        }
+        _ => "omitted: this policy type applies to all log groups in the account",
+    }
+}
+
+/// Split a `selectionCriteria` string into its clauses — each `Field IN [...]` or `Field
+/// NOT IN [...]`, joined by `AND` — refusing a string that is not written that way.
+fn parse_selection_clauses(criteria: &str) -> Result<Vec<SelectionClause>, String> {
+    let malformed = || {
+        "selectionCriteria must be one or more filters of the form 'Field IN [\"value\", ...]' or 'Field NOT IN [\"value\", ...]', joined by AND"
+            .to_string()
+    };
+    let mut clauses = Vec::new();
+    let mut rest = criteria.trim();
+    loop {
+        let open = rest.find('[').ok_or_else(malformed)?;
+        let (head, list) = rest.split_at(open);
+        let close = selection_list_end(list).ok_or_else(malformed)?;
+        // The list is a JSON array of strings in every documented form, so it is read as
+        // one rather than scanned by hand.
+        let values = serde_json::from_str::<Vec<String>>(&list[..=close]).map_err(|_| malformed())?;
+        clauses.push(SelectionClause::parse(head, values).ok_or_else(malformed)?);
+        rest = list[close + 1..].trim_start();
+        if rest.is_empty() {
+            break;
+        }
+        let joined = rest.strip_prefix("AND").ok_or_else(malformed)?;
+        if !joined.starts_with(char::is_whitespace) {
+            return Err(malformed());
+        }
+        rest = joined.trim_start();
+        if rest.is_empty() {
+            return Err(malformed());
+        }
+    }
+    if clauses.is_empty() {
+        return Err(malformed());
+    }
+    Ok(clauses)
+}
+
+/// The byte index of the `]` closing the list that starts at the beginning of `list`, or
+/// `None` for a list that is never closed. A `]` inside a quoted value does not close it.
+fn selection_list_end(list: &str) -> Option<usize> {
+    let mut in_string = false;
+    let mut escaped = false;
+    for (index, character) in list.char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match character {
+            '"' => in_string = true,
+            ']' => return Some(index),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Refuse a `selectionCriteria` that conflicts with the criteria of another account-level
+/// policy of the same type, answering the message to refuse it with.
+///
+/// `PutAccountPolicy` states the rule per type:
+///
+/// * a transformer policy — "If you have multiple account-level transformer policies with
+///   selection criteria, no two of them can use the same or overlapping log group name
+///   prefixes" — and a field index policy, with the same sentence for its
+///   `LogGroupNamePrefix` criteria plus "no two of them can use the same data source name
+///   and type combination" for its data source criteria;
+/// * a metric extraction policy — "no two of them can have overlapping criteria", "When
+///   using NOT IN, only one policy with this operator is allowed per account", and two
+///   policies with `IN` and `NOT IN` "do not overlap if and only if every value in the IN
+///   policy is completely contained within some value in the NOT IN policy".
+///
+/// A policy is identified by its type and name, so the policy being updated is not
+/// compared with itself.
+pub fn check_account_policy_criteria_overlap(
+    policies: &BTreeMap<(String, String), AccountPolicyRecord>,
+    policy_type: &str,
+    policy_name: &str,
+    criteria: &SelectionCriteria,
+) -> Result<(), String> {
+    let Some(putting) = CriteriaSelection::of(criteria) else {
+        return Ok(());
+    };
+    for held in policies.values() {
+        if held.policy_type != policy_type || held.policy_name == policy_name {
+            continue;
+        }
+        let Some(held_criteria) = held.selection_criteria.as_deref() else {
+            continue;
+        };
+        // A stored criteria string went through the same grammar when it was put, so one
+        // that does not parse selects nothing there is to conflict with.
+        let Ok(held_criteria) = check_selection_criteria(policy_type, held_criteria) else {
+            continue;
+        };
+        let Some(held_selection) = CriteriaSelection::of(&held_criteria) else {
+            continue;
+        };
+        if let Some(conflict) = criteria_conflict(policy_type, &putting, &held_selection) {
+            return Err(format!(
+                "selectionCriteria conflicts with the account-level {policy_type} policy '{}': {conflict}",
+                held.policy_name
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Why two criteria of one policy type conflict, or `None` when they do not. See
+/// [`check_account_policy_criteria_overlap`] for the sentence behind each answer.
+fn criteria_conflict(
+    policy_type: &str,
+    putting: &CriteriaSelection<'_>,
+    held: &CriteriaSelection<'_>,
+) -> Option<&'static str> {
+    match (putting, held) {
+        (
+            CriteriaSelection::DataSource { names, types },
+            CriteriaSelection::DataSource {
+                names: held_names,
+                types: held_types,
+            },
+        ) => {
+            let same_name = names.iter().any(|name| held_names.contains(name));
+            let same_type = types.iter().any(|source| held_types.contains(source));
+            (same_name && same_type)
+                .then_some("no two of them can use the same data source name and type combination")
+        }
+        (
+            CriteriaSelection::Groups { negated, selectors },
+            CriteriaSelection::Groups {
+                negated: held_negated,
+                selectors: held_selectors,
+            },
+        ) => {
+            if policy_type != POLICY_TYPE_METRIC_EXTRACTION {
+                // Every other type's sentence is about the prefixes themselves: "no two of
+                // them can use the same or overlapping log group name prefixes".
+                return selectors
+                    .iter()
+                    .any(|one| held_selectors.iter().any(|two| one.intersects(*two)))
+                    .then_some("no two of them can use the same or overlapping log group name prefixes");
+            }
+            match (negated, held_negated) {
+                (true, true) => {
+                    Some("when using NOT IN, only one policy with this operator is allowed per account")
+                }
+                (false, false) => selectors
+                    .iter()
+                    .any(|one| held_selectors.iter().any(|two| one.intersects(*two)))
+                    .then_some("no two of them can have overlapping criteria"),
+                // One selects the log groups it lists and the other excludes the ones it
+                // lists: they do not overlap only when every selected value is completely
+                // contained within some excluded value.
+                (false, true) => (!selectors
+                    .iter()
+                    .all(|one| held_selectors.iter().any(|two| one.contained_in(*two))))
+                .then_some(
+                    "every value of an IN policy must be completely contained within some value of the NOT IN policy",
+                ),
+                (true, false) => (!held_selectors
+                    .iter()
+                    .all(|one| selectors.iter().any(|two| one.contained_in(*two))))
+                .then_some(
+                    "every value of an IN policy must be completely contained within some value of the NOT IN policy",
+                ),
+            }
+        }
+        // One criteria selects log groups and the other a data source name and type: they
+        // select along different dimensions, which the field index policy's quota sentences
+        // count separately, so neither constrains the other.
+        _ => None,
+    }
 }
 
 /// One log group's data protection policy — what `PutDataProtectionPolicy` stores — as

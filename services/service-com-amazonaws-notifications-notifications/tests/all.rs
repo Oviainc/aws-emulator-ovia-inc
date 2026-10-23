@@ -23,5 +23,7 @@ mod organization_access;
 mod resource_tags;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/untag_resource.rs"]
+mod untag_resource;
 #[path = "all/validation_message_rendering.rs"]
 mod validation_message_rendering;

@@ -12,9 +12,14 @@
 //! whose set differs per DB engine, and this emulator monitors no running engine,
 //! so it cannot know which engine's per-SQL catalog a data source would publish:
 //! those types are answered with the scaffold's 501 rather than with another
-//! engine's names. A metric type the service does not publish at all, and one the
-//! requested `ServiceType` does not publish, are refused with the modelled
-//! `InvalidArgumentException`.
+//! engine's names. The `db` type's counters are the engine's own in the same way,
+//! so its catalog is EMPTY here rather than carrying invented counter names — and
+//! it never carries the Active Session History load series (`db.load`,
+//! `db.sampledload`), which is queryable through `GetResourceMetrics` and
+//! enumerated by `ListAvailableResourceDimensions` as the dimensional metric, but
+//! is not a counter this catalog advertises (see [`DB_COUNTER_METRICS`]). A metric
+//! type the service does not publish at all, and one the requested `ServiceType`
+//! does not publish, are refused with the modelled `InvalidArgumentException`.
 //!
 //! A request that addresses no data source this account may see is refused with
 //! the modelled `NotAuthorizedException`, the uniform answer the real service
@@ -335,28 +340,30 @@ impl MetricTypeCatalog {
 /// one the `db` metric types are documented NOT to be published for.
 const DOCDB_SERVICE_TYPE: &str = "DOCDB";
 
-/// The DB load metrics, the catalog of the `db` ("DB load metrics") type.
+/// The catalog of the `db` ("DB load metrics") type: the DB engine's own counter
+/// metrics, which a data source publishes only while an engine is running on it.
 ///
-/// SOURCE: this model's own documentation of a Performance Insights metric, on
-/// `MetricQuery$Metric` and `DescribeDimensionKeysRequest$Metric` — "db.load.avg
-/// - A scaled representation of the number of active sessions for the database
-/// engine" and "db.sampledload.avg - The raw number of active sessions for the
-/// database engine" — with the aggregate function the caller appends dropped from
-/// the name, exactly as `ListAvailableResourceDimensions`' `Metrics` member names
-/// the same metric `db.load`.
-const DB_LOAD_METRICS: &[CatalogMetric] = &[
-    CatalogMetric {
-        metric: "db.load",
-        description: "A scaled representation of the number of active sessions for the \
-                      database engine.",
-        unit: "Active sessions",
-    },
-    CatalogMetric {
-        metric: "db.sampledload",
-        description: "The raw number of active sessions for the database engine.",
-        unit: "Active sessions",
-    },
-];
+/// EMPTY here, and deliberately so. Two different things could go in it, and
+/// neither may:
+///
+/// * the engine's native counters (`db.<category>.<counter>`) are the engine's
+///   own set, differing per engine family, and this emulator monitors no running
+///   engine — publishing one engine's counter names for every data source would
+///   be inventing a catalog, exactly as the per-SQL types below would be; and
+/// * the Active Session History load series (`db.load`, `db.sampledload`) is
+///   QUERYABLE — `GetResourceMetrics` takes `db.load.avg` and
+///   `DescribeDimensionKeys` takes it as its `Metric` — but it is not a member of
+///   this catalog: it is the DIMENSIONAL metric, which
+///   `ListAvailableResourceDimensions` is the operation that enumerates ("Valid
+///   values include db.load"), and a live service never lists it here. A client
+///   that reads catalog membership as the set of counters it may query would be
+///   handed a name the real service does not advertise.
+///
+/// So the type is published (`MetricTypes` documents it for every engine except
+/// Amazon DocumentDB, and naming it is not an argument error), and the catalog it
+/// answers is the honest report that this emulator discovers no counter on a data
+/// source whose engine it does not run.
+const DB_COUNTER_METRICS: &[CatalogMetric] = &[];
 
 /// The OS counter metrics, the catalog of the `os` ("OS counter metrics") type,
 /// published for all engines.
@@ -537,7 +544,7 @@ const PUBLISHED_METRIC_TYPES: &[MetricTypeCatalog] = &[
     MetricTypeCatalog {
         name: "db",
         docdb: false,
-        metrics: Some(DB_LOAD_METRICS),
+        metrics: Some(DB_COUNTER_METRICS),
     },
     MetricTypeCatalog {
         name: "db.sql.stats",

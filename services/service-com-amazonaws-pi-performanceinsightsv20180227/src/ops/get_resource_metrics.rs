@@ -2,11 +2,21 @@
 
 //! @op GetResourceMetrics
 //! IMPLEMENTED: computes the aligned window, the effective period, the metric
-//! keys and the data-point grid of a request from the REQUEST itself — so this
-//! read persists nothing and repeating it answers identically.
+//! keys and the data-point grid of a request from the REQUEST and the service's
+//! own clock — so this read persists nothing and repeating it answers with the
+//! same series.
+//!
+//! The two bounds of the reported window have DIFFERENT drivers.
+//! `AlignedStartTime` is the requested `StartTime` floored to the effective
+//! period. `AlignedEndTime` is not a function of the requested `EndTime` at all:
+//! Performance Insights reports through the latest period boundary it HOLDS,
+//! which is the service's current time floored to that period (see
+//! [`crate::state::aligned_window`]), so it can land either side of the
+//! requested end and is never ceilinged past the server's clock.
 //!
 //! The series it returns is the GRID the window holds: one `DataPoint` per
-//! period across `[AlignedStartTime, AlignedEndTime)`, stamped at that period's
+//! period from `AlignedStartTime` up to the requested window's own aligned end,
+//! never past the latest boundary the service holds, stamped at that period's
 //! start or end as `PeriodAlignment` asks. `DataPoint$Value` is `@required` in
 //! the model, so a point cannot omit it, and the value every point carries here
 //! is zero: Performance Insights reports the activity a running DB engine had
@@ -301,14 +311,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The window, the effective period and the point count all come from
-        // the request. `aligned_window` is what bounds them: it refuses a
-        // timestamp the arithmetic could not hold and a `PeriodInSeconds`
-        // outside the documented set {1, 60, 300, 3600, 86400}, each with the
-        // modelled 400. How many points the window holds is this handler's own
-        // question, because this handler is what allocates them.
-        let window =
-            crate::state::aligned_window(input.start_time, input.end_time, input.period_in_seconds)
-                .map_err(invalid_argument)?;
+        // the request and the service's own clock. `aligned_window` is what
+        // bounds them: it refuses a timestamp the arithmetic could not hold and
+        // a `PeriodInSeconds` outside the documented set {1, 60, 300, 3600,
+        // 86400}, each with the modelled 400. How many points the window holds
+        // is this handler's own question, because this handler is what allocates
+        // them.
+        let window = crate::state::aligned_window(
+            input.start_time,
+            input.end_time,
+            input.period_in_seconds,
+            crate::state::now(),
+        )
+        .map_err(invalid_argument)?;
 
         // `MaxResults` pages the metric keys. A page size of zero could never
         // advance a cursor, so 0 reads as "no caller-imposed page size".
@@ -317,17 +332,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             _ => input.metric_queries.len(),
         };
         // The result set a cursor is handed out for: the resource, the effective
-        // period, the aligned window and the metric queries, through the
-        // service's one cursor-scope digest.
+        // period, the REQUESTED window and the metric queries, through the
+        // service's one cursor-scope digest. The requested window rather than
+        // the aligned one, because `AlignedEndTime` moves with the service's
+        // clock (see [`crate::state::aligned_window`]) while the metric-key list
+        // a cursor walks does not — a scope that moved would refuse a cursor the
+        // caller was handed moments earlier.
         let period_text = window.period.to_string();
-        let aligned_start_text = window.start.to_string();
-        let aligned_end_text = window.end.to_string();
+        let requested_start_text = format!(
+            "{}.{}",
+            input.start_time.secs(),
+            input.start_time.subsec_nanos()
+        );
+        let requested_end_text = format!(
+            "{}.{}",
+            input.end_time.secs(),
+            input.end_time.subsec_nanos()
+        );
         let mut scope_parts: Vec<&str> = vec![
             &input.service_type,
             &input.identifier,
             &period_text,
-            &aligned_start_text,
-            &aligned_end_text,
+            &requested_start_text,
+            &requested_end_text,
         ];
         scope_parts.extend(
             input
@@ -414,8 +441,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// not tell from a counter something measured.
 const UNMONITORED_PERIOD_VALUE: f64 = 0.0;
 
-/// The series an aligned window holds: one point per period of
-/// `[AlignedStartTime, AlignedEndTime)`, in time order.
+/// The series an aligned window holds: one point per period from
+/// `AlignedStartTime` up to the window's series end (its requested end aligned
+/// to a boundary, never past the latest boundary the service holds), in time
+/// order.
 ///
 /// Built once per request and shared by every metric key in the answer, because
 /// the grid depends on the window and the alignment only — never on which

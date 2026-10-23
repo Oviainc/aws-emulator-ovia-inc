@@ -4,10 +4,14 @@
 //!
 //! RULE under test: the operation answers the published CATALOG of the metric
 //! types the request names — every entry carrying the metric's full name,
-//! description and unit — for a data source this account monitors; a metric type
-//! Performance Insights does not publish, and one the requested `ServiceType`
-//! does not publish, are refused with the modelled `InvalidArgumentException`; a
-//! data source the account does not monitor is refused with the modelled
+//! description and unit — for a data source this account monitors; the catalog
+//! advertises only counters the service discovers, so the Active Session History
+//! load series (`db.load`, `db.sampledload`), which is queryable through
+//! `GetResourceMetrics` and enumerated by `ListAvailableResourceDimensions` as
+//! the dimensional metric, is NOT a catalog entry; a metric type Performance
+//! Insights does not publish, and one the requested `ServiceType` does not
+//! publish, are refused with the modelled `InvalidArgumentException`; a data
+//! source the account does not monitor is refused with the modelled
 //! `NotAuthorizedException`; and because availability is a published property
 //! rather than a measurement, the answer is the same every time and `MaxResults`
 //! /`NextToken` page it so every metric is visited exactly once.
@@ -41,9 +45,14 @@ const UNIFORM_MESSAGE: &str =
 /// SOURCE: the `MetricTypes` member's own documentation — "os (OS counter
 /// metrics) - All engines", "db (DB load metrics) - All engines except for Amazon
 /// DocumentDB". The per-SQL types that documentation also lists carry an
-/// engine-specific catalog and are covered by their own test below.
-const CATALOGUED_TYPES: &[(&str, &[&str], &str)] =
-    &[("os", &["RDS", "DOCDB"], "os."), ("db", &["RDS"], "db.")];
+/// engine-specific catalog and are covered by their own test below. The last
+/// field is whether this emulator discovers any counter of the type at all: the
+/// `db` type's counters are the DB engine's own, and this emulator monitors no
+/// running engine, so it discovers none (see the `db`-catalog test below).
+const CATALOGUED_TYPES: &[(&str, &[&str], &str, bool)] = &[
+    ("os", &["RDS", "DOCDB"], "os.", true),
+    ("db", &["RDS"], "db.", false),
+];
 
 /// The per-SQL metric types the same documentation lists: "db.sql.stats (per-SQL
 /// metrics)" and "db.sql_tokenized.stats (per-SQL digest metrics)", both "All
@@ -122,7 +131,7 @@ async fn whole_catalog(
 async fn each_published_metric_type_answers_its_catalog() {
     let emulator = emulator();
 
-    for (metric_type, service_types, prefix) in CATALOGUED_TYPES {
+    for (metric_type, service_types, prefix, discovers_counters) in CATALOGUED_TYPES {
         for service_type in *service_types {
             let case = format!("{service_type}/{metric_type}");
             let answer = call(
@@ -143,9 +152,15 @@ async fn each_published_metric_type_answers_its_catalog() {
                 .as_array()
                 .cloned()
                 .unwrap_or_default();
-            assert!(
+            assert_eq!(
                 !entries.is_empty(),
-                "case {case}: expected a non-empty catalog, got {:?}",
+                *discovers_counters,
+                "case {case}: expected a {} catalog, got {:?}",
+                if *discovers_counters {
+                    "non-empty"
+                } else {
+                    "empty"
+                },
                 answer.body
             );
 
@@ -214,15 +229,52 @@ async fn each_published_metric_type_answers_its_catalog() {
         }
     }
 
-    // The DB load metrics are what the `db` type publishes, and this model
-    // documents `db.load` as a Performance Insights metric by name
-    // (`ListAvailableResourceDimensions`' `Metrics` member: "Valid values include
-    // db.load").
+    // The Active Session History load series is QUERYABLE but never advertised
+    // here: `db.load` is the DIMENSIONAL metric, which
+    // `ListAvailableResourceDimensions` is the operation that enumerates ("Valid
+    // values include db.load"), and no catalog entry names it or its raw sibling.
+    // A client that reads catalog membership as the set of counters it may query
+    // must not be handed a name the service does not advertise.
     let db_catalog = whole_catalog(&emulator, "RDS", &["db"]).await;
+    let advertised_load: Vec<&String> = db_catalog
+        .iter()
+        .filter(|metric| metric.starts_with("db.load") || metric.starts_with("db.sampledload"))
+        .collect();
     assert!(
-        db_catalog.iter().any(|metric| metric == "db.load"),
-        "case RDS/db: expected the DB load metric in the catalog, got {db_catalog:?}"
+        advertised_load.is_empty(),
+        "case RDS/db: expected no Active Session History load counter in the catalog, got \
+         {advertised_load:?} in {db_catalog:?}"
     );
+
+    // And it stays queryable through the operations whose `Metric` member takes
+    // it, in every aggregate form the model documents.
+    for metric in [
+        "db.load.avg",
+        "db.load.min",
+        "db.load.max",
+        "db.load.sum",
+        "db.sampledload.avg",
+    ] {
+        let answer = call(
+            &emulator,
+            "GetResourceMetrics",
+            json!({
+                "ServiceType": "RDS",
+                "Identifier": IDENTIFIER,
+                "MetricQueries": [{"Metric": metric}],
+                "StartTime": 1_767_225_600_i64,
+                "EndTime": 1_767_229_200_i64,
+                "PeriodInSeconds": 3_600,
+            }),
+        )
+        .await;
+        assert_eq!(
+            answer.status, 200,
+            "case GetResourceMetrics({metric}): expected a counter absent from the catalog to \
+             still be queryable, got {} {:?}",
+            answer.status, answer.body
+        );
+    }
 }
 
 /// RULE: naming several metric types answers their catalogs together, in the

@@ -243,6 +243,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
+        // A gateway whose deletion the clock has already made due is gone before
+        // this call looks for it, so its name is free for the create below.
+        store.expire_deleted_gateways(now);
 
         // A replayed request carrying the same `clientToken` answers with the
         // gateway that token first produced, rather than minting a second one.
@@ -329,6 +332,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             interceptor_configurations: input.interceptor_configurations,
             policy_engine_configuration: input.policy_engine_configuration,
             exception_level: input.exception_level,
+            // `CreateGatewayRequest` declares neither member, so a gateway holds
+            // neither until an `UpdateGateway` supplies one.
+            custom_transform_configuration: None,
+            waf_configuration: None,
+            // Nobody has deleted this gateway, so the clock owes no removal.
+            removal_due_at: None,
             tags: crate::state::sorted_map(input.tags),
             workload_identity_details: Some(WorkloadIdentityDetails {
                 workload_identity_arn: crate::state::workload_identity_arn(&region, &gateway_id),

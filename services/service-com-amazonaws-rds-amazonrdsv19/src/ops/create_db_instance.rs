@@ -651,19 +651,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let db_instance = record.to_wire();
         let dbi_resource_id = record.dbi_resource_id.clone();
         let engine = record.engine.clone();
+        let monitoring = ::service_common::db_data_sources::MonitoringConfiguration {
+            performance_insights_enabled: record.performance_insights_enabled,
+            database_insights_mode: Some(record.database_insights_mode.clone()),
+        };
         store.db_instances.insert(key, record);
         // The id just minted is recorded in the SHARED data-source directory, so a
         // service that monitors this instance (Performance Insights addresses a data
         // source by its `DbiResourceId`) can tell that THIS service owns the id: the
         // id's form cannot say so, because Amazon DocumentDB mints ids of the same
-        // form. The RDS store is already locked here and the directory is taken
-        // second, the order its doc fixes.
+        // form. The monitoring settings this create persisted go in beside it, because
+        // a monitoring service cannot measure whether a feature is turned on for an
+        // instance — this service is what the setting was given to. The RDS store is
+        // already locked here and the directory is taken second, the order its doc
+        // fixes.
         if let Some(directory) = crate::state::data_source_directory(&*self.engine) {
-            directory.lock().register(
+            let mut directory = directory.lock();
+            directory.register(
                 &dbi_resource_id,
                 ::service_common::db_data_sources::SERVICE_TYPE_RDS,
                 &engine,
             );
+            directory.record_monitoring(&dbi_resource_id, monitoring);
         }
 
         Ok(CreateDBInstanceOutput {

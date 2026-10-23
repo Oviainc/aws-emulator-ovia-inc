@@ -11,6 +11,8 @@
 // `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` resolves to a SIBLING
 // (`tests/state_roundtrip.rs`) — which the layout check refuses. The `#[path]` is what
 // points it into `tests/all/`.
+#[path = "all/aligned_window_bounds.rs"]
+mod aligned_window_bounds;
 #[path = "all/authorization_gate.rs"]
 mod authorization_gate;
 #[path = "all/available_resource_metrics.rs"]
@@ -29,6 +31,8 @@ mod performance_analysis_reports;
 mod pi_harness;
 #[path = "all/resource_dimensions.rs"]
 mod resource_dimensions;
+#[path = "all/resource_features.rs"]
+mod resource_features;
 #[path = "all/resource_metrics.rs"]
 mod resource_metrics;
 #[path = "all/resource_tags.rs"]

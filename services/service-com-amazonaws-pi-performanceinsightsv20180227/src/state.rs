@@ -606,6 +606,144 @@ pub fn wrong_service_type_message(db_engine: &str) -> String {
     format!("The specified ServiceType is invalid for engine {db_engine}.")
 }
 
+// ---------------------------------------------------------------------------
+// The features Performance Insights observes on a data source
+// ---------------------------------------------------------------------------
+
+/// The Performance Insights feature whose status says whether the data source
+/// runs the ADVANCED database-insights mode.
+pub const FEATURE_DATABASE_INSIGHTS_ADVANCED_MODE: &str = "DATABASE_INSIGHTS_ADVANCED_MODE";
+
+/// The feature whose status says whether a performance analysis report can be
+/// created for the data source — the lifecycle this crate's
+/// `CreatePerformanceAnalysisReport` serves.
+pub const FEATURE_PERFORMANCE_ANALYSIS_REPORTS: &str = "PERFORMANCE_ANALYSIS_REPORTS";
+
+/// The feature whose status says whether per-SQL (statement-level) statistics are
+/// collected for the data source — what a client checks before asking for a
+/// per-SQL dimension or metric type.
+pub const FEATURE_SQL_LEVEL_STATISTICS: &str = "SQL_LEVEL_STATISTICS";
+
+/// `FeatureStatus` "ENABLED - The feature is enabled on the instance."
+pub const FEATURE_ENABLED: &str = "ENABLED";
+
+/// `FeatureStatus` "DISABLED - The feature is disabled on the instance."
+pub const FEATURE_DISABLED: &str = "DISABLED";
+
+/// `FeatureStatus` "UNSUPPORTED - The feature isn't supported on the instance."
+pub const FEATURE_UNSUPPORTED: &str = "UNSUPPORTED";
+
+/// `FeatureStatus` "UNKNOWN - The feature status couldn't be determined."
+pub const FEATURE_UNKNOWN: &str = "UNKNOWN";
+
+/// Which feature keys `GetResourceMetadata` reports, in a fixed order.
+///
+/// `FeatureMetadataMap`'s key is a plain `String`, so the model does not
+/// enumerate the feature names: these are the features whose status this
+/// emulator can DECIDE from what it holds — the database-insights mode a data
+/// source runs, the report lifecycle this crate serves, and whether per-SQL
+/// statistics are collected. A feature nothing here decides is not reported at
+/// all, rather than reported under an invented status.
+pub const REPORTED_FEATURES: [&str; 3] = [
+    FEATURE_DATABASE_INSIGHTS_ADVANCED_MODE,
+    FEATURE_PERFORMANCE_ANALYSIS_REPORTS,
+    FEATURE_SQL_LEVEL_STATISTICS,
+];
+
+/// The features observed on the data source `identifier` names, as
+/// `GetResourceMetadata` reports them.
+///
+/// A feature of a monitored DB resource is turned on by the service that OWNS
+/// the resource — `EnablePerformanceInsights` and `DatabaseInsightsMode` are
+/// members of the database control plane's create and modify requests, not of
+/// any Performance Insights request — so the status of each feature is PROJECTED
+/// from the monitoring configuration that service persisted in the shared
+/// data-source directory ([`::service_common::db_data_sources`]), never measured
+/// here and never invented:
+///
+/// * a feature the data source's owning service cannot have at all is
+///   `UNSUPPORTED` — per-SQL statistics for an Amazon DocumentDB data source,
+///   say, which `ListAvailableResourceMetrics$MetricTypes` documents the per-SQL
+///   metric types as published for "All engines except for Amazon DocumentDB";
+/// * a feature whose setting is ON is `ENABLED`, and one whose setting is OFF is
+///   `DISABLED`;
+/// * and when the directory holds no monitoring configuration for the data
+///   source — an id this emulator did not mint, or one whose owner records no
+///   such setting — every feature is `UNKNOWN`, the value the model defines for
+///   "the feature status couldn't be determined", because a missing record is
+///   not evidence that a feature is off.
+pub fn observed_features<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    service_type: &str,
+    identifier: &str,
+) -> HashMap<String, crate::ops::types::FeatureMetadata> {
+    let recorded = data_source_directory(engine).and_then(|directory| {
+        let guard = directory.lock();
+        guard
+            .get(identifier)
+            .and_then(|record| record.monitoring.clone())
+    });
+    let docdb = service_type.eq_ignore_ascii_case(::service_common::db_data_sources::SERVICE_TYPE_DOCDB);
+
+    REPORTED_FEATURES
+        .iter()
+        .map(|feature| {
+            let status = feature_status(feature, recorded.as_ref(), docdb);
+            (
+                (*feature).to_string(),
+                crate::ops::types::FeatureMetadata {
+                    status: Some(status.to_string()),
+                },
+            )
+        })
+        .collect()
+}
+
+/// The status of ONE feature, given the monitoring configuration on record for
+/// the data source (`None` when the directory holds none) and whether the data
+/// source is served under the Amazon DocumentDB `ServiceType`.
+fn feature_status(
+    feature: &str,
+    recorded: Option<&::service_common::db_data_sources::MonitoringConfiguration>,
+    docdb: bool,
+) -> &'static str {
+    // Per-SQL statistics are the one feature a data source's engine family can
+    // rule out: the per-SQL metric types are documented for "All engines except
+    // for Amazon DocumentDB", so on a DocumentDB data source the feature is not
+    // supported however the owner configured monitoring.
+    if docdb && feature == FEATURE_SQL_LEVEL_STATISTICS {
+        return FEATURE_UNSUPPORTED;
+    }
+    // The database-insights MODE is likewise a setting only a service whose model
+    // declares it can run; a service that declares none cannot be in advanced
+    // mode, so the feature is unsupported rather than merely off.
+    let Some(recorded) = recorded else {
+        return FEATURE_UNKNOWN;
+    };
+    if feature == FEATURE_DATABASE_INSIGHTS_ADVANCED_MODE && recorded.database_insights_mode.is_none()
+    {
+        return FEATURE_UNSUPPORTED;
+    }
+    // Performance Insights has to be turned on before any feature of it runs, so
+    // a data source it is off for has every feature disabled.
+    if !recorded.performance_insights_enabled {
+        return FEATURE_DISABLED;
+    }
+    let on = match feature {
+        // The report lifecycle this crate serves needs nothing beyond
+        // Performance Insights itself.
+        FEATURE_PERFORMANCE_ANALYSIS_REPORTS => true,
+        // The advanced mode, and the statement-level statistics it collects, are
+        // on exactly when the data source runs that mode.
+        _ => recorded.runs_advanced_insights_mode(),
+    };
+    if on {
+        FEATURE_ENABLED
+    } else {
+        FEATURE_DISABLED
+    }
+}
+
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
 ///
 /// Answer `None` with a modelled server error, never with a fresh engine.
@@ -710,8 +848,9 @@ const PERIOD_CHOICE_MAX_POINTS: i64 = 200;
 /// the budget (`MaxResults`, which pages the keys, and `PeriodInSeconds`).
 pub const MAX_DATA_POINTS_PER_RESPONSE: i64 = 100_000;
 
-/// The window a time-series request reports back: the effective period and the
-/// granular boundaries the requested window was widened to.
+/// The window a time-series request reports back: the effective period, the
+/// granular boundaries the window was aligned to, and the last boundary the
+/// series over it covers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AlignedWindow {
     /// The effective `PeriodInSeconds`: the caller's, or the one the service
@@ -720,16 +859,22 @@ pub struct AlignedWindow {
     /// `AlignedStartTime` as epoch seconds, on a period boundary at or before
     /// the requested `StartTime`.
     pub start: i64,
-    /// `AlignedEndTime` as epoch seconds, on a period boundary at or after the
-    /// requested `EndTime`.
+    /// `AlignedEndTime` as epoch seconds: the latest period boundary the service
+    /// HOLDS metrics through — the current time floored to the period — never a
+    /// boundary derived from the requested `EndTime` (see [`aligned_window`]).
     pub end: i64,
+    /// The boundary the series over this window stops at: the requested window's
+    /// own end, aligned up to a period boundary, but never past [`Self::end`],
+    /// because no period after the latest boundary the service holds has been
+    /// measured.
+    pub series_end: i64,
 }
 
 impl AlignedWindow {
-    /// How many whole periods the window holds — the number of data points a
-    /// series over it carries.
+    /// How many whole periods the series covers — the number of data points a
+    /// series over this window carries.
     pub fn period_count(&self) -> i64 {
-        (self.end - self.start) / self.period
+        ((self.series_end - self.start) / self.period).max(0)
     }
 
     /// The timestamp of period `index`, stamped as `alignment` asks: the
@@ -752,17 +897,32 @@ impl AlignedWindow {
 pub const PERIOD_ALIGNMENT_START_TIME: &str = "START_TIME";
 
 /// Resolve the window a request's `StartTime`, `EndTime` and `PeriodInSeconds`
-/// describe, or say why no window can be computed for them.
+/// describe AS OF `now`, or say why no window can be computed for them.
 ///
 /// `Err` is the sentence for the operation's modelled `InvalidArgumentException`.
 /// The ordering rule (`StartTime` before `EndTime`) is NOT checked here: it is
 /// the service-wide refusal every handler answers first (see
 /// [`crate::service::TIME_RANGE_ORDERING_MESSAGE`]), so a window that is merely
 /// inverted is never reported as an arithmetic problem.
+///
+/// THE TWO BOUNDS HAVE DIFFERENT DRIVERS. `AlignedStartTime` is the requested
+/// `StartTime` floored to the effective period, as its documentation says
+/// ("AlignedStartTime will be less than or equal to the value of the
+/// user-specified StartTime"). `AlignedEndTime` is NOT a function of the
+/// requested `EndTime`: Performance Insights reports through the latest period
+/// boundary it actually HOLDS, which is the service's own current time floored
+/// to that period — independently of how far in the past, or in the future, the
+/// caller asked it to stop. So the end bound can land either side of the
+/// requested `EndTime`, and it is never ceilinged: a boundary past the server's
+/// clock would claim periods nothing has measured yet.
+///
+/// `now` is passed in rather than read here, so the arithmetic is one pure
+/// function of the request and the clock; a handler passes [`now`].
 pub fn aligned_window(
     start_time: DateTime,
     end_time: DateTime,
     period_in_seconds: Option<i32>,
+    now: DateTime,
 ) -> Result<AlignedWindow, String> {
     // Both timestamps are caller-chosen and a `timestamp` shape carries no
     // `@range`, so the model cannot bound them and this must, before any
@@ -796,18 +956,29 @@ pub fn aligned_window(
         }
     };
 
-    // `AlignedStartTime` is documented to be less than or equal to the
-    // requested `StartTime`, and `AlignedEndTime` greater than or equal to the
-    // requested `EndTime`, each on a boundary of the effective period.
     let start = align_floor(start_time.secs(), period);
-    let end_seconds = end_time.secs() + i64::from(end_time.subsec_nanos() > 0);
-    let end = align_ceil(end_seconds, period);
+    // The latest boundary the service holds metrics through. Clamped to the
+    // window's own start, so the reported window is never inverted: a request
+    // whose `StartTime` is in the future is answered with an EMPTY window rather
+    // than with an end bound before its start.
+    let end = align_floor(now.secs().clamp(-MAX_TIMESTAMP_MAGNITUDE, MAX_TIMESTAMP_MAGNITUDE), period).max(start);
+    // The series covers the requested window — its end aligned up to a boundary,
+    // as `AlignedEndTime`'s documentation describes the alignment — and stops at
+    // the latest boundary the service holds, so no point is ever reported for a
+    // period the clock has not reached.
+    let requested_end = end_time.secs() + i64::from(end_time.subsec_nanos() > 0);
+    let series_end = align_ceil(requested_end, period).min(end).max(start);
 
     // An operation that MATERIALISES something per period bounds the count
     // itself ([`data_point_budget_refusal`]); the window arithmetic here is
     // total for every value this far, so a window is not refused for its width
     // by an operation that reports no series over it.
-    Ok(AlignedWindow { period, start, end })
+    Ok(AlignedWindow {
+        period,
+        start,
+        end,
+        series_end,
+    })
 }
 
 /// Why a response carrying `series` series over `window` cannot be
