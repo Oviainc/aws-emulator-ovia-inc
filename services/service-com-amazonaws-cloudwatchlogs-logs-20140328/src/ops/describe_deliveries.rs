@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeDeliveries
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeDeliveries`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeDeliveries::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the account's deliveries from [`crate::state`]: every delivery associated with
+//! one of the delivery sources the request names (or all of them, when it names none), in
+//! delivery-id order, one `limit`-sized page at a time.
 //!
 //! ## Shape of an operation
 //!
@@ -118,6 +113,50 @@ impl From<DescribeDeliveriesErrorModeled> for DescribeDeliveriesError {
     }
 }
 
+/// The kind tag this operation's pagination cursor carries, so a token minted by
+/// another paginated operation is refused rather than misread.
+const CURSOR_KIND: &str = "DescribeDeliveries";
+
+/// Where the next page resumes: the `id` of the last delivery returned, plus the filter of
+/// the enumeration it belongs to. A continuation that changes the filter is refused, because
+/// the token is only a position within one filtered enumeration.
+#[derive(Debug, Clone)]
+struct Cursor {
+    delivery_source_names: Option<Vec<String>>,
+    after: String,
+}
+
+impl Cursor {
+    fn encode(&self) -> String {
+        crate::state::encode_token(&::serde_json::json!({
+            "kind": CURSOR_KIND,
+            "deliverySourceNames": self.delivery_source_names,
+            "after": self.after,
+        }))
+    }
+
+    fn decode(token: &str) -> Option<Self> {
+        let value = crate::state::decode_token(token)?;
+        if value.get("kind")?.as_str()? != CURSOR_KIND {
+            return None;
+        }
+        let delivery_source_names = match value.get("deliverySourceNames") {
+            None | Some(::serde_json::Value::Null) => None,
+            Some(names) => Some(
+                names
+                    .as_array()?
+                    .iter()
+                    .map(|name| name.as_str().map(ToString::to_string))
+                    .collect::<Option<Vec<String>>>()?,
+            ),
+        };
+        Some(Self {
+            delivery_source_names,
+            after: value.get("after")?.as_str()?.to_string(),
+        })
+    }
+}
+
 /// The `DescribeDeliveries` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -154,18 +193,90 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeDeliveries` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeDeliveriesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeDeliveries"))
+        // `ctx` carries only request metadata; this operation reports on stored
+        // deliveries and needs none of it.
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeDeliveriesError::from(
+                DescribeDeliveriesErrorModeled::ServiceUnavailableException(
+                    ServiceUnavailableException {
+                        message: Some("the log store is unavailable".to_string()),
+                    },
+                ),
+            )
+        })?;
+        let store = state.lock();
+
+        let invalid = |message: &str| {
+            DescribeDeliveriesError::from(DescribeDeliveriesErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(message.to_string()),
+                },
+            ))
+        };
+
+        let cursor = match input.next_token.as_deref() {
+            Some(token) => {
+                let Some(cursor) = Cursor::decode(token) else {
+                    return Err(invalid("nextToken is not a valid token"));
+                };
+                if cursor.delivery_source_names != input.delivery_source_names {
+                    return Err(invalid(
+                        "nextToken was issued for a different DescribeDeliveries request",
+                    ));
+                }
+                Some(cursor)
+            }
+            None => None,
+        };
+
+        // One enumeration, in the order the store holds it (by delivery id), of the
+        // deliveries the request's filter selects: `deliverySourceNames` is "An array of
+        // delivery source names that filters the results to deliveries associated with ANY
+        // specified delivery source", so a delivery is selected when its source is one of
+        // them, and every delivery is selected when the request names no source at all.
+        let matching: Vec<&crate::state::DeliveryRecord> = store
+            .deliveries
+            .values()
+            .filter(|delivery| {
+                input
+                    .delivery_source_names
+                    .as_ref()
+                    .is_none_or(|names| names.contains(&delivery.delivery_source_name))
+            })
+            .collect();
+
+        let first = match &cursor {
+            Some(cursor) => matching.partition_point(|delivery| delivery.id <= cursor.after),
+            None => 0,
+        };
+        // "Optionally specify the maximum number of deliveries to return in the response."
+        // `limit` is modelled `range 1..50`, so the boundary validator has already refused a
+        // value outside it; `max(1)` only keeps the page bounds sane.
+        let limit = usize::try_from(input.limit.unwrap_or(crate::state::DEFAULT_DESCRIBE_LIMIT))
+            .unwrap_or(0)
+            .max(1);
+        let last = first.saturating_add(limit).min(matching.len());
+        let page = &matching[first..last];
+
+        // A token is "The token for the next set of items to return": there is a next set
+        // only while deliveries remain beyond this page.
+        let next_token = page.last().filter(|_| last < matching.len()).map(|delivery| {
+            Cursor {
+                delivery_source_names: input.delivery_source_names.clone(),
+                after: delivery.id.clone(),
+            }
+            .encode()
+        });
+
+        Ok(DescribeDeliveriesOutput {
+            deliveries: Some(
+                page.iter()
+                    .map(|delivery| delivery.reported())
+                    .collect::<Vec<Delivery>>(),
+            ),
+            next_token,
+        })
     }
 }
