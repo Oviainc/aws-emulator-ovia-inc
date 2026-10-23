@@ -2,10 +2,13 @@
 
 //! @op DetectDominantLanguage
 //!
-//! IMPLEMENTED. The inference runs in-process through the `whatlang` natural-language
+//! IMPLEMENTED. The inference runs in-process through the `lingua` natural-language
 //! identification engine, restricted to the languages Comprehend's `LanguageCode`
 //! enum names, so the answer is that engine's own identification of the
-//! submitted text — never a value matched out of the request.
+//! submitted text — never a value matched out of the request. The engine reports a
+//! confidence for EVERY language it was built with, and that ranked distribution is
+//! what the modelled `Languages` list carries: the dominant language first, the
+//! runner-up candidates after it in descending order of score.
 //!
 //! ## Shape of an operation
 //!
@@ -74,8 +77,9 @@
 use super::types::*;
 
 use std::sync::OnceLock;
+use std::time::Duration;
 
-use whatlang::{Detector, Lang};
+use lingua::{Language, LanguageDetector, LanguageDetectorBuilder};
 
 /// Comprehend's `LanguageCode` values (`super::types::LANGUAGE_CODE_VALUES`) paired
 /// with the language the identification engine recognises for each.
@@ -83,26 +87,26 @@ use whatlang::{Detector, Lang};
 /// `zh-TW` has no entry: the engine identifies Chinese without distinguishing the
 /// traditional-script variant, so it is never the answer — a language the engine
 /// cannot tell apart is not reported rather than guessed at.
-const DETECTABLE_LANGUAGES: &[(Lang, &str)] = &[
-    (Lang::Ara, "ar"),
-    (Lang::Deu, "de"),
-    (Lang::Eng, "en"),
-    (Lang::Spa, "es"),
-    (Lang::Fra, "fr"),
-    (Lang::Hin, "hi"),
-    (Lang::Jpn, "ja"),
-    (Lang::Kor, "ko"),
-    (Lang::Ita, "it"),
-    (Lang::Por, "pt"),
-    (Lang::Cmn, "zh"),
+const DETECTABLE_LANGUAGES: &[(Language, &str)] = &[
+    (Language::Arabic, "ar"),
+    (Language::German, "de"),
+    (Language::English, "en"),
+    (Language::Spanish, "es"),
+    (Language::French, "fr"),
+    (Language::Hindi, "hi"),
+    (Language::Japanese, "ja"),
+    (Language::Korean, "ko"),
+    (Language::Italian, "it"),
+    (Language::Portuguese, "pt"),
+    (Language::Chinese, "zh"),
 ];
 
-/// The largest `Text` this operation accepts, in UTF-8 bytes.
-///
-/// From the modelled member documentation of `DetectDominantLanguageRequest$Text`:
-/// "The maximum string size is 100 KB." Anything larger is refused with the
-/// `TextSizeLimitExceededException` the operation declares.
-const MAX_TEXT_BYTES: usize = 100 * 1024;
+/// The largest `Text` this operation accepts, in UTF-8 bytes: the real-time quota
+/// Comprehend publishes for `DetectDominantLanguage`, stated once for every
+/// real-time inference operation beside its siblings in
+/// [`crate::state::DOMINANT_LANGUAGE_TEXT_QUOTA_BYTES`]. Anything larger is refused
+/// with the `TextSizeLimitExceededException` the operation declares.
+const MAX_TEXT_BYTES: usize = crate::state::DOMINANT_LANGUAGE_TEXT_QUOTA_BYTES;
 
 /// How much of the document the identification engine is given, in characters.
 ///
@@ -119,29 +123,63 @@ const MAX_TEXT_BYTES: usize = 100 * 1024;
 /// sample alone.
 const IDENTIFICATION_SAMPLE_CHARS: usize = 4096;
 
+/// How long one identification may take before the caller is answered with the
+/// operation's own server error instead of being left waiting.
+///
+/// Two orders of magnitude above what identifying an
+/// [`IDENTIFICATION_SAMPLE_CHARS`]-character sample costs, so it never fires for a
+/// request the engine is simply working through.
+///
+/// What it does and does not do: it bounds what the CALLER waits for. A blocking
+/// task cannot be cancelled from outside, so when the budget fires the engine keeps
+/// running to its natural end and releases its blocking-pool slot then; the budget
+/// does not reclaim that slot early. What bounds the POOL is the work itself being
+/// bounded — the byte quota refuses an oversized document before any inference, and
+/// [`IDENTIFICATION_SAMPLE_CHARS`] caps what the engine reads of the rest.
+const IDENTIFICATION_TIME_BUDGET: Duration = Duration::from_secs(5);
+
 /// The shared language-identification engine, restricted to the languages
 /// Comprehend's `LanguageCode` enum names.
 ///
 /// Built once: the engine is immutable, so every request observes the same
-/// deterministic model set and the allow-list is assembled a single time.
-fn detector() -> &'static Detector {
-    static DETECTOR: OnceLock<Detector> = OnceLock::new();
+/// deterministic model set and the language models are assembled a single time.
+/// The engine's full-accuracy mode is what this operation needs, and not an
+/// optimisation: its reduced mode scores only trigrams and collapses onto a single
+/// candidate at confidence 1, which reports neither the runner-up candidates the
+/// modelled `Languages` list carries nor a usable confidence for the dominant one.
+///
+/// What that costs, and why it is bounded: the model set is FIXED at the eleven
+/// languages above — nothing a request says can widen it — and the engine
+/// materialises each language's n-gram models at most once per process, on the first
+/// request that needs them, so the residency is a constant of the emulator rather
+/// than something a caller can grow. Per-request work is bounded by
+/// [`IDENTIFICATION_SAMPLE_CHARS`], and every caller runs the engine through
+/// [`identify_languages`], off the async worker and under
+/// [`IDENTIFICATION_TIME_BUDGET`].
+fn detector() -> &'static LanguageDetector {
+    static DETECTOR: OnceLock<LanguageDetector> = OnceLock::new();
     DETECTOR.get_or_init(|| {
-        Detector::with_allowlist(DETECTABLE_LANGUAGES.iter().map(|(lang, _)| *lang).collect())
+        let languages: Vec<Language> =
+            DETECTABLE_LANGUAGES.iter().map(|(lang, _)| *lang).collect();
+        LanguageDetectorBuilder::from_languages(&languages).build()
     })
 }
 
-/// The engine's answer for `text`, as the modelled `DominantLanguage` list: the
-/// language it identifies and the confidence it reports, which is the list's single
-/// entry, so the array is trivially "sorted in descending order of the score (the
-/// dominant language is always the first element)" as the modelled `Languages`
-/// member documents. The engine ranks one candidate, so no further entry exists to
-/// report — a second language with an invented score is not one.
+/// The engine's answer for `text`, as the modelled `DominantLanguage` list: every
+/// language the engine gives a non-zero confidence, each with that confidence as
+/// its `Score`, "sorted in descending order of the score (the dominant language is
+/// always the first element in the array)" as the modelled `Languages` member
+/// documents. Nothing here is invented: the engine computes one confidence per
+/// language it was built with over the submitted text, and this projects them.
 ///
-/// A document the engine can place nowhere — one carrying no letters at all —
-/// gets an EMPTY list. That is the engine's own answer: a confidence it did not
-/// produce would be an invented one, and the modelled `Languages` member is
-/// optional precisely because a response need not name a language.
+/// Equal confidences are ordered by language code, so the list is a total order and
+/// two identical requests return byte-identical arrays.
+///
+/// A language the engine gives no confidence at all is NOT reported: a zero is the
+/// engine saying the document carries none of that language, and an entry with a
+/// zero score would claim a candidate it rejected. A document the engine can place
+/// nowhere — one carrying no letters at all — therefore gets an EMPTY list, which is
+/// why the modelled `Languages` member is optional in the first place.
 ///
 /// `pub(crate)` because every other caller identifies a document with the SAME
 /// engine, through this one function: `BatchDetectDominantLanguage`, documented as
@@ -151,13 +189,14 @@ fn detector() -> &'static Detector {
 /// implementations that can disagree.
 pub(crate) fn detect_languages(text: &str) -> Vec<DominantLanguage> {
     let sample: String = text.chars().take(IDENTIFICATION_SAMPLE_CHARS).collect();
-    detector()
-        .detect(&sample)
-        .and_then(|info| {
-            let score = info.confidence() as f32;
+    let mut candidates: Vec<DominantLanguage> = detector()
+        .compute_language_confidence_values(&sample)
+        .into_iter()
+        .filter_map(|(lang, confidence)| {
+            let score = confidence as f32;
             DETECTABLE_LANGUAGES
                 .iter()
-                .find(|(candidate, _)| *candidate == info.lang())
+                .find(|(candidate, _)| *candidate == lang)
                 // A confidence that renders as zero is no candidate at all.
                 .filter(|_| score > 0.0)
                 .map(|(_, code)| DominantLanguage {
@@ -165,8 +204,47 @@ pub(crate) fn detect_languages(text: &str) -> Vec<DominantLanguage> {
                     score: Some(score),
                 })
         })
-        .into_iter()
-        .collect()
+        .collect();
+    candidates.sort_by(|left, right| {
+        right
+            .score
+            .unwrap_or_default()
+            .total_cmp(&left.score.unwrap_or_default())
+            .then_with(|| left.language_code.cmp(&right.language_code))
+    });
+    candidates
+}
+
+/// [`detect_languages`] run OFF the async worker: identification is synchronous,
+/// CPU-bound work with no await of its own, so it goes to the blocking pool and the
+/// worker serving this request is released while the engine runs. The
+/// `spawn_blocking(..).await` is a real await point, so a request waiting on an
+/// identification can be cancelled or timed out, and a burst of concurrent
+/// inference cannot starve the operations sharing the runtime.
+///
+/// `Err` carries the sentence the caller puts in its OWN modelled server error: the
+/// engine either did not answer inside [`IDENTIFICATION_TIME_BUDGET`] — the budget
+/// bounds the caller's wait, not the blocking task, which runs to its natural end —
+/// or did not run at all, and in both cases nothing was computed, so no answer may
+/// be fabricated for it. Every request-time caller goes through here;
+/// [`detect_languages`] itself stays available for a pass that already yields
+/// between documents of its own accord.
+pub(crate) async fn identify_languages(text: String) -> Result<Vec<DominantLanguage>, String> {
+    match ::tokio::time::timeout(
+        IDENTIFICATION_TIME_BUDGET,
+        ::tokio::task::spawn_blocking(move || detect_languages(&text)),
+    )
+    .await
+    {
+        Ok(Ok(languages)) => Ok(languages),
+        Ok(Err(error)) => Err(format!(
+            "the language identification did not complete: {error}"
+        )),
+        Err(_) => Err(format!(
+            "the language identification did not complete within {} seconds",
+            IDENTIFICATION_TIME_BUDGET.as_secs()
+        )),
+    }
 }
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -244,22 +322,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let _ = (ctx, &self.engine);
 
         // The model's `@length` floor of 1 is enforced at the boundary; the byte
-        // ceiling it documents in prose is not, so it is enforced here.
-        if input.text.len() > MAX_TEXT_BYTES {
+        // quota is not modelled at all, so it is enforced here, through the one
+        // size check and the one size-report message every real-time inference
+        // operation shares.
+        if let Some(message) = crate::state::text_size_refusal(&input.text, MAX_TEXT_BYTES) {
             return Err(DetectDominantLanguageErrorModeled::TextSizeLimitExceededException(
                 TextSizeLimitExceededException {
-                    message: Some(format!(
-                        "Text is {} bytes, which exceeds the {MAX_TEXT_BYTES} byte limit for \
-                         DetectDominantLanguage. Use a smaller document.",
-                        input.text.len()
-                    )),
+                    message: Some(message),
                 },
             )
             .into());
         }
 
         Ok(DetectDominantLanguageOutput {
-            languages: Some(detect_languages(&input.text)),
+            languages: Some(identify_languages(input.text).await.map_err(|message| {
+                DetectDominantLanguageErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(message),
+                    },
+                )
+            })?),
         })
     }
 }

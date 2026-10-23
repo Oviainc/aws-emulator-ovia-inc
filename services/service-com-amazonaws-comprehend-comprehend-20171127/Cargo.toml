@@ -23,9 +23,23 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
-# Natural-language identification engine behind DetectDominantLanguage: trigram
-# script- and language-profile detection over the language set it is given.
-whatlang = "0.16"
+# Natural-language identification engine behind DetectDominantLanguage: reports a
+# confidence for EVERY language it is built with, which is what the operation's
+# ranked `Languages` list is. Only the languages Comprehend's `LanguageCode` enum
+# names are compiled in.
+lingua = { version = "1.8", default-features = false, features = [
+    "arabic",
+    "chinese",
+    "english",
+    "french",
+    "german",
+    "hindi",
+    "italian",
+    "japanese",
+    "korean",
+    "portuguese",
+    "spanish",
+] }
 # VADER sentiment engine behind DetectSentiment: a rule-based English sentiment
 # analyser returning positive/negative/neutral proportions and a compound score.
 vader_sentiment = "0.1"

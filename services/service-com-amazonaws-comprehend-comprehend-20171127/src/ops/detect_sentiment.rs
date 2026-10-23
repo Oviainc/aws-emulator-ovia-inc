@@ -82,12 +82,12 @@ use std::sync::OnceLock;
 
 use vader_sentiment::SentimentIntensityAnalyzer;
 
-/// The largest `Text` this operation accepts, in UTF-8 bytes.
-///
-/// From the modelled member documentation of `DetectSentimentRequest$Text`: "The
-/// maximum string size is 5 KB." Anything larger is refused with the
-/// `TextSizeLimitExceededException` the operation declares.
-const MAX_TEXT_BYTES: usize = 5 * 1024;
+/// The largest `Text` this operation accepts, in UTF-8 bytes: the real-time quota
+/// Comprehend publishes for a single-document inference call, stated once for every
+/// real-time inference operation in [`crate::state::REALTIME_TEXT_QUOTA_BYTES`].
+/// Anything larger is refused with the `TextSizeLimitExceededException` the
+/// operation declares.
+const MAX_TEXT_BYTES: usize = crate::state::REALTIME_TEXT_QUOTA_BYTES;
 
 /// The `LanguageCode` values the in-process sentiment engine has a lexicon for.
 ///
@@ -260,15 +260,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let _ = (ctx, &self.engine);
 
         // The model's `@length` floor of 1 is enforced at the boundary; the byte
-        // ceiling it documents in prose is not, so it is enforced here.
-        if input.text.len() > MAX_TEXT_BYTES {
+        // quota is not modelled at all, so it is enforced here, through the one
+        // size check and the one size-report message every real-time inference
+        // operation shares.
+        if let Some(message) = crate::state::text_size_refusal(&input.text, MAX_TEXT_BYTES) {
             return Err(DetectSentimentErrorModeled::TextSizeLimitExceededException(
                 TextSizeLimitExceededException {
-                    message: Some(format!(
-                        "Text is {} bytes, which exceeds the {MAX_TEXT_BYTES} byte limit for \
-                         DetectSentiment. Use a smaller document.",
-                        input.text.len()
-                    )),
+                    message: Some(message),
                 },
             )
             .into());
