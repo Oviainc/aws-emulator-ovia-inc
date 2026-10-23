@@ -21,6 +21,8 @@ mod pricing_rule_core_loop;
 mod pricing_rule_lifecycle;
 #[path = "all/pricing_rule_update.rs"]
 mod pricing_rule_update;
+#[path = "all/pricing_rules_associated_to_pricing_plan.rs"]
+mod pricing_rules_associated_to_pricing_plan;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/tagging_surface.rs"]

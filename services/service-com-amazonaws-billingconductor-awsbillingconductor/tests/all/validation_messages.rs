@@ -549,7 +549,16 @@ async fn a_request_within_every_modelled_constraint_reaches_the_operation() {
             "POST",
             "/list-pricing-rules-associated-to-pricing-plan",
             json!({ "PricingPlanArn": VALID_PLAN_ARN, "MaxResults": 1, "BillingPeriod": "2026-1" }),
-            501,
+            // Implemented: no pricing plan answers to this ARN, so the operation's own
+            // `ResourceNotFoundException` is what comes back.
+            404,
+        ),
+        (
+            "ListPricingRulesAssociatedToPricingPlan with a conforming bare plan id",
+            "POST",
+            "/list-pricing-rules-associated-to-pricing-plan",
+            json!({ "PricingPlanArn": "ABCDEFGHIJ", "MaxResults": 100 }),
+            404,
         ),
         (
             "ListPricingPlansAssociatedWithPricingRule at the upper MaxResults bound",
