@@ -1,15 +1,37 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeInstanceTypes
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeInstanceTypes`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeInstanceTypes::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the facts AWS publishes about each instance type of the catalog: its vCPUs
+//! and their cores and threads, its memory, its instance store, its EBS and network
+//! support, and the features — hibernation, Nitro Enclaves, NitroTPM, placement group
+//! strategies — the type is offered with.
+//!
+//! An instance type is a FACT of the catalog, not a resource a caller creates: no EC2
+//! operation adds a type or changes one. So every member is derived by
+//! [`crate::state::instance_type_info`] from the type's name — the family, generation,
+//! capability letters and size AWS's naming conventions define — read against the
+//! per-family ratios the EC2 User Guide publishes, and this handler writes NOTHING: two
+//! calls describe one type identically, and the types described are exactly the ones
+//! `DescribeInstanceTypeOfferings` reports as offered.
+//!
+//! What the request chooses is which types are reported, and how many at a time:
+//!
+//! * `InstanceTypes` names the types to describe; a request naming none describes "all
+//!   instance types for the current Region", as the operation's own doc says. The
+//!   member targets the modelled `InstanceType` enum, so a name outside the catalog is
+//!   already refused at the boundary.
+//! * `Filters` — the 56 names the `Filters` member documents — are ANDed with each
+//!   other and ORed over each filter's values, with EC2's `*` / `?` wildcards; a filter
+//!   this operation does not document is refused with `InvalidParameterValue`.
+//! * `MaxResults` and `NextToken` page the matching types in a stable order (the
+//!   instance type name), the token being the opaque cursor
+//!   `crate::state::encode_page_token` mints; the last page carries no token.
+//! * `IncludeUnsupportedInRegion` adds nothing to report: every type of the catalog is
+//!   offered in every Region this emulator serves, so each one answers
+//!   `SupportedInRegion` true whether or not the flag is set.
+//! * `DryRun` performs nothing and answers 412 `DryRunOperation`, the answer the real
+//!   service gives a caller that holds the action's permissions.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +177,436 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeInstanceTypes` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeInstanceTypesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            CompiledFilter, MAX_FILTER_MATCH_STEPS, MAX_FILTER_VALUE_BYTES, MAX_FILTER_VALUES,
+            MAX_FILTERS, MatchBudget, decode_page_token, encode_page_token, instance_type_info,
+            invalid_pagination_token, offered_instance_types,
+        };
+
+        // An instance type is a fact of the catalog rather than a stored resource, so
+        // this operation reaches neither the engine on `self` nor the request metadata
+        // on `ctx`: every type is described the same way in every Region.
+        let _ = (ctx, &self.engine);
+
+        // "The instance types" (`DescribeInstanceTypesRequest$InstanceTypes`). The
+        // member targets the modelled `InstanceType` enum and carries `@length 0..100`,
+        // so the boundary validator has already refused both a name outside the catalog
+        // and a list above that bound.
+        let requested: &[String] = input.instance_types.as_deref().unwrap_or_default();
+
+        // Matching cost is filters x values x held values x catalog types and the model
+        // bounds none of the first three, so the request-controlled factors are capped
+        // here, before any work proportional to them is done — and their PRODUCT is
+        // charged to one [`MatchBudget`] below, which is the bound the per-factor caps
+        // cannot give.
+        let filters: &[Filter] = input.filters.as_deref().unwrap_or_default();
+        if filters.len() > MAX_FILTERS {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "The request carries {} filters, above the maximum of {MAX_FILTERS}",
+                filters.len()
+            )));
+        }
+
+        // A filter name this operation does not document is refused whether or not any
+        // instance type would have matched it, so an unsupported filter can never read
+        // as "no results".
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeInstanceTypes"))
+        // The refusal is EC2's `InvalidParameterValue` with the message naming the
+        // offending filter ("The filter '<name>' is invalid"), which is what the whole
+        // Amazon EC2 query API answers for a filter name an operation does not define and
+        // what every other describe of this crate already answers (`describe_instances`,
+        // `describe_images`, `describe_instance_type_offerings`, …). The crate's
+        // `crate::state::invalid_filter` helper exists for the handful of EC2 operations
+        // whose own model declares the separate `InvalidFilter` code (see
+        // `describe_network_insights_access_scope_analyses`); this operation is not one of
+        // them, so using it here would refuse the same mistake with a second code.
+        let mut selectors: Vec<CompiledFilter> = Vec::with_capacity(filters.len());
+        for filter in filters {
+            let name = filter.name.as_deref().unwrap_or_default();
+            if !INSTANCE_TYPE_FILTERS.contains(&name) {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "The filter '{name}' is invalid"
+                )));
+            }
+            let values = filter.values.as_deref().unwrap_or_default();
+            if values.len() > MAX_FILTER_VALUES {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "The filter '{name}' carries {} values, above the maximum of \
+                     {MAX_FILTER_VALUES}",
+                    values.len()
+                )));
+            }
+            // A capped NUMBER of comparisons is not capped WORK: the matcher's cost is
+            // the product of the pattern's length and the value's, so each value's size
+            // is bounded too, before any matching runs.
+            if let Some(oversize) = values
+                .iter()
+                .find(|value| value.len() > MAX_FILTER_VALUE_BYTES)
+            {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "A value of the filter '{name}' carries {} bytes, above the maximum \
+                     of {MAX_FILTER_VALUE_BYTES}",
+                    oversize.len()
+                )));
+            }
+            selectors.push(CompiledFilter::new(name.to_string(), values.to_vec()));
+        }
+
+        // "The token returned from a previous paginated request" — anything else is
+        // refused rather than read as a cursor.
+        let start_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(decode_page_token(token).ok_or_else(invalid_pagination_token)?),
+        };
+
+        // DryRun sits AFTER every member has been validated: the flag asks whether the
+        // request WOULD have succeeded, so one that would have been refused is refused
+        // with that reason instead.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        // "By default, all instance types for the current Region are described.
+        // Alternatively, you can filter the results": the catalog narrowed by the types
+        // the request named and by every filter it carries, all of which must hold.
+        //
+        // Every comparison is charged to ONE budget, so the PRODUCT of catalog types,
+        // filters, values, held values and value length is bounded however the caller
+        // combines them.
+        let mut budget = MatchBudget::new(MAX_FILTER_MATCH_STEPS);
+        let mut selected: Vec<InstanceTypeInfo> = Vec::new();
+        for instance_type in offered_instance_types() {
+            if budget.exhausted() {
+                break;
+            }
+            // The name narrowing is read off the catalog entry, so a type the request
+            // did not name costs no projection and no comparison at all.
+            if !requested.is_empty() && !requested.iter().any(|named| named == instance_type) {
+                continue;
+            }
+            let Some(info) = instance_type_info(instance_type) else {
+                continue;
+            };
+            if matches_every_filter(&info, &selectors, &mut budget) {
+                selected.push(info);
+            }
+        }
+        // A spent budget means the answer is INCOMPLETE, which is not something to
+        // report as a result: the request asked for more filtering than one call will
+        // do, and is told so rather than given a silently truncated page.
+        if budget.exhausted() {
+            return Err(Scaffolded::request_limit_exceeded(format!(
+                "The request's filters would take more than {MAX_FILTER_MATCH_STEPS} \
+                 comparisons to evaluate; narrow them"
+            )));
+        }
+
+        // Page in instance type order, which the cursor below names a position in.
+        selected.sort_by(|left, right| left.instance_type.cmp(&right.instance_type));
+
+        let from = match start_at.as_deref() {
+            None => 0,
+            Some(cursor) => selected.partition_point(|info| {
+                info.instance_type.as_deref().unwrap_or_default() < cursor
+            }),
+        };
+        let page = selected.get(from..).unwrap_or_default();
+
+        // `MaxResults` carries the modelled `range 5..100`, so the boundary validator
+        // has already refused anything outside it. A request that names NO page size is
+        // not asking to page at all, so it is answered with every matching type at once
+        // — a set the catalog bounds, not the caller.
+        let limit = input
+            .max_results
+            .and_then(|max_results| usize::try_from(max_results).ok())
+            .unwrap_or(usize::MAX);
+
+        // "This value is null when there are no more items to return"
+        // (`DescribeInstanceTypesResult$NextToken`): a token only when a type follows
+        // this page.
+        let next_token = page
+            .get(limit)
+            .and_then(|info| info.instance_type.as_deref())
+            .map(encode_page_token);
+
+        Ok(DescribeInstanceTypesOutput {
+            instance_types: Some(page.iter().take(limit).cloned().collect()),
+            next_token,
+        })
     }
+}
+
+/// The filter names this operation documents, from `DescribeInstanceTypesRequest$Filters`:
+///
+/// ```text
+/// smithy_query(query="doc",shape="DescribeInstanceTypesRequest",member="Filters",model_path="services/service-com-amazonaws-ec2-amazonec2/smithy-model/com-amazonaws-ec2-amazonec2.json")
+/// ```
+///
+/// Every entry must be answered by [`filter_values`]. The ones naming a member this
+/// emulator reports absent — the published hardware figures `crate::state::instance_type_info`
+/// documents as absent — compare against no value, so they select nothing rather than
+/// everything.
+const INSTANCE_TYPE_FILTERS: [&str; 56] = [
+    "auto-recovery-supported",
+    "bare-metal",
+    "burstable-performance-supported",
+    "current-generation",
+    "dedicated-hosts-supported",
+    "ebs-info.attachment-limit-type",
+    "ebs-info.ebs-optimized-info.baseline-bandwidth-in-mbps",
+    "ebs-info.ebs-optimized-info.baseline-iops",
+    "ebs-info.ebs-optimized-info.baseline-throughput-in-mbps",
+    "ebs-info.ebs-optimized-info.maximum-bandwidth-in-mbps",
+    "ebs-info.ebs-optimized-info.maximum-iops",
+    "ebs-info.ebs-optimized-info.maximum-throughput-in-mbps",
+    "ebs-info.ebs-optimized-support",
+    "ebs-info.encryption-support",
+    "ebs-info.maximum-ebs-attachments",
+    "ebs-info.nvme-support",
+    "free-tier-eligible",
+    "hibernation-supported",
+    "hypervisor",
+    "instance-storage-info.disk.count",
+    "instance-storage-info.disk.size-in-gb",
+    "instance-storage-info.disk.type",
+    "instance-storage-info.encryption-support",
+    "instance-storage-info.nvme-support",
+    "instance-storage-info.total-size-in-gb",
+    "instance-storage-supported",
+    "instance-type",
+    "memory-info.size-in-mib",
+    "network-info.bandwidth-weightings",
+    "network-info.efa-info.maximum-efa-interfaces",
+    "network-info.efa-supported",
+    "network-info.ena-support",
+    "network-info.encryption-in-transit-supported",
+    "network-info.flexible-ena-queues-support",
+    "network-info.ipv4-addresses-per-interface",
+    "network-info.ipv6-addresses-per-interface",
+    "network-info.ipv6-supported",
+    "network-info.maximum-network-cards",
+    "network-info.maximum-network-interfaces",
+    "network-info.network-performance",
+    "nitro-enclaves-support",
+    "nitro-tpm-info.supported-versions",
+    "nitro-tpm-support",
+    "processor-info.supported-architecture",
+    "processor-info.supported-features",
+    "processor-info.sustained-clock-speed-in-ghz",
+    "reboot-migration-support",
+    "supported-boot-mode",
+    "supported-root-device-type",
+    "supported-usage-class",
+    "supported-virtualization-type",
+    "vcpu-info.default-cores",
+    "vcpu-info.default-threads-per-core",
+    "vcpu-info.default-vcpus",
+    "vcpu-info.valid-cores",
+    "vcpu-info.valid-threads-per-core",
+];
+
+/// One optional string as the values a filter compares against.
+fn text(value: Option<&str>) -> Vec<::std::borrow::Cow<'_, str>> {
+    value.map(::std::borrow::Cow::Borrowed).into_iter().collect()
+}
+
+/// A boolean member as a filter value: a client sends it the way the wire renders it,
+/// `true` or `false`. A member that is not set carries no value for the filter to match,
+/// like any other absent attribute.
+fn flag(value: Option<bool>) -> Vec<::std::borrow::Cow<'static, str>> {
+    value
+        .map(|flag| ::std::borrow::Cow::Borrowed(if flag { "true" } else { "false" }))
+        .into_iter()
+        .collect()
+}
+
+/// A numeric member as a filter value: the decimal rendering the wire carries it as,
+/// which is what the caller's filter value is compared against.
+fn number<T: ::std::fmt::Display>(value: Option<T>) -> Vec<::std::borrow::Cow<'static, str>> {
+    value
+        .map(|value| ::std::borrow::Cow::Owned(value.to_string()))
+        .into_iter()
+        .collect()
+}
+
+/// Every value of a string list member.
+fn list(values: Option<&Vec<String>>) -> Vec<::std::borrow::Cow<'_, str>> {
+    values
+        .into_iter()
+        .flatten()
+        .map(|value| ::std::borrow::Cow::Borrowed(value.as_str()))
+        .collect()
+}
+
+/// Every value of an integer list member.
+fn numbers(values: Option<&Vec<i32>>) -> Vec<::std::borrow::Cow<'static, str>> {
+    values
+        .into_iter()
+        .flatten()
+        .map(|value| ::std::borrow::Cow::Owned(value.to_string()))
+        .collect()
+}
+
+/// The values the EC2 filter `name` compares against this instance type.
+///
+/// A filter naming a member this type does not carry compares against NO values, so it
+/// selects nothing — the same answer AWS gives for, say,
+/// `instance-storage-info.disk.type` on a type with no instance store.
+fn filter_values<'a>(
+    info: &'a InstanceTypeInfo,
+    name: &str,
+) -> Vec<::std::borrow::Cow<'a, str>> {
+    let ebs = info.ebs_info.as_ref();
+    let ebs_optimized = ebs.and_then(|ebs| ebs.ebs_optimized_info.as_ref());
+    let storage = info.instance_storage_info.as_ref();
+    let disks = || storage.and_then(|storage| storage.disks.as_ref()).into_iter().flatten();
+    let network = info.network_info.as_ref();
+    let processor = info.processor_info.as_ref();
+    let vcpus = info.v_cpu_info.as_ref();
+    match name {
+        "auto-recovery-supported" => flag(info.auto_recovery_supported),
+        "bare-metal" => flag(info.bare_metal),
+        "burstable-performance-supported" => flag(info.burstable_performance_supported),
+        "current-generation" => flag(info.current_generation),
+        "dedicated-hosts-supported" => flag(info.dedicated_hosts_supported),
+        "ebs-info.attachment-limit-type" => {
+            text(ebs.and_then(|ebs| ebs.attachment_limit_type.as_deref()))
+        }
+        "ebs-info.ebs-optimized-info.baseline-bandwidth-in-mbps" => {
+            number(ebs_optimized.and_then(|info| info.baseline_bandwidth_in_mbps))
+        }
+        "ebs-info.ebs-optimized-info.baseline-iops" => {
+            number(ebs_optimized.and_then(|info| info.baseline_iops))
+        }
+        "ebs-info.ebs-optimized-info.baseline-throughput-in-mbps" => {
+            number(ebs_optimized.and_then(|info| info.baseline_throughput_in_m_bps))
+        }
+        "ebs-info.ebs-optimized-info.maximum-bandwidth-in-mbps" => {
+            number(ebs_optimized.and_then(|info| info.maximum_bandwidth_in_mbps))
+        }
+        "ebs-info.ebs-optimized-info.maximum-iops" => {
+            number(ebs_optimized.and_then(|info| info.maximum_iops))
+        }
+        "ebs-info.ebs-optimized-info.maximum-throughput-in-mbps" => {
+            number(ebs_optimized.and_then(|info| info.maximum_throughput_in_m_bps))
+        }
+        "ebs-info.ebs-optimized-support" => {
+            text(ebs.and_then(|ebs| ebs.ebs_optimized_support.as_deref()))
+        }
+        "ebs-info.encryption-support" => {
+            text(ebs.and_then(|ebs| ebs.encryption_support.as_deref()))
+        }
+        "ebs-info.maximum-ebs-attachments" => {
+            number(ebs.and_then(|ebs| ebs.maximum_ebs_attachments))
+        }
+        "ebs-info.nvme-support" => text(ebs.and_then(|ebs| ebs.nvme_support.as_deref())),
+        "free-tier-eligible" => flag(info.free_tier_eligible),
+        "hibernation-supported" => flag(info.hibernation_supported),
+        "hypervisor" => text(info.hypervisor.as_deref()),
+        "instance-storage-info.disk.count" => {
+            disks().flat_map(|disk| number(disk.count)).collect()
+        }
+        "instance-storage-info.disk.size-in-gb" => {
+            disks().flat_map(|disk| number(disk.size_in_gb)).collect()
+        }
+        "instance-storage-info.disk.type" => {
+            disks().flat_map(|disk| text(disk.r#type.as_deref())).collect()
+        }
+        "instance-storage-info.encryption-support" => {
+            text(storage.and_then(|storage| storage.encryption_support.as_deref()))
+        }
+        "instance-storage-info.nvme-support" => {
+            text(storage.and_then(|storage| storage.nvme_support.as_deref()))
+        }
+        "instance-storage-info.total-size-in-gb" => {
+            number(storage.and_then(|storage| storage.total_size_in_gb))
+        }
+        "instance-storage-supported" => flag(info.instance_storage_supported),
+        "instance-type" => text(info.instance_type.as_deref()),
+        "memory-info.size-in-mib" => {
+            number(info.memory_info.as_ref().and_then(|memory| memory.size_in_mi_b))
+        }
+        "network-info.bandwidth-weightings" => {
+            list(network.and_then(|network| network.bandwidth_weightings.as_ref()))
+        }
+        "network-info.efa-info.maximum-efa-interfaces" => number(
+            network
+                .and_then(|network| network.efa_info.as_ref())
+                .and_then(|efa| efa.maximum_efa_interfaces),
+        ),
+        "network-info.efa-supported" => flag(network.and_then(|network| network.efa_supported)),
+        "network-info.ena-support" => {
+            text(network.and_then(|network| network.ena_support.as_deref()))
+        }
+        "network-info.encryption-in-transit-supported" => {
+            flag(network.and_then(|network| network.encryption_in_transit_supported))
+        }
+        "network-info.flexible-ena-queues-support" => {
+            text(network.and_then(|network| network.flexible_ena_queues_support.as_deref()))
+        }
+        "network-info.ipv4-addresses-per-interface" => {
+            number(network.and_then(|network| network.ipv4_addresses_per_interface))
+        }
+        "network-info.ipv6-addresses-per-interface" => {
+            number(network.and_then(|network| network.ipv6_addresses_per_interface))
+        }
+        "network-info.ipv6-supported" => flag(network.and_then(|network| network.ipv6_supported)),
+        "network-info.maximum-network-cards" => {
+            number(network.and_then(|network| network.maximum_network_cards))
+        }
+        "network-info.maximum-network-interfaces" => {
+            number(network.and_then(|network| network.maximum_network_interfaces))
+        }
+        "network-info.network-performance" => {
+            text(network.and_then(|network| network.network_performance.as_deref()))
+        }
+        "nitro-enclaves-support" => text(info.nitro_enclaves_support.as_deref()),
+        "nitro-tpm-info.supported-versions" => list(
+            info.nitro_tpm_info
+                .as_ref()
+                .and_then(|tpm| tpm.supported_versions.as_ref()),
+        ),
+        "nitro-tpm-support" => text(info.nitro_tpm_support.as_deref()),
+        "processor-info.supported-architecture" => {
+            list(processor.and_then(|processor| processor.supported_architectures.as_ref()))
+        }
+        "processor-info.supported-features" => {
+            list(processor.and_then(|processor| processor.supported_features.as_ref()))
+        }
+        "processor-info.sustained-clock-speed-in-ghz" => {
+            number(processor.and_then(|processor| processor.sustained_clock_speed_in_ghz))
+        }
+        "reboot-migration-support" => text(info.reboot_migration_support.as_deref()),
+        "supported-boot-mode" => list(info.supported_boot_modes.as_ref()),
+        "supported-root-device-type" => list(info.supported_root_device_types.as_ref()),
+        "supported-usage-class" => list(info.supported_usage_classes.as_ref()),
+        "supported-virtualization-type" => list(info.supported_virtualization_types.as_ref()),
+        "vcpu-info.default-cores" => number(vcpus.and_then(|vcpus| vcpus.default_cores)),
+        "vcpu-info.default-threads-per-core" => {
+            number(vcpus.and_then(|vcpus| vcpus.default_threads_per_core))
+        }
+        "vcpu-info.default-vcpus" => number(vcpus.and_then(|vcpus| vcpus.default_v_cpus)),
+        "vcpu-info.valid-cores" => numbers(vcpus.and_then(|vcpus| vcpus.valid_cores.as_ref())),
+        "vcpu-info.valid-threads-per-core" => {
+            numbers(vcpus.and_then(|vcpus| vcpus.valid_threads_per_core.as_ref()))
+        }
+        // Unreachable: the handler has already refused every other name. An undefined
+        // name compares against nothing, so it could never widen a result even if that
+        // check were bypassed.
+        _ => Vec::new(),
+    }
+}
+
+/// Does `info` satisfy every filter?
+///
+/// The AND/OR evaluation, the wildcard matching and the budget charging all live in
+/// [`crate::state::matches_every_filter`], so this operation only says WHERE a filter's
+/// values come from.
+fn matches_every_filter(
+    info: &InstanceTypeInfo,
+    selectors: &[crate::state::CompiledFilter],
+    budget: &mut crate::state::MatchBudget,
+) -> bool {
+    crate::state::matches_every_filter(selectors, budget, &|name| filter_values(info, name))
 }

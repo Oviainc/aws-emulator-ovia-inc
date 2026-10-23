@@ -143,16 +143,20 @@ fn seed(engine: &engine::InMemoryEngine) -> Vec<String> {
     seeded_fixtures()
         .into_iter()
         .map(|fixture| {
-            guard.insert_coip_pool(CoipPoolSpec {
-                local_gateway_route_table_id: fixture.local_gateway_route_table_id.to_string(),
-                region: REGION.to_string(),
-                pool_cidrs: fixture
-                    .pool_cidrs
-                    .iter()
-                    .map(|cidr| (*cidr).to_string())
-                    .collect(),
-                tags: fixture.tags,
-            })
+            guard
+                .insert_coip_pool(CoipPoolSpec {
+                    local_gateway_route_table_id: fixture
+                        .local_gateway_route_table_id
+                        .to_string(),
+                    region: REGION.to_string(),
+                    pool_cidrs: fixture
+                        .pool_cidrs
+                        .iter()
+                        .map(|cidr| (*cidr).to_string())
+                        .collect(),
+                    tags: fixture.tags,
+                })
+                .expect("the store holds the seeded pool")
         })
         .collect()
 }
@@ -204,12 +208,16 @@ async fn every_stored_pool_is_reported_and_a_later_write_is_visible() {
         "all pools: expected every stored pool in store order, got {reported:?}"
     );
 
-    let late_id = engine.state::<Ec2State>().lock().insert_coip_pool(CoipPoolSpec {
-        local_gateway_route_table_id: ROUTE_TABLE_E.to_string(),
-        region: REGION.to_string(),
-        pool_cidrs: vec!["10.20.0.0/24".to_string()],
-        tags: vec![tag("Name", "late")],
-    });
+    let late_id = engine
+        .state::<Ec2State>()
+        .lock()
+        .insert_coip_pool(CoipPoolSpec {
+            local_gateway_route_table_id: ROUTE_TABLE_E.to_string(),
+            region: REGION.to_string(),
+            pool_cidrs: vec!["10.20.0.0/24".to_string()],
+            tags: vec![tag("Name", "late")],
+        })
+        .expect("the store holds the later pool");
 
     let after = described_ids(&router, "after a later write", &[]).await;
     let mut expected = seeded.clone();
