@@ -15,6 +15,8 @@
 mod enrollment_and_preferences;
 #[path = "all/harness.rs"]
 mod harness;
+#[path = "all/idle_recommendations.rs"]
+mod idle_recommendations;
 #[path = "all/reported_defaults_and_preference_validation.rs"]
 mod reported_defaults_and_preference_validation;
 #[path = "all/state_roundtrip.rs"]

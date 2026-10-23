@@ -12,7 +12,8 @@
 //! Beside them, one [`AcmeEndpointRecord`] per managed ACME endpoint, keyed by its
 //! ARN, plus the idempotency index `CreateAcmeEndpoint` consults
 //! ([`AcmeEndpointIdempotency`]). `DescribeAcmeEndpoint` projects that record through
-//! [`acme_endpoint_detail`], and a freshly created endpoint is `CREATING` until the
+//! [`acme_endpoint_detail`] and `ListAcmeEndpoints` through [`acme_endpoint_summary`],
+//! and a freshly created endpoint is `CREATING` until the
 //! transition the clock owes it falls due, exactly as a pending certificate is.
 //!
 //! Beside the endpoints, one [`AcmeAccountRecord`] per ACME account registered with
@@ -43,7 +44,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    AcmCertificateMetadata, AcmeAccountSummary, AcmeEndpoint, CertificateAuthority,
+    AcmCertificateMetadata, AcmeAccountSummary, AcmeEndpoint, AcmeEndpointSummary,
+    CertificateAuthority,
     CertificateDetail, CertificateMetadata, CertificateOptions, CertificateSearchResult,
     CertificateSummary, DistinguishedName, DomainValidation, ExpiryEventsConfiguration,
     ExtendedKeyUsage, GeneralName, HttpRedirect, KeyUsage, ResourceRecord, Tag, X509Attributes,
@@ -1142,12 +1144,13 @@ pub fn acme_endpoint_not_found_message(acme_endpoint_arn: &str) -> String {
     format!("Could not find ACME endpoint {acme_endpoint_arn}.")
 }
 
-/// The certificate id in an ACM certificate ARN, or `None` when `arn` names
-/// something that is not one (the caller answers `InvalidArnException`).
+/// The resource part of an ACM ARN
+/// (`arn:<partition>:acm:<region>:<account>:<type>/<id>`), or `None` when `arn` is not
+/// an ACM ARN at all.
 ///
-/// The model's `@pattern` already refused anything that is not an `acm` ARN before a
-/// handler runs; what is left to check here is that the resource is a `certificate`.
-pub fn certificate_id_from_arn(arn: &str) -> Option<&str> {
+/// Every ACM resource is addressed by an ARN of that one form, so the framing is parsed
+/// in one place and each resource type only names its own `<type>/` prefix.
+fn acm_arn_resource(arn: &str) -> Option<&str> {
     let mut fields = arn.split(':');
     let (
         Some("arn"),
@@ -1172,8 +1175,34 @@ pub fn certificate_id_from_arn(arn: &str) -> Option<&str> {
     if partition.is_empty() || !account.bytes().all(|b| b.is_ascii_digit()) || account.is_empty() {
         return None;
     }
-    let id = resource.strip_prefix("certificate/")?;
+    Some(resource)
+}
+
+/// The id in an ACM ARN whose resource type is `resource_type`, or `None` when `arn`
+/// names something else.
+fn acm_resource_id<'arn>(arn: &'arn str, resource_type: &str) -> Option<&'arn str> {
+    let id = acm_arn_resource(arn)?.strip_prefix(resource_type)?;
+    let id = id.strip_prefix('/')?;
     (!id.is_empty() && !id.contains('/')).then_some(id)
+}
+
+/// The certificate id in an ACM certificate ARN, or `None` when `arn` names
+/// something that is not one (the caller answers `InvalidArnException`).
+///
+/// The model's `@pattern` already refused anything that is not an `acm` ARN before a
+/// handler runs; what is left to check here is that the resource is a `certificate`.
+pub fn certificate_id_from_arn(arn: &str) -> Option<&str> {
+    acm_resource_id(arn, "certificate")
+}
+
+/// The endpoint id in an ACME endpoint ARN, or `None` when `arn` names something that
+/// is not one.
+///
+/// The counterpart of [`certificate_id_from_arn`] for the other resource type this
+/// service persists, and what tells an opaque `ListAcmeEndpoints` pagination token this
+/// service issued apart from one it did not.
+pub fn acme_endpoint_id_from_arn(arn: &str) -> Option<&str> {
+    acm_resource_id(arn, "acme-endpoint")
 }
 
 /// The `InvalidArnException` message for an ARN that is not an ACM certificate ARN,
@@ -1854,6 +1883,29 @@ pub fn acme_endpoint_detail(endpoint: &AcmeEndpointRecord) -> AcmeEndpoint {
             .then(|| tag_list(&endpoint.certificate_tags)),
         created_at: Some(to_date_time(endpoint.created_at)),
         updated_at: Some(to_date_time(endpoint.updated_at)),
+    }
+}
+
+/// A stored ACME endpoint as `ListAcmeEndpoints`' `AcmeEndpointSummary`.
+///
+/// `AcmeEndpointSummary` declares exactly the members `AcmeEndpoint` does, so one
+/// endpoint is reported identically whether it is read one at a time or listed: the
+/// summary is projected from the same record, member for member, through
+/// [`acme_endpoint_detail`] — including the two members that are present only when the
+/// record carries them (`FailureReason`, `CertificateTags`).
+pub fn acme_endpoint_summary(endpoint: &AcmeEndpointRecord) -> AcmeEndpointSummary {
+    let detail = acme_endpoint_detail(endpoint);
+    AcmeEndpointSummary {
+        acme_endpoint_arn: detail.acme_endpoint_arn,
+        endpoint_url: detail.endpoint_url,
+        status: detail.status,
+        failure_reason: detail.failure_reason,
+        authorization_behavior: detail.authorization_behavior,
+        contact: detail.contact,
+        certificate_authority: detail.certificate_authority,
+        certificate_tags: detail.certificate_tags,
+        created_at: detail.created_at,
+        updated_at: detail.updated_at,
     }
 }
 
