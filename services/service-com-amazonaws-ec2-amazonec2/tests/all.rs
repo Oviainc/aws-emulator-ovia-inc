@@ -41,6 +41,8 @@ mod describe_subnets;
 mod describe_vpc_attribute;
 #[path = "all/describe_vpcs.rs"]
 mod describe_vpcs;
+#[path = "all/dry_run_and_unknown_ids.rs"]
+mod dry_run_and_unknown_ids;
 // The shared ec2Query plumbing every suite drives the service through.
 #[path = "all/ec2_query.rs"]
 mod ec2_query;
@@ -78,6 +80,8 @@ mod snapshot_block_public_access;
 mod spot_placement_scores;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/transit_gateway_acceptance.rs"]
+mod transit_gateway_acceptance;
 #[path = "all/transit_gateway_lifecycle.rs"]
 mod transit_gateway_lifecycle;
 #[path = "all/volume_lifecycle.rs"]
@@ -88,6 +92,8 @@ mod vpc_attributes;
 mod vpc_block_public_access_exclusions;
 #[path = "all/vpc_endpoint_connections.rs"]
 mod vpc_endpoint_connections;
+#[path = "all/vpc_endpoints_and_byoip.rs"]
+mod vpc_endpoints_and_byoip;
 #[path = "all/vpc_lifecycle.rs"]
 mod vpc_lifecycle;
 #[path = "all/vpc_network_lifecycle.rs"]
