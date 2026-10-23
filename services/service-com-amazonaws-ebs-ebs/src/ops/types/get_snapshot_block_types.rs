@@ -11,7 +11,22 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-ebs-ebs.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.ebs#GetSnapshotBlockRequest")]
+// `skip_validation = ["BlockToken"]`: the expression the service enforces on a
+// `blockToken` is WIDER than the one the on-disk model declares — it admits the URL-safe
+// base64 alphabet (`_` and `-`), so a token the service itself mints can contain
+// characters the model's `@pattern` refuses. The member's constraints are enforced in
+// `crate::ops::get_snapshot_block` instead, against `crate::state::BLOCK_TOKEN_PATTERN` /
+// `BLOCK_TOKEN_LENGTH`, which is also the expression its refusal reports.
+//
+// `SnapshotId` is NOT in the list: the modelled constraints it carries are the
+// boundary's, as the recorded refusal of a query/label member shows. The service's
+// ADDITIONAL rule about an id's shape (`crate::state::is_well_formed_snapshot_id`) is one
+// the model does not express, so it is judged in the handler — reached only by a value the
+// boundary already accepted.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.ebs#GetSnapshotBlockRequest",
+    skip_validation = ["BlockToken"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct GetSnapshotBlockInput {
     pub snapshot_id: String,

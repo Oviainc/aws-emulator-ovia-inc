@@ -19,6 +19,10 @@
 //!    and status for that condition.
 //! 5. A repeated `ClientToken` replays the first answer; a changed request under the
 //!    same token conflicts.
+//!
+//! The harness below (`router`, `Reply`, the per-operation request helpers) is
+//! `pub(crate)` so the sibling suites in `tests/all/` drive the same wire path instead of
+//! growing a second copy of it.
 
 use std::sync::Arc;
 
@@ -31,7 +35,7 @@ use service_com_amazonaws_ebs_ebs::EmulatedService;
 /// The only block size the EBS direct APIs support: `PutSnapshotBlockRequest$DataLength`
 /// documents "Currently, the only supported size is `524288` bytes. Valid values:
 /// `524288`".
-const BLOCK_SIZE: i32 = 524_288;
+pub(crate) const BLOCK_SIZE: i32 = 524_288;
 
 /// A SigV4 `Authorization` header whose credential scope names the `ebs` signing name,
 /// which is how the router picks the service for a request. No authenticator is
@@ -41,7 +45,7 @@ const AUTHORIZATION: &str =
      SignedHeaders=host;x-amz-date, Signature=0000000000000000000000000000000000000000000000000000000000000000";
 
 /// A router carrying just this service over a fresh shared engine.
-fn router() -> MultiServiceRouter {
+pub(crate) fn router() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.register_service(EmulatedService::new(engine));
@@ -49,21 +53,21 @@ fn router() -> MultiServiceRouter {
 }
 
 /// One response, reduced to what these tests assert on.
-struct Reply {
-    status: u16,
-    headers: http::HeaderMap,
-    body: Vec<u8>,
+pub(crate) struct Reply {
+    pub(crate) status: u16,
+    pub(crate) headers: http::HeaderMap,
+    pub(crate) body: Vec<u8>,
 }
 
 impl Reply {
     /// The response body parsed as JSON, or `Null` when it is not JSON.
-    fn json(&self) -> serde_json::Value {
+    pub(crate) fn json(&self) -> serde_json::Value {
         serde_json::from_slice(&self.body).unwrap_or(serde_json::Value::Null)
     }
 
     /// The wire error code: the `x-amzn-errortype` header restJson1 sets, falling back
     /// to the `__type` discriminator in the body.
-    fn error_code(&self) -> String {
+    pub(crate) fn error_code(&self) -> String {
         self.headers
             .get("x-amzn-errortype")
             .and_then(|value| value.to_str().ok())
@@ -78,7 +82,7 @@ impl Reply {
     }
 
     /// A response header as a string, or the empty string when absent.
-    fn header(&self, name: &str) -> String {
+    pub(crate) fn header(&self, name: &str) -> String {
         self.headers
             .get(name)
             .and_then(|value| value.to_str().ok())
@@ -135,13 +139,13 @@ fn query_escape(value: &str) -> String {
 
 /// Base64 SHA256, the form `Checksum` carries on the wire. Computed here independently
 /// of the service so the service's value is compared against a second implementation.
-fn checksum(data: &[u8]) -> String {
+pub(crate) fn checksum(data: &[u8]) -> String {
     aws_smithy_types::base64::encode(Sha256::digest(data))
 }
 
 /// `BLOCK_SIZE` bytes that differ for every `seed`, so a block read back from the wrong
 /// index or the wrong snapshot cannot pass as the right one.
-fn block_bytes(seed: u8) -> Vec<u8> {
+pub(crate) fn block_bytes(seed: u8) -> Vec<u8> {
     let length = usize::try_from(BLOCK_SIZE).expect("the block size fits a usize");
     (0..length)
         .map(|offset| {
@@ -153,7 +157,10 @@ fn block_bytes(seed: u8) -> Vec<u8> {
         .collect()
 }
 
-async fn start_snapshot(router: &MultiServiceRouter, body: &serde_json::Value) -> Reply {
+pub(crate) async fn start_snapshot(
+    router: &MultiServiceRouter,
+    body: &serde_json::Value,
+) -> Reply {
     send(
         router,
         "POST",
@@ -164,13 +171,62 @@ async fn start_snapshot(router: &MultiServiceRouter, body: &serde_json::Value) -
     .await
 }
 
-async fn put_block(
+pub(crate) async fn put_block(
     router: &MultiServiceRouter,
     snapshot_id: &str,
     block_index: i32,
     data: Vec<u8>,
     data_length: i32,
     checksum_value: &str,
+) -> Reply {
+    put_block_with_algorithm(
+        router,
+        snapshot_id,
+        block_index,
+        data,
+        data_length,
+        checksum_value,
+        "SHA256",
+    )
+    .await
+}
+
+/// `PutSnapshotBlock` with the `x-amz-Checksum-Algorithm` header set to `algorithm`,
+/// whatever it is: the member the service judges itself rather than at the boundary.
+pub(crate) async fn put_block_with_algorithm(
+    router: &MultiServiceRouter,
+    snapshot_id: &str,
+    block_index: i32,
+    data: Vec<u8>,
+    data_length: i32,
+    checksum_value: &str,
+    algorithm: &str,
+) -> Reply {
+    send(
+        router,
+        "PUT",
+        &format!("/snapshots/{snapshot_id}/blocks/{block_index}"),
+        &[
+            ("content-type", "application/octet-stream".to_string()),
+            ("x-amz-Data-Length", data_length.to_string()),
+            ("x-amz-Checksum", checksum_value.to_string()),
+            ("x-amz-Checksum-Algorithm", algorithm.to_string()),
+        ],
+        data,
+    )
+    .await
+}
+
+/// `PutSnapshotBlock` with the optional `x-amz-Progress` header set to `progress`,
+/// whatever it is: another member the service judges itself.
+pub(crate) async fn put_block_with_progress(
+    router: &MultiServiceRouter,
+    snapshot_id: &str,
+    block_index: i32,
+    data: Vec<u8>,
+    data_length: i32,
+    checksum_value: &str,
+    progress: &str,
 ) -> Reply {
     send(
         router,
@@ -181,13 +237,14 @@ async fn put_block(
             ("x-amz-Data-Length", data_length.to_string()),
             ("x-amz-Checksum", checksum_value.to_string()),
             ("x-amz-Checksum-Algorithm", "SHA256".to_string()),
+            ("x-amz-Progress", progress.to_string()),
         ],
         data,
     )
     .await
 }
 
-async fn complete_snapshot(
+pub(crate) async fn complete_snapshot(
     router: &MultiServiceRouter,
     snapshot_id: &str,
     changed_blocks_count: i32,
@@ -205,7 +262,35 @@ async fn complete_snapshot(
     .await
 }
 
-async fn list_blocks(router: &MultiServiceRouter, snapshot_id: &str, query: &str) -> Reply {
+/// `CompleteSnapshot` with the optional `x-amz-Checksum-Algorithm` header set to
+/// `algorithm`, whatever it is.
+pub(crate) async fn complete_snapshot_with_algorithm(
+    router: &MultiServiceRouter,
+    snapshot_id: &str,
+    changed_blocks_count: i32,
+    algorithm: &str,
+) -> Reply {
+    send(
+        router,
+        "POST",
+        &format!("/snapshots/completion/{snapshot_id}"),
+        &[
+            (
+                "x-amz-ChangedBlocksCount",
+                changed_blocks_count.to_string(),
+            ),
+            ("x-amz-Checksum-Algorithm", algorithm.to_string()),
+        ],
+        Vec::new(),
+    )
+    .await
+}
+
+pub(crate) async fn list_blocks(
+    router: &MultiServiceRouter,
+    snapshot_id: &str,
+    query: &str,
+) -> Reply {
     let uri = if query.is_empty() {
         format!("/snapshots/{snapshot_id}/blocks")
     } else {
@@ -214,7 +299,7 @@ async fn list_blocks(router: &MultiServiceRouter, snapshot_id: &str, query: &str
     send(router, "GET", &uri, &[], Vec::new()).await
 }
 
-async fn get_block(
+pub(crate) async fn get_block(
     router: &MultiServiceRouter,
     snapshot_id: &str,
     block_index: i32,
@@ -235,7 +320,7 @@ async fn get_block(
 
 /// The `(BlockIndex, BlockToken)` pairs a listing reported, in the order it reported
 /// them.
-fn listed_blocks(reply: &Reply) -> Vec<(i32, String)> {
+pub(crate) fn listed_blocks(reply: &Reply) -> Vec<(i32, String)> {
     reply
         .json()
         .get("Blocks")
@@ -283,7 +368,7 @@ fn is_modelled_block_token(value: &str) -> bool {
 
 /// Start a snapshot, write `block_seeds` at the given indexes, seal it, and return its
 /// id. Each row of the write-then-read table goes through this.
-async fn write_snapshot(
+pub(crate) async fn write_snapshot(
     router: &MultiServiceRouter,
     case: &str,
     volume_size: i64,
@@ -355,13 +440,15 @@ async fn write_snapshot(
         completed.status,
         String::from_utf8_lossy(&completed.body)
     );
+    // The 202 ACKNOWLEDGES the seal; the snapshot is still pending at that instant. The
+    // transition to `completed` is asserted on its own in `snapshot_completion.rs`.
     assert_eq!(
         completed
             .json()
             .get("Status")
             .and_then(serde_json::Value::as_str),
-        Some("completed"),
-        "case {case:?}: CompleteSnapshot must report the sealed status, got {}",
+        Some("pending"),
+        "case {case:?}: CompleteSnapshot must acknowledge with the pending status, got {}",
         completed.json()
     );
 
@@ -589,12 +676,14 @@ async fn start_snapshot_reports_the_snapshot_it_stored() {
     let router = router();
 
     // Rows differ along volume size (including the documented maximum), description,
-    // tag count, timeout and encryption inputs.
-    let cases: &[(&str, serde_json::Value, &str)] = &[
+    // tag count, timeout and encryption inputs. The third column is the `SseType` the
+    // response must carry, or `None` where the snapshot has no SSE type and the member
+    // must be ABSENT.
+    let cases: &[(&str, serde_json::Value, Option<&str>)] = &[
         (
             "minimum volume, nothing optional",
             serde_json::json!({ "VolumeSize": 1 }),
-            "none",
+            None,
         ),
         (
             "description and one tag",
@@ -603,7 +692,7 @@ async fn start_snapshot_reports_the_snapshot_it_stored() {
                 "Description": "a described snapshot",
                 "Tags": [{ "Key": "team", "Value": "storage" }],
             }),
-            "none",
+            None,
         ),
         (
             "three tags and an explicit timeout",
@@ -616,12 +705,12 @@ async fn start_snapshot_reports_the_snapshot_it_stored() {
                     { "Key": "c", "Value": "3" },
                 ],
             }),
-            "none",
+            None,
         ),
         (
             "encrypted with the EBS-managed key",
             serde_json::json!({ "VolumeSize": 32, "Encrypted": true }),
-            "sse-ebs",
+            Some("sse-ebs"),
         ),
         (
             "encrypted with a KMS key",
@@ -629,13 +718,13 @@ async fn start_snapshot_reports_the_snapshot_it_stored() {
                 "VolumeSize": 64,
                 "KmsKeyArn": "arn:aws:kms:us-east-1:000000000000:key/1234abcd-12ab-34cd-56ef-1234567890ab",
             }),
-            "sse-kms",
+            Some("sse-kms"),
         ),
         (
             // `VolumeSize`: "The maximum size is 65536 GiB (64 TiB)" — the published bound.
             "the documented maximum volume size",
             serde_json::json!({ "VolumeSize": 65536, "Timeout": 4320 }),
-            "none",
+            None,
         ),
     ];
 
@@ -685,7 +774,7 @@ async fn start_snapshot_reports_the_snapshot_it_stored() {
         );
         assert_eq!(
             body.get("SseType").and_then(serde_json::Value::as_str),
-            Some(*expected_sse),
+            *expected_sse,
             "case {case:?}: SseType must follow the encryption inputs, got {body}"
         );
         assert_eq!(
@@ -698,19 +787,12 @@ async fn start_snapshot_reports_the_snapshot_it_stored() {
             request.get("Description").and_then(serde_json::Value::as_str),
             "case {case:?}: Description must be the stored description, got {body}"
         );
-        let expected_tags = request
-            .get("Tags")
-            .and_then(serde_json::Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        let reported_tags = body
-            .get("Tags")
-            .and_then(serde_json::Value::as_array)
-            .cloned()
-            .unwrap_or_default();
+        let expected_tags = request.get("Tags").and_then(serde_json::Value::as_array);
+        let reported_tags = body.get("Tags").and_then(serde_json::Value::as_array);
         assert_eq!(
             reported_tags, expected_tags,
-            "case {case:?}: the stored tags must be reported back key for key, got {body}"
+            "case {case:?}: the stored tags must be reported back key for key, and the member\
+             must be absent where the snapshot has none, got {body}"
         );
 
         // Round trip: the snapshot the create reported is the one a read observes.
@@ -797,10 +879,10 @@ async fn refusals_carry_the_modelled_error_and_status() {
             "ResourceNotFoundException",
         ),
         (
-            "GetSnapshotBlock on an index no block was written to",
+            "GetSnapshotBlock with a token that names no block at the index",
             get_block(&router, &sealed, 4, &sealed_token).await,
-            404,
-            "ResourceNotFoundException",
+            400,
+            "ValidationException",
         ),
         (
             "StartSnapshot naming a parent that does not exist",
@@ -1094,6 +1176,32 @@ async fn a_child_snapshot_starts_from_a_copy_of_the_parent_blocks() {
             checksum(&fetched.body)
         );
     }
+
+    // `ChangedBlocksCount` is "The number of blocks that were written to the snapshot",
+    // and the blocks a child inherited were not written to it: one new block written to
+    // the child is a count of ONE, whatever the parent contributed.
+    let new_bytes = block_bytes(13);
+    let new_checksum = checksum(&new_bytes);
+    let written = put_block(&router, &child, 9, new_bytes, BLOCK_SIZE, &new_checksum).await;
+    assert_eq!(
+        written.status, 201,
+        "case \"child\": writing a new block to the child must answer 201, got {} with body {}",
+        written.status,
+        String::from_utf8_lossy(&written.body)
+    );
+    let sealed = complete_snapshot(&router, &child, 1).await;
+    assert_eq!(
+        sealed.status, 202,
+        "case \"child\": CompleteSnapshot must count only the blocks written to the child, got {} with body {}",
+        sealed.status,
+        String::from_utf8_lossy(&sealed.body)
+    );
+    assert_eq!(
+        sealed.json().get("Status").and_then(serde_json::Value::as_str),
+        Some("pending"),
+        "case \"child\": the acknowledgement must report the snapshot as pending, got {}",
+        sealed.json()
+    );
 }
 
 /// A listing is a read: repeating it, and fetching through the tokens it handed out,
