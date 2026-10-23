@@ -27,6 +27,9 @@
 //! its appliance FQDN and its credential secret are produced by the VCF installation,
 //! which this emulator does not run, so both values would have to be invented.
 //!
+//! Like every implemented operation of this service, the request is authorized before
+//! the environment it names is looked up ([`crate::state::authorization`]).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -208,6 +211,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // records instead — see the same-type match below.
         let _ = &input.client_token;
         let region = crate::state::request_region(ctx.parts());
+        // Authorization first: AWS decides it at the IAM layer, before the resource the
+        // request names is evaluated, so the ARN is the one the REQUEST names.
+        if let Some(denied) = crate::state::authorization::denied(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            Some(&crate::state::environment_arn(&region, &input.environment_id)),
+        ) {
+            return Err(denied);
+        }
         let created_at_ms = crate::state::now_ms();
 
         let mut state = state.lock();
