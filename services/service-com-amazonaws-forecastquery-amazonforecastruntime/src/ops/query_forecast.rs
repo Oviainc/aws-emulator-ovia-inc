@@ -187,7 +187,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(QueryForecastErrorModeled::InvalidInputException(
                 InvalidInputException {
                     message: Some(
-                        crate::state::FORECAST.rejection_message(&input.forecast_arn),
+                        crate::state::FORECAST.invalid_arn_message(&input.forecast_arn),
                     ),
                 },
             )

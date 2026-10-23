@@ -45,18 +45,19 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
-/// The dotted member paths this service's RESOURCE IDENTIFIERS are refused under: the
-/// ARN each operation resolves a stored forecast by — `QueryForecast$ForecastArn`
-/// (target `Arn`, length 0..256) and `QueryWhatIfForecast$WhatIfForecastArn` (target
-/// `LongArn`, length 0..300), both carrying the pattern
-/// `^arn:([a-z\d-]+):forecast:.*:.*:.+$`. They are the only ARN-typed members the model
-/// declares; a refusal names a member in lowerCamel
-/// (`aws_smithy_schema_server::constraints::path::member`).
-///
-/// Source: `smithy_query(query="closure",operation="QueryForecast,QueryWhatIfForecast",
-/// model_path="services/service-com-amazonaws-forecastquery-amazonforecastruntime/\
-/// smithy-model/com-amazonaws-forecastquery-amazonforecastruntime.json")`.
-const RESOURCE_ARN_PATHS: [&str; 2] = ["forecastArn", "whatIfForecastArn"];
+use crate::state::ResourceKind;
+
+// This service's RESOURCE IDENTIFIERS — the ARN each operation resolves a stored forecast
+// by — are [`crate::state::RESOURCE_KINDS`]: `QueryForecast$ForecastArn` (target `Arn`,
+// length 0..256) and `QueryWhatIfForecast$WhatIfForecastArn` (target `LongArn`, length
+// 0..300), both carrying the pattern `^arn:([a-z\d-]+):forecast:.*:.*:.+$`. They are the
+// only ARN-typed members the model declares, and a refusal names a member in lowerCamel
+// (`ResourceKind::member_path`, which goes through
+// `aws_smithy_schema_server::constraints::path::member`).
+//
+// Source: `smithy_query(query="closure",operation="QueryForecast,QueryWhatIfForecast",
+// model_path="services/service-com-amazonaws-forecastquery-amazonforecastruntime/\
+// smithy-model/com-amazonaws-forecastquery-amazonforecastruntime.json")`.
 
 /// The service key `::emulator_server::service_from_target` reads out of the
 /// `X-Amz-Target` header this service's awsJson1_1 operations carry: that reader takes
@@ -76,36 +77,41 @@ const TARGET_SERVICE_KEY: &str = "amazonforecastruntime";
 /// `except InvalidInputException` matches it.
 const INVALID_INPUT_EXCEPTION: &str = "InvalidInputException";
 
-/// The first violation, if any, that says a resource ARN is not an ARN of this service:
+/// The first violation, if any, that says a resource ARN is not an ARN of this service —
 /// its modelled `@pattern`, or the modelled maximum length an ARN too long to be one
-/// exceeds.
+/// exceeds — together with the resource kind that member resolves.
 ///
-/// ONE selection, used both to DECIDE that this is an ARN-syntax refusal and to WORD it,
-/// so the code a caller branches on and the clause it reads can never come from different
-/// violations.
+/// ONE selection, used both to DECIDE that this is an ARN refusal and to WORD it, so the
+/// code a caller branches on and the sentence it reads can never come from different
+/// violations. The kind travels with it because the wording names the resource that was
+/// asked for, not the constraint that failed.
 ///
 /// ANY such violation is enough, and it wins over the rest: both operations resolve the
 /// resource their ARN names before anything else about the request is judged, so an
 /// unreadable ARN is what the caller is told about even when another member is also
-/// wrong. Every refusal that does NOT concern the resource ARN's syntax (an absent
-/// required member, a bound on `Filters` or `NextToken`, a `Filters` key outside its
-/// pattern) keeps the framework's generic request-validation wording: those are
-/// request-SHAPE constraints, reported by the validation layer in front of the service
-/// rather than by the service's own resolution of the resource.
-fn resource_arn_syntax_violation(violations: &[Violation]) -> Option<&Violation> {
-    violations.iter().find(|violation| {
-        RESOURCE_ARN_PATHS.contains(&violation.path.as_str())
-            && matches!(
+/// wrong. Every refusal that does NOT concern the resource ARN (an absent required
+/// member, a bound on `Filters` or `NextToken`, a `Filters` key outside its pattern)
+/// keeps the framework's generic request-validation wording: those are request-SHAPE
+/// constraints, reported by the validation layer in front of the service rather than by
+/// the service's own resolution of the resource.
+///
+/// A violation with no value to echo cannot be worded this way and is left alone: this
+/// message is built from the value the request supplied.
+fn resource_arn_violation(violations: &[Violation]) -> Option<(&Violation, ResourceKind)> {
+    violations.iter().find_map(|violation| {
+        if violation.value.is_none()
+            || !matches!(
                 violation.kind,
                 ViolationKind::Pattern(_) | ViolationKind::MaxLength(_)
             )
+        {
+            return None;
+        }
+        crate::state::RESOURCE_KINDS
+            .into_iter()
+            .find(|kind| kind.member_path() == violation.path)
+            .map(|kind| (violation, kind))
     })
-}
-
-/// How an ARN-syntax refusal is worded: the modelled error's own sentence, followed by
-/// the clause THAT violation states (built from the request, so a caller can fix it).
-fn arn_syntax_message(violation: &Violation) -> String {
-    format!("The value is invalid or is too long. {}", violation.message())
 }
 
 /// The `com-amazonaws-forecastquery-amazonforecastruntime` emulated service: the generated [`ServiceDefinition`] plus
@@ -201,14 +207,24 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // resolution, which answers `ResourceNotFoundException` for an ARN that is
         // well-formed but names nothing.
         //
+        // The MESSAGE is the service's own rule for an ARN it cannot read as one of the
+        // kind the operation queries — `Invalid ARN for <resource type>: <the value
+        // supplied>` ([`crate::state::ResourceKind::invalid_arn_message`]) — the same
+        // sentence the handler emits for an ARN that satisfies the member's constraints
+        // yet names no resource of that kind. The two paths differ only in WHERE the
+        // value is read, never in what the caller is told, so a client cannot tell a
+        // boundary refusal from a handler rejection.
+        //
         // Every other refusal keeps the framework's wording: an absent required member
         // and a bound on another member are request-SHAPE constraints, reported by the
         // validation layer in front of the service.
         match refusal {
             Refusal::Invalid(violations) => {
-                resource_arn_syntax_violation(violations).map(|violation| Refused {
+                resource_arn_violation(violations).map(|(violation, kind)| Refused {
                     code: INVALID_INPUT_EXCEPTION.to_string(),
-                    message: arn_syntax_message(violation),
+                    // `Some`, because `resource_arn_violation` selects only a violation
+                    // that carries the value it refused.
+                    message: kind.invalid_arn_message(violation.value.as_deref().unwrap_or_default()),
                 })
             }
             _ => None,

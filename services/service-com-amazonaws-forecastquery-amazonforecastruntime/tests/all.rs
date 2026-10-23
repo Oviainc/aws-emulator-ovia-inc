@@ -15,6 +15,8 @@
 mod arn_resource_kinds;
 #[path = "all/forecastquery.rs"]
 mod forecastquery;
+#[path = "all/invalid_arn_message.rs"]
+mod invalid_arn_message;
 #[path = "all/service_claim.rs"]
 mod service_claim;
 #[path = "all/state_roundtrip.rs"]
