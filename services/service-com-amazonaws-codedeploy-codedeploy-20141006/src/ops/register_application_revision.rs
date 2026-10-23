@@ -162,6 +162,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
+        // How long a `description` this service accepts is not modelled on
+        // `Description`, so it is refused here — with the
+        // `DescriptionTooLongException` this operation models for exactly that,
+        // the same bound every operation carrying a `description` applies.
+        if let Some(description) = input
+            .description
+            .as_deref()
+            .filter(|description| crate::state::description_too_long(description))
+        {
+            return Err(
+                RegisterApplicationRevisionErrorModeled::DescriptionTooLongException(
+                    DescriptionTooLongException {
+                        message: Some(crate::state::description_too_long_message(description)),
+                    },
+                )
+                .into(),
+            );
+        }
         // `applicationName` is @required with a modelled length and pattern, so
         // the boundary has already refused an absent, empty or malformed one, and
         // `revision` is @required too. What is left is the revision's own
