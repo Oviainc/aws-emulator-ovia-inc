@@ -34,9 +34,9 @@
 //!   `InactiveEventDataStoreException`.
 //!
 //! The registry is seeded through the service's public `state` module because
-//! `CreateEventDataStore` and `EnableFederation` are still scaffold stubs (they
-//! answer 501), so a federated store cannot yet be made over the wire. The disable
-//! call and the read-back are exercised only through the router.
+//! `CreateEventDataStore` is still a scaffold stub (it answers 501), so the store
+//! a disable call federates cannot yet be made over the wire. The disable call and
+//! the read-back are exercised only through the router.
 
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -165,7 +165,8 @@ fn rows() -> Vec<Row> {
 }
 
 /// Persist `record` in the registry every event data store operation reads, as
-/// `CreateEventDataStore` and `EnableFederation` will once they are implemented.
+/// `CreateEventDataStore` will once it is implemented (a federated store's role
+/// and status are what `EnableFederation` writes).
 fn seed(emulator: &Emulator, record: &EventDataStoreRecord) {
     emulator
         .state()

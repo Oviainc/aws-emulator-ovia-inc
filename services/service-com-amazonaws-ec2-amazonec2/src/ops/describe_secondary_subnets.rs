@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeSecondarySubnets
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeSecondarySubnets`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeSecondarySubnets::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the account's secondary subnets out of [`crate::state`]: the whole store by
+//! default, or the subset the request's `SecondarySubnetIds` and `Filters` select, one
+//! `MaxResults`-sized page at a time. A reporting operation only — it writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +143,297 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeSecondarySubnets` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeSecondarySubnetsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            CompiledFilter, MAX_FILTER_MATCH_STEPS, MAX_FILTER_VALUE_BYTES, MAX_FILTER_VALUES,
+            MAX_FILTERS, MAX_PAGE_SIZE, MAX_RESOURCE_IDS, MatchBudget, decode_page_token,
+            encode_page_token, invalid_pagination_token, invalid_secondary_subnet_id_not_found,
+            matches_every_filter, require_service_state,
+        };
+
+        // `ctx` carries request metadata only; this operation reads none of it. Every value
+        // it reports — including the ARN, which names a Region — was decided when the
+        // secondary subnet was stored, and the store is reached through the engine held on
+        // `self`.
+        let _ = ctx;
+
+        // Matching cost is filters x values x held values x stored subnets and the model
+        // bounds none of them, so the request-controlled factors are capped here, before
+        // any work proportional to them is done — and their PRODUCT is charged to one
+        // [`MatchBudget`] below, which is the bound the per-factor caps cannot give.
+        let supplied_filters = input.filters.as_ref().map_or(0, Vec::len);
+        if supplied_filters > MAX_FILTERS {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "The request carries {supplied_filters} filters, above the maximum \
+                 of {MAX_FILTERS}"
+            )));
+        }
+
+        // A filter name this operation does not document is refused whether or not any
+        // secondary subnet would have matched it, so an unsupported filter can never read
+        // as "no results". "Filter names are case-sensitive" (`Filter$Name`), so every
+        // comparison is exact.
+        let filters: &[Filter] = input.filters.as_deref().unwrap_or_default();
+        let mut selectors: Vec<CompiledFilter> = Vec::with_capacity(filters.len());
+        for filter in filters {
+            let name = filter.name.as_deref().unwrap_or_default();
+            if !filter_name_documented(name) {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "The filter '{name}' is invalid"
+                )));
+            }
+            let values = filter.values.as_deref().unwrap_or_default();
+            if values.len() > MAX_FILTER_VALUES {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "The filter '{name}' carries {} values, above the maximum of \
+                     {MAX_FILTER_VALUES}",
+                    values.len()
+                )));
+            }
+            // A capped NUMBER of comparisons is not capped WORK: the matcher's cost is the
+            // product of the pattern's length and the value's, so each value's size is
+            // bounded too, before any matching runs under the lock.
+            if let Some(oversize) = values
+                .iter()
+                .find(|value| value.len() > MAX_FILTER_VALUE_BYTES)
+            {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "A value of the filter '{name}' carries {} bytes, above the maximum of \
+                     {MAX_FILTER_VALUE_BYTES}",
+                    oversize.len()
+                )));
+            }
+            selectors.push(CompiledFilter::new(name.to_string(), values.to_vec()));
+        }
+
+        // "The IDs of the secondary subnets" (`DescribeSecondarySubnetsRequest$SecondarySubnetIds`):
+        // `SecondarySubnetIdList` declares no `@length`, so the handler is the only place
+        // the number of ids one request may name is bounded — at the 1,000 EC2 documents
+        // for a list of resource ids ([`MAX_RESOURCE_IDS`]).
+        let requested: &[String] = input.secondary_subnet_ids.as_deref().unwrap_or_default();
+        if requested.len() > MAX_RESOURCE_IDS {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "The request names {} secondary subnet ids, above the maximum of \
+                 {MAX_RESOURCE_IDS}",
+                requested.len()
+            )));
+        }
+
+        // "The token for the next page of results"
+        // (`DescribeSecondarySubnetsRequest$NextToken`) — anything else is refused rather
+        // than read as an id.
+        let start_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(decode_page_token(token).ok_or_else(invalid_pagination_token)?),
+        };
+
+        // "Checks whether you have the required permissions for the action, without
+        // actually making the request … If you have the required permissions, the error
+        // response is DryRunOperation" (`DescribeSecondarySubnetsRequest$DryRun`). Every
+        // caller of this emulator is permitted, so a dry run reports that outcome and reads
+        // nothing. It sits AFTER the parameter checks above — the flag asks whether the
+        // request WOULD have succeeded, so one that would have been refused for its own
+        // parameters is refused with that reason instead — and BEFORE the store is touched,
+        // a dry run resolving no resource.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        let state = require_service_state(&*self.engine)?;
+        let store = state.lock();
+
+        // A pure read: a secondary subnet's `SecondarySubnetState` moves when something
+        // creates or deletes one, which is an action and not an instant, so there is no
+        // clock-owed transition to materialise here and nothing this call writes.
+
+        // An id that names no secondary subnet of the account is an error, not an absent
+        // row — the same answer `DescribeSubnets` gives for an unknown `SubnetId`.
+        if let Some(unknown) = requested
+            .iter()
+            .find(|id| !store.secondary_subnets.contains_key(id.as_str()))
+        {
+            return Err(invalid_secondary_subnet_id_not_found(unknown));
+        }
+
+        // `SecondarySubnetIds` narrows the store to the ids named, and every filter must
+        // then hold ("If you specify multiple filters, the filters are joined with an AND"
+        // — `Filter`).
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeSecondarySubnets"))
+        // Every comparison is charged to ONE budget, so the PRODUCT of stored subnets,
+        // filters, values, held values and value length is bounded however the caller
+        // combines them — which is also what bounds how long this holds the state lock.
+        let mut budget = MatchBudget::new(MAX_FILTER_MATCH_STEPS);
+        let mut selected: Vec<SecondarySubnet> = Vec::new();
+        for secondary_subnet in store.secondary_subnets.values() {
+            if budget.exhausted() {
+                break;
+            }
+            let named = requested.is_empty()
+                || requested.iter().any(|id| {
+                    secondary_subnet.secondary_subnet_id.as_deref() == Some(id.as_str())
+                });
+            if !named {
+                continue;
+            }
+            if matches_every_filter(&selectors, &mut budget, &|name| {
+                filter_values(secondary_subnet, name)
+            }) {
+                selected.push(secondary_subnet.clone());
+            }
+        }
+        // A spent budget means the answer is INCOMPLETE, which is not something to report
+        // as a result: the request asked for more filtering than one call will do, and is
+        // told so rather than given a silently truncated page.
+        if budget.exhausted() {
+            return Err(Scaffolded::request_limit_exceeded(format!(
+                "The request's filters would take more than {MAX_FILTER_MATCH_STEPS} \
+                 comparisons to evaluate; narrow them or page with MaxResults"
+            )));
+        }
+
+        // Page in `SecondarySubnetId` order, which the cursor below names a position in.
+        // The store is an ordered map keyed by that id, so its iteration order already
+        // satisfies this sort; doing it here establishes the invariant the cursor depends
+        // on at the point of use rather than inheriting it from the container
+        // `crate::state` happens to hold.
+        selected.sort_by(|left, right| left.secondary_subnet_id.cmp(&right.secondary_subnet_id));
+
+        // That order is both the stable paging order and the cursor, so a token naming the
+        // id the next page starts at always advances.
+        let from = match start_at.as_deref() {
+            None => 0,
+            Some(cursor) => selected.partition_point(|secondary_subnet| {
+                secondary_subnet
+                    .secondary_subnet_id
+                    .as_deref()
+                    .unwrap_or_default()
+                    < cursor
+            }),
+        };
+        let page = selected.get(from..).unwrap_or_default();
+
+        // "The maximum number of results to return with a single call"
+        // (`DescribeSecondarySubnetsRequest$MaxResults`). A request that names none gets the
+        // largest page the model publishes, so the `NextToken` path below behaves the same
+        // whether or not a page size was asked for. The model's `range 5..1000`
+        // (`DescribeSecondarySubnetsMaxResults`) has already refused anything outside it, so
+        // the only value that cannot convert is one the boundary validator would have
+        // rejected. The `clamp` is for the same reason: the validator cannot deliver a page
+        // size of zero or one past the published maximum, so it only keeps this expression
+        // total — it is never what decides the page size of a request that got here.
+        let limit = input
+            .max_results
+            .and_then(|max_results| usize::try_from(max_results).ok())
+            .unwrap_or(MAX_PAGE_SIZE)
+            .clamp(1, MAX_PAGE_SIZE);
+
+        // "This value is null when there are no more results to return"
+        // (`DescribeSecondarySubnetsResult$NextToken`): a token only when a secondary subnet
+        // follows this page.
+        let next_token = page
+            .get(limit)
+            .and_then(|secondary_subnet| secondary_subnet.secondary_subnet_id.as_deref())
+            .map(encode_page_token);
+
+        Ok(DescribeSecondarySubnetsOutput {
+            secondary_subnets: Some(page.iter().take(limit).cloned().collect()),
+            next_token,
+        })
+    }
+}
+
+/// The filter names this operation documents, from
+/// `DescribeSecondarySubnetsRequest$Filters`:
+///
+/// ```text
+/// smithy_query(query="doc",shape="DescribeSecondarySubnetsRequest",member="Filters",model_path="services/service-com-amazonaws-ec2-amazonec2/smithy-model/com-amazonaws-ec2-amazonec2.json")
+/// ```
+///
+/// `tag:<key>` is the one name with a variable part, so it is matched by prefix
+/// ([`TAG_FILTER_PREFIX`]) rather than listed here. Every entry must be answered by
+/// [`filter_values`].
+const SECONDARY_SUBNET_FILTERS: [&str; 10] = [
+    "ipv4-cidr-block-association.association-id",
+    "ipv4-cidr-block-association.cidr-block",
+    "ipv4-cidr-block-association.state",
+    "owner-id",
+    "secondary-network-id",
+    "secondary-network-type",
+    "secondary-subnet-arn",
+    "secondary-subnet-id",
+    "state",
+    "tag-key",
+];
+
+/// The prefix of the tag filter: "Use the tag key in the filter name and the tag value as
+/// the filter value" (`DescribeSecondarySubnetsRequest$Filters`).
+const TAG_FILTER_PREFIX: &str = "tag:";
+
+/// Does this operation document a filter called `name`?
+///
+/// "Filter names are case-sensitive" (`Filter$Name`), so every comparison is exact — and a
+/// `tag:` prefix with no key names no tag, so it is as undocumented as any other
+/// misspelling.
+fn filter_name_documented(name: &str) -> bool {
+    if name
+        .strip_prefix(TAG_FILTER_PREFIX)
+        .is_some_and(|key| !key.is_empty())
+    {
+        return true;
+    }
+    SECONDARY_SUBNET_FILTERS.contains(&name)
+}
+
+/// The values the EC2 filter `name` compares against this secondary subnet.
+///
+/// A filter naming an attribute this subnet does not carry compares against NO values, so
+/// it selects nothing — the same answer AWS gives for a tag key a resource does not have.
+/// `name` is one [`filter_name_documented`] accepted.
+fn filter_values<'a>(
+    secondary_subnet: &'a SecondarySubnet,
+    name: &str,
+) -> Vec<::std::borrow::Cow<'a, str>> {
+    use ::std::borrow::Cow;
+
+    if let Some(key) = name.strip_prefix(TAG_FILTER_PREFIX) {
+        return secondary_subnet
+            .tags
+            .iter()
+            .flatten()
+            .filter(|tag| tag.key.as_deref() == Some(key))
+            .filter_map(|tag| tag.value.as_deref().map(Cow::Borrowed))
+            .collect();
+    }
+
+    let associations = || secondary_subnet.ipv4_cidr_block_associations.iter().flatten();
+    let text = |value: Option<&'a str>| -> Vec<Cow<'a, str>> {
+        value.map(Cow::Borrowed).into_iter().collect()
+    };
+    match name {
+        "ipv4-cidr-block-association.association-id" => associations()
+            .filter_map(|association| association.association_id.as_deref().map(Cow::Borrowed))
+            .collect(),
+        "ipv4-cidr-block-association.cidr-block" => associations()
+            .filter_map(|association| association.cidr_block.as_deref().map(Cow::Borrowed))
+            .collect(),
+        "ipv4-cidr-block-association.state" => associations()
+            .filter_map(|association| association.state.as_deref().map(Cow::Borrowed))
+            .collect(),
+        "owner-id" => text(secondary_subnet.owner_id.as_deref()),
+        "secondary-network-id" => text(secondary_subnet.secondary_network_id.as_deref()),
+        "secondary-network-type" => text(secondary_subnet.secondary_network_type.as_deref()),
+        "secondary-subnet-arn" => text(secondary_subnet.secondary_subnet_arn.as_deref()),
+        "secondary-subnet-id" => text(secondary_subnet.secondary_subnet_id.as_deref()),
+        "state" => text(secondary_subnet.state.as_deref()),
+        "tag-key" => secondary_subnet
+            .tags
+            .iter()
+            .flatten()
+            .filter_map(|tag| tag.key.as_deref().map(Cow::Borrowed))
+            .collect(),
+        // Unreachable: `filter_name_documented` has already refused every other name. An
+        // undefined name compares against nothing, so it could never widen a result even
+        // if that check were bypassed.
+        _ => Vec::new(),
     }
 }

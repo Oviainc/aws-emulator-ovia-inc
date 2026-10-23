@@ -70,6 +70,8 @@ mod mac_dedicated_hosts;
 mod modify_subnet_attribute;
 #[path = "all/secondary_networks.rs"]
 mod secondary_networks;
+#[path = "all/secondary_subnets.rs"]
+mod secondary_subnets;
 #[path = "all/security_group_filter_limits.rs"]
 mod security_group_filter_limits;
 #[path = "all/security_groups.rs"]

@@ -201,14 +201,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `PolicyNotFoundException`, distinct from the monitor itself not existing.
         let Some(policy) = record.resource_policy.as_ref() else {
             return Err(GetResourcePolicyErrorModeled::PolicyNotFoundException(
-                crate::state::policy_not_found(&input.name),
+                crate::state::policy_not_found(),
             )
             .into());
         };
 
         Ok(GetResourcePolicyOutput {
             policy_document: Some(policy.document.clone()),
-            policy_revision_id: Some(policy.revision_id.clone()),
+            policy_revision_id: Some(policy.revision_id()),
         })
     }
 }

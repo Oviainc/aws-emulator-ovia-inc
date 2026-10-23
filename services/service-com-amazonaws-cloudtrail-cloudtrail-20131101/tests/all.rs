@@ -29,6 +29,8 @@ mod event_configuration;
 mod event_data_store_reads;
 #[path = "all/event_selectors.rs"]
 mod event_selectors;
+#[path = "all/federation_lifecycle.rs"]
+mod federation_lifecycle;
 #[path = "all/import_list.rs"]
 mod import_list;
 #[path = "all/import_reads.rs"]

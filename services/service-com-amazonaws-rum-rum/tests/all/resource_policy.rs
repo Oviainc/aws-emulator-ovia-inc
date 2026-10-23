@@ -12,11 +12,16 @@
 //! object and as a list, both `Effect` values, `Action` as a string and as a list, every
 //! `Principal` form, the documented `Version` values, pretty-printed and minified text);
 //! the refusal table walks one grammar violation per row; the size test checks the
-//! documented 4 KB bound and one byte past it; and the revision tests assert the
-//! conditional-request invariant (a put or delete that names a revision id succeeds only
-//! on the current one, and a refused one leaves the stored policy untouched).
+//! documented 4 KB bound and one byte past it; the layout table pins that a document is
+//! stored as its CONTENT (the same policy written in any layout reads back as one
+//! canonical text, while whitespace inside a string value is content and survives); and
+//! the revision tests assert the conditional-request invariant (a put or delete that
+//! names a revision id succeeds only on the current one, and a refused one leaves the
+//! stored policy untouched), and the revision-counter rule (the id a write reports is the
+//! policy revision's number, 1 for the first revision an app monitor stores and one more
+//! for every later write) over rows that differ in how many writes they make and in how
+//! each one is made.
 
-use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -47,6 +52,19 @@ const MAX_POLICY_DOCUMENT_BYTES: usize = 4 * 1024;
 /// Source: `smithy_query(query="shape", shape="PolicyRevisionId")` — `@length(min: 1,
 /// max: 255)`.
 const POLICY_REVISION_ID_BOUNDS: (usize, usize) = (1, 255);
+
+/// The `PolicyRevisionId` the FIRST policy revision stored on an app monitor carries.
+/// Source: recorded RUM behaviour — the first policy written to an app monitor comes
+/// back with `PolicyRevisionId` `1` and the next successful write on the same monitor
+/// returns `2`, i.e. the revision id is the revision's number, which is what makes an
+/// optimistic-concurrency round trip orderable.
+const FIRST_POLICY_REVISION_ID: &str = "1";
+
+/// The message RUM answers `PolicyNotFoundException` with.
+/// Source: recorded RUM behaviour — a 404 for a missing resource policy carries this
+/// constant text, with nothing from the request in it; the shape models `message` and
+/// nothing else (`smithy_query(query="shape", shape="PolicyNotFoundException")`).
+const POLICY_NOT_FOUND_MESSAGE: &str = "Resource policy does not exist";
 
 /// One emulator: a shared engine, the RUM service, and the router that dispatches to
 /// it. Authentication is off so a test needs no signing key.
@@ -202,8 +220,63 @@ fn assert_refused(reply: &Reply, case: &str, status: u16, code: &str) {
     );
 }
 
-/// A `PolicyRevisionId` the service minted: a non-empty string inside the modelled
-/// length bounds.
+/// The canonical form of a policy document: the text with every whitespace character
+/// that falls BETWEEN JSON tokens removed, and everything inside a string literal kept
+/// exactly as written.
+///
+/// This restates the rule the service follows — a `PolicyDocument` is parsed and stored
+/// as its content, so the layout the caller chose (indentation, the spaces a
+/// pretty-printer puts after `:` and `,`, a trailing newline) is not part of what is
+/// stored, while the elements, their order and their values are. Recorded RUM behaviour:
+/// a put of a document written with those spaces answers the same policy without them.
+fn canonical_form(document: &str) -> String {
+    let mut canonical = String::with_capacity(document.len());
+    let mut in_string = false;
+    let mut escaped = false;
+    for character in document.chars() {
+        if in_string {
+            canonical.push(character);
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == '"' {
+                in_string = false;
+            }
+        } else if character == '"' {
+            in_string = true;
+            canonical.push(character);
+        } else if !character.is_whitespace() {
+            canonical.push(character);
+        }
+    }
+    canonical
+}
+
+/// Assert `answered` is the document `submitted` was: the same JSON content, in the
+/// canonical form the service stores.
+fn assert_stored_document(case: &str, submitted: &str, answered: &str) {
+    let expected = canonical_form(submitted);
+    assert_eq!(
+        answered, expected,
+        "case {case:?}: expected the submitted document's canonical text \
+         {expected:?}, got {answered:?}"
+    );
+    // Nothing but the layout changed: the answer parses to the very same JSON value as
+    // the text the caller submitted — same elements, same order, same values.
+    let answered_value: Value = serde_json::from_str(answered)
+        .unwrap_or_else(|e| panic!("case {case:?}: the answered document must parse: {e}"));
+    let submitted_value: Value = serde_json::from_str(submitted)
+        .unwrap_or_else(|e| panic!("case {case:?}: the submitted document must parse: {e}"));
+    assert_eq!(
+        answered_value, submitted_value,
+        "case {case:?}: the answered document must carry the submitted document's \
+         content, got {answered:?}"
+    );
+}
+
+/// A `PolicyRevisionId` the service minted: a revision NUMBER, rendered in decimal with
+/// no padding and at least 1, inside the modelled length bounds.
 fn assert_modelled_revision_id(case: &str, revision_id: &str) {
     let (min, max) = POLICY_REVISION_ID_BOUNDS;
     assert!(
@@ -211,6 +284,14 @@ fn assert_modelled_revision_id(case: &str, revision_id: &str) {
         "case {case:?}: expected a PolicyRevisionId of {min}..{max} characters, \
          got {revision_id:?} ({} characters)",
         revision_id.len()
+    );
+    let number = revision_id.parse::<u64>();
+    assert!(
+        number
+            .as_ref()
+            .is_ok_and(|number| *number >= 1 && number.to_string() == revision_id),
+        "case {case:?}: expected a PolicyRevisionId that is a revision number in \
+         decimal, got {revision_id:?}"
     );
 }
 
@@ -341,8 +422,8 @@ fn well_formed_documents() -> Vec<(&'static str, String)> {
             .to_string(),
         ),
         (
-            // Indented, multi-line text: the stored document must come back with the
-            // same bytes, not re-serialized.
+            // Indented, multi-line text: the layout is the caller's, so the stored
+            // document comes back as the same policy in canonical form.
             "pretty-printed-text",
             "{\n  \"Version\": \"2012-10-17\",\n  \"Statement\": [\n    {\n      \
              \"Effect\": \"Allow\",\n      \"Principal\": {\"AWS\": \"*\"},\n      \
@@ -350,7 +431,8 @@ fn well_formed_documents() -> Vec<(&'static str, String)> {
                 .to_string(),
         ),
         (
-            // Non-ASCII text inside the document: byte equality must survive it too.
+            // Non-ASCII text inside the document: it is string content, so it survives
+            // unchanged.
             "non-ascii-sid",
             json!({
                 "Version": "2012-10-17",
@@ -549,9 +631,8 @@ fn sized_policy_document(bytes: usize) -> String {
 }
 
 #[tokio::test]
-async fn put_then_get_returns_the_stored_document_byte_for_byte() {
+async fn put_then_get_returns_the_stored_document_as_its_canonical_content() {
     let router = emulator();
-    let mut revision_ids = BTreeSet::new();
 
     for (index, (case, document)) in well_formed_documents().into_iter().enumerate() {
         let name = format!("policy-roundtrip-{index}");
@@ -566,17 +647,16 @@ async fn put_then_get_returns_the_stored_document_byte_for_byte() {
             String::from_utf8_lossy(&put.body)
         );
         let put_document = put.member(case, "PolicyDocument");
-        assert_eq!(
-            put_document, document,
-            "case {case:?}: expected PutResourcePolicy to report the document it was \
-             given, got {put_document:?}"
-        );
+        assert_stored_document(case, &document, &put_document);
         let revision_id = put.member(case, "PolicyRevisionId");
         assert_modelled_revision_id(case, &revision_id);
-        assert!(
-            revision_ids.insert(revision_id.clone()),
-            "case {case:?}: PolicyRevisionId {revision_id:?} was already minted for an \
-             earlier put; each revision must be distinct"
+        // Each row writes to a FRESH app monitor, so each one reports that monitor's
+        // first policy revision — the revision belongs to the monitor's policy, not to
+        // the service as a whole.
+        assert_eq!(
+            revision_id, FIRST_POLICY_REVISION_ID,
+            "case {case:?}: expected the first policy stored on an app monitor to be \
+             revision {FIRST_POLICY_REVISION_ID}, got {revision_id:?}"
         );
 
         // Round trip: the reader reports the same bytes and the same revision.
@@ -589,10 +669,11 @@ async fn put_then_get_returns_the_stored_document_byte_for_byte() {
             String::from_utf8_lossy(&get.body)
         );
         let read_document = get.member(case, "PolicyDocument");
+        assert_stored_document(case, &document, &read_document);
         assert_eq!(
-            read_document, document,
-            "case {case:?}: expected GetResourcePolicy to report the stored document \
-             byte for byte, got {read_document:?}"
+            read_document, put_document,
+            "case {case:?}: expected GetResourcePolicy to report the document the put \
+             stored, got {read_document:?}"
         );
         let read_revision = get.member(case, "PolicyRevisionId");
         assert_eq!(
@@ -605,7 +686,7 @@ async fn put_then_get_returns_the_stored_document_byte_for_byte() {
         let again = get_policy(&router, &name).await;
         assert_eq!(
             again.member(case, "PolicyDocument"),
-            document,
+            put_document,
             "case {case:?}: a second GetResourcePolicy must report the same document"
         );
         assert_eq!(
@@ -647,15 +728,102 @@ async fn malformed_documents_are_refused_and_store_nothing() {
         let onto_holder = put_policy(&router, holder, &document, None).await;
         assert_refused(&onto_holder, case, 400, "MalformedPolicyDocumentException");
         let held = get_policy(&router, holder).await;
-        assert_eq!(
-            held.member(case, "PolicyDocument"),
-            good,
-            "case {case:?}: a refused put must leave the stored document unchanged"
-        );
+        assert_stored_document(case, &good, &held.member(case, "PolicyDocument"));
         assert_eq!(
             held.member(case, "PolicyRevisionId"),
             stored_revision,
             "case {case:?}: a refused put must leave the stored revision unchanged"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_documents_layout_is_not_part_of_what_is_stored() {
+    let router = emulator();
+
+    // ONE policy, written eight ways. The rows differ only in whitespace BETWEEN JSON
+    // tokens — the layout a caller's printer chose — so every one of them must read back
+    // as the same canonical text. The `Sid` carries spaces INSIDE a string value, which
+    // is content, so it must survive in every row.
+    let canonical = r#"{"Version":"2012-10-17","Statement":[{"Sid":"Allow One Account","Effect":"Allow","Principal":"*","Action":"rum:PutRumEvents"}]}"#;
+    let layouts: Vec<(&str, String)> = vec![
+        ("already-minified", canonical.to_string()),
+        (
+            "spaces-after-the-separators",
+            r#"{"Version": "2012-10-17", "Statement": [{"Sid": "Allow One Account", "Effect": "Allow", "Principal": "*", "Action": "rum:PutRumEvents"}]}"#.to_string(),
+        ),
+        (
+            "spaces-around-every-token",
+            r#"{ "Version" : "2012-10-17" , "Statement" : [ { "Sid" : "Allow One Account" , "Effect" : "Allow" , "Principal" : "*" , "Action" : "rum:PutRumEvents" } ] }"#.to_string(),
+        ),
+        (
+            "indented-two-spaces",
+            "{\n  \"Version\": \"2012-10-17\",\n  \"Statement\": [\n    {\n      \
+             \"Sid\": \"Allow One Account\",\n      \"Effect\": \"Allow\",\n      \
+             \"Principal\": \"*\",\n      \"Action\": \"rum:PutRumEvents\"\n    }\n  ]\n}"
+                .to_string(),
+        ),
+        (
+            "tab-indented",
+            "{\n\t\"Version\": \"2012-10-17\",\n\t\"Statement\": [\n\t\t{\n\t\t\t\
+             \"Sid\": \"Allow One Account\",\n\t\t\t\"Effect\": \"Allow\",\n\t\t\t\
+             \"Principal\": \"*\",\n\t\t\t\"Action\": \"rum:PutRumEvents\"\n\t\t}\n\t]\n}"
+                .to_string(),
+        ),
+        (
+            "crlf-line-endings",
+            "{\r\n\"Version\": \"2012-10-17\",\r\n\"Statement\": [{\r\n\"Sid\": \
+             \"Allow One Account\",\r\n\"Effect\": \"Allow\",\r\n\"Principal\": \"*\",\
+             \r\n\"Action\": \"rum:PutRumEvents\"\r\n}]\r\n}"
+                .to_string(),
+        ),
+        (
+            "leading-and-trailing-whitespace",
+            format!("\n\t  {canonical}  \n"),
+        ),
+        (
+            "newlines-inside-the-brackets",
+            format!(
+                "{{\n{}\n}}",
+                r#""Version":"2012-10-17",
+"Statement":
+[
+{"Sid":"Allow One Account","Effect":"Allow","Principal":"*","Action":"rum:PutRumEvents"}
+]"#
+            ),
+        ),
+    ];
+
+    for (index, (case, submitted)) in layouts.iter().enumerate() {
+        let name = format!("policy-layout-{index}");
+        create_app_monitor(&router, case, &name).await;
+
+        let put = put_policy(&router, &name, submitted, None).await;
+        assert_eq!(
+            put.status,
+            200,
+            "case {case:?}: expected PutResourcePolicy to answer 200, got {} {:?}",
+            put.status,
+            String::from_utf8_lossy(&put.body)
+        );
+        let answered = put.member(case, "PolicyDocument");
+        assert_stored_document(case, submitted, &answered);
+        assert_eq!(
+            answered, canonical,
+            "case {case:?}: every layout of one policy must be stored as the same \
+             canonical text, got {answered:?}"
+        );
+        // Whitespace inside a string value is content, not layout.
+        assert!(
+            answered.contains("Allow One Account"),
+            "case {case:?}: the Sid's own spaces must survive, got {answered:?}"
+        );
+
+        let read = get_policy(&router, &name).await.member(case, "PolicyDocument");
+        assert_eq!(
+            read, canonical,
+            "case {case:?}: expected GetResourcePolicy to report the canonical text, \
+             got {read:?}"
         );
     }
 }
@@ -687,11 +855,7 @@ async fn documents_are_accepted_up_to_the_documented_size_limit() {
                 String::from_utf8_lossy(&put.body)
             );
             let read = get_policy(&router, &name).await;
-            assert_eq!(
-                read.member(case, "PolicyDocument"),
-                document,
-                "case {case:?} ({bytes} bytes): expected the stored document to read back"
-            );
+            assert_stored_document(case, &document, &read.member(case, "PolicyDocument"));
         } else {
             assert_refused(&put, case, 400, "PolicySizeLimitExceededException");
             let read = get_policy(&router, &name).await;
@@ -743,11 +907,7 @@ async fn a_conditional_put_succeeds_only_on_the_current_revision() {
         let stale = put_policy(&router, &name, first, Some(&first_revision)).await;
         assert_refused(&stale, case, 400, "InvalidPolicyRevisionIdException");
         let after_stale = get_policy(&router, &name).await;
-        assert_eq!(
-            after_stale.member(case, "PolicyDocument"),
-            *second,
-            "case {case:?}: a refused conditional put must leave the document unchanged"
-        );
+        assert_stored_document(case, second, &after_stale.member(case, "PolicyDocument"));
         assert_eq!(
             after_stale.member(case, "PolicyRevisionId"),
             second_revision,
@@ -761,10 +921,12 @@ async fn a_conditional_put_succeeds_only_on_the_current_revision() {
             third_revision, second_revision,
             "case {case:?}: an unconditional put must still mint a new revision"
         );
-        assert_eq!(
-            get_policy(&router, &name).await.member(case, "PolicyDocument"),
-            *first,
-            "case {case:?}: an unconditional put must replace the stored document"
+        assert_stored_document(
+            case,
+            first,
+            &get_policy(&router, &name)
+                .await
+                .member(case, "PolicyDocument"),
         );
     }
 }
@@ -797,10 +959,12 @@ async fn delete_is_conditional_on_the_revision_and_then_reports_no_policy() {
             let stale = delete_policy(&router, &name, Some("00000000-0000-4000-8000-000000000000"))
                 .await;
             assert_refused(&stale, case, 400, "InvalidPolicyRevisionIdException");
-            assert_eq!(
-                get_policy(&router, &name).await.member(case, "PolicyDocument"),
-                *document,
-                "case {case:?}: a refused delete must leave the policy in place"
+            assert_stored_document(
+                case,
+                document,
+                &get_policy(&router, &name)
+                    .await
+                    .member(case, "PolicyDocument"),
             );
 
             let deleted = delete_policy(
@@ -823,11 +987,13 @@ async fn delete_is_conditional_on_the_revision_and_then_reports_no_policy() {
             );
 
             // The policy is gone: reading it, and deleting it again, both report that.
-            assert_refused(
-                &get_policy(&router, &name).await,
-                case,
-                404,
-                "PolicyNotFoundException",
+            let gone = get_policy(&router, &name).await;
+            assert_refused(&gone, case, 404, "PolicyNotFoundException");
+            let message = gone.member(case, "message");
+            assert_eq!(
+                message, POLICY_NOT_FOUND_MESSAGE,
+                "case {case:?}: expected the PolicyNotFoundException message \
+                 {POLICY_NOT_FOUND_MESSAGE:?}, got {message:?}"
             );
             assert_refused(
                 &delete_policy(&router, &name, None).await,
@@ -845,6 +1011,161 @@ async fn delete_is_conditional_on_the_revision_and_then_reports_no_policy() {
             );
         }
     }
+}
+
+/// How one write of a revision-counter row reaches the service.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Write {
+    /// A put naming no `PolicyRevisionId`: unconditional, it replaces whatever is there.
+    Unconditional,
+    /// A put naming the revision the previous write reported — the documented
+    /// read-revision-then-write loop.
+    Conditional,
+    /// A delete of the policy in force (naming its revision), then a put: the monitor
+    /// carries no policy in between.
+    DeleteThenPut,
+}
+
+#[tokio::test]
+async fn revision_ids_count_the_writes_to_each_app_monitors_policy() {
+    let router = emulator();
+    let documents = well_formed_documents();
+
+    // Rows differ in how many writes they make and in how each write is made: naming no
+    // revision, naming the one just read, or coming after the policy was deleted. Every
+    // row drives its own app monitor, so every row's first write is revision 1 and each
+    // later write is one more, whichever way it was made.
+    let rows: Vec<(&str, Vec<Write>)> = vec![
+        ("one unconditional write", vec![Write::Unconditional]),
+        (
+            "the read-revision-then-write loop",
+            vec![Write::Unconditional, Write::Conditional, Write::Conditional],
+        ),
+        (
+            "unconditional replacements",
+            vec![Write::Unconditional; 4],
+        ),
+        (
+            "a write after the policy was deleted",
+            vec![
+                Write::Unconditional,
+                Write::DeleteThenPut,
+                Write::Conditional,
+                Write::DeleteThenPut,
+            ],
+        ),
+        (
+            "twelve alternating writes",
+            (0..12)
+                .map(|step| {
+                    if step % 2 == 0 {
+                        Write::Unconditional
+                    } else {
+                        Write::Conditional
+                    }
+                })
+                .collect(),
+        ),
+    ];
+
+    for (row, (row_case, writes)) in rows.iter().enumerate() {
+        let name = format!("policy-revision-counter-{row}");
+        create_app_monitor(&router, row_case, &name).await;
+
+        // The number of writes this monitor's policy has taken, which is what the
+        // revision id must report, and the revision currently in force.
+        let mut written = 0_u64;
+        let mut in_force: Option<String> = None;
+
+        for (step, mode) in writes.iter().enumerate() {
+            let case = format!("{row_case}: step {step} ({mode:?})");
+            let document = &documents[(row + step) % documents.len()].1;
+
+            if *mode == Write::DeleteThenPut {
+                let held = in_force
+                    .clone()
+                    .unwrap_or_else(|| panic!("case {case:?}: no policy to delete"));
+                let deleted = delete_policy(&router, &name, Some(&held)).await;
+                assert_eq!(
+                    deleted.status,
+                    200,
+                    "case {case:?}: a delete naming the current revision must succeed, \
+                     got {} {:?}",
+                    deleted.status,
+                    String::from_utf8_lossy(&deleted.body)
+                );
+                let reported = deleted.member(&case, "PolicyRevisionId");
+                assert_eq!(
+                    reported, held,
+                    "case {case:?}: delete must report the revision it removed ({held:?}), \
+                     got {reported:?}"
+                );
+                in_force = None;
+            }
+
+            let named = match mode {
+                Write::Conditional => in_force.clone(),
+                Write::Unconditional | Write::DeleteThenPut => None,
+            };
+            let put = put_policy(&router, &name, document, named.as_deref()).await;
+            assert_eq!(
+                put.status,
+                200,
+                "case {case:?}: expected PutResourcePolicy to answer 200, got {} {:?}",
+                put.status,
+                String::from_utf8_lossy(&put.body)
+            );
+
+            written += 1;
+            let expected = written.to_string();
+            let reported = put.member(&case, "PolicyRevisionId");
+            assert_modelled_revision_id(&case, &reported);
+            assert_eq!(
+                reported, expected,
+                "case {case:?}: expected write number {written} to report revision \
+                 {expected:?}, got {reported:?}"
+            );
+
+            // The reader reports the very revision the write stored.
+            let read = get_policy(&router, &name).await;
+            let read_revision = read.member(&case, "PolicyRevisionId");
+            assert_eq!(
+                read_revision, expected,
+                "case {case:?}: expected GetResourcePolicy to report revision \
+                 {expected:?}, got {read_revision:?}"
+            );
+            in_force = Some(reported);
+        }
+    }
+
+    // Revisions are per app monitor and are NOT shared: a monitor written once still
+    // reports revision 1 while another has counted many writes, and the id one monitor
+    // holds does not satisfy another's conditional write.
+    let fresh = "policy-revision-counter-fresh";
+    create_app_monitor(&router, "fresh monitor", fresh).await;
+    let first = put_policy(&router, fresh, &documents[0].1, None).await;
+    let fresh_revision = first.member("fresh monitor", "PolicyRevisionId");
+    assert_eq!(
+        fresh_revision, FIRST_POLICY_REVISION_ID,
+        "case \"fresh monitor\": expected revision {FIRST_POLICY_REVISION_ID} on a \
+         monitor's first policy, got {fresh_revision:?}"
+    );
+    let busy = "policy-revision-counter-4";
+    let busy_revision = get_policy(&router, busy)
+        .await
+        .member("busy monitor", "PolicyRevisionId");
+    assert_ne!(
+        busy_revision, fresh_revision,
+        "case \"busy monitor\": a monitor that took many writes must not report the \
+         same revision as one that took a single write"
+    );
+    let crossed = put_policy(&router, busy, &documents[1].1, Some(&fresh_revision)).await;
+    assert_refused(
+        &crossed,
+        "cross-monitor revision",
+        400,
+        "InvalidPolicyRevisionIdException",
+    );
 }
 
 #[tokio::test]
@@ -922,11 +1243,7 @@ async fn each_app_monitor_carries_its_own_policy() {
     for (name, document, revision) in &names {
         let case = format!("name={name}");
         let read = get_policy(&router, name).await;
-        assert_eq!(
-            read.member(&case, "PolicyDocument"),
-            *document,
-            "case {case:?}: expected each monitor to report its own policy document"
-        );
+        assert_stored_document(&case, document, &read.member(&case, "PolicyDocument"));
         assert_eq!(
             read.member(&case, "PolicyRevisionId"),
             *revision,
@@ -939,10 +1256,10 @@ async fn each_app_monitor_carries_its_own_policy() {
     delete_policy(&router, first_name, None).await;
     for (name, document, _) in names.iter().skip(1) {
         let case = format!("name={name}");
-        assert_eq!(
-            get_policy(&router, name).await.member(&case, "PolicyDocument"),
-            *document,
-            "case {case:?}: deleting one monitor's policy must not touch another's"
+        assert_stored_document(
+            &case,
+            document,
+            &get_policy(&router, name).await.member(&case, "PolicyDocument"),
         );
     }
 }
