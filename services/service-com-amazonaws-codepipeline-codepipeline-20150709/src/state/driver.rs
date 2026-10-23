@@ -93,6 +93,7 @@ pub fn plan(
         pipelines,
         executions,
         executions_by_pipeline,
+        jobs,
         ..
     } = store;
     let pipeline = pipelines.get(pipeline_name)?;
@@ -110,11 +111,36 @@ pub fn plan(
         let Some(declaration) = pipeline.declaration_at(Some(record.pipeline_version)) else {
             continue;
         };
-        if let Some(job) = step_execution(record, declaration, &disabled, now) {
+        // The job queue is a THIRD disjoint field of the store, so an execution that
+        // reaches a custom action can be written while its job is queued.
+        let mut context = StepContext {
+            declaration,
+            pipeline_arn: &pipeline.arn,
+            jobs: &mut *jobs,
+            disabled: &disabled,
+        };
+        if let Some(job) = step_execution(record, &mut context, now) {
             return Some(job);
         }
     }
     None
+}
+
+/// What one step of an execution needs besides the execution's own record: the
+/// pipeline it belongs to, and the custom-action job queue it may have to write.
+///
+/// Each field is borrowed from a DIFFERENT field of the store, which is what lets a
+/// step read the pinned declaration and queue a job while it writes the execution.
+struct StepContext<'a> {
+    /// The pipeline declaration version the execution pinned at start.
+    declaration: &'a crate::ops::types::PipelineDeclaration,
+    /// That pipeline's ARN, which a custom action's job reports to its worker.
+    pipeline_arn: &'a str,
+    /// The jobs waiting for custom actions' workers: written when an execution
+    /// reaches an action CodePipeline does not run itself.
+    jobs: &'a mut super::JobQueue,
+    /// The `(stage, StageTransitionType)` pairs a caller has disabled.
+    disabled: &'a ::std::collections::BTreeSet<(String, String)>,
 }
 
 /// Let queued executions start, as the pipeline's `executionMode` allows.
@@ -154,10 +180,10 @@ fn admit_queued(
 /// Move one execution forward, returning the work it claimed, if any.
 fn step_execution(
     record: &mut PipelineExecutionRecord,
-    declaration: &crate::ops::types::PipelineDeclaration,
-    disabled: &::std::collections::BTreeSet<(String, String)>,
+    context: &mut StepContext<'_>,
     now: SystemTime,
 ) -> Option<Job> {
+    let disabled = context.disabled;
     if record.queued || is_terminal_status(&record.status) {
         return None;
     }
@@ -209,7 +235,7 @@ fn step_execution(
                 record.last_update_time = now;
             }
         }
-        return step_stage(record, declaration, index, now);
+        return step_stage(record, context, index, now);
     }
 
     // Every stage succeeded, so the execution has.
@@ -221,7 +247,7 @@ fn step_execution(
 /// Move one stage of one execution forward.
 fn step_stage(
     record: &mut PipelineExecutionRecord,
-    declaration: &crate::ops::types::PipelineDeclaration,
+    context: &mut StepContext<'_>,
     stage: usize,
     now: SystemTime,
 ) -> Option<Job> {
@@ -299,7 +325,7 @@ fn step_stage(
                 Some(due) if due > now => return None,
                 Some(_) => {}
             }
-            return start_action(record, declaration, stage, index, now);
+            return start_action(record, context, stage, index, now);
         }
         return None;
     }
@@ -313,16 +339,34 @@ fn step_stage(
 /// perform, or it fails because this emulator cannot perform that work at all.
 fn start_action(
     record: &mut PipelineExecutionRecord,
-    declaration: &crate::ops::types::PipelineDeclaration,
+    context: &mut StepContext<'_>,
     stage: usize,
     index: usize,
     now: SystemTime,
 ) -> Option<Job> {
+    let declaration = context.declaration;
+    let pipeline_arn = context.pipeline_arn.to_string();
     let variables = record.variables_map.clone();
     let pipeline_name = record.pipeline_name.clone();
+    let stage_name = record.stages[stage].name.clone();
     let artifact_bucket = record.artifact_bucket.clone();
     let artifact_encryption_key = record.artifact_encryption_key.clone();
     let execution_id = record.pipeline_execution_id.clone();
+    // The artifact store this execution writes to, as the DECLARATION states it: the
+    // bucket alone is on the record, and a job worker also needs the customer managed
+    // key the store declares to read and write those objects.
+    let artifact_encryption = declaration
+        .artifact_store
+        .iter()
+        .chain(
+            declaration
+                .artifact_stores
+                .iter()
+                .flatten()
+                .map(|(_, store)| store),
+        )
+        .find(|store| store.location == artifact_bucket)
+        .and_then(|store| store.encryption_key.clone());
     let pinned: BTreeMap<String, String> = record
         .source_revisions
         .iter()
@@ -385,6 +429,58 @@ fn start_action(
         // `PutApprovalResult` answers the token it publishes here.
         action.token = Some(random_uuid_v4());
         action.summary = config.get("CustomData").cloned();
+        return None;
+    }
+
+    if declared.action_type_id.owner == super::ACTION_OWNER_CUSTOM {
+        // CodePipeline does not run a CUSTOM action: the account's own job worker does
+        // ("PollForJobs is valid only for action types with Custom in the owner
+        // field"). So reaching the action does not perform work and does not fail it
+        // either — it QUEUES a job for the worker to poll for, and the action stays
+        // InProgress until the worker reports a result. The job is queued exactly once
+        // per action, because an action is started once: every later step sees it
+        // InProgress and waits.
+        //
+        // The artifacts the worker reads are the ones the earlier actions produced, at
+        // the locations they produced them at; the ones it is to write are the
+        // locations this execution assigns them in the artifact store.
+        let job_inputs: Vec<crate::ops::types::Artifact> = input_artifacts
+            .iter()
+            .filter_map(|name| {
+                produced
+                    .get(name)
+                    .map(|location| super::job_artifact(name, location))
+            })
+            .collect();
+        let job_outputs: Vec<crate::ops::types::Artifact> = output_artifacts
+            .iter()
+            .map(|name| {
+                super::job_artifact(
+                    name,
+                    &ArtifactRef {
+                        bucket: artifact_bucket.clone(),
+                        key: artifact_key(&pipeline_name, name),
+                        revision: None,
+                    },
+                )
+            })
+            .collect();
+        let job = super::JobRecord {
+            pipeline_name,
+            pipeline_arn,
+            pipeline_execution_id: execution_id,
+            stage_name,
+            action_name: action.name.clone(),
+            action_execution_id: action.action_execution_id.clone(),
+            stage,
+            action: index,
+            input_artifacts: job_inputs,
+            output_artifacts: job_outputs,
+            configuration: config,
+            encryption_key: artifact_encryption,
+            ..super::JobRecord::new(random_uuid_v4(), declared.action_type_id.clone(), now)
+        };
+        super::enqueue_job_into(context.jobs, &declared.action_type_id, job);
         return None;
     }
 
