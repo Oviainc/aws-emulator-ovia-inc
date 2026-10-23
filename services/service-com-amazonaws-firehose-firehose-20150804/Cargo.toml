@@ -23,6 +23,14 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# The AWS SDK for IAM, driven over the in-process callback
+# (`OperationContext::callback`): `CreateDeliveryStream`/`UpdateDestination` resolve every
+# `RoleARN` a configuration names with `GetRole` before the stream is written. Only the
+# generated client is needed — the emulator supplies the transport.
+aws-sdk-iam = { version = "1", default-features = false }
+# `iam_trust_policy`: the one reading of an IAM trust policy, shared with every other
+# service that resolves a caller-supplied role.
+service-common = { path = "../common" }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
