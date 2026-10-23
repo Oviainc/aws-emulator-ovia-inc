@@ -22,10 +22,10 @@ Credential=AKIDTESTS3VECTORS/20260101/us-east-1/s3vectors/aws4_request, \
 SignedHeaders=host;x-amz-date, Signature=0000";
 
 /// The region in [`AUTHORIZATION`]'s credential scope.
-const REGION: &str = "us-east-1";
+pub(crate) const REGION: &str = "us-east-1";
 
 /// The ARN a vector bucket of this name must carry, per `VectorBucketArn`'s pattern.
-fn expected_bucket_arn(bucket: &str) -> String {
+pub(crate) fn expected_bucket_arn(bucket: &str) -> String {
     format!(
         "arn:aws:s3vectors:{REGION}:{}:bucket/{bucket}",
         engine::EMULATOR_ACCOUNT_ID
@@ -41,7 +41,7 @@ fn expected_index_arn(bucket: &str, index: &str) -> String {
 }
 
 /// The production router with this one service mounted on a fresh shared engine.
-fn router() -> MultiServiceRouter {
+pub(crate) fn router() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -52,7 +52,7 @@ fn router() -> MultiServiceRouter {
 }
 
 /// Call one operation and return its HTTP status and JSON body.
-async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16, Value) {
+pub(crate) async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16, Value) {
     let request = http::Request::builder()
         .method("POST")
         .uri(format!("https://s3vectors.{REGION}.amazonaws.com/{operation}"))
@@ -74,7 +74,7 @@ async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u1
 }
 
 /// The wire error code (`__type`) of an error response, or `""`.
-fn error_code(body: &Value) -> String {
+pub(crate) fn error_code(body: &Value) -> String {
     body.get("__type")
         .and_then(Value::as_str)
         .unwrap_or_default()
@@ -82,7 +82,7 @@ fn error_code(body: &Value) -> String {
 }
 
 /// Call an operation that must succeed, returning its body.
-async fn ok(router: &MultiServiceRouter, operation: &str, body: &Value) -> Value {
+pub(crate) async fn ok(router: &MultiServiceRouter, operation: &str, body: &Value) -> Value {
     let (status, response) = call(router, operation, body).await;
     assert_eq!(
         status, 200,
@@ -1662,18 +1662,6 @@ async fn the_operations_outside_this_slice_still_answer_501() {
         (
             "PutVectorBucketDefaultIndexMode",
             json!({ "vectorBucketName": "stub-bucket", "defaultIndexMode": "ENHANCED" }),
-        ),
-        (
-            "PutVectorBucketPolicy",
-            json!({ "vectorBucketName": "stub-bucket", "policy": "{}" }),
-        ),
-        (
-            "GetVectorBucketPolicy",
-            json!({ "vectorBucketName": "stub-bucket" }),
-        ),
-        (
-            "DeleteVectorBucketPolicy",
-            json!({ "vectorBucketName": "stub-bucket" }),
         ),
     ];
 
