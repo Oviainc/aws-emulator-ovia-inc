@@ -14,7 +14,7 @@ use ::aws_smithy_types::DateTime;
 
 use crate::ops::types::{
     AccountAssignment, AccountAssignmentOperationStatus, InstanceMetadata, PermissionSet,
-    RegionMetadata, Tag,
+    RegionMetadata, Tag, TrustedTokenIssuerConfiguration,
 };
 
 /// The identity-store instance every `InstanceArn`-taking operation resolves against.
@@ -183,6 +183,33 @@ impl PermissionSetRecord {
     }
 }
 
+/// A trusted token issuer connected to one IAM Identity Center instance, keyed in
+/// [`ComAmazonawsSsoadminSwbexternalserviceState::trusted_token_issuers`] by the ARN
+/// minted for it at creation.
+///
+/// The `Tags` a create carries are held here (rather than dropped) so the tagging
+/// operations have one record to extend rather than a second map, and so the
+/// idempotency fingerprint below covers every parameter of the request that made it.
+#[derive(Debug, Clone)]
+pub struct TrustedTokenIssuerRecord {
+    pub trusted_token_issuer_arn: String,
+    pub instance_arn: String,
+    pub name: String,
+    pub trusted_token_issuer_type: String,
+    pub configuration: TrustedTokenIssuerConfiguration,
+    pub tags: Vec<Tag>,
+    /// The `ClientToken` of the create that minted this issuer, when it carried one.
+    ///
+    /// Held ON the record, so the idempotency promise lives exactly as long as the
+    /// resource it names: a deleted issuer frees its token instead of leaving a record
+    /// that would answer a replay with an ARN nothing resolves.
+    pub client_token: Option<String>,
+    /// [`trusted_token_issuer_fingerprint`] of the request that minted this issuer, so
+    /// a retry carrying the SAME token can be told from the same token carrying a
+    /// DIFFERENT request.
+    pub request_fingerprint: String,
+}
+
 /// An assignment of a permission set to a principal on one account.
 ///
 /// Its identity is the tuple (instance, account, permission set, principal type,
@@ -269,6 +296,10 @@ pub struct ComAmazonawsSsoadminSwbexternalserviceState {
     /// Account assignments. At most one row per identity tuple, and at most
     /// [`MAX_RECORDS_PER_STORE`] rows in all.
     pub account_assignments: Vec<AccountAssignmentRecord>,
+    /// Trusted token issuers by `TrustedTokenIssuerArn`. A `BTreeMap` so an
+    /// enumeration walks one stable order and can page by key. Holds at most
+    /// [`MAX_RECORDS_PER_STORE`] records.
+    pub trusted_token_issuers: BTreeMap<String, TrustedTokenIssuerRecord>,
     /// Assignment operation statuses by `RequestId`: one per assignment currently
     /// granted, so a repeated create reads the record it already wrote instead of
     /// adding another, and a delete that removes an assignment removes its status
@@ -310,6 +341,7 @@ impl Default for ComAmazonawsSsoadminSwbexternalserviceState {
             instances,
             permission_sets: BTreeMap::new(),
             account_assignments: Vec::new(),
+            trusted_token_issuers: BTreeMap::new(),
             assignment_operations: BTreeMap::new(),
         }
     }
@@ -340,6 +372,26 @@ impl ComAmazonawsSsoadminSwbexternalserviceState {
         self.permission_sets
             .values()
             .any(|record| record.instance_arn == instance_arn && record.name == name)
+    }
+
+    /// The trusted token issuer `trusted_token_issuer_arn` names, or `None` when no
+    /// such issuer exists.
+    pub fn trusted_token_issuer(
+        &self,
+        trusted_token_issuer_arn: &str,
+    ) -> Option<&TrustedTokenIssuerRecord> {
+        self.trusted_token_issuers.get(trusted_token_issuer_arn)
+    }
+
+    /// The trusted token issuer a previous `CreateTrustedTokenIssuer` minted under
+    /// `client_token`, if one still exists.
+    pub fn trusted_token_issuer_for_client_token(
+        &self,
+        client_token: &str,
+    ) -> Option<&TrustedTokenIssuerRecord> {
+        self.trusted_token_issuers
+            .values()
+            .find(|record| record.client_token.as_deref() == Some(client_token))
     }
 
     /// The index of the assignment with this identity tuple, if it exists.
@@ -385,11 +437,88 @@ pub fn mint_permission_set_arn(instance_arn: &str) -> String {
     format!("arn:{partition}:sso:::permissionSet/{instance_id}/ps-{suffix}")
 }
 
+/// Mint a fresh `TrustedTokenIssuerArn` under `instance_arn`.
+///
+/// `arn:<partition>:sso::<account>:trustedTokenIssuer/<instance id>/tti-<uuid>`, per the
+/// model's `TrustedTokenIssuerArn` pattern — unlike an instance or permission-set ARN,
+/// this one carries the owning ACCOUNT (`:sso::\d{12}:`) and no region, so it is built
+/// here rather than through `engine::emulator_arn`. The partition and instance id come
+/// from the owning instance's ARN; only the `tti-` UUID is minted.
+pub fn mint_trusted_token_issuer_arn(instance_arn: &str) -> String {
+    let partition = instance_arn.split(':').nth(1).unwrap_or("aws");
+    let instance_id = instance_arn.rsplit('/').next().unwrap_or(SEED_INSTANCE_ID);
+    format!(
+        "arn:{partition}:sso::{}:trustedTokenIssuer/{instance_id}/tti-{}",
+        ::engine::emulator_account_id(),
+        mint_uuid_v4(),
+    )
+}
+
+/// A stable digest of every parameter a `@idempotencyToken`-carrying
+/// `CreateTrustedTokenIssuer` is scoped to.
+///
+/// It is what tells a genuine retry (the same `ClientToken` AND the same request) from
+/// the same token carrying a different request, which is a conflict rather than a
+/// replay. `Tags` go in SORTED, because a tag set carries no order the caller chose.
+pub fn trusted_token_issuer_fingerprint(
+    instance_arn: &str,
+    name: &str,
+    trusted_token_issuer_type: &str,
+    configuration: &TrustedTokenIssuerConfiguration,
+    tags: &[Tag],
+) -> String {
+    let mut parts = vec![
+        instance_arn.to_string(),
+        name.to_string(),
+        trusted_token_issuer_type.to_string(),
+    ];
+    match configuration {
+        TrustedTokenIssuerConfiguration::OidcJwtConfiguration(oidc) => {
+            parts.push("OidcJwtConfiguration".to_string());
+            parts.push(oidc.issuer_url.clone());
+            parts.push(oidc.claim_attribute_path.clone());
+            parts.push(oidc.identity_store_attribute_path.clone());
+            parts.push(oidc.jwks_retrieval_option.clone());
+        }
+    }
+    let mut sorted: Vec<(&str, &str)> = tags
+        .iter()
+        .map(|tag| (tag.key.as_str(), tag.value.as_str()))
+        .collect();
+    sorted.sort_unstable();
+    for (key, value) in sorted {
+        parts.push(key.to_string());
+        parts.push(value.to_string());
+    }
+    request_fingerprint(&parts)
+}
+
+/// A stable digest of a request's parts, each LENGTH-PREFIXED so `["a", "bc"]` and
+/// `["ab", "c"]` cannot collide.
+pub fn request_fingerprint<S: AsRef<str>>(parts: &[S]) -> String {
+    use ::sha2::Digest as _;
+    let mut hasher = ::sha2::Sha256::new();
+    for part in parts {
+        let part = part.as_ref();
+        hasher.update((part.len() as u64).to_le_bytes());
+        hasher.update(part.as_bytes());
+    }
+    ::hex::encode(hasher.finalize())
+}
+
 /// A fresh `RequestId`: the hyphenated lowercase UUID the model's `UUId` shape
 /// requires (`length 36..36`, `^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`),
 /// laid out as a version-4 UUID (the `4` in the third group, and the RFC 4122 variant
 /// nibble `8`..`b` opening the fourth).
 pub fn mint_request_id() -> String {
+    mint_uuid_v4()
+}
+
+/// A fresh hyphenated lowercase version-4 UUID: `[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-
+/// [89ab][0-9a-f]{3}-[0-9a-f]{12}` (the `4` names the version and the RFC 4122 variant
+/// nibble `8`..`b` opens the fourth group). It is the form the model's `UUId` shape and
+/// the `tti-` segment of `TrustedTokenIssuerArn` both require.
+fn mint_uuid_v4() -> String {
     let digest = mint_digest();
     let variant = match u8::from_str_radix(&digest[30..31], 16).unwrap_or_default() % 4 {
         0 => '8',
