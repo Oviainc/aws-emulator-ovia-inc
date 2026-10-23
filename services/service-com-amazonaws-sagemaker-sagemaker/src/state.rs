@@ -49,7 +49,8 @@ use crate::ops::types::{
     ModelPackageStatusItem, ModelPackageValidationSpecification, NetworkConfig,
     ParallelismConfiguration, Parameter, ProcessingInput, ProcessingOutputConfig,
     ProcessingResources, ProcessingStoppingCondition, ProductionVariant, ProductionVariantSummary,
-    ResourceSpec, SelectiveExecutionConfig, SourceAlgorithmSpecification, Tag, TransformInput,
+    ResourceSpec, SelectiveExecutionConfig, SourceAlgorithmSpecification, Tag,
+    TransformInput,
     TransformOutput, TransformResources, UserContext, VpcConfig,
 };
 
@@ -3671,3 +3672,4 @@ impl ComAmazonawsSagemakerSagemakerState {
         false
     }
 }
+

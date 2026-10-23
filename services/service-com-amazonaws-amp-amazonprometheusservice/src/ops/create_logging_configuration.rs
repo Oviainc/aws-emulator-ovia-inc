@@ -224,6 +224,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             modified_at: now,
             transition_due: Some(now + crate::state::TRANSITION_DELAY),
             client_token: input.client_token,
+            // Nothing has updated it yet, so no token stands for an update.
+            update_token: None,
         };
         let status = crate::state::logging_configuration_status(&logging);
         workspace.logging_configuration = Some(logging);

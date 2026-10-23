@@ -164,6 +164,9 @@ pub mod network;
 pub mod rpc_target;
 pub mod shared_path;
 pub mod validation;
+pub mod validation_message;
+
+pub use validation_message::aws_validation_refusal;
 
 use aws_smithy_runtime_api::http::Request as RuntimeApiRequest;
 use aws_smithy_types::body::SdkBody;
