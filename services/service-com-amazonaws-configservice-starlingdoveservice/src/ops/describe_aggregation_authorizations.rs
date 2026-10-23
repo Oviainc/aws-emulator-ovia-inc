@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeAggregationAuthorizations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeAggregationAuthorizations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeAggregationAuthorizations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the aggregation authorizations held in [`crate::state`], a page at a time,
+//! in the order they are keyed: by authorized account id, then by authorized Region.
+//! Nothing here writes to state.
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +142,83 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeAggregationAuthorizations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeAggregationAuthorizationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeAggregationAuthorizations"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE)
+        })?;
+
+        // `Limit` is the page size, and 0 asks for the maximum (`Limit`: "The default
+        // is maximum. If you specify 0, Config uses the default"). The modelled range
+        // 0..100 is refused before this handler runs; a value outside it reaching here
+        // is still the limit error this operation models, never a page.
+        let max = usize::try_from(crate::state::DESCRIBE_AGGREGATION_AUTHORIZATIONS_PAGE_SIZE)
+            .unwrap_or_default();
+        let within_range = usize::try_from(input.limit)
+            .ok()
+            .filter(|limit| *limit <= max);
+        let page_size = match within_range {
+            Some(0) => max,
+            Some(limit) => limit,
+            None => {
+                // Defensive, and unreachable in the assembled emulator: the shared
+                // request validation refuses the modelled 0..100 range before this
+                // handler runs, so nothing reaches this arm.
+                return Err(
+                    DescribeAggregationAuthorizationsErrorModeled::InvalidLimitException(
+                        InvalidLimitException {
+                            message: Some(format!(
+                                "The specified Limit {} is outside the allowable range of \
+                                 0 to {max}.",
+                                input.limit
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        };
+
+        // The token is opaque: anything this operation did not issue is malformed.
+        let resume_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match crate::state::decode_page_token(token) {
+                Some(resume_at) => Some(resume_at),
+                None => {
+                    return Err(
+                        DescribeAggregationAuthorizationsErrorModeled::InvalidNextTokenException(
+                            InvalidNextTokenException {
+                                message: Some(
+                                    "the specified NextToken is not valid; use the NextToken a \
+                                     previous DescribeAggregationAuthorizations response \
+                                     returned"
+                                        .to_string(),
+                                ),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+            },
+        };
+
+        // Page over the store's own key ordering, so a token holds the KEY the next
+        // page resumes at and survives authorizations granted or revoked between pages.
+        // An absent token resumes at the empty key, which precedes every stored one.
+        let resume_at = resume_at.unwrap_or_default();
+        let store = state.lock();
+        let mut page = Vec::new();
+        let mut next_token = None;
+        for (key, entry) in store.aggregation_authorizations.range(resume_at..) {
+            if page.len() == page_size {
+                next_token = Some(crate::state::encode_page_token(key));
+                break;
+            }
+            page.push(entry.to_shape());
+        }
+
+        Ok(DescribeAggregationAuthorizationsOutput {
+            aggregation_authorizations: Some(page),
+            next_token,
+        })
     }
 }

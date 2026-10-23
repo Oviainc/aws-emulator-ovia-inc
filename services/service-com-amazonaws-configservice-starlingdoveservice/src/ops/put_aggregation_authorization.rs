@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutAggregationAuthorization
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutAggregationAuthorization`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Grants the aggregator account and Region named in the request the authorization to
+//! collect this account's data, persisting it in [`crate::state`] so
+//! `DescribeAggregationAuthorizations` reads back exactly what was written.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutAggregationAuthorization::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The authorized PAIR — `AuthorizedAccountId` and `AuthorizedAwsRegion` — identifies
+//! the authorization, so the operation is idempotent on it: a request naming a pair
+//! already authorized returns the authorization that pair already has, keeping its ARN,
+//! its creation time and the tags it was created with even when this request carries
+//! different ones.
 //!
 //! ## Shape of an operation
 //!
@@ -146,18 +146,69 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutAggregationAuthorization` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutAggregationAuthorizationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutAggregationAuthorization"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE)
+        })?;
+
+        // `AuthorizedAccountId`'s `^\d{12}$` pattern and `AuthorizedAwsRegion`'s 1..64
+        // length are modelled, so a request that reaches here already satisfies them.
+        let authorized_account_id = input.authorized_account_id;
+        let authorized_aws_region = input.authorized_aws_region;
+
+        let region = crate::state::request_region(ctx);
+        let now = ::std::time::SystemTime::now();
+        let key = crate::state::aggregation_authorization_key(
+            &authorized_account_id,
+            &authorized_aws_region,
+        );
+        let mut store = state.lock();
+
+        // A NEW authorized pair has to fit under this Region's bound on how many
+        // authorizations the account holds; an idempotent repeat of a pair that is
+        // already authorized consumes nothing and is never refused.
+        if !store.aggregation_authorizations.contains_key(&key)
+            && store.aggregation_authorizations.len()
+                >= crate::state::AGGREGATION_AUTHORIZATIONS_QUOTA
+        {
+            return Err(
+                PutAggregationAuthorizationErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(format!(
+                            "this account already holds the maximum of {} aggregation \
+                             authorizations in this Region; revoke one with \
+                             DeleteAggregationAuthorization and try again",
+                            crate::state::AGGREGATION_AUTHORIZATIONS_QUOTA,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "PutAggregationAuthorization is an idempotent API. Subsequent requests won't
+        // create a duplicate resource if one was already created. If a following
+        // request has different tags values, Config will ignore these differences and
+        // treat it as an idempotent request of the previous." So an authorization this
+        // pair already holds is left exactly as it was — ARN, creation time and tags —
+        // and reported back as it stands.
+        let authorization = store
+            .aggregation_authorizations
+            .entry(key)
+            .or_insert_with(|| crate::state::AggregationAuthorizationEntry {
+                arn: crate::state::aggregation_authorization_arn(
+                    &region,
+                    &authorized_account_id,
+                    &authorized_aws_region,
+                ),
+                authorized_account_id,
+                authorized_aws_region,
+                created_at: now,
+                tags: input.tags.unwrap_or_default(),
+            })
+            .to_shape();
+
+        Ok(PutAggregationAuthorizationOutput {
+            aggregation_authorization: Some(authorization),
+        })
     }
 }

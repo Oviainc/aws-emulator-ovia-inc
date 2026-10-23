@@ -15,9 +15,10 @@ use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    AccountAggregationSource, AggregatorFilters, Compliance, ComplianceContributorCount,
-    ComplianceSummary, ConfigExportDeliveryInfo, ConfigRule, ConfigSnapshotDeliveryProperties,
-    ConfigStreamDeliveryInfo, ConfigurationAggregator, ConfigurationRecorder,
+    AccountAggregationSource, AggregationAuthorization, AggregatorFilters, Compliance,
+    ComplianceContributorCount, ComplianceSummary, ConfigExportDeliveryInfo, ConfigRule,
+    ConfigSnapshotDeliveryProperties, ConfigStreamDeliveryInfo, ConfigurationAggregator,
+    ConfigurationRecorder,
     ConfigurationRecorderStatus, ConfigurationRecorderSummary, DeliveryChannel,
     DeliveryChannelStatus, EvaluationModeConfiguration, ExclusionByResourceTypes,
     ExecutionControls, OrganizationAggregationSource, PendingAggregationRequest, RecordingGroup,
@@ -201,6 +202,23 @@ pub const CONFIGURATION_AGGREGATORS_QUOTA: usize = 50;
 /// maximum. If you specify 0, Config uses the default") — the maximum being the
 /// modelled `Limit` range maximum.
 pub const DESCRIBE_CONFIGURATION_AGGREGATORS_PAGE_SIZE: i32 = 100;
+
+/// How many authorizations one `DescribeAggregationAuthorizations` page carries when
+/// the request asks for no `Limit` (`DescribeAggregationAuthorizationsRequest$Limit`:
+/// "The maximum number of AggregationAuthorizations returned on each page. The default
+/// is maximum. If you specify 0, Config uses the default") — the maximum being the
+/// modelled `Limit` range maximum.
+pub const DESCRIBE_AGGREGATION_AUTHORIZATIONS_PAGE_SIZE: i32 = 100;
+
+/// The most aggregation authorizations this account and Region can hold, after which
+/// `PutAggregationAuthorization` refuses a NEW authorized pair.
+///
+/// Config publishes no quota for aggregation authorizations, so this is the EMULATOR's
+/// own bound, not a documented AWS one: the store's keys are whole-cloth caller input
+/// (an authorized account and an authorized Region), so without a cap one caller could
+/// grow it one entry per distinct pair without end. It is two orders of magnitude above
+/// the aggregator quota Config does publish, so no faithful workload meets it.
+pub const AGGREGATION_AUTHORIZATIONS_QUOTA: usize = 5_000;
 
 /// How many rules one `DescribeConfigRules` page carries.
 ///
@@ -968,6 +986,38 @@ impl ConfigurationAggregatorEntry {
     }
 }
 
+/// One persisted aggregation authorization.
+///
+/// An authorization is identified by the PAIR it authorizes — the aggregator account
+/// and the aggregator Region (`AggregationAuthorization`: "the authorizations granted
+/// to aggregator accounts and regions") — which is also what its ARN carries, so the
+/// pair is the key [`ComAmazonawsConfigserviceStarlingdoveserviceState::aggregation_authorizations`]
+/// holds it under.
+#[derive(Debug, Clone)]
+pub struct AggregationAuthorizationEntry {
+    pub authorized_account_id: String,
+    pub authorized_aws_region: String,
+    pub arn: String,
+    pub created_at: SystemTime,
+    /// Tags are taken at creation and not updated afterwards
+    /// (`PutAggregationAuthorization`: "Tags are added at creation and cannot be
+    /// updated with this operation ... tags will not be updated, even if they are
+    /// different. Use TagResource and UntagResource to update tags after creation").
+    pub tags: Vec<Tag>,
+}
+
+impl AggregationAuthorizationEntry {
+    /// The modelled `AggregationAuthorization`, read back out of state.
+    pub fn to_shape(&self) -> AggregationAuthorization {
+        AggregationAuthorization {
+            aggregation_authorization_arn: Some(self.arn.clone()),
+            authorized_account_id: Some(self.authorized_account_id.clone()),
+            authorized_aws_region: Some(self.authorized_aws_region.clone()),
+            creation_time: Some(timestamp(self.created_at)),
+        }
+    }
+}
+
 /// Per-service state for com-amazonaws-configservice-starlingdoveservice. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsConfigserviceStarlingdoveserviceState {
@@ -1028,6 +1078,11 @@ pub struct ComAmazonawsConfigserviceStarlingdoveserviceState {
     /// Source of the next configuration aggregator id, so every aggregator gets a
     /// distinct one.
     pub next_aggregator_seq: u64,
+    /// Aggregation authorizations, keyed by
+    /// [`aggregation_authorization_key`]. A `BTreeMap` so
+    /// `DescribeAggregationAuthorizations` pages over a stable ordering and a page
+    /// token survives authorizations granted and deleted between pages.
+    pub aggregation_authorizations: BTreeMap<String, AggregationAuthorizationEntry>,
 }
 
 impl ComAmazonawsConfigserviceStarlingdoveserviceState {
@@ -1156,6 +1211,44 @@ pub fn configuration_aggregator_arn(region: &str, id: &str) -> String {
 /// ids.
 pub fn mint_configuration_aggregator_id(seq: u64) -> String {
     format!("{AGGREGATOR_ARN_RESOURCE_TYPE}-{}", base36(splitmix64(seq), 8))
+}
+
+/// The ARN resource type of an aggregation authorization, as Config spells it in the
+/// ARNs it mints: an aggregation authorization's ARN is
+/// `arn:aws:config:<region>:<account>:aggregation-authorization/`
+/// `<authorizedAccountId>/<authorizedAwsRegion>` (the AWS Config resource ARN format
+/// for `AggregationAuthorization`).
+pub const AGGREGATION_AUTHORIZATION_ARN_RESOURCE_TYPE: &str = "aggregation-authorization";
+
+/// The ARN of the aggregation authorization granted to `authorized_account_id` in
+/// `authorized_aws_region`, held by the account and Region the request was signed for.
+///
+/// The authorized pair is what identifies the authorization, so it is what the ARN
+/// carries: nothing is minted, and the same pair always names the same ARN.
+pub fn aggregation_authorization_arn(
+    region: &str,
+    authorized_account_id: &str,
+    authorized_aws_region: &str,
+) -> String {
+    ::emulator_server::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!(
+            "{AGGREGATION_AUTHORIZATION_ARN_RESOURCE_TYPE}/{authorized_account_id}/\
+             {authorized_aws_region}"
+        ),
+    )
+}
+
+/// The key one aggregation authorization is held under: the authorized account id and
+/// the authorized Region, in that order, so `DescribeAggregationAuthorizations` pages
+/// by account and then by Region. `AccountId`'s `^\d{12}$` pattern leaves no room for
+/// the separator in the account id, so distinct pairs give distinct keys.
+pub fn aggregation_authorization_key(
+    authorized_account_id: &str,
+    authorized_aws_region: &str,
+) -> String {
+    format!("{authorized_account_id}/{authorized_aws_region}")
 }
 
 /// The ARN of a Config rule: `arn:aws:config:<region>:<account>:config-rule/<id>`.
