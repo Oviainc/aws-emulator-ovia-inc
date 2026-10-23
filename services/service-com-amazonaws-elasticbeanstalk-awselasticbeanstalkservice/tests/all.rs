@@ -47,5 +47,7 @@ mod solution_stacks;
 mod state_roundtrip;
 #[path = "all/swap_environment_cnames.rs"]
 mod swap_environment_cnames;
+#[path = "all/tag_batch_conflicts.rs"]
+mod tag_batch_conflicts;
 #[path = "all/update_application.rs"]
 mod update_application;

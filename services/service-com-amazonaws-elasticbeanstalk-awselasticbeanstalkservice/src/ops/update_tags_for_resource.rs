@@ -4,6 +4,8 @@
 //! Implemented: adds, updates and removes tags on the Elastic Beanstalk resource the ARN
 //! names, within the per-resource tag quota — which also bounds the request: a tag list
 //! longer than the quota is refused before anything is merged or the store is locked.
+//! A key named in BOTH `TagsToAdd` and `TagsToRemove` asks for two contradictory
+//! outcomes, so that request is refused too and nothing is applied.
 //! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
@@ -136,7 +138,8 @@ fn refused(
 /// added, the tag's value is updated." / "`TagsToRemove`: A list of tag keys to
 /// remove. If a tag key doesn't exist, it is silently ignored." Removals are
 /// applied to what the resource already carries, then the additions are
-/// upserted, so a key in both lists ends up with the value that was added.
+/// upserted. The two lists cannot name the same key — the handler refuses that
+/// request before this runs — so neither pass can undo the other.
 ///
 /// Both passes are keyed through a set and a key index, so the work is LINEAR in
 /// the lists involved rather than quadratic: the caller chooses how long they
@@ -310,6 +313,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
             .into());
+        }
+        // One call either SETS a key or REMOVES it. A key named in both lists
+        // asks for both at once, so the request is refused rather than letting
+        // the merge order decide which of the two silently wins. Runs on the
+        // lists the bound above has already sized.
+        let keys_to_add: HashSet<&str> = tags_to_add
+            .iter()
+            .filter_map(|tag| tag.key.as_deref())
+            .collect();
+        if let Some(key) = tags_to_remove
+            .iter()
+            .find(|key| keys_to_add.contains(key.as_str()))
+        {
+            return Err(UpdateTagsForResourceError::invalid_parameter_value(format!(
+                "The tag key '{key}' cannot be specified in both TagsToAdd and TagsToRemove."
+            )));
         }
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
