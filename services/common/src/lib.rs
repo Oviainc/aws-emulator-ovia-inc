@@ -17,8 +17,9 @@
 //!   services publishing the SAME path space — the segment their modelled URIs differ at,
 //!   or (where only the whole route tells them apart) whether a service's own model binds
 //!   a route for the request at all. [`bedrock`] states that split once for the six
-//!   services that share the signing name `bedrock`, and [`lex`] for the four that share
-//!   `lex`;
+//!   services that share the signing name `bedrock`, [`lex`] for the four that share
+//!   `lex`, and the two AgentCore endpoints that share `bedrock-agentcore` call
+//!   [`claims_modeled_route`], which is that route test under the routing-key one;
 //! * [`shared_path`], the reader for the one case the path half of the claim rule
 //!   cannot settle on its own: two colliding models binding the same URI path space,
 //!   where the ARN in the path names the resource and so the service that owns it;
