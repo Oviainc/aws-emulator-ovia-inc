@@ -302,7 +302,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &crate::state::region_of(ctx.parts()),
             std::time::SystemTime::now(),
         );
-        let metadata = repository.metadata();
+        // The clone URLs name the endpoint THIS request arrived at, which is where
+        // the emulator's git transport (`crate::service::git_http`) answers for the
+        // repository; the public AWS git host is a different server, and a client
+        // that followed it would leave the emulator entirely.
+        let metadata = repository.metadata(&crate::state::ServingEndpoint::from_request(ctx.parts()));
         store
             .repositories
             .insert(input.repository_name.clone(), repository);

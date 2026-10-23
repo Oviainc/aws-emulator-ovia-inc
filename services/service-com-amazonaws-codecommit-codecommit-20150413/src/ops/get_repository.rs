@@ -152,7 +152,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // The clone URLs this reports name the endpoint THIS request arrived at —
+        // the address the emulator's git transport answers on for the repository —
+        // so they are derived from the request rather than stored (see
+        // `crate::state::ServingEndpoint`).
+        let endpoint = crate::state::ServingEndpoint::from_request(ctx.parts());
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             // An unreachable store is an internal mounting fault, not a modelled
             // CodeCommit failure; every handler in this crate refuses it this way.
@@ -171,7 +175,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         Ok(GetRepositoryOutput {
-            repository_metadata: Some(repository.metadata()),
+            repository_metadata: Some(repository.metadata(&endpoint)),
         })
     }
 }

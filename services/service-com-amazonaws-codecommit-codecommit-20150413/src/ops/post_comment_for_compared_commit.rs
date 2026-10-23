@@ -502,9 +502,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .and_then(|location| location.file_position)
                 {
                     let lines = repository
-                        .blobs
-                        .get(&commented.blob_id)
-                        .map_or(0, |content| crate::state::line_count(content));
+                        .blob(&commented.blob_id)
+                        .map_or(0, crate::state::line_count);
                     if position > lines {
                         return Err(
                             PostCommentForComparedCommitErrorModeled::InvalidFilePositionException(
