@@ -87,7 +87,7 @@ async fn physical_id(router: &MultiServiceRouter, stack: &str, logical_id: &str)
 }
 
 /// One Amazon S3 request, path style, the way the emulated S3 service routes it.
-async fn s3(
+pub(crate) async fn s3(
     router: &MultiServiceRouter,
     method: &str,
     uri: &str,

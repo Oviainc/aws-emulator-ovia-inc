@@ -141,6 +141,40 @@ impl Provisioner {
             Self::SqsQueue => delete_queue(ctx, region, physical_resource_id).await,
         }
     }
+
+    /// What the service that OWNS a resource reports the resource's configuration to be
+    /// NOW: the document its own read answers with. This is the ACTUAL configuration
+    /// [`super::drift`] compares a resource's expected template configuration against, so
+    /// drift is read off the owning service rather than off CloudFormation's own record of
+    /// what it once applied.
+    ///
+    /// `Ok(None)` is that service answering that it no longer holds the resource — judged
+    /// on its own not-found CODE, never on a message, exactly as [`Self::delete`] does —
+    /// which is the `DELETED` drift status. `Err(refusal)` is any other refusal: the check
+    /// did not run, and the detection reports that rather than a resource as checked.
+    pub(super) async fn actual_configuration(
+        self,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
+        region: &str,
+        resource: &StoredResource,
+    ) -> Result<Option<Value>, Refusal> {
+        let physical_resource_id = &resource.physical_resource_id;
+        match self {
+            Self::FirehoseDeliveryStream => {
+                describe_delivery_stream(ctx, region, physical_resource_id).await
+            }
+            Self::EcrPublicRepository => {
+                describe_public_repository(ctx, region, physical_resource_id).await
+            }
+            Self::S3Bucket => describe_bucket(ctx, region, physical_resource_id).await,
+            Self::IamRole => describe_role(ctx, region, physical_resource_id).await,
+            Self::CodePipelinePipeline => {
+                describe_pipeline(ctx, region, physical_resource_id).await
+            }
+            Self::EcsCluster => describe_cluster(ctx, region, physical_resource_id).await,
+            Self::SqsQueue => describe_queue(ctx, region, physical_resource_id).await,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -214,6 +248,30 @@ async fn delete_delivery_stream(
         // The stream is already in the state the delete asks for. Judged on the error
         // CODE, never on the message, which carries the request's own resource name.
         Err(refusal) if refusal.code == RESOURCE_NOT_FOUND => Ok(()),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// The stream's configuration as Amazon Data Firehose reports it, for drift detection.
+/// A stream it no longer has (`ResourceNotFoundException`) was deleted.
+async fn describe_delivery_stream(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<Option<Value>, Refusal> {
+    let request = serde_json::json!({ "DeliveryStreamName": physical_resource_id });
+    match call_json_rpc(
+        ctx,
+        FIREHOSE_SIGNING_NAME,
+        region,
+        AWS_JSON_1_1,
+        &format!("{FIREHOSE_TARGET_PREFIX}.DescribeDeliveryStream"),
+        &request,
+    )
+    .await
+    {
+        Ok(answer) => Ok(Some(reported_member(&answer, "DeliveryStreamDescription"))),
+        Err(refusal) if refusal.code == RESOURCE_NOT_FOUND => Ok(None),
         Err(refusal) => Err(refusal),
     }
 }
@@ -328,6 +386,31 @@ async fn delete_public_repository(
     }
 }
 
+/// The repository's configuration as Amazon ECR Public reports it, for drift detection. A
+/// repository it no longer holds (`RepositoryNotFoundException`, and an answer carrying no
+/// repository at all) was deleted.
+async fn describe_public_repository(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<Option<Value>, Refusal> {
+    let request = serde_json::json!({ "repositoryNames": [physical_resource_id] });
+    match call_json_rpc(
+        ctx,
+        ECR_PUBLIC_SIGNING_NAME,
+        region,
+        AWS_JSON_1_1,
+        &format!("{ECR_PUBLIC_TARGET_PREFIX}.DescribeRepositories"),
+        &request,
+    )
+    .await
+    {
+        Ok(answer) => Ok(first_listed(&answer, "repositories")),
+        Err(refusal) if refusal.code == REPOSITORY_NOT_FOUND => Ok(None),
+        Err(refusal) => Err(refusal),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
 // Amazon S3: AWS::S3::Bucket
@@ -427,6 +510,53 @@ async fn delete_bucket(
             Err(refusal)
         }
     }
+}
+
+/// The error code Amazon S3 answers for a bucket a `HeadBucket` does not find
+/// (`HeadBucketOutput`'s one modelled error is `NotFound`).
+const BUCKET_NOT_FOUND: &str = "NotFound";
+
+/// The bucket's configuration as Amazon S3 reports it, for drift detection.
+///
+/// A bucket S3 no longer holds was deleted. For one it still holds, the configuration
+/// reported is the `VersioningConfiguration` the create applies — the one property of this
+/// type this emulator sets in S3 — under the property name the template spells it with, so
+/// a bucket whose versioning was changed outside the stack is MODIFIED. A versioning read
+/// the owning service refuses leaves the bucket reported as existing with no comparable
+/// property rather than failing the whole detection.
+async fn describe_bucket(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<Option<Value>, Refusal> {
+    let client = s3_client(ctx, region);
+    if let Err(error) = client
+        .head_bucket()
+        .bucket(physical_resource_id)
+        .send()
+        .await
+    {
+        let refusal = refusal_of(&error);
+        if refusal.code == BUCKET_NOT_FOUND || refusal.code == NO_SUCH_BUCKET {
+            return Ok(None);
+        }
+        return Err(refusal);
+    }
+    let mut actual = Map::new();
+    if let Ok(versioning) = client
+        .get_bucket_versioning()
+        .bucket(physical_resource_id)
+        .send()
+        .await
+    {
+        if let Some(status) = versioning.status() {
+            actual.insert(
+                "VersioningConfiguration".to_string(),
+                serde_json::json!({ "Status": status.as_str() }),
+            );
+        }
+    }
+    Ok(Some(Value::Object(actual)))
 }
 
 // ---------------------------------------------------------------------------
@@ -590,6 +720,48 @@ async fn delete_role(
     }
 }
 
+/// The role's configuration as IAM reports it, for drift detection.
+///
+/// A role IAM no longer holds (`NoSuchEntity`) was deleted. The members compared are the
+/// ones the resource type and `GetRole` spell identically and the create sends — `Path`,
+/// `Description` and `MaxSessionDuration` — so a role whose description or session length
+/// was changed outside the stack is MODIFIED.
+async fn describe_role(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<Option<Value>, Refusal> {
+    let answer = match iam_client(ctx, region)
+        .get_role()
+        .role_name(physical_resource_id)
+        .send()
+        .await
+    {
+        Ok(answer) => answer,
+        Err(error) => {
+            let refusal = refusal_of(&error);
+            if refusal.code == NO_SUCH_ENTITY {
+                return Ok(None);
+            }
+            return Err(refusal);
+        }
+    };
+    let mut actual = Map::new();
+    if let Some(role) = answer.role() {
+        actual.insert("Path".to_string(), Value::String(role.path().to_string()));
+        if let Some(description) = role.description() {
+            actual.insert(
+                "Description".to_string(),
+                Value::String(description.to_string()),
+            );
+        }
+        if let Some(duration) = role.max_session_duration() {
+            actual.insert("MaxSessionDuration".to_string(), Value::from(duration));
+        }
+    }
+    Ok(Some(Value::Object(actual)))
+}
+
 /// The `Policies` entries a role declaration carries, as a slice — empty for a role that
 /// declares none, so the create and the delete walk them the same way.
 fn inline_policies(resource: &StoredResource) -> &[Value] {
@@ -727,6 +899,29 @@ async fn delete_pipeline(
     }
 }
 
+/// The pipeline's declaration as CodePipeline reports it, for drift detection. One it no
+/// longer holds (`PipelineNotFoundException`) was deleted.
+async fn describe_pipeline(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<Option<Value>, Refusal> {
+    match call_json_rpc(
+        ctx,
+        CODEPIPELINE_SIGNING_NAME,
+        region,
+        AWS_JSON_1_1,
+        &format!("{CODEPIPELINE_TARGET_PREFIX}.GetPipeline"),
+        &serde_json::json!({ "name": physical_resource_id }),
+    )
+    .await
+    {
+        Ok(answer) => Ok(Some(reported_member(&answer, "pipeline"))),
+        Err(refusal) if refusal.code == PIPELINE_NOT_FOUND => Ok(None),
+        Err(refusal) => Err(refusal),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Reading an evaluated property document
 // ---------------------------------------------------------------------------
@@ -772,15 +967,32 @@ fn lower_initial(name: &str) -> String {
     }
 }
 
-/// One JSON scalar as the text an API member takes, or `None` for a composite: the three
-/// scalars a template property can carry all have one textual spelling.
+/// One member of an answer document, or an empty object where the answer carried none: a
+/// read that succeeded reported the resource, and a member it did not carry is no
+/// configuration to compare rather than a missing resource.
+fn reported_member(answer: &Value, member: &str) -> Value {
+    answer
+        .get(member)
+        .cloned()
+        .unwrap_or_else(|| Value::Object(Map::new()))
+}
+
+/// The FIRST entry of a list an answer carries, or `None` for an answer that lists none —
+/// which is how a describe-many call reports a resource the service does not hold.
+fn first_listed(answer: &Value, member: &str) -> Option<Value> {
+    answer
+        .get(member)
+        .and_then(Value::as_array)
+        .and_then(|entries| entries.first())
+        .cloned()
+}
+
+/// One JSON scalar as the text an API member takes, or `None` for a composite.
+///
+/// The one spelling rule, held in [`super::scalar_text`] so the create side and the drift
+/// comparison that reads the resource back cannot disagree about it.
 fn scalar_text(value: &Value) -> Option<String> {
-    match value {
-        Value::String(text) => Some(text.clone()),
-        Value::Number(number) => Some(number.to_string()),
-        Value::Bool(flag) => Some(flag.to_string()),
-        _ => None,
-    }
+    super::scalar_text(value)
 }
 
 /// A policy-document property as the JSON text the IAM member takes.
@@ -1001,6 +1213,38 @@ async fn delete_cluster(
     }
 }
 
+/// The cluster's configuration as Amazon ECS reports it, for drift detection.
+///
+/// A cluster Amazon ECS no longer holds (`ClusterNotFoundException`, an answer listing no
+/// cluster, or one it reports `INACTIVE` — the status a deleted cluster keeps, which
+/// `DeleteCluster` documents) was deleted.
+async fn describe_cluster(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<Option<Value>, Refusal> {
+    /// The status Amazon ECS reports for a cluster whose deletion has gone through.
+    const INACTIVE: &str = "INACTIVE";
+
+    let request = serde_json::json!({ "clusters": [physical_resource_id] });
+    match call_json_rpc(
+        ctx,
+        ECS_SIGNING_NAME,
+        region,
+        AWS_JSON_1_1,
+        &format!("{ECS_TARGET_PREFIX}.DescribeClusters"),
+        &request,
+    )
+    .await
+    {
+        Ok(answer) => Ok(first_listed(&answer, "clusters").filter(|cluster| {
+            cluster.get("status").and_then(Value::as_str) != Some(INACTIVE)
+        })),
+        Err(refusal) if refusal.code == CLUSTER_NOT_FOUND => Ok(None),
+        Err(refusal) => Err(refusal),
+    }
+}
+
 /// One property value with every member name inside it in LOWER CAMEL case, which is how
 /// a service whose model spells its members that way names the very same members a
 /// CloudFormation property names in upper camel case (`ClusterSettings: [{Name, Value}]`
@@ -1106,6 +1350,37 @@ async fn delete_queue(
     {
         Ok(_) => Ok(()),
         Err(refusal) if refusal.code == QUEUE_DOES_NOT_EXIST => Ok(()),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// The queue's configuration as Amazon SQS reports it, for drift detection.
+///
+/// A queue SQS no longer has (`QueueDoesNotExist`) was deleted. A queue's configuration IS
+/// its attribute map, named identically to this type's properties ([`queue_attributes`]),
+/// so the attributes are the actual configuration compared against the declared one and a
+/// queue whose visibility timeout was changed outside the stack is MODIFIED.
+async fn describe_queue(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<Option<Value>, Refusal> {
+    let request = serde_json::json!({
+        "QueueUrl": physical_resource_id,
+        "AttributeNames": ["All"],
+    });
+    match call_json_rpc(
+        ctx,
+        SQS_SIGNING_NAME,
+        region,
+        AWS_JSON_1_0,
+        &format!("{SQS_TARGET_PREFIX}.GetQueueAttributes"),
+        &request,
+    )
+    .await
+    {
+        Ok(answer) => Ok(Some(reported_member(&answer, "Attributes"))),
+        Err(refusal) if refusal.code == QUEUE_DOES_NOT_EXIST => Ok(None),
         Err(refusal) => Err(refusal),
     }
 }

@@ -78,3 +78,56 @@ Cause 1: replay fixture ram-principal-association-workflow up to step task#5. Th
 Causes 2 and 3: replay fixture ram-resource-share-tagging. At step task#2 POST /tagresource attaches a tag to the stored share and answers 200 with tagsCreated; at step task#4 POST /untagresource removes it and answers 200 with deletedTags. Inspect each returned Tag object: the recorded bodies carry __type = "Tag" on every entry, the emulator's bodies carry only key and value.
 
 Confirming a fix: re-replay ram-principal-association-workflow#task#5 (cause 1) AND ram-resource-share-tagging#task#2 and #task#4 (causes 2 and 3). All three must pass; closing only the Tag serialization leaves cause 1 diverging, and vice versa.
+
+## Resolution notes
+
+This report re-files the three divergence keys of
+`issues/things-that-now-work/20261022T161229Z-ram-response-payload-fidelity-tag-entries-omit-type.md`
+(and the declined half of `…20261022T140607Z-…md`). All three are again DECLINED, on
+model and corpus evidence, and no handler or state change was made; what this change adds
+is test coverage of the two rules, in
+`services/service-com-amazonaws-ram-amazonresourcesharing/tests/all/response_payload_fidelity.rs`.
+
+### Causes 2 and 3 — `__type` inside a 2xx body (declined)
+
+The RULE: **a success body carries exactly the members the model declares, and one shape
+serializes one way wherever it is reported**; the restJson1 `__type` discriminator belongs
+to the ERROR envelope (`vendor/smithy-schema-server/src/rest_json.rs` writes it there and
+nowhere else). `smithy_query(query="shape",shape="Tag")` declares `com.amazonaws.ram#Tag`
+with exactly `key` and `value`, and the SAME recorded fixture serializes that same shape
+WITHOUT `__type` under `resourceShare.tags` (steps task#3/task#5 replay clean). No
+serializer rule produces the discriminator: emitting it would have to be keyed to two
+output members of two operations while the identical shape in the identical fixture goes
+without it.
+
+### Cause 1 — `external` (declined; the derivation it questions is already the documented one)
+
+The RULE: **`external` is one member of the one `ResourceShareAssociation` shape every
+association operation returns, so it is a function of the associated entity and the
+share's owning account alone** — the owning account itself and anything inside the owner's
+Organizations hierarchy are in-organization, anything this service cannot place there is
+external — and it does not depend on which operation reports the record, on the share's
+`allowExternalPrincipals` switch, or on how many times the association was made.
+
+The code already derives it exactly once that way (`state::entity_is_external`, written at
+`state::associate`, cloned by `state::disassociate` and rendered by
+`AssociationRecord::view`), so the report's "always true" / "filled in from its own
+derivation" reading does not match the code: the flag is false for the owner and for every
+Organizations-scoped entity. The recorded `false` at task#5 cannot come from a rule,
+because the same recording reports `external: true` for the SAME share and principal on
+`AssociateResourceShare` and on `GetResourceShareAssociations`
+(`ram-principal-association-workflow#task#6`, which replays clean). Satisfying task#5 would
+mean giving one stored record two different values keyed to the operation reporting it —
+fitting the recorded instance, which the one-shape-one-member model contradicts.
+
+### Tests
+
+`tests/all/response_payload_fidelity.rs` gains two rows for the Organizations ROOT entity
+forms (`r-…` and its `organizations` ARN, admitted by `state::ORGANIZATIONS_ID_PREFIXES`
+and not cited by the report) and a new eight-row test,
+`external_is_a_property_of_the_entity_and_the_owner_alone`, spanning entity form × the
+share's `allowExternalPrincipals` (explicit `true`, explicit `false`, and the documented
+default): each row asserts the flag is identical on `AssociateResourceShare`,
+`GetResourceShareAssociations` and `DisassociateResourceShare`, is unmoved by an
+`UpdateResourceShare` that flips the share's switch and by a repeat of the association,
+and that no association success body carries a `__type` member.
