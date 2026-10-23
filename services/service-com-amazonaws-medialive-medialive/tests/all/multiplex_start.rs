@@ -28,7 +28,8 @@ pub(crate) const ZONES: i64 = 2;
 /// `StartMultiplex`'s binding (`smithy_query(query="operation",
 /// operation="StartMultiplex")`: `POST /prod/multiplexes/{MultiplexId}/start`,
 /// success 202). Shared with the multiplex STOP suite, which starts a multiplex
-/// to have one running to stop.
+/// to have one running to stop, and with the multiplex DELETION suite, which
+/// drives a multiplex into the states a delete refuses.
 pub(crate) async fn start_multiplex(router: &MultiServiceRouter, id: &str) -> (u16, Value) {
     call(router, "POST", &format!("{MULTIPLEXES}/{id}/start"), None).await
 }
