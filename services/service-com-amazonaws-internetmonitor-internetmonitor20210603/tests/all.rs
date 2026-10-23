@@ -15,3 +15,5 @@
 mod monitor_lifecycle;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/untag_resource.rs"]
+mod untag_resource;

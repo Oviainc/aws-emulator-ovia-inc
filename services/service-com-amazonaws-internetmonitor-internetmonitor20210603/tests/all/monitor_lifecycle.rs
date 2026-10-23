@@ -2,7 +2,8 @@
 
 //! End-to-end tests for the monitor lifecycle: `CreateMonitor`, `GetMonitor`,
 //! `ListMonitors`, `UpdateMonitor`, `DeleteMonitor`, `TagResource` and
-//! `ListTagsForResource`.
+//! `ListTagsForResource`. `UntagResource` has its own suite in
+//! `tests/all/untag_resource.rs`, which reuses this module's harness.
 //!
 //! Every case drives real HTTP through the same `MultiServiceRouter` the emulator binary
 //! mounts, so the wire protocol (`restJson1`), the routing table, the boundary validator
@@ -23,7 +24,11 @@ use service_com_amazonaws_internetmonitor_internetmonitor20210603::EmulatedServi
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The region every case uses unless it is specifically about the region in an ARN.
-const REGION: &str = "us-east-1";
+///
+/// This module owns the crate's test harness (`emulator`, `call`, `label`,
+/// `create_monitor`, `expected_arn` and this constant); a sibling suite reuses it
+/// through `crate::monitor_lifecycle::…` rather than writing a second copy.
+pub(crate) const REGION: &str = "us-east-1";
 
 /// The account id every emulated ARN carries.
 const ACCOUNT: &str = "000000000000";
@@ -35,7 +40,7 @@ fn past_activation() -> Duration {
 
 /// One emulator: the shared engine behind the one service under test, mounted in the
 /// production router.
-fn emulator() -> MultiServiceRouter {
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -59,7 +64,7 @@ fn authorization(region: &str) -> String {
 /// Written out here rather than pulled from `percent-encoding`: this is the whole of the
 /// crate's need for it, and a new dev-dependency adds an entry to the shared workspace
 /// lockfile, which every fix landing in parallel then has to merge.
-fn label(value: &str) -> String {
+pub(crate) fn label(value: &str) -> String {
     /// The uppercase hex digits a percent-escape is written with.
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
 
@@ -112,7 +117,7 @@ async fn call_in(
 }
 
 /// [`call_in`] in [`REGION`].
-async fn call(
+pub(crate) async fn call(
     router: &MultiServiceRouter,
     method: &str,
     path: &str,
@@ -122,7 +127,7 @@ async fn call(
 }
 
 /// The ARN `CreateMonitor` must mint for `name` in `region`.
-fn expected_arn(region: &str, name: &str) -> String {
+pub(crate) fn expected_arn(region: &str, name: &str) -> String {
     format!("arn:aws:internetmonitor:{region}:{ACCOUNT}:monitor/{name}")
 }
 
@@ -168,7 +173,7 @@ fn timestamp_secs(value: &Value, field: &str) -> f64 {
 }
 
 /// Create a monitor, asserting the create succeeded, and hand back its ARN.
-async fn create_monitor(router: &MultiServiceRouter, body: Value) -> String {
+pub(crate) async fn create_monitor(router: &MultiServiceRouter, body: Value) -> String {
     let (status, created) = call(router, "POST", "/v20210603/Monitors", Some(body.clone())).await;
     assert_eq!(
         status, 200,
@@ -1327,7 +1332,7 @@ async fn a_monitor_name_no_monitor_carries_is_refused_with_the_modelled_error() 
 #[tokio::test]
 async fn the_operations_outside_this_slice_still_answer_501() {
     let router = emulator();
-    let arn = create_monitor(&router, json!({ "MonitorName": "untouched-monitor" })).await;
+    create_monitor(&router, json!({ "MonitorName": "untouched-monitor" })).await;
 
     // A stub answers 501 NotImplemented rather than an empty success, so the stub census
     // stays honest while these operations are filed separately.
@@ -1352,12 +1357,6 @@ async fn the_operations_outside_this_slice_still_answer_501() {
             "ListInternetEvents",
             "GET",
             "/v20210603/InternetEvents".to_string(),
-            None,
-        ),
-        (
-            "UntagResource",
-            "DELETE",
-            format!("/tags/{}?tagKeys=Env", label(&arn)),
             None,
         ),
     ];
