@@ -593,8 +593,9 @@ async fn a_resource_in_another_account_is_refused_naming_that_resource() {
 
 /// The other side of that rule: an ARN in the caller's own account — or one whose
 /// resource type carries no account segment at all — is NOT refused for the resource. It
-/// reaches the support-level stage, and an entitled caller reaches the operation itself
-/// (still scaffolded, so 501).
+/// reaches the support-level stage, and an entitled caller reaches the operation itself,
+/// which reports the recommendations that flagged that resource (200, possibly an empty
+/// list — see `tests/all/recommendations_for_resource.rs`).
 #[tokio::test]
 async fn a_resource_the_caller_owns_is_not_refused_for_the_resource() {
     let own = [
@@ -622,8 +623,12 @@ async fn a_resource_the_caller_owns_is_not_refused_for_the_resource() {
         let (entitled, _engine) = emulator_on_plan(SupportPlan::EnterpriseOnRamp);
         let (status, _errortype, response) = dispatch(&entitled, "GET", &path, None).await;
         assert_eq!(
-            status, 501,
+            status, 200,
             "case {case:?}: expected the operation's own answer, got {status} with {response}"
+        );
+        assert!(
+            response["recommendationForResourceSummaries"].is_array(),
+            "case {case:?}: expected a recommendationForResourceSummaries list, got {response}"
         );
     }
 }

@@ -21,6 +21,8 @@ mod organization_recommendation_lifecycle;
 mod organization_recommendations;
 #[path = "all/recommendation_loop.rs"]
 mod recommendation_loop;
+#[path = "all/recommendations_for_resource.rs"]
+mod recommendations_for_resource;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/support_level_gate.rs"]
