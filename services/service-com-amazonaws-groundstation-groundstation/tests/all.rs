@@ -15,6 +15,8 @@
 mod config_listing;
 #[path = "all/lifecycle_writes.rs"]
 mod lifecycle_writes;
+#[path = "all/minute_usage.rs"]
+mod minute_usage;
 #[path = "all/not_found_messages.rs"]
 mod not_found_messages;
 #[path = "all/request_validation.rs"]

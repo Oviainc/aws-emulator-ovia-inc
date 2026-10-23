@@ -112,9 +112,10 @@ service's operations.
 |---|---|
 | `GROUNDSTATION_APPROVED_UPLINK_BANDS_MHZ` | The uplink frequency bands this emulated account is approved to transmit on, as comma-separated `<low>-<high>` pairs in MHz (`2025-2120` approves the whole band the service operates). Read ONCE, when this service's store is first created, so setting it after the first request has no effect. |
 | `GROUNDSTATION_RECORDING_BUCKETS` | The S3 buckets this emulated Ground Station can read the location of, as comma-separated bucket NAMES (`aws-groundstation-downlink`). Read once, with the same timing. |
+| `GROUNDSTATION_RESERVED_MINUTES` | The reserved-minutes pricing plan this account holds, as comma-separated entries: a bare minute count is a standing monthly commitment (`500`) and `<year>-<month>=<minutes>` is one calendar month's own allocation (`500,2026-02=750`). Read once, with the same timing. |
 
-Both settings stand for something that happens OUTSIDE the Ground Station API, which is
-why they are settings rather than operations:
+All three settings stand for something that happens OUTSIDE the Ground Station API, which
+is why they are settings rather than operations:
 
 - Uplink approval is granted by AWS after spectrum coordination — the model has no
   operation that grants one and none that reports one — so an account starts with none
@@ -125,5 +126,13 @@ why they are settings rather than operations:
   never learns about one either; until a name is listed here an `s3RecordingConfig` is
   refused with the sentence AWS answers when it cannot read the bucket's location.
 
-`src/state.rs`'s `APPROVED_UPLINK_BANDS_ENV` and `RECORDING_BUCKETS_ENV` are the two
-readers, and both land in this service's own state, where a test seeds them directly.
+- A reserved-minutes commitment is bought from AWS, not through this API: the model has
+  no operation that signs an account up and none that reports the signup other than
+  `GetMinuteUsage` itself. So an account starts on on-demand pricing and `GetMinuteUsage`
+  answers `isReservedMinutesCustomer: false` with a zero allocation until a plan is listed
+  here; the minutes it reports as scheduled and upcoming are computed from the contacts
+  the account actually reserved either way.
+
+`src/state.rs`'s `APPROVED_UPLINK_BANDS_ENV`, `RECORDING_BUCKETS_ENV` and
+`RESERVED_MINUTES_ENV` are the three readers, and all land in this service's own state,
+where a test seeds them directly.

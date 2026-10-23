@@ -719,7 +719,53 @@ pub struct Contact {
 /// `UpdateContact` answers 501, which leaves `ACTIVE` as the only value that holds.
 pub const ACTIVE_VERSION_STATUS: &str = "ACTIVE";
 
+/// The `ContactStatus` values in which a contact holds NO antenna time for the account,
+/// so its window counts no minutes against the account's monthly usage.
+///
+/// Source: the model's own enum, whose values are `SCHEDULING`, `FAILED_TO_SCHEDULE`,
+/// `SCHEDULED`, `CANCELLED`, `AWS_CANCELLED`, `PREPASS`, `PASS`, `POSTPASS`, `COMPLETED`,
+/// `FAILED`, `AVAILABLE`, `CANCELLING` and `AWS_FAILED` (`smithy_query(query="shape",
+/// shape="ContactStatus")`). The five listed here are the ones where the antenna was
+/// never held on the account's behalf: a window merely offered and never reserved
+/// (`AVAILABLE`), a reservation that never became a contact (`FAILED_TO_SCHEDULE`), one
+/// released before the pass by the customer or by AWS (`CANCELLED`, `AWS_CANCELLED`) and
+/// one the service itself failed (`AWS_FAILED`). Every other value is a contact the
+/// account holds or held the antenna for — including `CANCELLING`, whose release has not
+/// completed, and `FAILED`, whose antenna time was still reserved.
+///
+/// CHOSEN classification: the API documents the member only as "total scheduled minutes",
+/// so which statuses release their minutes is this emulator's rule, applied in one place
+/// rather than per operation.
+pub const STATUSES_WITHOUT_ANTENNA_TIME: &[&str] = &[
+    "AVAILABLE",
+    "AWS_CANCELLED",
+    "AWS_FAILED",
+    "CANCELLED",
+    "FAILED_TO_SCHEDULE",
+];
+
 impl Contact {
+    /// Whether this contact holds (or held) antenna time for the account, so its minutes
+    /// count against the usage of the month it starts in. See
+    /// [`STATUSES_WITHOUT_ANTENNA_TIME`].
+    pub fn holds_antenna_time(&self) -> bool {
+        !STATUSES_WITHOUT_ANTENNA_TIME.contains(&self.contact_status.as_str())
+    }
+
+    /// The whole minutes of antenna time this contact is scheduled for: its own window,
+    /// `startTime` to `endTime`, rounded UP to the next whole minute.
+    ///
+    /// The pre- and post-pass widening is deliberately not part of it — those spans are
+    /// the set-up and tear-down around the pass, while the antenna time is the window the
+    /// reservation itself names. CHOSEN rounding: minute usage is reported as an
+    /// `Integer` of minutes (`smithy_query(query="operation",
+    /// operation="GetMinuteUsage")`), and a part minute of a pass is still a minute the
+    /// account has the antenna for, so it counts as a whole one.
+    pub fn scheduled_minutes(&self) -> i32 {
+        let seconds = (self.end_time.as_secs_f64() - self.start_time.as_secs_f64()).max(0.0);
+        (seconds / 60.0).ceil().min(f64::from(i32::MAX)) as i32
+    }
+
     /// This contact's version record, as `DescribeContact` and `ListContacts` report
     /// it: the one version `ReserveContact` created, still the active one.
     pub fn version(&self) -> ContactVersion {
@@ -833,6 +879,98 @@ pub struct ComAmazonawsGroundstationGroundstationState {
     /// refused with [`UNRESOLVABLE_RECORDING_BUCKET`] — the sentence AWS answers when
     /// the location cannot be read — until a bucket lands here.
     pub readable_recording_buckets: Vec<String>,
+    /// The reserved-minutes pricing plan this account holds — what `GetMinuteUsage`
+    /// reports as `isReservedMinutesCustomer` and `totalReservedMinuteAllocation`, and
+    /// what it measures `estimatedMinutesRemaining` against.
+    ///
+    /// EMPTY unless [`RESERVED_MINUTES_ENV`] grants an allocation, and that is this
+    /// account's real pricing plan rather than a gap in the emulator: an account signs up
+    /// for reserved minutes outside this API (AWS sells the commitment; the model carries
+    /// no operation that signs an account up and none that reports the signup other than
+    /// `GetMinuteUsage` itself — `smithy_query(query="digest")`). So an account starts on
+    /// on-demand pricing, exactly as a new AWS account does, and `GetMinuteUsage` answers
+    /// `isReservedMinutesCustomer: false` with a zero allocation until a plan lands here.
+    pub reserved_minutes: ReservedMinutesPlan,
+}
+
+/// The reserved-minutes pricing plan an account holds: which calendar months it covers
+/// and how many minutes it allocates in each.
+///
+/// The allocation is PER MONTH because `GetMinuteUsage` reports both the signup and the
+/// allocation "specific to the month being requested"
+/// (`smithy_query(query="operation", operation="GetMinuteUsage")`), so a plan that
+/// started, changed size or lapsed partway through a year answers differently month by
+/// month.
+#[derive(Debug, Clone, Default)]
+pub struct ReservedMinutesPlan {
+    /// Minutes allocated in every month the plan covers, when it is a standing monthly
+    /// commitment; `None` when the account has no standing commitment at all.
+    pub monthly_allocation: Option<i32>,
+    /// The allocation of one calendar month, keyed `(year, month)`. An entry here
+    /// OVERRIDES [`monthly_allocation`](Self::monthly_allocation) for that month, which
+    /// is how a plan of a different size — or one covering a single month — is expressed.
+    pub by_month: HashMap<(i32, i32), i32>,
+}
+
+impl ReservedMinutesPlan {
+    /// The minutes this plan allocates for `(year, month)`, or `None` when the plan does
+    /// not cover that month — which is exactly what makes the account a reserved-minutes
+    /// customer *for the month being requested*.
+    pub fn allocation_for(&self, year: i32, month: i32) -> Option<i32> {
+        self.by_month
+            .get(&(year, month))
+            .copied()
+            .or(self.monthly_allocation)
+    }
+}
+
+/// The environment variable an operator uses to put THIS emulated account on the reserved
+/// minutes pricing plan, since the API models no operation that signs one up: a
+/// comma-separated list of entries, each either a bare minute count (a standing monthly
+/// commitment, `GROUNDSTATION_RESERVED_MINUTES="500"`) or `<year>-<month>=<minutes>` for
+/// one calendar month (`"500,2026-02=750"` commits 500 minutes a month and 750 in
+/// February 2026). Read once when this service's store is created. Unset means on-demand
+/// pricing, which is what a new AWS account has.
+pub const RESERVED_MINUTES_ENV: &str = "GROUNDSTATION_RESERVED_MINUTES";
+
+/// The plan `setting` grants. An entry that is not a non-negative minute count, optionally
+/// keyed by a `<year>-<month>` inside the calendar's 1–12 months, is skipped rather than
+/// guessed at, so a typo commits nothing instead of committing something unintended.
+pub fn parse_reserved_minutes(setting: &str) -> ReservedMinutesPlan {
+    let mut plan = ReservedMinutesPlan::default();
+    for entry in setting.split(',') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        match entry.split_once('=') {
+            // A bare count: the standing monthly commitment.
+            None => {
+                if let Ok(minutes) = entry.parse::<i32>() {
+                    if minutes >= 0 {
+                        plan.monthly_allocation = Some(minutes);
+                    }
+                }
+            }
+            // `<year>-<month>=<minutes>`: one month's own allocation.
+            Some((month_key, minutes)) => {
+                let Some((year, month)) = month_key.trim().split_once('-') else {
+                    continue;
+                };
+                let (Ok(year), Ok(month), Ok(minutes)) = (
+                    year.trim().parse::<i32>(),
+                    month.trim().parse::<i32>(),
+                    minutes.trim().parse::<i32>(),
+                ) else {
+                    continue;
+                };
+                if (1..=12).contains(&month) && minutes >= 0 {
+                    plan.by_month.insert((year, month), minutes);
+                }
+            }
+        }
+    }
+    plan
 }
 
 /// The environment variable an operator uses to grant THIS emulated account its uplink
@@ -886,8 +1024,8 @@ fn from_env<T: Default>(variable: &str, parse: impl Fn(&str) -> T) -> T {
 
 impl Default for ComAmazonawsGroundstationGroundstationState {
     /// An account with no resources, the uplink approval [`APPROVED_UPLINK_BANDS_ENV`]
-    /// grants it and the recording buckets [`RECORDING_BUCKETS_ENV`] names (none of
-    /// either, unless they are set).
+    /// grants it, the recording buckets [`RECORDING_BUCKETS_ENV`] names and the reserved
+    /// minutes [`RESERVED_MINUTES_ENV`] commits (none of them, unless they are set).
     fn default() -> Self {
         Self {
             configs: HashMap::new(),
@@ -899,6 +1037,7 @@ impl Default for ComAmazonawsGroundstationGroundstationState {
                 parse_approved_uplink_bands,
             ),
             readable_recording_buckets: from_env(RECORDING_BUCKETS_ENV, parse_recording_buckets),
+            reserved_minutes: from_env(RESERVED_MINUTES_ENV, parse_reserved_minutes),
         }
     }
 }

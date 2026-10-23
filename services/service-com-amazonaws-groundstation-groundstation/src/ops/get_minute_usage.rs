@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetMinuteUsage
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetMinuteUsage`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetMinuteUsage::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: this operation reports the account's minute usage for one calendar
+//! month, computed from the contacts this service persisted and the account's
+//! reserved-minutes plan ([`crate::state::ReservedMinutesPlan`]). It is `@readonly`, so
+//! the only write it makes is materialising the `SCHEDULING` -> `SCHEDULED` moves the
+//! clock already owes before it reads the statuses.
+//!
+//! ## How the usage is computed
+//!
+//! * a contact counts in the calendar month (UTC) its `startTime` falls in, for the whole
+//!   minutes its `startTime`..`endTime` window holds (rounded up), and only while its
+//!   status still holds that antenna time
+//!   ([`crate::state::Contact::scheduled_minutes`] and
+//!   [`crate::state::Contact::holds_antenna_time`]);
+//! * `upcomingMinutesScheduled` is the part of that total whose pass has not started yet;
+//! * `isReservedMinutesCustomer` and `totalReservedMinuteAllocation` come from the
+//!   account's plan FOR THAT MONTH, and `estimatedMinutesRemaining` is what is left of the
+//!   allocation once the month's scheduled minutes are counted against it, floored at
+//!   zero.
 //!
 //! ## Shape of an operation
 //!
@@ -148,20 +158,108 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetMinuteUsage` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetMinuteUsageErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetMinuteUsage"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetMinuteUsageErrorModeled::DependencyException(DependencyException {
+                message: Some("this service's state store is unavailable".to_string()),
+                parameter_name: None,
+            })
+        })?;
+
+        // The month being requested, as the half-open window of epoch seconds it spans.
+        // The model bounds `month` to 1..12 and `year` to 2018..3000 and the framework
+        // refuses anything outside them before this handler runs, so a request that
+        // reaches here always names a month the calendar has; one that somehow does not
+        // is refused with this operation's own modelled error rather than guessed at.
+        let (month_start, month_end) =
+            utc_month_window(input.year, input.month).ok_or_else(|| {
+                GetMinuteUsageErrorModeled::InvalidParameterException(InvalidParameterException {
+                    message: Some(format!(
+                        "month {} of year {} is not a calendar month",
+                        input.month, input.year
+                    )),
+                    parameter_name: Some("month".to_string()),
+                })
+            })?;
+
+        // "Upcoming" is measured against the clock, not against the month: the minutes of
+        // the month's contacts whose pass has not started yet.
+        let now = crate::state::now_timestamp().as_secs_f64();
+
+        let mut guard = state.lock();
+        // Apply every `SCHEDULING` -> `SCHEDULED` move already due, so the statuses this
+        // read classifies are the ones in force now. That move was owed at this instant
+        // whether or not anybody called, which is why a reporting operation may
+        // materialise it.
+        guard.settle_due_contacts();
+
+        // Usage is DERIVED from the stored contacts: a contact counts in the month its
+        // pass starts in, for the whole minutes of antenna time its window holds, and
+        // only while its status still holds that antenna time — a cancelled contact has
+        // released its minutes.
+        let mut total_scheduled_minutes: i32 = 0;
+        let mut upcoming_minutes_scheduled: i32 = 0;
+        for contact in guard.contacts.values() {
+            let start = contact.start_time.as_secs_f64();
+            if start < month_start || start >= month_end || !contact.holds_antenna_time() {
+                continue;
+            }
+            let minutes = contact.scheduled_minutes();
+            total_scheduled_minutes = total_scheduled_minutes.saturating_add(minutes);
+            if start > now {
+                upcoming_minutes_scheduled = upcoming_minutes_scheduled.saturating_add(minutes);
+            }
+        }
+
+        // The account is a reserved-minutes customer for a month exactly when its plan
+        // covers that month; an account on on-demand pricing has no plan, so it is not
+        // one and has nothing allocated.
+        let allocation = guard
+            .reserved_minutes
+            .allocation_for(input.year, input.month);
+        let allocated = allocation.unwrap_or(0);
+
+        Ok(GetMinuteUsageOutput {
+            is_reserved_minutes_customer: Some(allocation.is_some()),
+            total_reserved_minute_allocation: Some(allocated),
+            total_scheduled_minutes: Some(total_scheduled_minutes),
+            upcoming_minutes_scheduled: Some(upcoming_minutes_scheduled),
+            // What is left of the allocation once the month's scheduled minutes are
+            // counted against it, and never less than nothing: an account that scheduled
+            // past its commitment has no reserved minutes remaining rather than a
+            // negative number of them.
+            estimated_minutes_remaining: Some(
+                allocated.saturating_sub(total_scheduled_minutes).max(0),
+            ),
+        })
     }
+}
+
+/// The calendar month `month` of `year` as the half-open window of epoch seconds
+/// `[first instant of the month, first instant of the next month)`, in UTC; `None` when
+/// the pair names no month the calendar has.
+///
+/// A calendar month is not a fixed number of seconds — lengths differ and February
+/// depends on the leap rule — so the boundaries come from `chrono`'s proleptic Gregorian
+/// calendar rather than from arithmetic on a nominal month. UTC because the timestamps
+/// this service stores are epoch seconds and the request carries no time zone for the
+/// month it asks about.
+fn utc_month_window(year: i32, month: i32) -> Option<(f64, f64)> {
+    let month = u32::try_from(month).ok()?;
+    let (next_year, next_month) = if month == 12 {
+        (year.checked_add(1)?, 1)
+    } else {
+        (year, month + 1)
+    };
+    Some((
+        first_instant_of_month(year, month)?,
+        first_instant_of_month(next_year, next_month)?,
+    ))
+}
+
+/// Midnight UTC on the first day of `month` in `year`, in epoch seconds.
+fn first_instant_of_month(year: i32, month: u32) -> Option<f64> {
+    let midnight = ::chrono::NaiveDate::from_ymd_opt(year, month, 1)?.and_hms_opt(0, 0, 0)?;
+    Some(midnight.and_utc().timestamp() as f64)
 }

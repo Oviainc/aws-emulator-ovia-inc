@@ -25,6 +25,9 @@ tracing = { workspace = true }
 # `Uuid`-shaped id (see `state::new_uuid`); `hex` renders them.
 sha2 = { workspace = true }
 hex = { workspace = true }
+# Calendar arithmetic for `GetMinuteUsage`: the first instant of a requested month, and of
+# the next one, in the proleptic Gregorian calendar (month lengths and the leap rule).
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
