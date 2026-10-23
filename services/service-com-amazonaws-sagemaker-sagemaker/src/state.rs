@@ -3351,6 +3351,20 @@ pub const DEFAULT_PLATFORM_IDENTIFIER: &str = "notebook-al2023-v1";
 /// is 5 GB".
 pub const DEFAULT_VOLUME_SIZE_IN_GB: i32 = 5;
 
+/// How long the presigned URL `CreatePresignedNotebookInstanceUrl` answers stays valid.
+///
+/// A DOCUMENTED duration, so it keeps its published value rather than being compressed:
+/// the operation's own doc says "the URL that you get from a call to
+/// CreatePresignedNotebookInstanceUrl is valid only for 5 minutes".
+pub const PRESIGNED_NOTEBOOK_URL_TTL: Duration = Duration::from_secs(5 * 60);
+
+/// The session a presigned notebook-instance URL opens when the request names no
+/// `SessionExpirationDurationInSeconds`.
+///
+/// Also DOCUMENTED, by the member itself: "The duration of the session, in seconds. The
+/// default is 12 hours." — which is the top of its modelled `range 1800..43200`.
+pub const DEFAULT_NOTEBOOK_SESSION_DURATION_SECONDS: i32 = 12 * 60 * 60;
+
 /// The resource kind a notebook instance's ARN carries, as `NotebookInstanceArn`'s
 /// documented `arn:aws:sagemaker:<region>:<account>:notebook-instance/<name>` form
 /// spells it. Named once so the create and the reader agree; both pass it to
@@ -3365,6 +3379,15 @@ pub const NOTEBOOK_INSTANCE_ARN_KIND: &str = "notebook-instance";
 /// across reads and distinct per instance.
 pub fn notebook_instance_url(region: &str, name: &str) -> String {
     format!("{name}.notebook.{region}.sagemaker.aws")
+}
+
+/// The presigned URL `CreatePresignedNotebookInstanceUrl` answers: the instance's own
+/// Jupyter host (the `Url` [`notebook_instance_url`] minted and
+/// `DescribeNotebookInstance` reports) with the grant this call recorded on the instance
+/// carried as the `authToken` query parameter — the same shape the presigned partner-app
+/// URL takes, so one scheme covers both.
+pub fn presigned_notebook_instance_url(host: &str, token: &str) -> String {
+    format!("https://{}/auth?authToken={token}", host.trim_end_matches('/'))
 }
 
 /// The id of the network interface `CreateNotebookInstance` reports it created:
@@ -3435,6 +3458,10 @@ pub struct NotebookInstance {
     /// instance that never came up has no Jupyter endpoint and no network interface to
     /// report (see [`NotebookInstance::is_provisioned`]).
     pub provisioned: bool,
+    /// Every presigned-URL grant `CreatePresignedNotebookInstanceUrl` minted for this
+    /// instance whose session could still be in use, oldest first. Same record as a
+    /// partner app's, [`PresignedUrlGrant`], because the two grants carry the same thing.
+    pub url_grants: Vec<PresignedUrlGrant>,
 }
 
 impl NotebookInstance {
@@ -3485,6 +3512,35 @@ impl NotebookInstance {
         self.status = NOTEBOOK_INSTANCE_STATUS_STOPPING.to_string();
         self.last_modified_time = now;
         self.stopped_at = Some(now + NOTEBOOK_INSTANCE_STOPPED_AFTER);
+    }
+
+    /// Record a presigned-URL grant against this instance and answer it: the opaque token
+    /// the URL carries, the [`PRESIGNED_NOTEBOOK_URL_TTL`] the URL itself is good for, and
+    /// the session `session_duration_seconds` opens once the URL is followed.
+    ///
+    /// A grant whose session the clock has already ended is released first — it was over
+    /// at its stored instant whether or not anybody called — and the history is bounded by
+    /// [`GRANT_HISTORY_CAP`], exactly as a partner app's grants are, so a caller asking
+    /// for URL after URL cannot grow the store without end.
+    pub fn grant_presigned_url(
+        &mut self,
+        now: SystemTime,
+        session_duration_seconds: i32,
+    ) -> PresignedUrlGrant {
+        let grant = PresignedUrlGrant {
+            token: mint_grant_token(),
+            issued_at: now,
+            expires_at: now + PRESIGNED_NOTEBOOK_URL_TTL,
+            session_expires_at: now
+                + Duration::from_secs(u64::try_from(session_duration_seconds).unwrap_or_default()),
+        };
+        self.url_grants.retain(|held| held.session_expires_at > now);
+        self.url_grants.push(grant.clone());
+        if self.url_grants.len() > GRANT_HISTORY_CAP {
+            let overflow = self.url_grants.len() - GRANT_HISTORY_CAP;
+            self.url_grants.drain(..overflow);
+        }
+        grant
     }
 
     /// Whether the instance has finished provisioning, i.e. the `Pending` ->

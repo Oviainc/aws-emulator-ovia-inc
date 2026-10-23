@@ -340,6 +340,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // Still provisioning: the instance has no Jupyter endpoint or network
                 // interface to report until the clock's `InService` transition is due.
                 provisioned: false,
+                // No presigned URL has been asked for yet, so the instance holds no grant.
+                url_grants: Vec::new(),
             },
         );
         drop(store);

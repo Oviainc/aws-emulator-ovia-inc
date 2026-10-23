@@ -111,6 +111,8 @@ mod partner_apps;
 mod pipeline_execution;
 #[path = "all/pipeline_lifecycle.rs"]
 mod pipeline_lifecycle;
+#[path = "all/presigned_notebook_instance_url.rs"]
+mod presigned_notebook_instance_url;
 #[path = "all/processing_job_lifecycle.rs"]
 mod processing_job_lifecycle;
 #[path = "all/rejection_fidelity.rs"]

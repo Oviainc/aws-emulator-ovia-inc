@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreatePresignedNotebookInstanceUrl
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreatePresignedNotebookInstanceUrl`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreatePresignedNotebookInstanceUrl::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints the Jupyter URL for a notebook instance this account holds: the instance's own
+//! `Url` host with an opaque grant token this call records on the instance, valid for the
+//! documented 5 minutes, opening a session of the requested duration (12 hours by
+//! default). An instance with no running Jupyter server to connect to — one still coming
+//! up, stopping or stopped — is refused with a 400 `ValidationException`, since this
+//! operation models no error of its own.
 //!
 //! ## Shape of an operation
 //!
@@ -146,18 +144,68 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreatePresignedNotebookInstanceUrl` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreatePresignedNotebookInstanceUrlErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreatePresignedNotebookInstanceUrl"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        // The session the URL opens: what the request asked for, or the documented
+        // 12-hour default when it named nothing. The modelled `range 1800..43200` is
+        // refused before this handler runs, so whatever arrives here is inside it.
+        let session_duration = input
+            .session_expiration_duration_in_seconds
+            .unwrap_or(crate::state::DEFAULT_NOTEBOOK_SESSION_DURATION_SECONDS);
+        let now = ::std::time::SystemTime::now();
+
+        let mut store = state.lock();
+        let Some(notebook) = store
+            .notebook_instances
+            .get_mut(&input.notebook_instance_name)
+        else {
+            // The same refusal this resource's readers give: the instance is this call's
+            // subject, and the operation models no not-found error of its own.
+            let arn = crate::state::resource_arn(
+                &crate::state::request_region(ctx),
+                crate::state::NOTEBOOK_INSTANCE_ARN_KIND,
+                &input.notebook_instance_name,
+            );
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "RecordNotFound. Notebook Instance Arn: {arn}"
+            )));
+        };
+
+        // The `Pending` -> `InService` transition the clock already owed is materialised
+        // first: it was due at its stored instant whether or not anybody called, so an
+        // instance that has finished coming up is served rather than refused.
+        let settled = notebook.settle_status(now);
+        let arn = notebook.arn.clone();
+        let status = notebook.status.clone();
+
+        // This URL connects its holder to the Jupyter server ON the instance, so an
+        // instance serving none — one still coming up, stopping, or stopped — has no URL
+        // to mint. The operation models no error for that, hence a 400
+        // `ValidationException` rather than the scaffold's 501.
+        if status != crate::state::STATUS_IN_SERVICE {
+            drop(store);
+            if settled {
+                crate::state::record_state_change(Self::NAME, &arn, ctx);
+            }
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "Notebook instance \"{arn}\" is {status}, so it is serving no Jupyter \
+                 server; it must be {} to create a presigned URL for it.",
+                crate::state::STATUS_IN_SERVICE
+            )));
+        }
+
+        // The grant is recorded ON the instance, so the URL names a token this store
+        // holds rather than one invented per response, and it addresses the instance's
+        // own Jupyter host as the create minted it.
+        let grant = notebook.grant_presigned_url(now, session_duration);
+        let authorized_url =
+            crate::state::presigned_notebook_instance_url(&notebook.url, &grant.token);
+        drop(store);
+
+        crate::state::record_state_change(Self::NAME, &arn, ctx);
+        Ok(CreatePresignedNotebookInstanceUrlOutput {
+            authorized_url: Some(authorized_url),
+        })
     }
 }
