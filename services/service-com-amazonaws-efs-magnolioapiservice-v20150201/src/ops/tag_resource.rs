@@ -172,13 +172,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(internal_server_error());
         };
 
-        // "An array of Tag objects to add. Each Tag object is a key-value pair." The
-        // modelled list carries no length bound and no key-uniqueness constraint, so the
-        // quota and the unique-key rule are checked here, before anything is stored.
-        if let Some(problem) = efs::tag_list_problem(&input.tags) {
-            return Err(bad_request(problem));
-        }
-
         let mut state = state.lock();
 
         // "The ID specifying the EFS resource that you want to create a tag for": the
@@ -189,21 +182,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(does_not_exist(resource));
         };
 
-        // The published quota bounds the set this write LEAVES, not the request alone: a
-        // requested key the resource already carries replaces a value instead of adding a
-        // tag, so only the keys that are new count towards it.
-        let added = input
-            .tags
-            .iter()
-            .filter(|tag| !held.iter().any(|tag_held| tag_held.key == tag.key))
-            .count();
-        let resulting = held.len() + added;
-        if resulting > efs::MAX_TAGS_PER_RESOURCE {
-            return Err(bad_request(format!(
-                "resource {} would hold {resulting} tags, more than the maximum of {}",
-                efs::quoted(&input.resource_id),
-                efs::MAX_TAGS_PER_RESOURCE
-            )));
+        // "An array of Tag objects to add. Each Tag object is a key-value pair." The
+        // modelled list carries no length bound and no key-uniqueness constraint, and the
+        // published quota bounds the set this write LEAVES, so both are checked through
+        // the one construction every tag write of this service refuses with.
+        if let Some(problem) = efs::tag_write_problem(held, &input.tags, &input.resource_id) {
+            return Err(bad_request(problem));
         }
 
         // Past every refusal, so this is the first write the request makes. `apply` both

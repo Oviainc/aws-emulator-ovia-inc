@@ -300,6 +300,9 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
     ///
     /// Keep it 501 and not a 5xx server fault: SDK retry classifiers treat those as
     /// retryable, so a client would retry an operation that can never succeed.
+    ///
+    /// A modeled error keeps the status the model declares for it, unless the handler
+    /// stated one with [`Scaffolded::modeled_with_status`].
     fn http_status(&self) -> u16 {
         match self {
             Self::NotImplemented(_) => 501,

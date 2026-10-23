@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeTable
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeTable`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeTable::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Describes one table of a database from the engine's own catalog: the columns
+//! it declares, paged with an opaque `NextToken`. A reporting operation — it
+//! reads the catalog of a database some statement already created and writes
+//! nothing, not even the database itself.
 //!
 //! ## Shape of an operation
 //!
@@ -131,6 +126,10 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::{
+    decode_cursor, encode_cursor, non_empty, ConnectionRequest, CURSOR_COLUMNS,
+    DEFAULT_COLUMN_PAGE_SIZE, DEFAULT_SCHEMA,
+};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -204,18 +203,201 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeTable` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeTableErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeTable"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DescribeTableErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the Redshift Data API state store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        // The same connection combinations every operation of this service
+        // documents: one data warehouse, one database, one authorization
+        // method. `Database` is "the name of the database that contains the
+        // tables to be described", so it is the database whose catalog is read;
+        // `ConnectedDatabase` names the one the credentials connect to, which
+        // this emulator does not need to tell apart because a statement reaches
+        // exactly the database it names.
+        let connection = match (ConnectionRequest {
+            cluster_identifier: input.cluster_identifier.as_ref(),
+            workgroup_name: input.workgroup_name.as_ref(),
+            session_id: None,
+            database: Some(&input.database),
+            db_user: input.db_user.as_ref(),
+            secret_arn: input.secret_arn.as_ref(),
+        })
+        .resolve()
+        {
+            Ok(connection) => connection,
+            // Every other combination — both warehouses, neither of them, no
+            // database, two authorization methods — is a malformed request.
+            // `DescribeTable` takes no `SessionId`, so no connection of its
+            // own can live on a session.
+            Err(problem) => return Err(validation(problem.message())),
+        };
+
+        let schema = non_empty(input.schema.as_ref());
+        let table = non_empty(input.table.as_ref());
+
+        // The cursor is a column offset, and its kind names the database and
+        // the table filter the page was issued for, so a token minted while
+        // paging one table's columns is refused for any other rather than
+        // silently resolving to the same offset in a different column list.
+        let cursor_kind = format!(
+            "{CURSOR_COLUMNS}:{}:{}",
+            connection.database,
+            table.as_deref().unwrap_or_default()
+        );
+        let offset = match input.next_token.as_deref() {
+            None => 0_usize,
+            Some(token) => match decode_cursor(&cursor_kind, token)
+                .and_then(|position| usize::try_from(position).ok())
+            {
+                Some(offset) => offset,
+                None => {
+                    return Err(validation(
+                        "NextToken is not a continuation token this operation issued for this \
+                         table",
+                    ))
+                }
+            },
+        };
+
+        // "The schema that contains the table. If no schema is specified, then
+        // matching tables for all schemas are returned." This emulator's engine
+        // holds every table of a database in the database's default schema, so
+        // a request naming another schema matches no table there.
+        if schema
+            .as_deref()
+            .is_some_and(|schema| !schema.eq_ignore_ascii_case(DEFAULT_SCHEMA))
+        {
+            return Err(no_such_table(&schema.unwrap_or_default(), table.as_deref()));
+        }
+
+        // The catalog of a database no statement has ever opened holds nothing:
+        // a reporting operation must not open one, or a later caller would find
+        // a database this read had created. The database is what is missing
+        // here, so that is what the refusal names.
+        let Some(handle) = state
+            .lock()
+            .open_database(&connection.target, &connection.database)
+        else {
+            return Err(DescribeTableErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("Database does not exist: {}", connection.database),
+                    resource_id: connection.database.clone(),
+                },
+            )
+            .into());
+        };
+
+        // The catalog is read on the blocking pool with only this database's
+        // lock held, bounded exactly as a statement's execution is, so a catalog
+        // read queued behind a slow statement cannot pin this request.
+        let budget = crate::state::wait_budget(None);
+        let engine_timeout = crate::state::engine_timeout(budget);
+        let bound = crate::state::ExecutionBound::new();
+        let interrupt = bound.interrupt();
+        let wanted = table.clone();
+        let joined = tokio::time::timeout(
+            budget,
+            tokio::task::spawn_blocking(move || {
+                crate::state::catalog_on(&handle, wanted.as_deref(), engine_timeout, &bound)
+            }),
+        )
+        .await;
+        let described = match joined {
+            Ok(Ok(Ok(described))) => described,
+            // The engine could not answer for this database.
+            Ok(Ok(Err(reason))) => {
+                return Err(DescribeTableErrorModeled::DatabaseConnectionException(
+                    DatabaseConnectionException {
+                        message: format!("the database's catalog could not be read: {reason}"),
+                    },
+                )
+                .into())
+            }
+            Err(_elapsed) => {
+                interrupt.now();
+                return Err(DescribeTableErrorModeled::QueryTimeoutException(
+                    QueryTimeoutException {
+                        message: Some(format!(
+                            "the database's catalog did not answer within {} seconds",
+                            budget.as_secs()
+                        )),
+                    },
+                )
+                .into());
+            }
+            Ok(Err(_panicked)) => {
+                return Err(DescribeTableErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the SQL engine did not answer for this database's catalog"
+                            .to_string(),
+                    },
+                )
+                .into())
+            }
+        };
+
+        // A named table that the catalog does not hold is a missing resource.
+        if described.is_empty() && table.is_some() {
+            return Err(no_such_table(DEFAULT_SCHEMA, table.as_deref()));
+        }
+
+        // "If no table is specified, then all tables for all matching schemas
+        // are returned", so the column list runs over every matching table in
+        // catalog order, each column carrying the table it belongs to.
+        let columns: Vec<ColumnMetadata> = described
+            .iter()
+            .flat_map(|described| described.columns.iter().cloned())
+            .collect();
+        if offset > columns.len() {
+            return Err(validation(
+                "NextToken is not a continuation token this operation issued for this table",
+            ));
+        }
+
+        let page_size = usize::try_from(input.max_results)
+            .ok()
+            .filter(|size| *size > 0)
+            .unwrap_or(DEFAULT_COLUMN_PAGE_SIZE);
+        let end = offset.saturating_add(page_size).min(columns.len());
+
+        Ok(DescribeTableOutput {
+            // The table the request named, as the catalog spells it; a request
+            // that named none describes several tables, so it reports no single
+            // table name and the columns carry their own.
+            table_name: table
+                .is_some()
+                .then(|| described.first().map(|described| described.table.clone()))
+                .flatten(),
+            column_list: Some(columns[offset..end].to_vec()),
+            next_token: (end < columns.len())
+                .then(|| encode_cursor(&cursor_kind, u64::try_from(end).unwrap_or(u64::MAX))),
+        })
     }
 }
+
+/// Refuse the request as invalid, with the `ValidationException` this operation
+/// models.
+fn validation(message: &str) -> DescribeTableError {
+    DescribeTableErrorModeled::ValidationException(ValidationException {
+        message: Some(message.to_string()),
+    })
+    .into()
+}
+
+/// Refuse a table the named database's catalog does not hold — a missing
+/// resource (404), not a malformed request.
+fn no_such_table(schema: &str, table: Option<&str>) -> DescribeTableError {
+    let named = table.unwrap_or("*");
+    DescribeTableErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: format!("Table does not exist: {schema}.{named}"),
+        resource_id: format!("{schema}.{named}"),
+    })
+    .into()
+}
+

@@ -2,8 +2,11 @@
 
 //! @op GetStatementResult
 //! Returns the rows the statement named by `Id` actually produced, paged with an
-//! opaque `NextToken`. A reporting operation, so the only thing it writes is the
-//! status transition the clock has already made due.
+//! opaque `NextToken`. A statement that produced no RESULT — one that failed, was
+//! aborted, or finished without a result set — is refused as a missing result
+//! (404), and a batch's own `Id` is refused as well: a batch's results live on
+//! the `:<n>` ids of the statements it submitted. A reporting operation, so the
+//! only thing it writes is the status transition the clock has already made due.
 //!
 //! ## Shape of an operation
 //!
@@ -94,7 +97,10 @@
 
 #[allow(unused_imports)]
 use super::types::*;
-use crate::state::{decode_cursor, encode_cursor, StatementStatus, CURSOR_ROWS, RESULT_PAGE_ROWS};
+use crate::state::{
+    decode_cursor, encode_cursor, BATCH_PARENT_RESULT_MESSAGE, CURSOR_ROWS, NO_RESULT_MESSAGE,
+    RESULT_PAGE_ROWS,
+};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -189,22 +195,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // Only a statement that ran to completion has rows to fetch. One that is
-        // still running, or that failed or was aborted, is refused rather than
-        // answered with an empty page a client would read as "no rows".
-        if statement.status != StatementStatus::Finished {
-            return Err(validation(format!(
-                "Query {} did not finish successfully; its status is {}",
-                input.id,
-                statement.status.as_str()
-            )));
+        // A batch is not a query: `BatchExecuteStatement` answers with one
+        // parent `Id` whose statements each carry their own `<id>:<n>`, and a
+        // result is read per statement. Reading the parent is refused rather
+        // than answered with a page no statement of the batch produced.
+        if statement.is_batch {
+            return Err(validation(BATCH_PARENT_RESULT_MESSAGE.to_string()));
         }
 
-        // A statement whose `HasResultSet` was recorded false — DDL, or DML such
-        // as INSERT — produced no result set, so its page holds no rows and no
-        // column metadata, consistently with that flag. It is still a page of
-        // this statement's result, so the continuation token is validated for it
-        // exactly as for a statement that did produce rows.
+        // Only a statement that ran to completion AND produced a result set has
+        // rows to fetch. A statement that FAILED or was ABORTED, and a FINISHED
+        // one with no result set (DDL, or DML such as INSERT), has no RESULT to
+        // read: that is a missing result resource (404), not a malformed
+        // request, and never an empty page a client would read as "no rows".
+        if !statement.has_fetchable_result() {
+            // A statement still running is a different answer: its result does
+            // not exist YET, and the caller's own request is what is wrong — it
+            // asked before the statement reached a terminal status.
+            if !statement.status.is_terminal() {
+                return Err(validation(format!(
+                    "Query {} has not finished running; its status is {}",
+                    input.id,
+                    statement.status.as_str()
+                )));
+            }
+            return Err(GetStatementResultErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: NO_RESULT_MESSAGE.to_string(),
+                    resource_id: input.id.clone(),
+                },
+            )
+            .into());
+        }
+
         let (rows, column_metadata) = match statement.result() {
             Some(result) => (result.rows.as_slice(), result.column_metadata.clone()),
             None => (&[][..], Vec::new()),

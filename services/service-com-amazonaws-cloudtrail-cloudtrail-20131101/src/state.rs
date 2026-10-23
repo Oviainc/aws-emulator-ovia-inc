@@ -545,6 +545,24 @@ pub fn parse_trail_identifier(value: &str) -> Result<TrailIdentifier, Identifier
     Ok(TrailIdentifier::Name(value.to_string()))
 }
 
+/// The Region, account and resource segments of a CloudTrail resource ARN —
+/// `arn:<partition>:cloudtrail:<region>:<account>:<resource>` — or `None` when `value`
+/// is not one.
+///
+/// The ARN itself is read through [`::service_common::arn`], this tree's ONE parse of a
+/// caller-supplied resource ARN — the same one [`parse_taggable_arn`] uses — so no
+/// parser in this module can disagree with another, or with another service, about what
+/// an ARN is. What this adds is CloudTrail's own part: every taggable or addressable
+/// CloudTrail resource lives in a Region and belongs to an account, so an ARN leaving
+/// either field empty names none of them, unlike the partition-global ARNs the shared
+/// parse deliberately admits. What the RESOURCE segment must look like stays the
+/// caller's rule, because it differs per resource type.
+pub fn cloudtrail_arn_fields(value: &str) -> Option<(&str, &str, &str)> {
+    let arn = ::service_common::arn::parse_of(value, SERVICE_NAMESPACE)?;
+    (!arn.region.is_empty() && !arn.account.is_empty())
+        .then_some((arn.region, arn.account, arn.resource))
+}
+
 /// Read `arn:<partition>:cloudtrail:<region>:<account>:trail/<name>`.
 fn parse_trail_arn(value: &str) -> Result<TrailIdentifier, IdentifierRejection> {
     // The refusal names the ARN the caller supplied, which is the one thing the
@@ -556,18 +574,9 @@ fn parse_trail_arn(value: &str) -> Result<TrailIdentifier, IdentifierRejection> 
         )))
     };
 
-    let fields: Vec<&str> = value.split(':').collect();
-    let [arn, partition, service, region, account, resource] = fields.as_slice() else {
+    let Some((region, _account, resource)) = cloudtrail_arn_fields(value) else {
         return reject();
     };
-    if *arn != "arn"
-        || partition.is_empty()
-        || *service != SERVICE_NAMESPACE
-        || region.is_empty()
-        || account.is_empty()
-    {
-        return reject();
-    }
     let Some(name) = resource.strip_prefix(TRAIL_RESOURCE_PREFIX) else {
         return reject();
     };
@@ -575,7 +584,7 @@ fn parse_trail_arn(value: &str) -> Result<TrailIdentifier, IdentifierRejection> 
         return reject();
     }
     Ok(TrailIdentifier::Arn {
-        region: (*region).to_string(),
+        region: region.to_string(),
         name: name.to_string(),
     })
 }
@@ -1045,8 +1054,8 @@ pub struct EventDataStoreRecord {
     /// them. Empty for a store nobody has configured; the model bounds
     /// `ContextKeySelectors` to 0..=2 entries.
     pub context_key_selectors: Vec<ContextKeySelector>,
-    /// The store's tag set, as `CreateEventDataStore` seeds it, `RemoveTags` drops
-    /// keys from it and `ListTags` reports it.
+    /// The store's tag set, as `CreateEventDataStore` seeds it, `AddTags` merges into
+    /// it, `RemoveTags` drops keys from it and `ListTags` reports it.
     pub tags: Vec<Tag>,
     /// The Insights selectors `PutInsightSelectors` configured on this store and
     /// `GetInsightSelectors` reports. EMPTY means Insights event logging is off,
@@ -1346,26 +1355,25 @@ pub fn parse_event_data_store_identifier(
         });
     }
 
-    let fields: Vec<&str> = value.split(':').collect();
-    let [arn, partition, service, region, account, resource] = fields.as_slice() else {
-        return Err(EventDataStoreRejection::InvalidArn(value.to_string()));
+    let reject = || Err(EventDataStoreRejection::InvalidArn(value.to_string()));
+    let Some((region, _account, resource)) = cloudtrail_arn_fields(value) else {
+        return reject();
     };
-    let id = resource.strip_prefix(EVENT_DATA_STORE_RESOURCE_PREFIX);
-    match id {
-        Some(id)
-            if *arn == "arn"
-                && !partition.is_empty()
-                && *service == SERVICE_NAMESPACE
-                && !region.is_empty()
-                && !account.is_empty()
-                && !id.is_empty() =>
-        {
-            Ok(EventDataStoreIdentifier {
-                id: id.to_string(),
-                region: Some((*region).to_string()),
-            })
-        }
-        _ => Err(EventDataStoreRejection::InvalidArn(value.to_string())),
+    // The shared parse keeps every colon the resource field carries, because an ARN of
+    // the `<type>:<id>` form is as well formed as one of the `<type>/<id>` form. An
+    // event data store ARN is only ever the slash form ("the ARN (or the ID suffix of
+    // the ARN) of an event data store", whose published format is
+    // `…:eventdatastore/<id>`), so a further colon here is a seventh field this
+    // identifier cannot carry.
+    if resource.contains(':') {
+        return reject();
+    }
+    match resource.strip_prefix(EVENT_DATA_STORE_RESOURCE_PREFIX) {
+        Some(id) if !id.is_empty() => Ok(EventDataStoreIdentifier {
+            id: id.to_string(),
+            region: Some(region.to_string()),
+        }),
+        _ => reject(),
     }
 }
 
@@ -1969,24 +1977,14 @@ pub fn is_valid_dashboard_name(name: &str) -> bool {
 /// A value that starts with `arn:` is read as an ARN — the modelled `DashboardArn`
 /// pattern admits both forms — and anything else as a bare name.
 pub fn parse_dashboard_identifier(value: &str) -> Option<DashboardIdentifier> {
-    if let Some(rest) = value.strip_prefix("arn:") {
-        let fields: Vec<&str> = rest.split(':').collect();
-        let [partition, service, region, account, resource] = fields.as_slice() else {
-            return None;
-        };
-        if partition.is_empty()
-            || *service != SERVICE_NAMESPACE
-            || region.is_empty()
-            || account.is_empty()
-        {
-            return None;
-        }
+    if value.starts_with("arn:") {
+        let (region, _account, resource) = cloudtrail_arn_fields(value)?;
         let name = resource.strip_prefix(DASHBOARD_RESOURCE_PREFIX)?;
         if !is_valid_dashboard_name(name) {
             return None;
         }
         return Some(DashboardIdentifier::Arn {
-            region: (*region).to_string(),
+            region: region.to_string(),
             name: name.to_string(),
         });
     }
@@ -2680,6 +2678,26 @@ impl TaggableArnRejection {
     }
 }
 
+/// The character set a CloudTrail resource ARN is written from.
+///
+/// The model constrains the ARN of three of the four taggable kinds — `ChannelArn`,
+/// `EventDataStoreArn` and `DashboardArn`, each `^[a-zA-Z0-9._/\-:]+$`
+/// (`smithy_query(query="shape", shape="ChannelArn,EventDataStoreArn,DashboardArn")`) —
+/// so that set is what a CloudTrail ARN is spelled with, whatever resource type is
+/// written inside it. A tagging `ResourceId` carries no `@pattern` of its own (it
+/// targets a plain `String`), so nothing has applied this before
+/// [`parse_taggable_arn`] does.
+const ARN_PUNCTUATION: [char; 5] = ['.', '_', '/', '-', ':'];
+
+/// Whether `value` is written only from the characters a CloudTrail resource ARN is
+/// spelled with ([`ARN_PUNCTUATION`] plus ASCII letters and digits).
+fn is_arn_spelling(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || ARN_PUNCTUATION.contains(&c))
+}
+
 /// Read a tagging `ResourceId` as the ARN of one of the four taggable resources.
 ///
 /// The member is documented as "the ARN of the trail, event data store, dashboard, or
@@ -2692,8 +2710,9 @@ impl TaggableArnRejection {
 /// caller-supplied resource ARN in this tree, so the resource field keeps the colons
 /// the model's `ChannelArn` / `EventDataStoreArn` pattern (`^[a-zA-Z0-9._/\-:]+$`)
 /// admits and the `<type>/<id>` and `<type>:<id>` forms are read the same way. What
-/// this function adds is this service's own part: WHICH of the four kinds the ARN
-/// names, and that kind's naming rules.
+/// this function adds is this service's own part: that the value is spelled like an ARN
+/// at all ([`is_arn_spelling`]), WHICH of the four kinds the ARN names, and that kind's
+/// naming rules.
 ///
 /// It is also why a tagging call does not read its identifier through
 /// [`parse_trail_identifier`] or [`parse_event_data_store_identifier`]: those accept
@@ -2705,6 +2724,16 @@ impl TaggableArnRejection {
 /// surface; see the note there for what keeps the two apart and what merging them
 /// would take.
 pub fn parse_taggable_arn(value: &str) -> Result<TaggableArn, TaggableArnRejection> {
+    // A value carrying a character no CloudTrail resource ARN is spelled with is not
+    // one, whatever resource type is written inside it, so it is refused as an ARN
+    // before its kind is read: the kind-specific errors below answer for a value that
+    // IS written as that kind's ARN, and reading a kind out of a value that is no ARN
+    // would let a resource id the model's ARN pattern cannot hold be looked up as if
+    // it named something.
+    if !is_arn_spelling(value) {
+        return Err(TaggableArnRejection::CloudTrailArn(value.to_string()));
+    }
+
     let reject = || {
         if value.contains(CHANNEL_RESOURCE_PREFIX) {
             TaggableArnRejection::ChannelArn(value.to_string())
@@ -2754,8 +2783,9 @@ pub fn parse_taggable_arn(value: &str) -> Result<TaggableArn, TaggableArnRejecti
         }
         // A channel id and an event data store id are opaque to this service: the
         // model constrains the WHOLE ARN (`ChannelArn` / `EventDataStoreArn`, length
-        // 3..256 of `^[a-zA-Z0-9._/\-:]+$`), which the boundary validator has already
-        // applied, and says nothing further about the id itself.
+        // 3..256 of `^[a-zA-Z0-9._/\-:]+$`), whose character set every value reaching
+        // here already satisfies (see `is_arn_spelling` above), and says nothing
+        // further about the id itself.
         "channel" => Ok(TaggableArn::Channel {
             region,
             id: id.to_string(),
@@ -2818,6 +2848,23 @@ impl ComAmazonawsCloudtrailCloudtrail20131101State {
             TaggableArn::Channel { .. } => None,
         }
     }
+}
+
+/// Merge `added` into `existing` the way `AddTags` documents it: "Overwrites an
+/// existing tag's value when a new value is specified for an existing tag key", and a
+/// key not already on the resource is appended.
+///
+/// The merged set is handed back rather than written in place, so a caller can hold it
+/// against the per-resource limit before it becomes the resource's tag set.
+pub fn tags_merged(existing: &[Tag], added: Vec<Tag>) -> Vec<Tag> {
+    let mut merged = existing.to_vec();
+    for tag in added {
+        match merged.iter_mut().find(|held| held.key == tag.key) {
+            Some(held) => held.value = tag.value,
+            None => merged.push(tag),
+        }
+    }
+    merged
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

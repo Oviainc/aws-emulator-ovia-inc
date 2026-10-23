@@ -573,6 +573,110 @@ pub const MAX_TAG_KEY_CHARS: usize = 128;
 /// characters."
 pub const MAX_TAG_VALUE_CHARS: usize = 256;
 
+// ---------------------------------------------------------------------------
+// Taggable resources, addressed by ARN
+//
+// `GetTags`, `TagResource` and `UntagResource` name their target by ARN rather than by
+// the path labels every other operation of this service takes, so reading an ARN into
+// the record it names lives HERE, in one place all three share: the same string must
+// resolve to the same record, and be refused the same way, whichever of them took it.
+//
+// WHICH resources are taggable comes from the model: a resource of this service is
+// taggable exactly when the shape declared for it carries a `tags` member
+// (`smithy_query(query="shape", shape="RestApi,Stage,ApiKey,UsagePlan,DomainName,\
+// ClientCertificate,VpcLink,DomainNameAccessAssociation")` — all eight do), and the
+// resource portion of such a resource's ARN is the URI of the operation that reads it
+// (`smithy_query(query="operation", operation="GetRestApi,GetStage,GetApiKey,\
+// GetUsagePlan,GetDomainName,GetClientCertificate,GetVpcLink")`: `/restapis/{restApiId}`,
+// `/restapis/{restApiId}/stages/{stageName}`, `/apikeys/{apiKey}`, and so on).
+// ---------------------------------------------------------------------------
+
+/// The vendor field an ARN of one of this service's resources carries: this service's
+/// own `aws.api#service$arnNamespace` (`smithy_query(query="service_info")`:
+/// `arnNamespace: apigateway`), which is what says an ARN names a resource this API can
+/// address at all.
+const ARN_SERVICE: &str = "apigateway";
+
+/// The leading resource-portion segment of each taggable resource kind whose records
+/// this emulator does not keep: the operations that create a usage plan, a domain name,
+/// a client certificate, a VPC link or a domain name access association are still
+/// scaffolds, so nothing can answer to one of these ARNs — while the ARN itself is a
+/// well-formed ARN of a taggable API Gateway resource and so is not a malformed request.
+///
+/// The segments are the first path segment of each kind's read URI; see the section
+/// comment above for the `smithy_query` calls they come from.
+const UNSTORED_TAGGABLE_KINDS: &[&str] = &[
+    "usageplans",
+    "domainnames",
+    "clientcertificates",
+    "vpclinks",
+    "domainnameaccessassociations",
+];
+
+/// The resource one `resourceArn` names: the stored record a tag collection hangs off,
+/// as [`parse_tagged_resource`] read it out of the ARN.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaggedResource {
+    /// `/restapis/{restApiId}` — a [`RestApiEntry`]'s tags.
+    RestApi { rest_api_id: String },
+    /// `/restapis/{restApiId}/stages/{stageName}` — a [`StageEntry`]'s tags.
+    Stage {
+        rest_api_id: String,
+        stage_name: String,
+    },
+    /// `/apikeys/{apiKey}` — an [`ApiKeyEntry`]'s tags.
+    ApiKey { api_key_id: String },
+    /// A taggable kind this emulator keeps no records of; see
+    /// [`UNSTORED_TAGGABLE_KINDS`]. `kind` is that list's entry and `id` the identifier
+    /// the ARN carried, so the refusal can name what it could not resolve.
+    Unstored { kind: &'static str, id: String },
+}
+
+/// Read `resource_arn` as the ARN of a taggable resource of this service.
+///
+/// The six ARN fields come from [`::service_common::arn::parse_of`], the ONE parse of a
+/// caller-supplied ARN, narrowed to this service's vendor namespace — so what counts as
+/// an ARN, and whose resource it names, is what every other service of this emulator
+/// says. Only the resource PORTION is read here, because its shape is this service's
+/// own.
+///
+/// `None` for anything that is not the ARN of a taggable resource — a string that is not
+/// an ARN, an ARN of another service, or an API Gateway ARN whose resource portion names
+/// something this service does not tag (a resource or a deployment of an API, a usage
+/// plan key) — which the caller is told is a bad request rather than a missing resource.
+///
+/// The region and account fields are not matched further: this emulator serves one
+/// account, and nothing it stores is keyed by partition or region, so what selects a
+/// record is the resource portion.
+pub fn parse_tagged_resource(resource_arn: &str) -> Option<TaggedResource> {
+    let arn = ::service_common::arn::parse_of(resource_arn, ARN_SERVICE)?;
+    let path: Vec<&str> = arn.resource.strip_prefix('/')?.split('/').collect();
+    if path.iter().any(|segment| segment.is_empty()) {
+        return None;
+    }
+    match path.as_slice() {
+        ["restapis", rest_api_id] => Some(TaggedResource::RestApi {
+            rest_api_id: (*rest_api_id).to_string(),
+        }),
+        ["restapis", rest_api_id, "stages", stage_name] => Some(TaggedResource::Stage {
+            rest_api_id: (*rest_api_id).to_string(),
+            stage_name: (*stage_name).to_string(),
+        }),
+        ["apikeys", api_key_id] => Some(TaggedResource::ApiKey {
+            api_key_id: (*api_key_id).to_string(),
+        }),
+        [kind, id] => UNSTORED_TAGGABLE_KINDS
+            .iter()
+            .copied()
+            .find(|known| known == kind)
+            .map(|known| TaggedResource::Unstored {
+                kind: known,
+                id: (*id).to_string(),
+            }),
+        _ => None,
+    }
+}
+
 /// Emulator resource guard, NOT an AWS quota: the most entries this emulator will store
 /// for a caller-sized list or map whose size the service publishes no limit for.
 pub const MAX_COLLECTION_ENTRIES: usize = 50;
@@ -1164,6 +1268,41 @@ impl ComAmazonawsApigatewayBackplanecontrolserviceState {
         ordered.sort_by_key(|api| (api.sequence, api.id.clone()));
         ordered.into_iter().map(|api| api.id.clone()).collect()
     }
+
+    /// The tag collection stored on the resource a `resourceArn` named, as
+    /// [`parse_tagged_resource`] read it.
+    ///
+    /// One lookup for every tag operation, so what a tag read reports and what a tag
+    /// write edits can never be two different records. `Err` carries the
+    /// `NotFoundException` message for an ARN that is well formed and that no stored
+    /// record answers to, in the wording this service already uses for the same
+    /// unresolvable identifier.
+    pub fn tags_of(&self, resource: &TaggedResource) -> Result<&BTreeMap<String, String>, String> {
+        match resource {
+            TaggedResource::RestApi { rest_api_id } => self
+                .rest_apis
+                .get(rest_api_id)
+                .map(|api| &api.tags)
+                .ok_or_else(|| no_such_rest_api(rest_api_id)),
+            TaggedResource::Stage {
+                rest_api_id,
+                stage_name,
+            } => self
+                .rest_apis
+                .get(rest_api_id)
+                .ok_or_else(|| no_such_rest_api(rest_api_id))?
+                .stages
+                .get(stage_name)
+                .map(|stage| &stage.tags)
+                .ok_or_else(|| NO_SUCH_STAGE.to_string()),
+            TaggedResource::ApiKey { api_key_id } => self
+                .api_keys
+                .get(api_key_id)
+                .map(|key| &key.tags)
+                .ok_or_else(|| NO_SUCH_API_KEY.to_string()),
+            TaggedResource::Unstored { kind, id } => Err(no_such_tagged_resource(kind, id)),
+        }
+    }
 }
 
 /// The `NotFoundException` message for a `restApiId` that names no stored API.
@@ -1202,6 +1341,28 @@ pub const NO_SUCH_DEPLOYMENT: &str = "Invalid deployment identifier specified";
 
 /// The `NotFoundException` message for an `apiKey` that names no stored API key.
 pub const NO_SUCH_API_KEY: &str = "Invalid API Key identifier specified";
+
+/// The `NotFoundException` message for a well-formed ARN of a taggable resource kind
+/// this emulator keeps no records of (see [`UNSTORED_TAGGABLE_KINDS`]): nothing answers
+/// to it, which is a missing resource and not a malformed request.
+///
+/// AWS states no fixed sentence here either, so the message is BUILT FROM THE REQUEST —
+/// it names the resource portion the lookup could not resolve, qualified by the account
+/// the lookup ran in, the way [`no_such_rest_api`] does.
+pub fn no_such_tagged_resource(kind: &str, id: &str) -> String {
+    format!(
+        "Invalid resource identifier specified {}:/{kind}/{id}",
+        ::emulator_server::emulator_account_id()
+    )
+}
+
+/// The `BadRequestException` message for a `resourceArn` that is not the ARN of a
+/// taggable resource of this service — the refusal [`parse_tagged_resource`]'s `None`
+/// earns. BUILT FROM THE REQUEST: it names the value that could not be read as such an
+/// ARN, so the caller can see which argument to fix.
+pub fn invalid_tagged_resource_arn(resource_arn: &str) -> String {
+    format!("Invalid ARN specified in the request {resource_arn}")
+}
 
 /// The `NotFoundException` message for a `documentationPartId` that names no stored
 /// documentation part of the API.

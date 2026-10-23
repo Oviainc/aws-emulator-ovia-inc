@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AddProfilePermission
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AddProfilePermission`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AddProfilePermission::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Adds one cross-account permission statement to a signing profile's permission
+//! policy. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -130,6 +123,54 @@ impl From<AddProfilePermissionErrorModeled> for AddProfilePermissionError {
     }
 }
 
+/// The modelled 404 for a profile name this account holds no profile for.
+///
+/// `code` carries the condition a client branches on — the profile named by the
+/// request does not exist — which is the only machine-readable discriminator a
+/// 404 body has.
+fn profile_not_found(profile_name: &str) -> AddProfilePermissionError {
+    AddProfilePermissionErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("profile with name {profile_name} does not exists")),
+        code: Some(crate::state::ERROR_CODE_PROFILE_NOT_FOUND.to_string()),
+    })
+    .into()
+}
+
+/// The modelled 404 for a `profileVersion` the profile has never had: a
+/// permission statement names the version it applies to, so a version that does
+/// not exist is a resource this grant could not be written against.
+fn profile_version_not_found(
+    profile_name: &str,
+    profile_version: &str,
+) -> AddProfilePermissionError {
+    AddProfilePermissionErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!(
+            "profile with name {profile_name} has no version {profile_version}"
+        )),
+        code: Some(crate::state::permissions::ERROR_CODE_NOT_FOUND.to_string()),
+    })
+    .into()
+}
+
+/// The modelled 409 for a request that lost the policy's optimistic-concurrency
+/// check or named a statement id the policy already holds.
+fn conflict(message: String) -> AddProfilePermissionError {
+    AddProfilePermissionErrorModeled::ConflictException(ConflictException {
+        message: Some(message),
+        code: Some(crate::state::permissions::ERROR_CODE_CONFLICT.to_string()),
+    })
+    .into()
+}
+
+/// The modelled 400 for a request refused on its own values.
+fn validation(message: String) -> AddProfilePermissionError {
+    AddProfilePermissionErrorModeled::ValidationException(ValidationException {
+        message: Some(message),
+        code: Some(crate::state::ERROR_CODE_VALIDATION.to_string()),
+    })
+    .into()
+}
+
 /// The `AddProfilePermission` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -166,18 +207,138 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AddProfilePermission` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AddProfilePermissionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AddProfilePermission"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                AddProfilePermissionErrorModeled::InternalServiceErrorException(
+                    InternalServiceErrorException {
+                        message: Some("the signer profile store is unavailable".to_string()),
+                        code: Some(crate::state::ERROR_CODE_INTERNAL_SERVICE_ERROR.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // `action` is modelled as a bare `String`, so the boundary validator let
+        // any text through; the four actions a Signer grant may carry are the ones
+        // the member documents, and nothing else is a grant AWS Signer could hold.
+        if !crate::state::permissions::is_grantable_action(&input.action) {
+            return Err(validation(
+                crate::state::permissions::ungrantable_action_message(&input.action),
+            ));
+        }
+        // `principal` and `statementId` are required strings the model puts no
+        // length on, so an empty one reaches here: a statement with no principal
+        // grants nothing, and one with no id could never be removed again.
+        for (member, value) in [
+            ("principal", input.principal.as_str()),
+            ("statementId", input.statement_id.as_str()),
+        ] {
+            if value.trim().is_empty() {
+                return Err(validation(format!("{member} must not be empty")));
+            }
+        }
+
+        let mut store = state.lock();
+
+        // The grant is written against a profile, and against one of that
+        // profile's versions when it names one.
+        let Some(profile) = store.profiles.get(&input.profile_name) else {
+            return Err(profile_not_found(&input.profile_name));
+        };
+        if let Some(version) = input.profile_version.as_deref() {
+            if !profile.versions.iter().any(|known| known == version) {
+                return Err(profile_version_not_found(&input.profile_name, version));
+            }
+        }
+
+        // `revisionId` is the policy's optimistic-concurrency token: a request
+        // naming one is applied only while that revision is still current, so two
+        // writers holding the same revision cannot both succeed and a writer
+        // holding a superseded revision is told rather than silently overwriting.
+        // A request naming none carries no precondition — the member is optional.
+        let current_revision = store
+            .profile_permissions
+            .get(&input.profile_name)
+            .map(|policy| policy.revision_id.clone());
+        if let Some(named) = input.revision_id.as_deref() {
+            if current_revision.as_deref() != Some(named) {
+                return Err(conflict(format!(
+                    "revision id {named} is not the current revision of the permissions of \
+                     profile {}",
+                    input.profile_name
+                )));
+            }
+        }
+
+        // A statement id identifies a statement WITHIN the policy, so the policy
+        // cannot hold two of them; replacing one means removing it first.
+        if store
+            .profile_permissions
+            .get(&input.profile_name)
+            .is_some_and(|policy| policy.statements.contains_key(&input.statement_id))
+        {
+            return Err(conflict(format!(
+                "statement id {} already exists in the permissions of profile {}",
+                input.statement_id, input.profile_name
+            )));
+        }
+
+        let statement = crate::state::permissions::ProfilePermissionRecord {
+            statement_id: input.statement_id.clone(),
+            action: input.action,
+            principal: input.principal,
+            profile_version: input.profile_version,
+        };
+
+        // A policy holds at most `MAX_POLICY_SIZE_BYTES`, so the document this
+        // grant WOULD leave is measured before anything is written and the grant
+        // refused with the modelled 402 when it does not fit — which is what
+        // bounds one profile's policy, and with it the work every later read of
+        // that policy does.
+        let resulting_size = {
+            let profile = store
+                .profiles
+                .get(&input.profile_name)
+                .expect("the profile resolved above is still in the store");
+            match store.profile_permissions.get(&input.profile_name) {
+                Some(policy) => policy.policy_size_bytes_with(profile, &statement),
+                // A profile holding no policy yet is measured as the empty policy
+                // this grant would create it with.
+                None => crate::state::permissions::ProfilePermissionPolicy::default()
+                    .policy_size_bytes_with(profile, &statement),
+            }
+        };
+        if resulting_size > crate::state::permissions::MAX_POLICY_SIZE_BYTES {
+            return Err(AddProfilePermissionErrorModeled::ServiceLimitExceededException(
+                ServiceLimitExceededException {
+                    message: Some(crate::state::permissions::policy_too_large_message(
+                        &input.profile_name,
+                        resulting_size,
+                    )),
+                    code: Some(
+                        crate::state::permissions::ERROR_CODE_SERVICE_LIMIT_EXCEEDED.to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // The write moves the policy to a fresh revision, which is what this call
+        // answers with and what every later read of the policy reports.
+        let revision_id = store.mint_permission_revision_id();
+        let policy = store
+            .profile_permissions
+            .entry(input.profile_name)
+            .or_default();
+        policy.revision_id = revision_id;
+        policy.statements.insert(input.statement_id, statement);
+
+        // Answered out of the stored policy, so what this call reports is exactly
+        // what a later `ListProfilePermissions` resolves.
+        Ok(AddProfilePermissionOutput {
+            revision_id: Some(policy.revision_id.clone()),
+        })
     }
 }

@@ -5,6 +5,10 @@
 //! carries as that instance's onboarding record and reports the record's job status,
 //! which starts `IN_PROGRESS` and the clock moves to `SUCCEEDED`.
 //!
+//! That record is what the rest of the service reads: `GetInstanceOnboardingJobStatus`
+//! reports its job, `GetConnectInstanceConfig` projects its config, and
+//! `CreateCampaign` mints a campaign only for an instance whose job has finished.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements

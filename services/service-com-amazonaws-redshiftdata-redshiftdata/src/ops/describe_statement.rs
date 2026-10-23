@@ -2,7 +2,10 @@
 
 //! @op DescribeStatement
 //! Reports one submitted statement out of [`crate::state`]: its SQL, its status, its
-//! timing and its result-set counters. A reporting operation, so the only thing it
+//! timing and its result-set counters. An `Id` carrying a `:<n>` suffix addresses one
+//! statement of a batch, whose record reports the batch's `Id` — the suffix is the
+//! address that reaches it, not the identity of the submission it belongs to. A
+//! reporting operation, so the only thing it
 //! writes is the status transition the clock has already made due — the move out of
 //! `SUBMITTED` that was owed at a given instant whether or not anyone called.
 //!
@@ -226,7 +229,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         Ok(DescribeStatementOutput {
-            id: statement.id.clone(),
+            // The `Id` of the SUBMISSION, which for one statement of a batch is
+            // the batch's: `SubStatementData.Id` documents the `:<n>` suffix
+            // positionally, so it is the ADDRESS that reaches this statement
+            // and not the identity its record reports. A client that walks a
+            // batch's `SubStatements` and describes each one correlates the
+            // record back to the batch through this member.
+            id: statement.submission_id().to_string(),
             secret_arn: statement.secret_arn.clone(),
             db_user: statement.db_user.clone(),
             database: statement.database.clone(),
