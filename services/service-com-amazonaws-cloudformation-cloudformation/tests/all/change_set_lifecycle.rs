@@ -483,9 +483,16 @@ fn diff_cases() -> Vec<DiffCase> {
             scope: vec![],
         },
         DiffCase {
+            // The execute half of this row APPLIES the change, and this emulator does not
+            // change the properties of a resource it really created in place (see
+            // `state::provisioning`, pinned by
+            // `core/router/tests/all/cloudformation_provisions_sns_topics.rs`), so the
+            // resource whose properties differ here is one of a type it leaves
+            // declared-only. What the row is about — a property difference is one MODIFY
+            // change scoped to `Properties` — is the same either way.
             case: "a resource's properties changed",
-            previous: r#"{"Resources":{"A":{"Type":"AWS::SNS::Topic","Properties":{"DisplayName":"one"}}}}"#,
-            next: r#"{"Resources":{"A":{"Type":"AWS::SNS::Topic","Properties":{"DisplayName":"two"}}}}"#,
+            previous: r#"{"Resources":{"A":{"Type":"AWS::Logs::LogGroup","Properties":{"RetentionInDays":7}}}}"#,
+            next: r#"{"Resources":{"A":{"Type":"AWS::Logs::LogGroup","Properties":{"RetentionInDays":14}}}}"#,
             changes: vec![(change_action::MODIFY, "A")],
             scope: vec!["Properties"],
         },

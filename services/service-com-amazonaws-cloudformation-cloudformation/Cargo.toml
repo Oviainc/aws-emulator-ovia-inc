@@ -42,6 +42,14 @@ aws-credential-types = "1"
 hex = { workspace = true }
 # Digests the counter + instant behind each minted identifier (see `state::new_identifier`).
 sha2 = { workspace = true }
+# Reads the XML document an awsQuery service answers a provisioning call with (the ARN
+# its create minted, the error code of a refusal). The same maintained XML reader the
+# emulator's own restXml services use.
+quick-xml = "0.41"
+# Percent-encodes the parameters of an awsQuery provisioning call, as its form body and
+# the SigV4 canonical request over it need. The same encoder the emulator's own request
+# verifier uses (`vendor/server/src/request_authentication.rs`).
+percent-encoding = "2"
 # A CloudFormation template body is JSON *or* YAML ("You can write CloudFormation
 # templates in JSON or YAML"), and the YAML spelling carries the short-form intrinsic
 # tags (`!Ref`, `!GetAtt`) that give a template its meaning. yaml-rust2 is a pure-Rust
@@ -66,6 +74,7 @@ emulator-core-build-support = { workspace = true }
 service-com-amazonaws-s3-amazons3 = { workspace = true }
 service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 service-com-amazonaws-codepipeline-codepipeline-20150709 = { workspace = true }
+service-com-amazonaws-sns-amazonsimplenotificationservice = { workspace = true }
 
 [lints]
 workspace = true

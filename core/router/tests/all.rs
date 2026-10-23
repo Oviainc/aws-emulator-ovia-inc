@@ -179,3 +179,5 @@ mod kinesis_video_signing_name_routing;
 mod apigatewayv2_websocket_deploy_then_connections;
 #[path = "all/cloudformation_provisions_fis_experiment_templates.rs"]
 mod cloudformation_provisions_fis_experiment_templates;
+#[path = "all/cloudformation_provisions_sns_topics.rs"]
+mod cloudformation_provisions_sns_topics;
