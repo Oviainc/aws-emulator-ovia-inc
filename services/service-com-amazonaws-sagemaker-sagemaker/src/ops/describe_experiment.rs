@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeExperiment
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeExperiment`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeExperiment::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Replays the experiment `CreateExperiment` stored, found by
+//! [`crate::state::ComAmazonawsSagemakerSagemakerState::experiment`] so the lookup folds
+//! case the same way the name's uniqueness does. A name that names no experiment is
+//! refused with the modelled `ResourceNotFound`, never a 200 with empty members.
 //!
 //! ## Shape of an operation
 //!
@@ -149,20 +145,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeExperiment` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeExperimentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeExperiment"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        let store = state.lock();
+        let Some(experiment) = store.experiment(&input.experiment_name) else {
+            // `ResourceNotFound` is the modelled failure for a name that names nothing;
+            // the message quotes the name the request supplied.
+            return Err(DescribeExperimentErrorModeled::ResourceNotFound(ResourceNotFound {
+                message: Some(format!(
+                    "Experiment \"{}\" does not exist.",
+                    input.experiment_name
+                )),
+            })
+            .into());
+        };
+
+        Ok(DescribeExperimentOutput {
+            experiment_name: Some(experiment.name.clone()),
+            experiment_arn: Some(experiment.arn.clone()),
+            display_name: Some(experiment.display_name.clone()),
+            // `Source` names the SageMaker resource that created the experiment on the
+            // caller's behalf (a pipeline or AutoML job). One created through this
+            // operation has no such source, which is why `CreateExperiment` models no
+            // `Source` input.
+            source: None,
+            description: experiment.description.clone(),
+            creation_time: Some(crate::state::timestamp(experiment.creation_time)),
+            // The identity the create was signed with, as it was stored then.
+            created_by: Some(experiment.created_by.clone()),
+            last_modified_time: Some(crate::state::timestamp(experiment.last_modified_time)),
+            // The creation IS the last modification until something updates the
+            // experiment, so the same identity made both.
+            last_modified_by: Some(experiment.created_by.clone()),
+        })
     }
 }

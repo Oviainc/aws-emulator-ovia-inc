@@ -1258,6 +1258,9 @@ pub fn model_package_lookup_key(identifier: &str) -> &str {
 /// Per-service state for com-amazonaws-sagemaker-sagemaker. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsSagemakerSagemakerState {
+    /// Keyed by [`entity_key`] of `ExperimentName`. See [`Experiment`], with the rest
+    /// of the experiment-management slice.
+    pub experiments: BTreeMap<String, Experiment>,
     /// Whether this account's SageMaker Service Catalog portfolio is enabled, as
     /// `EnableSagemakerServicecatalogPortfolio` and
     /// `DisableSagemakerServicecatalogPortfolio` set it and
@@ -3115,6 +3118,62 @@ pub fn entity_name_from_name_or_arn<'v>(
 }
 
 // ---------------------------------------------------------------------------
+// The experiment-management slice: `CreateExperiment` and `DescribeExperiment`. Kept
+// together as one span, the way the slices above are, so this one resource kind reads
+// as one block. The store key is [`entity_key`], shared with the experiment-tracking
+// slice: an `ExperimentEntityName` is unique per account and not case-sensitive.
+// ---------------------------------------------------------------------------
+
+/// The ARN resource kind an experiment carries, as the modelled `ExperimentArn` pattern
+/// spells it (`^arn:aws[a-z\-]*:sagemaker:[a-z0-9\-]*:[0-9]{12}:experiment/`).
+///
+/// Named once, the way the lineage slices name theirs, so `CreateExperiment`'s ARN
+/// minting and the ARN PARSING that resolves an `experiment/...` ARN back to a stored
+/// record cannot drift apart.
+pub const EXPERIMENT_KIND: &str = "experiment";
+
+/// See [`MODEL_QUOTA`]. Bounds the experiment store the same way, and is what
+/// `CreateExperiment` answers `ResourceLimitExceeded` past.
+pub const EXPERIMENT_QUOTA: usize = 1_000;
+
+/// An experiment created by `CreateExperiment`, as `DescribeExperiment` replays it.
+///
+/// `name` keeps the spelling the creating request used; the store's key is
+/// [`entity_key`] of that name, so a later create or read that differs only in case
+/// resolves to this same record. `created_by` is stored at creation rather than rebuilt
+/// per read, so every later read reports the identity that actually created it.
+#[derive(Debug, Clone)]
+pub struct Experiment {
+    pub name: String,
+    pub arn: String,
+    /// What `DescribeExperiment` reports as `DisplayName`: the value the request
+    /// supplied, or `ExperimentName` when it supplied none — the model documents that
+    /// "if DisplayName isn't specified, ExperimentName is displayed".
+    pub display_name: String,
+    pub description: Option<String>,
+    pub created_by: UserContext,
+    /// The tags the create carried, which `AddTags`/`DeleteTags`/`ListTags` and `Search`
+    /// read once those operations are implemented (they are scaffolded stubs today).
+    pub tags: Vec<Tag>,
+    pub creation_time: SystemTime,
+    pub last_modified_time: SystemTime,
+}
+
+impl ComAmazonawsSagemakerSagemakerState {
+    /// Whether another experiment fits, i.e. the store is below [`EXPERIMENT_QUOTA`].
+    pub fn experiments_below_quota(&self) -> bool {
+        self.experiments.len() < EXPERIMENT_QUOTA
+    }
+
+    /// The experiment `name` identifies, whatever case it is written in — the name is
+    /// unique per account and not case-sensitive, so the lookup folds case the way
+    /// [`entity_key`] does.
+    pub fn experiment(&self, name: &str) -> Option<&Experiment> {
+        self.experiments.get(&entity_key(name))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The custom-image slice: `CreateImage` / `CreateImageVersion` and the two
 // `Describe*` readers. Kept together at the end of this module, the way the
 // lineage-action, model-card and notebook-instance slices are, so one slice's
@@ -3346,10 +3405,9 @@ impl ComAmazonawsSagemakerSagemakerState {
     /// experiment-trial-component, artifact, action and context. Each is resolved against
     /// the store the matching create writes to, through
     /// [`entity_name_from_name_or_arn`], so an ARN naming another partition, service,
-    /// Region or account names no entity here. The experiment and context stores do not
-    /// exist yet — `CreateExperiment` and `CreateContext` are still scaffolds answering
-    /// 501, so nothing was ever created for an `experiment/...` or `context/...` ARN to
-    /// name and such an ARN names no entity.
+    /// Region or account names no entity here. The context store does not exist yet —
+    /// `CreateContext` is still a scaffold answering 501, so nothing was ever created for
+    /// a `context/...` ARN to name and such an ARN names no entity.
     pub fn lineage_entity_exists(&self, region: &str, arn: &str) -> bool {
         // Every `AssociationEntityArn` IS an ARN (its pattern starts `^arn:`), so the
         // bare-name branch of `entity_name_from_name_or_arn` is unreachable from an
@@ -3371,6 +3429,12 @@ impl ComAmazonawsSagemakerSagemakerState {
             // not case-sensitive" per its model doc), so the lookup goes through the same
             // key `CreateTrialComponent` stored the record under.
             return self.trial_components.contains_key(&entity_key(name));
+        }
+        if let Some(name) = entity_name_from_name_or_arn(arn, region, EXPERIMENT_KIND) {
+            // Same keying as the trial-component store, and for the same reason: an
+            // `ExperimentEntityName` is unique per account and not case-sensitive, so
+            // `CreateExperiment` filed the record under [`entity_key`] of the name.
+            return self.experiments.contains_key(&entity_key(name));
         }
         false
     }
