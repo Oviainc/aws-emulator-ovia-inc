@@ -17,6 +17,8 @@ mod appconfig_workflow;
 mod create_deployment_strategy;
 #[path = "all/environment_update.rs"]
 mod environment_update;
+#[path = "all/extensions.rs"]
+mod extensions;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/state_roundtrip.rs"]

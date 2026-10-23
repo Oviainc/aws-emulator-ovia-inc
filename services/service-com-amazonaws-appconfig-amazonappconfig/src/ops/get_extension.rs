@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetExtension
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetExtension`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetExtension::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports one version of an extension out of this service's state.
 //!
 //! ## Shape of an operation
 //!
@@ -152,20 +144,64 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetExtension` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetExtensionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetExtension"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetExtensionErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("AppConfig state is not reachable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+        let store = state.lock();
+
+        // `ExtensionIdentifier` is "the name, the ID, or the Amazon Resource Name (ARN)
+        // of the extension", and all three resolve through the one state function every
+        // extension operation uses. An ARN addresses one VERSION, so it pins the version
+        // to report unless the request names one explicitly.
+        let Some((extension, pinned_version)) = store.resolve_extension(&input.extension_identifier)
+        else {
+            return Err(not_found(format!(
+                "No extension matching {} exists.",
+                input.extension_identifier
+            )));
+        };
+        // "The extension version number. If no version number was defined, AppConfig
+        // uses the highest version."
+        let version = match input.version_number.or(pinned_version) {
+            Some(number) => extension.versions.get(&number).ok_or_else(|| {
+                not_found(format!(
+                    "Extension {} has no version {number}.",
+                    extension.name
+                ))
+            })?,
+            None => extension.latest_version().ok_or_else(|| {
+                not_found(format!("Extension {} holds no version.", extension.name))
+            })?,
+        };
+
+        Ok(GetExtensionOutput {
+            id: Some(extension.id.clone()),
+            name: Some(extension.name.clone()),
+            version_number: version.version_number,
+            arn: Some(version.arn.clone()),
+            description: version.description.clone(),
+            actions: Some(version.actions.clone()),
+            // `ParameterMap` is bounded `len 1..10`, so an extension that declares no
+            // parameter reports the member absent rather than an empty map a client
+            // would have to treat as a constraint violation.
+            parameters: (!version.parameters.is_empty()).then(|| version.parameters.clone()),
+        })
     }
+}
+
+/// The `ResourceNotFoundException` (HTTP 404) this operation answers an identifier that
+/// addresses no extension version this service holds with.
+fn not_found(message: String) -> GetExtensionError {
+    GetExtensionErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(message),
+        resource_name: None,
+    })
+    .into()
 }

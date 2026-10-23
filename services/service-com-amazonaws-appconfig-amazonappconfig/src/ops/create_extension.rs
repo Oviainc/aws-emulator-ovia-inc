@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateExtension
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateExtension`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateExtension::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: creates an extension, or one more version of an extension that already
+//! exists, and persists it in this service's state.
 //!
 //! ## Shape of an operation
 //!
@@ -186,18 +179,193 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateExtension` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateExtensionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateExtension"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateExtensionErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("AppConfig state is not reachable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+        // Every tag key this request would store is checked through the same function
+        // `TagResource` refuses through, and before anything is written.
+        if let Some(reason) = input
+            .tags
+            .as_ref()
+            .and_then(crate::state::first_tag_key_rejection)
+        {
+            return Err(bad_request(reason));
+        }
+        // "Dynamic parameters can't be marked `Required`" — the one `ParameterMap` rule
+        // the model states in prose rather than as a constraint, so the schema walk let
+        // the request through and it is enforced here.
+        if let Some(reason) = input
+            .parameters
+            .as_ref()
+            .and_then(crate::state::first_parameter_rejection)
+        {
+            return Err(bad_request(reason));
+        }
+        // `ActionsMap`'s key targets the model's `ActionPoint` enum, so an action bound
+        // to anything else names no point in AppConfig's workflow. Belt and braces: the
+        // schema walk refuses an unmodelled enum value before this handler runs, and a
+        // request that reached here with one is still not stored.
+        let mut action_points: Vec<&String> = input.actions.keys().collect();
+        action_points.sort();
+        if let Some(unknown) = action_points
+            .into_iter()
+            .find(|point| !ACTION_POINT_VALUES.contains(&point.as_str()))
+        {
+            return Err(bad_request(format!(
+                "{unknown} is not an AppConfig action point."
+            )));
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+
+        // `LatestVersionNumber` is an optimistic lock on the extension this name
+        // addresses: "When you create a new version, specify the most recent current
+        // version number." A name nobody has created is at version 0, so one uniform
+        // comparison covers both the first create and every later version — and a
+        // second create under a name that already exists without naming its current
+        // version is the duplicate-name conflict, since 0 is not that version.
+        let existing = store
+            .extension_named(&input.name)
+            .map(|extension| (extension.id.clone(), extension.latest_version_number()));
+        let current_version = existing.as_ref().map_or(0, |(_, latest)| *latest);
+        let extension_id = existing.map(|(id, _)| id);
+        let claimed_version = input.latest_version_number.unwrap_or(0);
+        if claimed_version != current_version {
+            return Err(CreateExtensionErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(if current_version == 0 {
+                        format!(
+                            "No extension named {} exists, so its latest version number is 0, \
+                             not {claimed_version}.",
+                            input.name
+                        )
+                    } else if input.latest_version_number.is_none() {
+                        format!(
+                            "An extension named {} already exists at version \
+                             {current_version}; to create another version, pass that number \
+                             as LatestVersionNumber.",
+                            input.name
+                        )
+                    } else {
+                        format!(
+                            "Extension {} is at version {current_version}, not \
+                             {claimed_version}.",
+                            input.name
+                        )
+                    }),
+                },
+            )
+            .into());
+        }
+
+        let version_number = current_version + 1;
+        let tags = input.tags.unwrap_or_default();
+        let parameters = input.parameters.unwrap_or_default();
+
+        let stored = match extension_id {
+            // One more version of an extension that already exists: its id and name are
+            // properties of the extension as a whole and are kept.
+            Some(id) => {
+                let version = crate::state::ExtensionVersion {
+                    version_number,
+                    arn: crate::state::extension_arn(&region, &id, version_number),
+                    description: input.description,
+                    actions: input.actions,
+                    parameters,
+                    tags,
+                };
+                if !store.try_insert_extension_version(&id, version) {
+                    return Err(quota_exceeded(format!(
+                        "Cannot create another version of extension {}: it already holds the \
+                         maximum of {} versions.",
+                        input.name,
+                        crate::state::MAX_EXTENSION_VERSIONS
+                    )));
+                }
+                id
+            }
+            // A name nobody has used yet: mint the extension's id and open its version
+            // history at version 1.
+            None => {
+                let id = store.mint_id();
+                let version = crate::state::ExtensionVersion {
+                    version_number,
+                    arn: crate::state::extension_arn(&region, &id, version_number),
+                    description: input.description,
+                    actions: input.actions,
+                    parameters,
+                    tags,
+                };
+                let extension =
+                    crate::state::Extension::new(id.clone(), input.name.clone(), version);
+                if !store.try_insert_extension(extension) {
+                    return Err(quota_exceeded(format!(
+                        "Cannot create another extension: this account already holds the \
+                         maximum of {} extensions.",
+                        crate::state::MAX_EXTENSIONS
+                    )));
+                }
+                id
+            }
+        };
+
+        // Answered from the stored record, so a later `GetExtension` reports exactly
+        // what this call persisted.
+        let extension = store.extension(&stored).ok_or_else(|| {
+            CreateExtensionError::from(CreateExtensionErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("The extension this call stored is not readable".to_string()),
+                },
+            ))
+        })?;
+        let version = extension.versions.get(&version_number).ok_or_else(|| {
+            CreateExtensionError::from(CreateExtensionErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "The extension version this call stored is not readable".to_string(),
+                    ),
+                },
+            ))
+        })?;
+
+        Ok(CreateExtensionOutput {
+            id: Some(extension.id.clone()),
+            name: Some(extension.name.clone()),
+            version_number: version.version_number,
+            arn: Some(version.arn.clone()),
+            description: version.description.clone(),
+            actions: Some(version.actions.clone()),
+            // `ParameterMap` is bounded `len 1..10`, so an extension that declares no
+            // parameter reports the member absent rather than an empty map a client
+            // would have to treat as a constraint violation.
+            parameters: (!version.parameters.is_empty()).then(|| version.parameters.clone()),
+        })
     }
+}
+
+/// The `BadRequestException` this operation answers a request it will not store with:
+/// "The input fails to satisfy the constraints specified by an Amazon Web Services
+/// service."
+fn bad_request(message: String) -> CreateExtensionError {
+    CreateExtensionErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message),
+        reason: None,
+        details: None,
+    })
+    .into()
+}
+
+/// The `ServiceQuotaExceededException` this operation answers a write past one of this
+/// emulator's documented bounds with.
+fn quota_exceeded(message: String) -> CreateExtensionError {
+    CreateExtensionErrorModeled::ServiceQuotaExceededException(ServiceQuotaExceededException {
+        message: Some(message),
+    })
+    .into()
 }

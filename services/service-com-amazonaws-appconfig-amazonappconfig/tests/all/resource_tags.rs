@@ -46,7 +46,8 @@ const REGION: &str = "us-east-1";
 /// Percent-encode one path segment or query value: everything outside RFC 3986 §2.3's
 /// unreserved set is escaped, which is what an SDK client sends for an ARN bound to a
 /// NON-greedy `@httpLabel` (`/tags/{ResourceArn}`) and for each `tagKeys` query pair.
-fn pct(value: &str) -> String {
+/// `pub(crate)` because the other suites in this target address resources by ARN too.
+pub(crate) fn pct(value: &str) -> String {
     value
         .bytes()
         .map(|byte| match byte {

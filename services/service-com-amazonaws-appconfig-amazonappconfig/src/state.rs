@@ -5,7 +5,9 @@
 //! AppConfig's control plane is a tree, and this module holds all of it: an
 //! application owns environments and configuration profiles, a profile owns the
 //! hosted configuration versions written into it, and an environment owns the
-//! deployments started into it. Every value an operation answers is read back out of
+//! deployments started into it. Extensions sit beside that tree, owned by the account
+//! rather than by any application, each one holding its own version history. Every
+//! value an operation answers is read back out of
 //! this tree rather than computed from the request that asked for it.
 //!
 //! A deployment is the one resource here with a lifetime of its own: AppConfig rolls
@@ -19,7 +21,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, SystemTime};
 
-use crate::ops::types::{DeploymentEvent, Monitor, Validator};
+use crate::ops::types::{Action, DeploymentEvent, Monitor, Parameter, Validator};
 
 /// `DeploymentState` values this service moves a deployment through. Each is a member
 /// of `DEPLOYMENT_STATE_VALUES` in `crate::ops::types` (the model's `DeploymentState`
@@ -79,6 +81,14 @@ pub const MAX_HOSTED_CONFIGURATION_VERSIONS_PER_PROFILE: usize = 100;
 /// [`ComAmazonawsAppconfigAmazonappconfigState::try_insert_strategy`], which is the only
 /// way into the created-strategy map.
 pub const MAX_DEPLOYMENT_STRATEGIES: usize = 100;
+/// See [`MAX_ENVIRONMENTS_PER_APPLICATION`]. Enforced by
+/// [`ComAmazonawsAppconfigAmazonappconfigState::try_insert_extension`], the only way a
+/// new extension reaches the extension map.
+pub const MAX_EXTENSIONS: usize = 100;
+/// See [`MAX_ENVIRONMENTS_PER_APPLICATION`]. Every `CreateExtension` against a name that
+/// already exists adds one more version to that extension, so the per-extension version
+/// history is bounded too.
+pub const MAX_EXTENSION_VERSIONS: usize = 100;
 
 /// The largest single hosted configuration this emulator stores, and the total it holds
 /// across every configuration profile.
@@ -122,6 +132,44 @@ pub const CONFIGURATION_PROFILE_TYPES: &[&str] = &["AWS.AppConfig.FeatureFlags",
 /// that addresses an AppConfig resource. An ARN naming any other service addresses no
 /// resource this service holds.
 pub const SERVICE_NAMESPACE: &str = "appconfig";
+
+/// The Region an ARN this service mints carries when the request names none.
+/// `::engine::emulator_arn`'s own documentation gives this as the emulator's default.
+pub const DEFAULT_REGION: &str = "us-east-1";
+
+/// Whether `region` is shaped like an AWS Region code (`us-east-1`, `ap-southeast-4`):
+/// lower-case letters, digits and hyphens only, and short enough that an ARN carrying it
+/// stays inside the modelled `Arn len 20..2048`.
+fn is_region_shaped(region: &str) -> bool {
+    !region.is_empty()
+        && region.len() <= 32
+        && region
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
+/// The Region this request was signed for, for the ARNs its response carries.
+///
+/// Read from the caller's own SigV4 credential scope, and checked against the Region
+/// grammar before it is interpolated into an ARN: a scope naming something that is not a
+/// Region (or no scope at all) falls back to [`DEFAULT_REGION`] rather than letting
+/// caller-chosen text reshape an ARN's colon-delimited fields.
+pub fn request_region(parts: &::http::request::Parts) -> String {
+    ::emulator_server::sigv4_credential_scope(&parts.headers)
+        .map(|scope| scope.region)
+        .filter(|region| is_region_shaped(region))
+        .unwrap_or_else(|| DEFAULT_REGION.to_string())
+}
+
+/// The ARN of one version of one extension: `extension/<extension id>/<version number>`,
+/// the resource portion [`parse_resource_arn`] reads back.
+pub fn extension_arn(region: &str, extension_id: &str, version_number: i32) -> String {
+    ::engine::emulator_arn(
+        SERVICE_NAMESPACE,
+        region,
+        &format!("extension/{extension_id}/{version_number}"),
+    )
+}
 
 /// The most tags ONE resource keeps, however many tag calls fill it: "You can specify a
 /// maximum of 50 tags for a resource" (`TagResource`'s own documentation,
@@ -195,6 +243,27 @@ pub fn first_tag_key_rejection(tags: &HashMap<String, String>) -> Option<String>
     keys.into_iter().find_map(|key| tag_key_rejection(key))
 }
 
+/// Why `parameters` is not an extension parameter map this service stores, or `None`
+/// when it is.
+///
+/// The one rule the model states but cannot express as a constraint: "Dynamic parameters
+/// can't be marked `Required`"
+/// (`smithy_query(query="doc",shape="Parameter",member="Dynamic")`). Every operation that
+/// writes a `ParameterMap` refuses through this one function, so the create side and the
+/// update side cannot drift apart. The names are sorted, so a request carrying two
+/// unacceptable parameters is refused with the same wording whichever order the map
+/// happened to iterate in.
+pub fn first_parameter_rejection(parameters: &HashMap<String, Parameter>) -> Option<String> {
+    let mut names: Vec<&String> = parameters.keys().collect();
+    names.sort();
+    names.into_iter().find_map(|name| {
+        let parameter = parameters.get(name)?;
+        (parameter.dynamic && parameter.required).then(|| {
+            format!("Parameter {name} is Dynamic, so it cannot also be marked Required.")
+        })
+    })
+}
+
 /// A resource one of this service's tag operations can address, as the resource portion
 /// of its ARN names it.
 ///
@@ -231,6 +300,13 @@ pub enum TaggedResource<'arn> {
     DeploymentStrategy {
         deployment_strategy_id: &'arn str,
     },
+    /// `extension/<extension id>/<version number>`. An extension belongs to the account
+    /// rather than to an application, and each of its versions is addressed separately —
+    /// which is the ARN `CreateExtension` answers with.
+    Extension {
+        extension_id: &'arn str,
+        version_number: i32,
+    },
 }
 
 /// The resource `resource_arn` addresses, or `None` when it addresses nothing whose tags
@@ -241,9 +317,9 @@ pub enum TaggedResource<'arn> {
 /// account, [`::engine::EMULATOR_ACCOUNT_ID`], and its store is not partitioned by
 /// region), so what is read is the service namespace — which must be
 /// [`SERVICE_NAMESPACE`] — and the resource portion. An ARN naming an AppConfig resource
-/// type whose tags this service does not persist (a hosted configuration version, an
-/// extension or an extension association: no record this service stores for one carries a
-/// tag map) answers `None`, exactly as an ARN naming a resource that does not exist does —
+/// type whose tags this service does not persist (a hosted configuration version or an
+/// extension association: no record this service stores for one carries a tag map)
+/// answers `None`, exactly as an ARN naming a resource that does not exist does —
 /// which includes a predefined `AppConfig.*` deployment strategy, since this service stores
 /// no record for one.
 pub fn parse_resource_arn(resource_arn: &str) -> Option<TaggedResource<'_>> {
@@ -299,6 +375,14 @@ pub fn parse_resource_arn(resource_arn: &str) -> Option<TaggedResource<'_>> {
         ["deploymentstrategy", deployment_strategy_id] if named(deployment_strategy_id) => {
             Some(TaggedResource::DeploymentStrategy {
                 deployment_strategy_id,
+            })
+        }
+        ["extension", extension_id, version] if named(extension_id) => {
+            Some(TaggedResource::Extension {
+                extension_id,
+                // Every extension ARN names one version, so a resource portion whose
+                // last segment is not a version number addresses no extension.
+                version_number: version.parse().ok()?,
             })
         }
         _ => None,
@@ -569,6 +653,66 @@ impl ConfigurationProfile {
     pub fn latest_version_number(&self) -> i32 {
         self.next_version_number - 1
     }
+}
+
+/// An extension: the logic AppConfig injects at an action point of its own workflow.
+///
+/// An extension is VERSIONED. Its name and its system-generated id are properties of the
+/// extension as a whole ("Extension versions use the same name", as the model documents
+/// on `CreateExtension`'s `Name` member); the description, the actions, the parameters
+/// and the tags belong to one version, because `CreateExtension` against a name that
+/// already exists writes a new version carrying its own copy of all four.
+#[derive(Debug, Clone)]
+pub struct Extension {
+    pub id: String,
+    pub name: String,
+    /// Every version of this extension, by version number. Ordered, so the latest
+    /// version is the last key rather than a separately maintained counter that could
+    /// disagree with the map.
+    pub versions: BTreeMap<i32, ExtensionVersion>,
+}
+
+impl Extension {
+    /// A brand-new extension holding only `version`.
+    pub fn new(id: String, name: String, version: ExtensionVersion) -> Self {
+        Self {
+            id,
+            name,
+            versions: BTreeMap::from([(version.version_number, version)]),
+        }
+    }
+
+    /// The highest version number this extension holds; `0` for an extension with no
+    /// version at all, which is also what a name nobody has created reports, so the two
+    /// compare alike against `CreateExtension`'s `LatestVersionNumber`.
+    pub fn latest_version_number(&self) -> i32 {
+        self.versions.keys().next_back().copied().unwrap_or(0)
+    }
+
+    /// The highest-numbered version, which is the one a reader naming no version gets:
+    /// "If no version number was defined, AppConfig uses the highest version"
+    /// (`smithy_query(query="doc",shape="GetExtensionRequest",member="VersionNumber")`).
+    pub fn latest_version(&self) -> Option<&ExtensionVersion> {
+        self.versions.values().next_back()
+    }
+}
+
+/// One version of an extension, exactly as the `CreateExtension` call that wrote it
+/// described it.
+#[derive(Debug, Clone)]
+pub struct ExtensionVersion {
+    pub version_number: i32,
+    /// The ARN of THIS version, minted when it was created and answered unchanged on
+    /// every later read.
+    pub arn: String,
+    pub description: Option<String>,
+    /// The action list bound to each action point, keyed by the `ActionPoint` value.
+    pub actions: HashMap<String, Vec<Action>>,
+    pub parameters: HashMap<String, Parameter>,
+    /// The metadata `CreateExtension` was asked to assign to this extension version.
+    /// Held on the record like an application's tags; the `Extension` shape carries no
+    /// `Tags` member, so they are reported by the tagging operations.
+    pub tags: HashMap<String, String>,
 }
 
 /// One version of a configuration held in AppConfig's hosted store, byte for byte as
@@ -846,6 +990,15 @@ pub struct ComAmazonawsAppconfigAmazonappconfigState {
     deployment_strategies: HashMap<String, DeploymentStrategy>,
     /// Counter behind [`Self::mint_id`]; never answered to a caller.
     id_sequence: u64,
+    /// Every extension this account created, by extension id.
+    ///
+    /// PRIVATE on purpose, for the same reason the strategy map is:
+    /// [`Self::try_insert_extension`] and [`Self::try_insert_extension_version`] are the
+    /// only ways in, so the [`MAX_EXTENSIONS`] and [`MAX_EXTENSION_VERSIONS`] bounds
+    /// cannot be bypassed by a handler mutating the map directly. AppConfig's own
+    /// AWS-authored `AWS.*` extensions are not in here: this service stores no record
+    /// for one.
+    extensions: HashMap<String, Extension>,
     /// Bytes of hosted configuration content this service is holding, across every
     /// configuration profile. Maintained by
     /// [`Self::reserve_hosted_configuration_bytes`] and bounded by
@@ -870,9 +1023,103 @@ impl ComAmazonawsAppconfigAmazonappconfigState {
     fn id_taken(&self, id: &str) -> bool {
         self.deployment_strategies.contains_key(id)
             || self.applications.contains_key(id)
+            || self.extensions.contains_key(id)
             || self.applications.values().any(|application| {
                 application.environments.contains_key(id) || application.profiles.contains_key(id)
             })
+    }
+
+    /// The extension `identifier` names, and the version number the identifier itself
+    /// pins, or `None` when this service holds no such extension.
+    ///
+    /// `identifier` is "the name, the ID, or the Amazon Resource Name (ARN) of the
+    /// extension"
+    /// (`smithy_query(query="doc",shape="GetExtensionRequest",member="ExtensionIdentifier")`),
+    /// so all three forms resolve here and every operation that takes an
+    /// `ExtensionIdentifier` resolves it the same way. An ARN addresses ONE version, so
+    /// it pins that version number; an id or a name addresses the extension as a whole
+    /// and pins none.
+    pub fn resolve_extension(&self, identifier: &str) -> Option<(&Extension, Option<i32>)> {
+        if let Some(by_id) = self.extensions.get(identifier) {
+            return Some((by_id, None));
+        }
+        if let Some(TaggedResource::Extension {
+            extension_id,
+            version_number,
+        }) = parse_resource_arn(identifier)
+        {
+            return self
+                .extensions
+                .get(extension_id)
+                .map(|extension| (extension, Some(version_number)));
+        }
+        self.extensions
+            .values()
+            .find(|extension| extension.name == identifier)
+            .map(|extension| (extension, None))
+    }
+
+    /// The extension stored under `extension_id`, for a caller that already holds the
+    /// minted id rather than a caller-supplied identifier.
+    pub fn extension(&self, extension_id: &str) -> Option<&Extension> {
+        self.extensions.get(extension_id)
+    }
+
+    /// The extension carrying `name`, or `None` when no extension does. Extension names
+    /// are unique per account ("Each extension name in your account must be unique", as
+    /// the model documents on `CreateExtension`'s `Name` member), so at most one answers.
+    pub fn extension_named(&self, name: &str) -> Option<&Extension> {
+        self.extensions
+            .values()
+            .find(|extension| extension.name == name)
+    }
+
+    /// Every extension this account created, for a reader that must report them without
+    /// reaching into the map.
+    pub fn created_extensions(&self) -> impl Iterator<Item = &Extension> {
+        self.extensions.values()
+    }
+
+    /// Store a brand-new extension, holding its first version.
+    ///
+    /// Answers `false`, having stored nothing, when this service already holds
+    /// [`MAX_EXTENSIONS`] of them — the bound that keeps a loop of create calls from
+    /// growing the emulator's heap without limit. `CreateExtension` is the caller this
+    /// exists for, and answers that `false` with the `ServiceQuotaExceededException` it
+    /// models.
+    pub fn try_insert_extension(&mut self, extension: Extension) -> bool {
+        if self.extensions.len() >= MAX_EXTENSIONS {
+            return false;
+        }
+        self.extensions.insert(extension.id.clone(), extension);
+        true
+    }
+
+    /// Add one more version to the extension `extension_id` names.
+    ///
+    /// Answers `false`, having stored nothing, when that extension already holds
+    /// [`MAX_EXTENSION_VERSIONS`] versions, or when no extension answers to
+    /// `extension_id`.
+    pub fn try_insert_extension_version(
+        &mut self,
+        extension_id: &str,
+        version: ExtensionVersion,
+    ) -> bool {
+        let Some(extension) = self.extensions.get_mut(extension_id) else {
+            return false;
+        };
+        if extension.versions.len() >= MAX_EXTENSION_VERSIONS {
+            return false;
+        }
+        extension.versions.insert(version.version_number, version);
+        true
+    }
+
+    /// Forget an extension this account created. Nothing calls this yet —
+    /// `DeleteExtension` is still a stub, and this is the hook it needs so deleting an
+    /// extension frees its slot.
+    pub fn remove_extension(&mut self, extension_id: &str) -> Option<Extension> {
+        self.extensions.remove(extension_id)
     }
 
     /// Resolve a deployment strategy id to the strategy it names: one this account
@@ -997,6 +1244,19 @@ impl ComAmazonawsAppconfigAmazonappconfigState {
             TaggedResource::DeploymentStrategy {
                 deployment_strategy_id,
             } => Some(&self.deployment_strategies.get(deployment_strategy_id)?.tags),
+            // An extension ARN names one VERSION, and each version carries the tags the
+            // `CreateExtension` call that wrote it was asked to assign.
+            TaggedResource::Extension {
+                extension_id,
+                version_number,
+            } => Some(
+                &self
+                    .extensions
+                    .get(extension_id)?
+                    .versions
+                    .get(&version_number)?
+                    .tags,
+            ),
         }
     }
 
@@ -1049,6 +1309,17 @@ impl ComAmazonawsAppconfigAmazonappconfigState {
                 &mut self
                     .deployment_strategies
                     .get_mut(deployment_strategy_id)?
+                    .tags,
+            ),
+            TaggedResource::Extension {
+                extension_id,
+                version_number,
+            } => Some(
+                &mut self
+                    .extensions
+                    .get_mut(extension_id)?
+                    .versions
+                    .get_mut(&version_number)?
                     .tags,
             ),
         }
