@@ -157,7 +157,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             DescribeInstanceAccessControlAttributeConfigurationErrorModeled::InternalServerException(
                 InternalServerException {
@@ -166,11 +165,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
         let now = ::std::time::SystemTime::now();
-        // A READ, except for what the CLOCK already owes the instances themselves
-        // (`materialize_due`); the ABAC status is DERIVED from the stored due instant, so
-        // this read writes nothing of its own.
+        let region = crate::state::request_region(ctx.parts());
+        // A READ, except for what the CLOCK already owes the instances themselves and the
+        // account's ambient instance if nothing has enabled one yet (`on_request`); the
+        // ABAC status is DERIVED from the stored due instant, so this read writes nothing
+        // of its own.
         let mut store = state.lock();
-        store.materialize_due(now);
+        store.on_request(&region, now);
 
         // The ACCOUNT-INSTANCE restriction, asked BEFORE any resource lookup: on an
         // account instance no ABAC configuration can ever exist, so the answer is this

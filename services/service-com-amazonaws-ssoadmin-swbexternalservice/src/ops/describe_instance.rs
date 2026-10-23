@@ -191,26 +191,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             DescribeInstanceErrorModeled::InternalServerException(InternalServerException {
                 message: Some("the SSO Admin state store is unavailable".to_string()),
             })
         })?;
-
         // A READ, except for what the CLOCK already owes: an instance whose activation
-        // instant has passed is ACTIVE whether or not anybody called, so
-        // `materialize_due` applies that and nothing else. The instance is otherwise
-        // reported exactly as it is held, and an ARN the store does not hold is refused
-        // rather than created.
+        // instant has passed is ACTIVE, and one whose deletion instant has passed no
+        // longer exists, whether or not anybody called — `on_request` applies that and
+        // enables the account's ambient instance if nothing has enabled one yet. The
+        // instance is otherwise reported exactly as it is held, and an ARN the store does
+        // not hold is refused rather than created.
+        let region = crate::state::request_region(ctx.parts());
         let mut guard = state.lock();
-        guard.materialize_due(::std::time::SystemTime::now());
+        guard.on_request(&region, ::std::time::SystemTime::now());
         let Some(instance) = guard.instance(&input.instance_arn) else {
             return Err(DescribeInstanceErrorModeled::AccessDeniedException(
                 AccessDeniedException {
-                    message: Some(format!(
-                        "No IAM Identity Center instance {} exists in this account",
-                        input.instance_arn
+                    message: Some(crate::state::instance_not_found_message(
+                        &input.instance_arn,
                     )),
                     reason: None,
                 },
