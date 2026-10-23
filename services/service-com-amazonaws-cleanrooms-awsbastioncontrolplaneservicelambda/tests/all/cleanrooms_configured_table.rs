@@ -28,10 +28,11 @@ use super::cleanrooms_collaboration_lifecycle::{account_id, error_code, is_model
 
 /// Every `TableReferenceType` the model declares (shape `TableReferenceType`), which is
 /// also one per member of the `TableReference` union.
-const ALL_TABLE_REFERENCE_TYPES: [&str; 4] = ["GLUE", "SNOWFLAKE", "ATHENA", "DATABRICKS"];
+pub(crate) const ALL_TABLE_REFERENCE_TYPES: [&str; 4] =
+    ["GLUE", "SNOWFLAKE", "ATHENA", "DATABRICKS"];
 
 /// Every `AnalysisMethod` the model declares (shape `AnalysisMethod`).
-const ALL_ANALYSIS_METHODS: [&str; 3] = ["DIRECT_QUERY", "DIRECT_JOB", "MULTIPLE"];
+pub(crate) const ALL_ANALYSIS_METHODS: [&str; 3] = ["DIRECT_QUERY", "DIRECT_JOB", "MULTIPLE"];
 
 /// Every `SelectedAnalysisMethod` the model declares (shape `SelectedAnalysisMethod`).
 const ALL_SELECTED_ANALYSIS_METHODS: [&str; 2] = ["DIRECT_QUERY", "DIRECT_JOB"];
@@ -107,10 +108,10 @@ fn table_reference(table_type: &str) -> Value {
 
 /// `ColumnName` values (pattern `^[a-z0-9_](([a-z0-9_ ]+-)*([a-z0-9_ ]+))?$`), used to
 /// build `allowedColumns` lists of varying length.
-const COLUMN_NAMES: [&str; 3] = ["order_id", "amount", "customer_region"];
+pub(crate) const COLUMN_NAMES: [&str; 3] = ["order_id", "amount", "customer_region"];
 
 /// A `CreateConfiguredTable` body.
-fn create_body(
+pub(crate) fn create_body(
     name: &str,
     table_type: &str,
     analysis_method: &str,
@@ -130,11 +131,11 @@ fn create_body(
 }
 
 impl Emulator {
-    async fn create_configured_table(&self, body: Value) -> (u16, Value) {
+    pub(crate) async fn create_configured_table(&self, body: Value) -> (u16, Value) {
         self.call("POST", "/configuredTables", Some(body)).await
     }
 
-    async fn get_configured_table(&self, id: &str) -> (u16, Value) {
+    pub(crate) async fn get_configured_table(&self, id: &str) -> (u16, Value) {
         self.call("GET", &format!("/configuredTables/{id}"), None)
             .await
     }
