@@ -11,7 +11,15 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-dataexchange-dataexchange.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.dataexchange#ListDataSetsRequest")]
+// `MaxResults` carries `skip_validation` for the reason given on
+// `ListDataSetRevisionsInput`: the model's `@default: 0` falls outside the member's
+// own `@range(min: 1, max: 200)`, so the boundary walk would refuse every request
+// that omits the parameter. The handler enforces the range over what the request
+// carried (`crate::state::requested_max_results`).
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.dataexchange#ListDataSetsRequest",
+    skip_validation = ["MaxResults"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct ListDataSetsInput {
     pub max_results: i32,
