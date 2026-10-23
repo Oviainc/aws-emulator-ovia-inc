@@ -47,3 +47,5 @@ mod state_roundtrip;
 mod external_connection_disassociation;
 #[path = "all/error_message_composition.rs"]
 mod error_message_composition;
+#[path = "all/removals_and_copies.rs"]
+mod removals_and_copies;

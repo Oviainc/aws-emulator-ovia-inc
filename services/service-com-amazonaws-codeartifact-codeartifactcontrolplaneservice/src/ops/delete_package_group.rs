@@ -1,15 +1,26 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeletePackageGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeletePackageGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeletePackageGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the package group the caller's `packageGroup` pattern names from the domain
+//! and answers with the description of what was removed:
+//!
+//! * the pattern is the group's identifier within the domain, so the lookup is the one
+//!   `DescribePackageGroup` performs — a domain this caller does not hold, or a pattern
+//!   the domain holds no group under, is `ResourceNotFoundException` (404);
+//! * the answer is the group's description PROJECTED BEFORE the removal, so it reports the
+//!   group as it last stood (its `parent` included);
+//! * the removal is committed to the store, so the next `DescribePackageGroup` for that
+//!   pattern is refused 404 and the pattern is free to be created again;
+//! * nothing else is removed. "Deleting a package group does not delete packages or
+//!   package versions associated with the package group. When a package group is deleted,
+//!   the direct child package groups will become children of the package group's direct
+//!   parent package group" — and they do here without a rewrite, because a group's parent
+//!   and its effective origin modes are derived from the patterns the domain holds AT THE
+//!   READ ([`crate::state::Domain::package_group_description`]);
+//! * the ROOT group is refused: it is created with the domain rather than by a caller, it
+//!   is the ancestor every inheriting restriction resolves against and the group every
+//!   package associates with by default, so there is no delete that could remove it.
 //!
 //! ## Shape of an operation
 //!
@@ -161,20 +172,81 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeletePackageGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeletePackageGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeletePackageGroup"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeletePackageGroupErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the CodeArtifact store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        // The root group is not a caller-created resource: every domain is created
+        // holding it, every inheriting restriction resolves against it and every package
+        // associates with it by default, so removing it would leave the domain unable to
+        // answer either question. Refused on the request's `packageGroup` value, before
+        // the store is touched — a parameter naming a group this API cannot delete.
+        if input.package_group == crate::state::ROOT_PACKAGE_GROUP_PATTERN {
+            return Err(DeletePackageGroupErrorModeled::ValidationException(
+                ValidationException {
+                    message: format!(
+                        "Package group '{}' is the root package group of its domain and cannot be deleted.",
+                        input.package_group
+                    ),
+                    reason: Some(VALIDATION_REASON_FIELD_FAILED.to_string()),
+                },
+            )
+            .into());
+        }
+
+        let mut store = state.lock();
+        let Some(domain) = store.domain_mut(&input.domain, input.domain_owner.as_deref()) else {
+            return Err(DeletePackageGroupErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: crate::state::domain_not_found_message(
+                        &input.domain,
+                        input.domain_owner.as_deref(),
+                    ),
+                    resource_id: Some(input.domain.clone()),
+                    resource_type: Some("domain".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // Projected BEFORE the removal, so the answer describes the group as it last
+        // stood — its `parent` and its effective origin modes resolved against the
+        // hierarchy it was still part of. `resourceType` is unset for the same reason as
+        // in `DescribePackageGroup`: `ResourceType` models no value for a package group.
+        let Some(description) = domain.package_group_description(&input.package_group) else {
+            return Err(DeletePackageGroupErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: crate::state::package_group_not_found_message(
+                        &domain.name,
+                        Some(&domain.owner),
+                        &input.package_group,
+                    ),
+                    resource_id: Some(input.package_group.clone()),
+                    resource_type: None,
+                },
+            )
+            .into());
+        };
+
+        // Removing it is the whole operation: the next DescribePackageGroup must answer
+        // 404, and the groups below it reparent on the next read because a parent is
+        // derived from the patterns the domain holds, never stored.
+        domain.package_groups.remove(&input.package_group);
+
+        Ok(DeletePackageGroupOutput {
+            package_group: Some(description),
+        })
     }
 }
+
+/// The `ValidationExceptionReason` a refused member carries: the request reached the
+/// service and one of its fields failed a rule the model cannot express.
+const VALIDATION_REASON_FIELD_FAILED: &str = "FIELD_VALIDATION_FAILED";
+

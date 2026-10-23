@@ -153,6 +153,16 @@ pub const MAX_ASSET_BYTES: usize = 64 * 1024 * 1024;
 /// reason as [`MAX_ASSET_BYTES`]: an unfinished version accepts assets until it closes).
 pub const MAX_ASSETS_PER_PACKAGE_VERSION: usize = 100;
 
+/// Maximum versions one `CopyPackageVersions` request may name.
+///
+/// This is the modelled `PackageVersionList` bound (`@length(0..100)`) that the `versions`
+/// member already carries, applied to the `versionRevisions` member, which names the SAME
+/// set and carries NO modelled length — so the boundary validator caps one form of the
+/// request and nothing but this constant caps the other. A request past it is refused with
+/// the same 400 `ValidationException` the validator answers for an over-long `versions`
+/// list, before the keys are collected.
+pub const MAX_VERSIONS_PER_COPY_REQUEST: usize = 100;
+
 /// Maximum versions one package may hold (the emulator's own bound).
 pub const MAX_PACKAGE_VERSIONS_PER_PACKAGE: usize = 1_000;
 
@@ -190,6 +200,14 @@ pub const PACKAGE_VERSION_STATUS_PUBLISHED: &str = "Published";
 /// `PackageVersionStatus` of a version that is still accepting assets, which is what the
 /// `unfinished` flag keeps a publish in.
 pub const PACKAGE_VERSION_STATUS_UNFINISHED: &str = "Unfinished";
+
+/// `PackageVersionStatus` of a version a delete removed, which is what
+/// `DeletePackageVersions` reports for every version it deleted ("The status of every
+/// successful version will be `Deleted`" — `DeletePackageVersionsResult$successfulVersions`).
+///
+/// Never STORED: a deleted version is gone from the store, so this status is reported by
+/// the call that removed it and by nothing that reads a stored record.
+pub const PACKAGE_VERSION_STATUS_DELETED: &str = "Deleted";
 
 /// The `AllowPublish`/`AllowUpstream` value that permits the action.
 pub const ORIGIN_RESTRICTION_ALLOW: &str = "ALLOW";
@@ -1616,6 +1634,19 @@ pub fn package_group_not_found_message(
          owned by account '{}' does not exist.",
         addressed_domain_owner(domain_owner)
     )
+}
+
+/// The `ResourceNotFoundException` message for a package the addressed repository does not
+/// hold. A package is addressed by its whole `(format, namespace, name)` triple, so the
+/// sentence quotes the name the request asked for and the repository it asked in.
+pub fn package_not_found_message(package: &str, repository: &str) -> String {
+    format!("Package {package} not found in repository {repository}.")
+}
+
+/// The `ResourceNotFoundException` message for a version the addressed package does not
+/// hold, and the `errorMessage` of a `NOT_FOUND` entry in a per-version answer map.
+pub fn package_version_not_found_message(package: &str, version: &str, repository: &str) -> String {
+    format!("Package version {package} {version} not found in repository {repository}.")
 }
 
 /// The `ConflictException` message for a create whose package-group pattern is already

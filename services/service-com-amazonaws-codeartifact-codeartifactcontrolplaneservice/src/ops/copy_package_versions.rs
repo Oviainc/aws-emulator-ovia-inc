@@ -1,15 +1,36 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CopyPackageVersions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CopyPackageVersions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CopyPackageVersions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Copies the named versions of one package from a source repository into a destination
+//! repository of the SAME domain, and materializes them there:
+//!
+//! * the request names its versions EITHER by `versions` or by `versionRevisions` — "You
+//!   must specify versions or versionRevisions. You cannot specify both" — so a request
+//!   carrying both, or neither, is refused as a bad request;
+//! * the domain, both repositories and the source package are resolved first; one this
+//!   caller does not hold is `ResourceNotFoundException` (404);
+//! * each named version is decided on its own and reported in ONE of the two modelled
+//!   maps, because this operation answers 200 with a per-version outcome: a version the
+//!   source repository does not hold is `NOT_FOUND`, a version whose stored revision is
+//!   not the one `versionRevisions` pinned is `MISMATCHED_REVISION`, a version the
+//!   destination already holds is `ALREADY_EXISTS` unless `allowOverwrite` is set, and a
+//!   destination package whose origin configuration blocks new versions is `NOT_ALLOWED`;
+//! * a copied version is the SOURCE record, assets and provenance included: its
+//!   `origin.domainEntryPoint.repositoryName` keeps naming the repository the version was
+//!   originally published to, because "if a package version exists in a repository and is
+//!   updated … the package version's `DomainEntryPoint` will not change from the original
+//!   package version's value" (`DomainEntryPoint`'s own documentation). So a later
+//!   `DescribePackageVersion` against the DESTINATION answers 200 with the same
+//!   description, revision included;
+//! * the destination package record is created on demand when the copy writes the first
+//!   version of it, and not otherwise — a copy that materializes nothing leaves the
+//!   destination exactly as it was;
+//! * `includeFromUpstream` changes nothing here, and deliberately: this emulator holds a
+//!   package version only in the repository it was published into, and no operation
+//!   resolves a version through a repository's upstreams, so a version the SOURCE
+//!   repository does not itself hold is reported `NOT_FOUND` rather than copied from a
+//!   place nothing was fetched from.
 //!
 //! ## Shape of an operation
 //!
@@ -193,20 +214,394 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CopyPackageVersions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CopyPackageVersionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CopyPackageVersions"))
+        // Request-only rule, refused before the store is touched: "You must specify
+        // versions or versionRevisions. You cannot specify both" (this operation's own
+        // documentation). The two members cannot be checked by the boundary validator,
+        // which sees each one on its own.
+        let requested: Vec<String> = match (&input.versions, &input.version_revisions) {
+            (Some(_), Some(_)) => {
+                return Err(bad_request(
+                    "versions and versionRevisions cannot both be specified; a copy names \
+                     its package versions by one or the other."
+                        .to_string(),
+                ));
+            }
+            (None, None) => {
+                return Err(bad_request(
+                    "either versions or versionRevisions must be specified to name the \
+                     package versions to copy."
+                        .to_string(),
+                ));
+            }
+            // The map's keys ARE the versions it pins a revision for, so a revision-keyed
+            // request names the same set the list form does — and is bounded by the same
+            // count, which the model declares on `versions` but not on this map. Checked
+            // BEFORE the keys are collected, so an oversized map buys no allocation, no
+            // sort and no per-entry failure message.
+            (None, Some(revisions)) => {
+                if revisions.len() > crate::state::MAX_VERSIONS_PER_COPY_REQUEST {
+                    return Err(bad_request(format!(
+                        "versionRevisions names {} package versions, more than the maximum of {} \
+                         versions one copy may name.",
+                        revisions.len(),
+                        crate::state::MAX_VERSIONS_PER_COPY_REQUEST
+                    )));
+                }
+                let mut versions: Vec<String> = revisions.keys().cloned().collect();
+                versions.sort();
+                versions
+            }
+            (Some(versions), None) => versions.clone(),
+        };
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CopyPackageVersionsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the CodeArtifact store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+        let mut store = state.lock();
+
+        // What the service already retains, read before the store is borrowed mutably: a
+        // copy duplicates the source assets, so it is a growth site and is bounded by the
+        // same declared ceiling every publish is.
+        let stored_asset_bytes = store.stored_asset_bytes();
+
+        let Some(domain) = store.domain_mut(&input.domain, input.domain_owner.as_deref()) else {
+            return Err(not_found(
+                crate::state::domain_not_found_message(
+                    &input.domain,
+                    input.domain_owner.as_deref(),
+                ),
+                &input.domain,
+                "domain",
+            ));
+        };
+        // Both repositories are resolved against the ONE domain the request names: a copy
+        // moves versions "from one repository to another repository in the same domain".
+        if !domain
+            .repositories
+            .contains_key(&input.destination_repository)
+        {
+            return Err(not_found(
+                crate::state::repository_not_found_message(
+                    &input.domain,
+                    input.domain_owner.as_deref(),
+                    &input.destination_repository,
+                ),
+                &input.destination_repository,
+                "repository",
+            ));
+        }
+
+        let key =
+            crate::state::package_key(&input.format, input.namespace.as_deref(), &input.package);
+
+        let mut failed: ::std::collections::HashMap<String, PackageVersionError> =
+            ::std::collections::HashMap::new();
+
+        // ------------------------------------------------------------------
+        // The SOURCE side: what the copy has to work with. Read out as owned
+        // records, because the destination lives in the same map and cannot be
+        // taken mutably while the source is still borrowed.
+        // ------------------------------------------------------------------
+        let candidates = {
+            let Some(source) = domain.repositories.get(&input.source_repository) else {
+                return Err(not_found(
+                    crate::state::repository_not_found_message(
+                        &input.domain,
+                        input.domain_owner.as_deref(),
+                        &input.source_repository,
+                    ),
+                    &input.source_repository,
+                    "repository",
+                ));
+            };
+            let Some(source_package) =
+                source.package(&input.format, input.namespace.as_deref(), &input.package)
+            else {
+                return Err(not_found(
+                    crate::state::package_not_found_message(
+                        &input.package,
+                        &input.source_repository,
+                    ),
+                    &input.package,
+                    "package",
+                ));
+            };
+
+            let mut candidates: Vec<(String, crate::state::PackageVersion)> = Vec::new();
+            // The versions already decided, as a SET: the answers are maps keyed by
+            // version, so a list that repeats one carries a single outcome for it, and the
+            // check for "already decided" must cost a lookup rather than a scan of
+            // everything decided so far.
+            let mut decided: ::std::collections::BTreeSet<&str> = ::std::collections::BTreeSet::new();
+            for version in &requested {
+                if !decided.insert(version.as_str()) {
+                    continue;
+                }
+
+                let Some(stored) = source_package.versions.get(version) else {
+                    failed.insert(
+                        version.clone(),
+                        version_error(
+                            PACKAGE_VERSION_ERROR_NOT_FOUND,
+                            crate::state::package_version_not_found_message(
+                                &input.package,
+                                version,
+                                &input.source_repository,
+                            ),
+                        ),
+                    );
+                    continue;
+                };
+
+                // A `versionRevisions` entry is the caller's precondition on the CONTENT
+                // they are copying: "A CopyPackageVersion operation succeeds if the
+                // specified versions in the source repository match the specified package
+                // version revision."
+                if let Some(pinned) = input
+                    .version_revisions
+                    .as_ref()
+                    .and_then(|revisions| revisions.get(version))
+                {
+                    let held = stored.revision();
+                    if *pinned != held {
+                        failed.insert(
+                            version.clone(),
+                            version_error(
+                                PACKAGE_VERSION_ERROR_MISMATCHED_REVISION,
+                                format!(
+                                    "Package version {} {} is at revision {}, not the \
+                                     specified revision {}.",
+                                    input.package, version, held, pinned
+                                ),
+                            ),
+                        );
+                        continue;
+                    }
+                }
+
+                // Cloned whole: a copy carries the version's assets, status, published
+                // time and origin provenance, so the destination holds the same version
+                // rather than a new one that merely shares its name.
+                candidates.push((version.clone(), stored.clone()));
+            }
+            candidates
+        };
+
+        // ------------------------------------------------------------------
+        // The DESTINATION side: what it already holds decides which candidates
+        // are written. Read out as owned values for the same borrow reason.
+        // ------------------------------------------------------------------
+        let Some(destination) = domain.repositories.get_mut(&input.destination_repository) else {
+            return Err(not_found(
+                crate::state::repository_not_found_message(
+                    &input.domain,
+                    input.domain_owner.as_deref(),
+                    &input.destination_repository,
+                ),
+                &input.destination_repository,
+                "repository",
+            ));
+        };
+        let held = destination.packages.get(&key);
+        let destination_holds_package = held.is_some();
+        // Origin control decides whether the destination package accepts a new version at
+        // all; `PackageVersionErrorCode$NOT_ALLOWED` is the per-version channel for that
+        // refusal. A package the destination does not hold yet is created with the default
+        // configuration, which allows it.
+        let publish_blocked = held.is_some_and(|package| !package.publish_allowed());
+        let held_versions: ::std::collections::BTreeSet<String> = held
+            .map(|package| package.versions.keys().cloned().collect())
+            .unwrap_or_default();
+
+        let mut to_write: Vec<(String, crate::state::PackageVersion)> = Vec::new();
+        for (version, record) in candidates {
+            if publish_blocked {
+                failed.insert(
+                    version,
+                    version_error(
+                        PACKAGE_VERSION_ERROR_NOT_ALLOWED,
+                        format!(
+                            "Copying into package {} is blocked by its package origin \
+                             configuration in repository {}.",
+                            input.package, input.destination_repository
+                        ),
+                    ),
+                );
+                continue;
+            }
+            // "Set to true to overwrite a package version that already exists in the
+            // destination repository. If set to false and the package version already
+            // exists in the destination repository, the package version is returned in the
+            // failedVersions field of the response with an ALREADY_EXISTS error code."
+            if held_versions.contains(&version) && !input.allow_overwrite.unwrap_or(false) {
+                failed.insert(
+                    version.clone(),
+                    version_error(
+                        PACKAGE_VERSION_ERROR_ALREADY_EXISTS,
+                        format!(
+                            "Package version {} {} already exists in repository {}.",
+                            input.package, version, input.destination_repository
+                        ),
+                    ),
+                );
+                continue;
+            }
+            to_write.push((version, record));
+        }
+
+        // Every ceiling is checked BEFORE the first write, so a refused copy leaves the
+        // destination exactly as it was.
+        if !to_write.is_empty() {
+            if !destination_holds_package
+                && destination.packages.len() >= crate::state::MAX_PACKAGES_PER_REPOSITORY
+            {
+                return Err(quota_exceeded(
+                    format!(
+                        "Cannot copy package {}: repository {} already holds the maximum of {} packages.",
+                        input.package,
+                        input.destination_repository,
+                        crate::state::MAX_PACKAGES_PER_REPOSITORY
+                    ),
+                    &input.package,
+                    "package",
+                ));
+            }
+            let added = to_write
+                .iter()
+                .filter(|(version, _)| !held_versions.contains(version))
+                .count();
+            if held_versions.len() + added > crate::state::MAX_PACKAGE_VERSIONS_PER_PACKAGE {
+                return Err(quota_exceeded(
+                    format!(
+                        "Cannot copy {} versions of package {}: the package would hold {} versions, \
+                         more than the maximum of {}.",
+                        added,
+                        input.package,
+                        held_versions.len() + added,
+                        crate::state::MAX_PACKAGE_VERSIONS_PER_PACKAGE
+                    ),
+                    &input.package,
+                    "package",
+                ));
+            }
+            let copied_bytes = to_write.iter().fold(0i64, |total, (_, record)| {
+                total.saturating_add(record.asset_size_bytes())
+            });
+            if stored_asset_bytes.saturating_add(copied_bytes)
+                > crate::state::MAX_STORED_ASSET_BYTES
+            {
+                return Err(quota_exceeded(
+                    format!(
+                        "Cannot copy package {}: this emulator already retains {} bytes of asset \
+                         content, the copy adds {} more and its ceiling is {} bytes (CodeArtifact \
+                         stores assets in S3; this emulator holds them in memory).",
+                        input.package,
+                        stored_asset_bytes,
+                        copied_bytes,
+                        crate::state::MAX_STORED_ASSET_BYTES
+                    ),
+                    &input.package,
+                    "package",
+                ));
+            }
+        }
+
+        let mut successful: ::std::collections::HashMap<String, SuccessfulPackageVersionInfo> =
+            ::std::collections::HashMap::new();
+        if !to_write.is_empty() {
+            // Created on demand, and only now: a copy that wrote no version must not leave
+            // an empty package record behind in the destination.
+            let package = destination.packages.entry(key).or_insert_with(|| {
+                crate::state::Package::new(
+                    &input.format,
+                    input.namespace.as_deref(),
+                    &input.package,
+                )
+            });
+            for (version, record) in to_write {
+                // Read off the record that is being STORED, so the reported revision and
+                // status cannot disagree with what the destination now holds.
+                let info = SuccessfulPackageVersionInfo {
+                    revision: Some(record.revision()),
+                    status: Some(record.status.clone()),
+                };
+                package.versions.insert(version.clone(), record);
+                successful.insert(version, info);
+            }
+        }
+
+        Ok(CopyPackageVersionsOutput {
+            successful_versions: Some(successful),
+            failed_versions: Some(failed),
+        })
     }
 }
+
+/// `PackageVersionErrorCode$NOT_FOUND`: the source repository holds no such version.
+const PACKAGE_VERSION_ERROR_NOT_FOUND: &str = "NOT_FOUND";
+
+/// `PackageVersionErrorCode$MISMATCHED_REVISION`: the source version is not at the
+/// revision the caller's `versionRevisions` pinned.
+const PACKAGE_VERSION_ERROR_MISMATCHED_REVISION: &str = "MISMATCHED_REVISION";
+
+/// `PackageVersionErrorCode$ALREADY_EXISTS`: the destination already holds that version
+/// and the request did not allow overwriting it.
+const PACKAGE_VERSION_ERROR_ALREADY_EXISTS: &str = "ALREADY_EXISTS";
+
+/// `PackageVersionErrorCode$NOT_ALLOWED`: the destination package's origin configuration
+/// refuses a new version.
+const PACKAGE_VERSION_ERROR_NOT_ALLOWED: &str = "NOT_ALLOWED";
+
+/// The `ValidationExceptionReason` a refused member carries: the request reached the
+/// service and one of its fields failed a rule the model cannot express.
+const VALIDATION_REASON_FIELD_FAILED: &str = "FIELD_VALIDATION_FAILED";
+
+/// One entry of the `failedVersions` map: the modelled error code and why.
+fn version_error(error_code: &str, error_message: String) -> PackageVersionError {
+    PackageVersionError {
+        error_code: Some(error_code.to_string()),
+        error_message: Some(error_message),
+    }
+}
+
+/// A `ValidationException` (400): the request cannot be served as sent.
+fn bad_request(message: String) -> CopyPackageVersionsError {
+    CopyPackageVersionsErrorModeled::ValidationException(ValidationException {
+        message,
+        reason: Some(VALIDATION_REASON_FIELD_FAILED.to_string()),
+    })
+    .into()
+}
+
+/// A `ResourceNotFoundException` (404) naming the resource that was addressed, so a caller
+/// can tell an unknown domain from an unknown repository or package.
+fn not_found(message: String, resource_id: &str, resource_type: &str) -> CopyPackageVersionsError {
+    CopyPackageVersionsErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message,
+        resource_id: Some(resource_id.to_string()),
+        resource_type: Some(resource_type.to_string()),
+    })
+    .into()
+}
+
+/// A `ServiceQuotaExceededException` (402): storing the copy would pass a declared ceiling.
+fn quota_exceeded(
+    message: String,
+    resource_id: &str,
+    resource_type: &str,
+) -> CopyPackageVersionsError {
+    CopyPackageVersionsErrorModeled::ServiceQuotaExceededException(ServiceQuotaExceededException {
+        message,
+        resource_id: Some(resource_id.to_string()),
+        resource_type: Some(resource_type.to_string()),
+    })
+    .into()
+}
+
