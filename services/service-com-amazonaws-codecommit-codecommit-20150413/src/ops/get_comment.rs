@@ -199,11 +199,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
         // "This comment has already been deleted." A comment whose content was
-        // deleted is no longer readable through this operation.
+        // deleted is no longer readable through this operation, and the refusal
+        // carries the sentence the exception is recorded with — no clause of this
+        // operation's own.
         if comment.deleted {
             return Err(GetCommentErrorModeled::CommentDeletedException(
                 CommentDeletedException {
-                    message: Some(crate::state::comment_deleted_message("retrieve")),
+                    message: Some(crate::state::comment_deleted_message(None)),
                 },
             )
             .into());
