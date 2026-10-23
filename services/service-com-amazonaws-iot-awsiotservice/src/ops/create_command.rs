@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateCommand
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateCommand`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateCommand::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! RECORDS a command under its `commandId` and answers the id and the ARN it minted.
+//! The record is what `GetCommand` reads back, and the ARN is also registered in the
+//! SHARED command index (`service_common::iot_commands`) that the IoT Jobs data
+//! plane's `StartCommandExecution` resolves a `commandArn` against — so a command
+//! created here is a command an execution may be started for, and nothing else is.
 //!
 //! ## Shape of an operation
 //!
@@ -176,18 +173,116 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateCommand` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateCommandErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateCommand"))
+        let unavailable = |what: &str| -> CreateCommandError {
+            CreateCommandErrorModeled::InternalServerException(InternalServerException {
+                message: Some(format!("the IoT emulator has no {what} attached")),
+            })
+            .into()
+        };
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(unavailable("state store"));
+        };
+        // A command's EXISTENCE is read outside this crate: the IoT Jobs data plane's
+        // `StartCommandExecution` refuses an execution of a command that was never
+        // created, and the store that answers it is the shared index. So the create
+        // writes BOTH this service's record and that index, or neither.
+        let Some(registry) = crate::state::command_registry(&*self.engine) else {
+            return Err(unavailable("command registry"));
+        };
+
+        let validation = |message: String| -> CreateCommandError {
+            CreateCommandErrorModeled::ValidationException(ValidationException {
+                message: Some(message),
+            })
+            .into()
+        };
+
+        // `roleArn` belongs to ONE namespace, per the member's own documentation:
+        // "The IAM role that you must provide when using the AWS-IoT-FleetWise
+        // namespace. [...] This field is not supported when you use the AWS-IoT
+        // namespace." So the role is required with that namespace and refused with
+        // any other (including a request that names none), and `ValidationException`
+        // (HTTP 400, "The request is not valid") is the modelled refusal.
+        match (input.namespace.as_deref(), input.role_arn.as_deref()) {
+            (Some(FLEETWISE_NAMESPACE), None) => {
+                return Err(validation(format!(
+                    "roleArn is required when the command namespace is {FLEETWISE_NAMESPACE}"
+                )));
+            }
+            (namespace, Some(_)) if namespace != Some(FLEETWISE_NAMESPACE) => {
+                return Err(validation(format!(
+                    "roleArn is only supported when the command namespace is \
+                     {FLEETWISE_NAMESPACE}"
+                )));
+            }
+            _ => {}
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let command_arn = crate::state::command_arn(&region, &input.command_id);
+        let created_at = ::std::time::SystemTime::now();
+
+        // LOCK ORDER: this service's store first, the shared index second, the order
+        // `crate::state::command_registry` documents.
+        let mut store = state.lock();
+        // "A unique identifier for the command": a second create under an id the store
+        // already holds is the conflict `ConflictException` (HTTP 409, "The request
+        // conflicts with the current state of the resource") names, and it leaves the
+        // command that exists exactly as it was.
+        if let Some(existing) = store.commands.get(&input.command_id) {
+            return Err(CreateCommandErrorModeled::ConflictException(ConflictException {
+                message: Some(format!("Command {} already exists", existing.command_id)),
+                resource_id: Some(existing.command_id.clone()),
+            })
+            .into());
+        }
+
+        // The shared index is what bounds the account's commands, so registering is
+        // what decides a create at the ceiling: it is refused with the modelled
+        // `ServiceQuotaExceededException` (HTTP 402) and nothing is written.
+        let mut index = registry.lock();
+        if let Err(refusal) = index.register(&command_arn) {
+            return Err(match refusal {
+                crate::state::iot_commands::RegisterRefusal::AlreadyRegistered => {
+                    CreateCommandErrorModeled::ConflictException(ConflictException {
+                        message: Some(format!("Command {} already exists", input.command_id)),
+                        resource_id: Some(input.command_id.clone()),
+                    })
+                    .into()
+                }
+                crate::state::iot_commands::RegisterRefusal::QuotaExceeded => {
+                    CreateCommandErrorModeled::ServiceQuotaExceededException(
+                        ServiceQuotaExceededException {
+                            message: Some(refusal.to_string()),
+                        },
+                    )
+                    .into()
+                }
+            });
+        }
+
+        let command = crate::state::RegisteredCommand::new(
+            input.command_id.clone(),
+            command_arn,
+            created_at,
+            &input,
+        );
+        // The response is built from the record that is about to be persisted, so what
+        // this call reports and what the next `GetCommand` reads are one value, not two
+        // that could drift.
+        let output = CreateCommandOutput {
+            command_id: Some(command.command_id.clone()),
+            command_arn: Some(command.command_arn.clone()),
+        };
+        store.commands.insert(command.command_id.clone(), command);
+        Ok(output)
     }
 }
+
+/// The namespace whose commands build their payload through an IAM role.
+///
+/// One of the two values `CommandNamespace` admits
+/// (`smithy_query(query="shape",shape="CommandNamespace")`: `AWS-IoT`,
+/// `AWS-IoT-FleetWise`), and the one `CreateCommand$roleArn` is documented as
+/// belonging to.
+const FLEETWISE_NAMESPACE: &str = "AWS-IoT-FleetWise";
