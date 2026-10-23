@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeregisterNotificationHub
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeregisterNotificationHub`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeregisterNotificationHub::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Moves the `NotificationHub` registered in a Region to `DEREGISTERING`, which
+//! the clock turns into its removal from the store a short span later. Refuses a
+//! Region holding no hub, and one whose hub is still `REGISTERING`.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +150,83 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeregisterNotificationHub` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeregisterNotificationHubErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeregisterNotificationHubErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the notifications store is unavailable".to_string(),
+                },
+            )
+        })?;
+        let mut store = state.lock();
+
+        // Apply what the clock already owed first: a hub whose registration has
+        // fallen due is `ACTIVE` and can be deregistered, and one whose earlier
+        // deregister has fallen due no longer exists.
+        let now = ::std::time::SystemTime::now();
+        store.settle_due_hubs(now);
+
+        // `notificationHubRegion` already satisfies the modelled `Region` length
+        // and pattern: the boundary validator refused the request otherwise.
+        let region = input.notification_hub_region;
+
+        let Some(hub) = store.hubs.get_mut(&region) else {
+            // No hub is registered in that Region, so there is nothing to
+            // deregister.
+            return Err(
+                DeregisterNotificationHubErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!("no NotificationHub is registered in region {region}"),
+                        resource_id: region,
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // "Cannot deregister a Notification Hub in this status", from
+        // `NotificationHubStatus`'s own documentation for `REGISTERING`: the hub
+        // is still initializing, which is the inconsistent state
+        // `ConflictException` names.
+        if hub.status == crate::state::NOTIFICATION_HUB_STATUS_REGISTERING {
+            return Err(DeregisterNotificationHubErrorModeled::ConflictException(
+                ConflictException {
+                    message: format!(
+                        "the NotificationHub in region {region} is still registering"
+                    ),
+                    resource_id: region,
+                },
+            )
+            .into());
+        }
+
+        // A hub already on its way out keeps the removal instant its first
+        // deregister set: this operation is `@idempotent`, so repeating it
+        // reports the same `DEREGISTERING` summary rather than extending the
+        // removal or failing.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeregisterNotificationHub"))
+        // AWS's prose for this operation adds "You can't deregister the last
+        // NotificationHub in the account". That refusal is NOT enforced here, on
+        // purpose: neither the model nor the documentation says which error AWS
+        // answers it with, and an error CODE is a requirement, so guessing one
+        // would diverge either way. An emulator store also starts with zero hubs
+        // — the very state the restriction exists to prevent — so enforcing it
+        // would make the first hub registered in a fresh store permanently
+        // undeletable, with no operation able to report why. The hub a caller
+        // asks to deregister is therefore deregistered, and the account-wide
+        // floor is left to the service that publishes its error.
+        if hub.status != crate::state::NOTIFICATION_HUB_STATUS_DEREGISTERING {
+            hub.status = crate::state::NOTIFICATION_HUB_STATUS_DEREGISTERING.to_string();
+            hub.reason = crate::state::HUB_REASON_DEREGISTERING.to_string();
+            hub.due_at = Some(now + crate::state::HUB_TRANSITION_SPAN);
+        }
+
+        // Report the stored record, so this response can only say what a listing
+        // now says.
+        Ok(DeregisterNotificationHubOutput {
+            notification_hub_region: hub.region.clone(),
+            status_summary: hub.status_summary(),
+        })
     }
 }

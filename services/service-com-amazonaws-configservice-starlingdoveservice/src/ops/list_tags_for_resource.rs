@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTagsForResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTagsForResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTagsForResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the tags the resource its `ResourceArn` identifies carries in
+//! [`crate::state`], one page at a time in tag-key order: this is the read path of
+//! `TagResource` and `UntagResource`, so it reports what they persisted and nothing
+//! from the request.
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +157,94 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTagsForResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTagsForResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTagsForResource"))
+        // A read: `ctx` is not consulted, because the resource is addressed by the ARN
+        // the request names.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE)
+        })?;
+
+        // The ARN is matched VERBATIM, as the resource's read path reports it and as a
+        // tag key is: surrounding whitespace is part of the value the caller sent.
+        let resource_arn = input.resource_arn.as_str();
+        if !crate::state::is_amazon_resource_name(resource_arn) {
+            return Err(ListTagsForResourceErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::malformed_resource_arn_message(resource_arn)),
+                },
+            )
+            .into());
+        }
+
+        // The modelled range of `Limit` is 0..100, so a value past the published limit
+        // maximum clears boundary validation and is refused here.
+        if input.limit > crate::state::LIST_TAGS_MAX_LIMIT {
+            return Err(ListTagsForResourceErrorModeled::InvalidLimitException(
+                InvalidLimitException {
+                    message: Some(format!(
+                        "Limit {} is outside the allowable range of 0 to {}.",
+                        input.limit,
+                        crate::state::LIST_TAGS_MAX_LIMIT,
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // A token this service did not mint names no page to resume at.
+        let resume_at = match input.next_token.as_deref() {
+            Some(token) if !token.is_empty() => match crate::state::decode_page_token(token) {
+                Some(key) => Some(key),
+                None => {
+                    return Err(ListTagsForResourceErrorModeled::InvalidNextTokenException(
+                        InvalidNextTokenException {
+                            message: Some(format!(
+                                "The nextToken '{token}' provided in the request is not valid."
+                            )),
+                        },
+                    )
+                    .into())
+                }
+            },
+            _ => None,
+        };
+
+        // `Limit` 0 asks for the service default; a negative value would ask for a page
+        // of no tags, which would hand out a page token forever, so it asks for the
+        // default too (the modelled minimum of 0 already keeps one out of here).
+        let page_size = if input.limit <= 0 {
+            crate::state::LIST_TAGS_DEFAULT_LIMIT
+        } else {
+            input.limit
+        };
+        // In 1..=LIST_TAGS_MAX_LIMIT by the branch above and the limit check, so it is
+        // a `usize`.
+        let page_size = usize::try_from(page_size).expect("the page size is positive");
+
+        let store = state.lock();
+        let Some(tags) = store.tags_of(resource_arn) else {
+            return Err(ListTagsForResourceErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::resource_not_found_message(resource_arn)),
+                },
+            )
+            .into());
+        };
+
+        // Tags are keyed, so the page is a span of the key ordering: a token resumes at
+        // a key, and the next token names the first key this page did not carry.
+        let mut remaining = tags
+            .iter()
+            .filter(|(key, _)| resume_at.as_deref().is_none_or(|from| key.as_str() >= from));
+        let page: Vec<(&String, &String)> = remaining.by_ref().take(page_size).collect();
+        let next_token = remaining
+            .next()
+            .map(|(key, _)| crate::state::encode_page_token(key));
+
+        // `Tags` is a `TagList`, whose modelled length minimum is 1, so a page with no
+        // tags on it omits the member rather than reporting an empty list.
+        let tags = (!page.is_empty()).then(|| crate::state::tag_list(page));
+
+        Ok(ListTagsForResourceOutput { tags, next_token })
     }
 }

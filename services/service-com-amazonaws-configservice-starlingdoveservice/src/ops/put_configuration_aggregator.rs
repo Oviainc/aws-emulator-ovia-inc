@@ -311,7 +311,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     aggregator_filters: input.aggregator_filters,
                     created_at: now,
                     last_updated_at: now,
-                    tags: input.tags.unwrap_or_default(),
+                    tags: crate::state::tag_set(input.tags.as_deref().unwrap_or_default()),
                 },
             );
         }
