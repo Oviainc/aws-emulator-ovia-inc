@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/gateway_lifecycle.rs"]
 mod gateway_lifecycle;
+#[path = "all/hypervisor_import_concurrency.rs"]
+mod hypervisor_import_concurrency;
 #[path = "all/hypervisor_listing.rs"]
 mod hypervisor_listing;
 #[path = "all/hypervisor_reads.rs"]
