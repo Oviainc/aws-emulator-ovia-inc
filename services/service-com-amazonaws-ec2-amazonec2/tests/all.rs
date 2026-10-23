@@ -17,6 +17,8 @@ mod application_status;
 mod availability_zones;
 #[path = "all/capacity_blocks.rs"]
 mod capacity_blocks;
+#[path = "all/coip_pools.rs"]
+mod coip_pools;
 #[path = "all/copy_volumes.rs"]
 mod copy_volumes;
 #[path = "all/create_security_group.rs"]

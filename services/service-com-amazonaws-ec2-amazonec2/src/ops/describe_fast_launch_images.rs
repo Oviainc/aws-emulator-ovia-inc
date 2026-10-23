@@ -148,7 +148,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         use crate::state::{
             CompiledFilter, MAX_FILTER_MATCH_STEPS, MAX_FILTER_VALUE_BYTES, MAX_FILTER_VALUES,
             MAX_FILTERS, MAX_RESOURCE_IDS, MatchBudget, account_can_see_image, decode_page_token,
-            encode_page_token, image_id_is_well_formed, invalid_pagination_token, invalid_request,
+            encode_page_token, image_id_is_well_formed, invalid_pagination_token_for, invalid_request,
             require_service_state,
         };
 
@@ -215,7 +215,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // else is refused rather than read as an id.
         let start_at = match input.next_token.as_deref() {
             None => None,
-            Some(token) => Some(decode_page_token(token).ok_or_else(invalid_pagination_token)?),
+            Some(token) => {
+                Some(decode_page_token(token).ok_or_else(|| invalid_pagination_token_for(token))?)
+            }
         };
 
         let state = require_service_state(&*self.engine)?;
