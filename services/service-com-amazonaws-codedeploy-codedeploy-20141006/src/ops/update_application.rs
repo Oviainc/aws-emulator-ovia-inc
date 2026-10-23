@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateApplication
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateApplication`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Renames a stored application: the record keeps its `applicationId`, its compute
+//! platform, its tags, its creation time, its deployment groups and its deployment
+//! history, and is answered from then on under the new name only.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateApplication::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +158,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateApplication` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateApplicationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateApplication"))
+        let _ = ctx;
+        // BOTH members are OPTIONAL in the model, so their length and pattern are
+        // refused by the boundary only where they are PRESENT — an empty name of
+        // either member never reaches here. What is left for the handler is which
+        // member has to be there at all: `applicationName` identifies the
+        // application to change, and without it there is nothing to change.
+        let Some(name) = input.application_name else {
+            return Err(UpdateApplicationErrorModeled::ApplicationNameRequiredException(
+                ApplicationNameRequiredException {
+                    message: Some(crate::state::APPLICATION_NAME_MISSING.to_string()),
+                },
+            )
+            .into());
+        };
+        let new_name = input.new_application_name;
+
+        crate::state::with_state(&*self.engine, |state| {
+            if !state.applications.contains_key(&name) {
+                return Err(UpdateApplicationErrorModeled::ApplicationDoesNotExistException(
+                    ApplicationDoesNotExistException {
+                        message: Some(crate::state::application_not_found(&name)),
+                    },
+                ));
+            }
+            // A request that carries no new name asks for no change: the stored
+            // record already is what it asks for, so this succeeds having renamed
+            // nothing. CodeDeploy documents nothing for the omitted member, and
+            // leaving the record alone is the only reading that invents no name.
+            let Some(new_name) = new_name else {
+                return Ok(());
+            };
+            // An application name is unique per account per Region, so renaming onto
+            // a name another application already holds is refused. The application's
+            // OWN current name is not another application: that request changes
+            // nothing, so it is answered as the no-op it is.
+            if new_name != name && state.applications.contains_key(&new_name) {
+                return Err(UpdateApplicationErrorModeled::ApplicationAlreadyExistsException(
+                    ApplicationAlreadyExistsException {
+                        message: Some(crate::state::application_already_exists(&new_name)),
+                    },
+                ));
+            }
+            state.rename_application(&name, &new_name);
+            Ok(())
+        })
+        .ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE)
+        })??;
+
+        Ok(UpdateApplicationOutput::default())
     }
 }

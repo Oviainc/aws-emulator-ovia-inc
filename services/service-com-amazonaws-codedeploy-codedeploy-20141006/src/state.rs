@@ -949,6 +949,45 @@ impl ComAmazonawsCodedeployCodedeploy20141006State {
         }
     }
 
+    /// Re-key the application stored under `current` as `new`, carrying every
+    /// record that references it by name with it. Renaming a `current` that no
+    /// application is stored under does nothing: whether the application exists
+    /// is the caller's to report, because it is the caller that raises the
+    /// modelled `ApplicationDoesNotExistException` for it.
+    ///
+    /// It is the SAME resource under a new name, so its identity is untouched —
+    /// `applicationId`, compute platform, tags and creation time all stay — and
+    /// everything that points at it by name moves: its deployment groups, and
+    /// the deployments it ran (`deployment_group_info` matches a deployment to
+    /// its group by application name, so a deployment left under the old name
+    /// would disappear from the group's last-deployment reporting).
+    ///
+    /// The creation position in [`Self::application_order`] is kept rather than
+    /// re-appended, so renaming does not reorder `ListApplications`.
+    pub fn rename_application(&mut self, current: &str, new: &str) {
+        if current == new {
+            return;
+        }
+        let Some(mut application) = self.applications.remove(current) else {
+            return;
+        };
+        application.application_name = new.to_string();
+        for group in application.deployment_groups.values_mut() {
+            group.application_name = new.to_string();
+        }
+        for deployment in self.deployments.values_mut() {
+            if deployment.application_name == current {
+                deployment.application_name = new.to_string();
+            }
+        }
+        for stored in &mut self.application_order {
+            if stored == current {
+                *stored = new.to_string();
+            }
+        }
+        self.applications.insert(new.to_string(), application);
+    }
+
     /// Settle `deployment_id` in the terminal `status` at `now_ms`, with the
     /// error information CodeDeploy reports for it, and answer whether the
     /// deployment was there to settle.
