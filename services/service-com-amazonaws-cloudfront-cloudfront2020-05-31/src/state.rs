@@ -51,9 +51,9 @@ use crate::ops::types::{
     DistributionTenant, DomainResult, EntityAlreadyExists, EntityNotFound, ForwardedValues,
     FunctionAssociations, GeoRestriction, Invalidation, InvalidationBatch, InvalidationSummary,
     InvalidTagging, KGKeyPairIds, KeyPairIds, KeyValueStore, LambdaFunctionAssociations,
-    LoggingConfig, ManagedCertificateRequest, NoSuchCloudFrontOriginAccessIdentity,
-    NoSuchCachePolicy, NoSuchDistribution, NoSuchInvalidation, NoSuchOriginRequestPolicy,
-    NoSuchResource,
+    LoggingConfig, ManagedCertificateRequest, MonitoringSubscription, NoSuchCachePolicy,
+    NoSuchCloudFrontOriginAccessIdentity, NoSuchDistribution, NoSuchInvalidation,
+    NoSuchMonitoringSubscription, NoSuchOriginRequestPolicy, NoSuchResource,
     NoSuchResponseHeadersPolicy, Origin, OriginRequestPolicy, OriginRequestPolicyAlreadyExists,
     OriginRequestPolicyConfig, OriginSslProtocols, Parameter, ParameterDefinition, Paths,
     ResponseHeadersPolicy,
@@ -749,6 +749,17 @@ pub struct StoredDistribution {
     pub tags: TagSet,
     /// Every invalidation created under this distribution, keyed by invalidation id.
     pub invalidations: BTreeMap<String, StoredInvalidation>,
+    /// The additional-CloudWatch-metrics subscription associated with this distribution,
+    /// or `None` while it has none.
+    ///
+    /// A sub-resource of the distribution rather than a member of its configuration —
+    /// `CreateMonitoringSubscription`, `GetMonitoringSubscription` and
+    /// `DeleteMonitoringSubscription` address it under
+    /// `/distributions/{Id}/monitoring-subscription` — so it is carried on this record
+    /// and released with it, and changing it leaves the configuration, the version token
+    /// and the propagation status of the distribution exactly as they were. A
+    /// distribution is created without one: nothing but a create puts one here.
+    pub monitoring_subscription: Option<MonitoringSubscription>,
 }
 
 impl StoredDistribution {
@@ -1804,6 +1815,10 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
             config,
             tags,
             invalidations: BTreeMap::new(),
+            // Additional CloudWatch metrics are enabled by a call of their own, so a
+            // distribution this create minted carries no monitoring subscription until
+            // `CreateMonitoringSubscription` puts one on it.
+            monitoring_subscription: None,
         };
         let created = CreatedDistribution {
             id: id.clone(),
@@ -3924,6 +3939,51 @@ pub fn no_such_response_headers_policy() -> NoSuchResponseHeadersPolicy {
         message: Some(NO_SUCH_RESPONSE_HEADERS_POLICY_MESSAGE.to_string()),
     }
 }
+
+/// The modelled `MonitoringSubscriptionAlreadyExists` (HTTP 409) for a distribution that
+/// already carries a monitoring subscription.
+///
+/// A property of the distribution's state rather than of the request, so nothing from the
+/// request belongs in the text, exactly as in [`no_such_distribution`]: one CONSTANT per
+/// error code.
+pub fn monitoring_subscription_already_exists()
+-> crate::ops::types::MonitoringSubscriptionAlreadyExists {
+    crate::ops::types::MonitoringSubscriptionAlreadyExists {
+        message: Some(MONITORING_SUBSCRIPTION_ALREADY_EXISTS_MESSAGE.to_string()),
+    }
+}
+
+/// The message `MonitoringSubscriptionAlreadyExists` carries, on the wire.
+///
+/// The value below is the WIRE text — what the recorded service answers this code with,
+/// and what this emulator therefore serves. Like
+/// [`DISTRIBUTION_NOT_DISABLED_MESSAGE`], it deliberately differs from the sentence the
+/// MODEL's documentation of the error shape uses for the same rule ("A monitoring
+/// subscription already exists for the specified distribution."): that one documents the
+/// condition, this one is served. Do not "correct" this constant to the documentation
+/// sentence.
+pub const MONITORING_SUBSCRIPTION_ALREADY_EXISTS_MESSAGE: &str =
+    "A monitoring subscription already exists for this distribution";
+
+/// The modelled `NoSuchMonitoringSubscription` (HTTP 404) for a distribution that carries
+/// no monitoring subscription. Fixed service text, for the same reason
+/// [`monitoring_subscription_already_exists`]'s is.
+pub fn no_such_monitoring_subscription() -> NoSuchMonitoringSubscription {
+    NoSuchMonitoringSubscription {
+        message: Some(NO_SUCH_MONITORING_SUBSCRIPTION_MESSAGE.to_string()),
+    }
+}
+
+/// The message `NoSuchMonitoringSubscription` carries, on the wire.
+///
+/// The WIRE text — what the recorded service answers this code with, and what this
+/// emulator therefore serves. Like [`MONITORING_SUBSCRIPTION_ALREADY_EXISTS_MESSAGE`] and
+/// [`DISTRIBUTION_NOT_DISABLED_MESSAGE`], it differs from the sentence the MODEL's
+/// documentation of the error shape uses for the same rule ("A monitoring subscription does
+/// not exist for the specified distribution."): that one documents the condition, this one
+/// is served. Do not "correct" this constant to the documentation sentence.
+pub const NO_SUCH_MONITORING_SUBSCRIPTION_MESSAGE: &str =
+    "The monitoring subscription does not exist.";
 
 /// `NoSuchResponseHeadersPolicy`'s message, as the model documents the shape.
 pub const NO_SUCH_RESPONSE_HEADERS_POLICY_MESSAGE: &str =
