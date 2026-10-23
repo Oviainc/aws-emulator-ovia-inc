@@ -67,7 +67,8 @@ use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
     AccessConfigResponse, AccessEntry, AccessScope, Addon, AddonHealth,
-    AddonNamespaceConfigResponse, AssociatedAccessPolicy, Cancellation, Capability,
+    AddonNamespaceConfigResponse, AssociatedAccessPolicy, BadRequestException, Cancellation,
+    Capability,
     CapabilityConfigurationResponse, CapabilityHealth, CapabilityIssue, CapabilitySummary,
     Certificate, Cluster, ClusterVersionInformation, ComputeConfigResponse,
     ConnectorConfigResponse,
@@ -516,6 +517,45 @@ pub fn child_resource_not_found(message: String) -> ResourceNotFoundException {
     ResourceNotFoundException {
         message: Some(message),
         ..Default::default()
+    }
+}
+
+/// This service's ARN namespace: the third field of every ARN its resources carry
+/// (`aws.api#service$arnNamespace` is `eks`, as
+/// `smithy_query query="service_info"` reports, and
+/// [`::engine::emulator_arn`] is given the same token wherever this crate mints one).
+pub const ARN_NAMESPACE: &str = "eks";
+
+/// The sentence a `resourceArn` that is not a resource ARN of this service is refused
+/// with.
+///
+/// `BadRequestException` is "thrown if the request contains a semantic error. The
+/// precise meaning will depend on the API, and will be documented in the error
+/// message", so the message is the service's own wording for THIS refusal — a syntax
+/// failure on the input — and it names nothing from the request: what a client
+/// branches on is the 400 and the error code.
+pub const INVALID_RESOURCE_ARN_MESSAGE: &str = "Invalid input resource arn: bad syntax";
+
+/// Whether `value` is syntactically a resource ARN OF THIS SERVICE: six well-formed
+/// ARN fields ([`::service_common::arn`]) whose vendor field is [`ARN_NAMESPACE`].
+///
+/// An operation whose input binds a caller-chosen `resourceArn` reads it with this
+/// before it looks anything up: a value that is not an ARN, or is an ARN of another
+/// vendor, addresses nothing this API can name, so it is a bad REQUEST rather than a
+/// resource that happens to be absent. A well-formed ARN of this namespace that no
+/// stored resource owns is the absent case, and stays a not-found.
+#[must_use]
+pub fn is_eks_resource_arn(value: &str) -> bool {
+    ::service_common::arn::is_resource_arn_of(value, ARN_NAMESPACE)
+}
+
+/// The `BadRequestException` payload for a `resourceArn` [`is_eks_resource_arn`]
+/// rejects, shared by every operation that binds one so they cannot disagree on the
+/// refusal.
+#[must_use]
+pub fn invalid_resource_arn() -> BadRequestException {
+    BadRequestException {
+        message: Some(INVALID_RESOURCE_ARN_MESSAGE.to_string()),
     }
 }
 
