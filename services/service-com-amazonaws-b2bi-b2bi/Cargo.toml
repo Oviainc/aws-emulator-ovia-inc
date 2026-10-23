@@ -10,6 +10,20 @@ build = "build.rs"
 engine = { workspace = true }
 # Hex codec for the opaque `nextToken` the @paginated List operations issue.
 hex = { workspace = true }
+# JSONata interpreter: `TestMapping` evaluates the caller's mapping template through it
+# (an execution substrate — `src/ops/test_mapping.rs`'s module docs carry the bounds it
+# runs under and the engine's whole builtin surface). `default-features = false`: the
+# emulator needs nothing the crate turns on by default. Pinned EXACTLY, not by caret:
+# that handler's step gate reads the engine's own parsed AST, so the version whose node
+# shapes it was verified against is the version it gets. Declared here rather than in the
+# root `[workspace.dependencies]`, which a service crate does not get to edit.
+jsonata-rs = { version = "=0.3.4", default-features = false }
+# The arena `jsonata-rs` allocates its parsed expressions and values into: one per
+# evaluation, dropped with it. Pinned EXACTLY for the same reason as the interpreter:
+# `src/ops/test_mapping.rs` enforces its memory ceiling through this crate's allocation
+# limit and the panic it raises when it refuses. Declared here rather than in the root
+# `[workspace.dependencies]`, which a service crate does not get to edit.
+bumpalo = "=3.20.3"
 # The CloudWatch Logs client CreateProfile provisions a logging-ENABLED profile's log
 # group with, over the in-process callback into this same emulator (no network client
 # feature is enabled: the transport is the emulator's own).
@@ -22,7 +36,9 @@ emulator-server = { workspace = true }
 emulator-telemetry = { workspace = true }
 aws-smithy-runtime-api = { workspace = true }
 aws-smithy-types = { workspace = true }
-tokio = { workspace = true }
+# `sync` and `time`: the evaluation permit and the evaluation deadline that bound the
+# caller-supplied mapping template in `src/ops/test_mapping.rs`.
+tokio = { workspace = true, features = ["sync", "time"] }
 bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
