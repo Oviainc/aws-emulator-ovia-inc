@@ -169,8 +169,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let state = crate::state::require_state(&*self.engine)?;
+
+        // Every step the clock had already made due before this call, so the concurrency
+        // accounting below sees the executions as they stand now (see `state::driver`).
+        crate::state::advance(&*self.engine, ctx, &input.pipeline_name).await;
         let mut state = state.lock();
 
         // The revision is reported against one action of one stage of one pipeline, so

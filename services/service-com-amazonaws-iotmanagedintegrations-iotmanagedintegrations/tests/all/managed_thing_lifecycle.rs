@@ -23,9 +23,9 @@ use std::time::{Duration, SystemTime};
 
 use serde_json::{json, Value};
 use service_com_amazonaws_iotmanagedintegrations_iotmanagedintegrations::state::{
-    IdempotencyRecord, AUTH_MATERIAL_TYPE_VALUES, HUB_NETWORK_MODE_VALUES, IDEMPOTENCY_TTL,
-    INITIAL_PROVISIONING_STATUS, MANAGED_THING_PAGE_LIMIT, MAX_IDEMPOTENCY_TOKENS,
-    MAX_MANAGED_THINGS, ROLE_VALUES,
+    IdempotencyKey, IdempotencyRecord, AUTH_MATERIAL_TYPE_VALUES, HUB_NETWORK_MODE_VALUES,
+    IDEMPOTENCY_TTL, INITIAL_PROVISIONING_STATUS, MANAGED_THING_PAGE_LIMIT,
+    MANAGED_THING_RESOURCE_TYPE, MAX_IDEMPOTENCY_TOKENS, MAX_MANAGED_THINGS, ROLE_VALUES,
 };
 use service_com_amazonaws_iotmanagedintegrations_iotmanagedintegrations::{
     ComAmazonawsIotmanagedintegrationsIotmanagedintegrationsState as ServiceState, EmulatedService,
@@ -1071,9 +1071,9 @@ async fn idempotency_records_are_retired_by_their_ttl_and_capped() {
                 now
             };
             store.idempotency_tokens.insert(
-                token.clone(),
+                IdempotencyKey::new(MANAGED_THING_RESOURCE_TYPE, &token),
                 IdempotencyRecord {
-                    managed_thing_id: kept.clone(),
+                    resource_id: kept.clone(),
                     minted_at,
                 },
             );
@@ -1105,13 +1105,15 @@ async fn idempotency_records_are_retired_by_their_ttl_and_capped() {
     );
     for token in &expired_tokens {
         assert!(
-            !tokens.contains_key(token),
+            !tokens.contains_key(&IdempotencyKey::new(MANAGED_THING_RESOURCE_TYPE, token)),
             "case \"sweep\": the record for {token:?} was past its TTL, so it must be retired"
         );
     }
     let surviving_fresh = fresh_tokens
         .iter()
-        .filter(|token| tokens.contains_key(*token))
+        .filter(|token| {
+            tokens.contains_key(&IdempotencyKey::new(MANAGED_THING_RESOURCE_TYPE, token))
+        })
         .count();
     assert!(
         surviving_fresh >= fresh_tokens.len() - 1,
@@ -1119,7 +1121,10 @@ async fn idempotency_records_are_retired_by_their_ttl_and_capped() {
         fresh_tokens.len()
     );
     assert!(
-        tokens.contains_key("after-the-sweep"),
+        tokens.contains_key(&IdempotencyKey::new(
+            MANAGED_THING_RESOURCE_TYPE,
+            "after-the-sweep"
+        )),
         "case \"sweep\": the create's own token must be recorded, got {} records",
         tokens.len()
     );

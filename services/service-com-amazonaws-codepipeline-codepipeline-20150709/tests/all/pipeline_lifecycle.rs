@@ -144,6 +144,15 @@ pub(crate) fn declaration(name: &str) -> Value {
     })
 }
 
+/// A source stage whose action is `Custom`-owned.
+///
+/// The owner matters to every suite that STARTS an execution of these fixtures: a
+/// `Custom`-owned action's outcome is a job worker's to report (`PollForJobs` ->
+/// `AcknowledgeJob` -> `PutJobSuccessResult`), so an execution that reaches it waits
+/// there instead of being carried on by the clock — which is what lets these suites
+/// assert about a running execution without racing the execution plane. The plane
+/// itself, including what it does to an action whose work runs outside this emulator,
+/// is `tests/all/execution_engine.rs`.
 pub(crate) fn source_stage(name: &str) -> Value {
     json!({
         "name": name,
@@ -151,8 +160,8 @@ pub(crate) fn source_stage(name: &str) -> Value {
             "name": "Src",
             "actionTypeId": {
                 "category": "Source",
-                "owner": "AWS",
-                "provider": "S3",
+                "owner": "Custom",
+                "provider": "MySource",
                 "version": "1",
             },
             "configuration": {"S3Bucket": "my-bucket", "S3ObjectKey": "app.zip"},

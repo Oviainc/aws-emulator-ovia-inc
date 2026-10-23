@@ -23,7 +23,10 @@
 //!   that quota is refused with the modelled `WAFLimitsExceededException` and changes
 //!   nothing.
 //! * `ListTagsForResource` "[r]etrieves the tags associated with the specified AWS
-//!   resource", paginated by the modelled `Limit`/`NextMarker` pair.
+//!   resource", paginated by the modelled `Limit`/`NextMarker` pair — and it reports its
+//!   pagination state POSITIVELY: `NextMarker` is present on every successful response,
+//!   naming the key the next page resumes at while one remains and EMPTY once the listing
+//!   is complete, never absent.
 //! * `UntagResource` removes the tags `TagKeys` names from that same set, so a key it
 //!   names that the resource does not carry leaves the set as it was.
 
@@ -125,9 +128,10 @@ async fn stored_tags(router: &MultiServiceRouter, arn: &str) -> BTreeMap<String,
         Some(arn),
         "ListTagsForResource must report the ARN of the resource it read: {body}"
     );
-    assert!(
-        body["NextMarker"].is_null(),
-        "a tag set that fits one page leaves no NextMarker: {body}"
+    assert_eq!(
+        body["NextMarker"].as_str(),
+        Some(""),
+        "a tag set that fits one page reports a complete listing's empty NextMarker: {body}"
     );
     tag_pairs(&body).into_iter().collect()
 }
@@ -603,7 +607,17 @@ async fn listing_tags_pages_through_the_tag_set_and_changes_nothing() {
                 "case Limit={limit}: a page must hold at most {limit} tags, got {page:?}"
             );
             walked.extend(page);
-            marker = body["NextMarker"].as_str().map(str::to_string);
+            // The marker is on every page; a page that ends the listing carries it
+            // empty, which is what ends the walk.
+            marker = Some(
+                body["NextMarker"]
+                    .as_str()
+                    .unwrap_or_else(|| {
+                        panic!("case Limit={limit}: every page carries NextMarker, got {body}")
+                    })
+                    .to_string(),
+            )
+            .filter(|marker| !marker.is_empty());
             if marker.is_none() {
                 break;
             }
@@ -665,9 +679,11 @@ async fn listing_tags_pages_through_the_tag_set_and_changes_nothing() {
         tag_pairs(&past_the_end).is_empty(),
         "a marker past every key yields an empty page, got {past_the_end}"
     );
-    assert!(
-        past_the_end["NextMarker"].is_null(),
-        "an empty page leaves no NextMarker, got {past_the_end}"
+    assert_eq!(
+        past_the_end["NextMarker"].as_str(),
+        Some(""),
+        "an empty page is a complete listing: its NextMarker is present and empty, \
+         got {past_the_end}"
     );
 }
 
@@ -903,8 +919,104 @@ async fn a_resource_with_no_tags_reports_an_empty_tag_list() {
         tag_pairs(&body).is_empty(),
         "an untagged resource carries no tags, got {body}"
     );
-    assert!(
-        body["NextMarker"].is_null(),
-        "an empty tag set leaves no NextMarker, got {body}"
+    assert_eq!(
+        body["NextMarker"].as_str(),
+        Some(""),
+        "an empty tag set is a complete listing: its NextMarker is present and empty, \
+         got {body}"
     );
+}
+
+/// `ListTagsForResource` reports its pagination state positively: the `NextMarker` key is
+/// on EVERY successful response — the key the next page resumes at while a further page
+/// remains, and empty exactly when the listing is complete.
+///
+/// The recorded unit is one resource with one tag read in a single page; the table below
+/// is the class that rule covers, its rows differing in how many tags the resource
+/// carries, the `Limit` each page asks for (the modelled `@range` 0..100, 0 being the
+/// declared default that asks for the service's own page size) and whether the page is
+/// the last, a truncated one, or exactly as full as the remaining tags.
+#[tokio::test]
+async fn every_tag_listing_page_reports_a_marker_empty_only_when_complete() {
+    let router = router();
+
+    // Rows: (tag count, Limit) spanning an empty tag set, a single tag, a page exactly as
+    // full as the tag set, a page smaller than it, and the default page size.
+    for (tag_count, limit) in [
+        (0_usize, 0_u32),
+        (0, 1),
+        (1, 0),
+        (1, 1),
+        (1, 2),
+        (3, 1),
+        (3, 2),
+        (3, 3),
+        (3, 4),
+        (3, 0),
+        (9, 4),
+        (9, 100),
+    ] {
+        let case = format!("{tag_count} tags, Limit={limit}");
+        let rule_id = create_rule(&router, &format!("marker-{tag_count}-{limit}"), None).await;
+        let arn = rule_arn(&rule_id);
+        let keys: Vec<String> = (0..tag_count).map(|index| format!("key-{index}")).collect();
+        if tag_count > 0 {
+            let tags: Vec<Value> = keys
+                .iter()
+                .map(|key| json!({"Key": key, "Value": "v"}))
+                .collect();
+            tag_resource(&router, &arn, &json!(tags)).await;
+        }
+
+        // `Limit` of 0 asks for the service's own page size, which holds every tag here.
+        let page_size = if limit == 0 {
+            tag_count
+        } else {
+            (limit as usize).min(tag_count)
+        };
+        let mut seen = 0_usize;
+        let mut marker: Option<String> = None;
+        let mut pages = 0_usize;
+        loop {
+            let body = list_tags_page(&router, &arn, limit, marker.as_deref()).await;
+            pages += 1;
+            let page = tag_pairs(&body);
+            seen += page.len();
+            let reported = body["NextMarker"].as_str().unwrap_or_else(|| {
+                panic!("case {case:?}: every successful page carries NextMarker, got {body}")
+            });
+
+            let complete = seen >= tag_count;
+            if complete {
+                assert_eq!(
+                    reported, "",
+                    "case {case:?}: page {pages} completes the listing, so its marker is \
+                     empty, got {reported:?} ({body})"
+                );
+                break;
+            }
+            // A further page remains, so the marker names the key it resumes at: the
+            // first key after this page.
+            assert_eq!(
+                reported,
+                keys[seen].as_str(),
+                "case {case:?}: page {pages} must resume at {:?}, got {reported:?} ({body})",
+                keys[seen]
+            );
+            assert_eq!(
+                page.len(),
+                page_size,
+                "case {case:?}: a page that leaves a marker must be full, got {page:?}"
+            );
+            marker = Some(reported.to_string());
+            assert!(
+                pages <= tag_count + 1,
+                "case {case:?}: paging must terminate, saw {pages} pages"
+            );
+        }
+        assert_eq!(
+            seen, tag_count,
+            "case {case:?}: the walk must yield every tag, got {seen}"
+        );
+    }
 }

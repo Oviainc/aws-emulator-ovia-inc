@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AcknowledgeJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AcknowledgeJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AcknowledgeJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Claims one of the jobs `PollForJobs` served, for the worker that presents the
+//! `nonce` that poll handed out: "returns information about a specified job and whether
+//! that job has been received by the job worker". A claimed job moves to `InProgress`,
+//! which is what makes this worker the one whose result it accepts — so
+//! `PutJobSuccessResult` / `PutJobFailureResult` are reachable only after it.
 //!
 //! ## Shape of an operation
 //!
@@ -146,18 +143,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AcknowledgeJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AcknowledgeJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AcknowledgeJob"))
+        let state = crate::state::require_state(&*self.engine)?;
+
+        let now = ::std::time::SystemTime::now();
+        // A job exists from the moment the step that starts its action was due, so every
+        // step the clock had already made due is materialised first, for every pipeline
+        // that could be waiting on a worker (an acknowledgement names no pipeline).
+        let pipelines = state.lock().pipelines_with_live_executions();
+        for pipeline_name in pipelines {
+            crate::state::advance(&*self.engine, ctx, &pipeline_name).await;
+        }
+
+        let status = {
+            let mut store = state.lock();
+            crate::state::jobs::acknowledge(&mut store, &input.job_id, &input.nonce, now)
+        }
+        .map_err(|problem| match problem {
+            // The two refusals are ordered the way the lookup is: a job the service is
+            // not holding has no nonce to compare against, so an unknown id is "not
+            // found" whatever nonce accompanies it.
+            crate::state::JobProblem::NotFound(message) => {
+                AcknowledgeJobErrorModeled::JobNotFoundException(JobNotFoundException {
+                    message: Some(message),
+                })
+            }
+            crate::state::JobProblem::InvalidNonce(message) => {
+                AcknowledgeJobErrorModeled::InvalidNonceException(InvalidNonceException {
+                    message: Some(message),
+                })
+            }
+            // A job another worker already claimed, or one that is already complete, is
+            // not this worker's to confirm receipt of.
+            crate::state::JobProblem::InvalidState(message)
+            | crate::state::JobProblem::OutputVariablesTooLarge(message) => {
+                AcknowledgeJobErrorModeled::ValidationException(ValidationException {
+                    message: Some(message),
+                })
+            }
+        })?;
+
+        Ok(AcknowledgeJobOutput {
+            status: Some(status),
+        })
     }
 }

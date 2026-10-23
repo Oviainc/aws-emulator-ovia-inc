@@ -86,7 +86,21 @@ pub(crate) async fn call_as(
     akid: &str,
     region: &str,
 ) -> (u16, Value) {
-    let response = router.dispatch(request(uri, body, akid, region)).await;
+    dispatch_parsed(router, request(uri, body, akid, region)).await
+}
+
+/// Status and parsed body of one dispatched request, whatever method and URI it
+/// carries.
+///
+/// Most of this service's operations are `POST /Operation`, which [`call_as`] builds;
+/// the three tagging operations are REST-bound (`GET`/`PUT`/`DELETE
+/// /tags/{ResourceArn}`), so a suite that builds its own request still reads the
+/// answer through this one parser rather than a second copy of it.
+pub(crate) async fn dispatch_parsed(
+    router: &MultiServiceRouter,
+    request: http::Request<bytes::Bytes>,
+) -> (u16, Value) {
+    let response = router.dispatch(request).await;
     let status = response.status().as_u16();
     let error_type = response
         .headers()

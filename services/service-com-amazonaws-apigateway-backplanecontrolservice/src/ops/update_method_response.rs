@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateMethodResponse
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateMethodResponse`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: applies the request's `patchOperations` to the stored `MethodResponse`
+//! record — the one `PutMethodResponse` wrote at this status code — in request order, and
+//! reports the updated response, so a later `GetMethodResponse` reads back exactly what
+//! the patch set.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateMethodResponse::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The whole list is applied to a COPY of the record and written back only once every op
+//! has succeeded, so a list carrying one unsupported op leaves the stored response as it
+//! was rather than half-patched.
 //!
 //! ## Shape of an operation
 //!
@@ -96,6 +95,121 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use super::put_method::method_key;
+use super::put_method_response::{invalid_response_parameter, is_method_response_header};
+use crate::state::{
+    patch_bool_map, patch_string_map, Patch, PatchFailure, PatchOpKind, MAX_COLLECTION_ENTRIES,
+    MAX_STRING_CHARS,
+};
+
+/// The `path` values `UpdateMethodResponse` accepts: one per updateable member of the
+/// `MethodResponse` shape. `statusCode` is the response's identity — it is the URI label
+/// that addresses this very record — so it is reported but not patchable, the way
+/// `UpdateMethod` treats a method's `httpMethod`.
+const SUPPORTED_PATHS: &[&str] = &[
+    "/responseModels/<content-type>",
+    "/responseParameters/<header-name>",
+];
+
+/// Apply one patch to a COPY of a stored method response.
+///
+/// Both patchable members are MAPS, so a path names ONE entry of one of them
+/// (`/responseModels/application~1json`), exactly as `UpdateMethod` addresses a method's
+/// `requestModels`. The edit itself is the service's shared map-patch semantics
+/// ([`patch_string_map`], [`patch_bool_map`]): `add` and `replace` set the entry, `remove`
+/// drops it, and `move`/`copy`/`test` name nothing on such a member.
+fn apply_patch(entry: &mut GetMethodResponseOutput, patch: &Patch) -> Result<(), PatchFailure> {
+    match patch.member() {
+        // "A key defines a method response header" whose expression "must match the
+        // pattern method.response.header.{name}" (`MethodResponse$responseParameters`), and
+        // the value "specifies whether the associated method response header is required or
+        // not" — so the entry is a boolean keyed by a mapping expression, refused here on
+        // the same rule `PutMethodResponse` refuses it on.
+        "responseParameters" => {
+            let name = bounded_map_key(patch)?;
+            if matches!(patch.op, PatchOpKind::Add | PatchOpKind::Replace)
+                && !is_method_response_header(&name)
+            {
+                return Err(PatchFailure::BadRequest(invalid_response_parameter(&name)));
+            }
+            let mut parameters = ordered(entry.response_parameters.take());
+            patch_bool_map(&mut parameters, patch, name, MAX_COLLECTION_ENTRIES)?;
+            entry.response_parameters = unordered(parameters);
+            Ok(())
+        }
+        // "Response models are represented as a key/value map, with a content-type as the
+        // key and a Model name as the value" (`MethodResponse$responseModels`); a `/` in the
+        // content type is escaped `~1` the way a JSON Pointer requires. The value names a
+        // `Model` resource, which no operation of this emulator creates yet, so it is stored
+        // as given rather than resolved — as `PutMethodResponse` stores it.
+        "responseModels" => {
+            let content_type = bounded_map_key(patch)?;
+            let mut models = ordered(entry.response_models.take());
+            patch_string_map(&mut models, patch, content_type, MAX_COLLECTION_ENTRIES)?;
+            entry.response_models = unordered(models);
+            Ok(())
+        }
+        _ => Err(patch.unsupported_path(SUPPORTED_PATHS)),
+    }
+}
+
+/// The map key this patch names, refused when it is longer than a stored key may be.
+fn bounded_map_key(patch: &Patch) -> Result<String, PatchFailure> {
+    let key = patch.map_key(1)?;
+    crate::state::bound_chars(&patch.path, &key, MAX_STRING_CHARS)
+        .map_err(PatchFailure::BadRequest)?;
+    Ok(key)
+}
+
+/// A stored map as the shared map-patch helpers take it: the modelled `MethodResponse`
+/// maps are `HashMap`s and absent when empty, while a patch is applied to a `BTreeMap`
+/// that is present-or-empty, so this is the one place the two spellings meet.
+fn ordered<V>(
+    stored: Option<::std::collections::HashMap<String, V>>,
+) -> ::std::collections::BTreeMap<String, V> {
+    stored.unwrap_or_default().into_iter().collect()
+}
+
+/// The inverse of [`ordered`]: a patched map as it is STORED and reported — absent once
+/// its last entry is removed, which is what [`crate::state::non_empty_map`] means by an
+/// empty caller-supplied map.
+fn unordered<V>(
+    patched: ::std::collections::BTreeMap<String, V>,
+) -> Option<::std::collections::HashMap<String, V>> {
+    crate::state::non_empty_map(Some(patched.into_iter().collect()))
+}
+
+/// The modelled failure for a patch this operation cannot apply.
+fn patch_failure(failure: PatchFailure) -> UpdateMethodResponseError {
+    match failure {
+        PatchFailure::BadRequest(message) => {
+            UpdateMethodResponseErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message),
+            })
+        }
+        PatchFailure::NotFound(message) => {
+            UpdateMethodResponseErrorModeled::NotFoundException(NotFoundException {
+                message: Some(message),
+            })
+        }
+        PatchFailure::Conflict(message) => {
+            UpdateMethodResponseErrorModeled::ConflictException(ConflictException {
+                message: Some(message),
+            })
+        }
+    }
+    .into()
+}
+
+/// Refuse a request naming a record that does not exist, with the message this service
+/// shares for that identifier.
+fn not_found(message: &str) -> UpdateMethodResponseError {
+    UpdateMethodResponseErrorModeled::NotFoundException(NotFoundException {
+        message: Some(message.to_string()),
+    })
+    .into()
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -169,18 +283,52 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateMethodResponse` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateMethodResponseErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateMethodResponse"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        // The list is read BEFORE the store lock is taken, so a malformed patch never
+        // reaches the records at all.
+        let patches =
+            crate::state::parse_patches(input.patch_operations.as_ref()).map_err(patch_failure)?;
+
+        let verb = method_key(&input.http_method);
+        let mut store = state.lock();
+
+        let api = store
+            .rest_apis
+            .get_mut(&input.rest_api_id)
+            .ok_or_else(|| not_found(&crate::state::no_such_rest_api(&input.rest_api_id)))?;
+        let resource = api
+            .resources
+            .get_mut(&input.resource_id)
+            .ok_or_else(|| not_found(crate::state::NO_SUCH_RESOURCE))?;
+        let method = resource
+            .methods
+            .get_mut(&verb)
+            .ok_or_else(|| not_found(crate::state::NO_SUCH_METHOD))?;
+        // Patched on a COPY: a list whose later op is refused leaves the stored response
+        // untouched, rather than keeping the ops before it.
+        let mut updated = method
+            .method_responses
+            .get(&input.status_code)
+            .ok_or_else(|| not_found(crate::state::NO_SUCH_METHOD_RESPONSE))?
+            .clone();
+
+        for patch in &patches {
+            apply_patch(&mut updated, patch).map_err(patch_failure)?;
+        }
+
+        method
+            .method_responses
+            .insert(input.status_code.clone(), updated.clone());
+
+        // The stored record IS the model's `MethodResponse`, so the update reports it
+        // exactly as `GetMethodResponse` will read it back.
+        Ok(UpdateMethodResponseOutput {
+            status_code: updated.status_code,
+            response_parameters: updated.response_parameters,
+            response_models: updated.response_models,
+        })
     }
 }
