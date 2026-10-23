@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateSecondaryNetwork
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateSecondaryNetwork`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateSecondaryNetwork::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: stores one secondary network of the requested type, with the requested
+//! IPv4 CIDR block associated to it, and answers it as [`crate::state`] now holds it —
+//! `create-in-progress`, with `create-complete` owed by the clock. This is the ONLY file to
+//! touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -144,18 +139,153 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateSecondaryNetwork` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateSecondaryNetworkErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateSecondaryNetwork"))
+        use crate::state;
+        use std::time::Instant;
+
+        let region = state::request_region(ctx.parts());
+
+        // "The IPv4 CIDR block for the secondary network. The CIDR block size must be
+        // between /12 and /28" (`Ipv4CidrBlock`), canonicalised the one way this crate
+        // canonicalises an IPv4 block. `NetworkType` is a modelled enum
+        // (`SecondaryNetworkType`), so a value that is not one of its members is already
+        // refused at the boundary and never reaches here.
+        let requested_cidr = input.ipv4_cidr_block.as_str();
+        let ipv4_cidr_block = match state::canonical_secondary_network_ipv4_cidr(requested_cidr) {
+            Ok(canonical) => canonical,
+            Err(state::CidrProblem::Malformed) => {
+                return Err(state::invalid_parameter_value(format!(
+                    "Value ({requested_cidr}) for parameter ipv4CidrBlock is invalid. \
+                     This is not a valid CIDR block."
+                )))
+            }
+            Err(state::CidrProblem::PrefixLength) => {
+                return Err(state::invalid_parameter_value(format!(
+                    "The CIDR '{requested_cidr}' is invalid. The allowed block size is \
+                     between a /{min} netmask and /{max} netmask.",
+                    min = state::MIN_SECONDARY_NETWORK_IPV4_PREFIX,
+                    max = state::MAX_SECONDARY_NETWORK_IPV4_PREFIX,
+                )))
+            }
+        };
+
+        // "The tags to assign to the secondary network" (`TagSpecifications`) — "you must
+        // specify the resource type to tag, otherwise the request will fail"
+        // (`TagSpecification`), and the only type this action tags is the network it
+        // creates. The tag payload's own bounds are the ones every create in this crate
+        // holds its tags to, so they are applied by the one shared reader.
+        let tags: Vec<Tag> = state::tags_from_specifications(
+            input.tag_specifications.as_deref(),
+            state::SECONDARY_NETWORK_TAGGABLE_RESOURCE,
+            Self::NAME,
+        )?;
+        if input
+            .client_token
+            .as_ref()
+            .is_some_and(|token| token.chars().count() > state::MAX_CLIENT_TOKEN_CHARS)
+        {
+            return Err(state::invalid_parameter_value(format!(
+                "clientToken accepts at most {} characters",
+                state::MAX_CLIENT_TOKEN_CHARS
+            )));
+        }
+        // The caller-chosen bytes this create would retain for the process's lifetime: the
+        // tags and the client token the token map keeps, counted by the ONE definition of
+        // that charge. A COUNT ceiling admits gigabytes on its own, because each record
+        // holds strings the caller chose the length of, so both are asked below.
+        let payload_bytes =
+            state::secondary_network_payload_bytes(&tags, input.client_token.as_deref());
+
+        let networks = state::require_service_state(&*self.engine)?;
+        let mut store = networks.lock();
+        let now = Instant::now();
+
+        // Idempotency: "Unique, case-sensitive identifier that you provide to ensure the
+        // idempotency of the request" (`ClientToken`) — one token names the one network it
+        // created, so a replay reports that network and creates nothing. Read here,
+        // answered below the DryRun check, because a replay stores nothing and so passes
+        // the ceilings a fresh create has to clear.
+        let replayed = input
+            .client_token
+            .as_deref()
+            .and_then(|token| store.secondary_network_client_tokens.get(token).cloned());
+
+        // A count ceiling first, then the byte budget: a record count on its own admits
+        // gigabytes, because each record holds strings the caller chose the length of.
+        if replayed.is_none() && !store.has_secondary_network_capacity() {
+            return Err(state::secondary_network_limit_exceeded(format!(
+                "This emulator holds {} secondary networks, which is as many as it stores",
+                state::MAX_SECONDARY_NETWORKS
+            )));
+        }
+        if replayed.is_none() && store.would_exceed_stored_bytes(payload_bytes) {
+            return Err(crate::scaffolded::Scaffolded::tag_limit_exceeded(format!(
+                "This emulator holds {held} of at most {max} bytes of caller-supplied \
+                 data, so it cannot store {payload_bytes} more",
+                held = store.stored_bytes(),
+                max = state::MAX_STORED_BYTES,
+            )));
+        }
+
+        // DryRun sits AFTER every parameter has been validated and BEFORE the first write:
+        // the flag asks whether the request WOULD have worked, so one that would have been
+        // refused is refused with that reason instead, and one that would have succeeded
+        // leaves state untouched.
+        if input.dry_run == Some(true) {
+            return Err(state::dry_run_operation());
+        }
+
+        if let Some(secondary_network_id) = replayed {
+            return store
+                .secondary_networks
+                .get(&secondary_network_id)
+                .map(|record| CreateSecondaryNetworkOutput {
+                    secondary_network: Some(record.view_at(now)),
+                    client_token: input.client_token.clone(),
+                })
+                .ok_or_else(|| {
+                    state::internal_error(format!(
+                        "a client token names secondary network '{secondary_network_id}', \
+                         which is not stored"
+                    ))
+                });
+        }
+
+        // The record itself, built the one way this crate builds a secondary network: every
+        // id, the ARN and the owning account are derived by `insert_secondary_network`,
+        // which also charges the tag bytes the check above reserved. A network AWS hands
+        // back is `create-in-progress` and reaches `create-complete` without anyone asking
+        // — the same clock-owed span, off the same monotonic clock, as a VPC's `pending`
+        // move.
+        let secondary_network_id = store.insert_secondary_network(state::SecondaryNetworkSpec {
+            ipv4_cidr_block,
+            network_type: input.network_type.clone(),
+            region,
+            tags,
+            create_complete_at: now + state::TRANSITION_DELAY,
+        });
+        if let Some(token) = input.client_token.clone() {
+            // The token's own bytes, charged against the budget the check above reserved
+            // them in, so nothing a caller chose the length of is stored uncharged.
+            store.add_stored_bytes(token.len());
+            store
+                .secondary_network_client_tokens
+                .insert(token, secondary_network_id.clone());
+        }
+
+        // Read the response back OUT of the store, so the caller sees what a later
+        // `DescribeSecondaryNetworks` will see rather than the request object.
+        store
+            .secondary_networks
+            .get(&secondary_network_id)
+            .map(|record| CreateSecondaryNetworkOutput {
+                secondary_network: Some(record.view_at(now)),
+                client_token: input.client_token.clone(),
+            })
+            .ok_or_else(|| {
+                state::internal_error(format!(
+                    "the newly created secondary network '{secondary_network_id}' \
+                     could not be read back"
+                ))
+            })
     }
 }

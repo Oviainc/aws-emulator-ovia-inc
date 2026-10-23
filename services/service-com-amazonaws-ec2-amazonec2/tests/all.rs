@@ -60,6 +60,8 @@ mod launch_templates;
 mod mac_dedicated_hosts;
 #[path = "all/modify_subnet_attribute.rs"]
 mod modify_subnet_attribute;
+#[path = "all/secondary_networks.rs"]
+mod secondary_networks;
 #[path = "all/security_group_filter_limits.rs"]
 mod security_group_filter_limits;
 #[path = "all/security_groups.rs"]

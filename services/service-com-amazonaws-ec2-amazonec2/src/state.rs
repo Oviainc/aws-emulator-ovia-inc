@@ -99,6 +99,19 @@
 //! Keyed by `VolumeId` in a [`BTreeMap`], the same stable order the VPC and subnet stores
 //! are kept in, so a pagination token can name the id the next page starts at.
 //!
+//! ## Secondary networks
+//!
+//! [`ComAmazonawsEc2Amazonec2State::secondary_networks`] holds the account's secondary
+//! networks as [`SecondaryNetworkRecord`]s, the same shape of record the volume store
+//! keeps: the modelled [`SecondaryNetwork`] every operation that reports one answers with,
+//! plus the instant the clock owes the network its `create-in-progress` ->
+//! `create-complete` move. The network's `State` and the `State` of each of its IPv4 CIDR
+//! block associations are facts of its age rather than of the request, so
+//! [`SecondaryNetworkRecord::view_at`] derives both on read instead of storing them. Keyed
+//! by `SecondaryNetworkId` in a [`BTreeMap`], the same stable order the VPC, subnet and
+//! volume stores are kept in, so a pagination token can name the id the next page starts
+//! at.
+//!
 //! ## BYOIP address ranges
 //!
 //! [`ComAmazonawsEc2Amazonec2State::byoip_cidrs`] holds the address ranges the account has
@@ -268,7 +281,8 @@ use crate::ops::types::{
     LaunchTemplate, MacHost, Monitoring, OperatorResponse, Placement,
     PrivateDnsNameOptionsOnLaunch,
     DnsEntry, PayerResponsibilityEntry,
-    RequestLaunchTemplateData, RunInstancesOutput, SecurityGroup, StateReason, Subnet, Tag,
+    RequestLaunchTemplateData, RunInstancesOutput, SecondaryNetwork,
+    SecondaryNetworkIpv4CidrBlockAssociation, SecurityGroup, StateReason, Subnet, Tag,
     TagSpecification,
     TransitGateway, TransitGatewayOptions, TransitGatewayRequestOptions, TransitGatewayRouteTable,
     UserIdGroupPair, Vpc, VpcCidrBlockAssociation, VpcCidrBlockState, VpcEndpointConnection,
@@ -964,6 +978,14 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// A `CreateVolume` `ClientToken` and the volume id it minted, so a repeat of the
     /// same request answers with that volume instead of creating a second one.
     pub volume_client_tokens: HashMap<String, String>,
+    /// Every secondary network the account holds, by `SecondaryNetworkId` — see the module
+    /// docs. Ordered by id, which is the order `DescribeSecondaryNetworks` reports and
+    /// pages over.
+    pub secondary_networks: BTreeMap<String, SecondaryNetworkRecord>,
+    /// A `CreateSecondaryNetwork` `ClientToken` and the secondary network id it minted, so
+    /// a repeat of the same request answers with that network instead of creating a second
+    /// one.
+    pub secondary_network_client_tokens: HashMap<String, String>,
     /// Every BYOIP address range the account holds, by the range itself in canonical form
     /// — see the module docs. Ordered by that key, which is the order a describe of them
     /// reports and pages over.
@@ -1072,6 +1094,8 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             id_counter: 0,
             volumes: BTreeMap::new(),
             volume_client_tokens: HashMap::new(),
+            secondary_networks: BTreeMap::new(),
+            secondary_network_client_tokens: HashMap::new(),
             byoip_cidrs: BTreeMap::new(),
             coip_pools: BTreeMap::new(),
             capacity_blocks: BTreeMap::new(),
@@ -3437,6 +3461,240 @@ pub fn volume_limit_exceeded<E>(message: impl Into<String>) -> crate::scaffolded
     crate::scaffolded::Scaffolded::service_error(VOLUME_LIMIT_EXCEEDED, 400, message)
 }
 
+// =============================================================================
+// Secondary networks
+// =============================================================================
+
+/// The prefix of a secondary network's id.
+///
+/// `com.amazonaws.ec2#SecondaryNetworkId` carries no `@pattern`, so the model publishes no
+/// spelling for it; this service mints EC2's own `<prefix>-<17 lowercase hex digits>` id
+/// form ([`ComAmazonawsEc2Amazonec2State::next_id`]) with a prefix naming the resource, the
+/// way every other id of this store is minted.
+pub const SECONDARY_NETWORK_ID_PREFIX: &str = "sn";
+
+/// The prefix of the id of a secondary network's IPv4 CIDR block association
+/// (`com.amazonaws.ec2#SecondaryNetworkCidrAssociationId`, which publishes no pattern
+/// either), minted the same way as [`SECONDARY_NETWORK_ID_PREFIX`].
+pub const SECONDARY_NETWORK_CIDR_ASSOCIATION_ID_PREFIX: &str = "sn-cidr-assoc";
+
+/// A secondary network AWS has not finished creating: `SecondaryNetworkState`'s
+/// `create-in-progress` (`smithy_query(query="shape",shape="SecondaryNetworkState")`).
+pub const SECONDARY_NETWORK_STATE_CREATE_IN_PROGRESS: &str = "create-in-progress";
+
+/// A secondary network AWS has finished creating: `SecondaryNetworkState`'s
+/// `create-complete`.
+pub const SECONDARY_NETWORK_STATE_CREATE_COMPLETE: &str = "create-complete";
+
+/// An IPv4 CIDR block whose association with a secondary network is still being made:
+/// `SecondaryNetworkCidrBlockAssociationState`'s `associating`.
+pub const SECONDARY_NETWORK_CIDR_STATE_ASSOCIATING: &str = "associating";
+
+/// An IPv4 CIDR block associated with a secondary network:
+/// `SecondaryNetworkCidrBlockAssociationState`'s `associated`.
+pub const SECONDARY_NETWORK_CIDR_STATE_ASSOCIATED: &str = "associated";
+
+/// The one resource type `CreateSecondaryNetwork`'s `TagSpecifications` may name: "The tags
+/// to assign to the secondary network"
+/// (`CreateSecondaryNetworkRequest$TagSpecifications`), spelled as the modelled
+/// `ResourceType` enum spells it.
+pub const SECONDARY_NETWORK_TAGGABLE_RESOURCE: &str = "secondary-network";
+
+/// The largest number of secondary networks this in-memory store holds.
+///
+/// A capacity bound in the style of [`MAX_VPCS`], not an AWS quota: each network is a
+/// record in this process's memory, so the number a caller can create has to be finite.
+/// A count ceiling is not a memory bound on its own — see [`MAX_STORED_BYTES`] — so the
+/// caller-chosen bytes of each network are charged against that budget too
+/// ([`secondary_network_payload_bytes`]).
+pub const MAX_SECONDARY_NETWORKS: usize = 1_000;
+
+/// The error code a create past [`MAX_SECONDARY_NETWORKS`] is refused with.
+///
+/// AWS publishes no quota code for this resource, so this follows EC2's own
+/// `<Resource>LimitExceeded` spelling ([`VPC_LIMIT_EXCEEDED`], [`SUBNET_LIMIT_EXCEEDED`],
+/// [`SECURITY_GROUP_LIMIT_EXCEEDED`]).
+pub const SECONDARY_NETWORK_LIMIT_EXCEEDED: &str = "SecondaryNetworkLimitExceeded";
+
+/// The error code for a request naming a secondary network id the account holds no network
+/// for, in EC2's `Invalid<Resource>Id.NotFound` spelling — the same spelling as
+/// [`INVALID_LAUNCH_TEMPLATE_ID_NOT_FOUND`].
+pub const INVALID_SECONDARY_NETWORK_ID_NOT_FOUND: &str = "InvalidSecondaryNetworkId.NotFound";
+
+/// One stored secondary network: the modelled [`SecondaryNetwork`] every operation that
+/// reports one answers with, plus the instant the clock owes it its `create-in-progress`
+/// -> `create-complete` move.
+///
+/// The view holds no `State` — neither the network's own nor that of its IPv4 CIDR block
+/// associations: both are facts of the network's age, so [`SecondaryNetworkRecord::view_at`]
+/// derives them rather than letting two writers store two different words for one network.
+#[derive(Debug, Clone)]
+pub struct SecondaryNetworkRecord {
+    /// The network as the model shapes it, with the `State` members left for
+    /// [`SecondaryNetworkRecord::view_at`] to fill.
+    pub view: SecondaryNetwork,
+    /// The instant from which this network's `create-in-progress` -> `create-complete`
+    /// move is due. Monotonic ([`Instant`]), because it is only ever compared against the
+    /// clock and never reported, so a wall-clock adjustment cannot move a network back to
+    /// `create-in-progress`.
+    pub create_complete_at: Instant,
+}
+
+impl SecondaryNetworkRecord {
+    /// This network as of `now`: the stored view with the states the clock has reached. A
+    /// read observes the transition the clock already owed without writing anything.
+    pub fn view_at(&self, now: Instant) -> SecondaryNetwork {
+        let mut view = self.view.clone();
+        view.state = Some(self.state_at(now).to_string());
+        let association_state = self.cidr_association_state_at(now);
+        for association in view.ipv4_cidr_block_associations.iter_mut().flatten() {
+            association.state = Some(association_state.to_string());
+        }
+        view
+    }
+
+    /// The network's `SecondaryNetworkState` at `now`.
+    pub fn state_at(&self, now: Instant) -> &'static str {
+        if now < self.create_complete_at {
+            SECONDARY_NETWORK_STATE_CREATE_IN_PROGRESS
+        } else {
+            SECONDARY_NETWORK_STATE_CREATE_COMPLETE
+        }
+    }
+
+    /// The `SecondaryNetworkCidrBlockAssociationState` of this network's IPv4 CIDR block
+    /// associations at `now`: a block is associated once the network it belongs to has
+    /// finished being created, so the two moves fall due together.
+    pub fn cidr_association_state_at(&self, now: Instant) -> &'static str {
+        if now < self.create_complete_at {
+            SECONDARY_NETWORK_CIDR_STATE_ASSOCIATING
+        } else {
+            SECONDARY_NETWORK_CIDR_STATE_ASSOCIATED
+        }
+    }
+}
+
+/// What one secondary network is created with: everything a writer chooses, with every id
+/// and every derived member left to [`ComAmazonawsEc2Amazonec2State::insert_secondary_network`].
+#[derive(Debug, Clone)]
+pub struct SecondaryNetworkSpec {
+    /// The network's IPv4 CIDR block, already canonical
+    /// ([`canonical_secondary_network_ipv4_cidr`]).
+    pub ipv4_cidr_block: String,
+    /// The `SecondaryNetworkType` the request named.
+    pub network_type: String,
+    /// The Region the request was signed for, which the network's ARN names.
+    pub region: String,
+    /// The tags the request assigned to the network.
+    pub tags: Vec<Tag>,
+    /// When this network's `create-in-progress` -> `create-complete` move falls due.
+    pub create_complete_at: Instant,
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// Whether another secondary network fits inside the store's ceiling
+    /// ([`MAX_SECONDARY_NETWORKS`]).
+    ///
+    /// The same contract as [`Self::has_vpc_capacity`]: a create asks first and refuses
+    /// with [`SECONDARY_NETWORK_LIMIT_EXCEEDED`] when it answers `false`.
+    pub fn has_secondary_network_capacity(&self) -> bool {
+        self.secondary_networks.len() < MAX_SECONDARY_NETWORKS
+    }
+
+    /// Insert a secondary network, and answer the `SecondaryNetworkId` it was given.
+    ///
+    /// Everything the service itself owns is derived here rather than taken from the
+    /// caller — the network's id, its ARN, the association id of its IPv4 CIDR block and
+    /// the owning account — so two writers cannot report the same network differently.
+    ///
+    /// Like [`Self::insert_vpc`], the caller-chosen bytes of `spec.tags` are charged
+    /// against the store's byte budget here, so a writer cannot store them uncharged; a
+    /// create still asks [`Self::has_secondary_network_capacity`] and
+    /// [`Self::would_exceed_stored_bytes`] first so it can refuse instead of overshooting.
+    pub fn insert_secondary_network(&mut self, spec: SecondaryNetworkSpec) -> String {
+        let secondary_network_id = self.next_id(SECONDARY_NETWORK_ID_PREFIX);
+        let association_id = self.next_id(SECONDARY_NETWORK_CIDR_ASSOCIATION_ID_PREFIX);
+        let view = SecondaryNetwork {
+            secondary_network_id: Some(secondary_network_id.clone()),
+            secondary_network_arn: Some(::engine::emulator_arn(
+                "ec2",
+                &spec.region,
+                &format!("{SECONDARY_NETWORK_TAGGABLE_RESOURCE}/{secondary_network_id}"),
+            )),
+            owner_id: Some(::engine::emulator_account_id().to_string()),
+            r#type: Some(spec.network_type),
+            // Both states are derived from `create_complete_at` on every read.
+            state: None,
+            // "The reason for the current state" (`SecondaryNetwork$StateReason`): a
+            // network that is being created as asked has nothing to explain, and no
+            // operation of this emulator fails one.
+            state_reason: None,
+            ipv4_cidr_block_associations: Some(vec![SecondaryNetworkIpv4CidrBlockAssociation {
+                association_id: Some(association_id),
+                cidr_block: Some(spec.ipv4_cidr_block),
+                state: None,
+                state_reason: None,
+            }]),
+            tags: Some(spec.tags),
+        };
+        self.add_stored_bytes(tag_list_bytes(view.tags.as_deref().unwrap_or_default()));
+        self.secondary_networks.insert(
+            secondary_network_id.clone(),
+            SecondaryNetworkRecord {
+                view,
+                create_complete_at: spec.create_complete_at,
+            },
+        );
+        secondary_network_id
+    }
+}
+
+/// The caller-chosen bytes one stored secondary network holds: its tags and the
+/// `ClientToken` the token map keeps for it. Everything else on the record — the ids, the
+/// ARN, the account, the canonical CIDR block and the states — is derived by this module or
+/// bounded by the model, so it is fixed-size.
+///
+/// The ONE definition of that charge: `CreateSecondaryNetwork` asks it before the write and
+/// charges exactly it, and a removal path must give back the same number.
+pub fn secondary_network_payload_bytes(tags: &[Tag], client_token: Option<&str>) -> usize {
+    tag_list_bytes(tags).saturating_add(client_token.map_or(0, str::len))
+}
+
+/// Refuse a secondary network id the request named that this service cannot resolve.
+///
+/// `SecondaryNetworkId` publishes no pattern, so there is no spelling to call an id
+/// malformed by: an id no network of the account has is answered as not found whatever it
+/// looks like, rather than being sorted into two codes on a rule AWS does not state.
+pub fn require_known_secondary_network<E>(
+    store: &ComAmazonawsEc2Amazonec2State,
+    secondary_network_id: &str,
+) -> Result<(), crate::scaffolded::Scaffolded<E>> {
+    if store.secondary_networks.contains_key(secondary_network_id) {
+        return Ok(());
+    }
+    Err(invalid_secondary_network_id_not_found(secondary_network_id))
+}
+
+/// Refuse a request that named a secondary network id no network of the account has: HTTP
+/// 400 [`INVALID_SECONDARY_NETWORK_ID_NOT_FOUND`].
+pub fn invalid_secondary_network_id_not_found<E>(
+    secondary_network_id: &str,
+) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_error(
+        INVALID_SECONDARY_NETWORK_ID_NOT_FOUND,
+        400,
+        format!("The secondary network '{secondary_network_id}' does not exist."),
+    )
+}
+
+/// Refuse a create that would take the store past [`MAX_SECONDARY_NETWORKS`]: HTTP 400
+/// [`SECONDARY_NETWORK_LIMIT_EXCEEDED`].
+pub fn secondary_network_limit_exceeded<E>(
+    message: impl Into<String>,
+) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_error(SECONDARY_NETWORK_LIMIT_EXCEEDED, 400, message)
+}
+
 /// The Region this request was signed for, from its SigV4 credential scope; the
 /// emulator's default Region when it carries none.
 ///
@@ -4734,9 +4992,36 @@ pub fn canonical_subnet_ipv4_cidr(value: &str) -> Result<String, CidrProblem> {
     Ok(canonical)
 }
 
+/// The smallest IPv4 prefix length a SECONDARY NETWORK CIDR block may have: "The allowed
+/// size for a secondary network CIDR block is between /28 netmask (16 IP addresses) and /12
+/// netmask (1,048,576 IP addresses)" (`CreateSecondaryNetwork`), also stated on the member
+/// itself — "The CIDR block size must be between /12 and /28"
+/// (`CreateSecondaryNetworkRequest$Ipv4CidrBlock`). Named separately from the VPC and
+/// subnet bounds because it comes from a different sentence.
+pub const MIN_SECONDARY_NETWORK_IPV4_PREFIX: u8 = 12;
+
+/// The largest IPv4 prefix length a secondary network CIDR block may have (see
+/// [`MIN_SECONDARY_NETWORK_IPV4_PREFIX`]).
+pub const MAX_SECONDARY_NETWORK_IPV4_PREFIX: u8 = 28;
+
+/// A requested IPv4 SECONDARY NETWORK CIDR block in the canonical form AWS stores it in:
+/// the same canonicalisation as a VPC's and a subnet's block, held to the secondary
+/// network block size
+/// ([`MIN_SECONDARY_NETWORK_IPV4_PREFIX`]..=[`MAX_SECONDARY_NETWORK_IPV4_PREFIX`]).
+pub fn canonical_secondary_network_ipv4_cidr(value: &str) -> Result<String, CidrProblem> {
+    let canonical = canonical_ipv4_cidr(value)?;
+    let (_, prefix_length) = split_ipv4_cidr(&canonical).ok_or(CidrProblem::Malformed)?;
+    if !(MIN_SECONDARY_NETWORK_IPV4_PREFIX..=MAX_SECONDARY_NETWORK_IPV4_PREFIX)
+        .contains(&prefix_length)
+    {
+        return Err(CidrProblem::PrefixLength);
+    }
+    Ok(canonical)
+}
+
 /// `value` as an IPv4 CIDR block with its host bits cleared, with NO rule on the prefix
-/// length: the one reader both [`canonical_vpc_ipv4_cidr`] and
-/// [`canonical_subnet_ipv4_cidr`] put their own published block size on top of.
+/// length: the one reader [`canonical_vpc_ipv4_cidr`], [`canonical_subnet_ipv4_cidr`] and
+/// [`canonical_secondary_network_ipv4_cidr`] put their own published block size on top of.
 fn canonical_ipv4_cidr(value: &str) -> Result<String, CidrProblem> {
     let (address, prefix_length) = value.split_once('/').ok_or(CidrProblem::Malformed)?;
     let base = u32::from(
