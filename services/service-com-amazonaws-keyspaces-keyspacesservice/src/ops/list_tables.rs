@@ -210,6 +210,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let mut store = state.lock();
+        // The service-managed keyspaces and their system tables are part of the account
+        // before any call, so `keyspaceName` resolves against them too — a keyspace
+        // Amazon Keyspaces always holds is never the `ResourceNotFoundException` below.
+        store.ensure_service_managed_catalog(&region);
         // Reporting, not mutating: see the note in `get_table.rs`.
         store.settle(::std::time::SystemTime::now());
 
