@@ -30,7 +30,7 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::file_system_lifecycle::{
-    assert_lifecycle_state, call, create_access_point, created_file_system_id,
+    assert_lifecycle_state, call, create_access_point, created_file_system_id, encoded,
     file_system_arn_prefix, is_minted_id, new_router, without, Answer, ACCOUNT,
 };
 
@@ -54,12 +54,6 @@ const DESCRIPTION_MEMBERS: &[&str] = &[
 const MAX_RESULTS_MIN: i64 = 1;
 const MAX_RESULTS_MAX: i64 = 1000;
 
-/// `fileSystemId` rides as an `@httpQuery` parameter, so an ARN-valued one needs its
-/// `:` and `/` percent-encoded.
-fn query_encode(value: &str) -> String {
-    value.replace('%', "%25").replace(':', "%3A").replace('/', "%2F")
-}
-
 /// `ListAccessPoints` on `label` (a bare id or an ARN), optionally with a page size and
 /// a resume cursor.
 async fn list_access_points(
@@ -68,12 +62,14 @@ async fn list_access_points(
     max_results: Option<i64>,
     next_token: Option<&str>,
 ) -> Answer {
-    let mut query = vec![format!("fileSystemId={}", query_encode(label))];
+    // `fileSystemId` and `nextToken` ride as `@httpQuery` parameters, so a value
+    // carrying `:` or `/` is percent-encoded by the harness's single encoder.
+    let mut query = vec![format!("fileSystemId={}", encoded(label))];
     if let Some(size) = max_results {
         query.push(format!("maxResults={size}"));
     }
     if let Some(token) = next_token {
-        query.push(format!("nextToken={}", query_encode(token)));
+        query.push(format!("nextToken={}", encoded(token)));
     }
     call(
         router,
