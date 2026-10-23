@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyClusterParameterGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyClusterParameterGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifyClusterParameterGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -94,11 +85,19 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-redshift-redshiftservic
 // here — hence the `ModifyClusterParameterGroupError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.redshift#ModifyClusterParameterGroup")]
+// `DependentServiceUnavailableFault` is widened in: the model does not list it for
+// this operation, but the service declares the shape, and it is the only modelled
+// way to say "the control-plane store could not be reached" (the same widening
+// `DescribeClusterParameters` makes).
+#[smithy_macros::operation_error(
+    "com.amazonaws.redshift#ModifyClusterParameterGroup",
+    extra_errors = ["DependentServiceUnavailableFault"]
+)]
 #[derive(Debug)]
 pub enum ModifyClusterParameterGroupErrorModeled {
     ClusterParameterGroupNotFoundFault(ClusterParameterGroupNotFoundFault),
     InvalidClusterParameterGroupStateFault(InvalidClusterParameterGroupStateFault),
+    DependentServiceUnavailableFault(DependentServiceUnavailableFault),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -147,23 +146,199 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::MODIFY_CLUSTER_PARAMETER_GROUP_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
+    /// Set the named parameters on one cluster parameter group.
+    ///
+    /// A MUTATION: the values the request carries become the group's own, so
+    /// every later `DescribeClusterParameters` reports them with `Source` `user`
+    /// in place of the family's engine default. Nothing else about the group
+    /// changes, and a request the service refuses changes NOTHING — every value
+    /// is checked against the family's published catalog before the first one is
+    /// written.
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyClusterParameterGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyClusterParameterGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyClusterParameterGroup"))
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(
+                ModifyClusterParameterGroupErrorModeled::DependentServiceUnavailableFault(
+                    DependentServiceUnavailableFault {
+                        message: Some(st::STORE_UNAVAILABLE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // "A maximum of 20 parameters can be modified in a single request" — a
+        // request carrying more is refused before the store is read at all.
+        if input.parameters.len() > st::MAX_MODIFIABLE_PARAMETERS {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "Invalid value for Parameters: {} parameters. A maximum of {} parameters can be modified in a single request.",
+                input.parameters.len(),
+                st::MAX_MODIFIABLE_PARAMETERS
+            )));
+        }
+
+        let mut store = state.lock();
+
+        let Some(position) = store.parameter_group_position(&input.parameter_group_name) else {
+            return Err(
+                ModifyClusterParameterGroupErrorModeled::ClusterParameterGroupNotFoundFault(
+                    ClusterParameterGroupNotFoundFault {
+                        message: Some(format!(
+                            "Cluster parameter group not found: {}",
+                            input.parameter_group_name
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+        let group = &store.parameter_groups[position];
+
+        // A DEFAULT parameter group is Redshift's own, and the Amazon Redshift
+        // Cluster Management Guide ("Amazon Redshift parameter groups") says you
+        // can't modify parameter values in a default parameter group — to change
+        // one you create a group of the same family. The service models no error
+        // for it, so it is the generic refusal rather than a group-state fault:
+        // nothing about this group is in a transient state.
+        if group.default_group {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "Invalid value for ParameterGroupName: '{}'. Default parameter group cannot be modified.",
+                input.parameter_group_name
+            )));
+        }
+
+        // Resolve every requested parameter against the catalog its family
+        // publishes FIRST: a request naming a parameter the family does not
+        // publish, or a value the published set does not admit, leaves the whole
+        // group as it was.
+        let mut resolved: Vec<(&'static st::EngineParameter, String)> =
+            Vec::with_capacity(input.parameters.len());
+        for (index, requested) in input.parameters.iter().enumerate() {
+            // The wire numbers a list member from 1, so a refusal names the
+            // member the caller sent.
+            let member = format!("Parameters.Parameter.{}", index + 1);
+
+            // "For each parameter to be modified, you must supply at least the
+            // parameter name and parameter value": the model marks neither
+            // required, so both are checked here.
+            let name = requested.parameter_name.as_deref().unwrap_or_default();
+            if name.is_empty() {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "Invalid value for {member}.ParameterName: a parameter name must be supplied for each parameter to be modified."
+                )));
+            }
+            let Some(value) = requested.parameter_value.clone() else {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "Invalid value for {member}.ParameterValue: a parameter value must be supplied for parameter '{name}'."
+                )));
+            };
+
+            let Some(parameter) = group.family_parameter(name) else {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "Invalid value for {member}.ParameterName: '{name}' is not a parameter of parameter group family {}.",
+                    group
+                        .group
+                        .parameter_group_family
+                        .as_deref()
+                        .unwrap_or_default()
+                )));
+            };
+            // "Some parameters have security or operational implications that
+            // prevent them from being changed" — one the catalog publishes as not
+            // modifiable is refused rather than silently kept.
+            if !parameter.is_modifiable {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "Invalid value for {member}.ParameterName: parameter '{name}' is not modifiable."
+                )));
+            }
+            if let Some(max_len) = st::parameter_value_max_len(name) {
+                if value.chars().count() > max_len {
+                    return Err(crate::scaffolded::Scaffolded::validation(format!(
+                        "Invalid value for {member}.ParameterValue: the value of '{name}' is longer than the maximum of {max_len} characters."
+                    )));
+                }
+            }
+            if !parameter.admits(&value) {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "Invalid value for {member}.ParameterValue: '{value}' is not a value parameter '{name}' allows. Allowed values: {}",
+                    parameter.allowed_values.unwrap_or_default()
+                )));
+            }
+            resolved.push((parameter, value));
+        }
+
+        // Nothing can be refused any more, so the group takes every value: the
+        // override is what flips the parameter's `Source` to `user`, and a later
+        // request naming the same parameter replaces it.
+        let group = &mut store.parameter_groups[position];
+        let mut pending_reboot: Vec<String> = Vec::new();
+        for (parameter, value) in resolved {
+            group
+                .parameter_values
+                .insert(parameter.name.to_string(), value);
+            // "For parameter changes to take effect you must reboot any
+            // associated clusters" — but only a STATIC parameter waits for one; a
+            // dynamic one is applied without a reboot, so it leaves no pending
+            // change behind.
+            if parameter.apply_type == st::APPLY_TYPE_STATIC
+                && !pending_reboot.iter().any(|name| name == parameter.name)
+            {
+                pending_reboot.push(parameter.name.to_string());
+            }
+        }
+        let group_name = group
+            .group
+            .parameter_group_name
+            .clone()
+            .unwrap_or_else(|| input.parameter_group_name.clone());
+
+        // Every cluster configured with this group now carries a change it has
+        // not seen: that is what `pending-reboot` reports, per parameter and for
+        // the membership as a whole.
+        if !pending_reboot.is_empty() {
+            for stored in &mut store.clusters {
+                let Some(memberships) = stored.cluster.cluster_parameter_groups.as_mut() else {
+                    continue;
+                };
+                for membership in memberships
+                    .iter_mut()
+                    .filter(|m| m.parameter_group_name.as_deref() == Some(group_name.as_str()))
+                {
+                    membership.parameter_apply_status =
+                        Some(st::PARAMETER_APPLY_STATUS_PENDING_REBOOT.to_string());
+                    let statuses = membership
+                        .cluster_parameter_status_list
+                        .get_or_insert_with(Vec::new);
+                    for name in &pending_reboot {
+                        match statuses
+                            .iter_mut()
+                            .find(|status| status.parameter_name.as_deref() == Some(name.as_str()))
+                        {
+                            Some(status) => {
+                                status.parameter_apply_status =
+                                    Some(st::PARAMETER_APPLY_STATUS_PENDING_REBOOT.to_string());
+                            }
+                            None => statuses.push(ClusterParameterStatus {
+                                parameter_name: Some(name.clone()),
+                                parameter_apply_status: Some(
+                                    st::PARAMETER_APPLY_STATUS_PENDING_REBOOT.to_string(),
+                                ),
+                                parameter_apply_error_description: None,
+                            }),
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(ModifyClusterParameterGroupOutput {
+            parameter_group_name: Some(group_name),
+            parameter_group_status: Some(st::PARAMETER_GROUP_STATUS_PENDING_REBOOT.to_string()),
+        })
     }
 }

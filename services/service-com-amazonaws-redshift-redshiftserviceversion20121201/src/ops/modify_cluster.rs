@@ -532,7 +532,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(name) = input.cluster_parameter_group_name.clone() {
             stored.cluster.cluster_parameter_groups = Some(vec![ClusterParameterGroupStatus {
                 parameter_group_name: Some(name),
-                parameter_apply_status: Some("in-sync".to_string()),
+                parameter_apply_status: Some(st::PARAMETER_APPLY_STATUS_IN_SYNC.to_string()),
                 cluster_parameter_status_list: None,
             }]);
         }
