@@ -21,7 +21,10 @@ use serde_json::{json, Map, Value};
 use service_com_amazonaws_ssmsap_ssmsap::ops::types::{
     APPLICATION_TYPE_VALUES, COMPONENT_TYPE_VALUES, FILTER_OPERATOR_VALUES,
 };
-use service_com_amazonaws_ssmsap_ssmsap::state::{FILTER_NAMES, MAX_PAGE_SIZE, TRANSITION_SPAN};
+use service_com_amazonaws_ssmsap_ssmsap::state::{
+    conditionally_required_members, ConditionalMember, FILTER_NAMES, MAX_PAGE_SIZE,
+    TRANSITION_SPAN,
+};
 use service_com_amazonaws_ssmsap_ssmsap::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -49,6 +52,9 @@ pub(crate) struct Reply {
     /// The wire error code: restJson1 resolves an error shape from
     /// `x-amzn-errortype`, falling back to the body's `__type`.
     error_code: Option<String>,
+    /// The `x-amzn-errortype` response header ALONE, with no fallback to the body —
+    /// what a client that reads the header sees.
+    pub(crate) error_type_header: Option<String>,
     pub(crate) body: Value,
 }
 
@@ -132,6 +138,7 @@ impl Emulator {
         } else {
             serde_json::from_slice(response.body()).unwrap_or(Value::Null)
         };
+        let error_type_header = error_code.clone();
         let error_code = error_code.or_else(|| {
             body.get("__type")
                 .and_then(Value::as_str)
@@ -140,6 +147,7 @@ impl Emulator {
         Reply {
             status,
             error_code,
+            error_type_header,
             body,
         }
     }
@@ -179,13 +187,7 @@ impl Emulator {
 
     /// Register a minimal HANA application, without waiting for the clock.
     async fn register_minimal(&self, id: &str) -> Reply {
-        let reply = self
-            .register(json!({
-                "ApplicationId": id,
-                "ApplicationType": "HANA",
-                "Instances": ["i-0123456789abcdef0"],
-            }))
-            .await;
+        let reply = self.register(valid_registration(id, "HANA")).await;
         assert_eq!(
             reply.status, 200,
             "case {id:?}: expected 200 from RegisterApplication, got {reply:?}"
@@ -210,6 +212,41 @@ impl Emulator {
 /// Wait out a status change the clock owes.
 async fn settle() {
     tokio::time::sleep(settle_wait()).await;
+}
+
+/// The smallest `RegisterApplication` body the service ACCEPTS for `app_type`: the
+/// modelled `@required` members, plus every member that type requires conditionally
+/// (`service_com_amazonaws_ssmsap_ssmsap::state::CONDITIONALLY_REQUIRED_MEMBERS` — a
+/// HANA application's SID, instance number and credentials).
+///
+/// `pub(crate)` because every suite of this target registers through one builder.
+pub(crate) fn valid_registration(id: &str, app_type: &str) -> Value {
+    let mut body = Map::new();
+    body.insert("ApplicationId".into(), json!(id));
+    body.insert("ApplicationType".into(), json!(app_type));
+    body.insert("Instances".into(), json!(["i-0123456789abcdef0"]));
+    for member in conditionally_required_members(app_type) {
+        body.insert(member.member_name().into(), conditional_value(*member));
+    }
+    Value::Object(body)
+}
+
+/// A value that satisfies `member`'s modelled constraints, so a body built by
+/// [`valid_registration`] carries the member rather than merely naming it.
+pub(crate) fn conditional_value(member: ConditionalMember) -> Value {
+    match member {
+        // `SID` is modelled `^[A-Z][A-Z0-9]{2}$`.
+        ConditionalMember::Sid => json!("HDB"),
+        // `SAPInstanceNumber` is modelled `^[0-9]{2}$`.
+        ConditionalMember::SapInstanceNumber => json!("00"),
+        // `ApplicationCredential` requires DatabaseName, CredentialType (an enum whose
+        // value is `ADMIN`) and SecretId.
+        ConditionalMember::Credentials => json!([{
+            "DatabaseName": "HDB",
+            "CredentialType": "ADMIN",
+            "SecretId": "sap/hdb/admin",
+        }]),
+    }
 }
 
 /// The ARN `RegisterApplication` must mint for `id`.
@@ -385,7 +422,7 @@ impl RegisterCase {
 /// combination of the optional members, 0/1/2/5 components (the model's
 /// `ComponentInfoList` is 0..5), and id forms across the `^[\w\d\.-]+$` pattern.
 const REGISTER_CASES: &[RegisterCase] = &[
-    // The case the issue records.
+    // The case the issue records, with the members a HANA registration requires.
     RegisterCase {
         id: "HDB-TEST",
         app_type: "HANA",
@@ -394,7 +431,7 @@ const REGISTER_CASES: &[RegisterCase] = &[
         components_info: &[],
         tags: &[("env", "dev")],
         database_arn: None,
-        credentials: &[],
+        credentials: &[("HDB", "ADMIN", "sap/hdb/admin")],
     },
     // The other application type, no optional member at all.
     RegisterCase {
@@ -431,7 +468,7 @@ const REGISTER_CASES: &[RegisterCase] = &[
         ],
         tags: &[],
         database_arn: None,
-        credentials: &[],
+        credentials: &[("HDB", "ADMIN", "sap/hdb/admin"), ("SYSTEMDB", "ADMIN", "sap/hdb/system")],
     },
     // The largest `ComponentsInfo` the model allows, and a 60-character id (the
     // `ApplicationId` length bound).
@@ -683,13 +720,7 @@ async fn every_modelled_application_type_registers() {
     for app_type in APPLICATION_TYPE_VALUES {
         let emulator = Emulator::new();
         let id = format!("app-{}", app_type.to_ascii_lowercase());
-        let reply = emulator
-            .register(json!({
-                "ApplicationId": id,
-                "ApplicationType": app_type,
-                "Instances": ["i-0123456789abcdef0"],
-            }))
-            .await;
+        let reply = emulator.register(valid_registration(&id, app_type)).await;
         assert_eq!(
             reply.status, 200,
             "case {app_type:?}: expected 200 from RegisterApplication, got {reply:?}"
@@ -827,21 +858,43 @@ async fn a_malformed_registration_is_refused_and_stores_nothing() {
     }
 }
 
+/// RULE: a lookup naming no registered application is refused with the modelled
+/// `ValidationException`, stating that THIS account holds no application under the
+/// reference the request carried — `GetApplication` models no
+/// `ResourceNotFoundException`, so an absent application is a 400.
 #[tokio::test]
 async fn an_unresolvable_application_reference_is_refused_rather_than_invented() {
     let emulator = Emulator::new();
     emulator.register_settled("HDB-TEST").await;
 
-    let cases: &[(&str, Value)] = &[
-        ("unknown id", json!({"ApplicationId": "NO-SUCH"})),
+    // Rows span the three members a reference can arrive in, and the request that
+    // carries none. `reference` is the one the refusal must name.
+    let app_registry_arn = "arn:aws:servicecatalog:us-east-1:000000000000:/applications/nope";
+    let cases: Vec<(&str, Value, Option<String>)> = vec![
+        (
+            "unknown id",
+            json!({"ApplicationId": "NO-SUCH"}),
+            Some("NO-SUCH".to_string()),
+        ),
+        (
+            "an id no registration used, in the recorded probe's form",
+            json!({"ApplicationId": "sim2real-probe-ssm-sap-app-8d37e33f"}),
+            Some("sim2real-probe-ssm-sap-app-8d37e33f".to_string()),
+        ),
         (
             "unknown arn",
             json!({"ApplicationArn": expected_arn("NO-SUCH")}),
+            Some(expected_arn("NO-SUCH")),
         ),
-        ("no reference at all", json!({})),
+        (
+            "unknown app registry arn",
+            json!({"AppRegistryArn": app_registry_arn}),
+            Some(app_registry_arn.to_string()),
+        ),
+        ("no reference at all", json!({}), None),
     ];
 
-    for (case, body) in cases {
+    for (case, body, reference) in cases {
         let reply = emulator.get_application(body.clone()).await;
         assert_eq!(
             reply.status, 400,
@@ -852,10 +905,36 @@ async fn an_unresolvable_application_reference_is_refused_rather_than_invented()
             "ValidationException",
             "case {case:?}: expected ValidationException, got {reply:?}"
         );
+        assert_eq!(
+            reply.error_type_header.as_deref(),
+            Some("ValidationException"),
+            "case {case:?}: the refusal must carry x-amzn-errortype, got {:?}",
+            reply.error_type_header
+        );
         assert!(
             reply.member("Application").is_none(),
             "case {case:?}: no application may be fabricated, got {reply:?}"
         );
+        let actual = reply
+            .member("Message")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        match reference {
+            Some(reference) => {
+                let expected = format!(
+                    "No registered application found for account: {ACCOUNT}, and application: {reference}"
+                );
+                assert_eq!(
+                    actual, expected,
+                    "case {case:?}: expected {expected:?}, got {actual:?}"
+                );
+            }
+            None => assert!(
+                actual.contains("must be specified"),
+                "case {case:?}: a request naming nothing is refused for naming nothing, got {actual:?}"
+            ),
+        }
     }
 }
 
@@ -1196,12 +1275,10 @@ async fn a_listing_reports_each_applications_own_summary() {
         ("hana-2", "HANA", &[("a", "1"), ("b", "2")]),
     ];
     for (id, app_type, tags) in expected {
-        let mut body = Map::new();
-        body.insert("ApplicationId".into(), json!(id));
-        body.insert("ApplicationType".into(), json!(app_type));
-        body.insert("Instances".into(), json!(["i-0123456789abcdef0"]));
+        let mut body = valid_registration(id, app_type);
+        let body_members = body.as_object_mut().expect("the body is a JSON object");
         if !tags.is_empty() {
-            body.insert(
+            body_members.insert(
                 "Tags".into(),
                 Value::Object(
                     tags.iter()
@@ -1210,7 +1287,7 @@ async fn a_listing_reports_each_applications_own_summary() {
                 ),
             );
         }
-        let reply = emulator.register(Value::Object(body)).await;
+        let reply = emulator.register(body).await;
         assert_eq!(
             reply.status, 200,
             "case {id:?}: expected 200 from RegisterApplication, got {reply:?}"
@@ -1293,13 +1370,7 @@ async fn filters_narrow_the_listing_by_the_summarys_own_members() {
         ("bravo", "SAP_ABAP"),
         ("charlie", "HANA"),
     ] {
-        let reply = emulator
-            .register(json!({
-                "ApplicationId": id,
-                "ApplicationType": app_type,
-                "Instances": ["i-0123456789abcdef0"],
-            }))
-            .await;
+        let reply = emulator.register(valid_registration(id, app_type)).await;
         assert_eq!(
             reply.status, 200,
             "case {id:?}: expected 200 from RegisterApplication, got {reply:?}"

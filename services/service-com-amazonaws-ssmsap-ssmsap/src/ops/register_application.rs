@@ -4,7 +4,10 @@
 //!
 //! Registers an SAP application and PERSISTS it, so every later `GetApplication`,
 //! `ListApplications`, `StartApplication`, `StopApplication` and
-//! `DeregisterApplication` resolves the same record. The call is asynchronous in the
+//! `DeregisterApplication` resolves the same record. A registration that omits a member
+//! its `ApplicationType` conditionally requires
+//! ([`crate::state::CONDITIONALLY_REQUIRED_MEMBERS`]) is refused with the modelled
+//! `ValidationException` before anything is stored. The call is asynchronous in the
 //! real service: the application is returned `REGISTERING` and the `OperationId` names
 //! a stored `INPROGRESS` operation record that reaches `SUCCESS`
 //! [`crate::state::TRANSITION_SPAN`] later, materialised by the first request at or
@@ -187,6 +190,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+
+        // Some members the model leaves optional are required by the service for some
+        // application types (`crate::state::CONDITIONALLY_REQUIRED_MEMBERS`): a HANA
+        // application cannot be managed without the SID and instance number that name
+        // the HANA instance and the credentials that reach it. The check runs before
+        // ANY state is written, so a refused registration leaves nothing behind.
+        crate::state::conditional_requirements_met(
+            &input.application_type,
+            input.sid.as_deref(),
+            input.sap_instance_number.as_deref(),
+            input.credentials.as_deref().unwrap_or_default(),
+        )
+        .map_err(RegisterApplicationErrorModeled::ValidationException)?;
 
         if state.applications.contains_key(&input.application_id) {
             return Err(RegisterApplicationErrorModeled::ConflictException(

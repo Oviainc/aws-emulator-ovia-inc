@@ -476,6 +476,140 @@ pub fn validation(message: impl Into<String>) -> ValidationException {
     }
 }
 
+/// A `RegisterApplication` input member the model leaves optional but the service
+/// requires for SOME application types.
+///
+/// The model cannot express "required when `ApplicationType` is X"
+/// (`smithy_query(query="operation", operation="RegisterApplication")` marks only
+/// `ApplicationId`, `ApplicationType` and `Instances` `@required`), so the requirement
+/// is conditional on the type the same request carries and belongs to the service.
+/// Each variant knows the input member it names and the words a refusal names it with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConditionalMember {
+    /// `RegisterApplication$Sid` — the application's System ID.
+    Sid,
+    /// `RegisterApplication$SapInstanceNumber` — the application's instance number.
+    SapInstanceNumber,
+    /// `RegisterApplication$Credentials` — the Secrets Manager credentials that reach
+    /// the application's database. An EMPTY list specifies none, which is what the
+    /// member's modelled `[]` default leaves behind when a request omits it.
+    Credentials,
+}
+
+impl ConditionalMember {
+    /// The input member this names, spelled as the model spells it.
+    pub const fn member_name(self) -> &'static str {
+        match self {
+            Self::Sid => "Sid",
+            Self::SapInstanceNumber => "SapInstanceNumber",
+            Self::Credentials => "Credentials",
+        }
+    }
+
+    /// How a refusal words the member — the service states the requirement in SAP's
+    /// own vocabulary rather than with the wire member name.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Sid => "SID",
+            Self::SapInstanceNumber => "instance number",
+            Self::Credentials => "credentials",
+        }
+    }
+}
+
+/// The members `RegisterApplication` requires IN ADDITION to the modelled `@required`
+/// ones, per `ApplicationType`.
+///
+/// A HANA application IS its database: AWS Systems Manager for SAP cannot manage one
+/// without the System ID and instance number that name the HANA instance and the
+/// credentials that reach it — which is why every member of `ApplicationCredential`
+/// (`DatabaseName`, `CredentialType`, `SecretId`) is documented in terms of "the SAP
+/// HANA database". A type whose row is EMPTY requires nothing beyond the modelled
+/// members, so a registration of that type is accepted on those alone.
+///
+/// One row per value of the model's `ApplicationType` enum (see
+/// [`crate::ops::types::APPLICATION_TYPE_VALUES`]); a type this table does not name
+/// requires nothing conditionally.
+pub const CONDITIONALLY_REQUIRED_MEMBERS: &[(&str, &[ConditionalMember])] = &[
+    (
+        "HANA",
+        &[
+            ConditionalMember::Sid,
+            ConditionalMember::SapInstanceNumber,
+            ConditionalMember::Credentials,
+        ],
+    ),
+    ("SAP_ABAP", &[]),
+];
+
+/// The members an application of `application_type` must carry beyond the modelled
+/// `@required` ones. Empty when the type requires none.
+pub fn conditionally_required_members(application_type: &str) -> &'static [ConditionalMember] {
+    CONDITIONALLY_REQUIRED_MEMBERS
+        .iter()
+        .find(|(name, _)| *name == application_type)
+        .map(|(_, members)| *members)
+        .unwrap_or(&[])
+}
+
+/// Refuse a registration that omits a member its `ApplicationType` conditionally
+/// requires ([`CONDITIONALLY_REQUIRED_MEMBERS`]).
+///
+/// `Ok(())` when the type requires nothing, or when every member it requires is
+/// carried; otherwise the modelled `ValidationException` (HTTP 400) stating the whole
+/// requirement for that type — the requirement is one condition, so it is reported as
+/// one sentence rather than per omitted member. The caller must apply this BEFORE
+/// writing anything, so a refused registration leaves no application behind.
+pub fn conditional_requirements_met(
+    application_type: &str,
+    sid: Option<&str>,
+    sap_instance_number: Option<&str>,
+    credentials: &[ApplicationCredential],
+) -> Result<(), ValidationException> {
+    let required = conditionally_required_members(application_type);
+    let carried = |member: ConditionalMember| match member {
+        ConditionalMember::Sid => sid.is_some(),
+        ConditionalMember::SapInstanceNumber => sap_instance_number.is_some(),
+        ConditionalMember::Credentials => !credentials.is_empty(),
+    };
+    if required.iter().copied().all(carried) {
+        return Ok(());
+    }
+    Err(validation(format!(
+        "{} of {application_type} instance must be specified for SAP applications with type {application_type}.",
+        join_labels(required)
+    )))
+}
+
+/// The labels of `members`, joined as a sentence lists them: `A`, `A and B`,
+/// `A, B, and C`.
+fn join_labels(members: &[ConditionalMember]) -> String {
+    let labels: Vec<&str> = members.iter().map(|member| member.label()).collect();
+    match labels.split_last() {
+        None => String::new(),
+        Some((last, [])) => (*last).to_string(),
+        Some((last, [first])) => format!("{first} and {last}"),
+        Some((last, head)) => format!("{}, and {last}", head.join(", ")),
+    }
+}
+
+/// The modelled `ValidationException` a lookup is refused with when no registered
+/// application answers the reference it named.
+///
+/// A registration is scoped to an account and Region, so what the refusal states is
+/// that THIS account holds no such application: it names the account the lookup ran in
+/// and the reference the request carried. `GetApplication` models no
+/// `ResourceNotFoundException` (`smithy_query(query="operation",
+/// operation="GetApplication")`: `ValidationException` 400 and
+/// `InternalServerException` 500 only), so an absent application is a 400 here rather
+/// than a 404. The account comes from the core's single source of truth.
+pub fn no_registered_application(reference: &str) -> ValidationException {
+    validation(format!(
+        "No registered application found for account: {}, and application: {reference}",
+        ::engine::emulator_account_id()
+    ))
+}
+
 /// This service's modelled `ResourceNotFoundException` (HTTP 404) carrying `message`.
 pub fn not_found(message: impl Into<String>) -> ResourceNotFoundException {
     ResourceNotFoundException {
