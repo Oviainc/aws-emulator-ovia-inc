@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteFpgaImage
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteFpgaImage`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: takes the Amazon FPGA Image the request names out of [`crate::state`] and
+//! answers whether the delete succeeded. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteFpgaImage::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The refusals, in the order the service answers them: something that is not an AFI id at
+//! all is `InvalidFpgaImageID.Malformed`; a `DryRun` request a caller holds the permissions
+//! for is `DryRunOperation` and deletes nothing; and a well-formed id the account holds no
+//! AFI for is `InvalidFpgaImageID.NotFound`. `DryRun` sits BEFORE the lookup because the
+//! flag asks whether the CALLER MAY make the request — "checks whether you have the
+//! required permissions for the action, without actually making the request"
+//! (`DeleteFpgaImageRequest$DryRun`) — which is a question about the caller, not about the
+//! resource, and AWS answers it for an id nothing is stored under.
 //!
 //! ## Shape of an operation
 //!
@@ -133,18 +135,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteFpgaImage` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteFpgaImageErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteFpgaImage"))
+        use crate::state::{
+            dry_run_operation, fpga_image_id_is_well_formed, invalid_fpga_image_id_malformed,
+            invalid_fpga_image_id_not_found, require_service_state,
+        };
+
+        // An AFI carries no Region member of its own, so nothing here depends on the Region
+        // the request was signed for.
+        let _ = ctx;
+
+        // Something that is not an AFI id at all is refused as malformed, before there is
+        // anything to look up.
+        if !fpga_image_id_is_well_formed(&input.fpga_image_id) {
+            return Err(invalid_fpga_image_id_malformed(&input.fpga_image_id));
+        }
+
+        // The permission question, answered before the resource one and before any write
+        // (see the module docs).
+        if input.dry_run == Some(true) {
+            return Err(dry_run_operation());
+        }
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+
+        // The delete is what takes the AFI out of the store, so the answer reports a
+        // removal that happened rather than one this handler assumed: an id the store holds
+        // nothing for is refused instead.
+        if store.remove_fpga_image(&input.fpga_image_id).is_none() {
+            return Err(invalid_fpga_image_id_not_found(&input.fpga_image_id));
+        }
+        Ok(DeleteFpgaImageOutput {
+            // "Is `true` if the request succeeds, and an error otherwise"
+            // (`DeleteFpgaImageResult$Return`).
+            r#return: Some(true),
+        })
     }
 }
