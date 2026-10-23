@@ -27,6 +27,8 @@ mod findings_feedback;
 mod investigation_lifecycle;
 #[path = "all/ip_set_lifecycle.rs"]
 mod ip_set_lifecycle;
+#[path = "all/malware_protection_plan.rs"]
+mod malware_protection_plan;
 #[path = "all/malware_scan_settings.rs"]
 mod malware_scan_settings;
 #[path = "all/member_accounts.rs"]
@@ -35,6 +37,8 @@ mod member_accounts;
 mod member_association;
 #[path = "all/modeled_constraint_refusals.rs"]
 mod modeled_constraint_refusals;
+#[path = "all/request_region_partition_bounds.rs"]
+mod request_region_partition_bounds;
 #[path = "all/sample_finding_catalog.rs"]
 mod sample_finding_catalog;
 #[path = "all/state_roundtrip.rs"]

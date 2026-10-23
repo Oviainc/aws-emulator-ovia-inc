@@ -6,6 +6,10 @@
 //! Region. Everything the detector owns — its findings and its filters — hangs off
 //! the [`Detector`] record, so `DeleteDetector` cascades by dropping one map entry.
 //!
+//! A Malware Protection plan is NOT one of those: it is created against an S3
+//! bucket rather than against a detector, so [`MalwareProtectionPlan`] hangs off
+//! the service's own map and outlives any detector.
+//!
 //! This module holds only plain records plus the helpers more than one operation
 //! needs (id minting, the monotonic clock, finding attribute lookup, filtering and
 //! sorting). Each operation builds its own modelled output in its own
@@ -31,6 +35,39 @@ pub struct ComAmazonawsGuarddutyGuarddutyapiserviceState {
     /// whose detector is gone, and read it through
     /// [`Self::detector_for_client_token`]; never insert into it directly.
     pub client_tokens: HashMap<(String, String), ClientTokenRecord>,
+    /// Every persisted Malware Protection plan, keyed by its minted
+    /// `MalwareProtectionPlanId`.
+    ///
+    /// A plan is NOT owned by a detector: Malware Protection for S3 is created
+    /// against an S3 bucket ("Creates a new Malware Protection plan for the
+    /// protected resource", `smithy_query(query="doc",shape="CreateMalwareProtectionPlan")`),
+    /// so it hangs off the service rather than off [`Detector`].
+    ///
+    /// BOUNDED at [`MAX_MALWARE_PROTECTION_PLANS_TOTAL`] records: the per-Region
+    /// quota bounds one Region's plans and
+    /// [`MAX_MALWARE_PROTECTION_PLAN_REGIONS`] bounds how many Regions the store
+    /// partitions into, both of which `CreateMalwareProtectionPlan` enforces before
+    /// it writes.
+    pub malware_protection_plans: HashMap<String, MalwareProtectionPlan>,
+    /// `ClientToken` -> `MalwareProtectionPlanId`, the plan counterpart of
+    /// [`Self::client_tokens`], keyed by `(region, token)` for the same reason.
+    ///
+    /// Separate from the detector index on purpose: a token resolves to a resource
+    /// of the type the create that carried it made, so one token replayed against
+    /// two different creates must never hand back the other one's id.
+    ///
+    /// The token is a pure REPLAY key: it maps to the plan it minted and nothing
+    /// about the replaying request is compared against it, so a replay carrying
+    /// different members answers with that plan unchanged rather than minting a
+    /// second one or mutating the first. Creating is not updating —
+    /// `UpdateMalwareProtectionPlan` is the operation that changes a plan — and a
+    /// replay that did mutate would make a retried create a hidden update.
+    ///
+    /// It needs no eviction policy of its own to stay bounded: an entry is written
+    /// ONLY for a plan that was minted, and a plan can only be minted while
+    /// [`MAX_MALWARE_PROTECTION_PLANS_TOTAL`] is not reached, so this map holds at
+    /// most that many mappings.
+    pub malware_protection_plan_client_tokens: HashMap<(String, String), String>,
     /// Last instant handed out by [`Self::tick_millis`], so two mutations in the
     /// same millisecond still get strictly increasing timestamps.
     last_millis: i64,
@@ -204,6 +241,60 @@ impl ComAmazonawsGuarddutyGuarddutyapiserviceState {
             .collect();
         ids.sort();
         ids
+    }
+
+    /// The Malware Protection plan `region`'s endpoint serves for `id`, if any.
+    ///
+    /// Regional for the same reason a detector is: a plan is created through one
+    /// Region's endpoint and only that endpoint reports it.
+    pub fn malware_protection_plan_in(
+        &self,
+        region: &str,
+        id: &str,
+    ) -> Option<&MalwareProtectionPlan> {
+        self.malware_protection_plans
+            .get(id)
+            .filter(|plan| plan.region == region)
+    }
+
+    /// The plan `region` already holds for the S3 bucket named `bucket_name`, if
+    /// any — the plan a second create for that same protected resource conflicts
+    /// with.
+    pub fn malware_protection_plan_for_bucket(
+        &self,
+        region: &str,
+        bucket_name: &str,
+    ) -> Option<&MalwareProtectionPlan> {
+        self.malware_protection_plans
+            .values()
+            .filter(|plan| plan.region == region)
+            .find(|plan| plan.bucket_name == bucket_name)
+    }
+
+    /// How many Malware Protection plans `region`'s endpoint holds — the count the
+    /// per-account-per-Region quota
+    /// ([`MAX_MALWARE_PROTECTION_PLANS_PER_ACCOUNT_PER_REGION`]) is measured
+    /// against.
+    pub fn malware_protection_plan_count_in(&self, region: &str) -> usize {
+        self.malware_protection_plans
+            .values()
+            .filter(|plan| plan.region == region)
+            .count()
+    }
+
+    /// Would a plan created through `region`'s endpoint partition this store into
+    /// one Region more than it will hold
+    /// ([`MAX_MALWARE_PROTECTION_PLAN_REGIONS`])?
+    ///
+    /// The Region is request-chosen, so this is the bound on the number of
+    /// PARTITIONS that makes the per-Region plan quota a bound on the whole plan
+    /// map. A Region the store already holds a plan for is never refused by it.
+    pub fn malware_protection_plan_regions_exhausted(&self, region: &str) -> bool {
+        let mut regions: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+        for plan in self.malware_protection_plans.values() {
+            regions.insert(plan.region.as_str());
+        }
+        !regions.contains(region) && regions.len() >= MAX_MALWARE_PROTECTION_PLAN_REGIONS
     }
 }
 
@@ -676,6 +767,141 @@ pub fn detector_id_rejection(detector_id: &str) -> String {
         invalid_parameter_message(DETECTOR_ID_MEMBER)
     }
 }
+
+/// The wire name of the `MalwareProtectionPlanId` member, as the request carries
+/// it (`smithy_query(operation="GetMalwareProtectionPlan")` binds it as the URI
+/// label `MalwareProtectionPlanId` and the create reports it as
+/// `malwareProtectionPlanId`). It is what a rejection names.
+pub const MALWARE_PROTECTION_PLAN_ID_MEMBER: &str = "malwareProtectionPlanId";
+
+/// The wire name of `CreateMalwareProtectionPlan`'s `Role` member
+/// (`smithy_query(operation="CreateMalwareProtectionPlan")` renders it `role`).
+pub const ROLE_MEMBER: &str = "role";
+
+/// The wire name of the `ProtectedResource` member, for the same reason.
+pub const PROTECTED_RESOURCE_MEMBER: &str = "protectedResource";
+
+/// The `MalwareProtectionPlanStatus` a plan GuardDuty accepted reports: the plan
+/// is in force and nothing is wrong with it. The enum's other two members
+/// (`WARNING`, `ERROR` — `smithy_query(shape="MalwareProtectionPlanStatus")`) both
+/// describe a plan whose role or bucket the service could not use, which is a
+/// condition this emulator never produces, so every member of the enum is
+/// terminal and a created plan needs no later transition.
+pub const MALWARE_PROTECTION_PLAN_ACTIVE: &str = "ACTIVE";
+
+/// The `MalwareProtectionPlanTaggingActionStatus` a plan gets when the create
+/// names no `Actions`.
+///
+/// Tagging is what "will be added to the S3 object after scanning"
+/// (`smithy_query(operation="CreateMalwareProtectionPlan")`), and writing a tag
+/// onto a scanned object needs a permission on the role beyond reading it, so a
+/// plan that did not ask for it does not tag.
+pub const DEFAULT_TAGGING_ACTION_STATUS: &str = DISABLED;
+
+/// The message a create for an already-protected resource is refused with.
+///
+/// GuardDuty protects one S3 bucket with one plan, so the second create for the
+/// same bucket conflicts with the first. The caller's bucket name is not quoted
+/// back: the rejection states the rule, as every other rejection here does.
+pub const MALWARE_PROTECTION_PLAN_CONFLICT_MESSAGE: &str =
+    "The request is rejected because a Malware Protection plan already exists for the specified protected resource.";
+
+/// How many Malware Protection plans one account may hold in one Region.
+///
+/// A plan is keyed by a REQUEST-chosen bucket name — the bucket is never required
+/// to exist — so without a bound a caller naming fresh bucket names could grow the
+/// store without limit. Neither the Smithy model nor this service's own
+/// documentation carries a plans-per-account-per-Region figure, so unlike
+/// [`MAX_FILTERS_PER_ACCOUNT_PER_REGION`] (100, documented on `CreateFilter`) and
+/// [`MAX_MEMBERS_PER_DETECTOR`] (5,000, GuardDuty's published member quota) this
+/// number is an EMULATOR-CHOSEN bound, not a value AWS publishes: a 26th plan is
+/// refused here, where the real service may accept it. The refusal states the rule
+/// rather than the number, and it is what keeps the plan map, the plan idempotency
+/// index (an entry is written only for a plan that was minted) and the per-create
+/// duplicate scan bounded.
+pub const MAX_MALWARE_PROTECTION_PLANS_PER_ACCOUNT_PER_REGION: usize = 25;
+
+/// The message a create past
+/// [`MAX_MALWARE_PROTECTION_PLANS_PER_ACCOUNT_PER_REGION`] is refused with.
+pub const MALWARE_PROTECTION_PLAN_QUOTA_EXCEEDED_MESSAGE: &str =
+    "The request is rejected because the maximum number of Malware Protection plans per account per Region has been reached.";
+
+/// How many Regions this store will hold Malware Protection plans for.
+///
+/// [`MAX_MALWARE_PROTECTION_PLANS_PER_ACCOUNT_PER_REGION`] bounds each Region's
+/// plans, but the Region is read from the REQUEST's credential scope
+/// ([`request_region`]), so the caller chooses the partition KEY as well as what
+/// goes in it: a per-Region quota bounds one partition and not the number of
+/// partitions, so without this a caller varying the Region could grow the plan map
+/// past every per-Region quota there is. AWS runs fewer Regions than this, so a
+/// request signed for a real Region never meets it; a caller inventing Region
+/// names does. Emulator-chosen, like the per-Region quota.
+///
+/// The detector-rooted store answers the same hazard its own way, which this does
+/// not change: its idempotency index is bounded by [`MAX_CLIENT_TOKENS`] with
+/// eviction, and a detector is one per Region.
+pub const MAX_MALWARE_PROTECTION_PLAN_REGIONS: usize = 50;
+
+/// The most Malware Protection plans this store will ever hold: the per-Region
+/// quota times the Region bound. It is what makes the plan map — and the plan
+/// idempotency index, which gets an entry only for a plan that was minted — finite
+/// whatever a caller sends.
+pub const MAX_MALWARE_PROTECTION_PLANS_TOTAL: usize =
+    MAX_MALWARE_PROTECTION_PLANS_PER_ACCOUNT_PER_REGION * MAX_MALWARE_PROTECTION_PLAN_REGIONS;
+
+/// The message a create that would partition the plan store into one Region more
+/// than [`MAX_MALWARE_PROTECTION_PLAN_REGIONS`] is refused with. The caller's
+/// Region is not quoted back, as with every other rejection here.
+pub const MALWARE_PROTECTION_PLAN_TOTAL_LIMIT_MESSAGE: &str =
+    "The request is rejected because the maximum number of Malware Protection plans has been reached.";
+
+/// The message a read of a plan this account and Region does not hold answers
+/// with. As with a detector id, "never existed" and "belongs to someone else" are
+/// one refusal, so one account cannot probe another's plan ids.
+pub fn malware_protection_plan_not_found_message() -> String {
+    not_owned_message(MALWARE_PROTECTION_PLAN_ID_MEMBER)
+}
+
+/// Is `value` an IAM role ARN?
+///
+/// `Role` is the "Amazon Resource Name (ARN) of the IAM role that has the
+/// permissions to scan and add tags to the associated protected resource"
+/// (`smithy_query(operation="CreateMalwareProtectionPlan")`), and the model
+/// constrains it no further than `String`, so the form is checked here:
+/// `arn:<partition>:iam::<account>:role/<name>`. IAM is global, so a role ARN's
+/// Region segment is empty. Form only — the role need not exist, and its account
+/// need not be the caller's.
+pub fn is_iam_role_arn(value: &str) -> bool {
+    let mut parts = value.splitn(6, ':');
+    parts.next() == Some("arn")
+        && parts.next().is_some_and(|partition| !partition.is_empty())
+        && parts.next() == Some("iam")
+        && parts.next() == Some("")
+        && parts
+            .next()
+            .is_some_and(|account| !account.is_empty() && account.bytes().all(|b| b.is_ascii_digit()))
+        && parts
+            .next()
+            .and_then(|resource| resource.strip_prefix("role/"))
+            .is_some_and(|name| !name.is_empty())
+}
+
+/// The ARN of the Malware Protection plan `id` in `region`.
+///
+/// Derived, never stored: the plan's own id and the Region that serves it are the
+/// only variable parts, so a read cannot report an ARN that disagrees with the id
+/// it was asked about.
+pub fn malware_protection_plan_arn(region: &str, id: &str) -> String {
+    ::engine::emulator_arn(
+        GUARDDUTY_ARN_SERVICE,
+        region,
+        &format!("malware-protection-plan/{id}"),
+    )
+}
+
+/// This service's segment in an ARN it owns — the `arnNamespace`/`endpointPrefix`
+/// from `smithy_query(query="service_info")`.
+const GUARDDUTY_ARN_SERVICE: &str = "guardduty";
 
 /// The wire name of the filter-name member on the operations that carry it as a
 /// URI label — `GetFilter`, `UpdateFilter` and `DeleteFilter` bind
@@ -1498,6 +1724,40 @@ pub struct FilterRecord {
     pub updated_at_millis: i64,
     /// `FilterVersion`: 1 for a filter nothing has updated.
     pub version: i64,
+}
+
+/// A Malware Protection plan: the resource `CreateMalwareProtectionPlan` mints for
+/// one protected S3 bucket.
+///
+/// Everything a read reports comes from here, except the ARN, which
+/// [`malware_protection_plan_arn`] derives from [`Self::region`] and
+/// [`Self::id`].
+#[derive(Debug, Clone)]
+pub struct MalwareProtectionPlan {
+    pub id: String,
+    /// The Region whose endpoint created this plan, and the only one that serves
+    /// it.
+    pub region: String,
+    /// The IAM role ARN the plan scans and tags the bucket through.
+    pub role: String,
+    /// The protected resource: the name of the S3 bucket. "Presently, S3Bucket is
+    /// the only supported protected resource"
+    /// (`smithy_query(shape="CreateProtectedResource")`), so the plan needs no
+    /// resource-type discriminator.
+    pub bucket_name: String,
+    /// The object prefixes the scan is limited to: "The S3 object will be scanned
+    /// only if it belongs to any of the specified object prefixes"
+    /// (`smithy_query(shape="CreateS3BucketResource")`). Empty means the whole
+    /// bucket — which is what an absent prefix list and an explicitly empty one
+    /// both ask for, so the two are stored, and reported, identically.
+    pub object_prefixes: Vec<String>,
+    /// `MalwareProtectionPlanTaggingActionStatus`: whether a scanned object gets
+    /// tagged.
+    pub tagging_status: String,
+    pub tags: BTreeMap<String, String>,
+    pub created_at_millis: i64,
+    /// `MalwareProtectionPlanStatus`.
+    pub status: String,
 }
 
 /// One stored finding. Timestamps are kept as epoch milliseconds — the single
