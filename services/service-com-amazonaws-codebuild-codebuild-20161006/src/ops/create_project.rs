@@ -208,15 +208,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let now = crate::state::now_millis();
         let created = crate::state::datetime(now);
+        let arn = crate::state::project_arn(&region, &input.name);
+
+        // A project with no input source code must carry its buildspec inline; the rule
+        // holds wherever a project's source is set, so UpdateProject applies the same
+        // check to the configuration one of its requests would leave behind.
+        //
+        // Checked BEFORE the name and quota checks below, so a request is answered for
+        // what it asked for rather than for the store's contents: the model fixes no
+        // precedence between these refusals, and this one needs no state at all.
+        if let Some(message) = crate::state::inline_buildspec_violation(&input.source) {
+            crate::state::audit(
+                Self::NAME,
+                ctx.parts(),
+                crate::state::AuditOutcome::ValidationRefused,
+                Some(&arn),
+            );
+            return Err(CreateProjectErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
         let mut guard = state.lock();
 
         if guard.projects.contains_key(&input.name) {
+            drop(guard);
+            crate::state::audit(
+                Self::NAME,
+                ctx.parts(),
+                crate::state::AuditOutcome::AlreadyExists,
+                Some(&arn),
+            );
             return Err(CreateProjectErrorModeled::ResourceAlreadyExistsException(
                 ResourceAlreadyExistsException {
-                    message: Some(format!(
-                        "Project already exists: {}",
-                        crate::state::project_arn(&region, &input.name)
-                    )),
+                    message: Some(format!("Project already exists: {arn}")),
                 },
             )
             .into());
@@ -225,6 +253,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The account's build-project quota, which is also the ceiling that keeps the
         // store from growing without bound as requests arrive.
         if guard.projects.len() >= crate::state::MAX_PROJECTS {
+            drop(guard);
+            crate::state::audit(
+                Self::NAME,
+                ctx.parts(),
+                crate::state::AuditOutcome::QuotaExceeded,
+                Some(&arn),
+            );
             return Err(CreateProjectErrorModeled::AccountLimitExceededException(
                 AccountLimitExceededException {
                     message: Some(format!(
@@ -237,7 +272,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let project = Project {
-            arn: Some(crate::state::project_arn(&region, &input.name)),
+            arn: Some(arn.clone()),
             name: Some(input.name.clone()),
             description: input.description,
             source: Some(input.source),
@@ -293,6 +328,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 created_millis: now,
                 last_modified_millis: now,
             },
+        );
+        // The lock is dropped before the audit record is written, so a log consumer
+        // can never hold this service's state.
+        drop(guard);
+
+        crate::state::audit(
+            Self::NAME,
+            ctx.parts(),
+            crate::state::AuditOutcome::ProjectCreated,
+            Some(&arn),
         );
 
         Ok(CreateProjectOutput {

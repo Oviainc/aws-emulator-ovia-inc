@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetDirectoryLimits
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetDirectoryLimits`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports this Region's directory limits, computed from the directories persisted in
+//! [`crate::state`]: for each counter the modelled `DirectoryLimits` structure carries —
+//! cloud-only directories, cloud-only Managed Microsoft AD directories and connected
+//! directories — the Region's directory allowance ([`crate::state::MAX_DIRECTORIES`]),
+//! how many stored directories fall in that category, and whether that allowance is
+//! used up. Every create in this service counts against the one allowance whatever the
+//! directory's type, so all three counters report it and the flag is on exactly when a
+//! further create would be refused.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetDirectoryLimits::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A reporting operation: the only write it performs is
+//! [`crate::state::ComAmazonawsDirectoryserviceDirectoryservice20150416State::advance_clock`],
+//! which materialises the stage transition the clock had already made due.
 //!
 //! ## Shape of an operation
 //!
@@ -135,18 +138,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetDirectoryLimits` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetDirectoryLimitsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetDirectoryLimits"))
+        // `GetDirectoryLimitsRequest` models no members: the limits are a property of
+        // the Region the call is made in, not of anything the caller sends.
+        let _ = (&input, ctx);
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        let mut store = state.lock();
+        // The one write a reporting operation makes: the stage transition the clock had
+        // already made due. It was owed whether or not anybody called.
+        store.advance_clock(::std::time::SystemTime::now());
+
+        // Every member is derived from the stored directories, in
+        // [`crate::state::ComAmazonawsDirectoryserviceDirectoryservice20150416State::directory_limits`]
+        // — the same place the sibling limits operation (`GetSnapshotLimits`) renders its
+        // structure, so the derivation lives beside the quota constant it reads.
+        let limits = store.directory_limits();
+        drop(store);
+
+        Ok(GetDirectoryLimitsOutput {
+            directory_limits: Some(limits),
+        })
     }
 }
