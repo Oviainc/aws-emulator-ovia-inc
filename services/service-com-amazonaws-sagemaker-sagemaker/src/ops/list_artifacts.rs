@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListArtifacts
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListArtifacts`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListArtifacts::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: filters, sorts and pages the lineage artifacts stored in `crate::state`,
+//! replaying each one's stored `Source` as `CreateArtifact` took it. This is the ONLY
+//! file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -135,6 +129,18 @@ impl<Eng> ListArtifacts<Eng> {
     }
 }
 
+/// `MaxResults`' documented default for this operation ("The maximum number of artifacts
+/// to return in the response. The default value is 10."), applied when the caller sends
+/// none. An explicit `MaxResults` is still capped by [`crate::state::MAX_PAGE_SIZE`].
+///
+/// `SortBy`'s and `SortOrder`'s documented defaults are [`crate::state::DEFAULT_SORT_BY`]
+/// and [`crate::state::DEFAULT_SORT_ORDER`] ("The property used to sort results. The
+/// default value is CreationTime." / "The sort order. The default value is Descending."),
+/// shared with the service's other listings; the accepted value sets are the generated
+/// `*_VALUES` slices in `super::types`, so a refusal stays in step with the model rather
+/// than with a transcription of it.
+const DEFAULT_MAX_RESULTS: i32 = 10;
+
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for ListArtifacts<Eng>
 {
@@ -152,18 +158,138 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListArtifacts` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListArtifactsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListArtifacts"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        let sort_by = input
+            .sort_by
+            .as_deref()
+            .unwrap_or(crate::state::DEFAULT_SORT_BY);
+        if !SORT_ARTIFACTS_BY_VALUES.contains(&sort_by) {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "SortBy must be one of {}; got \"{sort_by}\".",
+                SORT_ARTIFACTS_BY_VALUES.join(", ")
+            )));
+        }
+        let sort_order = input
+            .sort_order
+            .as_deref()
+            .unwrap_or(crate::state::DEFAULT_SORT_ORDER);
+        if !SORT_ORDER_VALUES.contains(&sort_order) {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "SortOrder must be one of {}; got \"{sort_order}\".",
+                SORT_ORDER_VALUES.join(", ")
+            )));
+        }
+        let descending = sort_order == crate::state::ORDER_DESCENDING;
+
+        let after = input.created_after.map(crate::state::timestamp_key);
+        let before = input.created_before.map(crate::state::timestamp_key);
+        // A lineage artifact is a REGIONAL resource — its ARN names the Region it was
+        // created in — so a listing reports the artifacts of the Region this request
+        // signed for and never one whose ARN names another.
+        let region = crate::state::request_region(ctx);
+
+        let store = state.lock();
+        let mut matching: Vec<&crate::state::Artifact> = store
+            .artifacts
+            .values()
+            .filter(|artifact| artifact.region == region)
+            .filter(|artifact| {
+                // `SourceUri` and `ArtifactType` are documented as returning only the
+                // artifacts WITH the specified value, so each is an equality filter on
+                // the stored member rather than a substring or prefix match.
+                input
+                    .source_uri
+                    .as_deref()
+                    .is_none_or(|wanted| artifact.source.source_uri == wanted)
+            })
+            .filter(|artifact| {
+                input
+                    .artifact_type
+                    .as_deref()
+                    .is_none_or(|wanted| artifact.artifact_type == wanted)
+            })
+            .filter(|artifact| {
+                // "created on or after" / "created on or before": both bounds are
+                // inclusive, so a timestamp copied straight out of a prior response's
+                // `CreationTime` still selects that artifact.
+                let created =
+                    crate::state::timestamp_key(crate::state::timestamp(artifact.creation_time));
+                after.is_none_or(|bound| created >= bound)
+                    && before.is_none_or(|bound| created <= bound)
+            })
+            .collect();
+        // `SortArtifactsBy` models `CreationTime` as its only key, so `SortOrder` reverses
+        // the creation instant. The tie-break stays `ArtifactArn` ascending in both
+        // directions — an artifact's `ArtifactName` is optional, and the ARN is the only
+        // identifier every artifact has — so two artifacts created in the same instant
+        // keep one order whichever way the page is sorted, and a `NextToken` resolved
+        // against a freshly computed result set lands on the same boundary.
+        matching.sort_by(|left, right| {
+            let by_key = crate::state::timestamp_key(crate::state::timestamp(left.creation_time))
+                .cmp(&crate::state::timestamp_key(crate::state::timestamp(
+                    right.creation_time,
+                )));
+            let by_key = if descending { by_key.reverse() } else { by_key };
+            by_key.then_with(|| left.arn.cmp(&right.arn))
+        });
+
+        let start = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => {
+                let resumed_after = crate::state::decode_page_token(token)
+                    .and_then(|arn| matching.iter().position(|artifact| artifact.arn == arn))
+                    .ok_or_else(|| {
+                        crate::scaffolded::Scaffolded::validation(
+                            "NextToken does not name a page boundary of this result set; \
+                             restart the listing without it.",
+                        )
+                    })?;
+                resumed_after + 1
+            }
+        };
+
+        // An absent `MaxResults` takes this operation's documented default of 10; an
+        // explicit one is capped by the service's own ceiling, so no single call can
+        // serialise the whole store. The token below is emitted whenever anything is
+        // left, so a paginating client walks the full result set exactly once either way.
+        let start = start.min(matching.len());
+        let page_size = input
+            .max_results
+            .map_or(DEFAULT_MAX_RESULTS, |max| {
+                max.clamp(1, crate::state::MAX_PAGE_SIZE)
+            })
+            .unsigned_abs() as usize;
+        let end = start.saturating_add(page_size).min(matching.len());
+        let page = &matching[start..end];
+
+        let next_token = match page.last() {
+            // A token only where a further page exists, so a paginating client stops.
+            Some(last) if end < matching.len() => Some(crate::state::encode_page_token(&last.arn)),
+            _ => None,
+        };
+
+        Ok(ListArtifactsOutput {
+            // The member is always present, the empty list included: a listing that
+            // selects nothing answers an empty list rather than omitting the member.
+            artifact_summaries: Some(
+                page.iter()
+                    .map(|artifact| ArtifactSummary {
+                        artifact_arn: Some(artifact.arn.clone()),
+                        artifact_name: artifact.name.clone(),
+                        // Replayed as stored, so an absent `SourceTypes` stays absent and
+                        // an empty one stays empty.
+                        source: Some(artifact.source.clone()),
+                        artifact_type: Some(artifact.artifact_type.clone()),
+                        creation_time: Some(crate::state::timestamp(artifact.creation_time)),
+                        last_modified_time: Some(crate::state::timestamp(
+                            artifact.last_modified_time,
+                        )),
+                    })
+                    .collect(),
+            ),
+            next_token,
+        })
     }
 }

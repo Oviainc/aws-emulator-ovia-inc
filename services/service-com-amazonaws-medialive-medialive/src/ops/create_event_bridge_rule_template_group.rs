@@ -200,14 +200,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `Name` is documented "Names must be unique within the scope of a
         // resource type in a specific region", so a second group with a name
-        // this region already holds is refused rather than created.
-        if let Some(existing) = state.event_bridge_rule_template_group_named(&region, &input.name) {
+        // this region already holds is refused rather than created — with the
+        // fixed message every monitor resource's name collision carries.
+        if state
+            .event_bridge_rule_template_group_named(&region, &input.name)
+            .is_some()
+        {
             return Err(CreateEventBridgeRuleTemplateGroupErrorModeled::ConflictException(
                 ConflictException {
-                    message: Some(format!(
-                        "An eventbridge rule template group named {} already exists in {region} (id {})",
-                        input.name, existing.id
-                    )),
+                    message: Some(crate::state::NAME_ALREADY_IN_USE_MESSAGE.to_string()),
                 },
             )
             .into());

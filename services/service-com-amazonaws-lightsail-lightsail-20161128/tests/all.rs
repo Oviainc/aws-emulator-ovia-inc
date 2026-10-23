@@ -71,3 +71,5 @@ mod relational_database_bundles;
 mod relational_database_lifecycle;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/static_ip_allocation.rs"]
+mod static_ip_allocation;
