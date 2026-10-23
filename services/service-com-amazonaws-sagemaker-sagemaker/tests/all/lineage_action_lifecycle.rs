@@ -604,11 +604,18 @@ async fn describe_and_delete_refuse_an_unknown_action_with_resource_not_found() 
             "ResourceNotFound",
             "case describe-unknown={name}: error code, got {body:?}"
         );
-        // The message quotes the identifier the CALLER passed, not one the service
-        // synthesised from it.
-        assert!(
-            message(&body).contains(&format!("\"{name}\"")),
-            "case describe-unknown={name}: the message must quote the identifier passed, \
+        // The lineage readers report the identifier RESOLVED to its ARN, single-quoted:
+        // a name is resolved against the Region the request signed for, an ARN stands as
+        // it arrived.
+        let resolved = if name.starts_with("arn:") {
+            name.to_string()
+        } else {
+            format!("arn:aws:sagemaker:us-east-1:{ACCOUNT}:action/{name}")
+        };
+        assert_eq!(
+            message(&body),
+            format!("Action '{resolved}' does not exist."),
+            "case describe-unknown={name}: the message must name the resolved ARN, \
              got {:?}",
             message(&body)
         );
@@ -627,9 +634,10 @@ async fn describe_and_delete_refuse_an_unknown_action_with_resource_not_found() 
             "ResourceNotFound",
             "case delete-unknown={name}: error code, got {body:?}"
         );
-        assert!(
-            message(&body).contains(&format!("\"{name}\"")),
-            "case delete-unknown={name}: the message must quote the name passed, got {:?}",
+        assert_eq!(
+            message(&body),
+            format!("Action 'arn:aws:sagemaker:us-east-1:{ACCOUNT}:action/{name}' does not exist."),
+            "case delete-unknown={name}: the message must name the resolved ARN, got {:?}",
             message(&body)
         );
     }

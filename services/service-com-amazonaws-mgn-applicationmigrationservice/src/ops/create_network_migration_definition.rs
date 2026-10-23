@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateNetworkMigrationDefinition
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateNetworkMigrationDefinition`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Mints a `networkMigrationDefinitionID` and an ARN, stores the definition in this
+//! service's state and returns the stored record.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateNetworkMigrationDefinition::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The operation is `@idempotent` but models no idempotency token, so the request's own
+//! members are the only thing a retry can be recognised by: a request every member of
+//! which equals a stored definition of the caller's account answers that definition
+//! unchanged (same id, same `createdAt`), and any other request creates a new
+//! definition. The model declares no conflict error and the definition's identity is its
+//! minted id, so two definitions may share a `name`.
+//!
+//! `cidrMappings` is refused with the modelled `ValidationException` (400) unless
+//! `vpcProvisioningStrategy` is `USE_EXISTING`, which is what the model documents for
+//! that member and cannot express.
+//!
+//! The store is bounded by `crate::state::NETWORK_MIGRATION_DEFINITION_QUOTA` and
+//! refuses past it with the modelled `ServiceQuotaExceededException` (402), so a caller
+//! cannot grow the emulator's heap without end.
 //!
 //! ## Shape of an operation
 //!
@@ -129,11 +137,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-mgn-applicationmigratio
 // here — hence the `CreateNetworkMigrationDefinitionError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.mgn#CreateNetworkMigrationDefinition")]
+// `extra_errors` widens the accepted set with a shape the SERVICE models but this
+// operation does not list: `InternalServerException` (HTTP 500) is the only honest
+// answer when the engine carries no store for this service.
+#[smithy_macros::operation_error(
+    "com.amazonaws.mgn#CreateNetworkMigrationDefinition",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum CreateNetworkMigrationDefinitionErrorModeled {
     ServiceQuotaExceededException(ServiceQuotaExceededException),
     ValidationException(ValidationException),
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -187,18 +202,112 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateNetworkMigrationDefinition` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateNetworkMigrationDefinitionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateNetworkMigrationDefinition"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateNetworkMigrationDefinitionErrorModeled::InternalServerException(
+                crate::state::state_unavailable(),
+            )
+        })?;
+        // The operation models no `accountID` member, so a definition always belongs to
+        // the account the request is signed for.
+        let account = crate::state::account_key(None);
+        let region = crate::state::request_region(ctx.parts());
+
+        let cidr_mappings = input.cidr_mappings.unwrap_or_default();
+        let migrates_into_existing_vpcs = input.vpc_provisioning_strategy.as_deref()
+            == Some(crate::state::VPC_PROVISIONING_USE_EXISTING);
+        if !cidr_mappings.is_empty() && !migrates_into_existing_vpcs {
+            crate::state::audit(
+                ctx.parts(),
+                Self::NAME,
+                &account,
+                &input.name,
+                "refused: ValidationException",
+            );
+            return Err(CreateNetworkMigrationDefinitionErrorModeled::ValidationException(
+                crate::state::cidr_mappings_need_existing_vpcs(),
+            )
+            .into());
+        }
+
+        let configuration = crate::state::NetworkMigrationDefinitionConfiguration {
+            name: input.name,
+            description: input.description,
+            source_configurations: input.source_configurations.unwrap_or_default(),
+            target_s3_configuration: input.target_s3_configuration,
+            target_network: input.target_network,
+            target_deployment: input.target_deployment,
+            vpc_provisioning_strategy: input.vpc_provisioning_strategy,
+            cidr_mappings,
+            // Stored sorted, so the tags a read reports are in one stable order.
+            tags: input.tags.unwrap_or_default().into_iter().collect(),
+            scope_tags: input.scope_tags.unwrap_or_default().into_iter().collect(),
+        };
+
+        let mut store = state.lock();
+
+        // `@idempotent` with no idempotency token: a request whose every member equals a
+        // stored definition's is a retry of the call that created it, so it answers that
+        // definition rather than minting a second one.
+        if let Some(existing) = store
+            .network_migration_definitions_of(&account)
+            .into_iter()
+            .find(|definition| definition.configuration.matches(&configuration))
+        {
+            let replayed = existing.to_shape();
+            crate::state::audit(
+                ctx.parts(),
+                Self::NAME,
+                &account,
+                &existing.network_migration_definition_id,
+                "replayed",
+            );
+            return Ok(replayed);
+        }
+
+        // The store is bounded per account AND in total: see
+        // `crate::state::NETWORK_MIGRATION_DEFINITION_QUOTA`.
+        if store.network_migration_definition_store_is_full(&account) {
+            crate::state::audit(
+                ctx.parts(),
+                Self::NAME,
+                &account,
+                &configuration.name,
+                "refused: ServiceQuotaExceededException",
+            );
+            return Err(
+                CreateNetworkMigrationDefinitionErrorModeled::ServiceQuotaExceededException(
+                    crate::state::network_migration_definition_quota_exceeded(&account),
+                )
+                .into(),
+            );
+        }
+
+        // One instant for both timestamps: nothing has updated the definition since it
+        // was created.
+        let now = ::std::time::SystemTime::now();
+        let definition_id = store.mint_network_migration_definition_id();
+        let definition = crate::state::NetworkMigrationDefinition {
+            arn: crate::state::network_migration_definition_arn(&region, &definition_id),
+            network_migration_definition_id: definition_id,
+            account_id: account.clone(),
+            created_at: now,
+            updated_at: now,
+            configuration,
+        };
+
+        let created = definition.to_shape();
+        let stored = store.insert_network_migration_definition(definition);
+        debug_assert!(stored, "the store bound is checked above this insert");
+        crate::state::audit(
+            ctx.parts(),
+            Self::NAME,
+            &account,
+            created
+                .network_migration_definition_id
+                .as_deref()
+                .unwrap_or_default(),
+            "created",
+        );
+        Ok(created)
     }
 }

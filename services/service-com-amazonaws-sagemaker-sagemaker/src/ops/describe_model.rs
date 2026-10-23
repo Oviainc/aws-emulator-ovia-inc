@@ -144,7 +144,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let state = crate::state::service_state(&*self.engine)
             .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
@@ -153,14 +153,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(model) = store.models.get(&input.model_name) else {
             // Never a 200 with empty fields: a caller cannot tell that from a model
             // that exists and carries nothing.
-            let arn = crate::state::resource_arn(
-                &crate::state::request_region(ctx),
-                "model",
-                &input.model_name,
-            );
-            return Err(crate::scaffolded::Scaffolded::validation(format!(
-                "Could not find model \"{arn}\"."
-            )));
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::could_not_find(
+                    crate::state::MODEL_KIND_LABEL,
+                    &input.model_name,
+                ),
+            ));
         };
 
         Ok(DescribeModelOutput {

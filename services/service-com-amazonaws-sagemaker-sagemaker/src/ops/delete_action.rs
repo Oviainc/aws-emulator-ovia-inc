@@ -146,12 +146,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
         let Some(action) = store.actions.remove(&arn) else {
-            // The message quotes the identifier the CALLER passed, never an ARN this
-            // service synthesised for it.
+            // The lineage readers report the identifier RESOLVED to its ARN, which is the
+            // store key this request resolved to.
             return Err(DeleteActionErrorModeled::ResourceNotFound(ResourceNotFound {
-                message: Some(format!(
-                    "Could not find action \"{}\".",
-                    input.action_name
+                message: Some(crate::state::does_not_exist(
+                    crate::state::ACTION_ENTITY,
+                    &arn,
                 )),
             })
             .into());

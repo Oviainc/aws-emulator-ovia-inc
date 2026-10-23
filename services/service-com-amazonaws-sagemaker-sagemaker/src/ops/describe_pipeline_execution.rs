@@ -170,23 +170,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
-        // The writes this report may make: a pipeline removal the clock already owed —
-        // which takes that pipeline's executions with it — and the execution's own due
-        // terminal status. Both were due at the same instant whether or not anybody
-        // called.
-        store.settle_pipeline_deletions(now);
+        // The one write this report may make: the execution's own due terminal status,
+        // owed at the stored instant whether or not anybody called. A removal needs no
+        // settling here — `DeletePipeline` takes the pipeline's executions with it when it
+        // runs.
 
         let Some(execution) = store
             .pipeline_executions
             .get_mut(&input.pipeline_execution_arn)
         else {
             // Never a 200 with empty fields: a caller cannot tell that from an execution
-            // that exists and carries nothing.
+            // that exists and carries nothing. `PipelineExecutionArn` is already the
+            // resolved ARN, so this reports it through the same template as the pipeline
+            // and lineage readers of this service.
             return Err(DescribePipelineExecutionErrorModeled::ResourceNotFound(
                 ResourceNotFound {
-                    message: Some(format!(
-                        "Pipeline execution {} does not exist.",
-                        input.pipeline_execution_arn
+                    message: Some(crate::state::does_not_exist(
+                        crate::state::PIPELINE_EXECUTION_ENTITY,
+                        &input.pipeline_execution_arn,
                     )),
                 },
             )

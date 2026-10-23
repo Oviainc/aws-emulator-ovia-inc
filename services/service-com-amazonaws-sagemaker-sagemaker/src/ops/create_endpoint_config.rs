@@ -231,10 +231,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .filter_map(|variant| variant.model_name.as_deref());
         for model_name in named_models {
             if !store.models.contains_key(model_name) {
-                let model_arn = crate::state::resource_arn(&region, "model", model_name);
-                return Err(crate::scaffolded::Scaffolded::validation(format!(
-                    "Could not find model \"{model_arn}\"."
-                )));
+                return Err(crate::scaffolded::Scaffolded::validation(
+                    crate::state::could_not_find(crate::state::MODEL_KIND_LABEL, model_name),
+                ));
             }
         }
 

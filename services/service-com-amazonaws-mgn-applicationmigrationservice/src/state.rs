@@ -10,10 +10,12 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::ops::types::{
-    ApplicationAggregatedStatus, ConflictException, CreateApplicationOutput, DataReplicationInfo,
-    InternalServerException, LaunchedInstance, LifeCycle, ResourceNotFoundException,
-    ServiceQuotaExceededException, SourceProperties, SourceServerConnectorAction,
-    UninitializedAccountException, UpdateSourceServerOutput, ValidationException,
+    ApplicationAggregatedStatus, CidrMapping, ConflictException, CreateApplicationOutput,
+    CreateNetworkMigrationDefinitionOutput, DataReplicationInfo, InternalServerException,
+    LaunchedInstance, LifeCycle, ResourceNotFoundException, ServiceQuotaExceededException,
+    SourceConfiguration, SourceProperties, SourceServerConnectorAction, TargetNetwork,
+    TargetS3Configuration, UninitializedAccountException, UpdateSourceServerOutput,
+    ValidationException, ValidationExceptionField,
 };
 
 /// The region an ARN carries when the request names none: the emulator's default.
@@ -32,6 +34,21 @@ const APPLICATION_ID_BODY_LEN: usize = 17;
 
 /// The `sourceServerID` prefix the model's `^s-[0-9a-zA-Z]{17}$` pattern requires.
 const SOURCE_SERVER_ID_PREFIX: &str = "s-";
+
+/// The `networkMigrationDefinitionID` prefix the model's `^nmd-[0-9a-zA-Z]{17}$`
+/// pattern requires.
+const NETWORK_MIGRATION_DEFINITION_ID_PREFIX: &str = "nmd-";
+
+/// How many `[0-9a-zA-Z]` characters follow the prefix of a
+/// `NetworkMigrationDefinitionID` (model pattern `^nmd-[0-9a-zA-Z]{17}$`, length
+/// 21..21).
+const NETWORK_MIGRATION_DEFINITION_ID_BODY_LEN: usize = 17;
+
+/// The `VpcProvisioningStrategy` value that migrates into VPCs that already exist —
+/// the only one a network migration definition may carry CIDR mappings under, as the
+/// model documents `cidrMappings` ("CIDR mappings can be provided only when
+/// `vpcProvisioningStrategy` is set to `USE_EXISTING`").
+pub const VPC_PROVISIONING_USE_EXISTING: &str = "USE_EXISTING";
 
 /// How many `[0-9a-zA-Z]` characters follow the prefix of a `SourceServerID`
 /// (model pattern `^s-[0-9a-zA-Z]{17}$`, length 19..19).
@@ -66,6 +83,17 @@ pub const SOURCE_SERVER_QUOTA: usize = 1_000;
 /// with the modelled `ValidationException`.
 pub const ACCOUNT_QUOTA: usize = 16;
 
+/// The most network migration definitions this store holds at a time — per account
+/// AND in total.
+///
+/// The emulator's own bound on the network-migration-definition growth site, not a
+/// claim about any AWS quota: the same reasoning as [`APPLICATION_QUOTA`].
+/// `CreateNetworkMigrationDefinition` checks
+/// [`ComAmazonawsMgnApplicationmigrationserviceState::network_migration_definition_store_is_full`]
+/// before minting anything and refuses past it with the modelled
+/// `ServiceQuotaExceededException`, so the record count cannot be grown past the bound.
+pub const NETWORK_MIGRATION_DEFINITION_QUOTA: usize = 1_000;
+
 /// Per-service state for com-amazonaws-mgn-applicationmigrationservice. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsMgnApplicationmigrationserviceState {
@@ -81,6 +109,11 @@ pub struct ComAmazonawsMgnApplicationmigrationserviceState {
     /// The `sourceServerID`s in registration order, so `DescribeSourceServers` pages
     /// in a stable order and a `nextToken` resumes where the previous page stopped.
     pub source_server_order: Vec<String>,
+    /// Every network migration definition, by `networkMigrationDefinitionID`.
+    pub network_migration_definitions: HashMap<String, NetworkMigrationDefinition>,
+    /// The `networkMigrationDefinitionID`s in creation order, so a listing pages in a
+    /// stable order and a `nextToken` resumes where the previous page stopped.
+    pub network_migration_definition_order: Vec<String>,
 }
 
 impl ComAmazonawsMgnApplicationmigrationserviceState {
@@ -236,6 +269,81 @@ impl ComAmazonawsMgnApplicationmigrationserviceState {
         }
         self.source_servers
             .insert(server.source_server_id.clone(), server);
+        true
+    }
+
+    /// Every network migration definition of `account_id`, in creation order.
+    pub fn network_migration_definitions_of(
+        &self,
+        account_id: &str,
+    ) -> Vec<&NetworkMigrationDefinition> {
+        self.network_migration_definition_order
+            .iter()
+            .filter_map(|id| self.network_migration_definitions.get(id))
+            .filter(|definition| definition.account_id == account_id)
+            .collect()
+    }
+
+    /// The network migration definition `definition_id` names within `account_id`, or
+    /// `None` — a definition of another account is not visible to this one.
+    pub fn network_migration_definition_of(
+        &self,
+        account_id: &str,
+        definition_id: &str,
+    ) -> Option<&NetworkMigrationDefinition> {
+        self.network_migration_definitions
+            .get(definition_id)
+            .filter(|definition| definition.account_id == account_id)
+    }
+
+    /// A fresh `networkMigrationDefinitionID` no stored definition holds.
+    pub fn mint_network_migration_definition_id(&self) -> String {
+        loop {
+            let candidate = mint_id(
+                NETWORK_MIGRATION_DEFINITION_ID_PREFIX,
+                NETWORK_MIGRATION_DEFINITION_ID_BODY_LEN,
+            );
+            if !self.network_migration_definitions.contains_key(&candidate) {
+                return candidate;
+            }
+        }
+    }
+
+    /// Whether the network-migration-definition store is full: either the account
+    /// already holds [`NETWORK_MIGRATION_DEFINITION_QUOTA`] definitions, or the whole
+    /// store does. Checked before a create mints anything, so neither the per-account
+    /// count nor the total can be grown past the bound.
+    pub fn network_migration_definition_store_is_full(&self, account_id: &str) -> bool {
+        self.network_migration_definitions.len() >= NETWORK_MIGRATION_DEFINITION_QUOTA
+            || self.network_migration_definitions_of(account_id).len()
+                >= NETWORK_MIGRATION_DEFINITION_QUOTA
+    }
+
+    /// Store a network migration definition, remembering its place in creation order.
+    ///
+    /// Answers whether it was stored, exactly as [`Self::insert_application`] does: a
+    /// store already at [`NETWORK_MIGRATION_DEFINITION_QUOTA`] refuses rather than
+    /// growing past the bound, and re-storing a known id keeps its place in the
+    /// creation order rather than duplicating it.
+    pub fn insert_network_migration_definition(
+        &mut self,
+        definition: NetworkMigrationDefinition,
+    ) -> bool {
+        let known = self
+            .network_migration_definitions
+            .contains_key(&definition.network_migration_definition_id);
+        if !known && self.network_migration_definitions.len() >= NETWORK_MIGRATION_DEFINITION_QUOTA
+        {
+            return false;
+        }
+        if !known {
+            self.network_migration_definition_order
+                .push(definition.network_migration_definition_id.clone());
+        }
+        self.network_migration_definitions.insert(
+            definition.network_migration_definition_id.clone(),
+            definition,
+        );
         true
     }
 }
@@ -398,6 +506,173 @@ pub struct AggregatedStatus {
 /// the state every application is created in.
 pub const PROGRESS_NOT_STARTED: &str = "NOT_STARTED";
 
+/// Everything a caller supplies about a network migration definition: the members
+/// `CreateNetworkMigrationDefinition` stores and an update replaces.
+///
+/// Held apart from the minted id, the ARN and the timestamps so a create can tell an
+/// `@idempotent` replay — a request whose every member equals a stored definition's —
+/// from a request for a new definition. The operation models no idempotency token, so
+/// the request's own members are the only thing a replay can be recognised by.
+#[derive(Debug, Clone, Default)]
+pub struct NetworkMigrationDefinitionConfiguration {
+    pub name: String,
+    pub description: Option<String>,
+    pub source_configurations: Vec<SourceConfiguration>,
+    pub target_s3_configuration: TargetS3Configuration,
+    pub target_network: TargetNetwork,
+    /// One of the model's `TargetDeployment` values (`SINGLE_ACCOUNT`,
+    /// `MULTI_ACCOUNT`), or absent while the caller named none.
+    pub target_deployment: Option<String>,
+    /// One of the model's `VpcProvisioningStrategy` values (`CREATE_NEW`,
+    /// `USE_EXISTING`), or absent while the caller named none.
+    pub vpc_provisioning_strategy: Option<String>,
+    pub cidr_mappings: Vec<CidrMapping>,
+    /// Stored sorted, so the tags a read reports are in one stable order.
+    pub tags: BTreeMap<String, String>,
+    /// Stored sorted, for the same reason as [`Self::tags`].
+    pub scope_tags: BTreeMap<String, String>,
+}
+
+impl NetworkMigrationDefinitionConfiguration {
+    /// Whether two configurations carry the same members, member by member.
+    ///
+    /// The modelled shapes are generated without `PartialEq`, so the comparison is
+    /// spelled out here rather than derived; it covers every member of the shape, so a
+    /// configuration that differs anywhere is not a match.
+    pub fn matches(&self, other: &Self) -> bool {
+        self.name == other.name
+            && self.description == other.description
+            && self.target_deployment == other.target_deployment
+            && self.vpc_provisioning_strategy == other.vpc_provisioning_strategy
+            && self.tags == other.tags
+            && self.scope_tags == other.scope_tags
+            && same_target_s3_configuration(
+                &self.target_s3_configuration,
+                &other.target_s3_configuration,
+            )
+            && same_target_network(&self.target_network, &other.target_network)
+            && self.source_configurations.len() == other.source_configurations.len()
+            && self
+                .source_configurations
+                .iter()
+                .zip(other.source_configurations.iter())
+                .all(|(left, right)| same_source_configuration(left, right))
+            && self.cidr_mappings.len() == other.cidr_mappings.len()
+            && self
+                .cidr_mappings
+                .iter()
+                .zip(other.cidr_mappings.iter())
+                .all(|(left, right)| {
+                    left.original_cidr == right.original_cidr
+                        && left.updated_cidr == right.updated_cidr
+                })
+    }
+}
+
+fn same_target_s3_configuration(
+    left: &TargetS3Configuration,
+    right: &TargetS3Configuration,
+) -> bool {
+    left.s3_bucket == right.s3_bucket && left.s3_bucket_owner == right.s3_bucket_owner
+}
+
+fn same_target_network(left: &TargetNetwork, right: &TargetNetwork) -> bool {
+    left.topology == right.topology
+        && left.inbound_cidr == right.inbound_cidr
+        && left.outbound_cidr == right.outbound_cidr
+        && left.inspection_cidr == right.inspection_cidr
+}
+
+fn same_source_configuration(left: &SourceConfiguration, right: &SourceConfiguration) -> bool {
+    left.source_environment == right.source_environment
+        && left.source_s3_configuration.s3_bucket == right.source_s3_configuration.s3_bucket
+        && left.source_s3_configuration.s3_bucket_owner
+            == right.source_s3_configuration.s3_bucket_owner
+        && left.source_s3_configuration.s3_key == right.source_s3_configuration.s3_key
+}
+
+/// One stored network migration definition: the minted id and ARN, the account it
+/// lives in, when it was created and last updated, and the caller-supplied
+/// configuration. `GetNetworkMigrationDefinition` reports exactly these members and
+/// NOTHING it computes per read, so two reads of an unchanged definition answer the
+/// same record.
+#[derive(Debug, Clone)]
+pub struct NetworkMigrationDefinition {
+    pub network_migration_definition_id: String,
+    pub arn: String,
+    /// The account the definition lives in (the emulator's own account: the operation
+    /// models no `accountID` member).
+    pub account_id: String,
+    pub created_at: ::std::time::SystemTime,
+    pub updated_at: ::std::time::SystemTime,
+    pub configuration: NetworkMigrationDefinitionConfiguration,
+}
+
+impl NetworkMigrationDefinition {
+    /// The `tags` member: the stored tags, or absent when the definition carries none.
+    pub fn tags_shape(&self) -> Option<std::collections::HashMap<String, String>> {
+        map_shape(&self.configuration.tags)
+    }
+
+    /// The `scopeTags` member: the stored scope tags, or absent when it carries none.
+    pub fn scope_tags_shape(&self) -> Option<std::collections::HashMap<String, String>> {
+        map_shape(&self.configuration.scope_tags)
+    }
+
+    /// This definition as the model's `NetworkMigrationDefinition` structure — the
+    /// output shape every network-migration-definition operation answers with.
+    pub fn to_shape(&self) -> CreateNetworkMigrationDefinitionOutput {
+        let configuration = &self.configuration;
+        CreateNetworkMigrationDefinitionOutput {
+            arn: Some(self.arn.clone()),
+            network_migration_definition_id: Some(self.network_migration_definition_id.clone()),
+            name: Some(configuration.name.clone()),
+            description: configuration.description.clone(),
+            source_configurations: list_shape(&configuration.source_configurations),
+            target_s3_configuration: Some(configuration.target_s3_configuration.clone()),
+            target_network: Some(configuration.target_network.clone()),
+            target_deployment: configuration.target_deployment.clone(),
+            vpc_provisioning_strategy: configuration.vpc_provisioning_strategy.clone(),
+            cidr_mappings: list_shape(&configuration.cidr_mappings),
+            created_at: Some(to_date_time(self.created_at)),
+            updated_at: Some(to_date_time(self.updated_at)),
+            tags: self.tags_shape(),
+            scope_tags: self.scope_tags_shape(),
+        }
+    }
+}
+
+/// A stored map as its wire member: the entries, or absent when there are none.
+fn map_shape(
+    stored: &BTreeMap<String, String>,
+) -> Option<std::collections::HashMap<String, String>> {
+    if stored.is_empty() {
+        None
+    } else {
+        Some(
+            stored
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+        )
+    }
+}
+
+/// A stored list as its wire member: the entries, or absent when there are none.
+fn list_shape<T: Clone>(stored: &[T]) -> Option<Vec<T>> {
+    if stored.is_empty() {
+        None
+    } else {
+        Some(stored.to_vec())
+    }
+}
+
+/// A stored instant as the model's `Timestamp`, rendered by the SDK crate this
+/// service already serialises its shapes with.
+pub fn to_date_time(at: ::std::time::SystemTime) -> ::aws_smithy_types::DateTime {
+    ::aws_smithy_types::DateTime::from(at)
+}
+
 /// The account an operation acts on: the request's `accountID` member when it carries
 /// one in the modelled shape (exactly 12 ASCII digits), else the emulator's own
 /// canonical account.
@@ -437,6 +712,16 @@ pub fn source_server_arn(region: &str, source_server_id: &str) -> String {
         ARN_NAMESPACE,
         region,
         &format!("source-server/{source_server_id}"),
+    )
+}
+
+/// The ARN of a network migration definition:
+/// `arn:aws:mgn:<region>:<account>:network-migration-definition/<networkMigrationDefinitionID>`.
+pub fn network_migration_definition_arn(region: &str, definition_id: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_NAMESPACE,
+        region,
+        &format!("network-migration-definition/{definition_id}"),
     )
 }
 
@@ -572,6 +857,106 @@ pub fn application_quota_exceeded(account_id: &str) -> ServiceQuotaExceededExcep
         quota_code: None,
         quota_value: i32::try_from(APPLICATION_QUOTA).ok(),
     }
+}
+
+/// The modelled refusal for a `networkMigrationDefinitionID` the account holds no
+/// record of.
+pub fn network_migration_definition_not_found(definition_id: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(format!(
+            "Network migration definition {definition_id} does not exist."
+        )),
+        code: None,
+        resource_id: Some(definition_id.to_string()),
+        resource_type: Some(NETWORK_MIGRATION_DEFINITION_RESOURCE_TYPE.to_string()),
+    }
+}
+
+/// The modelled refusal for an account already holding
+/// [`NETWORK_MIGRATION_DEFINITION_QUOTA`] network migration definitions.
+pub fn network_migration_definition_quota_exceeded(
+    account_id: &str,
+) -> ServiceQuotaExceededException {
+    ServiceQuotaExceededException {
+        message: Some(format!(
+            "Account {account_id} already holds the maximum of \
+             {NETWORK_MIGRATION_DEFINITION_QUOTA} network migration definitions."
+        )),
+        code: None,
+        resource_id: None,
+        resource_type: Some(NETWORK_MIGRATION_DEFINITION_RESOURCE_TYPE.to_string()),
+        service_code: Some(ARN_NAMESPACE.to_string()),
+        quota_code: None,
+        quota_value: i32::try_from(NETWORK_MIGRATION_DEFINITION_QUOTA).ok(),
+    }
+}
+
+/// The `resourceType` a network-migration-definition refusal names.
+const NETWORK_MIGRATION_DEFINITION_RESOURCE_TYPE: &str = "network-migration-definition";
+
+/// The modelled refusal for `cidrMappings` on a definition that is not migrating into
+/// VPCs that already exist.
+///
+/// The model documents the constraint on the member itself — "CIDR mappings can be
+/// provided only when `vpcProvisioningStrategy` is set to `USE_EXISTING`" — and cannot
+/// express it, so it is refused here: a field validation, named after the field it is
+/// about.
+pub fn cidr_mappings_need_existing_vpcs() -> ValidationException {
+    ValidationException {
+        message: Some(format!(
+            "cidrMappings can be provided only when vpcProvisioningStrategy is \
+             {VPC_PROVISIONING_USE_EXISTING}."
+        )),
+        code: None,
+        reason: Some(VALIDATION_FIELD_FAILED.to_string()),
+        field_list: Some(vec![ValidationExceptionField {
+            name: Some("cidrMappings".to_string()),
+            message: Some(format!(
+                "cidrMappings is allowed only with vpcProvisioningStrategy \
+                 {VPC_PROVISIONING_USE_EXISTING}."
+            )),
+        }]),
+    }
+}
+
+/// The `ValidationExceptionReason` for a request a member of which is not acceptable.
+///
+/// Taken from the model's own generated value list rather than retyped, so the spelling
+/// cannot drift from the model: [`validation_exception_reason`] fails the build if the
+/// model stops declaring it. The ONE definition of this value for the service — every
+/// handler that words a field validation reaches it here.
+pub const VALIDATION_FIELD_FAILED: &str = validation_exception_reason("fieldValidationFailed");
+
+/// The `ValidationExceptionReason` value the model spells `wanted`, resolved at compile
+/// time against `ops::types::VALIDATION_EXCEPTION_REASON_VALUES` (generated from the
+/// Smithy model). A name the model does not declare is a compile error, not a wire value
+/// no client would recognise.
+const fn validation_exception_reason(wanted: &str) -> &str {
+    let declared = crate::ops::types::VALIDATION_EXCEPTION_REASON_VALUES;
+    let mut index = 0;
+    while index < declared.len() {
+        if same_ascii(declared[index], wanted) {
+            return declared[index];
+        }
+        index += 1;
+    }
+    panic!("the model declares no such ValidationExceptionReason")
+}
+
+/// Whether two strings are the same bytes — `==` is not available in a `const fn`.
+const fn same_ascii(left: &str, right: &str) -> bool {
+    let (left, right) = (left.as_bytes(), right.as_bytes());
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut index = 0;
+    while index < left.len() {
+        if left[index] != right[index] {
+            return false;
+        }
+        index += 1;
+    }
+    true
 }
 
 /// The modelled server fault for an engine this service has no store in — the only

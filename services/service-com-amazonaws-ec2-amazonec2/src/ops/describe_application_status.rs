@@ -148,7 +148,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         use crate::state::{
             CompiledFilter, MatchBudget, MAX_FILTERS, MAX_FILTER_MATCH_STEPS, MAX_FILTER_VALUES,
             MAX_FILTER_VALUE_BYTES, MAX_RESOURCE_IDS, decode_page_token, encode_page_token,
-            invalid_pagination_token, matches_every_filter, require_known_instance,
+            invalid_pagination_token_for, matches_every_filter, require_known_instance,
             require_service_state,
         };
 
@@ -239,7 +239,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // holds, only on the token itself.
         let start_at = match input.next_token.as_deref() {
             None => None,
-            Some(token) => Some(decode_page_token(token).ok_or_else(invalid_pagination_token)?),
+            Some(token) => {
+                Some(decode_page_token(token).ok_or_else(|| invalid_pagination_token_for(token))?)
+            }
         };
 
         let state = require_service_state(&*self.engine)?;

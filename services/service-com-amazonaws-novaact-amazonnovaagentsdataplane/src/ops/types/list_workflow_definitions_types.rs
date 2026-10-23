@@ -26,7 +26,15 @@ pub struct ListWorkflowDefinitionsOutput {
     pub next_token: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.novaact#WorkflowDefinitionSummary")]
+/// `WorkflowDefinitionSummary`. Its schema and codec come from
+/// [`nova_act_schema_and_codec!`] rather than `#[smithy_macros::smithy(shape = ...)]`
+/// because `createdAt` targets `DateTimestamp`, which carries
+/// `@timestampFormat("date-time")` (`smithy_query(query="shape",
+/// shape="WorkflowDefinitionSummary")`), and the derive does not put that trait on a
+/// member schema — see `types/date_time_wire.rs`.
+///
+/// The member list below is the model's, member for member: same shape ids, same wire
+/// names, same order, same shape types.
 #[derive(Debug, Clone)]
 pub struct WorkflowDefinitionSummary {
     pub workflow_definition_arn: String,
@@ -34,4 +42,30 @@ pub struct WorkflowDefinitionSummary {
     pub created_at: ::aws_smithy_types::DateTime,
     pub status: String,
 }
+
+nova_act_schema_and_codec!(
+    WorkflowDefinitionSummary,
+    WORKFLOW_DEFINITION_SUMMARY_SCHEMA,
+    "com.amazonaws.novaact#WorkflowDefinitionSummary",
+    "com.amazonaws.novaact",
+    "WorkflowDefinitionSummary",
+    (
+        M_WORKFLOW_DEFINITION_ARN,
+        workflow_definition_arn,
+        "workflowDefinitionArn",
+        0,
+        req,
+        string
+    ),
+    (
+        M_WORKFLOW_DEFINITION_NAME,
+        workflow_definition_name,
+        "workflowDefinitionName",
+        1,
+        req,
+        string
+    ),
+    (M_CREATED_AT, created_at, "createdAt", 2, req, date_time),
+    (M_STATUS, status, "status", 3, req, string),
+);
 

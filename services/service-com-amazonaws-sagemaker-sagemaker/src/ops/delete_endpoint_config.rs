@@ -164,17 +164,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // type the endpoint is using"), not a refusal: the delete is accepted either way.
         //
         // This operation models no errors, so a name nothing created is refused with the
-        // service-common `ValidationException` the sibling deletes use, naming the ARN it
-        // could not resolve.
+        // service-common `ValidationException` the sibling deletes use, naming the
+        // configuration the way the caller named it.
         let mut store = state.lock();
         if store
             .endpoint_configs
             .remove(&input.endpoint_config_name)
             .is_none()
         {
-            return Err(crate::scaffolded::Scaffolded::validation(format!(
-                "Could not find endpoint configuration \"{arn}\"."
-            )));
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::could_not_find(
+                    crate::state::ENDPOINT_CONFIG_KIND_LABEL,
+                    &input.endpoint_config_name,
+                ),
+            ));
         }
         drop(store);
 

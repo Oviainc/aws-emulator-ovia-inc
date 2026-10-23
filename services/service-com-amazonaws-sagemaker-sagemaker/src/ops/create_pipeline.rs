@@ -205,9 +205,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
 
         let mut store = state.lock();
-        // A pipeline whose deletion the clock already owes is gone before this create
-        // reads the store, so its name is free again.
-        store.settle_pipeline_deletions(now);
 
         if let Some(existing) = store.pipelines.get(&input.pipeline_name) {
             // `ClientRequestToken` makes the operation idempotent — "an idempotent
@@ -256,8 +253,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 description: input.pipeline_description,
                 role_arn: input.role_arn,
                 // A created pipeline is usable at once: `Active` is the status SageMaker
-                // reports for it, and the other member of `PipelineStatus` (`Deleting`)
-                // is reached only through `DeletePipeline`.
+                // reports for it, and a deleted one is gone rather than reported in any
+                // other status.
                 status: crate::state::PIPELINE_STATUS_ACTIVE.to_string(),
                 parallelism_configuration: input.parallelism_configuration,
                 tags: input.tags.unwrap_or_default(),
@@ -265,7 +262,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 creation_time: now,
                 last_modified_time: now,
                 last_run_time: None,
-                removal_due_at: None,
             },
         );
         drop(store);

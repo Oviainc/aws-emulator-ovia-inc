@@ -246,8 +246,9 @@ fn unresumable_token(token: &str) -> DescribeSourceServersError {
             "nextToken '{token}' cannot be resumed: it is not a token this service issued, or the source server it continues from is no longer in this selection"
         )),
         code: None,
-        // One of the model's `ValidationExceptionReason` values.
-        reason: Some("fieldValidationFailed".to_string()),
+        // One of the model's `ValidationExceptionReason` values, from the one place the
+        // service defines it.
+        reason: Some(crate::state::VALIDATION_FIELD_FAILED.to_string()),
         field_list: Some(vec![ValidationExceptionField {
             name: Some("nextToken".to_string()),
             message: Some("not a pagination token this service issued".to_string()),

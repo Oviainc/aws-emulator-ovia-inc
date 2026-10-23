@@ -108,6 +108,28 @@ impl From<CreateArtifactErrorModeled> for CreateArtifactError {
     }
 }
 
+/// The validation path of the `Properties` member, as the framework's own path spelling
+/// (lowerCamel) writes it — the map a property-value refusal is stated against.
+const PROPERTIES_PATH: &str = "properties";
+
+/// The lower bound a property VALUE must satisfy. The model's `ArtifactPropertyValue`
+/// states `@length 0..4096`, so an empty value is inside the modelled bound and outside
+/// the one the service enforces; this is that enforced minimum.
+const PROPERTY_VALUE_MIN_LENGTH: i64 = 1;
+
+/// The whole constraint set a property VALUE must satisfy, in the order the service
+/// lists it in a refusal: the modelled maximum, the enforced minimum, then the modelled
+/// expression. Source for the two modelled entries:
+/// `smithy_query(query="shape",shape="ArtifactPropertyValue")` — `@length 0..4096`,
+/// `@pattern .*`.
+fn property_value_constraints() -> [::aws_smithy_schema_server::ViolationKind; 3] {
+    [
+        ::aws_smithy_schema_server::ViolationKind::MaxLength(4096),
+        ::aws_smithy_schema_server::ViolationKind::MinLength(PROPERTY_VALUE_MIN_LENGTH),
+        ::aws_smithy_schema_server::ViolationKind::Pattern(".*".to_string()),
+    ]
+}
+
 /// The `CreateArtifact` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -149,15 +171,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A lineage-entity property VALUE must carry at least one character. The model's
         // `ArtifactPropertyValue` states `len 0..4096`, so the boundary validator lets an
-        // empty value through and the service's own minimum is enforced here, in the
-        // wording the boundary validator uses for a map-value constraint.
+        // empty value through and the service's own minimum is enforced here, worded by
+        // the one module that owns this service's validation dialect: the clause is
+        // stated against the MAP, echoing every entry of it and listing the whole
+        // constraint set a property value must satisfy.
         if let Some(properties) = &input.properties {
             if properties.values().any(String::is_empty) {
                 return Err(crate::scaffolded::Scaffolded::validation(
-                    "1 validation error detected: Value '' at 'properties' failed to satisfy \
-                     constraint: Map value must satisfy constraint: [Member must have length \
-                     greater than or equal to 1, Member must have length less than or equal \
-                     to 4096]",
+                    crate::service::validation::map_value_message(
+                        PROPERTIES_PATH,
+                        properties
+                            .iter()
+                            .map(|(key, value)| (key.as_str(), value.as_str())),
+                        &property_value_constraints(),
+                    ),
                 ));
             }
         }

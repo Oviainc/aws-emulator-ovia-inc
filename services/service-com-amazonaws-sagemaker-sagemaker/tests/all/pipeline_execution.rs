@@ -13,7 +13,7 @@
 //! pipeline cannot support is refused and persists nothing; a repeated
 //! `ClientRequestToken` completes the start no more than once; the execution's terminal
 //! status is moved by the CLOCK, not by a read; and a pipeline's executions go with the
-//! pipeline when it is removed.
+//! pipeline when `DeletePipeline` removes it.
 
 use std::time::Duration;
 
@@ -24,9 +24,6 @@ use super::pipeline_lifecycle::{create_body, step, token, DEFINITION_VERSION};
 
 /// Long enough to pass `state::PIPELINE_EXECUTION_ENDS_AFTER` (400 ms).
 const PAST_EXECUTION_DUE: Duration = Duration::from_millis(800);
-
-/// Long enough to pass `state::PIPELINE_DELETED_AFTER` (300 ms).
-const PAST_REMOVAL_DUE: Duration = Duration::from_millis(600);
 
 /// The parameter names the fixture definition declares — what a run may assign values
 /// to, per `Parameter$Name`'s doc ("This parameter name must match a named parameter in
@@ -521,9 +518,9 @@ async fn a_start_the_stored_pipeline_cannot_support_is_refused() {
          is accepted, got {started:?}"
     );
 
-    // A pipeline whose delete is in flight is no longer runnable: the start conflicts
-    // with the removal already under way. Asserted straight after the delete, while the
-    // pipeline still reports the transient `Deleting`.
+    // A deleted pipeline is no longer runnable: `DeletePipeline` removes the record, so a
+    // start naming it is refused with the modelled not-found, exactly as a start naming a
+    // pipeline nobody created is.
     pipeline(&emulator, "doomed").await;
     emulator
         .ok(
@@ -539,8 +536,8 @@ async fn a_start_the_stored_pipeline_cannot_support_is_refused() {
         .await;
     assert_eq!(
         (status, error_code(&parsed).as_str()),
-        (400, "ConflictException"),
-        "case pipeline-being-deleted: expected 400 ConflictException, got {status} {parsed:?}"
+        (400, "ResourceNotFound"),
+        "case pipeline-already-deleted: expected 400 ResourceNotFound, got {status} {parsed:?}"
     );
 }
 
@@ -641,9 +638,8 @@ async fn a_repeated_start_completes_no_more_than_once() {
 }
 
 /// RULE: an execution belongs to the pipeline that ran it — it is resolvable while that
-/// pipeline exists, including while its delete is in flight, and gone once the clock
-/// owes the pipeline's removal, so a pipeline recreated under the freed name inherits no
-/// run.
+/// pipeline exists and gone with the pipeline's removal, so a pipeline recreated under
+/// the freed name inherits no run.
 #[tokio::test]
 async fn a_pipelines_executions_go_with_the_pipeline() {
     let emulator = Emulator::new();
@@ -659,26 +655,26 @@ async fn a_pipelines_executions_go_with_the_pipeline() {
     );
     let read = json!({ "PipelineExecutionArn": execution_arn });
 
+    // While the pipeline exists, its run is resolvable.
+    let described = emulator.ok("DescribePipelineExecution", &read).await;
+    assert_eq!(
+        str_field(&described, "PipelineExecutionArn"),
+        str_field(&read, "PipelineExecutionArn"),
+        "case before-the-delete: the run is resolvable, got {described:?}"
+    );
+
     emulator
         .ok(
             "DeletePipeline",
             &json!({ "PipelineName": "cascade", "ClientRequestToken": token("delete-cascade") }),
         )
         .await;
-    // The removal is not due yet, so the run is still resolvable.
-    let described = emulator.ok("DescribePipelineExecution", &read).await;
-    assert_eq!(
-        str_field(&described, "PipelineExecutionArn"),
-        str_field(&read, "PipelineExecutionArn"),
-        "case delete-in-flight: the run is still resolvable, got {described:?}"
-    );
-
-    tokio::time::sleep(PAST_REMOVAL_DUE).await;
+    // The delete takes the run with it, from that call on.
     let (status, parsed) = emulator.call("DescribePipelineExecution", &read).await;
     assert_eq!(
         (status, error_code(&parsed).as_str()),
         (400, "ResourceNotFound"),
-        "case past-removal: a removed pipeline's run is refused, got {status} {parsed:?}"
+        "case after-the-delete: a removed pipeline's run is refused, got {status} {parsed:?}"
     );
 
     // The name is free again, and the recreated pipeline inherits no run.

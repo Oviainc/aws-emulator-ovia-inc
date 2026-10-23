@@ -17,7 +17,15 @@ pub struct GetWorkflowDefinitionInput {
     pub workflow_definition_name: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.novaact#GetWorkflowDefinitionResponse")]
+/// `GetWorkflowDefinitionResponse`. Its schema and codec come from
+/// [`nova_act_schema_and_codec!`] rather than `#[smithy_macros::smithy(shape = ...)]`
+/// because `createdAt` targets `DateTimestamp`, which carries
+/// `@timestampFormat("date-time")` (`smithy_query(query="operation",
+/// operation="GetWorkflowDefinition")`), and the derive does not put that trait on a
+/// member schema — see `types/date_time_wire.rs`.
+///
+/// The member list below is the model's, member for member: same shape ids, same wire
+/// names, same order, same shape types.
 #[derive(Debug, Clone)]
 pub struct GetWorkflowDefinitionOutput {
     pub name: String,
@@ -27,4 +35,25 @@ pub struct GetWorkflowDefinitionOutput {
     pub export_config: Option<WorkflowExportConfig>,
     pub status: String,
 }
+
+nova_act_schema_and_codec!(
+    GetWorkflowDefinitionOutput,
+    GET_WORKFLOW_DEFINITION_OUTPUT_SCHEMA,
+    "com.amazonaws.novaact#GetWorkflowDefinitionResponse",
+    "com.amazonaws.novaact",
+    "GetWorkflowDefinitionResponse",
+    (M_NAME, name, "name", 0, req, string),
+    (M_ARN, arn, "arn", 1, req, string),
+    (M_CREATED_AT, created_at, "createdAt", 2, req, date_time),
+    (M_DESCRIPTION, description, "description", 3, opt, string),
+    (
+        M_EXPORT_CONFIG,
+        export_config,
+        "exportConfig",
+        4,
+        opt,
+        struct_of(WorkflowExportConfig)
+    ),
+    (M_STATUS, status, "status", 5, req, string),
+);
 

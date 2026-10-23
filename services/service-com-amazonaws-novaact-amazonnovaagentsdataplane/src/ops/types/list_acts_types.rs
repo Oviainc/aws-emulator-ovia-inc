@@ -29,7 +29,14 @@ pub struct ListActsOutput {
     pub next_token: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.novaact#ActSummary")]
+/// `ActSummary`. Its schema and codec come from [`nova_act_schema_and_codec!`] rather than
+/// `#[smithy_macros::smithy(shape = ...)]` because `startedAt` and `endedAt` target
+/// `DateTimestamp`, which carries `@timestampFormat("date-time")`
+/// (`smithy_query(query="shape", shape="ActSummary")`), and the derive does not put that
+/// trait on a member schema — see `types/date_time_wire.rs`.
+///
+/// The member list below is the model's, member for member: same shape ids, same wire
+/// names, same order, same shape types.
 #[derive(Debug, Clone)]
 pub struct ActSummary {
     pub workflow_run_id: String,
@@ -40,4 +47,26 @@ pub struct ActSummary {
     pub ended_at: Option<::aws_smithy_types::DateTime>,
     pub trace_location: Option<TraceLocation>,
 }
+
+nova_act_schema_and_codec!(
+    ActSummary,
+    ACT_SUMMARY_SCHEMA,
+    "com.amazonaws.novaact#ActSummary",
+    "com.amazonaws.novaact",
+    "ActSummary",
+    (M_WORKFLOW_RUN_ID, workflow_run_id, "workflowRunId", 0, req, string),
+    (M_SESSION_ID, session_id, "sessionId", 1, req, string),
+    (M_ACT_ID, act_id, "actId", 2, req, string),
+    (M_STATUS, status, "status", 3, req, string),
+    (M_STARTED_AT, started_at, "startedAt", 4, req, date_time),
+    (M_ENDED_AT, ended_at, "endedAt", 5, opt, date_time),
+    (
+        M_TRACE_LOCATION,
+        trace_location,
+        "traceLocation",
+        6,
+        opt,
+        struct_of(TraceLocation)
+    ),
+);
 

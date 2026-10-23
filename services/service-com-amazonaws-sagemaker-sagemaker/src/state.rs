@@ -169,21 +169,14 @@ pub const NO_CONTAINER_RUNTIME_REASON: &str =
 /// `ProcessingClusterConfig$InstanceCount`'s doc: "The default value is 1."
 pub const DEFAULT_PROCESSING_INSTANCE_COUNT: i32 = 1;
 
-/// How long after `DeletePipeline` the clock owes the pipeline's disappearance.
-///
-/// `DeletePipeline` is asynchronous: the pipeline reports `PipelineStatus` `Deleting`
-/// (one of the two members the modelled `PipelineStatus` enum carries) before it is
-/// gone, so a caller that describes it straight after deleting it still observes that
-/// transient status, and one that waits observes the not-found refusal. Real SageMaker
-/// takes as long as it takes; the span is compressed, never zero.
-pub const PIPELINE_DELETED_AFTER: Duration = Duration::from_millis(300);
-
 /// `PipelineStatus`'s members (`smithy_query(query="shape",shape="PipelineStatus")`
 /// answers exactly `Active` and `Deleting`). Named once here so no handler compares a
 /// bare string literal.
+///
+/// Only `Active` is ever reported: recorded AWS makes a pipeline unreadable from the
+/// `DeletePipeline` call on, so no reader observes a pipeline being deleted and there is
+/// no transient status for `DeletePipeline` to leave behind.
 pub const PIPELINE_STATUS_ACTIVE: &str = "Active";
-/// See [`PIPELINE_STATUS_ACTIVE`].
-pub const PIPELINE_STATUS_DELETING: &str = "Deleting";
 
 /// The one pipeline-definition schema version SageMaker Pipelines publishes, and the
 /// value a definition's required `Version` key carries.
@@ -745,12 +738,12 @@ impl ProcessingJob {
     }
 }
 
-/// A pipeline created by `CreatePipeline`, as `DescribePipeline` replays it and
-/// `DeletePipeline` retires it.
+/// A pipeline created by `CreatePipeline`, as `DescribePipeline` replays it until
+/// `DeletePipeline` removes it.
 ///
-/// `removal_due_at` is the instant the clock owes the record's disappearance after a
-/// `DeletePipeline`; it is stored, never slept on, and materialised by
-/// [`ComAmazonawsSagemakerSagemakerState::settle_pipeline_deletions`].
+/// A pipeline carries no deletion clock: recorded AWS makes a deleted pipeline
+/// unreadable from the delete call on, so `DeletePipeline` drops the record outright
+/// and there is no transient state for a later call to materialise.
 #[derive(Debug, Clone)]
 pub struct Pipeline {
     pub name: String,
@@ -770,7 +763,6 @@ pub struct Pipeline {
     /// When an execution of this pipeline last started, which is what
     /// `StartPipelineExecution` stamps; `None` until one has.
     pub last_run_time: Option<SystemTime>,
-    pub removal_due_at: Option<SystemTime>,
 }
 
 /// One execution of a pipeline, started by `StartPipelineExecution` and replayed by
@@ -1513,34 +1505,22 @@ impl ComAmazonawsSagemakerSagemakerState {
         })
     }
 
-    /// Drop every pipeline whose removal the clock already owes.
+    /// Remove the pipeline stored under `name`, with everything that belongs to it, and
+    /// answer the record that went — `None` when the account holds no such pipeline.
     ///
-    /// `DeletePipeline` starts an asynchronous removal: the pipeline reports
-    /// `PipelineStatus` `Deleting` (one of the two members the modelled `PipelineStatus`
-    /// enum carries) until [`PIPELINE_DELETED_AFTER`] has passed, after which it is gone.
-    /// That disappearance was due at `removal_due_at` whether or not anybody called, so
-    /// materialising it here is the one write a reporting operation may make: an observer
-    /// makes no difference to the result.
+    /// `DeletePipeline` is observable AS a delete: recorded AWS makes the pipeline
+    /// unreadable from the delete call on, so the record goes at once rather than
+    /// lingering in a transient status for a later call to materialise.
     ///
-    /// Keeps whatever the clock does not owe yet, dropping the rest in one pass — no
-    /// caller needs the names it removed, so none is collected.
     /// A pipeline's executions go with it: an execution belongs to the pipeline that ran
     /// it, so once the pipeline is gone its executions are no longer resolvable either —
     /// and leaving them would let a pipeline recreated under the freed name inherit the
     /// executions of the one deleted before it.
-    pub fn settle_pipeline_deletions(&mut self, now: SystemTime) {
-        let mut removed: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-        self.pipelines.retain(|name, pipeline| {
-            let keep = pipeline.removal_due_at.is_none_or(|at| now < at);
-            if !keep {
-                removed.insert(name.clone());
-            }
-            keep
-        });
-        if !removed.is_empty() {
-            self.pipeline_executions
-                .retain(|_, execution| !removed.contains(&execution.pipeline_name));
-        }
+    pub fn remove_pipeline(&mut self, name: &str) -> Option<Pipeline> {
+        let removed = self.pipelines.remove(name)?;
+        self.pipeline_executions
+            .retain(|_, execution| execution.pipeline_name != removed.name);
+        Some(removed)
     }
 
     /// Whether another transform job fits, i.e. the store is below
@@ -1750,6 +1730,59 @@ pub fn record_state_change(
 pub fn resource_arn(region: &str, kind: &str, name: &str) -> String {
     ::emulator_server::emulator_arn(ARN_SERVICE, region, &format!("{kind}/{name}"))
 }
+
+/// How SageMaker's lineage and pipeline readers state a resource the account does not
+/// hold: the entity kind, then the identifier RESOLVED TO ITS ARN in single quotes, then
+/// `does not exist.`
+///
+/// These resources are addressed by name OR by ARN (`ExperimentEntityNameOrArn`,
+/// `PipelineNameOrArn`), and the recorded refusals report the ARN the request resolved
+/// to whichever form arrived — so the identifier a consumer extracts from the message is
+/// the same one it would read off a successful call. The single quotes are part of that
+/// rule: a parser that cuts on them has to find them.
+///
+/// Stated once here so the reader and the delete of one resource kind, and the kinds
+/// sharing the template, cannot word the same fact differently. The hosting resources
+/// (model, endpoint configuration, endpoint) use their OWN recorded template instead —
+/// `Could not find <kind> "<identifier as the caller sent it>".` — so they do not come
+/// through here.
+pub fn does_not_exist(entity: &str, arn: &str) -> String {
+    format!("{entity} '{arn}' does not exist.")
+}
+
+/// The entity label [`does_not_exist`] names a lineage action by.
+pub const ACTION_ENTITY: &str = "Action";
+
+/// The entity label [`does_not_exist`] names a pipeline by.
+pub const PIPELINE_ENTITY: &str = "Pipeline";
+
+/// The entity label [`does_not_exist`] names one execution of a pipeline by.
+pub const PIPELINE_EXECUTION_ENTITY: &str = "Pipeline execution";
+
+/// How SageMaker's hosting operations state a resource the account does not hold: the
+/// resource kind as the service words it, then the identifier AS THE CALLER SENT IT, in
+/// double quotes.
+///
+/// A model, an endpoint configuration and an endpoint are addressed by NAME, and the
+/// recorded refusals quote that name — never an ARN the service synthesised from it,
+/// which is an identifier the caller never supplied and which a consumer extracting the
+/// offending resource from the message cannot match against what it sent.
+///
+/// Stated once here so every operation that resolves one of these references — the
+/// readers, the deletes, and the creates that reference another resource — words the
+/// same fact the same way.
+pub fn could_not_find(kind: &str, identifier: &str) -> String {
+    format!("Could not find {kind} \"{identifier}\".")
+}
+
+/// The kind label [`could_not_find`] names a model by.
+pub const MODEL_KIND_LABEL: &str = "model";
+
+/// The kind label [`could_not_find`] names an endpoint configuration by.
+pub const ENDPOINT_CONFIG_KIND_LABEL: &str = "endpoint configuration";
+
+/// The kind label [`could_not_find`] names an endpoint by.
+pub const ENDPOINT_KIND_LABEL: &str = "endpoint";
 
 /// Why SageMaker refuses this pipeline definition, or `None` when it accepts it.
 ///

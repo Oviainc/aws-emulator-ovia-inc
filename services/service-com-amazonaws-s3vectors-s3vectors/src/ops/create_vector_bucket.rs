@@ -204,6 +204,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 creation_time: ::std::time::SystemTime::now(),
                 encryption,
                 default_index_mode: None,
+                policy: None,
                 indexes: ::std::collections::BTreeMap::new(),
             },
         );
