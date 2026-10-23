@@ -36,6 +36,26 @@ pub const STATE_DELETING: &str = "DELETING";
 /// `NetworkConnectorState$FAILED` — "Creation or update failed".
 pub const STATE_FAILED: &str = "FAILED";
 
+/// The `StateReason` a connector and its first version carry while their initial
+/// creation is the event that put them in their current state.
+///
+/// `StateReason` is "a human-readable explanation of the current state", and the recorded
+/// AWS answer for a freshly created connector carries one, so a reported `State` comes
+/// with the reason the resource reached it rather than being reserved for a failure. No
+/// documented rule computes the text, so the emulator uses the short noun phrase naming
+/// the event, and keeps it until another event sets a new state: a connector is `ACTIVE`
+/// because the creation that started it finished.
+pub const STATE_REASON_INITIAL_CREATION: &str = "Initial creation";
+
+/// The `StateReason` a version appended by `UpdateNetworkConnector` carries: "each
+/// configuration update creates a new immutable version", so that update is the event
+/// that put the new version in its state.
+pub const STATE_REASON_CONFIGURATION_UPDATE: &str = "Configuration update";
+
+/// The `StateReason` a connector carries once `DeleteNetworkConnector` moved it to
+/// `DELETING`: the deletion is the event that put it there.
+pub const STATE_REASON_DELETION_REQUESTED: &str = "Deletion requested";
+
 /// `NetworkConnectorLastUpdateStatus$InProgress`.
 pub const LAST_UPDATE_IN_PROGRESS: &str = "InProgress";
 /// `NetworkConnectorLastUpdateStatus$Successful`.
@@ -130,6 +150,10 @@ pub struct ConnectorVersion {
     pub operator_role: Option<String>,
     /// One of `NetworkConnectorState`'s values.
     pub state: String,
+    /// The human-readable explanation of [`ConnectorVersion::state`]: the event that set
+    /// it (see [`STATE_REASON_INITIAL_CREATION`]). Set by whatever sets `state`, so the
+    /// two are always reported together.
+    pub state_reason: Option<String>,
     /// The state this version takes once its provisioning falls due.
     pub pending: Option<PendingTransition>,
     pub last_modified: SystemTime,
@@ -165,6 +189,9 @@ pub struct NetworkConnector {
     pub state: String,
     /// The change the clock owes this connector, if any.
     pub pending: Option<PendingTransition>,
+    /// The human-readable explanation of [`NetworkConnector::state`]: the event that set
+    /// it (see [`STATE_REASON_INITIAL_CREATION`]). Set by whatever sets `state`, so the
+    /// two are always reported together.
     pub state_reason: Option<String>,
     pub state_reason_code: Option<String>,
     /// One of `NetworkConnectorLastUpdateStatus`'s values; unset until the
@@ -256,10 +283,14 @@ impl NetworkConnector {
             id: self.id.clone(),
             version: version.version,
             state: version.state.clone(),
-            // Both reason members report why a version is in its state and are
-            // "populated when the state is FAILED"; nothing in this emulator
-            // fails a version, so neither is reported.
-            state_reason: None,
+            // `StateReason` explains the state this answer reports, so it is
+            // the reason the record holds for it.
+            state_reason: version.state_reason.clone(),
+            // `StateReasonCode` is one of `NetworkConnectorStateReasonCode`'s
+            // values, every one of which names a provisioning FAILURE
+            // (`InvalidSubnet`, `InternalError`, …). No version this emulator
+            // provisions fails, so none of those codes describes its state and
+            // the member stays unset.
             state_reason_code: None,
             last_modified: Some(::aws_smithy_types::DateTime::from(version.last_modified)),
         }

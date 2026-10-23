@@ -20,7 +20,14 @@ pub struct UpdateNetworkConnectorInput {
     pub client_token: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.lambdacore#UpdateNetworkConnectorResponse")]
+/// `UpdateNetworkConnectorResponse`. Its schema and codec come from
+/// [`lambdacore_schema_and_codec!`] rather than `#[smithy_macros::smithy(shape = ...)]`
+/// because `LastModified` targets `CoreTimestamp`, which carries
+/// `@timestampFormat("date-time")` (`smithy_query(query="operation",
+/// operation="UpdateNetworkConnector")`) — see `types/date_time_wire.rs`.
+///
+/// The member list below is the model's, member for member: same shape ids, same wire
+/// names, same order, same shape types.
 #[derive(Debug, Clone, Default)]
 pub struct UpdateNetworkConnectorOutput {
     pub arn: String,
@@ -35,4 +42,44 @@ pub struct UpdateNetworkConnectorOutput {
     pub last_update_status_reason: Option<String>,
     pub last_modified: Option<::aws_smithy_types::DateTime>,
 }
+
+lambdacore_schema_and_codec!(
+    UpdateNetworkConnectorOutput,
+    UPDATE_NETWORK_CONNECTOR_OUTPUT_SCHEMA,
+    "com.amazonaws.lambdacore#UpdateNetworkConnectorResponse",
+    "com.amazonaws.lambdacore",
+    "UpdateNetworkConnectorResponse",
+    (M_ARN, arn, "Arn", 0, req, string),
+    (M_NAME, name, "Name", 1, req, string),
+    (M_ID, id, "Id", 2, req, string),
+    (M_VERSION_ARN, version_arn, "VersionArn", 3, opt, string),
+    (M_VERSION, version, "Version", 4, opt, long),
+    (M_OPERATOR_ROLE, operator_role, "OperatorRole", 5, opt, string),
+    (
+        M_CONFIGURATION,
+        configuration,
+        "Configuration",
+        6,
+        opt,
+        union_of(NetworkConnectorConfiguration)
+    ),
+    (M_STATE, state, "State", 7, opt, string),
+    (
+        M_LAST_UPDATE_STATUS,
+        last_update_status,
+        "LastUpdateStatus",
+        8,
+        opt,
+        string
+    ),
+    (
+        M_LAST_UPDATE_STATUS_REASON,
+        last_update_status_reason,
+        "LastUpdateStatusReason",
+        9,
+        opt,
+        string
+    ),
+    (M_LAST_MODIFIED, last_modified, "LastModified", 10, opt, date_time),
+);
 
