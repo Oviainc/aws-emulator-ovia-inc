@@ -14,6 +14,11 @@
 //! [`ComAmazonawsCloudwatchlogsLogs20140328State::account_resource_policies`], a
 //! resource-scoped one on the log group it is attached to
 //! ([`LogGroupRecord::resource_policy`]).
+//!
+//! A log group's data protection policy lives on that group as well
+//! ([`LogGroupRecord::data_protection_policy`]), because `PutDataProtectionPolicy`
+//! "applies to only the specified log group": one group holds at most one, and deleting
+//! the group takes its policy with it.
 
 use std::collections::BTreeMap;
 
@@ -84,6 +89,23 @@ pub const MAX_LOG_GROUPS: usize = 1_000_000;
 /// stored ON its log group ([`LogGroupRecord::resource_policy`]), so a group can hold
 /// exactly one.
 pub const MAX_ACCOUNT_RESOURCE_POLICIES: usize = 10;
+
+/// The longest `policyDocument` `PutDataProtectionPolicy` admits, from that member's own
+/// documentation: "The JSON specified in policyDocument can be up to 30,720 characters."
+/// The model puts no `@length` on `DataProtectionPolicyDocument`, so nothing refuses an
+/// over-long document before the handler runs.
+pub const MAX_DATA_PROTECTION_POLICY_DOCUMENT_CHARS: usize = 30_720;
+
+/// The `dataProtectionStatus` of a log group that has a data protection policy right
+/// now, from the model's `DataProtectionStatus` enum (`ACTIVATED` | `DELETED` |
+/// `ARCHIVED` | `DISABLED`).
+pub const DATA_PROTECTION_STATUS_ACTIVATED: &str = "ACTIVATED";
+
+/// The `dataProtectionStatus` of a log group whose data protection policy has been
+/// deleted — the "or whether it had one in the past" half of `LogGroup$dataProtectionStatus`
+/// ("Displays whether this log group has a protection policy, or whether it had one in
+/// the past"). From the same `DataProtectionStatus` enum.
+pub const DATA_PROTECTION_STATUS_DELETED: &str = "DELETED";
 
 /// The scope of a policy attached to no resource, from the model's `PolicyScope` enum
 /// (`ACCOUNT` | `RESOURCE`). This is also the scope `DescribeResourcePolicies` reports
@@ -232,6 +254,163 @@ impl ResourcePolicyRecord {
     }
 }
 
+/// One log group's data protection policy — what `PutDataProtectionPolicy` stores — as
+/// it is stored.
+///
+/// The document is kept VERBATIM, exactly the bytes the request carried: AWS reports it
+/// back through `GetDataProtectionPolicy` unchanged, so re-serializing the parsed JSON
+/// (which would reorder members and drop whitespace) would not be the same document.
+#[derive(Debug, Clone)]
+pub struct DataProtectionPolicyRecord {
+    /// `policyDocument`, byte-for-byte as the put carried it.
+    pub policy_document: String,
+    /// "The date and time that this policy was most recently updated."
+    pub last_updated_time_ms: i64,
+}
+
+/// What a data protection policy document says, once it has been judged: the parts a
+/// handler acts on after [`check_data_protection_policy_document`] accepts it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DataProtectionPolicyShape {
+    /// The data identifiers both of the document's blocks list, in the order the Audit
+    /// block lists them.
+    pub data_identifiers: Vec<String>,
+    /// The log groups the Audit action's `FindingsDestination` sends audit findings to
+    /// (`FindingsDestination.CloudWatchLogs.LogGroup`). A destination this service does
+    /// not own (a Firehose stream, an S3 bucket) is not here: only a log group lives in
+    /// this service's state.
+    pub findings_destination_log_groups: Vec<String>,
+}
+
+/// Judge a `PutDataProtectionPolicy$policyDocument`, answering the message to refuse it
+/// with, or what the accepted document says.
+///
+/// Every rule here is one that member's own documentation states:
+///
+/// * "Specify the data protection policy, in JSON" — and "This policy must include two
+///   JSON blocks", so the document is a JSON object carrying a `Statement` array;
+/// * "The first block must include both a `DataIdentifer` array and an `Operation`
+///   property with an `Audit` action", and "This `Audit` action must contain a
+///   `FindingsDestination` object";
+/// * "The second block must include both a `DataIdentifer` array and an `Operation`
+///   property with an `Deidentify` action", which "must contain the `"MaskConfig": {}`
+///   object. The `"MaskConfig": {}` object must be empty";
+/// * "The contents of the two `DataIdentifer` arrays must match exactly";
+/// * "The JSON specified in `policyDocument` can be up to 30,720 characters."
+///
+/// The documentation spells the member `DataIdentifer` while the API's own policy
+/// documents spell it `DataIdentifier`, so both spellings are read.
+///
+/// Which data identifiers exist, and whether a Firehose stream or S3 bucket named as a
+/// findings destination exists, are NOT judged here: that catalogue and those resources
+/// live outside this service.
+pub fn check_data_protection_policy_document(
+    document: &str,
+) -> Result<DataProtectionPolicyShape, String> {
+    if document.chars().count() > MAX_DATA_PROTECTION_POLICY_DOCUMENT_CHARS {
+        return Err(format!(
+            "policyDocument can be up to {MAX_DATA_PROTECTION_POLICY_DOCUMENT_CHARS} characters"
+        ));
+    }
+    let parsed = serde_json::from_str::<serde_json::Value>(document)
+        .ok()
+        .filter(serde_json::Value::is_object)
+        .ok_or_else(|| {
+            "policyDocument must be a data protection policy in JSON (a JSON object)".to_string()
+        })?;
+    let statements = parsed
+        .get("Statement")
+        .and_then(serde_json::Value::as_array)
+        .filter(|statements| !statements.is_empty())
+        .ok_or_else(|| {
+            "policyDocument must include a Statement array of the policy's two blocks".to_string()
+        })?;
+
+    // One block per action: the Audit block that finds the sensitive data terms, and the
+    // Deidentify block that masks them.
+    let block = |action: &str| {
+        statements.iter().find(|statement| {
+            statement
+                .get("Operation")
+                .and_then(|operation| operation.get(action))
+                .is_some_and(serde_json::Value::is_object)
+        })
+    };
+    let audit = block("Audit").ok_or_else(|| {
+        "policyDocument must include a Statement block whose Operation has an Audit action"
+            .to_string()
+    })?;
+    let deidentify = block("Deidentify").ok_or_else(|| {
+        "policyDocument must include a Statement block whose Operation has a Deidentify action"
+            .to_string()
+    })?;
+
+    let findings_destination = audit
+        .get("Operation")
+        .and_then(|operation| operation.get("Audit"))
+        .and_then(|action| action.get("FindingsDestination"))
+        .filter(|destination| destination.is_object())
+        .ok_or_else(|| {
+            "the Audit action in policyDocument must contain a FindingsDestination object"
+                .to_string()
+        })?;
+    let mask_config = deidentify
+        .get("Operation")
+        .and_then(|operation| operation.get("Deidentify"))
+        .and_then(|action| action.get("MaskConfig"))
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| {
+            "the Deidentify action in policyDocument must contain a MaskConfig object".to_string()
+        })?;
+    if !mask_config.is_empty() {
+        return Err("the MaskConfig object in policyDocument must be empty".to_string());
+    }
+
+    let identifiers = |statement: &serde_json::Value| -> Option<Vec<String>> {
+        let listed = statement
+            .get("DataIdentifier")
+            .or_else(|| statement.get("DataIdentifer"))?
+            .as_array()?;
+        if listed.is_empty() {
+            return None;
+        }
+        listed
+            .iter()
+            .map(|identifier| identifier.as_str().map(str::to_string))
+            .collect()
+    };
+    let audit_identifiers = identifiers(audit).ok_or_else(|| {
+        "the Audit block in policyDocument must include a DataIdentifier array of data identifiers"
+            .to_string()
+    })?;
+    let deidentify_identifiers = identifiers(deidentify).ok_or_else(|| {
+        "the Deidentify block in policyDocument must include a DataIdentifier array of data identifiers"
+            .to_string()
+    })?;
+    // "must match exactly" is about the CONTENTS of the two arrays, so the order they are
+    // listed in is not part of the match.
+    let sorted = |mut identifiers: Vec<String>| {
+        identifiers.sort();
+        identifiers
+    };
+    if sorted(audit_identifiers.clone()) != sorted(deidentify_identifiers) {
+        return Err(
+            "the contents of the two DataIdentifier arrays in policyDocument must match exactly"
+                .to_string(),
+        );
+    }
+
+    Ok(DataProtectionPolicyShape {
+        data_identifiers: audit_identifiers,
+        findings_destination_log_groups: findings_destination
+            .get("CloudWatchLogs")
+            .and_then(|destination| destination.get("LogGroup"))
+            .and_then(serde_json::Value::as_str)
+            .map(|log_group| vec![log_group.to_string()])
+            .unwrap_or_default(),
+    })
+}
+
 /// One created log group and everything stored under it.
 #[derive(Debug, Clone)]
 pub struct LogGroupRecord {
@@ -264,6 +443,16 @@ pub struct LogGroupRecord {
     /// The resource-scoped policy attached to this group, if one has been put: AWS
     /// allows "one per LogGroup resourceARN", so at most one.
     pub resource_policy: Option<ResourcePolicyRecord>,
+    /// The data protection policy attached to this group, if one has been put:
+    /// `PutDataProtectionPolicy` "applies to only the specified log group" and a put
+    /// replaces the policy the group holds, so at most one. `None` again after
+    /// `DeleteDataProtectionPolicy`, and gone with the group when it is deleted.
+    pub data_protection_policy: Option<DataProtectionPolicyRecord>,
+    /// Whether this group has EVER held a data protection policy, which is what lets
+    /// `LogGroup$dataProtectionStatus` report "whether this log group has a protection
+    /// policy, or whether it had one in the past". See
+    /// [`LogGroupRecord::data_protection_status`].
+    pub had_data_protection_policy: bool,
     /// The data sources that ingest into this group — what `ListLogGroups`'s
     /// `dataSources` filter selects on and what `ListAggregateLogGroupSummaries`
     /// counts log groups by. See [`DataSourceRecord`] for why a group created through
@@ -290,7 +479,26 @@ impl LogGroupRecord {
             streams: BTreeMap::new(),
             subscription_filters: BTreeMap::new(),
             resource_policy: None,
+            data_protection_policy: None,
+            had_data_protection_policy: false,
             data_sources: Vec::new(),
+        }
+    }
+
+    /// This group's `dataProtectionStatus`: `ACTIVATED` while it holds a data protection
+    /// policy, `DELETED` once one it held has been deleted, and absent for a group that
+    /// has never held one — the member "displays whether this log group has a protection
+    /// policy, or whether it had one in the past", so a group with neither has nothing to
+    /// report. The other two values of the `DataProtectionStatus` enum belong to the
+    /// account-level policies of `PutAccountPolicy`, which no operation of this service
+    /// stores yet.
+    pub fn data_protection_status(&self) -> Option<&'static str> {
+        if self.data_protection_policy.is_some() {
+            Some(DATA_PROTECTION_STATUS_ACTIVATED)
+        } else if self.had_data_protection_policy {
+            Some(DATA_PROTECTION_STATUS_DELETED)
+        } else {
+            None
         }
     }
 }

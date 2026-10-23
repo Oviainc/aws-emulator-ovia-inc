@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutDataProtectionPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutDataProtectionPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutDataProtectionPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The data protection policy of ONE log group: `PutDataProtectionPolicy` stores it on
+//! the group its `logGroupIdentifier` names (the operation "applies to only the specified
+//! log group"), `GetDataProtectionPolicy` reports it back and
+//! `DeleteDataProtectionPolicy` removes it. The stored document is what
+//! `LogGroup$dataProtectionStatus` reports on.
 //!
 //! ## Shape of an operation
 //!
@@ -176,18 +173,76 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutDataProtectionPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutDataProtectionPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutDataProtectionPolicy"))
+        // `ctx` carries only request metadata; the group this policy attaches to comes
+        // from the request's `logGroupIdentifier`, not from its headers.
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            PutDataProtectionPolicyError::from(
+                PutDataProtectionPolicyErrorModeled::ServiceUnavailableException(
+                    ServiceUnavailableException {
+                        message: Some("the log store is unavailable".to_string()),
+                    },
+                ),
+            )
+        })?;
+        let mut store = state.lock();
+
+        let invalid = |message: String| {
+            PutDataProtectionPolicyError::from(
+                PutDataProtectionPolicyErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(message),
+                    },
+                ),
+            )
+        };
+
+        // What the document must say is that member's own contract; the check, and the
+        // sentences it refuses with, live beside the stored record in `crate::state`.
+        let policy = crate::state::check_data_protection_policy_document(&input.policy_document)
+            .map_err(invalid)?;
+
+        // "If you specify destinations such as log groups, Firehose streams, and S3
+        // buckets, they must already exist." A log group destination is one this service
+        // owns, so it is the half of that rule this service can judge.
+        for destination in &policy.findings_destination_log_groups {
+            let destination_name = crate::state::log_group_name_from_identifier(destination);
+            if !store.log_groups.contains_key(destination_name) {
+                return Err(invalid(format!(
+                    "the findings destination log group '{destination_name}' does not exist"
+                )));
+            }
+        }
+
+        // `logGroupIdentifier` is "either the log group name or log group ARN", so an ARN
+        // resolves to the name the store is keyed by.
+        let log_group_name =
+            crate::state::log_group_name_from_identifier(&input.log_group_identifier).to_string();
+        let Some(group) = store.log_groups.get_mut(&log_group_name) else {
+            return Err(PutDataProtectionPolicyErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::resource_not_found_message("log group")),
+                },
+            )
+            .into());
+        };
+
+        // The put replaces whatever policy that group holds, and the document is stored
+        // exactly as it arrived: AWS reports it back unchanged.
+        let now = crate::state::now_ms();
+        group.data_protection_policy = Some(crate::state::DataProtectionPolicyRecord {
+            policy_document: input.policy_document.clone(),
+            last_updated_time_ms: now,
+        });
+        group.had_data_protection_policy = true;
+
+        Ok(PutDataProtectionPolicyOutput {
+            // "The log group name or ARN that you specified in your request" — the
+            // identifier as it arrived, not the name it resolved to.
+            log_group_identifier: Some(input.log_group_identifier),
+            policy_document: Some(input.policy_document),
+            last_updated_time: Some(now),
+        })
     }
 }
