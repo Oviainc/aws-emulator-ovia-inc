@@ -152,12 +152,18 @@
 //!
 //! [`ComAmazonawsEc2Amazonec2State::byoip_cidrs`] holds the address ranges the account has
 //! brought to AWS as [`ByoipCidrRecord`]s: the modelled [`ByoipCidr`] every operation that
-//! reports one answers with, plus the release the clock owes a range a
-//! `DeprovisionByoipCidr` has started ([`ByoipCidrRecord::released_at`], on the same monotonic
-//! clock and the same [`TRANSITION_DELAY`] as a `pending` VPC's `available` move). Keyed by
+//! reports one answers with, plus the two moves the clock can owe one — the state move a
+//! `ProvisionByoipCidr` or an `AdvertiseByoipCidr` left non-terminal
+//! ([`ByoipCidrRecord::pending`], the [`PendingStateMove`] every other record of this store
+//! carries) and the release a `DeprovisionByoipCidr` has started
+//! ([`ByoipCidrRecord::released_at`], beside it because WHAT a release ends as is decided at
+//! its due instant rather than when it starts). Both run on the same monotonic clock and the
+//! same [`TRANSITION_DELAY`] span as a `pending` VPC's `available` move, and are applied by
+//! [`ComAmazonawsEc2Amazonec2State::materialize_due_transitions`]. Keyed by
 //! the range itself in its canonical form ([`canonical_byoip_cidr`]), because the range IS
 //! the name the API takes — every BYOIP operation is addressed by `Cidr`, not by a minted id
-//! — which also gives the describe path one stable order. That key comes from a REQUEST, so
+//! — which also gives the describe path one stable order, the order `DescribeByoipCidrs`
+//! reports and pages over. That key comes from a REQUEST, so
 //! the store is bounded like every other one here: a new range has to fit inside the record
 //! ceiling ([`ComAmazonawsEc2Amazonec2State::has_byoip_cidr_capacity`]) and the byte budget,
 //! and [`byoip_cidr_payload_bytes`] is the one definition of what a range is charged, given
@@ -2602,7 +2608,9 @@ impl ComAmazonawsEc2Amazonec2State {
             if held.is_empty() {
                 // The release succeeded: the range is not one of the account's any more, so
                 // the bytes its record held go back to the budget — exactly what
-                // [`Self::insert_byoip_cidr`] charged for it.
+                // [`Self::insert_byoip_cidr`] charged for it. The move the clock may still
+                // have owed the range goes with the record that carried it
+                // ([`ByoipCidrRecord::pending`]), so nothing can resurrect a released range.
                 if let Some(record) = self.byoip_cidrs.remove(&cidr) {
                     self.release_stored_bytes(byoip_cidr_payload_bytes(&record));
                 }
@@ -2755,6 +2763,15 @@ impl ComAmazonawsEc2Amazonec2State {
                 .and_then(|pending| pending.due_by(now))
                 .map(str::to_string)
             {
+                // A range leaving `pending-provision` is one whose provision has just
+                // completed — "the address range is not ready to use until its status
+                // changes from pending-provision to provisioned" (`ProvisionByoipCidr`) —
+                // and "Upon success, contains the ID of the address pool"
+                // (`ByoipCidr$StatusMessage`) is what there is to report from that instant
+                // on, where until it there was no success to report.
+                if record.byoip_cidr.state.as_deref() == Some(BYOIP_CIDR_STATE_PENDING_PROVISION) {
+                    record.byoip_cidr.status_message = record.byoip_cidr.pool_id.clone();
+                }
                 record.byoip_cidr.state = Some(state);
                 record.pending = None;
             }
@@ -7734,8 +7751,62 @@ impl ComAmazonawsEc2Amazonec2State {
 }
 
 // ---------------------------------------------------------------------------
-// BYOIP address ranges
+// BYOIP address ranges: the modelled states, the address family, and what a
+// provision is held to. The published prefix bounds, the non-public address
+// catalogs and the provision path itself continue under the `part 2` banner
+// further down.
 // ---------------------------------------------------------------------------
+
+/// "pending-provision: You've submitted a request to provision an address range and it's
+/// pending" (`ByoipCidr$State`) — the state a range is in until the clock has given it
+/// [`TRANSITION_DELAY`], because "provisioning an address range is an asynchronous
+/// operation, so the call returns immediately, but the address range is not ready to use
+/// until its status changes from pending-provision to provisioned"
+/// (`ProvisionByoipCidr`).
+pub const BYOIP_CIDR_STATE_PENDING_PROVISION: &str = "pending-provision";
+
+/// The address family of a CIDR block: which of the two address spaces it names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddressFamily {
+    /// IPv4, read by the crate's own `canonical_ipv4_cidr` and the published-bound
+    /// readers on top of it ([`canonical_vpc_ipv4_cidr`] and friends).
+    Ipv4,
+    /// IPv6, read by [`canonical_ipv6_cidr`].
+    Ipv6,
+}
+
+impl AddressFamily {
+    /// The `ResourceType` of the address pool "provisioning an IPv4 or IPv6 address range
+    /// … creates a corresponding address pool" (`ProvisionByoipCidr`) for a range of this
+    /// family: the `ResourceType` enum's `ipv4pool-ec2` and `ipv6pool-ec2` members. It is
+    /// both the type a `PoolTagSpecifications` entry may name and the prefix of the pool's
+    /// own id, which is how EC2 spells a public pool id (`ipv4pool-ec2-…`).
+    pub fn pool_resource_type(self) -> &'static str {
+        match self {
+            Self::Ipv4 => "ipv4pool-ec2",
+            Self::Ipv6 => "ipv6pool-ec2",
+        }
+    }
+
+    /// The family of `cidr`: an IPv6 block is the one that carries a `:`, no IPv4
+    /// presentation form having one.
+    pub fn of_cidr(cidr: &str) -> Self {
+        if cidr.contains(':') {
+            Self::Ipv6
+        } else {
+            Self::Ipv4
+        }
+    }
+
+    /// How the model spells this family in an `AddressFamily` member
+    /// ([`ADDRESS_FAMILY_IPV4`] / [`ADDRESS_FAMILY_IPV6`]).
+    pub fn wire_name(self) -> &'static str {
+        match self {
+            Self::Ipv4 => ADDRESS_FAMILY_IPV4,
+            Self::Ipv6 => ADDRESS_FAMILY_IPV6,
+        }
+    }
+}
 
 /// `ByoipCidrState` of a range AWS has finished provisioning and will advertise on
 /// request.
@@ -7804,13 +7875,15 @@ pub struct ByoipCidrRecord {
     /// [`ComAmazonawsEc2Amazonec2State::materialize_due_transitions`], from the addresses
     /// the account holds out of the range then.
     pub released_at: Option<Instant>,
-    /// The state move an ADVERTISEMENT owes the range, for a range `AdvertiseByoipCidr` left
-    /// in `pending-advertising`; `None` for a range nothing is advertising.
+    /// The state move the clock owes the range for the work a request has STARTED on it: a
+    /// range `ProvisionByoipCidr` left in `pending-provision`, or one `AdvertiseByoipCidr`
+    /// left in `pending-advertising`; `None` for a range nothing is owed.
     ///
     /// Beside [`Self::released_at`] rather than folded into it because the two owe different
     /// things: a release's outcome is decided at its due instant from the addresses the
-    /// account holds then, while an advertisement's is known when it is asked for, so it is
-    /// carried as the [`PendingStateMove`] every other record of this store uses.
+    /// account holds then, while a provision's and an advertisement's are known when they
+    /// are asked for, so they are carried as the [`PendingStateMove`] every other record of
+    /// this store uses.
     pub pending: Option<PendingStateMove>,
 }
 
@@ -7940,6 +8013,11 @@ impl ComAmazonawsEc2Amazonec2State {
         record.byoip_cidr.state = Some(BYOIP_CIDR_STATE_PENDING_DEPROVISION.to_string());
         record.byoip_cidr.status_message = None;
         record.released_at = Some(Instant::now() + TRANSITION_DELAY);
+        // The release supersedes whatever state move was owed the range: a range being
+        // released is not going to land in the state an earlier provision or advertisement
+        // was moving it to, so that move is dropped rather than left to overwrite the
+        // release's own outcome.
+        record.pending = None;
         Some(record.byoip_cidr.clone())
     }
 
@@ -8540,6 +8618,357 @@ impl<T> ClockTransition<T> {
             due_at: Instant::now() + TRANSITION_DELAY,
             at: SystemTime::now() + TRANSITION_DELAY,
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// BYOIP address ranges (`ByoipCidr`), part 2: what a provision is held to, and
+// the stored record. Continues the `part 1` banner above.
+// ---------------------------------------------------------------------------
+
+/// The most specific IPv4 prefix a BYOIP range may have: "The most specific IPv4 prefix
+/// that you can specify is /24" (`ProvisionByoipCidrRequest$Cidr`).
+pub const MOST_SPECIFIC_BYOIP_IPV4_PREFIX: u8 = 24;
+
+/// The most specific IPv6 prefix a publicly advertisable BYOIP range may have: "The most
+/// specific IPv6 address range that you can bring is /48 for CIDRs that are publicly
+/// advertisable" (`ProvisionByoipCidrRequest$Cidr`).
+pub const MOST_SPECIFIC_BYOIP_IPV6_PREFIX: u8 = 48;
+
+/// The most specific IPv6 prefix a range that is NOT publicly advertisable may have: "…
+/// and /56 for CIDRs that are not publicly advertisable"
+/// (`ProvisionByoipCidrRequest$Cidr`).
+pub const MOST_SPECIFIC_BYOIP_IPV6_PREFIX_NOT_PUBLICLY_ADVERTISABLE: u8 = 56;
+
+/// "(IPv6 only) Indicate whether the address range will be publicly advertised to the
+/// internet. Default: true" (`ProvisionByoipCidrRequest$PubliclyAdvertisable`).
+pub const DEFAULT_PUBLICLY_ADVERTISABLE: bool = true;
+
+/// The Local Zone network border groups a BYOIPv4 range may be provisioned to: "You can
+/// provision BYOIP address ranges to and advertise them in the following Local Zone
+/// network border groups: us-east-1-dfw-2 us-west-2-lax-1 us-west-2-phx-2"
+/// (`ProvisionByoipCidrRequest$NetworkBorderGroup`).
+pub const LOCAL_ZONE_NETWORK_BORDER_GROUPS: [&str; 3] =
+    ["us-east-1-dfw-2", "us-west-2-lax-1", "us-west-2-phx-2"];
+
+/// May a range of `family` be provisioned to the network border group `group` from
+/// `region`?
+///
+/// The Region a request was signed for is always a network border group of its own — it is
+/// the group a request that names none gets — and beside it a BYOIPv4 range may name one of
+/// the Region's own Local Zone groups ([`LOCAL_ZONE_NETWORK_BORDER_GROUPS`], each of which
+/// starts with its parent Region's name). "You cannot provision or advertise BYOIPv6
+/// address ranges in Local Zones at this time"
+/// (`ProvisionByoipCidrRequest$NetworkBorderGroup`), so for IPv6 only the Region itself
+/// holds.
+pub fn byoip_network_border_group_allowed(
+    group: &str,
+    region: &str,
+    family: AddressFamily,
+) -> bool {
+    group == region
+        || (family == AddressFamily::Ipv4
+            && group.starts_with(region)
+            && LOCAL_ZONE_NETWORK_BORDER_GROUPS.contains(&group))
+}
+
+/// The error code a provision past the store's record ceiling carries, in EC2's own
+/// `<Resource>LimitExceeded` naming — the same convention as [`VPC_LIMIT_EXCEEDED`],
+/// [`SUBNET_LIMIT_EXCEEDED`] and [`VOLUME_LIMIT_EXCEEDED`], each of which is the code the
+/// real service answers that resource's quota with.
+pub const BYOIP_CIDR_LIMIT_EXCEEDED: &str = "ByoipCidrLimitExceeded";
+
+/// Refuse a provision that would take the store past the BYOIP record ceiling
+/// ([`ComAmazonawsEc2Amazonec2State::has_byoip_cidr_capacity`]): HTTP 400
+/// [`BYOIP_CIDR_LIMIT_EXCEEDED`].
+pub fn byoip_cidr_limit_exceeded<E>() -> Scaffolded<E> {
+    Scaffolded::service_error(
+        BYOIP_CIDR_LIMIT_EXCEEDED,
+        400,
+        format!(
+            "The maximum number of BYOIP address ranges has been reached \
+             ({MAX_STORED_RECORDS_PER_STORE})"
+        ),
+    )
+}
+
+/// Why a requested BYOIP address range cannot be provisioned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ByoipCidrProblem {
+    /// The value is not a CIDR block of either address family.
+    Malformed,
+    /// The block parses, but its prefix is more specific than the most specific one the
+    /// family (and, for IPv6, the advertisability) admits — the carried bound.
+    PrefixLength(u8),
+    /// The block parses, but it is not public address space, so it cannot be an address
+    /// range brought to AWS: `ProvisionByoipCidrRequest$Cidr` is "The public IPv4 or IPv6
+    /// address range".
+    NotPublic,
+}
+
+/// One readable BYOIP address range: the block in canonical form, and its family.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ByoipCidrBlock {
+    /// The block with its host bits cleared, the form this crate stores every CIDR in.
+    pub cidr: String,
+    /// Which address space it names, which decides the pool's resource type and the
+    /// prefix bound it was held to.
+    pub family: AddressFamily,
+}
+
+/// A requested BYOIP address range, read the one way this crate reads a CIDR block and
+/// held to what `ProvisionByoipCidrRequest$Cidr` publishes for one: a PUBLIC IPv4 or IPv6
+/// range, no more specific than /24 for IPv4, /48 for a publicly advertisable IPv6 range
+/// and /56 for one that is not.
+///
+/// The canonical form is the one the store keys its ranges by ([`canonical_byoip_cidr`]);
+/// what this adds is the published bounds a PROVISION is held to, which a range already in
+/// the store is not re-checked against.
+pub fn provisionable_byoip_cidr(
+    value: &str,
+    publicly_advertisable: bool,
+) -> Result<ByoipCidrBlock, ByoipCidrProblem> {
+    let family = AddressFamily::of_cidr(value);
+    let canonical = canonical_byoip_cidr(value).map_err(|_| ByoipCidrProblem::Malformed)?;
+    let (prefix_length, most_specific) = match family {
+        AddressFamily::Ipv4 => {
+            let (_, prefix_length) =
+                split_ipv4_cidr(&canonical).ok_or(ByoipCidrProblem::Malformed)?;
+            (prefix_length, MOST_SPECIFIC_BYOIP_IPV4_PREFIX)
+        }
+        AddressFamily::Ipv6 => {
+            let (_, prefix_length) =
+                split_ipv6_cidr(&canonical).ok_or(ByoipCidrProblem::Malformed)?;
+            let most_specific = if publicly_advertisable {
+                MOST_SPECIFIC_BYOIP_IPV6_PREFIX
+            } else {
+                MOST_SPECIFIC_BYOIP_IPV6_PREFIX_NOT_PUBLICLY_ADVERTISABLE
+            };
+            (prefix_length, most_specific)
+        }
+    };
+    if prefix_length > most_specific {
+        return Err(ByoipCidrProblem::PrefixLength(most_specific));
+    }
+    if !cidr_block_is_public(&canonical) {
+        return Err(ByoipCidrProblem::NotPublic);
+    }
+    Ok(ByoipCidrBlock {
+        cidr: canonical,
+        family,
+    })
+}
+
+/// Every IPv4 block the IANA IPv4 Special-Purpose Address Registry (RFC 6890) marks as
+/// NOT globally reachable: this host, private use, shared address space, loopback,
+/// link local, protocol assignments, the three documentation blocks, the AS112 and AMT
+/// assignments, benchmarking, 6to4 relay anycast, multicast and reserved space.
+///
+/// An address range brought to AWS is "The public IPv4 or IPv6 address range"
+/// (`ProvisionByoipCidrRequest$Cidr`) — a range the account holds a registry allocation and
+/// an RPKI ROA for — so a block that meets any of these cannot be one.
+const NON_PUBLIC_IPV4_BLOCKS: [&str; 18] = [
+    "0.0.0.0/8",
+    "10.0.0.0/8",
+    "100.64.0.0/10",
+    "127.0.0.0/8",
+    "169.254.0.0/16",
+    "172.16.0.0/12",
+    "192.0.0.0/24",
+    "192.0.2.0/24",
+    "192.31.196.0/24",
+    "192.52.193.0/24",
+    "192.88.99.0/24",
+    "192.168.0.0/16",
+    "192.175.48.0/24",
+    "198.18.0.0/15",
+    "198.51.100.0/24",
+    "203.0.113.0/24",
+    "224.0.0.0/4",
+    "240.0.0.0/4",
+];
+
+/// Every IPv6 block the IANA IPv6 Special-Purpose Address Registry marks as not globally
+/// reachable while sitting INSIDE global unicast space: Teredo, benchmarking, ORCHIDv2 and
+/// the two documentation blocks, plus 6to4. Everything outside global unicast is excluded
+/// by [`GLOBAL_UNICAST_IPV6_BLOCK`] instead.
+const NON_PUBLIC_IPV6_BLOCKS: [&str; 6] = [
+    "2001::/32",
+    "2001:2::/48",
+    "2001:20::/28",
+    "2001:db8::/32",
+    "2002::/16",
+    "3fff::/20",
+];
+
+/// The one global unicast IPv6 block: IANA's IPv6 Global Unicast Address Assignments give
+/// `2000::/3` as the only space handed to the registries, so a BYOIPv6 range has to be
+/// inside it.
+const GLOBAL_UNICAST_IPV6_BLOCK: &str = "2000::/3";
+
+/// Is every address of `block` public address space — space a registry allocates, as
+/// opposed to the special-purpose blocks no one can bring to AWS?
+///
+/// A block that is only PARTLY public is not: a caller cannot hold an allocation for a
+/// range that reaches into reserved space, which is why this asks about overlap rather
+/// than about the block's base address.
+pub fn cidr_block_is_public(block: &str) -> bool {
+    match AddressFamily::of_cidr(block) {
+        AddressFamily::Ipv4 => NON_PUBLIC_IPV4_BLOCKS
+            .iter()
+            .all(|reserved| !ipv4_cidr_blocks_overlap(block, reserved)),
+        AddressFamily::Ipv6 => {
+            ipv6_cidr_block_contains(GLOBAL_UNICAST_IPV6_BLOCK, block)
+                && NON_PUBLIC_IPV6_BLOCKS
+                    .iter()
+                    .all(|reserved| !ipv6_cidr_blocks_overlap(block, reserved))
+        }
+    }
+}
+
+/// `block` as its base address and prefix length, for a block already in canonical form —
+/// the IPv6 counterpart of [`split_ipv4_cidr`].
+fn split_ipv6_cidr(block: &str) -> Option<(u128, u8)> {
+    let (address, prefix_length) = block.split_once('/')?;
+    let base = u128::from(address.parse::<Ipv6Addr>().ok()?);
+    let prefix_length: u8 = prefix_length.parse().ok()?;
+    (prefix_length <= 128).then_some((base, prefix_length))
+}
+
+/// The first and last address of `block`, or `None` when it is not an IPv6 CIDR block.
+fn ipv6_cidr_bounds(block: &str) -> Option<(u128, u128)> {
+    let (base, prefix_length) = split_ipv6_cidr(block)?;
+    let size = 1u128
+        .checked_shl(u32::from(128 - prefix_length))
+        .unwrap_or_default();
+    // A /0 spans the whole space, whose size does not fit a u128; its last address is the
+    // largest one there is.
+    let last = match size {
+        0 => u128::MAX,
+        size => base.checked_add(size - 1)?,
+    };
+    Some((base, last))
+}
+
+/// Do `left` and `right` share any IPv6 address? The IPv6 counterpart of
+/// [`ipv4_cidr_blocks_overlap`], on the same terms: a block this emulator cannot read
+/// overlaps nothing.
+pub fn ipv6_cidr_blocks_overlap(left: &str, right: &str) -> bool {
+    match (ipv6_cidr_bounds(left), ipv6_cidr_bounds(right)) {
+        (Some((left_first, left_last)), Some((right_first, right_last))) => {
+            left_first <= right_last && right_first <= left_last
+        }
+        _ => false,
+    }
+}
+
+/// Is every address of `inner` an address of `outer`? The IPv6 counterpart of
+/// [`ipv4_cidr_block_contains`].
+pub fn ipv6_cidr_block_contains(outer: &str, inner: &str) -> bool {
+    match (ipv6_cidr_bounds(outer), ipv6_cidr_bounds(inner)) {
+        (Some((outer_first, outer_last)), Some((inner_first, inner_last))) => {
+            outer_first <= inner_first && inner_last <= outer_last
+        }
+        _ => false,
+    }
+}
+
+/// Do `left` and `right` share an address, whatever family they are?
+///
+/// Two blocks of DIFFERENT families share nothing — an IPv4 address is not an IPv6 one —
+/// so the question is only ever asked within one family, and this is the one reader that
+/// picks which. It is what "The address range cannot overlap with another address range
+/// that you've brought to this or another Region" (`ProvisionByoipCidrRequest$Cidr`) asks.
+pub fn cidr_blocks_overlap(left: &str, right: &str) -> bool {
+    match (AddressFamily::of_cidr(left), AddressFamily::of_cidr(right)) {
+        (AddressFamily::Ipv4, AddressFamily::Ipv4) => ipv4_cidr_blocks_overlap(left, right),
+        (AddressFamily::Ipv6, AddressFamily::Ipv6) => ipv6_cidr_blocks_overlap(left, right),
+        _ => false,
+    }
+}
+
+/// What a provision stores: everything about one BYOIP range that comes from the request,
+/// read and validated by `ProvisionByoipCidr` before the store is touched.
+#[derive(Debug, Clone)]
+pub struct ByoipCidrSpec {
+    /// The range, canonical, as [`provisionable_byoip_cidr`] read it.
+    pub block: ByoipCidrBlock,
+    /// "A description for the address range and the address pool"
+    /// (`ProvisionByoipCidrRequest$Description`).
+    pub description: Option<String>,
+    /// The network border group the range is advertised from: the one the request named,
+    /// or the Region it was signed for.
+    pub network_border_group: String,
+    /// Whether the range "will be publicly advertised to the internet"
+    /// (`ProvisionByoipCidrRequest$PubliclyAdvertisable`).
+    pub publicly_advertisable: bool,
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// The BYOIP range the store holds that shares an address with `cidr`, if any.
+    ///
+    /// "The address range cannot overlap with another address range that you've brought to
+    /// this or another Region" (`ProvisionByoipCidrRequest$Cidr`) — asked over the whole
+    /// store, so a range that merely CONTAINS or sits inside a provisioned one is caught
+    /// as well as an exact repeat.
+    pub fn byoip_cidr_overlapping(&self, cidr: &str) -> Option<&str> {
+        self.byoip_cidrs
+            .keys()
+            .find(|held| cidr_blocks_overlap(cidr, held))
+            .map(String::as_str)
+    }
+
+    /// Store `spec` as a newly provisioned BYOIP range and answer it as the provision
+    /// reports it — `pending-provision`, the state the clock owes `provisioned`
+    /// [`TRANSITION_DELAY`] from now ([`ByoipCidrRecord::pending`]).
+    ///
+    /// The pool the range gets ("creates a corresponding address pool",
+    /// `ProvisionByoipCidr`) is minted here from the store's own id counter, so no caller
+    /// can choose a pool id. The record goes in through [`Self::insert_byoip_cidr`], the one
+    /// write path, which charges the bytes it holds and REFUSES a record that does not fit
+    /// the store's ceilings — so `None`, with nothing stored, rather than a range reported
+    /// to a caller that the store does not hold.
+    pub fn provision_byoip_cidr(&mut self, spec: ByoipCidrSpec) -> Option<ByoipCidr> {
+        let pool_id = self.next_id(spec.block.family.pool_resource_type());
+        let becomes = match (spec.block.family, spec.publicly_advertisable) {
+            (AddressFamily::Ipv6, false) => BYOIP_CIDR_STATE_PROVISIONED_NOT_PUBLICLY_ADVERTISABLE,
+            _ => BYOIP_CIDR_STATE_PROVISIONED,
+        };
+        let record = ByoipCidrRecord {
+            byoip_cidr: ByoipCidr {
+                cidr: Some(spec.block.cidr.clone()),
+                description: spec.description,
+                // "The BYOIP CIDR associations with ASNs" (`ByoipCidr$AsnAssociations`):
+                // none until `AssociateIpamByoasn` makes one.
+                asn_associations: Some(Vec::new()),
+                // "Upon success, contains the ID of the address pool"
+                // (`ByoipCidr$StatusMessage`) — the provision has not succeeded yet, so
+                // there is nothing to report until the clock says it has.
+                status_message: None,
+                state: Some(BYOIP_CIDR_STATE_PENDING_PROVISION.to_string()),
+                network_border_group: Some(spec.network_border_group),
+                // `ByoipCidr$AdvertisementType` is how the range IS advertised, and this
+                // one is not advertised yet — `AdvertiseByoipCidr` is what starts that.
+                advertisement_type: None,
+                pool_id: Some(pool_id),
+                // "The ID of the IPAM pool associated with the CIDR"
+                // (`ByoipCidr$IpamPoolId`): a range provisioned through this operation is
+                // not in an IPAM pool; `MoveByoipCidrToIpam` is what puts one there.
+                ipam_pool_id: None,
+            },
+            released_at: None,
+            // What the clock now owes this range, recorded rather than slept for: "the
+            // address range is not ready to use until its status changes from
+            // pending-provision to provisioned" (`ProvisionByoipCidr`), one
+            // [`TRANSITION_DELAY`] from now, off the same monotonic clock as every other
+            // move this store owes. WHAT it becomes is decided by the REQUEST — an IPv6
+            // range the caller asked not to have advertised lands in
+            // `provisioned-not-publicly-advertisable` — so it is recorded here rather than
+            // guessed at the due instant.
+            pending: Some(PendingStateMove::starting_now(becomes)),
+        };
+        let reported = record.byoip_cidr.clone();
+        self.insert_byoip_cidr(record).then_some(reported)
     }
 }
 
@@ -10803,13 +11232,14 @@ pub const ADDRESS_FAMILY_IPV4: &str = "ipv4";
 /// The `AddressFamily` of an IPv6 pool or range.
 pub const ADDRESS_FAMILY_IPV6: &str = "ipv6";
 
-/// The address family a canonical BYOIP range belongs to, as `AddressFamily` spells it.
+/// The address family a canonical BYOIP range belongs to, as `AddressFamily` spells it on
+/// the wire.
+///
+/// One definition of "which family is this range": the decision is
+/// [`AddressFamily::of_cidr`]'s and this only names the result the way the model does
+/// ([`AddressFamily::wire_name`]), so the two cannot drift.
 pub fn byoip_cidr_address_family(cidr: &str) -> &'static str {
-    if cidr.contains(':') {
-        ADDRESS_FAMILY_IPV6
-    } else {
-        ADDRESS_FAMILY_IPV4
-    }
+    AddressFamily::of_cidr(cidr).wire_name()
 }
 
 // =============================================================================

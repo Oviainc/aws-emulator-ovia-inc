@@ -549,8 +549,8 @@ async fn a_page_size_outside_the_modelled_range_is_refused() {
         );
         if expected_status == 400 {
             assert!(
-                answer.error_code().contains("ValidationException"),
-                "case {case:?}: expected ValidationException, got {:?}",
+                answer.error_code().contains("BadRequestException"),
+                "case {case:?}: expected the modelled BadRequestException, got {:?}",
                 answer.error_code()
             );
             assert!(

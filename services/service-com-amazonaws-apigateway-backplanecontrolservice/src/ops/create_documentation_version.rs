@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDocumentationVersion
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDocumentationVersion`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDocumentationVersion::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -84,6 +75,57 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::DocumentationVersionEntry;
+
+/// The `DocumentationVersion` body for a stored snapshot — the one place this crate
+/// renders that shape, so `CreateDocumentationVersion` and `GetDocumentationVersion`
+/// cannot report one record two different ways.
+pub fn documentation_version_body(
+    entry: &DocumentationVersionEntry,
+) -> CreateDocumentationVersionOutput {
+    CreateDocumentationVersionOutput {
+        version: Some(entry.version.clone()),
+        created_date: entry.created_date,
+        description: entry.description.clone(),
+    }
+}
+
+/// The `ConflictException` message for a version identifier this API already has a
+/// snapshot under.
+///
+/// Built from the request: it names the identifier the caller has to change.
+pub fn version_clash_message(version: &str) -> String {
+    format!("Documentation version already exists: {version}")
+}
+
+/// Refuse a request whose caller-sized members would grow the store past a bound, or
+/// whose version identifier names no snapshot.
+///
+/// Called BEFORE the store lock is taken, so such a request never reaches the records.
+fn validated_input(input: &CreateDocumentationVersionInput) -> Result<(), String> {
+    // The version identifier is this record's KEY and a path label of every later read
+    // of it, so a blank one would name a snapshot no request could address again.
+    if input.documentation_version.trim().is_empty() {
+        return Err("documentationVersion must name a version identifier".to_string());
+    }
+    crate::state::bound_chars(
+        "documentationVersion",
+        &input.documentation_version,
+        crate::state::MAX_STRING_CHARS,
+    )?;
+    if let Some(description) = &input.description {
+        crate::state::bound_chars("description", description, crate::state::MAX_STRING_CHARS)?;
+    }
+    if let Some(stage_name) = &input.stage_name {
+        crate::state::bound_chars(
+            "stageName",
+            stage_name,
+            crate::state::MAX_STAGE_NAME_CHARS,
+        )?;
+    }
+    Ok(())
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -157,18 +199,141 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDocumentationVersion` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDocumentationVersionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDocumentationVersion"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        // The modelled 400 for a request this operation cannot store, with the message
+        // naming the member to fix.
+        fn bad_request(message: String) -> CreateDocumentationVersionError {
+            CreateDocumentationVersionErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message),
+            })
+            .into()
+        }
+
+        // The modelled 404 for a `restApiId` that names no stored API.
+        fn no_such_api(rest_api_id: &str) -> CreateDocumentationVersionError {
+            CreateDocumentationVersionErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::no_such_rest_api(rest_api_id)),
+            })
+            .into()
+        }
+
+        // Read before the store lock is taken, so a request that cannot be stored never
+        // reaches the records.
+        validated_input(&input).map_err(bad_request)?;
+
+        let created_date = crate::state::now();
+        let mut store = state.lock();
+
+        // The snapshot the version IS: this API's documentation parts as they stand at
+        // this instant, in their creation order. Taken under the same lock as the insert,
+        // so the stored snapshot is the documentation that existed when the version was
+        // created and later edits to those parts do not reach it.
+        let snapshot = {
+            let api = store
+                .rest_apis
+                .get(&input.rest_api_id)
+                .ok_or_else(|| no_such_api(&input.rest_api_id))?;
+            // A version identifier addresses one snapshot of one API, so a second
+            // snapshot under the same identifier is a conflict rather than an overwrite.
+            if api
+                .documentation_versions
+                .contains_key(&input.documentation_version)
+            {
+                return Err(CreateDocumentationVersionErrorModeled::ConflictException(
+                    ConflictException {
+                        message: Some(version_clash_message(&input.documentation_version)),
+                    },
+                )
+                .into());
+            }
+            // One version per request, and at most this many per API: the store cannot
+            // grow past the bound however many requests arrive.
+            if api.documentation_versions.len() >= crate::state::MAX_DOCUMENTATION_VERSIONS_PER_API
+            {
+                return Err(
+                    CreateDocumentationVersionErrorModeled::LimitExceededException(
+                        LimitExceededException {
+                            retry_after_seconds: None,
+                            message: Some(format!(
+                                "Maximum number of documentation versions exceeded for this \
+                                 API: {}",
+                                crate::state::MAX_DOCUMENTATION_VERSIONS_PER_API
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            // `stageName` is "the stage name to be associated with the new documentation
+            // snapshot", so it has to name a stage of THIS API — there is nothing to
+            // associate otherwise.
+            if let Some(stage_name) = &input.stage_name {
+                if !api.stages.contains_key(stage_name) {
+                    return Err(CreateDocumentationVersionErrorModeled::NotFoundException(
+                        NotFoundException {
+                            message: Some(crate::state::NO_SUCH_STAGE.to_string()),
+                        },
+                    )
+                    .into());
+                }
+            }
+            api.documentation_parts_in_creation_order()
+                .into_iter()
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+
+        let sequence = store.next_sequence();
+        let version = input.documentation_version.clone();
+        let api = store
+            .rest_apis
+            .get_mut(&input.rest_api_id)
+            .ok_or_else(|| no_such_api(&input.rest_api_id))?;
+        api.documentation_versions.insert(
+            version.clone(),
+            DocumentationVersionEntry {
+                version: version.clone(),
+                description: input.description.clone(),
+                created_date: Some(created_date),
+                documentation_parts: snapshot,
+                sequence,
+            },
+        );
+        // Associating the snapshot with a stage is what `stageName` asks for: the stage
+        // then serves this version of the documentation, which is what a later read of
+        // the stage reports.
+        if let Some(stage_name) = &input.stage_name {
+            if let Some(stage) = api.stages.get_mut(stage_name) {
+                stage.documentation_version = Some(version.clone());
+                stage.last_updated_date = Some(created_date);
+            }
+        }
+        // Rendered from the record that was just stored, so the answer is the stored
+        // snapshot and not the request read back.
+        let body = api
+            .documentation_versions
+            .get(&version)
+            .map(documentation_version_body)
+            // Unreachable: the entry was inserted under this identifier a statement ago.
+            // A miss would mean the store did not keep it, which is answered as the
+            // server-side failure it would be rather than reported as a success.
+            .ok_or_else(crate::state::state_unavailable)?;
+        // Everything below is owned, so the store lock is released before the access
+        // record is emitted: the critical section covers the state change only.
+        drop(store);
+        // The access record for a state-changing operation: who, what, and the outcome.
+        ::tracing::info!(
+            target: crate::state::AUDIT_TARGET,
+            operation = Self::NAME,
+            caller = ?crate::state::request_caller(ctx.parts()),
+            rest_api = ?input.rest_api_id,
+            documentation_version = ?version,
+            stage = ?input.stage_name,
+            outcome = "created",
+            "documentation version created",
+        );
+        Ok(body)
     }
 }

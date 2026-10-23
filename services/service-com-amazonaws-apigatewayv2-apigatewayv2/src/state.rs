@@ -56,7 +56,8 @@ pub const DEFAULT_IP_ADDRESS_TYPE: &str = "ipv4";
 
 /// The `ProtocolType` value that selects a WebSocket API, from
 /// `PROTOCOL_TYPE_VALUES` (`HTTP | WEBSOCKET`) — the protocol whose two-way
-/// communication the route-response resources belong to.
+/// communication the route-response resources belong to, and the one whose
+/// `ApiEndpoint` carries the WebSocket scheme (see [`execute_api_scheme`]).
 pub const WEBSOCKET_PROTOCOL_TYPE: &str = "WEBSOCKET";
 
 /// The `AuthorizationType` a route gets when the request names none. One of
@@ -116,6 +117,10 @@ pub const MAX_DEPLOYMENTS_PER_API: usize = 500;
 /// integrations, which this store already holds — so a minted deployment is reported
 /// released, the terminal status, and never moves again.
 pub const DEPLOYMENT_STATUS_DEPLOYED: &str = "DEPLOYED";
+
+/// The `ProtocolType` value that selects an HTTP API, from `PROTOCOL_TYPE_VALUES`
+/// (`smithy_query(query="shape", shape="ProtocolType")`: `HTTP | WEBSOCKET`).
+pub const HTTP_PROTOCOL_TYPE: &str = "HTTP";
 
 /// The `ConnectionType` an integration gets when the request names none. From
 /// `Integration$ConnectionType`: "Specify INTERNET for connections through the public
@@ -648,13 +653,40 @@ pub fn request_region(parts: &::http::request::Parts) -> String {
         .unwrap_or_else(|| DEFAULT_REGION.to_string())
 }
 
-/// The default execute-api endpoint of an api: the host clients invoke it on when
+/// The URI scheme of an api's default endpoint, chosen by its `ProtocolType`.
+///
+/// `ApiEndpoint` is the value a caller hands to a client library to reach the api, so
+/// its scheme has to name the protocol that api speaks: a WebSocket API is opened with
+/// an RFC 6455 handshake, whose URI scheme is `wss` (secure) — `ws` is the cleartext
+/// form, and nothing this emulator serves is cleartext — while an HTTP API is invoked
+/// over `https` ("clients can invoke your API with the default
+/// https://{api_id}.execute-api.{region}.amazonaws.com endpoint",
+/// `Api$DisableExecuteApiEndpoint`).
+///
+/// `ProtocolType` is an enum of exactly `HTTP | WEBSOCKET`
+/// (`smithy_query(query="shape", shape="ProtocolType")`) and the boundary validator
+/// refuses anything else, so `WEBSOCKET` and the `HTTP` arm cover every api a record
+/// can hold; that arm doubles as the fallback a future enum value would take, which
+/// gives it the scheme an api is invoked over rather than one no client could open.
+pub fn execute_api_scheme(protocol_type: &str) -> &'static str {
+    match protocol_type {
+        WEBSOCKET_PROTOCOL_TYPE => "wss",
+        // HTTP_PROTOCOL_TYPE, and anything the enum gains later.
+        _ => "https",
+    }
+}
+
+/// The default execute-api endpoint of an api: the URI clients reach it on when
 /// no custom domain name is configured.
 ///
-/// From `Api$DisableExecuteApiEndpoint`: "clients can invoke your API with the
-/// default https://{api_id}.execute-api.{region}.amazonaws.com endpoint".
-pub fn execute_api_endpoint(api_id: &str, region: &str) -> String {
-    format!("https://{api_id}.execute-api.{region}.amazonaws.com")
+/// The host is the one `CreateApiResponse$ApiEndpoint` documents —
+/// `{api-id}.execute-api.{region}.amazonaws.com` — and the scheme comes from the
+/// api's `ProtocolType` (see [`execute_api_scheme`]).
+pub fn execute_api_endpoint(api_id: &str, region: &str, protocol_type: &str) -> String {
+    format!(
+        "{}://{api_id}.execute-api.{region}.amazonaws.com",
+        execute_api_scheme(protocol_type)
+    )
 }
 
 /// Resolve a `MaxResults` query value into the page size to serve.

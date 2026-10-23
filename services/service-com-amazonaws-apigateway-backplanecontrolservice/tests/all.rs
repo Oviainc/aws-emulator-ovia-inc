@@ -23,6 +23,8 @@ mod delete_lifecycle;
 mod delete_method_response;
 #[path = "all/documentation_parts.rs"]
 mod documentation_parts;
+#[path = "all/documentation_versions.rs"]
+mod documentation_versions;
 #[path = "all/epoch_second_timestamps.rs"]
 mod epoch_second_timestamps;
 #[path = "all/gateway_response.rs"]

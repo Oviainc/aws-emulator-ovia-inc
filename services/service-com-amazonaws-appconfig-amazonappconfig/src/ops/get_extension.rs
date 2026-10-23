@@ -162,22 +162,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // to report unless the request names one explicitly.
         let Some((extension, pinned_version)) = store.resolve_extension(&input.extension_identifier)
         else {
-            return Err(not_found(format!(
-                "No extension matching {} exists.",
-                input.extension_identifier
+            return Err(not_found(crate::state::extension_not_found(
+                &input.extension_identifier,
             )));
         };
         // "The extension version number. If no version number was defined, AppConfig
         // uses the highest version."
         let version = match input.version_number.or(pinned_version) {
             Some(number) => extension.versions.get(&number).ok_or_else(|| {
-                not_found(format!(
-                    "Extension {} has no version {number}.",
-                    extension.name
+                not_found(crate::state::extension_version_not_found(
+                    &input.extension_identifier,
+                    number,
                 ))
             })?,
             None => extension.latest_version().ok_or_else(|| {
-                not_found(format!("Extension {} holds no version.", extension.name))
+                not_found(crate::state::extension_not_found(
+                    &input.extension_identifier,
+                ))
             })?,
         };
 

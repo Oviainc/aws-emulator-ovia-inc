@@ -174,24 +174,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let Some(application) = store.applications.get(&input.application_id) else {
             return Err(not_found(
-                format!("No application with id {} exists.", input.application_id),
+                crate::state::application_not_found(&input.application_id),
                 input.application_id,
             ));
         };
         let Some(profile) = application.profiles.get(&input.configuration_profile_id) else {
             return Err(not_found(
-                format!(
-                    "No configuration profile with id {} exists in application {}.",
-                    input.configuration_profile_id, input.application_id
+                crate::state::configuration_profile_not_found(
+                    &input.application_id,
+                    &input.configuration_profile_id,
                 ),
                 input.configuration_profile_id,
             ));
         };
         let Some(version) = profile.hosted_versions.get(&input.version_number) else {
             return Err(not_found(
-                format!(
-                    "No hosted configuration version {} exists in configuration profile {}.",
-                    input.version_number, input.configuration_profile_id
+                crate::state::hosted_configuration_version_not_found(
+                    &input.application_id,
+                    &input.configuration_profile_id,
+                    input.version_number,
                 ),
                 input.version_number.to_string(),
             ));

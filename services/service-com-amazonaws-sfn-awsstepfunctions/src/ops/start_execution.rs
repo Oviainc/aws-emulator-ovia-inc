@@ -382,7 +382,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             output: None,
             error: None,
             cause: None,
-            trace_header: input.trace_header,
+            // "If both sources are provided, Step Functions will use the header value
+            // (preferred) over the value in the request body" — the one rule both start
+            // operations state, applied through [`crate::state::effective_trace_header`].
+            trace_header: crate::state::effective_trace_header(ctx.parts(), input.trace_header),
             redrive_count: 0,
             redrive_date: None,
             redrive_tokens: Vec::new(),

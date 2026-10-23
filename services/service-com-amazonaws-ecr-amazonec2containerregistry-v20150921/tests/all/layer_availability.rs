@@ -3,12 +3,15 @@
 //! `BatchCheckLayerAvailability` over the wire.
 //!
 //! The rule under test: for each layer digest a request names, the answer is the
-//! repository's own record of that blob — `AVAILABLE` with the size and media type the
-//! repository stores for it when the repository holds it, a `MissingLayerDigest`
-//! failure when no blob of that repository answers to the digest, and an
-//! `InvalidLayerDigest` failure when the requested digest is not a content digest at
-//! all. The blobs a repository holds are the ones a completed layer upload registered
-//! there (`InitiateLayerUpload`, `UploadLayerPart`, `CompleteLayerUpload`), so the size
+//! repository's own record of that layer — a `layers` entry marked `AVAILABLE`, with the
+//! size and media type the repository stores for it, when the repository holds the
+//! layer, and a `layers` entry marked `UNAVAILABLE` when it does not. A `failures` entry
+//! is reserved for a request entry that addresses no layer at all: `Layer$layerDigest`
+//! is constrained to `<algorithm>:<hex>`, so a requested string outside that form can
+//! only be answered as a failure — `InvalidLayerDigest` when it carries something that
+//! is not a content digest, `MissingLayerDigest` when it carries nothing. The blobs a
+//! repository holds are the ones a completed layer upload registered there
+//! (`InitiateLayerUpload`, `UploadLayerPart`, `CompleteLayerUpload`), so the size
 //! reported is the registry's own byte count; the media type is what a stored manifest
 //! referencing the blob declares for it.
 //!
@@ -49,10 +52,13 @@ enum Expected {
         size: Option<i64>,
         media_type: Option<&'static str>,
     },
-    /// A well-formed digest no blob of the repository answers to.
-    Missing,
+    /// A well-formed digest no layer of the repository answers to: the layer is
+    /// addressed, and it is not here.
+    Unavailable,
     /// A requested digest that is not of the form `<algorithm>:<hex>`.
     Invalid,
+    /// A request entry carrying no digest at all.
+    Missing,
 }
 
 /// One row of the availability table: the case name, the digest asked about, and the
@@ -353,22 +359,22 @@ fn pushed_manifests() -> (Vec<&'static str>, Vec<String>, Vec<Row>) {
             // the index uploads nothing for it and the repository holds no such blob.
             "a manifest an index references".to_string(),
             child_manifest,
-            Expected::Missing,
+            Expected::Unavailable,
         ),
         (
             "a well-formed sha256 digest nothing uploaded".to_string(),
             blob_digest("never-pushed"),
-            Expected::Missing,
+            Expected::Unavailable,
         ),
         (
             "a digest of another algorithm, nothing uploaded".to_string(),
             "sha512:0123456789abcdefABCDEF".to_string(),
-            Expected::Missing,
+            Expected::Unavailable,
         ),
         (
             "the digest of a stored manifest, which is not a blob of it".to_string(),
             manifest_digest(&schema2),
-            Expected::Missing,
+            Expected::Unavailable,
         ),
         (
             "a digest with no algorithm separator".to_string(),
@@ -378,7 +384,7 @@ fn pushed_manifests() -> (Vec<&'static str>, Vec<String>, Vec<Row>) {
         (
             "an empty digest".to_string(),
             String::new(),
-            Expected::Invalid,
+            Expected::Missing,
         ),
         (
             "an algorithm with no encoded value".to_string(),
@@ -482,6 +488,18 @@ async fn every_requested_digest_is_answered_from_the_repositorys_stored_blobs() 
                     next_layer - 1
                 );
             }
+            Expected::Unavailable => {
+                // The repository knows no size and no media type for a layer it does
+                // not hold, so neither member is reported.
+                let wanted = json!({"layerDigest": digest, "layerAvailability": "UNAVAILABLE"});
+                let got = layers.get(next_layer).cloned().unwrap_or(Value::Null);
+                next_layer += 1;
+                assert_eq!(
+                    got, wanted,
+                    "case {case:?}: expected layers[{}] to be {wanted}, got {got:?}",
+                    next_layer - 1
+                );
+            }
             Expected::Missing | Expected::Invalid => {
                 let code = if *expected == Expected::Missing {
                     MISSING_LAYER_DIGEST
@@ -507,30 +525,51 @@ async fn every_requested_digest_is_answered_from_the_repositorys_stored_blobs() 
     assert_eq!(
         layers.len(),
         next_layer,
-        "every available digest is reported exactly once, got {layers:?}"
+        "every addressed layer is reported exactly once, got {layers:?}"
     );
     assert_eq!(
         failures.len(),
         next_failure,
-        "every unavailable digest is reported exactly once, got {failures:?}"
+        "every entry addressing no layer is reported exactly once, got {failures:?}"
     );
 
     // Blobs belong to the repository they were uploaded to: the very same digests are
-    // missing from a repository no upload was completed against.
+    // reported unavailable in a repository no upload was completed against.
     let elsewhere = check(&router, "another repository", EMPTY, &digests).await;
+    let addressed = rows
+        .iter()
+        .filter(|(_, _, expected)| {
+            !matches!(expected, Expected::Invalid | Expected::Missing)
+        })
+        .count();
+    let elsewhere_layers = elsewhere["layers"]
+        .as_array()
+        .cloned()
+        .unwrap_or_else(|| panic!("the answer must carry a layers list, got {elsewhere:?}"));
     assert_eq!(
-        elsewhere["layers"],
-        json!([]),
-        "a repository holding no image holds no blob, got {:?}",
-        elsewhere["layers"]
+        elsewhere_layers.len(),
+        addressed,
+        "every addressed layer is answered there too, got {elsewhere_layers:?}"
     );
+    for layer in &elsewhere_layers {
+        assert_eq!(
+            layer["layerAvailability"],
+            json!("UNAVAILABLE"),
+            "a repository holding no image holds no layer, got {layer:?}"
+        );
+        assert_eq!(
+            layer["layerSize"],
+            Value::Null,
+            "no size is reported for a layer the repository has not got, got {layer:?}"
+        );
+    }
     assert_eq!(
         elsewhere["failures"]
             .as_array()
             .map(Vec::len)
             .unwrap_or_default(),
-        digests.len(),
-        "every digest must be reported as a failure there, got {:?}",
+        digests.len() - addressed,
+        "only the entries addressing no layer are failures there, got {:?}",
         elsewhere["failures"]
     );
 
@@ -604,19 +643,31 @@ async fn a_batch_is_answered_reference_by_reference_within_the_modelled_bounds()
     let mut full = vec![held.clone()];
     full.extend((1..100).map(|n| blob_digest(&format!("absent-{n}"))));
     let answer = check(&router, "a batch of 100", HOLDER, &full).await;
+    let layers = answer["layers"]
+        .as_array()
+        .cloned()
+        .unwrap_or_else(|| panic!("the answer must carry a layers list, got {answer:?}"));
     assert_eq!(
-        answer["layers"].as_array().map(Vec::len).unwrap_or_default(),
-        1,
-        "the one held digest is available, got {:?}",
-        answer["layers"]
+        layers.len(),
+        full.len(),
+        "every reference is answered, got {layers:?}"
     );
     assert_eq!(
-        answer["failures"]
-            .as_array()
-            .map(Vec::len)
-            .unwrap_or_default(),
-        99,
-        "the other 99 are failures, got {:?}",
+        layers[0]["layerAvailability"],
+        json!("AVAILABLE"),
+        "the one held digest is available, got {:?}",
+        layers[0]
+    );
+    assert!(
+        layers[1..]
+            .iter()
+            .all(|layer| layer["layerAvailability"] == json!("UNAVAILABLE")),
+        "the other 99 are unavailable, got {layers:?}"
+    );
+    assert_eq!(
+        answer["failures"],
+        json!([]),
+        "every entry addresses a layer, so none is a failure, got {:?}",
         answer["failures"]
     );
 
@@ -702,8 +753,8 @@ async fn a_check_against_a_repository_this_registry_has_not_got_is_refused() {
     )
     .await;
     assert_eq!(
-        answer["failures"][0]["layerDigest"],
-        json!(digest),
-        "the empty repository holds no blob, got {answer:?}"
+        answer["layers"][0],
+        json!({"layerDigest": digest, "layerAvailability": "UNAVAILABLE"}),
+        "the empty repository holds no layer, got {answer:?}"
     );
 }

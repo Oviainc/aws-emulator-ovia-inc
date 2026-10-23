@@ -1,15 +1,35 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetPolicyVersion
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetPolicyVersion`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports ONE version of a catalog policy in [`crate::state`], the version its
+//! `PolicyVersionArn` names.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetPolicyVersion::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A policy and its versions are AWS's, not the caller's: nothing in this model creates,
+//! updates or deletes either, so the catalog is seeded when the store is first touched and
+//! this handler only reads it — `@readonly`, and like `ListPolicies` /
+//! `ListPolicyVersions` it has no clock-owed change to materialise, because no catalog
+//! entry changes with time.
+//!
+//! `PolicyVersionArn` is a QUALIFIED policy ARN: the policy's own unqualified ARN followed
+//! by a version qualifier, which is either the version's id or `$DEFAULT`
+//! (`QualifiedPolicyArn`'s pattern: `…/(?:[\d]+|\$DEFAULT)$`). `$DEFAULT` is resolved
+//! against the policy's recorded default version, so the same ARN follows the default
+//! wherever it points; every other qualifier names the version whose id it spells. An ARN
+//! the catalog holds no version for earns `ResourceNotFoundException` (404), whatever its
+//! form, since the catalog is the only thing consulted.
+//!
+//! The answer is computed from the stored version and the policy that owns it, so a
+//! reported version can never disagree with the entry `ListPolicyVersions` lists or with
+//! the policy `ListPolicies` reports: the `Arn` is minted from the version this service
+//! RESOLVED (a `$DEFAULT` request therefore answers with that version's id, not with the
+//! alias), `IsDefault` holds exactly for the policy's `DefaultVersion`, and the `Document`
+//! is the one [`crate::state::policy_version_document`] holds for this version — the same
+//! value the resource-policy reads report for it, so no two readers of one version
+//! disagree about its contents.
+//!
+//! A policy ARN carries EMPTY region and account fields (`arn:<partition>:mpa:::aws:policy/…`),
+//! so it names no account and there is no account boundary to decide here — unlike an
+//! operation whose ARN names an approval team.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +170,60 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetPolicyVersion` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetPolicyVersionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetPolicyVersion"))
+        // A policy ARN names no account (its region and account fields are empty), so
+        // there is no per-resource authorization to decide here; `ctx` carries nothing
+        // this answer depends on.
+        let _ = ctx;
+        let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetPolicyVersionError::Modeled(GetPolicyVersionErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the policy catalog is unavailable".to_string(),
+                },
+            ))
+        })?;
+
+        let state = store.lock();
+
+        // One resolution step for the whole ARN: the policy it names, and the version its
+        // qualifier names within that policy (`$DEFAULT` included). Anything the catalog
+        // holds no version for is not found.
+        let Some((policy, version)) = state.policy_version(&input.policy_version_arn) else {
+            return Err(GetPolicyVersionErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!(
+                        "No policy version found for ARN '{}'.",
+                        input.policy_version_arn
+                    ),
+                },
+            )
+            .into());
+        };
+
+        Ok(GetPolicyVersionOutput {
+            policy_version: detail(policy, version),
+        })
+    }
+}
+
+/// The `PolicyVersion` for one version of a catalog policy. The members a version shares
+/// with its policy are read off the policy, so a reported version can never disagree with
+/// the policy that owns it — the document included: it is the one
+/// [`crate::state::policy_version_document`] builds for this version, which is what the
+/// resource-policy reads report for the same version.
+fn detail(
+    policy: &crate::state::CatalogPolicy,
+    version: &crate::state::CatalogPolicyVersion,
+) -> PolicyVersion {
+    PolicyVersion {
+        arn: policy.version_arn(version.version_id),
+        policy_arn: policy.arn.clone(),
+        version_id: version.version_id,
+        policy_type: policy.policy_type.as_wire().to_string(),
+        is_default: policy.is_default_version(version.version_id),
+        name: policy.name.clone(),
+        status: version.status.as_wire().to_string(),
+        creation_time: ::aws_smithy_types::DateTime::from(version.creation_time),
+        last_updated_time: ::aws_smithy_types::DateTime::from(version.last_updated_time),
+        document: crate::state::policy_version_document(policy, version.version_id),
     }
 }

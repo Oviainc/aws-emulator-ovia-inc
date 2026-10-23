@@ -158,6 +158,20 @@ impl Emulator {
         );
         (status, error_code(&parsed))
     }
+
+    /// This emulator's own store.
+    ///
+    /// For a suite that has to assert what a call PERSISTED where no operation of this
+    /// API reports it — a synchronous Express execution, which `DescribeExecution` and
+    /// `ListExecutions` each refuse to report.
+    pub(crate) fn store(
+        &self,
+    ) -> engine::ServiceState<
+        service_com_amazonaws_sfn_awsstepfunctions::ComAmazonawsSfnAwsstepfunctionsState,
+    > {
+        service_com_amazonaws_sfn_awsstepfunctions::state::service_state(&*self.engine)
+            .expect("this engine carries the Step Functions store")
+    }
 }
 
 /// The `__type` discriminator of an awsJson error body, without its namespace.
