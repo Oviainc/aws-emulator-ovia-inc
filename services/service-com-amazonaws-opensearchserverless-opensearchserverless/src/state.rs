@@ -9,7 +9,8 @@
 //! endpoints derived from a collection id, the epoch-millisecond timestamps), the
 //! clock-owed `CREATING -> ACTIVE` transition a just-created collection settles through,
 //! the opaque page token a listing hands out, and the `clientToken` replay index the
-//! `@idempotent` creates read.
+//! `@idempotent` creates read. Beside the resources sits the ACCOUNT's own settings — the
+//! OCU capacity limits `GetAccountSettings` reports ([`AccountSettingsRecord`]).
 //!
 //! `src/ops/mod.rs` is generated, so a helper more than one operation reaches lives here
 //! rather than in a second module under `src/ops/`.
@@ -18,12 +19,12 @@ use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::{
-    AccessPolicyDetail, CapacityDetails, CollectionDetail, CollectionErrorDetail,
-    CollectionGroupCapacityLimits, CollectionGroupDetail, CollectionGroupErrorDetail,
-    CollectionSummary, CreateCollectionDetail, CreateCollectionGroupDetail, CurrentCapacity,
-    DeleteCollectionDetail, FipsEndpoints, IamFederationConfigOptions,
-    IamIdentityCenterConfigOptions, SamlConfigOptions, SecurityConfigDetail,
-    SecurityConfigSummary, SecurityPolicyDetail, Tag, VectorOptions,
+    AccessPolicyDetail, AccountSettingsDetail, CapacityDetails, CapacityLimits, CollectionDetail,
+    CollectionErrorDetail, CollectionGroupCapacityLimits, CollectionGroupDetail,
+    CollectionGroupErrorDetail, CollectionSummary, CreateCollectionDetail,
+    CreateCollectionGroupDetail, CurrentCapacity, DeleteCollectionDetail, FipsEndpoints,
+    IamFederationConfigOptions, IamIdentityCenterConfigOptions, SamlConfigOptions,
+    SecurityConfigDetail, SecurityConfigSummary, SecurityPolicyDetail, Tag, VectorOptions,
 };
 
 /// This service's ARN namespace, from the model's `aws.api#service` trait
@@ -174,6 +175,15 @@ pub const MAX_ACCESS_POLICIES: usize = 100;
 /// allows", and it is set at the collection quota above so a group per collection still
 /// fits.
 pub const MAX_COLLECTION_GROUPS: usize = MAX_COLLECTIONS;
+
+/// The `maxIndexingCapacityInOCU` an account reports before anything calls
+/// `UpdateAccountSettings`, from AWS's "Managing capacity limits for Amazon OpenSearch
+/// Serverless" — the page `CapacityLimits`' own documentation links — which gives the
+/// default maximum capacity as 10 OCUs for indexing and 10 OCUs for search.
+pub const DEFAULT_MAX_INDEXING_CAPACITY_IN_OCU: i32 = 10;
+
+/// The `maxSearchCapacityInOCU` default; see [`DEFAULT_MAX_INDEXING_CAPACITY_IN_OCU`].
+pub const DEFAULT_MAX_SEARCH_CAPACITY_IN_OCU: i32 = 10;
 
 /// The page bound a listing applies when the caller names none, from each listing's own
 /// `maxResults` documentation: "The maximum number of results to return. Default is 20."
@@ -559,6 +569,61 @@ pub fn validate_capacity_limits(limits: &CollectionGroupCapacityLimits) -> Resul
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// The account's own settings
+// ---------------------------------------------------------------------------
+
+/// The account-level settings `GetAccountSettings` reports and `UpdateAccountSettings`
+/// writes: the maximum capacity, in OCUs, this account's collections may scale to.
+///
+/// Held as plain `i32`s rather than as the modelled `CapacityLimits` (whose members are
+/// both optional) because the account always HAS both limits: one it was set to, or the
+/// default it starts at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AccountSettingsRecord {
+    /// `CapacityLimits$maxIndexingCapacityInOCU`.
+    pub max_indexing_capacity_in_ocu: i32,
+    /// `CapacityLimits$maxSearchCapacityInOCU`.
+    pub max_search_capacity_in_ocu: i32,
+}
+
+impl Default for AccountSettingsRecord {
+    /// The documented defaults, so a `GetAccountSettings` on an account nobody has
+    /// configured reports the limits AWS starts one at instead of nothing.
+    fn default() -> Self {
+        Self {
+            max_indexing_capacity_in_ocu: DEFAULT_MAX_INDEXING_CAPACITY_IN_OCU,
+            max_search_capacity_in_ocu: DEFAULT_MAX_SEARCH_CAPACITY_IN_OCU,
+        }
+    }
+}
+
+impl AccountSettingsRecord {
+    /// The `AccountSettingsDetail` body for these settings — the one place this crate
+    /// renders that shape, so an update cannot report settings a later
+    /// `GetAccountSettings` would not.
+    pub fn detail(&self) -> AccountSettingsDetail {
+        AccountSettingsDetail {
+            capacity_limits: Some(CapacityLimits {
+                max_indexing_capacity_in_ocu: Some(self.max_indexing_capacity_in_ocu),
+                max_search_capacity_in_ocu: Some(self.max_search_capacity_in_ocu),
+            }),
+        }
+    }
+
+    /// Apply the limits an `UpdateAccountSettings` request named, leaving a limit the
+    /// request did NOT name at its stored value: both `CapacityLimits` members are
+    /// optional, so a request may raise or lower one limit without restating the other.
+    pub fn apply(&mut self, limits: &CapacityLimits) {
+        if let Some(value) = limits.max_indexing_capacity_in_ocu {
+            self.max_indexing_capacity_in_ocu = value;
+        }
+        if let Some(value) = limits.max_search_capacity_in_ocu {
+            self.max_search_capacity_in_ocu = value;
+        }
+    }
+}
+
 /// One stored security policy, keyed by its `(type, name)` pair.
 #[derive(Debug, Clone)]
 pub struct SecurityPolicyRecord {
@@ -800,6 +865,10 @@ pub struct ComAmazonawsOpensearchserverlessOpensearchserverlessState {
     /// Drives [`ComAmazonawsOpensearchserverlessOpensearchserverlessState::next_policy_version`], so two writes in the same
     /// millisecond still mint different versions.
     pub policy_version_seed: u32,
+    /// The account's own OCU capacity settings: `GetAccountSettings` reports them and
+    /// `UpdateAccountSettings` writes them. Defaulted rather than optional, because an
+    /// account always has limits — see [`AccountSettingsRecord`].
+    pub account_settings: AccountSettingsRecord,
 }
 
 impl ComAmazonawsOpensearchserverlessOpensearchserverlessState {
@@ -1254,6 +1323,8 @@ pub enum AuditOutcome {
     IdempotentReplay,
     /// A stored policy was reported to a reader.
     PolicyRead,
+    /// The account's own settings were written (`UpdateAccountSettings`).
+    SettingsUpdated,
     /// The request was refused as invalid (400 `ValidationException`).
     ValidationRefused,
     /// A policy with that `(type, name)` pair already exists (409 `ConflictException`).
@@ -1273,6 +1344,7 @@ impl AuditOutcome {
             Self::PolicyCreated => "policy-created",
             Self::IdempotentReplay => "idempotent-replay",
             Self::PolicyRead => "policy-read",
+            Self::SettingsUpdated => "settings-updated",
             Self::ValidationRefused => "validation-refused",
             Self::AlreadyExists => "already-exists",
             Self::QuotaExceeded => "quota-exceeded",
@@ -1319,6 +1391,11 @@ pub fn audit(
 pub fn audit_access_policy_resource(kind: &str, name: &str) -> String {
     format!("access-policy/{kind}/{name}")
 }
+
+/// The `resource` field naming the account's own settings, which `UpdateAccountSettings`
+/// writes. A single resource per account, so it is a constant rather than a function:
+/// nothing request-derived identifies it.
+pub const AUDIT_ACCOUNT_SETTINGS_RESOURCE: &str = "account-settings";
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
 ///
