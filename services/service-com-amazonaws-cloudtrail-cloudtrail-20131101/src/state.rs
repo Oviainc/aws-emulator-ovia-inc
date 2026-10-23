@@ -23,8 +23,8 @@ use std::net::Ipv4Addr;
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    AdvancedEventSelector, ImportSource, ImportStatistics, PartitionKey, RefreshSchedule,
-    RequestWidget, Tag, Trail, TrailInfo, Widget,
+    AdvancedEventSelector, EventSelector, ImportSource, ImportStatistics, PartitionKey,
+    RefreshSchedule, RequestWidget, Tag, Trail, TrailInfo, Widget,
 };
 
 /// The Region a request is served in when it carries no SigV4 credential scope to
@@ -71,6 +71,49 @@ pub const TAGS_PER_RESOURCE_LIMIT: usize = 50;
 /// an emulator serves.
 pub const TRAIL_QUOTA: usize = 1_000;
 
+/// How `ReadWriteType` reads when an event selector leaves it out, from the model doc
+/// for `EventSelector$ReadWriteType`: "By default, the value is `All`." It is one of
+/// [`crate::ops::types::READ_WRITE_TYPE_VALUES`].
+pub const DEFAULT_READ_WRITE_TYPE: &str = "All";
+
+/// How `IncludeManagementEvents` reads when an event selector leaves it out, from the
+/// model doc for `EventSelector$IncludeManagementEvents`: "By default, the value is
+/// `true`."
+pub const DEFAULT_INCLUDE_MANAGEMENT_EVENTS: bool = true;
+
+/// The resource types a BASIC event selector's `DataResource` may name, from the model
+/// doc for `DataResource$Type`: "You can specify the following basic event selector
+/// resource types: AWS::DynamoDB::Table, AWS::Lambda::Function, AWS::S3::Object".
+/// Every other resource type is reached through advanced event selectors.
+pub const BASIC_DATA_RESOURCE_TYPES: [&str; 3] = [
+    "AWS::DynamoDB::Table",
+    "AWS::Lambda::Function",
+    "AWS::S3::Object",
+];
+
+/// The management event sources `ExcludeManagementEventSources` may name, from the
+/// model doc for `EventSelector$ExcludeManagementEventSources`: "the list can be empty
+/// (disables the filter), or it can filter out Key Management Service or Amazon RDS
+/// Data API events by containing `kms.amazonaws.com` or `rdsdata.amazonaws.com`".
+pub const EXCLUDABLE_MANAGEMENT_EVENT_SOURCES: [&str; 2] =
+    ["kms.amazonaws.com", "rdsdata.amazonaws.com"];
+
+/// How many basic event selectors one trail may carry, from the model doc for
+/// `InvalidEventSelectorsException`: "A trail can have up to 5 event selectors."
+pub const EVENT_SELECTORS_PER_TRAIL_LIMIT: usize = 5;
+
+/// How many data resources one trail may carry across all of its basic event
+/// selectors, from the model doc for `InvalidEventSelectorsException`: "A trail is
+/// limited to 250 data resources. These data resources can be distributed across event
+/// selectors, but the overall total cannot exceed 250."
+pub const DATA_RESOURCES_PER_TRAIL_LIMIT: usize = 250;
+
+/// How many condition values one trail may carry across all of its advanced event
+/// selectors, from the model doc for `PutEventSelectors`: "You can add advanced event
+/// selectors, and conditions for your advanced event selectors, up to a maximum of 500
+/// values for all conditions and selectors on a trail."
+pub const ADVANCED_SELECTOR_VALUES_PER_TRAIL_LIMIT: usize = 500;
+
 /// How many trails one `ListTrails` page carries. `ListTrails` models no
 /// `MaxResults`, so the page size is the service's to choose; the remainder is
 /// reached through `NextToken`.
@@ -90,6 +133,38 @@ pub struct TrailStatus {
     pub is_logging: bool,
     pub start_logging_time: Option<SystemTime>,
     pub stop_logging_time: Option<SystemTime>,
+}
+
+/// The event selectors configured on one trail.
+///
+/// The two kinds are mutually exclusive — the model doc for `PutEventSelectors` says
+/// "You can use either AdvancedEventSelectors or EventSelectors, but not both. If you
+/// apply AdvancedEventSelectors to a trail, any existing EventSelectors are
+/// overwritten" — so the store holds ONE of them rather than two fields that could
+/// disagree.
+#[derive(Debug, Clone)]
+pub enum EventSelectorConfig {
+    /// Basic event selectors, as `PutEventSelectors$EventSelectors` carries them.
+    Basic(Vec<EventSelector>),
+    /// Advanced event selectors, as `PutEventSelectors$AdvancedEventSelectors`
+    /// carries them.
+    Advanced(Vec<AdvancedEventSelector>),
+}
+
+/// The basic event selector a trail logs by, until something configures it.
+///
+/// From the model doc for `EventSelector`: "By default, trails created without
+/// specific event selectors will be configured to log all read and write management
+/// events, and no data events" — so `ReadWriteType` is `All`,
+/// `IncludeManagementEvents` is true, and neither data resources nor excluded
+/// management event sources are in effect.
+pub fn default_event_selector() -> EventSelector {
+    EventSelector {
+        read_write_type: Some(DEFAULT_READ_WRITE_TYPE.to_string()),
+        include_management_events: Some(DEFAULT_INCLUDE_MANAGEMENT_EVENTS),
+        data_resources: Some(Vec::new()),
+        exclude_management_event_sources: Some(Vec::new()),
+    }
 }
 
 /// One persisted trail: everything `CreateTrail` was given, plus the values the
@@ -112,10 +187,12 @@ pub struct TrailRecord {
     pub is_organization_trail: bool,
     pub recursive_logging: bool,
     pub home_region: String,
-    /// Set by `PutEventSelectors` / `PutInsightSelectors`, which are not
-    /// implemented yet, so a trail is created without either.
-    pub has_custom_event_selectors: bool,
-    /// See [`TrailRecord::has_custom_event_selectors`].
+    /// What `PutEventSelectors` configured, or `None` for a trail nothing has
+    /// configured — which logs by [`default_event_selector`] and reports
+    /// `HasCustomEventSelectors` false.
+    pub event_selectors: Option<EventSelectorConfig>,
+    /// Set by `PutInsightSelectors`, which is not implemented yet, so a trail is
+    /// created without Insights selectors.
     pub has_insight_selectors: bool,
     pub tags: Vec<Tag>,
     pub status: TrailStatus,
@@ -141,7 +218,10 @@ impl TrailRecord {
             cloud_watch_logs_log_group_arn: self.cloud_watch_logs_log_group_arn.clone(),
             cloud_watch_logs_role_arn: self.cloud_watch_logs_role_arn.clone(),
             kms_key_id: self.kms_key_id.clone(),
-            has_custom_event_selectors: Some(self.has_custom_event_selectors),
+            // "Specifies if the trail has custom event selectors" — true exactly
+            // when something configured them, so it is derived from the stored
+            // configuration rather than tracked beside it.
+            has_custom_event_selectors: Some(self.event_selectors.is_some()),
             has_insight_selectors: Some(self.has_insight_selectors),
             is_organization_trail: Some(self.is_organization_trail),
             recursive_logging: Some(self.recursive_logging),
@@ -154,6 +234,23 @@ impl TrailRecord {
             trail_arn: Some(self.trail_arn.clone()),
             name: Some(self.name.clone()),
             home_region: Some(self.home_region.clone()),
+        }
+    }
+
+    /// The event selectors `GetEventSelectors` and `PutEventSelectors` report for this
+    /// trail, as the `(EventSelectors, AdvancedEventSelectors)` pair of their output.
+    ///
+    /// Exactly one of the two is reported, because a trail carries one kind: the
+    /// advanced selectors when advanced selectors are configured, otherwise the basic
+    /// ones — which for a trail nothing has configured is the single
+    /// [`default_event_selector`].
+    pub fn reported_event_selectors(
+        &self,
+    ) -> (Option<Vec<EventSelector>>, Option<Vec<AdvancedEventSelector>>) {
+        match &self.event_selectors {
+            Some(EventSelectorConfig::Basic(selectors)) => (Some(selectors.clone()), None),
+            Some(EventSelectorConfig::Advanced(selectors)) => (None, Some(selectors.clone())),
+            None => (Some(vec![default_event_selector()]), None),
         }
     }
 

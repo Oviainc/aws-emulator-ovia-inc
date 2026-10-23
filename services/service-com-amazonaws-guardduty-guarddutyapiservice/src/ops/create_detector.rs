@@ -180,19 +180,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `ClientToken` is `@idempotencyToken`: a replayed create returns the
         // detector the first call minted rather than minting a second one.
-        let token_key = input
+        let token = input
             .client_token
             .as_deref()
             .filter(|t| !t.is_empty())
-            .map(|token| (region.clone(), token.to_string()));
-        if let Some(key) = token_key.as_ref() {
-            if let Some(existing) = state.client_tokens.get(key).cloned() {
-                if state.detector_in(&region, &existing).is_some() {
-                    return Ok(CreateDetectorOutput {
-                        detector_id: Some(existing),
-                        unprocessed_data_sources: None,
-                    });
-                }
+            .map(str::to_string);
+        if let Some(token) = token.as_deref() {
+            if let Some(existing) = state.detector_for_client_token(&region, token) {
+                return Ok(CreateDetectorOutput {
+                    detector_id: Some(existing.id.clone()),
+                    unprocessed_data_sources: None,
+                });
             }
         }
 
@@ -246,6 +244,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             filters: std::collections::BTreeMap::new(),
             investigations: std::collections::BTreeMap::new(),
             ip_sets: std::collections::BTreeMap::new(),
+            // Malware Protection scans every eligible resource and retains no
+            // snapshot until `UpdateMalwareScanSettings` says otherwise.
+            malware_scan_settings: crate::state::MalwareScanSettings::default(),
             // A new detector administers nobody: `CreateMembers` is what records a
             // member account against it.
             members: std::collections::BTreeMap::new(),
@@ -256,8 +257,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         crate::state::apply_feature_configurations(&mut detector, input.features.as_ref(), now);
 
         state.detectors.insert(id.clone(), detector);
-        if let Some(key) = token_key {
-            state.client_tokens.insert(key, id.clone());
+        if let Some(token) = token.as_deref() {
+            // Recorded through the state helper, which keeps the idempotency store
+            // bounded: the token is request-chosen.
+            state.record_client_token(&region, token, &id, now);
         }
 
         Ok(CreateDetectorOutput {

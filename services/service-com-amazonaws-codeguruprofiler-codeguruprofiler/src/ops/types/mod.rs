@@ -14,6 +14,14 @@
 //! here named after an operation would make that operation's own module name
 //! ambiguous inside `ops` (`E0659`).
 
+// The schema/codec macros every structure carrying a `@timestampFormat("date-time")`
+// member — or a `@required` member AWS omits from the body — uses, because the vendored
+// codegen reads neither. Hand-added, not generated; see the module's own note.
+// `#[macro_use]`, and declared FIRST, so the macros are in the textual scope of every
+// `*_types` module below.
+#[macro_use]
+pub mod date_time_wire;
+
 pub mod add_notification_channels_types;
 pub mod batch_get_frame_metric_data_types;
 pub mod configure_agent_types;

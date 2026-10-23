@@ -199,7 +199,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             if let Some(group) = guard.groups.get(&input.profiling_group_name) {
                 return Ok(CreateProfilingGroupOutput {
-                    profiling_group: group.description(),
+                    profiling_group: group.created_description(),
                 });
             }
         }
@@ -268,7 +268,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // holds no findings reports: `ListFindingsReports` reports the empty list.
             findings_reports: ::std::collections::VecDeque::new(),
         };
-        let description = group.description();
+        let description = group.created_description();
         guard
             .groups
             .insert(input.profiling_group_name.clone(), group);

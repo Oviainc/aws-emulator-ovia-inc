@@ -22,7 +22,7 @@ use service_com_amazonaws_amp_amazonprometheusservice::state::{
 use std::collections::BTreeMap;
 
 /// `POST /workspaces/{workspaceId}/rulegroupsnamespaces` — CreateRuleGroupsNamespace.
-async fn create_namespace(
+pub(crate) async fn create_namespace(
     amp: &Amp,
     region: &str,
     workspace_id: &str,
@@ -39,7 +39,12 @@ async fn create_namespace(
 
 /// `GET /workspaces/{workspaceId}/rulegroupsnamespaces/{name}` —
 /// DescribeRuleGroupsNamespace.
-async fn describe_namespace(amp: &Amp, region: &str, workspace_id: &str, name: &str) -> Reply {
+pub(crate) async fn describe_namespace(
+    amp: &Amp,
+    region: &str,
+    workspace_id: &str,
+    name: &str,
+) -> Reply {
     amp.call(
         "GET",
         &format!("/workspaces/{workspace_id}/rulegroupsnamespaces/{name}"),
@@ -51,7 +56,11 @@ async fn describe_namespace(amp: &Amp, region: &str, workspace_id: &str, name: &
 
 /// The create request body: `data` is a blob, so it travels base64-encoded on
 /// `restJson1` — the same codec the wire serializer uses.
-fn create_body(name: &str, data: &[u8], tags: &[(String, String)]) -> serde_json::Value {
+pub(crate) fn create_body(
+    name: &str,
+    data: &[u8],
+    tags: &[(String, String)],
+) -> serde_json::Value {
     let mut body = serde_json::json!({
         "name": name,
         "data": aws_smithy_types::base64::encode(data),

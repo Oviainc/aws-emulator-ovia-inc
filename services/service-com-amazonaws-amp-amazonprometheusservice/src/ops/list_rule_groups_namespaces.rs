@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListRuleGroupsNamespaces
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListRuleGroupsNamespaces`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports the rule groups namespaces the named workspace HOLDS, read off
+//! the persisted records — filtered by the `name` prefix when one is given, ordered by
+//! name and served one bounded page at a time with `nextToken` as the cursor.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListRuleGroupsNamespaces::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -161,18 +157,100 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListRuleGroupsNamespaces` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListRuleGroupsNamespacesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListRuleGroupsNamespaces"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                ListRuleGroupsNamespacesErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the workspace store is unavailable".to_string(),
+                        retry_after_seconds: None,
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let mut store = state.lock();
+        // The transitions the clock already owes (a namespace's move out of CREATING,
+        // UPDATING or DELETING) are materialised first, so this listing reports the same
+        // state a caller would read through any other operation at this instant.
+        store.materialize_due(::std::time::SystemTime::now());
+
+        // The namespaces listed are the ones "in a workspace", so without that workspace
+        // there is nothing to list: `ResourceNotFoundException` (404), the same refusal
+        // every per-workspace operation in this crate answers with.
+        let Some(workspace) = store.workspaces.get(&input.workspace_id) else {
+            return Err(
+                ListRuleGroupsNamespacesErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: crate::state::WORKSPACE_NOT_FOUND_MESSAGE.to_string(),
+                        resource_id: input.workspace_id.clone(),
+                        resource_type: crate::state::WORKSPACE_RESOURCE_TYPE.to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // "Use this parameter to filter the rule groups namespaces that are returned.
+        // Only the namespaces with names that begin with the value that you specify are
+        // returned." — a PREFIX match on the stored name, not an exact one.
+        let name_prefix = input.name.as_deref();
+
+        // `rule_groups_namespaces` is a `BTreeMap` keyed by name, so iteration is already
+        // in one stable order: a page boundary means the same thing on every call, which
+        // is what makes `nextToken` a usable cursor.
+        let mut namespaces: Vec<&crate::state::RuleGroupsNamespace> = workspace
+            .rule_groups_namespaces
+            .values()
+            .filter(|namespace| {
+                name_prefix.is_none_or(|prefix| namespace.name.starts_with(prefix))
+            })
+            .collect();
+
+        // `nextToken` is the cursor this operation itself emitted: the name of the last
+        // summary of the previous page, so the next page starts after it. "The other
+        // parameters must be the same as the initial call", which is why the filter is
+        // applied before the cursor rather than after it.
+        if let Some(cursor) = input.next_token.as_deref() {
+            namespaces.retain(|namespace| namespace.name.as_str() > cursor);
+        }
+
+        // "The maximum number of results to return. The default is 100."
+        // (`ListRuleGroupsNamespacesRequest$maxResults`, modelled
+        // `@range(min: 1, max: 1000)`.) Clamped here rather than trusted from the
+        // request, so the amount of work one call does is bounded by this service.
+        let page_size = input.max_results.map_or(
+            crate::state::RULE_GROUPS_NAMESPACE_PAGE_DEFAULT,
+            |max| max.clamp(1, crate::state::RULE_GROUPS_NAMESPACE_PAGE_LIMIT),
+        ) as usize;
+
+        let has_more = namespaces.len() > page_size;
+        namespaces.truncate(page_size);
+        // "A token indicating that there are more results to retrieve" — so it is emitted
+        // ONLY when a further page exists, never on the last one.
+        let next_token = if has_more {
+            namespaces.last().map(|namespace| namespace.name.clone())
+        } else {
+            None
+        };
+
+        Ok(ListRuleGroupsNamespacesOutput {
+            rule_groups_namespaces: namespaces
+                .into_iter()
+                .map(|namespace| RuleGroupsNamespaceSummary {
+                    arn: namespace.arn.clone(),
+                    name: namespace.name.clone(),
+                    status: RuleGroupsNamespaceStatus {
+                        status_code: namespace.status_code.clone(),
+                        status_reason: namespace.status_reason.clone(),
+                    },
+                    created_at: ::aws_smithy_types::DateTime::from(namespace.created_at),
+                    modified_at: ::aws_smithy_types::DateTime::from(namespace.modified_at),
+                    tags: crate::state::tag_map(&namespace.tags),
+                })
+                .collect(),
+            next_token,
+        })
     }
 }

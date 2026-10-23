@@ -195,8 +195,7 @@ async fn a_probe_added_to_an_idle_monitor_activates_it_and_its_deletion_idles_it
 ///
 /// The table spans both locations across five operations and every constraint
 /// kind the model uses on them — `@pattern`, `@length` (both bounds) and
-/// `@range` (both bounds) — including one operation that is still a 501 stub, so
-/// the rule is the service's and not one handler's.
+/// `@range` (both bounds) — so the rule is the service's and not one handler's.
 #[tokio::test]
 async fn a_body_value_outside_its_constraint_is_refused_by_the_front_door() {
     let long_name = name_of_length(201);
@@ -272,7 +271,7 @@ async fn a_body_value_outside_its_constraint_is_refused_by_the_front_door() {
             "BadRequestException",
         ),
         (
-            "UpdateProbe (a 501 stub): packetSize below the @range minimum",
+            "UpdateProbe: packetSize below the @range minimum",
             "PATCH",
             format!("/monitors/front-door-host/probes/{probe_id}"),
             Some(r#"{"packetSize":1}"#.to_string()),

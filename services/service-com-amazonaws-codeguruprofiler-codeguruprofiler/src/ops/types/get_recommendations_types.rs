@@ -20,7 +20,14 @@ pub struct GetRecommendationsInput {
     pub locale: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.codeguruprofiler#GetRecommendationsResponse")]
+/// `GetRecommendationsResponse`. Its schema and codec come from
+/// [`profiler_schema_and_codec!`] rather than `#[smithy_macros::smithy(shape = ...)]` for
+/// both reasons that module exists: `profileStartTime`/`profileEndTime` carry
+/// `@timestampFormat("date-time")`, and the two analysis lists — `@required` in the model
+/// — are OMITTED from the body by the service when the analysis has nothing to report,
+/// rather than reported empty, which the derive's always-write serializer cannot express.
+///
+/// The member list below is the model's, member for member.
 #[derive(Debug, Clone)]
 pub struct GetRecommendationsOutput {
     pub profiling_group_name: String,
@@ -30,7 +37,56 @@ pub struct GetRecommendationsOutput {
     pub anomalies: Vec<Anomaly>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.codeguruprofiler#Recommendation")]
+profiler_schema_and_codec!(
+    GetRecommendationsOutput,
+    GET_RECOMMENDATIONS_OUTPUT_SCHEMA,
+    "com.amazonaws.codeguruprofiler#GetRecommendationsResponse",
+    "com.amazonaws.codeguruprofiler",
+    "GetRecommendationsResponse",
+    (
+        M_PROFILING_GROUP_NAME,
+        profiling_group_name,
+        "profilingGroupName",
+        0,
+        req,
+        string
+    ),
+    (
+        M_PROFILE_START_TIME,
+        profile_start_time,
+        "profileStartTime",
+        1,
+        req,
+        date_time
+    ),
+    (
+        M_PROFILE_END_TIME,
+        profile_end_time,
+        "profileEndTime",
+        2,
+        req,
+        date_time
+    ),
+    (
+        M_RECOMMENDATIONS,
+        recommendations,
+        "recommendations",
+        3,
+        req_unless_empty,
+        list_of(Recommendation)
+    ),
+    (
+        M_ANOMALIES,
+        anomalies,
+        "anomalies",
+        4,
+        req_unless_empty,
+        list_of(Anomaly)
+    ),
+);
+
+/// `Recommendation`. Hand-written because `startTime` and `endTime` carry
+/// `@timestampFormat("date-time")`.
 #[derive(Debug, Clone)]
 pub struct Recommendation {
     pub all_matches_count: i32,
@@ -40,6 +96,41 @@ pub struct Recommendation {
     pub start_time: ::aws_smithy_types::DateTime,
     pub end_time: ::aws_smithy_types::DateTime,
 }
+
+profiler_schema_and_codec!(
+    Recommendation,
+    RECOMMENDATION_SCHEMA,
+    "com.amazonaws.codeguruprofiler#Recommendation",
+    "com.amazonaws.codeguruprofiler",
+    "Recommendation",
+    (
+        M_ALL_MATCHES_COUNT,
+        all_matches_count,
+        "allMatchesCount",
+        0,
+        req,
+        integer
+    ),
+    (
+        M_ALL_MATCHES_SUM,
+        all_matches_sum,
+        "allMatchesSum",
+        1,
+        req,
+        double
+    ),
+    (M_PATTERN, pattern, "pattern", 2, req, struct_of(Pattern)),
+    (
+        M_TOP_MATCHES,
+        top_matches,
+        "topMatches",
+        3,
+        req,
+        list_of(Match)
+    ),
+    (M_START_TIME, start_time, "startTime", 4, req, date_time),
+    (M_END_TIME, end_time, "endTime", 5, req, date_time),
+);
 
 #[smithy_macros::smithy(shape = "com.amazonaws.codeguruprofiler#Pattern")]
 #[derive(Debug, Clone, Default)]
@@ -77,7 +168,8 @@ pub struct Metric {
     pub thread_states: Vec<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.codeguruprofiler#AnomalyInstance")]
+/// `AnomalyInstance`. Hand-written because `startTime` and `endTime` carry
+/// `@timestampFormat("date-time")`.
 #[derive(Debug, Clone)]
 pub struct AnomalyInstance {
     pub id: String,
@@ -85,6 +177,25 @@ pub struct AnomalyInstance {
     pub end_time: Option<::aws_smithy_types::DateTime>,
     pub user_feedback: Option<UserFeedback>,
 }
+
+profiler_schema_and_codec!(
+    AnomalyInstance,
+    ANOMALY_INSTANCE_SCHEMA,
+    "com.amazonaws.codeguruprofiler#AnomalyInstance",
+    "com.amazonaws.codeguruprofiler",
+    "AnomalyInstance",
+    (M_ID, id, "id", 0, req, string),
+    (M_START_TIME, start_time, "startTime", 1, req, date_time),
+    (M_END_TIME, end_time, "endTime", 2, opt, date_time),
+    (
+        M_USER_FEEDBACK,
+        user_feedback,
+        "userFeedback",
+        3,
+        opt,
+        struct_of(UserFeedback)
+    ),
+);
 
 #[smithy_macros::smithy(shape = "com.amazonaws.codeguruprofiler#UserFeedback")]
 #[derive(Debug, Clone, Default)]

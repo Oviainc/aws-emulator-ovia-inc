@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeAgreement
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeAgreement`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeAgreement::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports one stored AS2 agreement: the `(ServerId, AgreementId)` pair the model
+//! makes `AgreementResource`'s identifiers addresses the record `CreateAgreement`
+//! wrote, and every member below is projected from it — nothing is re-resolved or
+//! defaulted here.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +145,52 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeAgreement` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeAgreementErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeAgreement"))
+        use crate::state as st;
+
+        // A `@readonly` report: it reads request metadata nowhere (the agreement's ARN
+        // is the stored one) and writes nothing.
+        let _ = ctx;
+        let state = st::service_state(&*self.engine).ok_or_else(|| {
+            DescribeAgreementErrorModeled::InternalServiceError(InternalServiceError {
+                message: "the transfer service state is unavailable".to_string(),
+            })
+        })?;
+
+        let guard = state.lock();
+
+        // An agreement is addressed by the pair the model makes `AgreementResource`'s
+        // identifiers, so the lookup is that pair: a `(ServerId, AgreementId)` the
+        // store does not hold is the one not-found this report answers. The server
+        // itself is NOT re-resolved, because `DeleteServer` does not take a server's
+        // agreements with it — an agreement outlives the server it referenced, and
+        // still reports the configuration it was created with.
+        let key = (input.server_id.clone(), input.agreement_id.clone());
+        let stored = guard.agreements.get(&key).ok_or_else(|| {
+            st::not_found(DescribeAgreementErrorModeled::ResourceNotFoundException(
+                st::unknown_agreement(&input.agreement_id),
+            ))
+        })?;
+
+        let agreement = DescribedAgreement {
+            arn: stored.arn.clone(),
+            agreement_id: Some(stored.agreement_id.clone()),
+            server_id: Some(stored.server_id.clone()),
+            description: stored.description.clone(),
+            status: Some(stored.status.clone()),
+            local_profile_id: Some(stored.local_profile_id.clone()),
+            partner_profile_id: Some(stored.partner_profile_id.clone()),
+            // The agreement carries exactly one of the two directory configurations,
+            // so the other member is absent rather than empty.
+            base_directory: stored.base_directory.clone(),
+            custom_directories: stored.custom_directories.clone(),
+            access_role: Some(stored.access_role.clone()),
+            preserve_filename: Some(stored.preserve_filename.clone()),
+            enforce_message_signing: Some(stored.enforce_message_signing.clone()),
+            // `Tags` is modelled `len 1..50`: absent, not empty, for an agreement
+            // created without any — as `DescribeProfile` reports the same member.
+            tags: Some(stored.tags.clone()).filter(|tags| !tags.is_empty()),
+        };
+
+        Ok(DescribeAgreementOutput { agreement })
     }
 }

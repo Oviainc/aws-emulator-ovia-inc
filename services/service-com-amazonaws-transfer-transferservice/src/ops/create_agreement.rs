@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateAgreement
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateAgreement`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateAgreement::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Writes one AS2 agreement into [`crate::state`]: it resolves the server and the two
+//! profiles the agreement combines, refuses the documented
+//! `BaseDirectory`/`CustomDirectories` either/or, mints the agreement's own
+//! `AgreementId` and ARN, and stores the configuration the request carried with the
+//! documented defaults already applied, so `DescribeAgreement` answers out of that
+//! record rather than re-resolving anything.
 //!
 //! ## Shape of an operation
 //!
@@ -196,18 +194,118 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateAgreement` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateAgreementErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateAgreement"))
+        use crate::state as st;
+
+        // A directory configuration the service would never create is refused BEFORE
+        // anything is read or written, with the modelled `InvalidRequestException`
+        // (HTTP 400) the model documents as "thrown when the client submits a malformed
+        // request": this operation's own documentation states "Specify either
+        // BaseDirectory or CustomDirectories, but not both. Specifying both causes the
+        // command to fail."
+        if let Some(message) = st::agreement_directory_violation(
+            input.base_directory.as_deref(),
+            input.custom_directories.as_ref(),
+        ) {
+            return Err(CreateAgreementErrorModeled::InvalidRequestException(
+                InvalidRequestException { message },
+            )
+            .into());
+        }
+
+        let state = st::service_state(&*self.engine).ok_or_else(|| {
+            CreateAgreementErrorModeled::InternalServiceError(InternalServiceError {
+                message: "the transfer service state is unavailable".to_string(),
+            })
+        })?;
+        let region = st::request_region(ctx.parts());
+
+        let mut guard = state.lock();
+
+        // An agreement is what "Transfer Family combines" out of "a server, local
+        // profile, partner profile, certificate, and other attributes", so every
+        // resource it references must resolve: an id the store does not hold is refused
+        // with the modelled not-found rather than written into an agreement whose
+        // references nothing else can resolve.
+        if !guard.servers.contains_key(&input.server_id) {
+            return Err(st::not_found(
+                CreateAgreementErrorModeled::ResourceNotFoundException(st::unknown_server(
+                    &input.server_id,
+                )),
+            ));
+        }
+        for profile_id in [&input.local_profile_id, &input.partner_profile_id] {
+            if !guard.profiles.contains_key(profile_id) {
+                return Err(st::not_found(
+                    CreateAgreementErrorModeled::ResourceNotFoundException(st::unknown_profile(
+                        profile_id,
+                    )),
+                ));
+            }
+        }
+
+        // Each server's agreement set is BOUNDED, like its user and access sets, and so
+        // is the store as a whole: past either bound a create is refused with the
+        // modelled `ServiceUnavailableException` rather than growing the store. The
+        // total bound is the one that holds when a caller keeps creating servers, since
+        // an agreement outlives the server it references and nothing reclaims it.
+        if !guard.has_agreement_capacity() {
+            return Err(CreateAgreementErrorModeled::ServiceUnavailableException(
+                ServiceUnavailableException {
+                    message: Some(format!(
+                        "the account already holds the maximum of {} agreements; \
+                         delete one before creating another",
+                        st::MAX_STORED_AGREEMENTS
+                    )),
+                },
+            )
+            .into());
+        }
+        if !guard.server_has_agreement_capacity(&input.server_id) {
+            return Err(CreateAgreementErrorModeled::ServiceUnavailableException(
+                ServiceUnavailableException {
+                    message: Some(format!(
+                        "server {} already holds the maximum of {} agreements; \
+                         delete one before creating another",
+                        input.server_id,
+                        st::MAX_AGREEMENTS_PER_SERVER
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Every create mints a NEW system-assigned identifier: two creates carrying
+        // identical configuration are two independent agreements.
+        let agreement_id = guard.mint_id("a");
+        let agreement = st::Agreement {
+            arn: st::agreement_arn(&region, &input.server_id, &agreement_id),
+            agreement_id: agreement_id.clone(),
+            server_id: input.server_id.clone(),
+            description: input.description,
+            // The three members the service resolves at create time: the agreement's
+            // own status, and the two message-handling settings whose documented
+            // defaults the model states.
+            status: input
+                .status
+                .unwrap_or_else(|| st::DEFAULT_AGREEMENT_STATUS.to_string()),
+            preserve_filename: input
+                .preserve_filename
+                .unwrap_or_else(|| st::DEFAULT_PRESERVE_FILENAME.to_string()),
+            enforce_message_signing: input
+                .enforce_message_signing
+                .unwrap_or_else(|| st::DEFAULT_ENFORCE_MESSAGE_SIGNING.to_string()),
+            local_profile_id: input.local_profile_id,
+            partner_profile_id: input.partner_profile_id,
+            base_directory: st::agreement_base_directory(input.base_directory.as_deref()),
+            custom_directories: input.custom_directories,
+            access_role: input.access_role,
+            tags: input.tags.unwrap_or_default(),
+        };
+        guard
+            .agreements
+            .insert((input.server_id, agreement_id.clone()), agreement);
+        drop(guard);
+
+        Ok(CreateAgreementOutput { agreement_id })
     }
 }

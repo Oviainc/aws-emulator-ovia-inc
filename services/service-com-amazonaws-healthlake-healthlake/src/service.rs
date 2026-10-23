@@ -21,9 +21,15 @@
 //!   for anything the model does not express: a signing name shared by several
 //!   services, or routing that keys on the access-key id.
 //! - `override_operation` — serve a request the model's routing key cannot name
-//!   correctly. THIS service uses it: it puts the input-validation gate described
-//!   below in front of every modelled operation and lets the generated routing table
-//!   serve the request from there.
+//!   correctly. THIS service uses it for two things. First, HealthLake serves two
+//!   surfaces that are not awsJson1_0 RPC calls and carry no `X-Amz-Target` at all —
+//!   a data store's FHIR REST data plane ([`fhir_rest`], on the path a
+//!   `DatastoreEndpoint` publishes) and the data-transformation endpoint's
+//!   `/validate-source` check ([`validate_source`]); neither is a modelled operation,
+//!   so the generated routing table cannot name either, and this seam routes them by
+//!   HTTP method and path, which is how a REST surface is addressed. Second, every
+//!   other request is handed to the input-validation gate described below, which lets
+//!   the generated routing table serve it from there.
 //! - `override_refusal` — how this service words a request the framework refused
 //!   before any handler ran. The default returns `None`, keeping the framework's
 //!   wording. See the inline note on that method for how to reword.
@@ -72,6 +78,10 @@
 //! per-operation telemetry the centralized sequence records — a request the gate
 //! refuses never enters that sequence, so it is counted nowhere, exactly as a request
 //! refused before dispatch is.
+
+pub mod fhir_rest;
+pub mod non_rpc;
+pub mod validate_source;
 
 use std::collections::HashMap;
 use std::marker::PhantomData;
@@ -174,6 +184,14 @@ pub(crate) fn enum_violation_message(path: &str, allowed: &[&str]) -> String {
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// Serves a data store's FHIR REST data plane — the wire its
+    /// `DatastoreEndpoint` advertises. Held on the service because
+    /// [`Service::override_operation`] hands the router a BORROW of one of its own
+    /// operations, and it owns the shared engine so the resources it writes live in
+    /// the same store the control plane's handlers read.
+    fhir_rest: fhir_rest::FhirRestDataPlane<Eng>,
+    /// Serves `POST /validate-source`, which is stateless.
+    validate_source: validate_source::ValidateSource,
     /// The input-validation gate for each modelled operation, keyed by the routing key
     /// the protocol resolves for it (the operation's own `NAME`). Built once, in `new`.
     input_validation: HashMap<&'static str, Box<dyn ErasedOperation>>,
@@ -185,6 +203,8 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
+            fhir_rest: fhir_rest::FhirRestDataPlane::new(Arc::clone(&engine)),
+            validate_source: validate_source::ValidateSource::new(),
             entry: crate::ServiceDefinition::new(engine),
             input_validation: input_validation_gates::<Eng>(),
         }
@@ -391,13 +411,34 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // Put this service's input-validation gate in front of the modelled operation
-        // the request names, so a value outside a constraint the model declares — or a
-        // required member left out — is refused with the MODELLED `ValidationException`,
-        // whose `Message` member carries the constraint envelope, instead of the
-        // framework's generic 400 body. The gate then hands every request the model
-        // accepts to the generated operation, which the routing table still owns; a
-        // request that names no modelled operation resolves as it always did.
+        // Two HealthLake surfaces are not awsJson1_0 RPC calls: a data store's FHIR
+        // REST endpoint and the data-transformation endpoint's `/validate-source`
+        // check. Both are addressed by path and HTTP method and carry no
+        // `X-Amz-Target`, so the protocol's routing key cannot name them and the
+        // framework would otherwise refuse them at the codec with `400
+        // SerializationException`. They are routed FIRST, because this seam is the one
+        // place a service can name a request the model's routing key cannot.
+        //
+        // A request that DOES name an RPC target is an RPC call whatever its path, so
+        // it is left to the modelled path below: these two surfaces are non-RPC by
+        // construction.
+        if req.headers().get("x-amz-target").is_none() {
+            let path = non_rpc::request_path(req.uri());
+            if crate::state::parse_datastore_fhir_path(path).is_some() {
+                return Some(&self.fhir_rest);
+            }
+            if req.method() == "POST" && non_rpc::addresses_validate_source(path) {
+                return Some(&self.validate_source);
+            }
+        }
+        // Otherwise, put this service's input-validation gate in front of the modelled
+        // operation the request names, so a value outside a constraint the model
+        // declares — or a required member left out — is refused with the MODELLED
+        // `ValidationException`, whose `Message` member carries the constraint
+        // envelope, instead of the framework's generic 400 body. The gate then hands
+        // every request the model accepts to the generated operation, which the routing
+        // table still owns; a request that names no modelled operation resolves as it
+        // always did.
         let key = self.entry.protocol().routing_key(req).ok()?;
         let gate = self.input_validation.get(key)?;
         Some(gate.as_ref())
