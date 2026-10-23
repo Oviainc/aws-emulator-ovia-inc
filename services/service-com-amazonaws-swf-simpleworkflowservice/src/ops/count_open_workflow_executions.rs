@@ -183,7 +183,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ])
         .map_err(crate::scaffolded::Scaffolded::validation)?;
 
-        let guard = state.lock();
+        let swept_at = crate::state::now();
+        let mut guard = state.lock();
+        // The count is taken only after the service's own start-to-close reaping is
+        // materialised, so a run whose budget the clock already spent is not counted as
+        // open.
+        guard.materialise_due_timeouts_in(&input.domain, swept_at);
         // This operation is documented as an eventually consistent, best-effort REPORT
         // over the domain's visibility store ("The results are best effort and may not
         // exactly reflect recent updates and changes"), and the recorded AWS answer for

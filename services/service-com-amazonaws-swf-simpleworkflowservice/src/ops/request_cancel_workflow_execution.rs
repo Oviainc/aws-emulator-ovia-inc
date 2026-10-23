@@ -172,6 +172,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let requested_at = crate::state::now();
         let mut guard = state.lock();
+        // A run the clock already closed is out of scope for a cancel request, so the
+        // service's own start-to-close reaping is materialised before the lookup.
+        guard.materialise_due_timeouts_in(&input.domain, requested_at);
         let unknown = || {
             RequestCancelWorkflowExecutionErrorModeled::UnknownResourceFault(
                 UnknownResourceFault {

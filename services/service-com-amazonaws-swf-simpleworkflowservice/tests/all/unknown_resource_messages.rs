@@ -71,9 +71,33 @@ struct ExecutionCase {
     run_id: String,
 }
 
-/// Every execution-scoped reader: both resolve the pair the same way, so both must
-/// report a miss the same way.
-const EXECUTION_READERS: [&str; 2] = ["DescribeWorkflowExecution", "GetWorkflowExecutionHistory"];
+/// Every execution-scoped operation that resolves a `(workflowId, runId)` pair: each
+/// resolves it the same way, so each must report a miss the same way. `GetHistory` and
+/// `Describe` take the pair in an `execution` member; `SignalWorkflowExecution` takes
+/// the two ids flat, which [`execution_body`] is what hides.
+const EXECUTION_OPERATIONS: [&str; 3] = [
+    "DescribeWorkflowExecution",
+    "GetWorkflowExecutionHistory",
+    "SignalWorkflowExecution",
+];
+
+/// The request addressing `(workflow_id, run_id)` in `domain`, in the shape
+/// `operation` takes it.
+fn execution_body(operation: &str, domain: &str, workflow_id: &str, run_id: &str) -> Value {
+    if operation == "SignalWorkflowExecution" {
+        json!({
+            "domain": domain,
+            "workflowId": workflow_id,
+            "runId": run_id,
+            "signalName": "a-signal",
+        })
+    } else {
+        json!({
+            "domain": domain,
+            "execution": { "workflowId": workflow_id, "runId": run_id },
+        })
+    }
+}
 
 #[tokio::test]
 async fn an_unknown_execution_fault_names_the_requested_execution_only() {
@@ -143,19 +167,13 @@ async fn an_unknown_execution_fault_names_the_requested_execution_only() {
         ];
 
         for case in &cases {
-            for operation in EXECUTION_READERS {
+            for operation in EXECUTION_OPERATIONS {
                 let label = format!("{domain} / {} / {operation}", case.case);
                 let message = unknown_resource(
                     &emulator,
                     &label,
                     operation,
-                    &json!({
-                        "domain": domain,
-                        "execution": {
-                            "workflowId": case.workflow_id,
-                            "runId": case.run_id,
-                        },
-                    }),
+                    &execution_body(operation, domain, &case.workflow_id, &case.run_id),
                 )
                 .await;
                 assert_eq!(
@@ -294,6 +312,19 @@ async fn a_domain_no_record_is_stored_under_is_named_by_the_fault() {
                 "domain": absent,
                 "execution": { "workflowId": "wf", "runId": "run" },
             }),
+        ),
+        (
+            "SignalWorkflowExecution",
+            json!({
+                "domain": absent,
+                "workflowId": "wf",
+                "runId": "run",
+                "signalName": "a-signal",
+            }),
+        ),
+        (
+            "PollForDecisionTask",
+            json!({ "domain": absent, "taskList": { "name": "tasks" } }),
         ),
         (
             "DescribeWorkflowType",

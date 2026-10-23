@@ -229,7 +229,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )
         .map_err(crate::scaffolded::Scaffolded::validation)?;
 
-        let guard = state.lock();
+        let swept_at = crate::state::now();
+        let mut guard = state.lock();
+        // The listing is taken only after the service's own start-to-close reaping is
+        // materialised, so a run the clock closed is reported here — with
+        // `closeStatus=TIMED_OUT` — rather than staying invisible to both listings.
+        guard.materialise_due_timeouts_in(&input.domain, swept_at);
         // A listing is scoped to one domain, and the domain's registration status does
         // not gate it: deprecating a domain stops new registrations and starts in it,
         // while its executions stay visible.

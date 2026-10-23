@@ -143,7 +143,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
 
-        let guard = state.lock();
+        let swept_at = crate::state::now();
+        let mut guard = state.lock();
+        // The description is built only after the service's own start-to-close reaping
+        // is materialised, so a run whose budget the clock already spent reports
+        // `executionStatus=CLOSED` with `closeStatus=TIMED_OUT` instead of staying OPEN
+        // forever.
+        guard.materialise_due_timeouts_in(&input.domain, swept_at);
         // An `UnknownResourceFault` message names the resource the lookup failed on and
         // nothing else: the domain when no domain is stored under that name, otherwise
         // the requested execution, in the
