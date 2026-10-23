@@ -10,13 +10,15 @@
 //!
 //! Besides the store this module owns the small rules every cluster operation
 //! shares: the published engine-version catalog and the default parameter group
-//! of each of its families, the documented identifier
-//! syntax, the documented `MaxRecords` window,
+//! of each of its families, the engine default PARAMETERS a parameter group of
+//! such a family publishes (see [`ENGINE_DEFAULT_PARAMETERS`]), the documented
+//! identifier syntax, the documented `MaxRecords` window,
 //! the derived endpoint address / namespace ARN, and the clock-owed
 //! `creating` -> `available` transitions (see [`PROVISIONING_SPAN`]).
 
-use crate::ops::types::{Cluster, ClusterParameterGroup, ClusterVersion, Snapshot};
+use crate::ops::types::{Cluster, ClusterParameterGroup, ClusterVersion, Parameter, Snapshot};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 /// How long after the call that starts it a provisioning transition falls due:
@@ -148,6 +150,9 @@ pub fn default_parameter_groups() -> Vec<StoredParameterGroup> {
                     tags: Some(Vec::new()),
                 },
                 default_group: true,
+                // A default group reports its family's engine defaults and
+                // nothing else: nobody has changed a value on it.
+                parameter_values: BTreeMap::new(),
             })
         })
         .collect()
@@ -156,6 +161,288 @@ pub fn default_parameter_groups() -> Vec<StoredParameterGroup> {
 /// The description Redshift gives a default cluster parameter group.
 pub fn default_parameter_group_description(family: &str) -> String {
     format!("Default parameter group for {family}")
+}
+
+/// `Parameter$Source` for a value nobody changed: the parameter still carries
+/// its family's engine default.
+///
+/// Source: `smithy_query(query="doc", shape="Parameter", member="Source")` —
+/// "The source of the parameter value, such as \"engine-default\" or \"user\"".
+pub const PARAMETER_SOURCE_ENGINE_DEFAULT: &str = "engine-default";
+
+/// `Parameter$Source` for a value a caller set on the group.
+pub const PARAMETER_SOURCE_USER: &str = "user";
+
+/// The `Source` values a `DescribeClusterParameters` request may filter on, in
+/// the documented order.
+///
+/// Source: `smithy_query(query="doc", shape="DescribeClusterParametersMessage",
+/// member="Source")` — "Valid Values: user | engine-default".
+pub const PARAMETER_SOURCES: [&str; 2] = [PARAMETER_SOURCE_USER, PARAMETER_SOURCE_ENGINE_DEFAULT];
+
+/// `Parameter$ApplyType` for a parameter an associated cluster picks up without
+/// being rebooted.
+///
+/// Source: `smithy_query(query="shape", shape="ParameterApplyType")` — the enum
+/// declares exactly `static` and `dynamic`.
+pub const APPLY_TYPE_DYNAMIC: &str = "dynamic";
+
+/// `Parameter$ApplyType` for a parameter whose new value an associated cluster
+/// only sees after a reboot.
+pub const APPLY_TYPE_STATIC: &str = "static";
+
+/// `Parameter$DataType` for a parameter that takes `true` or `false`.
+pub const DATA_TYPE_BOOLEAN: &str = "boolean";
+/// `Parameter$DataType` for a parameter that takes a whole number.
+pub const DATA_TYPE_INTEGER: &str = "integer";
+/// `Parameter$DataType` for a parameter that takes free text.
+pub const DATA_TYPE_STRING: &str = "string";
+
+/// The two values every boolean parameter takes, as Redshift publishes the set
+/// in `Parameter$AllowedValues` ("The valid range of values for the
+/// parameter").
+const BOOLEAN_ALLOWED_VALUES: &str = "true,false";
+
+/// One engine default parameter: a setting every cluster parameter group of a
+/// published family publishes, with the value it carries before anybody changes
+/// it.
+///
+/// This is the CATALOG entry, not a stored record: a group persists only the
+/// values a caller changed (see [`StoredParameterGroup::parameter_values`]), so
+/// the description, data type, allowed values, apply type and modifiability a
+/// read reports come from here for every group of the family at once.
+#[derive(Debug, Clone, Copy)]
+pub struct EngineParameter {
+    /// `Parameter$ParameterName`, as the engine spells it in its own
+    /// configuration.
+    pub name: &'static str,
+    /// `Parameter$ParameterValue` before any change: the family's engine
+    /// default.
+    pub default_value: &'static str,
+    /// `Parameter$Description` — "A description of the parameter".
+    pub description: &'static str,
+    /// `Parameter$DataType` — one of [`DATA_TYPE_BOOLEAN`],
+    /// [`DATA_TYPE_INTEGER`] or [`DATA_TYPE_STRING`].
+    pub data_type: &'static str,
+    /// `Parameter$AllowedValues` — the published value set, or `None` for a
+    /// parameter the engine itself parses and publishes no set for.
+    pub allowed_values: Option<&'static str>,
+    /// `Parameter$ApplyType` — [`APPLY_TYPE_STATIC`] when an associated cluster
+    /// only sees a new value after a reboot, [`APPLY_TYPE_DYNAMIC`] otherwise.
+    pub apply_type: &'static str,
+    /// `Parameter$IsModifiable` — "If true, the parameter can be modified."
+    pub is_modifiable: bool,
+}
+
+impl EngineParameter {
+    /// The modelled `Parameter` this setting reports for one group.
+    ///
+    /// `override_value` is the value that group PERSISTED for it, `None` when the
+    /// group never changed it — which is exactly what decides `Source`: a value a
+    /// caller set reports [`PARAMETER_SOURCE_USER`], an untouched one
+    /// [`PARAMETER_SOURCE_ENGINE_DEFAULT`].
+    pub fn to_api(
+        &self,
+        override_value: Option<&str>,
+        minimum_engine_version: Option<&str>,
+    ) -> Parameter {
+        Parameter {
+            parameter_name: Some(self.name.to_string()),
+            parameter_value: Some(override_value.unwrap_or(self.default_value).to_string()),
+            description: Some(self.description.to_string()),
+            source: Some(
+                if override_value.is_some() {
+                    PARAMETER_SOURCE_USER
+                } else {
+                    PARAMETER_SOURCE_ENGINE_DEFAULT
+                }
+                .to_string(),
+            ),
+            data_type: Some(self.data_type.to_string()),
+            allowed_values: self.allowed_values.map(str::to_string),
+            apply_type: Some(self.apply_type.to_string()),
+            is_modifiable: Some(self.is_modifiable),
+            minimum_engine_version: minimum_engine_version.map(str::to_string),
+        }
+    }
+}
+
+/// The engine default parameters a cluster parameter group of a published family
+/// reports, in `ParameterName` order — which is the order a page walks, so the
+/// `Marker` cursor stays a stable offset into one sequence.
+///
+/// Source: the Amazon Redshift Cluster Management Guide, "Amazon Redshift
+/// parameter groups": its default-parameter table lists exactly these settings
+/// with these default values, which is what
+/// `aws redshift describe-default-cluster-parameters --parameter-group-family
+/// redshift-1.0` reports for the one family this service publishes. The same
+/// guide is where each [`EngineParameter::apply_type`] comes from: a change to
+/// `enable_case_sensitive_identifier`, `enable_user_activity_logging`,
+/// `require_ssl`, `use_fips_ssl` or `wlm_json_configuration` is seen by an
+/// associated cluster only after a reboot, while every other setting applies
+/// dynamically. Every setting in the table is one a caller may change, hence
+/// [`EngineParameter::is_modifiable`] on all of them.
+pub const ENGINE_DEFAULT_PARAMETERS: &[EngineParameter] = &[
+    EngineParameter {
+        name: "auto_analyze",
+        default_value: "true",
+        description: "Collects table statistics automatically in the background.",
+        data_type: DATA_TYPE_BOOLEAN,
+        allowed_values: Some(BOOLEAN_ALLOWED_VALUES),
+        apply_type: APPLY_TYPE_DYNAMIC,
+        is_modifiable: true,
+    },
+    EngineParameter {
+        name: "auto_mv",
+        default_value: "true",
+        description: "Creates and refreshes materialized views automatically.",
+        data_type: DATA_TYPE_BOOLEAN,
+        allowed_values: Some(BOOLEAN_ALLOWED_VALUES),
+        apply_type: APPLY_TYPE_DYNAMIC,
+        is_modifiable: true,
+    },
+    EngineParameter {
+        name: "datestyle",
+        default_value: "ISO, MDY",
+        description: "Sets the display format for date and time values.",
+        data_type: DATA_TYPE_STRING,
+        allowed_values: None,
+        apply_type: APPLY_TYPE_DYNAMIC,
+        is_modifiable: true,
+    },
+    EngineParameter {
+        name: "enable_case_sensitive_identifier",
+        default_value: "false",
+        description: "Makes database, table and column names case sensitive.",
+        data_type: DATA_TYPE_BOOLEAN,
+        allowed_values: Some(BOOLEAN_ALLOWED_VALUES),
+        apply_type: APPLY_TYPE_STATIC,
+        is_modifiable: true,
+    },
+    EngineParameter {
+        name: "enable_user_activity_logging",
+        default_value: "false",
+        description: "Logs each query run against the database to the user activity log.",
+        data_type: DATA_TYPE_BOOLEAN,
+        allowed_values: Some(BOOLEAN_ALLOWED_VALUES),
+        apply_type: APPLY_TYPE_STATIC,
+        is_modifiable: true,
+    },
+    EngineParameter {
+        name: "extra_float_digits",
+        default_value: "0",
+        description: "Sets the number of digits displayed for floating-point values.",
+        data_type: DATA_TYPE_INTEGER,
+        allowed_values: Some("-15-2"),
+        apply_type: APPLY_TYPE_DYNAMIC,
+        is_modifiable: true,
+    },
+    EngineParameter {
+        name: "max_concurrency_scaling_clusters",
+        default_value: "1",
+        description: "Sets the number of concurrency scaling clusters the cluster may use.",
+        data_type: DATA_TYPE_INTEGER,
+        allowed_values: Some("0-10"),
+        apply_type: APPLY_TYPE_DYNAMIC,
+        is_modifiable: true,
+    },
+    EngineParameter {
+        name: "max_cursor_result_set_size",
+        default_value: "default",
+        description: "Sets the maximum result set size of a cursor, in megabytes.",
+        data_type: DATA_TYPE_STRING,
+        allowed_values: None,
+        apply_type: APPLY_TYPE_DYNAMIC,
+        is_modifiable: true,
+    },
+    EngineParameter {
+        name: "query_group",
+        default_value: "default",
+        description: "Applies a user-defined label to the queries run in the same session.",
+        data_type: DATA_TYPE_STRING,
+        allowed_values: None,
+        apply_type: APPLY_TYPE_DYNAMIC,
+        is_modifiable: true,
+    },
+    EngineParameter {
+        name: "require_ssl",
+        default_value: "false",
+        description: "Requires SSL for every connection to the database.",
+        data_type: DATA_TYPE_BOOLEAN,
+        allowed_values: Some(BOOLEAN_ALLOWED_VALUES),
+        apply_type: APPLY_TYPE_STATIC,
+        is_modifiable: true,
+    },
+    EngineParameter {
+        name: "search_path",
+        default_value: "$user, public",
+        description: "Sets the schema search order for names that are not schema-qualified.",
+        data_type: DATA_TYPE_STRING,
+        allowed_values: None,
+        apply_type: APPLY_TYPE_DYNAMIC,
+        is_modifiable: true,
+    },
+    EngineParameter {
+        name: "statement_timeout",
+        default_value: "0",
+        description: "Aborts any statement that takes over the specified number of \
+                      milliseconds; 0 turns the limit off.",
+        data_type: DATA_TYPE_INTEGER,
+        allowed_values: Some("0,100-2147483647"),
+        apply_type: APPLY_TYPE_DYNAMIC,
+        is_modifiable: true,
+    },
+    EngineParameter {
+        name: "use_fips_ssl",
+        default_value: "false",
+        description: "Uses the FIPS-compliant SSL library for connections to the database.",
+        data_type: DATA_TYPE_BOOLEAN,
+        allowed_values: Some(BOOLEAN_ALLOWED_VALUES),
+        apply_type: APPLY_TYPE_STATIC,
+        is_modifiable: true,
+    },
+    EngineParameter {
+        name: "wlm_json_configuration",
+        default_value: "[{\"auto_wlm\":true}]",
+        description: "The workload management configuration, as a JSON array of queues.",
+        data_type: DATA_TYPE_STRING,
+        allowed_values: None,
+        apply_type: APPLY_TYPE_STATIC,
+        is_modifiable: true,
+    },
+];
+
+/// The engine default parameters a cluster parameter group of family `family`
+/// publishes: [`ENGINE_DEFAULT_PARAMETERS`] for a family some published engine
+/// version offers, and NOTHING for any other — a group of an unknown family
+/// reports no parameters rather than another family's.
+///
+/// The family catalogue is read off [`published_cluster_versions`], the same
+/// place `CreateClusterParameterGroup` checks a requested family against, so a
+/// group that could be created always has parameters to report.
+pub fn family_parameters(family: &str) -> &'static [EngineParameter] {
+    let published = published_cluster_versions().into_iter().any(|version| {
+        version.cluster_parameter_group_family.as_deref() == Some(family)
+    });
+    if published {
+        ENGINE_DEFAULT_PARAMETERS
+    } else {
+        &[]
+    }
+}
+
+/// `Parameter$MinimumEngineVersion` — "The earliest engine version to which the
+/// parameter can apply".
+///
+/// Every published engine version's family carries the whole catalog, so the
+/// earliest version any of its parameters can apply to is the first entry of
+/// [`published_cluster_versions`]. Derived rather than spelled out, so adding an
+/// engine version cannot make the reported value disagree with the catalog.
+pub fn minimum_engine_version() -> Option<String> {
+    published_cluster_versions()
+        .into_iter()
+        .next()
+        .and_then(|version| version.cluster_version)
 }
 
 /// How many parameter groups the ACCOUNT's own groups may number before
@@ -298,6 +585,31 @@ pub struct StoredParameterGroup {
     /// created it. A default group is outside [`PARAMETER_GROUP_QUOTA`] and its
     /// family is one of the valid `ParameterGroupFamily` values.
     pub default_group: bool,
+    /// The parameter values a caller SET on this group, by parameter name.
+    ///
+    /// ONLY the overrides: a parameter the group never changed reports its
+    /// family's engine default (see [`family_parameters`]), so a stored group is
+    /// never a copy of the catalog and a group of a family whose catalog grows
+    /// reports the new settings too.
+    pub parameter_values: BTreeMap<String, String>,
+}
+
+impl StoredParameterGroup {
+    /// The parameters this group reports, in the catalog's `ParameterName`
+    /// order: its family's engine defaults, each carrying the value this group
+    /// holds for it and `user` as its `Source` where the group changed it.
+    pub fn parameters(&self) -> Vec<Parameter> {
+        let minimum_engine_version = minimum_engine_version();
+        family_parameters(self.group.parameter_group_family.as_deref().unwrap_or_default())
+            .iter()
+            .map(|parameter| {
+                parameter.to_api(
+                    self.parameter_values.get(parameter.name).map(String::as_str),
+                    minimum_engine_version.as_deref(),
+                )
+            })
+            .collect()
+    }
 }
 
 /// A snapshot as this service stores it.

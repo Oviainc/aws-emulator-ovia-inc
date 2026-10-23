@@ -857,6 +857,7 @@ async fn creating_past_the_parameter_group_quota_is_refused() {
                         tags: Some(Vec::new()),
                     },
                     default_group: false,
+                    parameter_values: std::collections::BTreeMap::new(),
                 });
         }
     }

@@ -242,6 +242,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.parameter_groups.push(st::StoredParameterGroup {
             group: group.clone(),
             default_group: false,
+            // A new group holds no value of its own: every parameter it reports
+            // is its family's engine default until a caller changes one.
+            parameter_values: std::collections::BTreeMap::new(),
         });
 
         Ok(CreateClusterParameterGroupOutput {
