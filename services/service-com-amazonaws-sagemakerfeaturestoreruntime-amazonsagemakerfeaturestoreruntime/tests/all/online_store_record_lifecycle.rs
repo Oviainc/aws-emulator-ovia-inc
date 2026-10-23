@@ -1305,8 +1305,8 @@ async fn the_online_store_refuses_a_write_past_its_capacity_bound() {
 async fn the_operations_this_slice_does_not_implement_still_answer_501() {
     let emulator = Emulator::new();
 
-    // BatchWriteRecord and UpdateRecord are left to their own issues: a stub answers
-    // 501, never an empty 200.
+    // BatchWriteRecord is left to its own issue: a stub answers 501, never an empty 200.
+    // (`UpdateRecord` is implemented — see `tests/all/update_record_partial_update.rs`.)
     let (status, body) = emulator
         .send(
             "POST",
@@ -1325,22 +1325,5 @@ async fn the_operations_this_slice_does_not_implement_still_answer_501() {
     assert_eq!(
         code, "NotImplemented",
         "case \"BatchWriteRecord\": expected the NotImplemented error code, got {code:?}"
-    );
-
-    let (status, body) = emulator
-        .send(
-            "POST",
-            "/FeatureGroup/customers/Record",
-            Some(json!({
-                "RecordIdentifierValueAsString": "C1",
-                "Features": [feature("city", "Seattle")]
-            })),
-        )
-        .await;
-    assert_eq!(status, 501, "case \"UpdateRecord\": expected 501, got {status}");
-    let code = error_code(&body);
-    assert_eq!(
-        code, "NotImplemented",
-        "case \"UpdateRecord\": expected the NotImplemented error code, got {code:?}"
     );
 }

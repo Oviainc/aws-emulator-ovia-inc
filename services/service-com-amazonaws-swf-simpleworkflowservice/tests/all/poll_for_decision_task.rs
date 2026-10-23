@@ -12,8 +12,10 @@
 //! history: the task's run and workflow type, the new event's id as `startedEventId`, the
 //! `startedEventId` of the last decision task a decider completed as
 //! `previousStartedEventId`, and a page of the run's events. A task is handed out at most
-//! once, a list with nothing waiting answers the documented empty result (`taskToken` an
-//! empty string), a task not completed within its own `startToCloseTimeout` is timed out
+//! once, a list with nothing waiting is held open — the call is the documented long poll,
+//! so the empty result (`taskToken` an empty string) comes only once the documented
+//! 60-second timeout has passed — a task not completed within its own
+//! `startToCloseTimeout` is timed out
 //! and replaced by the server at the instant that duration runs out, and an unregistered
 //! domain is the modelled `UnknownResourceFault`.
 //!
@@ -41,6 +43,11 @@ const DEFAULT_LIST: &str = "default-deciders";
 
 /// The modelled `TaskToken` maximum length (`len 1..1024`).
 const MAX_TASK_TOKEN_LENGTH: usize = 1024;
+
+/// How long a poll of a task list with nothing waiting is given to prove it is NOT
+/// answering. The documented long-poll timeout is 60 seconds, so any wait far below it
+/// that produces no answer shows the connection was held open.
+const HOLD_OPEN_PROBE: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// Register the domain and the one workflow type this suite starts runs of.
 async fn seed(emulator: &Emulator, domain: &str) {
@@ -151,32 +158,29 @@ fn event_id_member(body: &Value, member: &str) -> i64 {
     body.get(member).and_then(Value::as_i64).unwrap_or(0)
 }
 
-/// Assert the answer is the documented EMPTY result: "a DecisionTask is returned, but ...
-/// the value of taskToken is an empty string".
-fn assert_empty_result(case: &str, body: &Value) {
-    let token = body.get("taskToken").and_then(Value::as_str).unwrap_or("");
-    assert!(
-        token.is_empty(),
-        "case {case:?}: a list with nothing waiting answers an empty taskToken, got {body:?}"
-    );
-    let events = body
-        .pointer("/events")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    assert!(
-        events.is_empty(),
-        "case {case:?}: an empty result carries no history events, got {body:?}"
-    );
-    assert_eq!(
-        (
-            event_id_member(body, "startedEventId"),
-            event_id_member(body, "previousStartedEventId"),
-            body.get("nextPageToken").is_some(),
+/// Assert a poll of a task list with NOTHING waiting holds the connection open instead
+/// of answering.
+///
+/// `PollForDecisionTask` is a long poll: "the service holds the HTTP connection open and
+/// responds as soon a task becomes available. If no decision task is available in the
+/// specified task list before the timeout of 60 seconds expires, an empty result is
+/// returned." So a drained list answers nothing for that long; [`HOLD_OPEN_PROBE`] is far
+/// below the timeout, and a poll that answers inside it is the failure. (The empty answer
+/// the timeout eventually produces is asserted by the `decision_task_poller_cap` suite's
+/// own hold-open case, which does not wait the documented minute out either.)
+async fn assert_holds_open(emulator: &Emulator, case: &str, domain: &str, task_list: &str) {
+    let answered = tokio::time::timeout(
+        HOLD_OPEN_PROBE,
+        emulator.call(
+            "PollForDecisionTask",
+            &json!({ "domain": domain, "taskList": { "name": task_list } }),
         ),
-        (0, 0, false),
-        "case {case:?}: an empty result names no started event and no further page, \
-         got {body:?}"
+    )
+    .await;
+    assert!(
+        answered.is_err(),
+        "case {case:?}: a poll of a task list with nothing waiting holds the connection \
+         open rather than answering, got {answered:?}"
     );
 }
 
@@ -344,14 +348,13 @@ async fn a_poll_hands_out_the_waiting_task_and_records_the_hand_over_in_the_hist
         );
 
         // Handing the task over took it out of the list, so a second poll of the same list
-        // finds nothing waiting.
+        // finds nothing waiting — and, being a long poll, holds open instead of answering.
         let left = pending(&emulator, case, "handout", list).await;
         assert_eq!(
             left, 0,
             "case {case:?}: the handed-out task no longer waits in {list:?}, got {left}"
         );
-        let again = poll(&emulator, case, "handout", list, json!({})).await;
-        assert_empty_result(case, &again);
+        assert_holds_open(&emulator, case, "handout", list).await;
 
         tokens.push((case, token));
     }
@@ -470,18 +473,17 @@ async fn the_tasks_of_one_list_are_handed_out_highest_priority_then_oldest_first
         "case \"dispatch order\": each of the {distinct} tasks must carry its own token"
     );
 
-    // Every task of the list has been handed out exactly once, so the list is now empty.
-    let answer = poll(&emulator, "drained", "order", list, json!({})).await;
-    assert_empty_result("drained", &answer);
+    // Every task of the list has been handed out exactly once, so the list is now empty
+    // and a further poll of it waits rather than answering.
+    assert_holds_open(&emulator, "drained", "order", list).await;
     let waiting = pending(&emulator, "drained", "order", list).await;
     assert_eq!(
         waiting, 0,
         "case \"drained\": no task of {list:?} is waiting any more, got {waiting}"
     );
 
-    // A list nothing was ever scheduled in answers the same empty result.
-    let answer = poll(&emulator, "never used", "order", "deciders-unused", json!({})).await;
-    assert_empty_result("never used", &answer);
+    // A list nothing was ever scheduled in waits the same way.
+    assert_holds_open(&emulator, "never used", "order", "deciders-unused").await;
 }
 
 /// One paged read of a handed-out task's history.
@@ -630,6 +632,13 @@ async fn start_at_previous_started_event_begins_at_the_previous_decision_task() 
     // at, so the whole history is returned either way.
     for start_at_previous in [false, true] {
         let case = format!("first task, startAtPreviousStartedEvent={start_at_previous}");
+        if start_at_previous {
+            // The first poll of the loop took the run's only task, so the list now holds
+            // nothing and the poll waits; the flag itself is exercised on the task the
+            // first iteration was handed, and on the second task below.
+            assert_holds_open(&emulator, &case, "resume", list).await;
+            continue;
+        }
         let answer = poll(
             &emulator,
             &case,
@@ -638,11 +647,6 @@ async fn start_at_previous_started_event_begins_at_the_previous_decision_task() 
             json!({ "startAtPreviousStartedEvent": start_at_previous, "maximumPageSize": 1000 }),
         )
         .await;
-        if start_at_previous {
-            // The second poll of the list finds nothing: the first one took the task.
-            assert_empty_result(&case, &answer);
-            continue;
-        }
         let events = events_of(&case, &answer);
         let stored = whole_history(&emulator, "resume", "wf-resume", &run_id).await;
         assert_eq!(
@@ -715,20 +719,24 @@ async fn a_task_not_completed_within_its_start_to_close_duration_is_timed_out_an
             .and_then(Value::as_i64)
             .unwrap_or_else(|| panic!("case {case:?}: no scheduled event in {first:?}"));
 
-        let second = poll(&emulator, case, row.domain, list, json!({})).await;
-        let stored = whole_history(&emulator, row.domain, "wf-timeout", &run_id).await;
-        let timed_out = events_typed(&stored, "DecisionTaskTimedOut");
-        let scheduled = events_typed(&stored, "DecisionTaskScheduled");
-
         if !row.times_out {
-            assert_empty_result(case, &second);
+            // The task is still outstanding, so the list holds nothing and the second
+            // poll waits instead of answering.
+            assert_holds_open(&emulator, case, row.domain, list).await;
+            let stored = whole_history(&emulator, row.domain, "wf-timeout", &run_id).await;
             assert!(
-                timed_out.is_empty() && scheduled.len() == 1,
+                events_typed(&stored, "DecisionTaskTimedOut").is_empty()
+                    && events_typed(&stored, "DecisionTaskScheduled").len() == 1,
                 "case {case:?}: a duration that has not run out times nothing out and \
                  schedules no replacement, got {stored:?}"
             );
             continue;
         }
+
+        let second = poll(&emulator, case, row.domain, list, json!({})).await;
+        let stored = whole_history(&emulator, row.domain, "wf-timeout", &run_id).await;
+        let timed_out = events_typed(&stored, "DecisionTaskTimedOut");
+        let scheduled = events_typed(&stored, "DecisionTaskScheduled");
 
         // The timeout is the SERVER's: it fell due at the instant the duration ran out,
         // and the run carries the modelled DecisionTaskTimedOut event naming the task it

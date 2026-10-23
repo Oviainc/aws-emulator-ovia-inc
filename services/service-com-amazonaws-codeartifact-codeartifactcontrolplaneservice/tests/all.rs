@@ -53,3 +53,5 @@ mod error_envelopes;
 mod removals_and_copies;
 #[path = "all/package_version_description.rs"]
 mod package_version_description;
+#[path = "all/policy_document_rendering.rs"]
+mod policy_document_rendering;

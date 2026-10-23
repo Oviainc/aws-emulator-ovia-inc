@@ -4,17 +4,22 @@
 //!
 //! This is the DynamoDB table + item store every handler in `src/ops/` reads and
 //! writes, plus the pure helpers several of them share (key extraction, the
-//! order-preserving key encoding, item sizing, capacity accounting and the
-//! `TableDescription` projection). Nothing here is a canned response: every value an
-//! operation reports is computed from what a previous request wrote.
+//! order-preserving key encoding, item sizing, capacity accounting, the expression
+//! language the item writes share and the `TableDescription` projection). Nothing here
+//! is a canned response: every value an operation reports is computed from what a
+//! previous request wrote.
 
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::str::FromStr;
 use std::time::{Duration, SystemTime};
 
+use bigdecimal::BigDecimal;
+
 use crate::ops::types::{
-    AttributeDefinition, AttributeValue, BillingModeSummary, Capacity, ConsumedCapacity,
-    GlobalSecondaryIndexDescription, GlobalSecondaryIndexWarmThroughputDescription,
+    AttributeDefinition, AttributeValue, AttributeValueUpdate, BillingModeSummary, Capacity,
+    ConsumedCapacity, ExpectedAttributeValue, GlobalSecondaryIndexDescription,
+    GlobalSecondaryIndexWarmThroughputDescription,
     ItemCollectionMetrics, KeySchemaElement, LocalSecondaryIndexDescription, Projection,
     ProvisionedThroughput, ProvisionedThroughputDescription, Tag, TableClassSummary,
     TableDescription, TableThroughputModeSummary, TableWarmThroughputDescription, WarmThroughput,
@@ -762,10 +767,12 @@ impl NumberKey {
     /// DynamoDB as strings, to maximize compatibility across languages and libraries.
     /// However, DynamoDB treats them as number type attributes" — `AttributeValue$N`),
     /// so what is stored is the NUMBER and what a read reports is that number rendered
-    /// once, not the lexeme a writer happened to send. The rendering is plain decimal
-    /// over the normalised digits — never an exponent, no sign on zero, and a leading
-    /// or trailing zero only where the decimal point needs one — so every spelling of
-    /// one value reads back identically.
+    /// once, not the lexeme a writer happened to send. It is also the form a value
+    /// COMPUTED by the service carries (an `ADD`ed or `SET`-arithmetic number), so one
+    /// value has one spelling however the operands were written. The rendering is plain
+    /// decimal over the normalised digits — never an exponent, no sign on zero, and a
+    /// leading or trailing zero only where the decimal point needs one — so every
+    /// spelling of one value reads back identically.
     pub fn canonical_text(&self) -> String {
         if self.digits.is_empty() {
             return "0".to_string();
@@ -2078,16 +2085,32 @@ impl Table {
 pub struct ComAmazonawsDynamodbDynamodb20120810State {
     /// Every table this emulator holds, keyed by region and then by table name.
     pub regions: HashMap<String, HashMap<String, Table>>,
+    /// The transactions already applied under a `ClientRequestToken`, keyed by the
+    /// REGION the call was signed for and that token — a table name resolves inside one
+    /// region, so a token stands for the transaction it ran in that region and nowhere
+    /// else ([`CompletedTransaction`]). Entries past
+    /// [`TRANSACTION_IDEMPOTENCY_WINDOW`] are dropped by
+    /// [`Self::apply_due_transitions`], because "after 10 minutes, any request with
+    /// the same client token is treated as a new request".
+    pub transactions: HashMap<(String, String), CompletedTransaction>,
 }
 
 impl ComAmazonawsDynamodbDynamodb20120810State {
     /// Materialise the changes the clock has already made due: a table whose
-    /// `DeleteTable` span has elapsed is gone, and a table whose metering interval has
-    /// elapsed reports freshly counted `ItemCount`/`TableSizeBytes` figures.
+    /// `DeleteTable` span has elapsed is gone, a table whose metering interval has
+    /// elapsed reports freshly counted `ItemCount`/`TableSizeBytes` figures, and a
+    /// `ClientRequestToken` whose idempotency window has elapsed no longer stands for
+    /// the transaction it named.
     ///
     /// These are the only writes a reporting operation makes — each finishes something
     /// that was owed at this instant whether or not anybody called.
     pub fn apply_due_transitions(&mut self, now: SystemTime) {
+        self.transactions.retain(|_, transaction| {
+            !matches!(
+                now.duration_since(transaction.completed_at),
+                Ok(age) if age >= TRANSACTION_IDEMPOTENCY_WINDOW
+            )
+        });
         for tables in self.regions.values_mut() {
             tables.retain(|_, table| !table.removal_due(now));
             for table in tables.values_mut() {
@@ -2153,6 +2176,47 @@ impl ComAmazonawsDynamodbDynamodb20120810State {
             .get_mut(region)
             .and_then(|tables| tables.get_mut(name))
             .ok_or_else(|| not_found(name))
+    }
+
+    /// Remember what a `ClientRequestToken` stands for, so a retry of that transaction
+    /// is answered rather than re-applied.
+    ///
+    /// The map is BUDGETED, like every other growth site in this store: a record past
+    /// [`MAX_RECORDED_TRANSACTIONS`] evicts the OLDEST one, so what the store retains is
+    /// bounded whatever number of distinct tokens a caller presents inside the window.
+    /// Evicting the oldest is what a client can least observe — the records nearest
+    /// their own expiry are the ones least likely to be retried — and a token whose
+    /// record is gone is treated as a new request, exactly as one past the window is.
+    pub fn record_transaction(
+        &mut self,
+        region: &str,
+        token: &str,
+        transaction: CompletedTransaction,
+    ) {
+        self.transactions
+            .insert((region.to_string(), token.to_string()), transaction);
+        while self.transactions.len() > MAX_RECORDED_TRANSACTIONS {
+            let Some(oldest) = self
+                .transactions
+                .iter()
+                .min_by_key(|(_, recorded)| recorded.completed_at)
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            self.transactions.remove(&oldest);
+        }
+    }
+
+    /// What a `ClientRequestToken` already stands for in `region`, while it is still
+    /// valid.
+    pub fn recorded_transaction(
+        &self,
+        region: &str,
+        token: &str,
+    ) -> Option<&CompletedTransaction> {
+        self.transactions
+            .get(&(region.to_string(), token.to_string()))
     }
 
     /// The table an ARN-ADDRESSED operation names.
@@ -3263,6 +3327,2034 @@ pub fn consumed_capacity(
     })
 }
 
+// ===========================================================================
+// What the multi-item paths share: `BatchWriteItem`, `BatchGetItem`,
+// `TransactWriteItems` and `TransactGetItems`
+// ===========================================================================
+
+/// The ceilings, refusals, per-table ledgers and canonical encoding the four
+/// multi-item operations share, in their own file: they are about a REQUEST that spans
+/// several items, while this module is the table and item store itself. Re-exported
+/// below, so every caller still names them `crate::state::…`.
+pub mod multi_item;
+
+pub use multi_item::*;
+
+// ===========================================================================
+// The PartiQL dialect `ExecuteStatement` runs
+// ===========================================================================
+
+/// The statement language the PartiQL surface serves, in its own file: it is about
+/// the TEXT one request carries, which it parses into this module's primitives — the
+/// item an `INSERT` writes, the key a singleton write addresses, and the condition
+/// and update expressions the item API already evaluates. Re-exported below, so every
+/// caller still names it `crate::state::…`.
+pub mod partiql;
+
+pub use partiql::*;
+
+// ===========================================================================
+// The expression language `PutItem`, `UpdateItem` and `DeleteItem` share
+// ===========================================================================
+
+/// The most any one expression member may carry: "Maximum length of any expression
+/// string is 4 KB" ("Service, Account, and Table Quotas"), plus the ceilings on the
+/// tokens and the nesting that 4 KB of text can express. All three bound the work one
+/// request can ask the parsers below for, so neither the token vector nor the parser's
+/// stack use is a function of what a caller sends.
+pub const MAX_EXPRESSION_BYTES: usize = 4096;
+pub const MAX_EXPRESSION_TOKENS: usize = 1024;
+pub const MAX_EXPRESSION_DEPTH: usize = 16;
+
+/// The most actions one update may state, whichever member states them.
+///
+/// An `UpdateExpression` is already bounded by the token ceiling above — the shortest
+/// action an expression can spell takes three tokens (a path, an operator and a value)
+/// — and this is that same bound, named, so the legacy `AttributeUpdates` map is held
+/// to it too: that member carries no modelled length, so without this the number of
+/// actions one request can ask the service to index, apply and write would be the
+/// number of entries a request body can carry. Reaching it is the ordinary
+/// `ValidationException`.
+pub const MAX_UPDATE_ACTIONS: usize = MAX_EXPRESSION_TOKENS / 3;
+
+/// The most members one COLLECTION attribute — a set, a list or a map — may carry,
+/// whether a request sent it or an update computed it. This is the EMULATOR's own
+/// limit, not an AWS quota.
+///
+/// A collection's cardinality is what every operation over it costs (comparison, set
+/// union and difference, a `list_append` concatenation), and it is the request's to
+/// choose. The documented 400 KB item limit does not bound it on its own, because a
+/// member's accounted size can be zero (an empty string member). This ceiling is the
+/// item limit's own byte count, so it refuses only collections far larger than one a
+/// 400 KB item could hold with a byte per member, and it keeps the work one request can
+/// ask for a function of this service's constants.
+pub const MAX_COLLECTION_MEMBERS: usize = 400 * 1024;
+
+/// The message a conditional write's refusal carries.
+///
+/// The CONTRACT is the error code `ConditionalCheckFailedException` and its 400; this
+/// is the text the service is observed to send with it, the same for every operation
+/// and every unmet condition, so it reveals nothing about the stored item.
+pub const CONDITION_FAILED_MESSAGE: &str = "The conditional request failed";
+
+/// One comparison an expression makes between two operands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompareOp {
+    Equal,
+    NotEqual,
+    Less,
+    LessOrEqual,
+    Greater,
+    GreaterOrEqual,
+}
+
+/// One lexical token of a DynamoDB expression.
+///
+/// The lexer is shared by the condition and update grammars below: both spell a
+/// document path, an `#alias`, a `:placeholder` and a parenthesised argument list the
+/// same way.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExprToken {
+    /// A bare word: an attribute name, a section or operator keyword (`SET`, `AND`,
+    /// ...) or a function name. Which it is, is the parser's business.
+    Word(String),
+    /// A `#alias` naming an `ExpressionAttributeNames` entry, with its `#`, which is
+    /// how that map's keys are spelled.
+    Alias(String),
+    /// A `:placeholder` naming an `ExpressionAttributeValues` entry, with its `:`.
+    Placeholder(String),
+    /// A list index, as a document path writes it: `[3]`.
+    Index(usize),
+    Compare(CompareOp),
+    Open,
+    Close,
+    Comma,
+    Dot,
+    Plus,
+    Minus,
+}
+
+/// Which characters make up a bare word: an attribute name written out in an
+/// expression, or a keyword. A name outside this set is reachable only through
+/// `ExpressionAttributeNames`, which is what that member is for ("To prevent special
+/// characters in an attribute name from being misinterpreted in an expression").
+fn is_expression_word_char(character: char) -> bool {
+    character.is_ascii_alphanumeric() || character == '_'
+}
+
+/// The refusal for an expression member past [`MAX_EXPRESSION_BYTES`]: the member it
+/// was sent as and the rule it broke, inside the same validation envelope every other
+/// request refusal of this service renders. One wording for one rule, whichever
+/// expression member a request oversized.
+pub fn expression_size_exceeded(member: &str) -> RequestError {
+    refused(format!(
+        "Invalid {member}: Expression size has exceeded the maximum allowed size;"
+    ))
+}
+
+/// The refusal for an expression this service cannot parse. The member is named so the
+/// caller knows which one to fix; the expression itself is not echoed back.
+fn expression_syntax_error(member: &str) -> RequestError {
+    RequestError::Validation(format!("Invalid {member}: syntax error"))
+}
+
+/// Split one expression into tokens, refusing a text or a token count past the bounds
+/// above before any parsing starts.
+pub fn tokenize_expression(
+    member: &str,
+    expression: &str,
+) -> Result<Vec<ExprToken>, RequestError> {
+    if expression.len() > MAX_EXPRESSION_BYTES {
+        return Err(expression_size_exceeded(member));
+    }
+    let characters: Vec<char> = expression.chars().collect();
+    let mut tokens = Vec::new();
+    let mut at = 0;
+    while at < characters.len() {
+        if tokens.len() >= MAX_EXPRESSION_TOKENS {
+            return Err(RequestError::Validation(format!(
+                "Invalid {member}: an expression may hold at most {MAX_EXPRESSION_TOKENS} tokens"
+            )));
+        }
+        let character = characters[at];
+        match character {
+            c if c.is_whitespace() => at += 1,
+            '(' => {
+                tokens.push(ExprToken::Open);
+                at += 1;
+            }
+            ')' => {
+                tokens.push(ExprToken::Close);
+                at += 1;
+            }
+            ',' => {
+                tokens.push(ExprToken::Comma);
+                at += 1;
+            }
+            '.' => {
+                tokens.push(ExprToken::Dot);
+                at += 1;
+            }
+            '+' => {
+                tokens.push(ExprToken::Plus);
+                at += 1;
+            }
+            '-' => {
+                tokens.push(ExprToken::Minus);
+                at += 1;
+            }
+            '=' => {
+                tokens.push(ExprToken::Compare(CompareOp::Equal));
+                at += 1;
+            }
+            '<' | '>' => {
+                let next = characters.get(at + 1).copied();
+                let (operator, width) = match (character, next) {
+                    ('<', Some('=')) => (CompareOp::LessOrEqual, 2),
+                    ('<', Some('>')) => (CompareOp::NotEqual, 2),
+                    ('<', _) => (CompareOp::Less, 1),
+                    (_, Some('=')) => (CompareOp::GreaterOrEqual, 2),
+                    _ => (CompareOp::Greater, 1),
+                };
+                tokens.push(ExprToken::Compare(operator));
+                at += width;
+            }
+            '[' => {
+                let start = at + 1;
+                let mut end = start;
+                while end < characters.len() && characters[end].is_ascii_digit() {
+                    end += 1;
+                }
+                if end == start || characters.get(end) != Some(&']') {
+                    return Err(expression_syntax_error(member));
+                }
+                let digits: String = characters[start..end].iter().collect();
+                let index = digits
+                    .parse::<usize>()
+                    .map_err(|_| expression_syntax_error(member))?;
+                tokens.push(ExprToken::Index(index));
+                at = end + 1;
+            }
+            '#' | ':' => {
+                let start = at;
+                at += 1;
+                while at < characters.len() && is_expression_word_char(characters[at]) {
+                    at += 1;
+                }
+                if at - start < 2 {
+                    return Err(expression_syntax_error(member));
+                }
+                let text: String = characters[start..at].iter().collect();
+                tokens.push(if character == '#' {
+                    ExprToken::Alias(text)
+                } else {
+                    ExprToken::Placeholder(text)
+                });
+            }
+            c if is_expression_word_char(c) => {
+                let start = at;
+                while at < characters.len() && is_expression_word_char(characters[at]) {
+                    at += 1;
+                }
+                tokens.push(ExprToken::Word(characters[start..at].iter().collect()));
+            }
+            _ => return Err(expression_syntax_error(member)),
+        }
+    }
+    if tokens.is_empty() {
+        return Err(expression_syntax_error(member));
+    }
+    Ok(tokens)
+}
+
+/// The substitution tables an expression resolves its names and values through:
+/// `ExpressionAttributeNames` and `ExpressionAttributeValues`, exactly as the request
+/// sent them.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Substitutions<'a> {
+    names: Option<&'a HashMap<String, String>>,
+    values: Option<&'a HashMap<String, AttributeValue>>,
+}
+
+impl<'a> Substitutions<'a> {
+    pub fn new(
+        names: Option<&'a HashMap<String, String>>,
+        values: Option<&'a HashMap<String, AttributeValue>>,
+    ) -> Self {
+        Self { names, values }
+    }
+
+    /// The attribute name an `#alias` stands for. An alias with no entry is the
+    /// caller's mistake, not an empty name.
+    fn name(&self, alias: &str) -> Result<String, RequestError> {
+        self.names
+            .and_then(|names| names.get(alias))
+            .cloned()
+            .ok_or_else(|| {
+                RequestError::Validation(format!(
+                    "An expression attribute name used in the document path is not defined; \
+                     attribute name: {alias}"
+                ))
+            })
+    }
+
+    /// The value a `:placeholder` stands for.
+    fn value(&self, placeholder: &str) -> Result<AttributeValue, RequestError> {
+        self.values
+            .and_then(|values| values.get(placeholder))
+            .cloned()
+            .ok_or_else(|| {
+                RequestError::Validation(format!(
+                    "An expression attribute value used in expression is not defined; \
+                     attribute value: {placeholder}"
+                ))
+            })
+    }
+}
+
+/// One step of a document path: an attribute name, or an index into a list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PathStep {
+    Attribute(String),
+    Index(usize),
+}
+
+/// A document path, as an expression writes it — `a`, `a.b`, `a[2].b` — with every
+/// `#alias` already resolved. The first step is always an attribute name, so every
+/// path starts at one of the item's own attributes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocumentPath(Vec<PathStep>);
+
+impl DocumentPath {
+    /// The path naming one top-level attribute, which is all the legacy
+    /// `AttributeUpdates`/`Expected` maps can address.
+    pub fn attribute_named(name: &str) -> Self {
+        Self(vec![PathStep::Attribute(name.to_string())])
+    }
+
+    /// The top-level attribute this path reaches into, which is the attribute a write
+    /// through it changes.
+    pub fn attribute(&self) -> &str {
+        match self.0.first() {
+            Some(PathStep::Attribute(name)) => name.as_str(),
+            // Unreachable by construction: every path starts at an attribute.
+            _ => "",
+        }
+    }
+
+    /// How the path reads, for a refusal message and for the prefix index two actions
+    /// are checked for overlap through.
+    fn render(&self) -> String {
+        self.render_prefix(self.0.len())
+    }
+
+    /// The same for this path's first `steps` steps only: a path overlaps another
+    /// exactly when one of them is one of the other's step-prefixes.
+    fn render_prefix(&self, steps: usize) -> String {
+        let mut text = String::new();
+        for step in self.0.iter().take(steps) {
+            match step {
+                PathStep::Attribute(name) => {
+                    if !text.is_empty() {
+                        text.push('.');
+                    }
+                    text.push_str(name);
+                }
+                PathStep::Index(index) => {
+                    text.push('[');
+                    text.push_str(&index.to_string());
+                    text.push(']');
+                }
+            }
+        }
+        text
+    }
+
+    /// The refusal for a path that does not address a location this item can hold.
+    fn invalid(&self) -> RequestError {
+        RequestError::Validation(format!(
+            "The document path provided in the update expression is invalid for update: {}",
+            self.render()
+        ))
+    }
+
+    /// The value at this path, or `None` when the item holds nothing there.
+    pub fn get<'i>(&self, item: &'i Item) -> Option<&'i AttributeValue> {
+        let mut steps = self.0.iter();
+        let PathStep::Attribute(first) = steps.next()? else {
+            return None;
+        };
+        let mut current = item.get(first)?;
+        for step in steps {
+            current = match (step, current) {
+                (PathStep::Attribute(name), AttributeValue::M(entries)) => entries.get(name)?,
+                (PathStep::Index(index), AttributeValue::L(values)) => values.get(*index)?,
+                _ => return None,
+            };
+        }
+        Some(current)
+    }
+
+    /// Write `value` at this path, creating a missing map entry and appending past the
+    /// end of a list, but never inventing a missing parent container.
+    pub fn set(&self, item: &mut Item, value: AttributeValue) -> Result<(), RequestError> {
+        let Some((PathStep::Attribute(first), rest)) = self.0.split_first() else {
+            return Err(self.invalid());
+        };
+        if rest.is_empty() {
+            item.insert(first.clone(), value);
+            return Ok(());
+        }
+        let parent = item.get_mut(first).ok_or_else(|| self.invalid())?;
+        set_within(parent, rest, value).map_err(|()| self.invalid())
+    }
+
+    /// Remove whatever this path addresses, reporting what was there.
+    pub fn remove(&self, item: &mut Item) -> Option<AttributeValue> {
+        let (head, rest) = self.0.split_first()?;
+        let PathStep::Attribute(first) = head else {
+            return None;
+        };
+        if rest.is_empty() {
+            return item.remove(first);
+        }
+        remove_within(item.get_mut(first)?, rest)
+    }
+}
+
+/// Write `value` at `steps` inside `target`.
+///
+/// Recursive, and bounded: a path carries at most [`MAX_ATTRIBUTE_DEPTH`] steps (the
+/// parser refuses a longer one), so the number of frames is a constant of this service
+/// rather than a function of the request.
+fn set_within(
+    target: &mut AttributeValue,
+    steps: &[PathStep],
+    value: AttributeValue,
+) -> Result<(), ()> {
+    match (steps.first(), target) {
+        (None, slot) => {
+            *slot = value;
+            Ok(())
+        }
+        (Some(PathStep::Attribute(name)), AttributeValue::M(entries)) => {
+            if steps.len() == 1 {
+                entries.insert(name.clone(), value);
+                Ok(())
+            } else {
+                set_within(entries.get_mut(name).ok_or(())?, &steps[1..], value)
+            }
+        }
+        (Some(PathStep::Index(index)), AttributeValue::L(values)) => {
+            if steps.len() == 1 {
+                // "the new element is appended to the end of the list" when the index
+                // is past its end, which is what DynamoDB does with an out-of-range
+                // index in a SET.
+                if *index < values.len() {
+                    values[*index] = value;
+                } else {
+                    values.push(value);
+                }
+                Ok(())
+            } else {
+                set_within(values.get_mut(*index).ok_or(())?, &steps[1..], value)
+            }
+        }
+        _ => Err(()),
+    }
+}
+
+/// Remove what `steps` addresses inside `target`, bounded the same way
+/// [`set_within`] is. Removing a list element shifts the ones after it down.
+fn remove_within(target: &mut AttributeValue, steps: &[PathStep]) -> Option<AttributeValue> {
+    match (steps.first()?, target) {
+        (PathStep::Attribute(name), AttributeValue::M(entries)) => {
+            if steps.len() == 1 {
+                entries.remove(name)
+            } else {
+                remove_within(entries.get_mut(name)?, &steps[1..])
+            }
+        }
+        (PathStep::Index(index), AttributeValue::L(values)) => {
+            if steps.len() == 1 {
+                (*index < values.len()).then(|| values.remove(*index))
+            } else {
+                remove_within(values.get_mut(*index)?, &steps[1..])
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Whether two attribute values are the same value.
+///
+/// Comparison is by TYPE first, as the `ComparisonOperator` doc's `EQ` entry states:
+/// "If an item contains an AttributeValue element of a different type than the one
+/// provided in the request, the value does not match. For example, {"S":"6"} does not
+/// equal {"N":"6"}". Within a type, two `N` values compare NUMERICALLY (`6` equals
+/// `6.0`), a set compares as a set — its members in any order — and a list or map
+/// compares element by element.
+pub fn attribute_values_equal(left: &AttributeValue, right: &AttributeValue) -> bool {
+    values_equal_within(left, right, MAX_ATTRIBUTE_DEPTH)
+}
+
+/// The same, with an explicit depth budget: a stored value nests at most
+/// [`MAX_ATTRIBUTE_DEPTH`] levels (every write path refuses a deeper one), so the walk
+/// cannot recurse further than that however the two values are shaped.
+fn values_equal_within(left: &AttributeValue, right: &AttributeValue, budget: usize) -> bool {
+    if budget == 0 {
+        return false;
+    }
+    match (left, right) {
+        (AttributeValue::S(mine), AttributeValue::S(theirs)) => mine == theirs,
+        (AttributeValue::B(mine), AttributeValue::B(theirs)) => mine == theirs,
+        (AttributeValue::N(mine), AttributeValue::N(theirs)) => numbers_equal(mine, theirs),
+        (AttributeValue::Bool(mine), AttributeValue::Bool(theirs)) => mine == theirs,
+        (AttributeValue::Null(mine), AttributeValue::Null(theirs)) => mine == theirs,
+        (AttributeValue::Ss(mine), AttributeValue::Ss(theirs)) => {
+            same_members(mine, theirs, |text| text.as_str())
+        }
+        (AttributeValue::Ns(mine), AttributeValue::Ns(theirs)) => {
+            same_members(mine, theirs, |text| canonical_number(text))
+        }
+        (AttributeValue::Bs(mine), AttributeValue::Bs(theirs)) => {
+            same_members(mine, theirs, |bytes| bytes.as_slice())
+        }
+        (AttributeValue::L(mine), AttributeValue::L(theirs)) => {
+            mine.len() == theirs.len()
+                && mine
+                    .iter()
+                    .zip(theirs.iter())
+                    .all(|(a, b)| values_equal_within(a, b, budget - 1))
+        }
+        (AttributeValue::M(mine), AttributeValue::M(theirs)) => {
+            mine.len() == theirs.len()
+                && mine.iter().all(|(name, value)| {
+                    theirs
+                        .get(name)
+                        .is_some_and(|other| values_equal_within(value, other, budget - 1))
+                })
+        }
+        _ => false,
+    }
+}
+
+/// Whether two `N` texts denote one value, which is a numeric question rather than a
+/// textual one. A text neither side can parse falls back to the text itself.
+fn numbers_equal(left: &str, right: &str) -> bool {
+    match (NumberKey::parse(left), NumberKey::parse(right)) {
+        (Some(mine), Some(theirs)) => mine == theirs,
+        _ => left == right,
+    }
+}
+
+/// The refusal for an update that states more actions than this service will index,
+/// apply and write for one request.
+fn too_many_actions(count: usize) -> RequestError {
+    RequestError::Validation(format!(
+        "One or more parameter values were invalid: an update may state at most \
+         {MAX_UPDATE_ACTIONS} actions, got {count}"
+    ))
+}
+
+/// The refusal for two actions of one update that write the same document location, or
+/// one inside the other: DynamoDB cannot apply both.
+fn overlapping_paths(one: &str, two: &str) -> RequestError {
+    RequestError::Validation(format!(
+        "Invalid UpdateExpression: Two document paths overlap with each other; must remove or \
+         rewrite one of these paths; path one: {one}, path two: {two}"
+    ))
+}
+
+/// The limits every attribute value this service stores — or compares a stored one
+/// against — is held to: the documented nesting depth, the documented 400 KB item size
+/// (no ONE value can be larger than the item that must hold it), and
+/// [`MAX_COLLECTION_MEMBERS`] over the sets, lists and maps the value carries.
+///
+/// Every term comes from the request, and every one bounds work done per request later
+/// (the walk over a value, the clone of it into the item, the set and list operations
+/// over its members), so every value is held to them at admission — on every write
+/// path, for every substituted expression value, AND for every value an update computes
+/// before it is written.
+pub fn check_attribute_value(name: &str, value: &AttributeValue) -> Result<(), RequestError> {
+    if attribute_depth_exceeds(value, MAX_ATTRIBUTE_DEPTH) {
+        return Err(nesting_levels_exceeded());
+    }
+    // No ONE value can be larger than the item that would have to hold it, so this is
+    // also the bound on the bytes a single substitution can carry into the store: the
+    // check PRECEDES every clone of it.
+    if attribute_value_size(value) > MAX_ITEM_SIZE_BYTES {
+        return Err(RequestError::Validation(
+            ITEM_SIZE_EXCEEDED_MESSAGE.to_string(),
+        ));
+    }
+    if value_members(value) > MAX_COLLECTION_MEMBERS {
+        return Err(too_many_members(name, value_members(value)));
+    }
+    Ok(())
+}
+
+/// The TOTAL members every collection inside `value` carries, summed — the stricter of
+/// the two bounds a value could be held to, so neither one wide collection nor many
+/// narrow ones escapes [`MAX_COLLECTION_MEMBERS`].
+///
+/// The walk is ITERATIVE, over an explicit stack, for the reason
+/// [`attribute_value_size`] gives.
+fn value_members(value: &AttributeValue) -> usize {
+    let mut total = 0usize;
+    let mut pending = vec![value];
+    while let Some(value) = pending.pop() {
+        total = total.saturating_add(match value {
+            AttributeValue::L(values) => {
+                pending.extend(values.iter());
+                values.len()
+            }
+            AttributeValue::M(entries) => {
+                pending.extend(entries.values());
+                entries.len()
+            }
+            other => set_len(other).unwrap_or(0),
+        });
+    }
+    total
+}
+
+/// The members an update has written so far, plus the ones `value` carries — refused
+/// past [`MAX_COLLECTION_MEMBERS`] in TOTAL across the update, so a per-value ceiling
+/// cannot be multiplied by the action count. Counted before the value is written.
+fn check_members_written(
+    written: usize,
+    name: &str,
+    value: &AttributeValue,
+) -> Result<usize, RequestError> {
+    let total = written.saturating_add(value_members(value));
+    if total > MAX_COLLECTION_MEMBERS {
+        return Err(too_many_members(name, total));
+    }
+    Ok(total)
+}
+
+/// Whether `item` has room for `value` at `path` — the clamp that PRECEDES the write,
+/// so the item an update builds cannot grow past the documented 400 KB even while it is
+/// being built, however many actions the update states.
+fn check_room_for(
+    item: &Item,
+    path: &DocumentPath,
+    value: &AttributeValue,
+) -> Result<(), RequestError> {
+    let replaced = path.get(item).map_or(0, attribute_value_size);
+    let projected = item_size(item)
+        .saturating_sub(replaced)
+        .saturating_add(attribute_value_size(value));
+    if projected > MAX_ITEM_SIZE_BYTES {
+        return Err(RequestError::Validation(
+            ITEM_SIZE_EXCEEDED_MESSAGE.to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// The refusal for a collection past [`MAX_COLLECTION_MEMBERS`], whether a request sent
+/// it or an update's own `ADD`/`list_append` built it.
+fn too_many_members(name: &str, members: usize) -> RequestError {
+    RequestError::Validation(format!(
+        "Attribute {name} holds {members} members, more than this emulator's maximum of \
+         {MAX_COLLECTION_MEMBERS}"
+    ))
+}
+
+/// A set member's canonical sort key, so that members compare and deduplicate by the
+/// VALUE they denote: two `N` spellings of one number share one key.
+fn canonical_number(text: &str) -> String {
+    NumberKey::parse(text).map_or_else(|| text.to_string(), |number| number.canonical_text())
+}
+
+/// Whether two sets hold the same members. A DynamoDB set is unordered, so this is
+/// member-wise rather than position-wise.
+///
+/// Both sides are SORTED by `key` rather than walked pairwise: the member count comes
+/// from the request, so a pairwise walk would cost the product of two caller-chosen
+/// counts, where sorting costs `n log n`.
+fn same_members<'v, T: 'v, K: Ord>(
+    left: &'v [T],
+    right: &'v [T],
+    key: impl Fn(&'v T) -> K,
+) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut mine: Vec<K> = left.iter().map(&key).collect();
+    let mut theirs: Vec<K> = right.iter().map(&key).collect();
+    mine.sort_unstable();
+    theirs.sort_unstable();
+    mine == theirs
+}
+
+/// How two attribute values order, or `None` when DynamoDB documents no order between
+/// them: "For type Number, value comparisons are numeric. String value comparisons for
+/// greater than, equals, or less than are based on ASCII character code values. For
+/// Binary, DynamoDB treats each byte of the binary data as unsigned when it compares
+/// binary values" (the `AttributeValueList` doc) — and nothing for the other types, or
+/// across types.
+fn compare_values(left: &AttributeValue, right: &AttributeValue) -> Option<Ordering> {
+    match (left, right) {
+        (AttributeValue::S(mine), AttributeValue::S(theirs)) => Some(mine.cmp(theirs)),
+        (AttributeValue::B(mine), AttributeValue::B(theirs)) => Some(mine.cmp(theirs)),
+        (AttributeValue::N(mine), AttributeValue::N(theirs)) => {
+            Some(NumberKey::parse(mine)?.cmp(&NumberKey::parse(theirs)?))
+        }
+        _ => None,
+    }
+}
+
+/// `begins_with (path, operand)` — "true if the attribute specified by path begins
+/// with a particular substring", which only a string or binary value can.
+fn begins_with_value(value: &AttributeValue, prefix: &AttributeValue) -> bool {
+    match (value, prefix) {
+        (AttributeValue::S(text), AttributeValue::S(prefix)) => text.starts_with(prefix.as_str()),
+        (AttributeValue::B(bytes), AttributeValue::B(prefix)) => bytes.starts_with(prefix),
+        _ => false,
+    }
+}
+
+/// `contains (path, operand)` — "true if the attribute specified by path is: A String
+/// that contains a particular substring, [or] A Set that contains a particular
+/// element". A list is searched for the element too, the way `CONTAINS` reads it.
+fn contains_value(haystack: &AttributeValue, needle: &AttributeValue) -> bool {
+    match (haystack, needle) {
+        (AttributeValue::S(text), AttributeValue::S(part)) => text.contains(part.as_str()),
+        (AttributeValue::Ss(members), AttributeValue::S(member)) => members.contains(member),
+        (AttributeValue::Ns(members), AttributeValue::N(member)) => {
+            members.iter().any(|stored| numbers_equal(stored, member))
+        }
+        (AttributeValue::Bs(members), AttributeValue::B(member)) => members.contains(member),
+        (AttributeValue::L(members), needle) => members
+            .iter()
+            .any(|stored| attribute_values_equal(stored, needle)),
+        _ => false,
+    }
+}
+
+/// `size (path)` — the length of the value at a path: bytes for a string or binary
+/// value, members for a set, elements for a list, entries for a map. Nothing else has
+/// a documented size.
+fn size_of_value(value: &AttributeValue) -> Option<i64> {
+    Some(match value {
+        AttributeValue::S(text) => byte_len(text.len()),
+        AttributeValue::B(bytes) => byte_len(bytes.len()),
+        AttributeValue::Ss(members) => byte_len(members.len()),
+        AttributeValue::Ns(members) => byte_len(members.len()),
+        AttributeValue::Bs(members) => byte_len(members.len()),
+        AttributeValue::L(values) => byte_len(values.len()),
+        AttributeValue::M(entries) => byte_len(entries.len()),
+        AttributeValue::N(_) | AttributeValue::Bool(_) | AttributeValue::Null(_) => return None,
+    })
+}
+
+/// Add or subtract two `N` values, reporting the canonical text of the result.
+///
+/// The arithmetic is exact decimal arithmetic (the `bigdecimal` crate), rounded to the
+/// documented 38 significant digits, so `SET n = n + :v` and `ADD n :v` answer what
+/// DynamoDB answers rather than what binary floating point would. The result is
+/// rendered through [`canonical_number_text`], the same canonicalization a written
+/// number goes through, so a computed number is refused by the rule it breaks and
+/// stored in the one form every read reports.
+pub fn number_arithmetic(
+    left: &str,
+    right: &str,
+    subtract: bool,
+) -> Result<String, RequestError> {
+    let left_value = parse_decimal(left)?;
+    let right_value = parse_decimal(right)?;
+    let result = if subtract {
+        left_value - right_value
+    } else {
+        left_value + right_value
+    };
+    let precision = u64::try_from(MAX_SIGNIFICANT_DIGITS).unwrap_or(38);
+    let (digits, scale) = result.with_prec(precision).as_bigint_and_exponent();
+    // `digits * 10^-scale` is the value, which is exactly what an `N` text spells.
+    canonical_number_text(&format!("{digits}e{}", -scale))
+}
+
+/// One operand of that arithmetic. The canonical text is what reaches the decimal
+/// parser, so only one spelling of a number ever does, and a text that denotes no
+/// number this store can hold is refused by the rule it breaks.
+fn parse_decimal(text: &str) -> Result<BigDecimal, RequestError> {
+    let canonical = canonical_number_text(text)?;
+    BigDecimal::from_str(&canonical)
+        .map_err(|_| number_rejection(text, NumberFault::NotNumeric))
+}
+
+/// The members of a set value, as the member-wise set operations below walk them.
+enum SetMembers<'a> {
+    Strings(&'a [String]),
+    Numbers(&'a [String]),
+    Binaries(&'a [Vec<u8>]),
+}
+
+/// A value's set members, or `None` when it is not a set at all.
+fn set_members(value: &AttributeValue) -> Option<SetMembers<'_>> {
+    match value {
+        AttributeValue::Ss(members) => Some(SetMembers::Strings(members)),
+        AttributeValue::Ns(members) => Some(SetMembers::Numbers(members)),
+        AttributeValue::Bs(members) => Some(SetMembers::Binaries(members)),
+        _ => None,
+    }
+}
+
+/// How many members a set holds, for the empty-set refusal.
+fn set_len(value: &AttributeValue) -> Option<usize> {
+    Some(match set_members(value)? {
+        SetMembers::Strings(members) | SetMembers::Numbers(members) => members.len(),
+        SetMembers::Binaries(members) => members.len(),
+    })
+}
+
+/// The members a union would hold at most, refused past [`MAX_COLLECTION_MEMBERS`]
+/// BEFORE the union is built: a repeated `ADD` must not grow one stored set past the
+/// ceiling every value is admitted under.
+fn check_union_members(stored: usize, incoming: usize) -> Result<(), RequestError> {
+    let total = stored.saturating_add(incoming);
+    if total > MAX_COLLECTION_MEMBERS {
+        return Err(too_many_members("the set being added to", total));
+    }
+    Ok(())
+}
+
+/// `ADD`'s set form: "If the existing data type is a set and if Value is also a set,
+/// then Value is added to the existing set". Both sets must hold the same primitive
+/// type, and a member the set already holds is not added twice.
+///
+/// Membership is tested against a SORTED index of the stored members rather than by
+/// scanning them per incoming member: both counts come from the request, so a scan per
+/// member would cost their product.
+fn set_union(
+    existing: &AttributeValue,
+    addition: &AttributeValue,
+) -> Result<AttributeValue, RequestError> {
+    match (existing, addition) {
+        (AttributeValue::Ss(stored), AttributeValue::Ss(incoming)) => {
+            check_union_members(stored.len(), incoming.len())?;
+            let mut held: BTreeSet<&str> = stored.iter().map(String::as_str).collect();
+            let mut members = stored.clone();
+            for member in incoming {
+                if held.insert(member.as_str()) {
+                    members.push(member.clone());
+                }
+            }
+            Ok(AttributeValue::Ss(members))
+        }
+        (AttributeValue::Ns(stored), AttributeValue::Ns(incoming)) => {
+            check_union_members(stored.len(), incoming.len())?;
+            let mut held: BTreeSet<String> = stored.iter().map(|text| canonical_number(text)).collect();
+            let mut members = stored.clone();
+            for member in incoming {
+                if held.insert(canonical_number(member)) {
+                    members.push(member.clone());
+                }
+            }
+            Ok(AttributeValue::Ns(members))
+        }
+        (AttributeValue::Bs(stored), AttributeValue::Bs(incoming)) => {
+            check_union_members(stored.len(), incoming.len())?;
+            let mut held: BTreeSet<&[u8]> = stored.iter().map(Vec::as_slice).collect();
+            let mut members = stored.clone();
+            for member in incoming {
+                if held.insert(member.as_slice()) {
+                    members.push(member.clone());
+                }
+            }
+            Ok(AttributeValue::Bs(members))
+        }
+        (held, incoming) => Err(RequestError::Validation(format!(
+            "Type mismatch for attribute to update: an ADD of a {} cannot be applied to a {}",
+            attribute_value_type(incoming),
+            attribute_value_type(held)
+        ))),
+    }
+}
+
+/// `DELETE`'s set form: "those values are subtracted from the old set". An empty
+/// result is no set at all, so the attribute goes away with its last member. The
+/// members to remove are indexed first, for the reason [`set_union`] gives.
+fn set_difference(
+    existing: &AttributeValue,
+    removal: &AttributeValue,
+) -> Result<Option<AttributeValue>, RequestError> {
+    let remaining = match (existing, removal) {
+        (AttributeValue::Ss(stored), AttributeValue::Ss(removed)) => {
+            let gone: BTreeSet<&str> = removed.iter().map(String::as_str).collect();
+            let members: Vec<String> = stored
+                .iter()
+                .filter(|member| !gone.contains(member.as_str()))
+                .cloned()
+                .collect();
+            (!members.is_empty()).then_some(AttributeValue::Ss(members))
+        }
+        (AttributeValue::Ns(stored), AttributeValue::Ns(removed)) => {
+            let gone: BTreeSet<String> = removed.iter().map(|text| canonical_number(text)).collect();
+            let members: Vec<String> = stored
+                .iter()
+                .filter(|member| !gone.contains(&canonical_number(member)))
+                .cloned()
+                .collect();
+            (!members.is_empty()).then_some(AttributeValue::Ns(members))
+        }
+        (AttributeValue::Bs(stored), AttributeValue::Bs(removed)) => {
+            let gone: BTreeSet<&[u8]> = removed.iter().map(Vec::as_slice).collect();
+            let members: Vec<Vec<u8>> = stored
+                .iter()
+                .filter(|member| !gone.contains(member.as_slice()))
+                .cloned()
+                .collect();
+            (!members.is_empty()).then_some(AttributeValue::Bs(members))
+        }
+        (held, removed) => {
+            return Err(RequestError::Validation(format!(
+                "Type mismatch for attribute to update: a DELETE of a {} cannot be applied to a {}",
+                attribute_value_type(removed),
+                attribute_value_type(held)
+            )))
+        }
+    };
+    Ok(remaining)
+}
+
+/// One operand of a condition: a document path, a literal value, or `size (path)`.
+#[derive(Debug, Clone)]
+enum Operand {
+    Path(DocumentPath),
+    Value(AttributeValue),
+    Size(DocumentPath),
+}
+
+/// One node of a parsed `ConditionExpression`.
+#[derive(Debug, Clone)]
+enum ConditionNode {
+    /// Every one of these must hold (`AND`).
+    All(Vec<ConditionNode>),
+    /// At least one of these must hold (`OR`).
+    Any(Vec<ConditionNode>),
+    Not(Box<ConditionNode>),
+    Compare(Operand, CompareOp, Operand),
+    Between(Operand, Operand, Operand),
+    In(Operand, Vec<Operand>),
+    /// `attribute_exists` when true, `attribute_not_exists` when false.
+    Exists(DocumentPath, bool),
+    AttributeType(DocumentPath, Operand),
+    BeginsWith(Operand, Operand),
+    Contains(Operand, Operand),
+}
+
+/// A `ConditionExpression`, parsed once and then evaluated against the stored item.
+#[derive(Debug, Clone)]
+pub struct ParsedCondition {
+    node: ConditionNode,
+}
+
+impl ParsedCondition {
+    /// Parse one `ConditionExpression`. The grammar is DynamoDB's own: comparisons,
+    /// `BETWEEN`, `IN`, the documented functions, combined with `AND`, `OR` and `NOT`
+    /// and grouped with parentheses.
+    pub fn parse(
+        member: &'static str,
+        expression: &str,
+        substitutions: Substitutions<'_>,
+    ) -> Result<Self, RequestError> {
+        let tokens = tokenize_expression(member, expression)?;
+        let mut parser = ExprParser::new(member, &tokens, substitutions);
+        let node = parser.disjunction()?;
+        if !parser.at_end() {
+            return Err(expression_syntax_error(member));
+        }
+        Ok(Self { node })
+    }
+
+    /// Whether the condition holds for `item` — the stored item, or `None` when the
+    /// key holds no item, which is what `attribute_not_exists` is for.
+    pub fn evaluate(&self, item: Option<&Item>) -> Result<bool, RequestError> {
+        let absent = Item::new();
+        evaluate_condition(&self.node, item.unwrap_or(&absent))
+    }
+}
+
+/// Evaluate one condition node.
+///
+/// Recursion follows the parsed tree, whose depth the parser holds at
+/// [`MAX_EXPRESSION_DEPTH`]: `AND` and `OR` chains are flattened into one node each,
+/// so a long expression widens the tree rather than deepening it.
+fn evaluate_condition(node: &ConditionNode, item: &Item) -> Result<bool, RequestError> {
+    match node {
+        ConditionNode::All(nodes) => {
+            for node in nodes {
+                if !evaluate_condition(node, item)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        ConditionNode::Any(nodes) => {
+            for node in nodes {
+                if evaluate_condition(node, item)? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        ConditionNode::Not(inner) => Ok(!evaluate_condition(inner, item)?),
+        ConditionNode::Compare(left, operator, right) => {
+            let (Some(left), Some(right)) = (resolve_operand(left, item), resolve_operand(right, item))
+            else {
+                // A path that addresses nothing satisfies no comparison, the way a
+                // missing attribute matches no `Expected` comparison either.
+                return Ok(false);
+            };
+            Ok(match operator {
+                CompareOp::Equal => attribute_values_equal(&left, &right),
+                CompareOp::NotEqual => !attribute_values_equal(&left, &right),
+                CompareOp::Less => compare_values(&left, &right) == Some(Ordering::Less),
+                CompareOp::LessOrEqual => {
+                    matches!(
+                        compare_values(&left, &right),
+                        Some(Ordering::Less | Ordering::Equal)
+                    )
+                }
+                CompareOp::Greater => compare_values(&left, &right) == Some(Ordering::Greater),
+                CompareOp::GreaterOrEqual => matches!(
+                    compare_values(&left, &right),
+                    Some(Ordering::Greater | Ordering::Equal)
+                ),
+            })
+        }
+        ConditionNode::Between(value, low, high) => {
+            let (Some(value), Some(low), Some(high)) = (
+                resolve_operand(value, item),
+                resolve_operand(low, item),
+                resolve_operand(high, item),
+            ) else {
+                return Ok(false);
+            };
+            Ok(matches!(
+                compare_values(&value, &low),
+                Some(Ordering::Greater | Ordering::Equal)
+            ) && matches!(
+                compare_values(&value, &high),
+                Some(Ordering::Less | Ordering::Equal)
+            ))
+        }
+        ConditionNode::In(value, candidates) => {
+            let Some(value) = resolve_operand(value, item) else {
+                return Ok(false);
+            };
+            Ok(candidates.iter().any(|candidate| {
+                resolve_operand(candidate, item)
+                    .is_some_and(|candidate| attribute_values_equal(&value, &candidate))
+            }))
+        }
+        ConditionNode::Exists(path, expected) => Ok(path.get(item).is_some() == *expected),
+        ConditionNode::AttributeType(path, operand) => {
+            let Some(AttributeValue::S(wanted)) = resolve_operand(operand, item) else {
+                return Err(RequestError::Validation(
+                    "Invalid ConditionExpression: the second operand of attribute_type must be a \
+                     string naming an attribute type"
+                        .to_string(),
+                ));
+            };
+            Ok(path
+                .get(item)
+                .is_some_and(|value| attribute_value_type(value) == wanted))
+        }
+        ConditionNode::BeginsWith(value, prefix) => {
+            let (Some(value), Some(prefix)) =
+                (resolve_operand(value, item), resolve_operand(prefix, item))
+            else {
+                return Ok(false);
+            };
+            Ok(begins_with_value(&value, &prefix))
+        }
+        ConditionNode::Contains(haystack, needle) => {
+            let (Some(haystack), Some(needle)) = (
+                resolve_operand(haystack, item),
+                resolve_operand(needle, item),
+            ) else {
+                return Ok(false);
+            };
+            Ok(contains_value(&haystack, &needle))
+        }
+    }
+}
+
+/// The value one condition operand stands for, or `None` when it addresses nothing.
+fn resolve_operand(operand: &Operand, item: &Item) -> Option<AttributeValue> {
+    match operand {
+        Operand::Value(value) => Some(value.clone()),
+        Operand::Path(path) => path.get(item).cloned(),
+        Operand::Size(path) => path
+            .get(item)
+            .and_then(size_of_value)
+            .map(|size| AttributeValue::N(size.to_string())),
+    }
+}
+
+/// One action of a parsed `UpdateExpression` (or of the legacy `AttributeUpdates`
+/// map, which states the same four actions a request at a time).
+#[derive(Debug, Clone)]
+enum UpdateAction {
+    Set(DocumentPath, SetValue),
+    Remove(DocumentPath),
+    Add(DocumentPath, AttributeValue),
+    Delete(DocumentPath, AttributeValue),
+}
+
+impl UpdateAction {
+    /// The path this action writes to.
+    fn path(&self) -> &DocumentPath {
+        match self {
+            Self::Set(path, _) | Self::Remove(path) | Self::Add(path, _) | Self::Delete(path, _) => {
+                path
+            }
+        }
+    }
+}
+
+/// The right-hand side of one `SET`: one operand, or two joined by `+` or `-`.
+#[derive(Debug, Clone)]
+enum SetValue {
+    Single(SetOperand),
+    Sum(SetOperand, SetOperand),
+    Difference(SetOperand, SetOperand),
+}
+
+/// One operand of a `SET`: a path, a literal value, or one of the two documented
+/// functions.
+#[derive(Debug, Clone)]
+enum SetOperand {
+    Path(DocumentPath),
+    Value(AttributeValue),
+    /// `if_not_exists (path, operand)` — "if the item does not contain an attribute at
+    /// the specified path, then if_not_exists evaluates to operand; otherwise, it
+    /// evaluates to path".
+    IfNotExists(DocumentPath, Box<SetOperand>),
+    /// `list_append (operand, operand)` — "evaluates to a list with a new element
+    /// added to it".
+    ListAppend(Box<SetOperand>, Box<SetOperand>),
+}
+
+/// The update one request states, from `UpdateExpression` or from the legacy
+/// `AttributeUpdates` map, parsed once and then applied to the stored item.
+#[derive(Debug, Clone)]
+pub struct ParsedUpdate {
+    actions: Vec<UpdateAction>,
+}
+
+impl ParsedUpdate {
+    /// Parse one `UpdateExpression`: the `SET`, `REMOVE`, `ADD` and `DELETE` sections,
+    /// each at most once, each a comma-separated list of actions.
+    pub fn parse(
+        member: &'static str,
+        expression: &str,
+        substitutions: Substitutions<'_>,
+    ) -> Result<Self, RequestError> {
+        let tokens = tokenize_expression(member, expression)?;
+        let mut parser = ExprParser::new(member, &tokens, substitutions);
+        let actions = parser.update_actions()?;
+        Self::from_actions(actions)
+    }
+
+    /// The same update, as the legacy `AttributeUpdates` map states it: one action per
+    /// top-level attribute, `PUT` by default (the `AttributeValueUpdate$Action` doc).
+    ///
+    /// The map's entry count is the request's to choose and this legacy member carries
+    /// no modelled bound, so it is clamped BEFORE one action per entry is built.
+    pub fn from_attribute_updates(
+        updates: &HashMap<String, AttributeValueUpdate>,
+    ) -> Result<Self, RequestError> {
+        if updates.len() > MAX_UPDATE_ACTIONS {
+            return Err(too_many_actions(updates.len()));
+        }
+        let mut actions = Vec::new();
+        for (name, update) in updates {
+            let path = DocumentPath::attribute_named(name);
+            let action = update.action.as_deref().unwrap_or("PUT");
+            match action {
+                "PUT" => actions.push(UpdateAction::Set(
+                    path,
+                    SetValue::Single(SetOperand::Value(required_update_value(name, update)?)),
+                )),
+                // "DELETE - If no value is specified, the attribute and its value are
+                // removed from the item", and with a set value those members are
+                // subtracted from the stored set.
+                "DELETE" => actions.push(match &update.value {
+                    None => UpdateAction::Remove(path),
+                    Some(value) => UpdateAction::Delete(path, value.clone()),
+                }),
+                "ADD" => {
+                    actions.push(UpdateAction::Add(path, required_update_value(name, update)?));
+                }
+                other => {
+                    return Err(RequestError::Validation(format!(
+                        "One or more parameter values were invalid: Unknown AttributeUpdates \
+                         action: {other} for attribute {name}"
+                    )))
+                }
+            }
+        }
+        Self::from_actions(actions)
+    }
+
+    /// Hold the actions, refusing two that write overlapping document locations:
+    /// DynamoDB cannot apply both, so the request is wrong rather than one of them
+    /// winning silently.
+    ///
+    /// The action count comes from the request, so it is CLAMPED here — before the
+    /// overlap check, before [`Self::apply`] walks it and before any caller takes the
+    /// store's lock — and the overlap check itself indexes the paths rather than
+    /// comparing every pair: a path overlaps another exactly when one is a step-prefix
+    /// of the other, so each path only has to look its own prefixes up.
+    fn from_actions(actions: Vec<UpdateAction>) -> Result<Self, RequestError> {
+        if actions.len() > MAX_UPDATE_ACTIONS {
+            return Err(too_many_actions(actions.len()));
+        }
+        let mut written: BTreeSet<String> = BTreeSet::new();
+        for action in &actions {
+            let path = action.path();
+            if !written.insert(path.render()) {
+                return Err(overlapping_paths(&path.render(), &path.render()));
+            }
+        }
+        for action in &actions {
+            let path = action.path();
+            for steps in 1..path.0.len() {
+                let prefix = path.render_prefix(steps);
+                if written.contains(&prefix) {
+                    return Err(overlapping_paths(&prefix, &path.render()));
+                }
+            }
+        }
+        Ok(Self { actions })
+    }
+
+    /// The update a request that states none makes: nothing at all. `UpdateItem`
+    /// still "adds a new item to the table if it does not already exist", so such a
+    /// request creates the item from its key alone.
+    pub fn nothing() -> Self {
+        Self {
+            actions: Vec::new(),
+        }
+    }
+
+    /// Apply every action to `item`, reporting the top-level attributes that changed.
+    ///
+    /// Every operand reads the item as it stood BEFORE the update, so one expression's
+    /// actions are independent of the order they are applied in. A value an action
+    /// COMPUTES goes through [`check_attribute_value`] before it is written, exactly as
+    /// one a request sent does, and the item is clamped AS IT GROWS — the room check and
+    /// the running member count both precede each write — so a many-action update
+    /// cannot multiply a per-value bound into an unbounded item while it is being
+    /// built, however many actions the expression states.
+    pub fn apply(&self, item: &mut Item) -> Result<BTreeSet<String>, RequestError> {
+        let before = item.clone();
+        let mut touched = BTreeSet::new();
+        let mut members_written = 0usize;
+        for action in &self.actions {
+            let path = action.path();
+            match action {
+                UpdateAction::Set(path, value) => {
+                    let value = evaluate_set_value(value, &before)?;
+                    check_attribute_value(path.attribute(), &value)?;
+                    members_written =
+                        check_members_written(members_written, path.attribute(), &value)?;
+                    check_room_for(item, path, &value)?;
+                    path.set(item, value)?;
+                    touched.insert(path.attribute().to_string());
+                }
+                UpdateAction::Remove(path) => {
+                    if path.remove(item).is_some() {
+                        touched.insert(path.attribute().to_string());
+                    }
+                }
+                UpdateAction::Add(_, value) => {
+                    let added = apply_add(path, value, &before)?;
+                    check_attribute_value(path.attribute(), &added)?;
+                    members_written =
+                        check_members_written(members_written, path.attribute(), &added)?;
+                    check_room_for(item, path, &added)?;
+                    path.set(item, added)?;
+                    touched.insert(path.attribute().to_string());
+                }
+                UpdateAction::Delete(_, value) => {
+                    if apply_delete(path, value, &before, item)? {
+                        touched.insert(path.attribute().to_string());
+                    }
+                }
+            }
+        }
+        Ok(touched)
+    }
+}
+
+/// The value of an `AttributeValueUpdate` that needs one.
+fn required_update_value(
+    name: &str,
+    update: &AttributeValueUpdate,
+) -> Result<AttributeValue, RequestError> {
+    update.value.clone().ok_or_else(|| {
+        RequestError::Validation(format!(
+            "One or more parameter values were invalid: Only DELETE action is allowed when no \
+             attribute value is specified: {name}"
+        ))
+    })
+}
+
+/// What one `ADD` leaves at its path: "If the existing attribute is a number, and if
+/// Value is also a number, then Value is mathematically added to the existing
+/// attribute"; a set is unioned; and an attribute that is not there yet starts from
+/// `0` for a number, or from the empty set, so the value itself is the result.
+fn apply_add(
+    path: &DocumentPath,
+    value: &AttributeValue,
+    before: &Item,
+) -> Result<AttributeValue, RequestError> {
+    if set_len(value) == Some(0) {
+        return Err(RequestError::Validation(format!(
+            "One or more parameter values were invalid: An ADD action may not specify an empty \
+             set: {}",
+            path.render()
+        )));
+    }
+    match path.get(before) {
+        None => match value {
+            AttributeValue::N(_) | AttributeValue::Ns(_) | AttributeValue::Ss(_)
+            | AttributeValue::Bs(_) => Ok(value.clone()),
+            other => Err(RequestError::Validation(format!(
+                "One or more parameter values were invalid: ADD only supports Number and set \
+                 data types, got {} for {}",
+                attribute_value_type(other),
+                path.render()
+            ))),
+        },
+        Some(AttributeValue::N(held)) => match value {
+            AttributeValue::N(increment) => Ok(AttributeValue::N(number_arithmetic(
+                held, increment, false,
+            )?)),
+            other => Err(RequestError::Validation(format!(
+                "Type mismatch for attribute to update: an ADD of a {} cannot be applied to a \
+                 number",
+                attribute_value_type(other)
+            ))),
+        },
+        Some(held) if set_members(held).is_some() => set_union(held, value),
+        Some(held) => Err(RequestError::Validation(format!(
+            "One or more parameter values were invalid: ADD only supports Number and set data \
+             types, and {} holds a {}",
+            path.render(),
+            attribute_value_type(held)
+        ))),
+    }
+}
+
+/// Apply one `DELETE`, reporting whether it changed the item. Deleting from an
+/// attribute that is not there is nothing to do, the way the legacy action's doc says:
+/// "DELETE - Nothing happens; there is no attribute to delete".
+fn apply_delete(
+    path: &DocumentPath,
+    value: &AttributeValue,
+    before: &Item,
+    item: &mut Item,
+) -> Result<bool, RequestError> {
+    if set_len(value) == Some(0) {
+        return Err(RequestError::Validation(format!(
+            "One or more parameter values were invalid: A DELETE action may not specify an empty \
+             set: {}",
+            path.render()
+        )));
+    }
+    let Some(held) = path.get(before) else {
+        return Ok(false);
+    };
+    match set_difference(held, value)? {
+        Some(remaining) => path.set(item, remaining)?,
+        None => {
+            path.remove(item);
+        }
+    }
+    Ok(true)
+}
+
+/// The value one `SET` writes, evaluated against the item as it stood before the
+/// update.
+fn evaluate_set_value(value: &SetValue, before: &Item) -> Result<AttributeValue, RequestError> {
+    match value {
+        SetValue::Single(operand) => evaluate_set_operand(operand, before),
+        SetValue::Sum(left, right) | SetValue::Difference(left, right) => {
+            let subtract = matches!(value, SetValue::Difference(_, _));
+            let left = evaluate_set_operand(left, before)?;
+            let right = evaluate_set_operand(right, before)?;
+            match (&left, &right) {
+                (AttributeValue::N(left), AttributeValue::N(right)) => Ok(AttributeValue::N(
+                    number_arithmetic(left, right, subtract)?,
+                )),
+                _ => Err(RequestError::Validation(format!(
+                    "Invalid UpdateExpression: Incorrect operand type for operator or function; \
+                     operator: {}, operand types: {} and {}",
+                    if subtract { "-" } else { "+" },
+                    attribute_value_type(&left),
+                    attribute_value_type(&right)
+                ))),
+            }
+        }
+    }
+}
+
+/// One `SET` operand's value. A path that addresses nothing is the caller's mistake —
+/// there is no value to write — rather than a silent no-op.
+fn evaluate_set_operand(
+    operand: &SetOperand,
+    before: &Item,
+) -> Result<AttributeValue, RequestError> {
+    match operand {
+        SetOperand::Value(value) => Ok(value.clone()),
+        SetOperand::Path(path) => path.get(before).cloned().ok_or_else(|| {
+            RequestError::Validation(format!(
+                "The provided expression refers to an attribute that does not exist in the item: \
+                 {}",
+                path.render()
+            ))
+        }),
+        SetOperand::IfNotExists(path, fallback) => match path.get(before) {
+            Some(value) => Ok(value.clone()),
+            None => evaluate_set_operand(fallback, before),
+        },
+        SetOperand::ListAppend(first, second) => {
+            let first = evaluate_set_operand(first, before)?;
+            let second = evaluate_set_operand(second, before)?;
+            match (first, second) {
+                (AttributeValue::L(mut head), AttributeValue::L(tail)) => {
+                    // The concatenation is bounded BEFORE it is built, and the result
+                    // is held to the documented item size: a `list_append` nested
+                    // inside another would otherwise double its operand per level, and
+                    // only the outermost result ever reaches the item-size check.
+                    let total = head.len().saturating_add(tail.len());
+                    if total > MAX_COLLECTION_MEMBERS {
+                        return Err(too_many_members("the list being appended to", total));
+                    }
+                    head.extend(tail);
+                    let appended = AttributeValue::L(head);
+                    if attribute_value_size(&appended) > MAX_ITEM_SIZE_BYTES {
+                        return Err(RequestError::Validation(
+                            ITEM_SIZE_EXCEEDED_MESSAGE.to_string(),
+                        ));
+                    }
+                    Ok(appended)
+                }
+                (first, second) => Err(RequestError::Validation(format!(
+                    "Invalid UpdateExpression: Incorrect operand type for operator or function; \
+                     function: list_append, operand types: {} and {}",
+                    attribute_value_type(&first),
+                    attribute_value_type(&second)
+                ))),
+            }
+        }
+    }
+}
+
+/// Recursive-descent parser over the tokens of one expression.
+///
+/// `depth` caps how far the rules that descend may: the nesting is caller-chosen, so
+/// without the cap the number of stack frames would be too (and a stack overflow
+/// aborts the process rather than failing one request).
+struct ExprParser<'a> {
+    member: &'static str,
+    tokens: &'a [ExprToken],
+    at: usize,
+    depth: usize,
+    substitutions: Substitutions<'a>,
+}
+
+impl<'a> ExprParser<'a> {
+    fn new(member: &'static str, tokens: &'a [ExprToken], substitutions: Substitutions<'a>) -> Self {
+        Self {
+            member,
+            tokens,
+            at: 0,
+            depth: 0,
+            substitutions,
+        }
+    }
+
+    fn syntax(&self) -> RequestError {
+        expression_syntax_error(self.member)
+    }
+
+    fn at_end(&self) -> bool {
+        self.at >= self.tokens.len()
+    }
+
+    fn peek(&self) -> Option<&ExprToken> {
+        self.tokens.get(self.at)
+    }
+
+    fn next_token(&mut self) -> Result<ExprToken, RequestError> {
+        let token = self.peek().cloned().ok_or_else(|| self.syntax())?;
+        self.at += 1;
+        Ok(token)
+    }
+
+    /// Consume `token` if that is what comes next.
+    fn eat(&mut self, token: &ExprToken) -> bool {
+        if self.peek() == Some(token) {
+            self.at += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn expect(&mut self, token: &ExprToken) -> Result<(), RequestError> {
+        if self.eat(token) {
+            Ok(())
+        } else {
+            Err(self.syntax())
+        }
+    }
+
+    /// Consume a keyword if that is what comes next. The operator and section keywords
+    /// are case-insensitive; the FUNCTION names are not ("These function names are
+    /// case-sensitive"), so they are matched exactly, elsewhere.
+    fn eat_keyword(&mut self, keyword: &str) -> bool {
+        match self.peek() {
+            Some(ExprToken::Word(word)) if word.eq_ignore_ascii_case(keyword) => {
+                self.at += 1;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The name of the function call that starts here, if one does.
+    fn peek_call(&self) -> Option<String> {
+        match (self.peek(), self.tokens.get(self.at + 1)) {
+            (Some(ExprToken::Word(word)), Some(ExprToken::Open)) => Some(word.clone()),
+            _ => None,
+        }
+    }
+
+    fn descend(&mut self) -> Result<(), RequestError> {
+        self.depth += 1;
+        if self.depth > MAX_EXPRESSION_DEPTH {
+            return Err(RequestError::Validation(format!(
+                "Invalid {}: an expression may nest at most {MAX_EXPRESSION_DEPTH} levels deep",
+                self.member
+            )));
+        }
+        Ok(())
+    }
+
+    /// `path := (name | #alias) ('.' (name | #alias) | '[' index ']')*`
+    fn path(&mut self) -> Result<DocumentPath, RequestError> {
+        let mut steps = vec![PathStep::Attribute(self.path_name()?)];
+        loop {
+            if steps.len() >= MAX_ATTRIBUTE_DEPTH {
+                return Err(RequestError::Validation(format!(
+                    "Invalid {}: a document path may name at most {MAX_ATTRIBUTE_DEPTH} levels",
+                    self.member
+                )));
+            }
+            match self.peek().cloned() {
+                Some(ExprToken::Dot) => {
+                    self.at += 1;
+                    steps.push(PathStep::Attribute(self.path_name()?));
+                }
+                Some(ExprToken::Index(index)) => {
+                    self.at += 1;
+                    steps.push(PathStep::Index(index));
+                }
+                _ => break,
+            }
+        }
+        Ok(DocumentPath(steps))
+    }
+
+    /// One attribute name of a path, written out or behind an `#alias`.
+    fn path_name(&mut self) -> Result<String, RequestError> {
+        match self.next_token()? {
+            ExprToken::Word(word) => Ok(word),
+            ExprToken::Alias(alias) => self.substitutions.name(&alias),
+            _ => Err(self.syntax()),
+        }
+    }
+
+    /// `disjunction := conjunction (OR conjunction)*`
+    fn disjunction(&mut self) -> Result<ConditionNode, RequestError> {
+        let mut nodes = vec![self.conjunction()?];
+        while self.eat_keyword("OR") {
+            nodes.push(self.conjunction()?);
+        }
+        Ok(if nodes.len() == 1 {
+            nodes.remove(0)
+        } else {
+            ConditionNode::Any(nodes)
+        })
+    }
+
+    /// `conjunction := negation (AND negation)*`
+    fn conjunction(&mut self) -> Result<ConditionNode, RequestError> {
+        let mut nodes = vec![self.negation()?];
+        while self.eat_keyword("AND") {
+            nodes.push(self.negation()?);
+        }
+        Ok(if nodes.len() == 1 {
+            nodes.remove(0)
+        } else {
+            ConditionNode::All(nodes)
+        })
+    }
+
+    /// `negation := NOT negation | primary`
+    fn negation(&mut self) -> Result<ConditionNode, RequestError> {
+        if self.eat_keyword("NOT") {
+            self.descend()?;
+            let inner = self.negation()?;
+            self.depth -= 1;
+            return Ok(ConditionNode::Not(Box::new(inner)));
+        }
+        self.condition_primary()
+    }
+
+    /// `primary := '(' disjunction ')' | function | comparison`
+    fn condition_primary(&mut self) -> Result<ConditionNode, RequestError> {
+        if self.eat(&ExprToken::Open) {
+            self.descend()?;
+            let node = self.disjunction()?;
+            self.depth -= 1;
+            self.expect(&ExprToken::Close)?;
+            return Ok(node);
+        }
+        // `size (path)` is an OPERAND rather than a condition of its own, so it falls
+        // through to the comparison below.
+        if let Some(name) = self.peek_call().filter(|name| name != "size") {
+            return self.condition_function(&name);
+        }
+        let left = self.operand()?;
+        if self.eat_keyword("BETWEEN") {
+            let low = self.operand()?;
+            if !self.eat_keyword("AND") {
+                return Err(self.syntax());
+            }
+            let high = self.operand()?;
+            return Ok(ConditionNode::Between(left, low, high));
+        }
+        if self.eat_keyword("IN") {
+            self.expect(&ExprToken::Open)?;
+            let mut candidates = vec![self.operand()?];
+            while self.eat(&ExprToken::Comma) {
+                candidates.push(self.operand()?);
+            }
+            self.expect(&ExprToken::Close)?;
+            return Ok(ConditionNode::In(left, candidates));
+        }
+        match self.next_token()? {
+            ExprToken::Compare(operator) => {
+                let right = self.operand()?;
+                Ok(ConditionNode::Compare(left, operator, right))
+            }
+            _ => Err(self.syntax()),
+        }
+    }
+
+    /// One of the documented condition functions: `attribute_exists`,
+    /// `attribute_not_exists`, `attribute_type`, `begins_with` and `contains`.
+    fn condition_function(&mut self, name: &str) -> Result<ConditionNode, RequestError> {
+        self.at += 2;
+        let node = match name {
+            "attribute_exists" => ConditionNode::Exists(self.path()?, true),
+            "attribute_not_exists" => ConditionNode::Exists(self.path()?, false),
+            "attribute_type" => {
+                let path = self.path()?;
+                self.expect(&ExprToken::Comma)?;
+                ConditionNode::AttributeType(path, self.operand()?)
+            }
+            "begins_with" => {
+                let value = self.operand()?;
+                self.expect(&ExprToken::Comma)?;
+                ConditionNode::BeginsWith(value, self.operand()?)
+            }
+            "contains" => {
+                let haystack = self.operand()?;
+                self.expect(&ExprToken::Comma)?;
+                ConditionNode::Contains(haystack, self.operand()?)
+            }
+            other => {
+                return Err(RequestError::Validation(format!(
+                    "Invalid {}: unknown function {other}",
+                    self.member
+                )))
+            }
+        };
+        self.expect(&ExprToken::Close)?;
+        Ok(node)
+    }
+
+    /// `operand := :value | size '(' path ')' | path`
+    fn operand(&mut self) -> Result<Operand, RequestError> {
+        if let Some(ExprToken::Placeholder(placeholder)) = self.peek().cloned() {
+            self.at += 1;
+            return Ok(Operand::Value(self.substitutions.value(&placeholder)?));
+        }
+        if self.peek_call().as_deref() == Some("size") {
+            self.at += 2;
+            let path = self.path()?;
+            self.expect(&ExprToken::Close)?;
+            return Ok(Operand::Size(path));
+        }
+        match self.peek() {
+            Some(ExprToken::Word(_) | ExprToken::Alias(_)) => Ok(Operand::Path(self.path()?)),
+            _ => Err(self.syntax()),
+        }
+    }
+
+    /// `update := (SET sets | REMOVE removes | ADD adds | DELETE deletes)+`, each
+    /// section at most once.
+    fn update_actions(&mut self) -> Result<Vec<UpdateAction>, RequestError> {
+        const SECTIONS: [&str; 4] = ["SET", "REMOVE", "ADD", "DELETE"];
+        let mut actions = Vec::new();
+        let mut seen: BTreeSet<&'static str> = BTreeSet::new();
+        while !self.at_end() {
+            let section = SECTIONS
+                .iter()
+                .find(|section| self.eat_keyword(section))
+                .copied()
+                .ok_or_else(|| self.syntax())?;
+            if !seen.insert(section) {
+                return Err(RequestError::Validation(format!(
+                    "Invalid {}: the {section} section can only be used once in an expression",
+                    self.member
+                )));
+            }
+            loop {
+                let path = self.path()?;
+                actions.push(match section {
+                    "SET" => {
+                        self.expect(&ExprToken::Compare(CompareOp::Equal))?;
+                        UpdateAction::Set(path, self.set_value()?)
+                    }
+                    "REMOVE" => UpdateAction::Remove(path),
+                    "ADD" => UpdateAction::Add(path, self.action_value()?),
+                    _ => UpdateAction::Delete(path, self.action_value()?),
+                });
+                if !self.eat(&ExprToken::Comma) {
+                    break;
+                }
+            }
+        }
+        if actions.is_empty() {
+            return Err(self.syntax());
+        }
+        Ok(actions)
+    }
+
+    /// The value operand `ADD` and `DELETE` take, which is a `:placeholder` — both
+    /// actions take a value, not another of the item's attributes.
+    fn action_value(&mut self) -> Result<AttributeValue, RequestError> {
+        match self.next_token()? {
+            ExprToken::Placeholder(placeholder) => self.substitutions.value(&placeholder),
+            _ => Err(self.syntax()),
+        }
+    }
+
+    /// `set_value := set_operand (('+' | '-') set_operand)?`
+    fn set_value(&mut self) -> Result<SetValue, RequestError> {
+        let left = self.set_operand()?;
+        if self.eat(&ExprToken::Plus) {
+            return Ok(SetValue::Sum(left, self.set_operand()?));
+        }
+        if self.eat(&ExprToken::Minus) {
+            return Ok(SetValue::Difference(left, self.set_operand()?));
+        }
+        Ok(SetValue::Single(left))
+    }
+
+    /// `set_operand := :value | if_not_exists '(' path ',' set_operand ')'
+    ///              | list_append '(' set_operand ',' set_operand ')' | path`
+    fn set_operand(&mut self) -> Result<SetOperand, RequestError> {
+        if let Some(name) = self.peek_call() {
+            self.at += 2;
+            self.descend()?;
+            let operand = match name.as_str() {
+                "if_not_exists" => {
+                    let path = self.path()?;
+                    self.expect(&ExprToken::Comma)?;
+                    SetOperand::IfNotExists(path, Box::new(self.set_operand()?))
+                }
+                "list_append" => {
+                    let first = self.set_operand()?;
+                    self.expect(&ExprToken::Comma)?;
+                    SetOperand::ListAppend(Box::new(first), Box::new(self.set_operand()?))
+                }
+                other => {
+                    return Err(RequestError::Validation(format!(
+                        "Invalid {}: unknown function {other}",
+                        self.member
+                    )))
+                }
+            };
+            self.depth -= 1;
+            self.expect(&ExprToken::Close)?;
+            return Ok(operand);
+        }
+        if let Some(ExprToken::Placeholder(placeholder)) = self.peek().cloned() {
+            self.at += 1;
+            return Ok(SetOperand::Value(self.substitutions.value(&placeholder)?));
+        }
+        match self.peek() {
+            Some(ExprToken::Word(_) | ExprToken::Alias(_)) => Ok(SetOperand::Path(self.path()?)),
+            _ => Err(self.syntax()),
+        }
+    }
+}
+
+/// The refusal for a request that states one thing twice: through an expression member
+/// and through the legacy member that expression member replaces ("This is a legacy
+/// parameter. Use ConditionExpression instead"). The message names both members, the
+/// way the service's own refusal does, so the caller knows which pair to drop.
+pub fn expression_conflict(legacy: &str, expression: &str) -> RequestError {
+    refused(format!(
+        "Can not use both expression and non-expression parameters in the same request: \
+         Non-expression parameters: {{{legacy}}} Expression parameters: {{{expression}}}"
+    ))
+}
+
+/// Whether the condition a conditional write states is satisfied by the stored item.
+///
+/// One entry point for all three single-item writes: each states its condition the
+/// same two ways — the `ConditionExpression` language, or the legacy `Expected` map
+/// combined by `ConditionalOperator` — and they are incompatible with each other
+/// ("Use ConditionExpression instead"; a request may not use both).
+pub fn write_condition_satisfied(
+    condition_expression: Option<&str>,
+    expected: Option<&HashMap<String, ExpectedAttributeValue>>,
+    conditional_operator: Option<&str>,
+    substitutions: Substitutions<'_>,
+    item: Option<&Item>,
+) -> Result<bool, RequestError> {
+    let expected = expected.filter(|map| !map.is_empty());
+    match (condition_expression, expected) {
+        (Some(_), Some(_)) => Err(expression_conflict("Expected", "ConditionExpression")),
+        (Some(expression), None) => {
+            if conditional_operator.is_some() {
+                return Err(expression_conflict(
+                    "ConditionalOperator",
+                    "ConditionExpression",
+                ));
+            }
+            ParsedCondition::parse("ConditionExpression", expression, substitutions)?.evaluate(item)
+        }
+        (None, Some(expected)) => expected_satisfied(expected, conditional_operator, item),
+        (None, None) => {
+            if conditional_operator.is_some() {
+                return Err(RequestError::Validation(
+                    "ConditionalOperator can only be used together with Expected".to_string(),
+                ));
+            }
+            Ok(true)
+        }
+    }
+}
+
+/// Whether the legacy `Expected` map holds for the stored item.
+///
+/// "ConditionalOperator ... AND - If all of the conditions evaluate to true ... OR -
+/// If at least one of the conditions evaluate to true"; `AND` is the default.
+fn expected_satisfied(
+    expected: &HashMap<String, ExpectedAttributeValue>,
+    conditional_operator: Option<&str>,
+    item: Option<&Item>,
+) -> Result<bool, RequestError> {
+    let any = match conditional_operator {
+        None | Some("AND") => false,
+        Some("OR") => true,
+        Some(other) => {
+            return Err(RequestError::Validation(format!(
+                "ConditionalOperator must be AND or OR, got {other}"
+            )))
+        }
+    };
+    let absent = Item::new();
+    let item = item.unwrap_or(&absent);
+    let mut satisfied = !any;
+    for (name, condition) in expected {
+        let held = item.get(name);
+        let holds = expected_entry_satisfied(name, condition, held)?;
+        if any {
+            satisfied |= holds;
+        } else {
+            satisfied &= holds;
+        }
+    }
+    Ok(satisfied)
+}
+
+/// One entry of the legacy `Expected` map.
+///
+/// "Value and Exists are incompatible with AttributeValueList and ComparisonOperator.
+/// Note that if you use both sets of parameters at once, DynamoDB will return a
+/// ValidationException"; with neither set, there is nothing to check.
+fn expected_entry_satisfied(
+    name: &str,
+    condition: &ExpectedAttributeValue,
+    held: Option<&AttributeValue>,
+) -> Result<bool, RequestError> {
+    let comparison = condition.comparison_operator.as_deref();
+    let operands = condition
+        .attribute_value_list
+        .as_deref()
+        .filter(|values| !values.is_empty());
+    if (comparison.is_some() || operands.is_some())
+        && (condition.value.is_some() || condition.exists.is_some())
+    {
+        return Err(RequestError::Validation(format!(
+            "One or more parameter values were invalid: Value and Exists can not be used with \
+             AttributeValueList and ComparisonOperator for attribute {name}"
+        )));
+    }
+    if let Some(operator) = comparison {
+        return legacy_comparison_matches(operator, held, operands.unwrap_or(&[]));
+    }
+    match (condition.value.as_ref(), condition.exists) {
+        // "If you supply a Value all by itself, DynamoDB assumes the attribute exists"
+        // — the attribute must be there AND match.
+        (Some(value), None | Some(true)) => {
+            Ok(held.is_some_and(|held| attribute_values_equal(held, value)))
+        }
+        // "Exists is false but you also provide a Value" is refused, as is an `Exists`
+        // of true with nothing to check.
+        (Some(_), Some(false)) => Err(RequestError::Validation(format!(
+            "One or more parameter values were invalid: Value cannot be used when Exists is false \
+             for attribute {name}"
+        ))),
+        (None, Some(true)) => Err(RequestError::Validation(format!(
+            "One or more parameter values were invalid: Value must also be used when Exists is \
+             true for attribute {name}"
+        ))),
+        (None, Some(false)) => Ok(held.is_none()),
+        (None, None) => Ok(true),
+    }
+}
+
+/// Whether one legacy `ComparisonOperator` holds between the stored attribute and the
+/// request's `AttributeValueList`, as the `ComparisonOperator` doc defines each one.
+/// The operand count is part of that definition, so a request that gives the wrong
+/// number of them is refused rather than guessed at.
+pub fn legacy_comparison_matches(
+    operator: &str,
+    held: Option<&AttributeValue>,
+    operands: &[AttributeValue],
+) -> Result<bool, RequestError> {
+    let required = match operator {
+        "NULL" | "NOT_NULL" => 0,
+        "BETWEEN" => 2,
+        "IN" => usize::MAX,
+        "EQ" | "NE" | "LE" | "LT" | "GE" | "GT" | "CONTAINS" | "NOT_CONTAINS" | "BEGINS_WITH" => 1,
+        other => {
+            return Err(RequestError::Validation(format!(
+                "ComparisonOperator must be one of EQ, NE, IN, LE, LT, GE, GT, BETWEEN, NOT_NULL, \
+                 NULL, CONTAINS, NOT_CONTAINS or BEGINS_WITH, got {other}"
+            )))
+        }
+    };
+    let count_ok = if required == usize::MAX {
+        !operands.is_empty()
+    } else {
+        operands.len() == required
+    };
+    if !count_ok {
+        return Err(RequestError::Validation(format!(
+            "One or more parameter values were invalid: {operator} takes {} value(s) in \
+             AttributeValueList, got {}",
+            if required == usize::MAX {
+                "one or more".to_string()
+            } else {
+                required.to_string()
+            },
+            operands.len()
+        )));
+    }
+    Ok(match operator {
+        // "NOT_NULL : the attribute exists"; "NULL : the attribute does not exist".
+        "NOT_NULL" => held.is_some(),
+        "NULL" => held.is_none(),
+        _ => {
+            let Some(held) = held else {
+                // Every other operator compares a value, and a missing attribute has
+                // none: "the operation fails" rather than matching.
+                return Ok(false);
+            };
+            match operator {
+                "EQ" => attribute_values_equal(held, &operands[0]),
+                "NE" => !attribute_values_equal(held, &operands[0]),
+                "LT" => compare_values(held, &operands[0]) == Some(Ordering::Less),
+                "LE" => matches!(
+                    compare_values(held, &operands[0]),
+                    Some(Ordering::Less | Ordering::Equal)
+                ),
+                "GT" => compare_values(held, &operands[0]) == Some(Ordering::Greater),
+                "GE" => matches!(
+                    compare_values(held, &operands[0]),
+                    Some(Ordering::Greater | Ordering::Equal)
+                ),
+                "CONTAINS" => contains_value(held, &operands[0]),
+                "NOT_CONTAINS" => !contains_value(held, &operands[0]),
+                "BEGINS_WITH" => begins_with_value(held, &operands[0]),
+                "IN" => operands
+                    .iter()
+                    .any(|candidate| attribute_values_equal(held, candidate)),
+                _ => matches!(
+                    compare_values(held, &operands[0]),
+                    Some(Ordering::Greater | Ordering::Equal)
+                ) && matches!(
+                    compare_values(held, &operands[1]),
+                    Some(Ordering::Less | Ordering::Equal)
+                ),
+            }
+        }
+    })
+}
+
+/// The `Attributes` a write reports, by the `ReturnValues` the request asked for.
+///
+/// `before` is the item as it stood immediately before the write and `after` as it
+/// stands immediately after it (`None` when the write removed it); `touched` names the
+/// attributes the write changed. An empty projection is reported as no `Attributes`
+/// member at all, the way a write that replaced nothing reports none.
+pub fn projected_return_values(
+    return_values: Option<&str>,
+    before: Option<&Item>,
+    after: Option<&Item>,
+    touched: &BTreeSet<String>,
+) -> Option<Item> {
+    let projected = match return_values {
+        Some("ALL_OLD") => before.cloned(),
+        Some("ALL_NEW") => after.cloned(),
+        Some("UPDATED_OLD") => before.map(|item| project_attributes(item, touched)),
+        Some("UPDATED_NEW") => after.map(|item| project_attributes(item, touched)),
+        _ => None,
+    };
+    projected.filter(|item| !item.is_empty())
+}
+
+/// Just the named attributes of an item, which is what the `UPDATED_*` forms report:
+/// "Returns only the updated attributes".
+fn project_attributes(item: &Item, names: &BTreeSet<String>) -> Item {
+    names
+        .iter()
+        .filter_map(|name| {
+            item.get_key_value(name)
+                .map(|(name, value)| (name.clone(), value.clone()))
+        })
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Resource-based policies
 // ---------------------------------------------------------------------------
@@ -3670,4 +5762,3 @@ pub fn policy_denial(table: &Table, action: &str, now: SystemTime) -> Option<Str
     }
     Some(message)
 }
-

@@ -157,6 +157,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = crate::state::now();
         let mut guard = state.lock();
+        // The service's own start-to-close reaping of abandoned executions is
+        // materialised first, so a history read of an unattended run reports the
+        // WorkflowExecutionTimedOut event the clock already owed it.
+        guard.materialise_due_timeouts_in(&input.domain, now);
         // An `UnknownResourceFault` message names the resource the lookup failed on and
         // nothing else: the domain when no domain is stored under that name, otherwise
         // the requested execution, in the
@@ -212,39 +216,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // `reverseOrder` reverses the stored (oldest-first) log, so paging walks the
-        // same events in the opposite direction — never a different set.
-        let ordered: Vec<&crate::state::HistoryEventRecord> = if input.reverse_order {
-            execution.history.iter().rev().collect()
-        } else {
-            execution.history.iter().collect()
-        };
-        let total = ordered.len();
-        // The token names the event the previous page ended on, so the next page
-        // starts at the one after it in THIS ordering. The position is searched for
-        // rather than computed from the id, so the cursor stays correct for any log
-        // the store can hold — including one whose ids are not a dense 1..n range.
-        let start = match resume_after {
-            Some(event_id) => ordered
-                .iter()
-                .position(|record| record.event_id == event_id)
-                .map(|position| position + 1)
-                .ok_or_else(|| {
-                    crate::scaffolded::Scaffolded::validation(format!(
-                        "nextPageToken resumes after event {event_id}, which this execution's \
-                         history does not hold"
-                    ))
-                })?,
-            None => 0,
-        };
-        let end = (start + page_size).min(total);
-        let page = &ordered[start..end];
+        // same events in the opposite direction — never a different set. The paging
+        // itself is the rule both history readers share, so it lives in `state`.
+        let (page, more) = crate::state::history_page(
+            &execution.history,
+            input.reverse_order,
+            page_size,
+            resume_after,
+        )
+        .map_err(crate::scaffolded::Scaffolded::validation)?;
         let events: Vec<HistoryEvent> = page.iter().map(|record| record.event()).collect();
 
         Ok(GetWorkflowExecutionHistoryOutput {
             events,
             // The token names the last event of THIS page, so `last()` is what the
             // cursor is built from — no index arithmetic to underflow.
-            next_page_token: page.last().filter(|_| end < total).map(|last| {
+            next_page_token: page.last().filter(|_| more).map(|last| {
                 crate::state::encode_history_page_token(input.reverse_order, last.event_id)
             }),
         })

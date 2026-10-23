@@ -1,15 +1,31 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchGetItem
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchGetItem`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports, for each table in `RequestItems`, the stored item behind each
+//! `Keys` entry — "BatchGetItem returns a partial result if the response size limit is
+//! exceeded, the table's provisioned throughput is exceeded, [...] or an internal
+//! processing failure occurs", and "if a requested item does not exist, it is not returned
+//! in the result". A key that holds no item therefore contributes nothing to that table's
+//! list, and a table every key of which is absent reports an empty list.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchGetItem::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The keys are read against the SAME stored items `GetItem` reads, so a batch sees what
+//! any earlier write left. An unknown — or not yet `ACTIVE` — table is
+//! `ResourceNotFoundException`, and a table whose resource-based policy denies the caller
+//! `dynamodb:BatchGetItem` is `AccessDeniedException`. A key that is not the table's
+//! primary key, a batch past the documented 100 keys, one key addressed twice, and one
+//! table addressed twice ("each table name or ARN can be used only once per
+//! BatchGetItem request", whichever spelling each entry used) are each a
+//! `ValidationException`.
+//!
+//! `ConsistentRead` is honoured per table, as the capacity each table reports: a strongly
+//! consistent read costs a whole unit per 4 KB and an eventually consistent one half that
+//! ([`crate::state::read_capacity_units`]), totalled per table by
+//! [`crate::state::ReadLedger`]. Every key this emulator accepted is read, so
+//! `UnprocessedKeys` is the empty map AWS answers with rather than an absent member.
+//!
+//! `ProjectionExpression` and the legacy `AttributesToGet` are NOT served yet: a request
+//! that carries either is answered 501 rather than silently served the whole item, exactly
+//! as `GetItem` answers them.
 //!
 //! ## Shape of an operation
 //!
@@ -224,18 +240,135 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchGetItem` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchGetItemErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchGetItem"))
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
+
+        // "A single operation can retrieve up to 16 MB of data, which can contain as
+        // many as 100 items": the ceiling is on the KEYS, counted across every table.
+        let requested: usize = input
+            .request_items
+            .values()
+            .map(|keys| keys.keys.len())
+            .sum();
+        if requested > crate::state::MAX_BATCH_GET_KEYS {
+            return Err(lift(crate::state::too_many_batch_items("BatchGetItem")));
+        }
+        for keys in input.request_items.values() {
+            if keys.projection_expression.is_some() {
+                return Err(crate::scaffolded::Scaffolded::not_implemented(
+                    "BatchGetItem with ProjectionExpression",
+                ));
+            }
+            if keys
+                .attributes_to_get
+                .as_ref()
+                .is_some_and(|names| !names.is_empty())
+            {
+                return Err(crate::scaffolded::Scaffolded::not_implemented(
+                    "BatchGetItem with AttributesToGet",
+                ));
+            }
+        }
+
+        let mut store = state.lock();
+        store.apply_due_transitions(now);
+
+        // The tables are walked in name order, so which refusal a bad batch earns does
+        // not depend on the request map's iteration order.
+        let mut addressed: Vec<(&String, &KeysAndAttributes)> =
+            input.request_items.iter().collect();
+        addressed.sort_by(|left, right| left.0.cmp(right.0));
+
+        let mut responses: std::collections::HashMap<String, Vec<crate::state::Item>> =
+            std::collections::HashMap::new();
+        let mut ledger = crate::state::ReadLedger::default();
+        // One key is read at most once per TABLE, keyed by the RESOLVED name, and one
+        // table is addressed at most once: "each table name or ARN can be used only
+        // once per BatchGetItem request" (`BatchGetItem$RequestItems`), so two map
+        // entries that resolve to the same table are refused rather than both served.
+        let mut keyed: std::collections::BTreeSet<(String, crate::state::ItemKey)> =
+            std::collections::BTreeSet::new();
+        let mut tables: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for (table_name, requested_keys) in addressed {
+            let name = crate::state::resolve_table_name(table_name).map_err(lift)?;
+            if !tables.insert(name.clone()) {
+                return Err(crate::scaffolded::Scaffolded::validation(
+                    crate::state::DUPLICATE_BATCH_TABLE_MESSAGE,
+                ));
+            }
+            let consistent_read = requested_keys.consistent_read.unwrap_or(false);
+            let table = store.active_table(&region, &name, now).map_err(lift)?;
+            // A table whose resource-based policy denies the caller this action answers
+            // the denial, not its items.
+            if let Some(denial) =
+                crate::state::policy_denial(table, "dynamodb:BatchGetItem", now)
+            {
+                return Err(crate::scaffolded::Scaffolded::access_denied(denial));
+            }
+            let mut found: Vec<crate::state::Item> = Vec::new();
+            for key_map in &requested_keys.keys {
+                for (attribute, value) in key_map {
+                    crate::state::check_attribute_value(attribute, value).map_err(lift)?;
+                }
+                let key = table.key_of_key_map(key_map).map_err(lift)?;
+                if !keyed.insert((name.clone(), key.clone())) {
+                    return Err(crate::scaffolded::Scaffolded::validation(
+                        crate::state::DUPLICATE_BATCH_KEYS_MESSAGE,
+                    ));
+                }
+                let item = table.items.get(&key);
+                // A key that holds no item still consumed the read it asked for, which
+                // is why the capacity is charged for every key and the list only grows
+                // for the ones that were there.
+                let size = item.map_or(0, crate::state::item_size);
+                ledger.record(
+                    &name,
+                    crate::state::read_capacity_units(size, consistent_read),
+                );
+                if let Some(item) = item {
+                    found.push(item.clone());
+                }
+            }
+            // "Each element in the response consists of a table name, along with a map
+            // of attribute data": the entry is keyed by the name the REQUEST addressed
+            // the table by — which a client that addressed it by ARN looks its own
+            // results up under — while the store and the capacity report use the
+            // resolved table name.
+            responses.insert(table_name.clone(), found);
+        }
+
+        Ok(BatchGetItemOutput {
+            responses: Some(responses),
+            // "A map of tables and their respective keys that were not processed":
+            // every key this emulator accepted was read, so the map is EMPTY — the
+            // member AWS answers with, which is what lets a client's retry loop
+            // terminate.
+            unprocessed_keys: Some(std::collections::HashMap::new()),
+            consumed_capacity: ledger.consumed_capacity(input.return_consumed_capacity.as_deref()),
+        })
+    }
+}
+
+/// The modelled server error for a request that cannot reach this service's store.
+fn store_unavailable() -> BatchGetItemError {
+    BatchGetItemErrorModeled::InternalServerError(InternalServerError {
+        message: Some("the DynamoDB table store is unavailable".to_string()),
+    })
+    .into()
+}
+
+/// Lift a store refusal into this operation's error channel.
+fn lift(error: crate::state::RequestError) -> BatchGetItemError {
+    match error {
+        crate::state::RequestError::NotFound(message) => {
+            BatchGetItemErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: Some(message),
+            })
+            .into()
+        }
+        crate::state::RequestError::Validation(message) => {
+            crate::scaffolded::Scaffolded::validation(message)
+        }
     }
 }

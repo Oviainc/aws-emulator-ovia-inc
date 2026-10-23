@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateItem
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateItem`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: applies the request's update to the item named by `Key`, creating that
+//! item when the key holds none ("Edits an existing item's attributes, or adds a new
+//! item to the table if it does not already exist"). The update is stated either as an
+//! `UpdateExpression` (the `SET`, `REMOVE`, `ADD` and `DELETE` sections, with
+//! `if_not_exists`, `list_append` and `+`/`-` arithmetic) or as the legacy
+//! `AttributeUpdates` map, never both; the write is conditional on
+//! `ConditionExpression` or the legacy `Expected`/`ConditionalOperator`, and an unmet
+//! condition is `ConditionalCheckFailedException` (carrying the item when
+//! `ReturnValuesOnConditionCheckFailure=ALL_OLD`). `ReturnValues` reports the item
+//! before or after the write, whole or projected to the attributes the update touched.
+//! An unknown — or not yet `ACTIVE` — table is `ResourceNotFoundException`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateItem::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A key attribute cannot be updated, and the stored result is held to the documented
+//! item bounds (400 KB, 32 levels of nesting) before it lands. The expression language
+//! itself lives in [`crate::state`], which is where `PutItem` and `DeleteItem` reach
+//! their own conditions.
 //!
 //! ## Shape of an operation
 //!
@@ -274,18 +281,217 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateItem` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateItemErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateItem"))
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
+        let name = crate::state::resolve_table_name(&input.table_name).map_err(lift)?;
+
+        // "For UpdateItem, the valid values are: NONE ... ALL_OLD ... UPDATED_OLD ...
+        // ALL_NEW ... UPDATED_NEW" (`UpdateItem$ReturnValues`) — every value the
+        // `ReturnValue` enum declares.
+        let return_values = input.return_values.as_deref().unwrap_or("NONE");
+        if !matches!(
+            return_values,
+            "NONE" | "ALL_OLD" | "ALL_NEW" | "UPDATED_OLD" | "UPDATED_NEW"
+        ) {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "ReturnValues must be one of NONE, ALL_OLD, UPDATED_OLD, ALL_NEW or UPDATED_NEW \
+                 for UpdateItem, got {return_values}"
+            )));
+        }
+        // "An optional parameter that returns the item attributes for an UpdateItem
+        // operation that failed a condition check"
+        // (`UpdateItem$ReturnValuesOnConditionCheckFailure`).
+        let return_old_on_failure = match input.return_values_on_condition_check_failure.as_deref()
+        {
+            None | Some("NONE") => false,
+            Some("ALL_OLD") => true,
+            Some(other) => {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "ReturnValuesOnConditionCheckFailure can only be ALL_OLD or NONE, got {other}"
+                )))
+            }
+        };
+
+        let substitutions = crate::state::Substitutions::new(
+            input.expression_attribute_names.as_ref(),
+            input.expression_attribute_values.as_ref(),
+        );
+        let report_item_collection = crate::state::returns_item_collection_metrics(
+            input.return_item_collection_metrics.as_deref(),
+        )
+        .map_err(lift)?;
+        // A value a condition compares against, or a value the update writes, is held
+        // to the same limits a stored value is: the documented nesting depth, and this
+        // emulator's own ceiling on the members one set may carry. Both bound the work
+        // this request can ask for, and both come from the request.
+        for (placeholder, value) in input.expression_attribute_values.iter().flatten() {
+            crate::state::check_attribute_value(placeholder, value).map_err(lift)?;
+        }
+        for (attribute, value) in &input.key {
+            crate::state::check_attribute_value(attribute, value).map_err(lift)?;
+        }
+        for update in input.attribute_updates.iter().flatten() {
+            if let Some(value) = update.1.value.as_ref() {
+                crate::state::check_attribute_value(update.0, value).map_err(lift)?;
+            }
+        }
+
+        // "This is a legacy parameter. Use UpdateExpression instead"
+        // (`UpdateItem$AttributeUpdates`): a request states its update one way or the
+        // other, and one that states neither still creates the item from its key.
+        let legacy_updates = input
+            .attribute_updates
+            .as_ref()
+            .filter(|updates| !updates.is_empty());
+        let update = match (input.update_expression.as_deref(), legacy_updates) {
+            (Some(_), Some(_)) => {
+                return Err(lift(crate::state::expression_conflict(
+                    "AttributeUpdates",
+                    "UpdateExpression",
+                )))
+            }
+            (Some(expression), None) => {
+                crate::state::ParsedUpdate::parse("UpdateExpression", expression, substitutions)
+                    .map_err(lift)?
+            }
+            (None, Some(updates)) => {
+                crate::state::ParsedUpdate::from_attribute_updates(updates).map_err(lift)?
+            }
+            (None, None) => crate::state::ParsedUpdate::nothing(),
+        };
+
+        let mut store = state.lock();
+        store.apply_due_transitions(now);
+        let (key, partition_key, sort_key) = {
+            let table = store.active_table(&region, &name, now).map_err(lift)?;
+            // A table whose resource-based policy denies the caller this action is not
+            // written to at all: authorization is decided before the item is keyed.
+            if let Some(denial) = crate::state::policy_denial(table, "dynamodb:UpdateItem", now) {
+                return Err(crate::scaffolded::Scaffolded::access_denied(denial));
+            }
+            (
+                table.key_of_key_map(&input.key).map_err(lift)?,
+                table.partition_key_name().to_string(),
+                table.sort_key_name().map(ToString::to_string),
+            )
+        };
+        let before = store
+            .active_table(&region, &name, now)
+            .map_err(lift)?
+            .items
+            .get(&key)
+            .cloned();
+
+        // The condition is read against the item as it stands BEFORE this write, which
+        // is the only state it can speak about.
+        let satisfied = crate::state::write_condition_satisfied(
+            input.condition_expression.as_deref(),
+            input.expected.as_ref(),
+            input.conditional_operator.as_deref(),
+            substitutions,
+            before.as_ref(),
+        )
+        .map_err(lift)?;
+        if !satisfied {
+            return Err(UpdateItemErrorModeled::ConditionalCheckFailedException(
+                ConditionalCheckFailedException {
+                    message: Some(crate::state::CONDITION_FAILED_MESSAGE.to_string()),
+                    item: if return_old_on_failure { before } else { None },
+                },
+            )
+            .into());
+        }
+
+        // An update of a key that holds no item starts from the key itself, so the
+        // created item carries the primary key the request addressed it by.
+        let mut item = before.clone().unwrap_or_else(|| input.key.clone());
+        let touched = update.apply(&mut item).map_err(lift)?;
+        for attribute in &touched {
+            if attribute.as_str() == partition_key.as_str()
+                || Some(attribute.as_str()) == sort_key.as_deref()
+            {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "One or more parameter values were invalid: Cannot update attribute \
+                     {attribute}. This attribute is part of the key"
+                )));
+            }
+        }
+
+        // The result is held to the same bounds a `PutItem` of it would be: the
+        // documented 32 levels of nesting, this emulator's collection-member ceiling
+        // and the documented 400 KB item size. Its numbers are canonicalized here too,
+        // before the item is sized or reported, so what `ReturnValues` echoes is the
+        // item as STORED rather than the lexemes the request spelled; the store
+        // canonicalizes again at its write site, which is idempotent.
+        for (attribute, value) in &item {
+            crate::state::check_attribute_value(attribute, value).map_err(lift)?;
+        }
+        crate::state::canonicalize_item(&mut item).map_err(lift)?;
+        let size = crate::state::item_size(&item);
+        if size > crate::state::MAX_ITEM_SIZE_BYTES {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::ITEM_SIZE_EXCEEDED_MESSAGE,
+            ));
+        }
+        // The item the update leaves is held to the documented key-value limits for
+        // every index key it would be projected into, exactly as the same item written
+        // by a `PutItem` is: an update must not leave an item an index cannot represent.
+        store
+            .active_table(&region, &name, now)
+            .map_err(lift)?
+            .check_index_key_limits(&item)
+            .map_err(lift)?;
+
+        store
+            .put_item(&region, &name, now, key, item.clone())
+            .map_err(lift)?;
+
+        // Both figures are read back from the table the write landed in, so the
+        // capacity fan-out and the item-collection size are computed from stored state:
+        // the table is charged for the larger of the two versions of the item, and each
+        // index only for the ones this update actually moved.
+        let table = store.active_table(&region, &name, now).map_err(lift)?;
+        let capacity = table.write_capacity(before.as_ref(), Some(&item));
+        let item_collection_metrics =
+            report_item_collection.then(|| table.item_collection_metrics(&item));
+
+        Ok(UpdateItemOutput {
+            attributes: crate::state::projected_return_values(
+                Some(return_values),
+                before.as_ref(),
+                Some(&item),
+                &touched,
+            ),
+            consumed_capacity: crate::state::consumed_write_capacity(
+                input.return_consumed_capacity.as_deref(),
+                &name,
+                &capacity,
+            ),
+            item_collection_metrics: item_collection_metrics.flatten(),
+        })
+    }
+}
+
+/// The modelled server error for a request that cannot reach this service's store.
+fn store_unavailable() -> UpdateItemError {
+    UpdateItemErrorModeled::InternalServerError(InternalServerError {
+        message: Some("the DynamoDB table store is unavailable".to_string()),
+    })
+    .into()
+}
+
+/// Lift a store refusal into this operation's error channel.
+fn lift(error: crate::state::RequestError) -> UpdateItemError {
+    match error {
+        crate::state::RequestError::NotFound(message) => {
+            UpdateItemErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: Some(message),
+            })
+            .into()
+        }
+        crate::state::RequestError::Validation(message) => {
+            crate::scaffolded::Scaffolded::validation(message)
+        }
     }
 }

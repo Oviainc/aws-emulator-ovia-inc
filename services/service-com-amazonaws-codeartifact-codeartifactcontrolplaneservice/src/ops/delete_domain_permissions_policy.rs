@@ -200,10 +200,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ) {
             return Err(DeleteDomainPermissionsPolicyErrorModeled::ConflictException(
                 ConflictException {
-                    message: crate::state::policy_revision_conflict_message(
-                        DOMAIN_RESOURCE_TYPE,
-                        &input.domain,
-                    ),
+                    message: crate::state::POLICY_REVISION_CONFLICT_MESSAGE.to_string(),
                     resource_id: Some(input.domain.clone()),
                     resource_type: Some(DOMAIN_RESOURCE_TYPE.to_string()),
                 },

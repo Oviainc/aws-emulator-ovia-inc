@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AddTagsToResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AddTagsToResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AddTagsToResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Adds the request's `Tags` to the resource its `ResourceName` names, and answers
+//! with the tag set that resource is left with. This is the ONLY file to touch for
+//! this operation.
+//!
+//! A tag belongs to a RESOURCE, so the ARN is resolved against this service's store
+//! first — `crate::state::ComAmazonawsElasticacheAmazonelasticachev9State::resource_tags_mut`,
+//! the one resolution this operation shares with `ListTagsForResource` and
+//! `RemoveTagsFromResource`: a value that is not an ElastiCache resource ARN is the
+//! modelled 400 `InvalidARNFault`, and a well-formed ARN naming no stored resource is
+//! that resource kind's own not-found fault.
+//!
+//! The write MERGES and is ATOMIC: a key the resource does not carry is added, a key
+//! it does carry takes the new value, a key the request does not name is left alone,
+//! and a request this service refuses — a tag key a caller may not use, a merge past
+//! `crate::state::MAX_TAGS_PER_RESOURCE` — changes NOTHING, so the next
+//! `ListTagsForResource` still reports the tags the resource had.
 //!
 //! ## Shape of an operation
 //!
@@ -165,6 +173,88 @@ impl From<AddTagsToResourceErrorModeled> for AddTagsToResourceError {
     }
 }
 
+/// This operation's answer to a `ResourceName` that names no resource of this service.
+///
+/// The classification is
+/// [`crate::state::ComAmazonawsElasticacheAmazonelasticachev9State::resource_tags_mut`]'s,
+/// shared with `ListTagsForResource` and `RemoveTagsFromResource`; only the lift into
+/// THIS operation's error enum lives here, because each tagging operation declares its
+/// own.
+fn reject(rejection: crate::state::TagTargetRejection) -> AddTagsToResourceError {
+    use crate::state::{TagTargetRejection, TaggedResourceKind};
+    match rejection {
+        TagTargetRejection::InvalidArn(message) => {
+            AddTagsToResourceErrorModeled::InvalidARNFault(InvalidARNFault {
+                message: Some(message),
+            })
+        }
+        TagTargetRejection::NotFound(kind, text) => {
+            let message = Some(text);
+            match kind {
+                TaggedResourceKind::CacheCluster => {
+                    AddTagsToResourceErrorModeled::CacheClusterNotFoundFault(
+                        CacheClusterNotFoundFault { message },
+                    )
+                }
+                TaggedResourceKind::CacheParameterGroup => {
+                    AddTagsToResourceErrorModeled::CacheParameterGroupNotFoundFault(
+                        CacheParameterGroupNotFoundFault { message },
+                    )
+                }
+                TaggedResourceKind::CacheSecurityGroup => {
+                    AddTagsToResourceErrorModeled::CacheSecurityGroupNotFoundFault(
+                        CacheSecurityGroupNotFoundFault { message },
+                    )
+                }
+                TaggedResourceKind::CacheSubnetGroup => {
+                    AddTagsToResourceErrorModeled::CacheSubnetGroupNotFoundFault(
+                        CacheSubnetGroupNotFoundFault { message },
+                    )
+                }
+                TaggedResourceKind::GlobalReplicationGroup => {
+                    AddTagsToResourceErrorModeled::GlobalReplicationGroupNotFoundFault(
+                        GlobalReplicationGroupNotFoundFault { message },
+                    )
+                }
+                TaggedResourceKind::ReplicationGroup => {
+                    AddTagsToResourceErrorModeled::ReplicationGroupNotFoundFault(
+                        ReplicationGroupNotFoundFault { message },
+                    )
+                }
+                TaggedResourceKind::ReservedCacheNode => {
+                    AddTagsToResourceErrorModeled::ReservedCacheNodeNotFoundFault(
+                        ReservedCacheNodeNotFoundFault { message },
+                    )
+                }
+                TaggedResourceKind::ServerlessCache => {
+                    AddTagsToResourceErrorModeled::ServerlessCacheNotFoundFault(
+                        ServerlessCacheNotFoundFault { message },
+                    )
+                }
+                TaggedResourceKind::ServerlessCacheSnapshot => {
+                    AddTagsToResourceErrorModeled::ServerlessCacheSnapshotNotFoundFault(
+                        ServerlessCacheSnapshotNotFoundFault { message },
+                    )
+                }
+                TaggedResourceKind::Snapshot => {
+                    AddTagsToResourceErrorModeled::SnapshotNotFoundFault(SnapshotNotFoundFault {
+                        message,
+                    })
+                }
+                TaggedResourceKind::User => {
+                    AddTagsToResourceErrorModeled::UserNotFoundFault(UserNotFoundFault { message })
+                }
+                TaggedResourceKind::UserGroup => {
+                    AddTagsToResourceErrorModeled::UserGroupNotFoundFault(UserGroupNotFoundFault {
+                        message,
+                    })
+                }
+            }
+        }
+    }
+    .into()
+}
+
 /// The `AddTagsToResource` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -201,18 +291,75 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AddTagsToResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AddTagsToResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AddTagsToResource"))
+        // This operation MUTATES: it writes the request's tags onto a stored
+        // resource's own record. The ARN carries the Region the resource lives in, so
+        // nothing here reads the request's Region.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+
+        // The caller's tags are checked BEFORE anything is resolved or written, so a
+        // refused request leaves the resource with exactly the tags it had.
+        let requested = match crate::state::tag_pairs(Some(input.tags)) {
+            Ok(tags) => tags,
+            Err(crate::state::TagRefusal::TooMany(count)) => {
+                return Err(AddTagsToResourceErrorModeled::TagQuotaPerResourceExceeded(
+                    TagQuotaPerResourceExceeded {
+                        message: Some(format!(
+                            "{count} tags were supplied; the maximum number of tags permitted on a \
+                             resource is {}.",
+                            crate::state::MAX_TAGS_PER_RESOURCE
+                        )),
+                    },
+                )
+                .into())
+            }
+            Err(crate::state::TagRefusal::InvalidTag(message)) => {
+                return Err(
+                    AddTagsToResourceErrorModeled::InvalidParameterValueException(
+                        InvalidParameterValueException {
+                            message: Some(message),
+                        },
+                    )
+                    .into(),
+                )
+            }
+        };
+
+        let mut store = state.lock();
+        let stored = store
+            .resource_tags_mut(&input.resource_name)
+            .map_err(reject)?;
+        // MERGE into a COPY first: the quota is checked on what the resource would be
+        // left with, and a merge that would push it past the quota is refused without
+        // the stored tags having been touched. Re-tagging a key the resource already
+        // carries adds no tag, so only a merge that really would exceed the quota is
+        // refused.
+        let mut merged = stored.clone();
+        crate::state::merge_tags(&mut merged, requested);
+        if merged.len() > crate::state::MAX_TAGS_PER_RESOURCE {
+            return Err(AddTagsToResourceErrorModeled::TagQuotaPerResourceExceeded(
+                TagQuotaPerResourceExceeded {
+                    message: Some(format!(
+                        "Adding these tags would give {} {} tags; the maximum number of tags \
+                         permitted on a resource is {}.",
+                        input.resource_name,
+                        merged.len(),
+                        crate::state::MAX_TAGS_PER_RESOURCE
+                    )),
+                },
+            )
+            .into());
+        }
+        *stored = merged;
+        // `TagListMessage$TagList` is "a list of tags as key-value pairs": the whole
+        // tag set the resource is left with, read back out of the record this call just
+        // wrote rather than from a copy beside it.
+        Ok(AddTagsToResourceOutput {
+            tag_list: Some(crate::state::tag_list(stored)),
+        })
     }
 }

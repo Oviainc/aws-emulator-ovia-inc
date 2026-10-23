@@ -349,6 +349,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             description: input.description,
             created_date: Some(now),
             api_summary: api_summary(api),
+            // ... and the resource tree they hang off, which is what a stage pointing at
+            // this deployment serves on the execute-api data plane. See
+            // `DeploymentEntry::resources`.
+            resources: api.resources.clone(),
             sequence,
         };
         api.deployments.insert(id.clone(), entry);

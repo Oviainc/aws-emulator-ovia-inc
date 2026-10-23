@@ -157,6 +157,207 @@ pub fn canonical_json(document: &str) -> Result<String, String> {
 }
 
 // ---------------------------------------------------------------------------
+// A document whose member order is part of the document
+//
+// A schema document is an opaque TEXT this service stores and serves: `Content` is
+// modelled `__string`, so a read answers the document's own bytes — its members in the
+// order the published document writes them. A client caches the document it fetched and
+// diffs or hashes it against the next read, and a code generator renders the schemas in
+// the order it reads them, so a document handed back with its members rearranged is a
+// different document even though it denotes the same schema.
+//
+// [`serde_json::Map`] cannot state that order: it is a SORTED map or an
+// insertion-ordered one depending on whether anything in the BUILD asks for
+// `serde_json`'s `preserve_order` feature — a workspace-wide switch, so a document
+// composed through [`serde_json::Value`] does not even render the same way in two builds
+// of this emulator. Hence this node: its object members keep the order they were written
+// or read in, whatever else is in the build, and are serialized in it. `canonical_json`
+// above is the same decision for a document this service only passes through, and
+// `GetDiscoveredSchema` writes the document it infers through this node too.
+// ---------------------------------------------------------------------------
+
+/// One JSON value of a document whose object member ORDER is part of the document.
+#[derive(Debug, Clone, PartialEq)]
+pub enum JsonNode {
+    /// JSON `null`.
+    Null,
+    /// `true` or `false`.
+    Flag(bool),
+    /// A JSON number, as the value it denotes.
+    Number(::serde_json::Number),
+    /// A JSON string.
+    Text(String),
+    /// A JSON array, in its own order.
+    List(Vec<JsonNode>),
+    /// A JSON object, its members in the order they were written or read in.
+    Object(Vec<(String, JsonNode)>),
+}
+
+impl JsonNode {
+    /// A JSON string node.
+    pub fn text(value: &str) -> Self {
+        Self::Text(value.to_string())
+    }
+
+    /// This node as the JSON text that goes on the wire.
+    ///
+    /// Infallible in practice: the only failures `serde_json` reports here are a
+    /// non-string map key and a writer error, and this node's keys are `String` and the
+    /// writer is an in-memory buffer.
+    pub fn to_json(&self) -> String {
+        ::serde_json::to_string(self).expect("a JsonNode serializes into a String buffer")
+    }
+
+    /// `document` read as this node: every object's members keep the order the document
+    /// writes them in. `None` where `document` is not one JSON value.
+    pub fn parse(document: &str) -> Option<Self> {
+        ::serde_json::from_str(document).ok()
+    }
+
+    /// The same value as `value`, each object's members in the order
+    /// [`serde_json::Value`] happens to hold them in. For a scalar there is nothing to
+    /// order; for an object or an array, order the members deliberately instead of
+    /// relying on this.
+    pub fn from_value(value: &::serde_json::Value) -> Self {
+        match value {
+            ::serde_json::Value::Null => Self::Null,
+            ::serde_json::Value::Bool(flag) => Self::Flag(*flag),
+            ::serde_json::Value::Number(number) => Self::Number(number.clone()),
+            ::serde_json::Value::String(text) => Self::Text(text.clone()),
+            ::serde_json::Value::Array(items) => {
+                Self::List(items.iter().map(Self::from_value).collect())
+            }
+            ::serde_json::Value::Object(members) => Self::Object(
+                members
+                    .iter()
+                    .map(|(name, member)| (name.clone(), Self::from_value(member)))
+                    .collect(),
+            ),
+        }
+    }
+
+    /// The member named `name`, for a node that is an object.
+    pub fn member(&self, name: &str) -> Option<&Self> {
+        match self {
+            Self::Object(members) => members
+                .iter()
+                .find(|(written, _)| written == name)
+                .map(|(_, member)| member),
+            _ => None,
+        }
+    }
+
+    /// Write `name` as this object's LAST member, replacing any member it already has
+    /// under that name — a JSON object carries one member per name. Does nothing to a
+    /// node that is not an object.
+    pub fn set_member(&mut self, name: &str, value: Self) {
+        if let Self::Object(members) = self {
+            members.retain(|(written, _)| written != name);
+            members.push((name.to_string(), value));
+        }
+    }
+}
+
+impl ::serde::Serialize for JsonNode {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use ::serde::ser::{SerializeMap, SerializeSeq};
+        match self {
+            Self::Null => serializer.serialize_unit(),
+            Self::Flag(flag) => serializer.serialize_bool(*flag),
+            Self::Number(number) => number.serialize(serializer),
+            Self::Text(text) => serializer.serialize_str(text),
+            Self::List(items) => {
+                let mut sequence = serializer.serialize_seq(Some(items.len()))?;
+                for item in items {
+                    sequence.serialize_element(item)?;
+                }
+                sequence.end()
+            }
+            Self::Object(members) => {
+                let mut map = serializer.serialize_map(Some(members.len()))?;
+                for (name, value) in members {
+                    map.serialize_entry(name, value)?;
+                }
+                map.end()
+            }
+        }
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for JsonNode {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(JsonNodeVisitor)
+    }
+}
+
+/// Reads one JSON value into a [`JsonNode`], an object's members in document order:
+/// `serde_json`'s reader hands them over in that order, and this keeps them in it
+/// rather than inserting them into a sorted map.
+struct JsonNodeVisitor;
+
+impl<'de> ::serde::de::Visitor<'de> for JsonNodeVisitor {
+    type Value = JsonNode;
+
+    fn expecting(&self, formatter: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        formatter.write_str("a JSON value")
+    }
+
+    fn visit_unit<E: ::serde::de::Error>(self) -> Result<Self::Value, E> {
+        Ok(JsonNode::Null)
+    }
+
+    fn visit_none<E: ::serde::de::Error>(self) -> Result<Self::Value, E> {
+        Ok(JsonNode::Null)
+    }
+
+    fn visit_bool<E: ::serde::de::Error>(self, flag: bool) -> Result<Self::Value, E> {
+        Ok(JsonNode::Flag(flag))
+    }
+
+    fn visit_i64<E: ::serde::de::Error>(self, number: i64) -> Result<Self::Value, E> {
+        Ok(JsonNode::Number(number.into()))
+    }
+
+    fn visit_u64<E: ::serde::de::Error>(self, number: u64) -> Result<Self::Value, E> {
+        Ok(JsonNode::Number(number.into()))
+    }
+
+    fn visit_f64<E: ::serde::de::Error>(self, number: f64) -> Result<Self::Value, E> {
+        ::serde_json::Number::from_f64(number)
+            .map(JsonNode::Number)
+            .ok_or_else(|| E::custom(format!("{number} is not a JSON number")))
+    }
+
+    fn visit_str<E: ::serde::de::Error>(self, text: &str) -> Result<Self::Value, E> {
+        Ok(JsonNode::text(text))
+    }
+
+    fn visit_seq<A: ::serde::de::SeqAccess<'de>>(
+        self,
+        mut sequence: A,
+    ) -> Result<Self::Value, A::Error> {
+        let mut items = Vec::new();
+        while let Some(item) = sequence.next_element()? {
+            items.push(item);
+        }
+        Ok(JsonNode::List(items))
+    }
+
+    fn visit_map<A: ::serde::de::MapAccess<'de>>(
+        self,
+        mut map: A,
+    ) -> Result<Self::Value, A::Error> {
+        let mut node = JsonNode::Object(Vec::new());
+        while let Some((name, value)) = map.next_entry::<String, JsonNode>()? {
+            // One member per name, the last spelling of it winning — what a sorted map
+            // would do too, and the only part of this a document cannot state twice.
+            node.set_member(&name, value);
+        }
+        Ok(node)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Where a JSON body stops being JSON
 //
 // Every refusal this service gives for a body it could not read — `CreateSchema`'s
@@ -1126,36 +1327,36 @@ pub const CLOUD_TRAIL_EVENT_FAMILY: &[(&str, &str)] = &[
 /// named by [`EVENT_COMPONENT_PLACEHOLDER`], because the same record is published under
 /// each member of [`CLOUD_TRAIL_EVENT_FAMILY`].
 ///
-/// Source: the CloudTrail record contents AWS documents (CloudTrail User Guide,
-/// "CloudTrail record contents") — the `detail` of a CloudTrail-delivered event IS a
-/// CloudTrail record, and the record's contents are the same for every event source and
-/// every record kind, which is why one template serves all of [`AWS_EVENT_SOURCES`].
-/// The nested `userIdentity`/`sessionContext`/`resources` structures are components of
-/// their own, as the document's `$ref`s name them.
+/// Source: the document AWS PUBLISHES for a CloudTrail-delivered event, as the recorded
+/// `DescribeSchema` of `aws.events@AWSAPICallviaCloudTrail` serves it — the model states
+/// nothing about a document's text, so the published document is the reference, and it
+/// is what this operation serves. The `detail` of a CloudTrail-delivered event IS a
+/// CloudTrail record (CloudTrail User Guide, "CloudTrail record contents") and the
+/// record is the same whichever source published it and whichever kind of record it is,
+/// which is why one template serves all of [`AWS_EVENT_SOURCES`] and the whole family.
 ///
-/// The members CloudTrail fills only for some records (the free-form
-/// `requestParameters`/`responseElements`/`additionalEventData` objects, the `addendum`
-/// a late-delivered record carries, the TLS, Insights and edge-device details) are
-/// marked `nullable`, which is OpenAPI 3.0's way of saying the member may be present
-/// and null; `ExportSchema` lowers that to draft-04's type union.
+/// What the published document says about that record, and this template with it:
+///
+/// * it constrains the record's members but marks none of them required — CloudTrail
+///   fills a member only for the records it applies to;
+/// * the record's nested structures (a resource of `resources`, the `tlsDetails`, the
+///   `userIdentity` and its `sessionContext`) are declared INLINE, so the document
+///   carries no component beside the event's own and the envelope's;
+/// * a member CloudTrail fills only for some records — the free-form
+///   `requestParameters`/`responseElements`/`additionalEventData`/`eventContext`
+///   objects, the `addendum` a late-delivered record carries, the TLS and edge-device
+///   details — is marked `nullable`, OpenAPI 3.0's way of saying the member may be
+///   present and null; `ExportSchema` lowers that to draft-04's type union;
+/// * `eventTime` carries both the `date-time` format and the `yyyy-MM-dd'T'HH:mm:ss'Z'`
+///   pattern the record writes it in, which is what a generated binding parses it with.
+///
+/// The members keep the order the published document writes them in: it is served as
+/// written (see [`JsonNode`]), not re-ordered by the map it passes through.
 const CLOUD_TRAIL_COMPONENTS: &str = r##"{
   "{EventName}": {
     "type": "object",
-    "required": [
-      "eventID", "eventName", "eventSource", "eventTime", "eventVersion",
-      "awsRegion", "recipientAccountId", "requestID", "userIdentity"
-    ],
     "properties": {
-      "addendum": {
-        "type": "object",
-        "nullable": true,
-        "properties": {
-          "originalEventID": {"type": "string"},
-          "originalRequestID": {"type": "string"},
-          "reason": {"type": "string"},
-          "updatedFields": {"type": "array", "items": {"type": "string"}}
-        }
-      },
+      "addendum": {"type": "object", "nullable": true},
       "additionalEventData": {"type": "object", "nullable": true},
       "annotation": {"type": "string"},
       "apiVersion": {"type": "string"},
@@ -1164,13 +1365,13 @@ const CLOUD_TRAIL_COMPONENTS: &str = r##"{
       "errorCode": {"type": "string"},
       "errorMessage": {"type": "string"},
       "eventCategory": {"type": "string"},
+      "eventContext": {"type": "object", "nullable": true},
       "eventID": {"type": "string"},
       "eventName": {"type": "string"},
       "eventSource": {"type": "string"},
-      "eventTime": {"type": "string", "format": "date-time"},
+      "eventTime": {"pattern": "yyyy-MM-dd'T'HH:mm:ss'Z'", "type": "string", "format": "date-time"},
       "eventType": {"type": "string"},
       "eventVersion": {"type": "string"},
-      "insightDetails": {"type": "object", "nullable": true},
       "managementEvent": {"type": "boolean"},
       "readOnly": {"type": "boolean"},
       "recipientAccountId": {"type": "string"},
@@ -1178,10 +1379,17 @@ const CLOUD_TRAIL_COMPONENTS: &str = r##"{
       "requestParameters": {"type": "object", "nullable": true},
       "resources": {
         "type": "array",
-        "items": {"$ref": "#/components/schemas/CloudTrailResource"}
+        "items": {
+          "type": "object",
+          "properties": {
+            "accountId": {"type": "string"},
+            "ARN": {"type": "string"},
+            "ARNPrefix": {"type": "string"},
+            "type": {"type": "string"}
+          }
+        }
       },
       "responseElements": {"type": "object", "nullable": true},
-      "serviceEventDetails": {"type": "object", "nullable": true},
       "sessionCredentialFromConsole": {"type": "string"},
       "sharedEventID": {"type": "string"},
       "sourceIPAddress": {"type": "string"},
@@ -1191,70 +1399,57 @@ const CLOUD_TRAIL_COMPONENTS: &str = r##"{
         "properties": {
           "cipherSuite": {"type": "string"},
           "clientProvidedHostHeader": {"type": "string"},
+          "keyExchange": {"type": "string"},
           "tlsVersion": {"type": "string"}
         }
       },
       "userAgent": {"type": "string"},
-      "userIdentity": {"$ref": "#/components/schemas/CloudTrailUserIdentity"},
-      "vpcEndpointAccountId": {"type": "string"},
-      "vpcEndpointId": {"type": "string"}
-    }
-  },
-  "CloudTrailResource": {
-    "type": "object",
-    "properties": {
-      "ARN": {"type": "string"},
-      "accountId": {"type": "string"},
-      "type": {"type": "string"}
-    }
-  },
-  "CloudTrailUserIdentity": {
-    "type": "object",
-    "properties": {
-      "accessKeyId": {"type": "string"},
-      "accountId": {"type": "string"},
-      "arn": {"type": "string"},
-      "credentialId": {"type": "string"},
-      "invokedBy": {"type": "string"},
-      "onBehalfOf": {
+      "userIdentity": {
         "type": "object",
-        "nullable": true,
         "properties": {
-          "backTraceId": {"type": "string"},
-          "userId": {"type": "string"}
+          "accessKeyId": {"type": "string"},
+          "accountId": {"type": "string"},
+          "arn": {"type": "string"},
+          "credentialId": {"type": "string"},
+          "invokedBy": {"type": "string"},
+          "onBehalfOf": {
+            "type": "object",
+            "nullable": true,
+            "properties": {
+              "backTraceId": {"type": "string"},
+              "userId": {"type": "string"}
+            }
+          },
+          "principalId": {"type": "string"},
+          "sessionContext": {
+            "type": "object",
+            "properties": {
+              "attributes": {
+                "type": "object",
+                "properties": {
+                  "creationDate": {"type": "string", "format": "date-time"},
+                  "mfaAuthenticated": {"type": "string"}
+                }
+              },
+              "ec2RoleDelivery": {"type": "string"},
+              "sessionIssuer": {
+                "type": "object",
+                "properties": {
+                  "accountId": {"type": "string"},
+                  "arn": {"type": "string"},
+                  "principalId": {"type": "string"},
+                  "type": {"type": "string"},
+                  "userName": {"type": "string"}
+                }
+              },
+              "sourceIdentity": {"type": "string"},
+              "webIdFederationData": {"type": "object", "nullable": true}
+            }
+          },
+          "type": {"type": "string"},
+          "userName": {"type": "string"}
         }
-      },
-      "principalId": {"type": "string"},
-      "sessionContext": {"$ref": "#/components/schemas/CloudTrailSessionContext"},
-      "type": {"type": "string"},
-      "userName": {"type": "string"}
-    }
-  },
-  "CloudTrailSessionContext": {
-    "type": "object",
-    "properties": {
-      "attributes": {"$ref": "#/components/schemas/CloudTrailSessionAttributes"},
-      "ec2RoleDelivery": {"type": "string"},
-      "sessionIssuer": {"$ref": "#/components/schemas/CloudTrailSessionIssuer"},
-      "sourceIdentity": {"type": "string"},
-      "webIdFederationData": {"type": "object", "nullable": true}
-    }
-  },
-  "CloudTrailSessionAttributes": {
-    "type": "object",
-    "properties": {
-      "creationDate": {"type": "string", "format": "date-time"},
-      "mfaAuthenticated": {"type": "string"}
-    }
-  },
-  "CloudTrailSessionIssuer": {
-    "type": "object",
-    "properties": {
-      "accountId": {"type": "string"},
-      "arn": {"type": "string"},
-      "principalId": {"type": "string"},
-      "type": {"type": "string"},
-      "userName": {"type": "string"}
+      }
     }
   }
 }"##;
@@ -1690,6 +1885,13 @@ pub fn managed_schema_description(schema_name: &str) -> Option<String> {
 /// schema under (see `SearchSchemas`), so they travel with the component a converted
 /// document keeps.
 ///
+/// The document is assembled through [`JsonNode`], not [`serde_json::Value`], because
+/// the published document's MEMBER ORDER is part of it: it opens with `openapi`, then
+/// `info` (its `title` before its `version`), then `paths`, then `components`, and each
+/// component's `type` precedes its `properties`. A `serde_json::Map` cannot state that
+/// — it holds members by name or by insertion depending on a workspace-wide feature —
+/// and `Content` is text a client caches, diffs and hashes.
+///
 /// `None` when `components` is not a JSON object, or does not define the component the
 /// envelope's `detail` must reference (the one named after the event) as an object:
 /// that is a document with nothing to describe, and the catalogue leaves it out rather
@@ -1700,49 +1902,120 @@ fn event_schema_document(
     event_name: &str,
     components: &str,
 ) -> Option<String> {
-    let mut schemas = match ::serde_json::from_str(components).ok()? {
-        ::serde_json::Value::Object(schemas) => schemas,
-        _ => return None,
+    let JsonNode::Object(mut schemas) = JsonNode::parse(components)? else {
+        return None;
     };
-    let event = schemas.get_mut(event_name)?.as_object_mut()?;
-    event.insert(
-        "x-amazon-events-detail-type".to_string(),
-        ::serde_json::Value::String(detail_type.to_string()),
-    );
-    event.insert(
-        "x-amazon-events-source".to_string(),
-        ::serde_json::Value::String(source.to_string()),
-    );
-    schemas.insert(
+    let event = schemas
+        .iter_mut()
+        .find(|(name, _)| name == event_name)
+        .map(|(_, component)| component)?;
+    if !matches!(event, JsonNode::Object(_)) {
+        return None;
+    }
+    event.set_member("x-amazon-events-detail-type", JsonNode::text(detail_type));
+    event.set_member("x-amazon-events-source", JsonNode::text(source));
+    schemas.push((
         EVENT_ENVELOPE_COMPONENT.to_string(),
-        ::serde_json::json!({
-            "type": "object",
-            "required": [
-                "detail-type", "resources", "detail", "id", "source", "time",
-                "region", "version", "account"
-            ],
-            "x-amazon-events-detail-type": detail_type,
-            "x-amazon-events-source": source,
-            "properties": {
-                "account": {"type": "string"},
-                "detail": {"$ref": format!("{OPENAPI_COMPONENT_REF}{event_name}")},
-                "detail-type": {"type": "string"},
-                "id": {"type": "string"},
-                "region": {"type": "string"},
-                "resources": {"type": "array", "items": {"type": "string"}},
-                "source": {"type": "string"},
-                "time": {"type": "string", "format": "date-time"},
-                "version": {"type": "string"}
-            }
-        }),
-    );
-    ::serde_json::to_string(&::serde_json::json!({
-        "openapi": "3.0.0",
-        "info": {"version": "1.0.0", "title": managed_schema_title(source, detail_type)},
-        "paths": {},
-        "components": {"schemas": schemas}
-    }))
-    .ok()
+        event_envelope(source, detail_type, event_name),
+    ));
+    Some(
+        JsonNode::Object(vec![
+            ("openapi".to_string(), JsonNode::text(MANAGED_OPENAPI_VERSION)),
+            (
+                "info".to_string(),
+                JsonNode::Object(vec![
+                    (
+                        "title".to_string(),
+                        JsonNode::Text(managed_schema_title(source, detail_type)),
+                    ),
+                    ("version".to_string(), JsonNode::text(MANAGED_DOCUMENT_VERSION)),
+                ]),
+            ),
+            ("paths".to_string(), JsonNode::Object(Vec::new())),
+            (
+                "components".to_string(),
+                JsonNode::Object(vec![("schemas".to_string(), JsonNode::Object(schemas))]),
+            ),
+        ])
+        .to_json(),
+    )
+}
+
+/// The OpenAPI dialect every published event document declares.
+const MANAGED_OPENAPI_VERSION: &str = "3.0.0";
+
+/// The `info.version` every published event document carries: the document describes
+/// one event type, which the catalogue publishes one revision of at a time.
+const MANAGED_DOCUMENT_VERSION: &str = "1.0.0";
+
+/// The [`EVENT_ENVELOPE_COMPONENT`] of a published event document: the EventBridge
+/// event fields every AWS event carries, with `detail` referencing the component that
+/// describes THIS event's `detail`.
+///
+/// Its members are in the order the published documents write them — `type`, the
+/// `required` envelope fields, the two `x-amazon-events-*` extensions, then
+/// `properties` — because the document is served as written.
+fn event_envelope(source: &str, detail_type: &str, event_name: &str) -> JsonNode {
+    let string = || JsonNode::Object(vec![("type".to_string(), JsonNode::text("string"))]);
+    JsonNode::Object(vec![
+        ("type".to_string(), JsonNode::text("object")),
+        (
+            "required".to_string(),
+            JsonNode::List(
+                [
+                    "detail-type",
+                    "resources",
+                    "detail",
+                    "id",
+                    "source",
+                    "time",
+                    "region",
+                    "version",
+                    "account",
+                ]
+                .iter()
+                .map(|field| JsonNode::text(field))
+                .collect(),
+            ),
+        ),
+        (
+            "x-amazon-events-detail-type".to_string(),
+            JsonNode::text(detail_type),
+        ),
+        ("x-amazon-events-source".to_string(), JsonNode::text(source)),
+        (
+            "properties".to_string(),
+            JsonNode::Object(vec![
+                ("account".to_string(), string()),
+                (
+                    "detail".to_string(),
+                    JsonNode::Object(vec![(
+                        "$ref".to_string(),
+                        JsonNode::Text(format!("{OPENAPI_COMPONENT_REF}{event_name}")),
+                    )]),
+                ),
+                ("detail-type".to_string(), string()),
+                ("id".to_string(), string()),
+                ("region".to_string(), string()),
+                (
+                    "resources".to_string(),
+                    JsonNode::Object(vec![
+                        ("type".to_string(), JsonNode::text("array")),
+                        ("items".to_string(), string()),
+                    ]),
+                ),
+                ("source".to_string(), string()),
+                (
+                    "time".to_string(),
+                    JsonNode::Object(vec![
+                        ("type".to_string(), JsonNode::text("string")),
+                        ("format".to_string(), JsonNode::text("date-time")),
+                    ]),
+                ),
+                ("version".to_string(), string()),
+            ]),
+        ),
+    ])
 }
 
 /// The title the catalogue gives the document of one published event type:

@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/arn_addressed_tag_refusals.rs"]
 mod arn_addressed_tag_refusals;
+#[path = "all/batch_and_transact_items.rs"]
+mod batch_and_transact_items;
 #[path = "all/collection_cap_constraint_reports.rs"]
 mod collection_cap_constraint_reports;
 #[path = "all/emulator.rs"]
@@ -21,10 +23,14 @@ mod emulator;
 mod global_secondary_indexes;
 #[path = "all/index_capacity_and_item_collections.rs"]
 mod index_capacity_and_item_collections;
+#[path = "all/item_write_expressions.rs"]
+mod item_write_expressions;
 #[path = "all/key_schema_element_refusals.rs"]
 mod key_schema_element_refusals;
 #[path = "all/number_canonicalization.rs"]
 mod number_canonicalization;
+#[path = "all/partiql_statements.rs"]
+mod partiql_statements;
 #[path = "all/region_from_the_request_endpoint.rs"]
 mod region_from_the_request_endpoint;
 #[path = "all/regions_indexes_and_capacity.rs"]

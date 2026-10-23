@@ -19,6 +19,8 @@ mod activity_type_registration;
 mod count_open_workflow_executions;
 #[path = "all/count_pending_decision_tasks.rs"]
 mod count_pending_decision_tasks;
+#[path = "all/decision_task_poller_cap.rs"]
+mod decision_task_poller_cap;
 #[path = "all/delete_workflow_type.rs"]
 mod delete_workflow_type;
 #[path = "all/deprecate_activity_type.rs"]
@@ -33,6 +35,8 @@ mod domain_tag_resource;
 mod domain_tagging;
 #[path = "all/domain_undeprecation.rs"]
 mod domain_undeprecation;
+#[path = "all/execution_start_to_close_timeout.rs"]
+mod execution_start_to_close_timeout;
 #[path = "all/list_closed_workflow_executions.rs"]
 mod list_closed_workflow_executions;
 #[path = "all/list_open_workflow_executions.rs"]
@@ -43,6 +47,8 @@ mod pending_activity_task_count;
 mod poll_for_decision_task;
 #[path = "all/request_cancel_workflow_execution.rs"]
 mod request_cancel_workflow_execution;
+#[path = "all/signal_workflow_execution.rs"]
+mod signal_workflow_execution;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/tag_resource_value_fidelity.rs"]

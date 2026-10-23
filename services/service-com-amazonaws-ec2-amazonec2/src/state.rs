@@ -389,6 +389,22 @@
 //! is account-wide because this store is per ACCOUNT and not per Region (see "The default
 //! VPC's default subnets" below).
 //!
+//! ## Longer-ID (17-character ID) format settings
+//!
+//! [`ComAmazonawsEc2Amazonec2State::id_format_overrides`] holds the longer-ID preference
+//! each principal has EXPLICITLY set, keyed by principal ARN and then by resource type:
+//! exactly the set `DescribePrincipalIdFormat` reports beside the account's root user
+//! ("all IAM roles and IAM users that have explicitly specified a longer ID
+//! (17-character ID) preference"), and what `ModifyIdentityIdFormat` writes. A principal
+//! that has set nothing is NOT a row here, because it is not a resource anybody created:
+//! "all IAM roles and IAM users default to the same ID settings as the root user, unless
+//! they explicitly override the settings", so
+//! [`ComAmazonawsEc2Amazonec2State::use_long_ids_for`] derives one principal's setting
+//! from its own entry, then the root user's, then [`DEFAULT_USE_LONG_IDS`] — rather than
+//! writing a row per principal and per type that two operations could then disagree
+//! about. The resource-type key is a `&'static str` out of
+//! [`LONGER_ID_RESOURCE_TYPES`], so only a type the model publishes is ever stored.
+//!
 //! ## The default security group of a VPC
 //!
 //! "Your VPC automatically comes with a default security group. … you can't delete a
@@ -1022,6 +1038,17 @@ pub const INVALID_POOL_ID_NOT_FOUND: &str = "InvalidPoolID.NotFound";
 /// EC2's error code for a pagination token this service did not issue.
 pub const INVALID_PAGINATION_TOKEN: &str = "InvalidPaginationToken";
 
+/// EC2's error code for a request that named a resource TYPE the action does not support —
+/// a word where one of a published list of resource types belongs. Distinct from
+/// [`INVALID_PARAMETER_VALUE`], which is about a value of any other kind.
+pub const INVALID_RESOURCE_TYPE_UNKNOWN: &str = "InvalidResourceType.Unknown";
+
+/// The message EC2 answers [`INVALID_RESOURCE_TYPE_UNKNOWN`] with: a fixed sentence that
+/// does not name the type at fault, as observed for every operation that takes a resource
+/// type (`CreateTags` with an unknown one answers "Invalid resource type"), unlike most of
+/// this service's refusals, whose message is built from the request.
+pub const INVALID_RESOURCE_TYPE_MESSAGE: &str = "Invalid resource type";
+
 /// EC2's error code for a request that named a volume id this account holds no EBS
 /// volume for.
 pub const INVALID_VOLUME_ID_NOT_FOUND: &str = "InvalidVolume.NotFound";
@@ -1611,6 +1638,18 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// [`Self::set_snapshot_block_public_access_state`], so the operations that report and
     /// the operations that change it cannot disagree.
     snapshot_block_public_access: &'static str,
+    /// The longer-ID (17-character ID) preference each principal has EXPLICITLY set, by
+    /// principal ARN and then by resource type — see the module docs.
+    ///
+    /// Only the overrides are stored: a principal with no entry (or with an empty one)
+    /// follows the root user, and the root user with no entry follows
+    /// [`DEFAULT_USE_LONG_IDS`], so [`Self::use_long_ids_for`] is the one definition of
+    /// what is in force. The inner key is a `&'static str` out of
+    /// [`LONGER_ID_RESOURCE_TYPES`], which keeps request text out of the store; the outer
+    /// key is the ARN the request named, and a new one is charged against
+    /// [`MAX_STORED_BYTES`] ([`Self::id_format_principal_bytes`]) so the number of
+    /// principals a run can store is bounded by that budget.
+    pub id_format_overrides: BTreeMap<String, BTreeMap<&'static str, bool>>,
 }
 
 /// A fresh account's EC2 state: the ambient network AWS gives it — the default VPC, that
@@ -1696,6 +1735,9 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             // "Public sharing is not blocked" is where an account that has never called
             // `EnableSnapshotBlockPublicAccess` sits.
             snapshot_block_public_access: SNAPSHOT_BLOCK_PUBLIC_ACCESS_UNBLOCKED,
+            // No principal has overridden its ID format settings yet, so every one of
+            // them follows the root user, which follows `DEFAULT_USE_LONG_IDS`.
+            id_format_overrides: BTreeMap::new(),
         };
         let default_vpc = state.insert_vpc(
             DEFAULT_VPC_CIDR_BLOCK,
@@ -4393,6 +4435,22 @@ pub fn matches_every_filter<'a>(
 /// with a message naming the value at fault.
 pub fn invalid_parameter_value<E>(message: impl Into<String>) -> crate::scaffolded::Scaffolded<E> {
     crate::scaffolded::Scaffolded::service_error(INVALID_PARAMETER_VALUE, 400, message)
+}
+
+/// Refuse a resource TYPE the action does not support, the way EC2 does: HTTP 400
+/// [`INVALID_RESOURCE_TYPE_UNKNOWN`] with its fixed message
+/// [`INVALID_RESOURCE_TYPE_MESSAGE`].
+///
+/// This is the code for a member whose value must be one of a published list of resource
+/// types — the ID format surface's `Resource`/`Resources` — rather than
+/// [`invalid_parameter_value`], which is for a value of any other kind. It takes no
+/// message because EC2's own is a constant: the refusal does not name the type at fault.
+pub fn invalid_resource_type_unknown<E>() -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_error(
+        INVALID_RESOURCE_TYPE_UNKNOWN,
+        400,
+        INVALID_RESOURCE_TYPE_MESSAGE,
+    )
 }
 
 /// Refuse a `Filters` entry naming a filter the operation does not support, the way EC2
@@ -13009,6 +13067,326 @@ impl ComAmazonawsEc2Amazonec2State {
     pub fn set_snapshot_block_public_access_state(&mut self, state: &'static str) -> &'static str {
         self.snapshot_block_public_access = state;
         self.snapshot_block_public_access
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Longer-ID (17-character ID) format settings
+// ---------------------------------------------------------------------------
+
+/// Every resource type that has a longer-ID setting, as
+/// `DescribePrincipalIdFormatRequest$Resources` publishes them ("The type of resource:
+/// `bundle` | `conversion-task` | … | `vpn-gateway`") — the same list
+/// `DescribePrincipalIdFormat`'s own documentation gives for "the following resource types
+/// support longer IDs".
+///
+/// Held in the order that documentation lists them in, which is also sorted, so it is the
+/// stable order a describe reports one principal's statuses in.
+pub const LONGER_ID_RESOURCE_TYPES: [&str; 31] = [
+    "bundle",
+    "conversion-task",
+    "customer-gateway",
+    "dhcp-options",
+    "elastic-ip-allocation",
+    "elastic-ip-association",
+    "export-task",
+    "flow-log",
+    "image",
+    "import-task",
+    "instance",
+    "internet-gateway",
+    "network-acl",
+    "network-acl-association",
+    "network-interface",
+    "network-interface-attachment",
+    "prefix-list",
+    "reservation",
+    "route-table",
+    "route-table-association",
+    "security-group",
+    "snapshot",
+    "subnet",
+    "subnet-cidr-block-association",
+    "volume",
+    "vpc",
+    "vpc-cidr-block-association",
+    "vpc-endpoint",
+    "vpc-peering-connection",
+    "vpn-connection",
+    "vpn-gateway",
+];
+
+/// The resource types whose longer-ID setting a caller can still CHANGE, as
+/// `ModifyIdentityIdFormatRequest$Resource` publishes them: "This request can only be used
+/// to modify longer ID settings for resource types that are within the opt-in period.
+/// Resources currently in their opt-in period include: `bundle` | … | `vpn-gateway`".
+///
+/// That is [`LONGER_ID_RESOURCE_TYPES`] without
+/// [`PERMANENT_LONGER_ID_RESOURCE_TYPES`], the four the modify list leaves out.
+pub const OPT_IN_LONGER_ID_RESOURCE_TYPES: [&str; 27] = [
+    "bundle",
+    "conversion-task",
+    "customer-gateway",
+    "dhcp-options",
+    "elastic-ip-allocation",
+    "elastic-ip-association",
+    "export-task",
+    "flow-log",
+    "image",
+    "import-task",
+    "internet-gateway",
+    "network-acl",
+    "network-acl-association",
+    "network-interface",
+    "network-interface-attachment",
+    "prefix-list",
+    "route-table",
+    "route-table-association",
+    "security-group",
+    "subnet",
+    "subnet-cidr-block-association",
+    "vpc",
+    "vpc-cidr-block-association",
+    "vpc-endpoint",
+    "vpc-peering-connection",
+    "vpn-connection",
+    "vpn-gateway",
+];
+
+/// The resource types [`LONGER_ID_RESOURCE_TYPES`] holds that
+/// `ModifyIdentityIdFormatRequest$Resource` does NOT: the ones past their opt-in period,
+/// which are "permanently switched over to using longer IDs"
+/// (`IdFormat$Deadline`) — so their setting is always on and no request can change it.
+pub const PERMANENT_LONGER_ID_RESOURCE_TYPES: [&str; 4] =
+    ["instance", "reservation", "snapshot", "volume"];
+
+/// `all-current`: "use the `all-current` option to include all resource types that are
+/// currently within their opt-in period for longer IDs"
+/// (`ModifyIdentityIdFormatRequest$Resource`) — every member of
+/// [`OPT_IN_LONGER_ID_RESOURCE_TYPES`] in one request.
+pub const ALL_CURRENT_RESOURCES: &str = "all-current";
+
+/// `all`: "Specify `all` to modify the ID format for all IAM users, IAM roles, and the
+/// root user of the account" (`ModifyIdentityIdFormatRequest$PrincipalArn`).
+pub const ALL_PRINCIPALS: &str = "all";
+
+/// The longer-ID setting in force for a resource type nobody has overridden.
+///
+/// `true`, because every id this emulator mints is already of the longer form —
+/// [`ComAmazonawsEc2Amazonec2State::next_id`] appends 17 lowercase hexadecimal digits to
+/// every resource-id prefix — so reporting anything else for a type nobody has set would
+/// describe ids this service does not hand out.
+pub const DEFAULT_USE_LONG_IDS: bool = true;
+
+/// The resource portion of an account's root-user ARN.
+pub const IAM_ROOT_RESOURCE: &str = "root";
+
+/// The resource prefixes of the two kinds of IAM principal that are not the root user,
+/// as an IAM ARN spells them (`arn:aws:iam::<account>:user/<name>`,
+/// `…:role/<name>`).
+const IAM_PRINCIPAL_PREFIXES: [&str; 2] = ["user/", "role/"];
+
+/// The most bytes the path-and-name part of an IAM user or role ARN may carry: the IAM
+/// quotas on the two ("Path: 512 characters", "Role name / User name: 64 characters" — IAM
+/// identifiers and quotas), so an ARN a request names is bounded before it is stored.
+const IAM_PRINCIPAL_PATH_AND_NAME_MAX: usize = 512 + 64;
+
+/// The ARN of the account's root user — the principal `DescribePrincipalIdFormat` always
+/// reports ("Describes the ID format settings for the root user and all IAM roles and IAM
+/// users that have explicitly specified a longer ID … preference").
+///
+/// Built through [`::engine::emulator_arn`] with the empty Region IAM's global ARNs carry,
+/// so it names the same account every resource of this store is owned by.
+pub fn root_principal_arn() -> String {
+    ::engine::emulator_arn("iam", "", IAM_ROOT_RESOURCE)
+}
+
+/// The [`LONGER_ID_RESOURCE_TYPES`] member `requested` names, or `None` when it names
+/// none.
+///
+/// Answering a `&'static str` out of this module's own catalog is what keeps request text
+/// out of the store: a writer stores what this returns.
+pub fn longer_id_resource_type(requested: &str) -> Option<&'static str> {
+    LONGER_ID_RESOURCE_TYPES
+        .into_iter()
+        .find(|resource| *resource == requested)
+}
+
+/// The [`OPT_IN_LONGER_ID_RESOURCE_TYPES`] member `requested` names, or `None` when it
+/// names none — the types a modify may write, for the same reason as
+/// [`longer_id_resource_type`].
+pub fn opt_in_longer_id_resource_type(requested: &str) -> Option<&'static str> {
+    OPT_IN_LONGER_ID_RESOURCE_TYPES
+        .into_iter()
+        .find(|resource| *resource == requested)
+}
+
+/// Is `resource` a type whose longer-ID setting is permanently on
+/// ([`PERMANENT_LONGER_ID_RESOURCE_TYPES`])?
+pub fn longer_ids_are_permanent_for(resource: &str) -> bool {
+    PERMANENT_LONGER_ID_RESOURCE_TYPES.contains(&resource)
+}
+
+/// Is `arn` the ARN of an IAM principal of the account this store belongs to — "an IAM
+/// user, IAM role, or the root user" (`ModifyIdentityIdFormatRequest$PrincipalArn`)?
+///
+/// `arn:<partition>:iam::<account>:root`, `…:user/<path><name>` or `…:role/<path><name>`,
+/// with the empty Region segment IAM's global ARNs carry and with `<account>` the account
+/// this emulator serves: the ID format settings of another account's principals are not
+/// this account's to set. The path-and-name part is bounded by
+/// [`IAM_PRINCIPAL_PATH_AND_NAME_MAX`] and limited to the characters IAM admits in the
+/// two, so a request cannot name an unbounded principal.
+pub fn iam_principal_arn_is_well_formed(arn: &str) -> bool {
+    let fields: Vec<&str> = arn.split(':').collect();
+    let [prefix, partition, service, region, account, resource] = fields.as_slice() else {
+        return false;
+    };
+    let partition_is_well_formed = !partition.is_empty()
+        && partition
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-');
+    if *prefix != "arn"
+        || !partition_is_well_formed
+        || *service != "iam"
+        || !region.is_empty()
+        || *account != ::engine::emulator_account_id()
+    {
+        return false;
+    }
+    if *resource == IAM_ROOT_RESOURCE {
+        return true;
+    }
+    IAM_PRINCIPAL_PREFIXES
+        .iter()
+        .filter_map(|kind| resource.strip_prefix(kind))
+        .any(|path_and_name| {
+            !path_and_name.is_empty()
+                && path_and_name.len() <= IAM_PRINCIPAL_PATH_AND_NAME_MAX
+                && !path_and_name.ends_with('/')
+                && path_and_name.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || b"+=,.@_-/".contains(&byte)
+                })
+        })
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// Whether longer IDs are in force for `resource` for the principal `arn`.
+    ///
+    /// The three rules the ID format API documents, in order: a type past its opt-in
+    /// period is permanently on ([`PERMANENT_LONGER_ID_RESOURCE_TYPES`]); otherwise the
+    /// principal's own explicit setting wins; otherwise "all IAM roles and IAM users
+    /// default to the same ID settings as the root user, unless they explicitly override
+    /// the settings" (`DescribePrincipalIdFormat`), and the root user itself falls back to
+    /// [`DEFAULT_USE_LONG_IDS`].
+    ///
+    /// A pure read: nothing about the setting changes with time, so no caller of this can
+    /// change what a later one sees.
+    pub fn use_long_ids_for(&self, arn: &str, resource: &str) -> bool {
+        self.use_long_ids_against_root(arn, resource, &root_principal_arn())
+    }
+
+    /// [`Self::use_long_ids_for`] with the root user's ARN already in hand, so a caller
+    /// answering for many principals and many resource types formats it ONCE rather than
+    /// per status.
+    fn use_long_ids_against_root(&self, arn: &str, resource: &str, root: &str) -> bool {
+        if longer_ids_are_permanent_for(resource) {
+            return true;
+        }
+        let setting_of = |principal: &str| {
+            self.id_format_overrides
+                .get(principal)
+                .and_then(|overrides| overrides.get(resource))
+                .copied()
+        };
+        setting_of(arn)
+            .or_else(|| (arn != root).then(|| setting_of(root)).flatten())
+            .unwrap_or(DEFAULT_USE_LONG_IDS)
+    }
+
+    /// The principals `DescribePrincipalIdFormat` reports, each with its setting for every
+    /// type in `resources`.
+    ///
+    /// "the root user and all IAM roles and IAM users that have explicitly specified a
+    /// longer ID (17-character ID) preference": the root user is always reported, whether
+    /// or not anything has ever been set for it, and every other principal only once it
+    /// holds an explicit setting. Ordered by ARN — the order
+    /// [`Self::id_format_overrides`] is kept in — so one page follows the previous one and
+    /// a token can name the ARN the next page starts at.
+    pub fn principal_id_formats(
+        &self,
+        resources: &[&'static str],
+    ) -> Vec<crate::ops::types::PrincipalIdFormat> {
+        let root = root_principal_arn();
+        let mut principals: BTreeSet<&str> = self
+            .id_format_overrides
+            .iter()
+            .filter(|(_, overrides)| !overrides.is_empty())
+            .map(|(arn, _)| arn.as_str())
+            .collect();
+        principals.insert(root.as_str());
+        principals
+            .into_iter()
+            .map(|arn| crate::ops::types::PrincipalIdFormat {
+                arn: Some(arn.to_string()),
+                statuses: Some(
+                    resources
+                        .iter()
+                        .map(|resource| crate::ops::types::IdFormat {
+                            // "The date in UTC at which you are permanently switched over
+                            // to using longer IDs. If a deadline is not yet available for
+                            // this resource type, this field is not returned"
+                            // (`IdFormat$Deadline`): this emulator mints longer ids for
+                            // every type already, so there is no future switch-over date
+                            // to report for any of them.
+                            deadline: None,
+                            resource: Some((*resource).to_string()),
+                            use_long_ids: Some(self.use_long_ids_against_root(
+                                arn, resource, &root,
+                            )),
+                        })
+                        .collect(),
+                ),
+            })
+            .collect()
+    }
+
+    /// The caller-chosen bytes storing a setting for `arn` would add: the ARN itself for a
+    /// principal this store holds nothing for yet, and nothing for one it already has,
+    /// since a further setting of the same principal only adds a `&'static str` key and a
+    /// `bool`.
+    pub fn id_format_principal_bytes(&self, arn: &str) -> usize {
+        if self.id_format_overrides.contains_key(arn) {
+            0
+        } else {
+            arn.len()
+        }
+    }
+
+    /// Record `use_long_ids` as the principal `arn`'s EXPLICIT setting for `resource`.
+    ///
+    /// `resource` is a `&'static str`, so only a member of this module's own catalog can
+    /// be stored; the ARN is the one the request named, charged against
+    /// [`MAX_STORED_BYTES`] by its caller through [`Self::id_format_principal_bytes`].
+    pub fn set_id_format(&mut self, arn: &str, resource: &'static str, use_long_ids: bool) {
+        self.id_format_overrides
+            .entry(arn.to_string())
+            .or_default()
+            .insert(resource, use_long_ids);
+    }
+
+    /// Record `use_long_ids` as the setting of `resource` for EVERY principal of the
+    /// account: "Specify `all` to modify the ID format for all IAM users, IAM roles, and
+    /// the root user of the account" (`ModifyIdentityIdFormatRequest$PrincipalArn`).
+    ///
+    /// The root user's setting is what every principal that has not overridden the type
+    /// follows ([`Self::use_long_ids_for`]), so writing it is what reaches the principals
+    /// this store has never heard of; the principals it HAS heard of are written too, so a
+    /// setting one of them overrode earlier cannot survive a request that covers it.
+    pub fn set_id_format_for_all_principals(&mut self, resource: &'static str, use_long_ids: bool) {
+        self.set_id_format(&root_principal_arn(), resource, use_long_ids);
+        for overrides in self.id_format_overrides.values_mut() {
+            overrides.insert(resource, use_long_ids);
+        }
     }
 }
 

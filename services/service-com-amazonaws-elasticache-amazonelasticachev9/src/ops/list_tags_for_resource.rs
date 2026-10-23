@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTagsForResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTagsForResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTagsForResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Lists the tags the resource its `ResourceName` names carries. This is the ONLY
+//! file to touch for this operation.
+//!
+//! A READ: it reports the tags on the resource's own record — whatever kind of
+//! resource that is and however the tags got there (a create's `Tags` member, or
+//! `AddTagsToResource`) — and writes nothing, so two of these agree and neither
+//! changes what a later caller sees.
+//!
+//! The ARN is resolved through the one resolution this operation shares with
+//! `AddTagsToResource` and `RemoveTagsFromResource`
+//! (`crate::state::ComAmazonawsElasticacheAmazonelasticachev9State::resource_tags`), so
+//! a value that is not an ElastiCache resource ARN is the modelled 400
+//! `InvalidARNFault` and a well-formed ARN naming no stored resource is that resource
+//! kind's own not-found fault, rather than an empty tag list for an ARN nothing
+//! answers for.
 //!
 //! ## Shape of an operation
 //!
@@ -154,6 +161,89 @@ impl From<ListTagsForResourceErrorModeled> for ListTagsForResourceError {
     }
 }
 
+/// This operation's answer to a `ResourceName` that names no resource of this service.
+///
+/// The classification is
+/// [`crate::state::ComAmazonawsElasticacheAmazonelasticachev9State::resource_tags`]'s,
+/// shared with `AddTagsToResource` and `RemoveTagsFromResource`; only the lift into THIS
+/// operation's error enum lives here, because each tagging operation declares its own.
+fn reject(rejection: crate::state::TagTargetRejection) -> ListTagsForResourceError {
+    use crate::state::{TagTargetRejection, TaggedResourceKind};
+    match rejection {
+        TagTargetRejection::InvalidArn(message) => {
+            ListTagsForResourceErrorModeled::InvalidARNFault(InvalidARNFault {
+                message: Some(message),
+            })
+        }
+        TagTargetRejection::NotFound(kind, text) => {
+            let message = Some(text);
+            match kind {
+                TaggedResourceKind::CacheCluster => {
+                    ListTagsForResourceErrorModeled::CacheClusterNotFoundFault(
+                        CacheClusterNotFoundFault { message },
+                    )
+                }
+                TaggedResourceKind::CacheParameterGroup => {
+                    ListTagsForResourceErrorModeled::CacheParameterGroupNotFoundFault(
+                        CacheParameterGroupNotFoundFault { message },
+                    )
+                }
+                TaggedResourceKind::CacheSecurityGroup => {
+                    ListTagsForResourceErrorModeled::CacheSecurityGroupNotFoundFault(
+                        CacheSecurityGroupNotFoundFault { message },
+                    )
+                }
+                TaggedResourceKind::CacheSubnetGroup => {
+                    ListTagsForResourceErrorModeled::CacheSubnetGroupNotFoundFault(
+                        CacheSubnetGroupNotFoundFault { message },
+                    )
+                }
+                TaggedResourceKind::GlobalReplicationGroup => {
+                    ListTagsForResourceErrorModeled::GlobalReplicationGroupNotFoundFault(
+                        GlobalReplicationGroupNotFoundFault { message },
+                    )
+                }
+                TaggedResourceKind::ReplicationGroup => {
+                    ListTagsForResourceErrorModeled::ReplicationGroupNotFoundFault(
+                        ReplicationGroupNotFoundFault { message },
+                    )
+                }
+                TaggedResourceKind::ReservedCacheNode => {
+                    ListTagsForResourceErrorModeled::ReservedCacheNodeNotFoundFault(
+                        ReservedCacheNodeNotFoundFault { message },
+                    )
+                }
+                TaggedResourceKind::ServerlessCache => {
+                    ListTagsForResourceErrorModeled::ServerlessCacheNotFoundFault(
+                        ServerlessCacheNotFoundFault { message },
+                    )
+                }
+                TaggedResourceKind::ServerlessCacheSnapshot => {
+                    ListTagsForResourceErrorModeled::ServerlessCacheSnapshotNotFoundFault(
+                        ServerlessCacheSnapshotNotFoundFault { message },
+                    )
+                }
+                TaggedResourceKind::Snapshot => {
+                    ListTagsForResourceErrorModeled::SnapshotNotFoundFault(SnapshotNotFoundFault {
+                        message,
+                    })
+                }
+                TaggedResourceKind::User => {
+                    ListTagsForResourceErrorModeled::UserNotFoundFault(UserNotFoundFault {
+                        message,
+                    })
+                }
+                TaggedResourceKind::UserGroup => {
+                    ListTagsForResourceErrorModeled::UserGroupNotFoundFault(
+                        UserGroupNotFoundFault { message },
+                    )
+                }
+            }
+        }
+    }
+    .into()
+}
+
 /// The `ListTagsForResource` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -190,18 +280,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTagsForResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTagsForResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTagsForResource"))
+        // A READ: it reports the tags the store holds and writes nothing. The ARN
+        // carries the Region the resource lives in, so nothing here reads the
+        // request's Region.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+
+        let store = state.lock();
+        let stored = store
+            .resource_tags(&input.resource_name)
+            .map_err(reject)?;
+        // `TagListMessage$TagList` is "a list of tags as key-value pairs" — every tag
+        // the resource carries, built from the stored record. A resource carrying none
+        // answers an EMPTY list rather than an absent member: it HAS a tag set, and it
+        // is empty.
+        Ok(ListTagsForResourceOutput {
+            tag_list: Some(crate::state::tag_list(stored)),
+        })
     }
 }

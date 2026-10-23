@@ -1483,22 +1483,36 @@ pub fn package_cursor_scope(domain: &str, repository: &str) -> String {
 /// `asset` (`smithy_query(query="shape",shape="ResourceType")`).
 pub const DOMAIN_RESOURCE_TYPE: &str = "domain";
 
-/// The not-found message a domain-scoped policy operation reports when the domain it
-/// resolved holds no policy: the type of resource whose policy was asked for, and the name
-/// the request addressed it by. Shared by the read and the delete, so the two cannot report
-/// one domain's unset policy differently.
-pub fn no_policy_message(resource_type: &str, resource: &str) -> String {
-    format!("No policy found for ({resource_type}): ({resource})")
-}
-
-/// The conflict message a domain-scoped policy write or delete reports when the
-/// `policyRevision` the caller supplied is not the revision currently attached — the
-/// optimistic-locking refusal [`policy_revision_matches`] decides.
-pub fn policy_revision_conflict_message(resource_type: &str, resource: &str) -> String {
+/// The not-found message a resource-policy read reports when the resource it resolved holds
+/// no policy: the kinds of resource that address the policy, and the names the request
+/// addressed them by, each in one parenthesised, comma-separated list.
+///
+/// A policy hangs off a resource that takes ONE name on a domain (`(domain): (<domain>)`)
+/// and TWO on a repository, which is addressed inside its domain
+/// (`(domain, repo): (<domain>, <repository>)`) — both recorded. Shared by every policy
+/// read so two of them cannot report an unset policy differently.
+pub fn no_policy_message(resource_kinds: &[&str], resources: &[&str]) -> String {
     format!(
-        "The policy revision supplied for ({resource_type}): ({resource}) is not the current revision of its resource policy."
+        "No policy found for ({}): ({})",
+        resource_kinds.join(", "),
+        resources.join(", ")
     )
 }
+
+/// The resource kind the recorded no-policy message names a repository by — the word AWS
+/// uses in that message, which is NOT the `ResourceType` enum member
+/// [`REPOSITORY_RESOURCE_TYPE`] reported beside it as `resourceType`.
+pub const REPOSITORY_POLICY_RESOURCE_KIND: &str = "repo";
+
+/// The conflict message a resource-policy write or delete reports when the `policyRevision`
+/// the caller supplied is not the revision currently attached — the optimistic-locking
+/// refusal [`policy_revision_matches`] decides.
+///
+/// ONE sentence, naming no resource: the recorded refusal says only that the revision the
+/// caller held is not the one the service holds. Shared by the domain and the repository
+/// families, and by the write and the delete, so no two of them word the same refusal
+/// differently.
+pub const POLICY_REVISION_CONFLICT_MESSAGE: &str = "Provided policy version conflicts with the server";
 
 /// The refusal a resource-policy write owes a `policyDocument` that is not a policy, or
 /// `None` when the document is one.
@@ -1507,8 +1521,9 @@ pub fn policy_revision_conflict_message(resource_type: &str, resource: &str) -> 
 /// the modelled pattern (`^[\P{C}\s]+$`) only forbids control characters, so JSON
 /// well-formedness is the service's own rule — checked here, once, for every resource a
 /// policy can hang off, so the modelled `reason` cannot differ between the domain and the
-/// repository families. The document is parsed ONLY to check it: what the caller sent is
-/// what gets stored ([`attached_policy`]).
+/// repository families. The document is parsed ONLY to check it: its structure is never
+/// rewritten, and the only thing dropped on the way into the store is the whitespace
+/// between its tokens ([`stored_policy_document`]).
 pub fn policy_document_refusal(document: &str) -> Option<ValidationException> {
     match serde_json::from_str::<serde_json::Value>(document) {
         Ok(serde_json::Value::Object(_)) => None,
@@ -1555,17 +1570,182 @@ pub fn policy_revision_matches(current: Option<&ResourcePolicy>, supplied: Optio
     }
 }
 
-/// The policy to store on the resource `resource_arn` names: `document` as the caller
-/// sent it, under the revision minted for this resource's `attachment`-th policy.
+/// The policy to store on the resource `resource_arn` names: `document` in the form a
+/// policy is stored in ([`stored_policy_document`]), under the revision minted for this
+/// resource's `attachment`-th policy.
 ///
-/// The document is stored VERBATIM — a resource policy is reported back as the string
-/// that was submitted, never as a re-serialised or normalised rendering of it.
+/// The revision is derived from the STORED form, so the token a write mints identifies the
+/// document a later read answers with and not a rendering of it nobody can observe.
 pub fn attached_policy(resource_arn: &str, document: String, attachment: u64) -> ResourcePolicy {
+    let document = stored_policy_document(&document);
     ResourcePolicy {
         revision: Some(policy_revision(resource_arn, &document, attachment)),
         resource_arn: Some(resource_arn.to_string()),
         document: Some(document),
     }
+}
+
+/// The form a submitted `policyDocument` is STORED and reported in: CodeArtifact's own
+/// rendering of the policy the caller wrote.
+///
+/// A resource policy is an Aspen (IAM) policy document, and CodeArtifact reports it as it
+/// renders it, not as the request spelled it. Two differences are what the recorded
+/// `Put`/`Get`/`Delete` responses of both the domain and the repository policy show:
+///
+/// 1. the whitespace BETWEEN the document's JSON tokens is gone — no space after a `:` or
+///    a `,`, no indentation, whatever spacing the request used; and
+/// 2. an Aspen element whose value the policy language types as "String or Array of
+///    strings" ([`SINGLE_ELEMENT_COLLAPSING_ELEMENTS`]) is rendered as the STRING when the
+///    caller submitted a one-element array of strings — a one-action statement comes back
+///    with a scalar `Action`.
+///
+/// Everything else about the document is the caller's data and survives untouched: member
+/// order, statement count, the `Statement` array itself (a one-statement policy is reported
+/// as a one-element array, never as a bare object), the type and spelling of every other
+/// value, and every byte inside a string literal — whitespace, escapes and non-ASCII
+/// characters included. That is why this walks the document's own bytes rather than
+/// re-serialising a parsed value, which would also rewrite the member order, the escapes
+/// and the number spellings the caller chose.
+///
+/// Both rewrites are one pass over the document's TOKENS, so a member name is only ever
+/// read where a name can appear (a string followed by `:`) and the contents of a string
+/// literal — which may hold anything, braces, quotes and whitespace included — are copied
+/// through whole. The `minifier` crate's `json::minify` is deliberately NOT used for the
+/// first rewrite: as of 0.4.0 it stops minifying at the first escaped quote, so
+/// `{ "a" : "x\"y" , "b" : 1 }` comes back still spaced from `"b"` on, and an escaped quote
+/// is legal in any `Sid` or condition value.
+///
+/// Applied at the ONE place a policy is attached ([`attached_policy`]), so the domain and
+/// the repository families cannot store a policy in two different forms, and the write,
+/// the read and the delete of one policy all report the same bytes.
+///
+/// A document that is not valid JSON never reaches here: it is refused by
+/// [`policy_document_refusal`] before anything is stored.
+pub fn stored_policy_document(document: &str) -> String {
+    let bytes = document.as_bytes();
+    let mut out = String::with_capacity(bytes.len());
+    // The Aspen element whose value starts at the current position: set by a string token
+    // that a `:` follows, and dropped as soon as that value is reached or anything else
+    // intervenes.
+    let mut element: Option<&str> = None;
+    let mut at = 0;
+    while at < bytes.len() {
+        match bytes[at] {
+            // Whitespace between tokens is dropped — and only between tokens: whitespace
+            // inside a string literal is part of the literal, which the arm below copies
+            // whole. It does not end an element name's reach, so `"Action" : [ "x" ]` is
+            // still the `Action` element.
+            b' ' | b'\t' | b'\n' | b'\r' => at += 1,
+            b'"' => {
+                let end = string_token_end(bytes, at);
+                out.push_str(&document[at..end]);
+                // A string is an element NAME exactly when a `:` follows it — possibly
+                // across whitespace, which is why the scan skips it here too. A literal
+                // that never closed (only reachable for a document that is not valid JSON,
+                // which never gets this far) names nothing.
+                let closed = end > at + 1 && bytes[end - 1] == b'"';
+                let after = skip_json_whitespace(bytes, end);
+                element = (closed && bytes.get(after) == Some(&b':'))
+                    .then(|| &document[at + 1..end - 1]);
+                at = end;
+            }
+            b'[' if element
+                .is_some_and(|name| SINGLE_ELEMENT_COLLAPSING_ELEMENTS.contains(&name)) =>
+            {
+                // A one-element array of one string — `["value"]`, however it is spaced —
+                // is rendered as that string. Anything else (no element, several, or one
+                // that is not a string) is left to the loop, which copies it as it is.
+                let first = skip_json_whitespace(bytes, at + 1);
+                let single = (bytes.get(first) == Some(&b'"'))
+                    .then(|| string_token_end(bytes, first))
+                    .map(|end| (end, skip_json_whitespace(bytes, end)))
+                    .filter(|(_, close)| bytes.get(*close) == Some(&b']'));
+                match single {
+                    Some((end, close)) => {
+                        out.push_str(&document[first..end]);
+                        at = close + 1;
+                    }
+                    None => {
+                        out.push('[');
+                        at += 1;
+                    }
+                }
+                element = None;
+            }
+            _ => {
+                // Every other token is copied byte for byte. The run stops at the bytes the
+                // arms above own, each of which is ASCII, so it always ends on a character
+                // boundary even when a non-ASCII byte sequence sits inside it.
+                let start = at;
+                at += 1;
+                while at < bytes.len()
+                    && !matches!(
+                        bytes[at],
+                        b'"' | b'[' | b':' | b' ' | b'\t' | b'\n' | b'\r'
+                    )
+                {
+                    at += 1;
+                }
+                let token = &document[start..at];
+                out.push_str(token);
+                // `:` is what introduces an element's value; every other token ends the
+                // name's reach.
+                if token != ":" {
+                    element = None;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The Aspen policy elements whose value the policy language types as "String or Array of
+/// strings", so that a one-element array and the bare string say the same thing: the
+/// statement's `Action`/`NotAction` and `Resource`/`NotResource`, and the principal lists
+/// inside `Principal`/`NotPrincipal` (`AWS`, `Service`, `Federated`, `CanonicalUser`).
+/// CodeArtifact renders every one of them in the string form when the array holds exactly
+/// one string, which the recorded repository policy shows for `Action`.
+///
+/// `Statement` is deliberately NOT in this list: the recorded documents keep a
+/// single-statement policy as a one-element array, so the array form is what a stored
+/// policy reports there.
+const SINGLE_ELEMENT_COLLAPSING_ELEMENTS: &[&str] = &[
+    "Action",
+    "NotAction",
+    "Resource",
+    "NotResource",
+    "AWS",
+    "Service",
+    "Federated",
+    "CanonicalUser",
+];
+
+/// The index of the first byte from `start` on that is not JSON whitespace — the four
+/// characters JSON allows between tokens (space, tab, carriage return, line feed).
+fn skip_json_whitespace(bytes: &[u8], start: usize) -> usize {
+    let mut at = start;
+    while matches!(bytes.get(at), Some(b' ' | b'\t' | b'\n' | b'\r')) {
+        at += 1;
+    }
+    at
+}
+
+/// The index just past the JSON string literal that starts at `start` (which must be its
+/// opening `"`), honouring `\` escapes so an escaped quote does not end the literal.
+///
+/// A policy document is parsed before it is stored ([`policy_document_refusal`]), so its
+/// literals are well-formed; an unterminated one would run to the end of the document,
+/// which this reports as the whole remaining input rather than panicking.
+fn string_token_end(bytes: &[u8], start: usize) -> usize {
+    let mut at = start + 1;
+    while at < bytes.len() {
+        match bytes[at] {
+            b'\\' => at += 2,
+            b'"' => return at + 1,
+            _ => at += 1,
+        }
+    }
+    bytes.len()
 }
 
 /// The `ResourcePolicy` a policy delete answers with for the resource `resource_arn`

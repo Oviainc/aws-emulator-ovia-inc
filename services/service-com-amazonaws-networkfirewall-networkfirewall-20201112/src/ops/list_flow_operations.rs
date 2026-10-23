@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListFlowOperations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListFlowOperations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListFlowOperations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: pages the flow operations stored on one firewall, in the order
+//! they were started, narrowed by the type and scope the request names. A
+//! reporting operation, which materialises only the `IN_PROGRESS` ->
+//! `COMPLETED` move the clock already made due.
 //!
 //! ## Shape of an operation
 //!
@@ -186,18 +181,73 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListFlowOperations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListFlowOperationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListFlowOperations"))
+        let _ = ctx;
+        // The two Availability Zone members name one scope two ways, so naming
+        // both is a bad request here exactly as it is on the start commands
+        // (`AvailabilityZoneId`: "Specify either AvailabilityZone or
+        // AvailabilityZoneId, not both. If you specify both, the request fails").
+        if input.availability_zone.is_some() && input.availability_zone_id.is_some() {
+            return Err(ListFlowOperationsErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(crate::state::ZONE_AMBIGUOUS_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                ListFlowOperationsErrorModeled::InternalServerError(InternalServerError {
+                    message: Some("the firewall store is unavailable".to_string()),
+                })
+                .into(),
+            );
+        };
+        let mut state = state.lock();
+
+        // Each operation finishes at its own `completed_at()` whether or not
+        // anybody asks, so a listing after that instant reports (and records)
+        // `COMPLETED`. Nothing else here writes.
+        let Some(entries) = state.settled_flow_operation_page(
+            &input.firewall_arn,
+            &crate::state::FlowOperationFilter {
+                flow_operation_type: input.flow_operation_type,
+                availability_zone: input.availability_zone,
+                availability_zone_id: input.availability_zone_id,
+                vpc_endpoint_association_arn: input.vpc_endpoint_association_arn,
+                vpc_endpoint_id: input.vpc_endpoint_id,
+            },
+            ::std::time::SystemTime::now(),
+        ) else {
+            return Err(
+                ListFlowOperationsErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let page = crate::state::paginate(
+            entries,
+            crate::state::PAGE_KIND_FLOW_OPERATIONS,
+            input.next_token.as_deref(),
+            input.max_results,
+        )
+        .map_err(|_| {
+            ListFlowOperationsError::from(
+                ListFlowOperationsErrorModeled::InvalidRequestException(InvalidRequestException {
+                    message: Some(
+                        "NextToken is not a pagination token this listing issued.".to_string(),
+                    ),
+                }),
+            )
+        })?;
+
+        Ok(ListFlowOperationsOutput {
+            flow_operations: Some(page.items),
+            next_token: page.next_token,
+        })
     }
 }

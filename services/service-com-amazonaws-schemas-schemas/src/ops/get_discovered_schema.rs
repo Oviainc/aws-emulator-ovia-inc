@@ -373,58 +373,17 @@ fn is_date_time(text: &str) -> bool {
 
 /// One JSON value of the document this operation writes.
 ///
-/// Written with its own node type rather than [`serde_json::Value`] because the ORDER
-/// of an object's members is part of the document: `serde_json::Map` is a SORTED map,
-/// which cannot express `type` before `required` before `properties`, nor the root
-/// schema before the schemas hoisted out of it. These members keep the order they were
-/// added in, and are serialized in it.
-#[derive(Debug, Clone, PartialEq)]
-enum Node {
-    Text(String),
-    Flag(bool),
-    List(Vec<Node>),
-    Object(Vec<(String, Node)>),
-}
-
-impl Node {
-    /// A JSON string node.
-    fn text(value: &str) -> Self {
-        Self::Text(value.to_string())
-    }
-
-    /// This node as the JSON text that goes on the wire.
-    ///
-    /// Infallible in practice: the only failures `serde_json` reports here are a
-    /// non-string map key and a writer error, and this node's keys are `String` and
-    /// the writer is an in-memory buffer.
-    fn to_json(&self) -> String {
-        ::serde_json::to_string(self).expect("a Node serializes into a String buffer")
-    }
-}
-
-impl ::serde::Serialize for Node {
-    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        use ::serde::ser::{SerializeMap, SerializeSeq};
-        match self {
-            Self::Text(text) => serializer.serialize_str(text),
-            Self::Flag(flag) => serializer.serialize_bool(*flag),
-            Self::List(items) => {
-                let mut sequence = serializer.serialize_seq(Some(items.len()))?;
-                for item in items {
-                    sequence.serialize_element(item)?;
-                }
-                sequence.end()
-            }
-            Self::Object(members) => {
-                let mut map = serializer.serialize_map(Some(members.len()))?;
-                for (name, value) in members {
-                    map.serialize_entry(name, value)?;
-                }
-                map.end()
-            }
-        }
-    }
-}
+/// Written with an ordered node rather than [`serde_json::Value`] because the ORDER of
+/// an object's members is part of the document: a `serde_json::Map` holds members by
+/// name or by insertion depending on a workspace-wide feature, so it cannot state `type`
+/// before `required` before `properties`, nor the root schema before the schemas hoisted
+/// out of it. These members keep the order they were added in, and are serialized in it.
+///
+/// The node itself lives in `crate::state`, beside the other document helpers more than
+/// one operation needs: the AWS-managed catalogue composes its published documents with
+/// it and `ExportSchema` renders its draft-04 root with it, so there is one ordered
+/// document type in this crate rather than three.
+use crate::state::JsonNode as Node;
 
 /// The named schemas a document carries beside its root one, and the names already
 /// taken in it.

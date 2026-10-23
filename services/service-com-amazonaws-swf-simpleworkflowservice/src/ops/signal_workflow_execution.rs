@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SignalWorkflowExecution
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SignalWorkflowExecution`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SignalWorkflowExecution::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: records the `WorkflowExecutionSignaled` event in the addressed run's
+//! history and schedules the decision task that lets its decider act on the signal.
 //!
 //! ## Shape of an operation
 //!
@@ -175,20 +168,129 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SignalWorkflowExecution` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SignalWorkflowExecutionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SignalWorkflowExecution"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            SignalWorkflowExecutionErrorModeled::OperationNotPermittedFault(
+                OperationNotPermittedFault {
+                    message: Some("the SWF domain store is unavailable".to_string()),
+                },
+            )
+        })?;
+
+        crate::state::validate_name("workflowId", &input.workflow_id)
+            .map_err(crate::scaffolded::Scaffolded::validation)?;
+
+        let signaled_at = crate::state::now();
+        let mut guard = state.lock();
+        // A run the clock already closed is out of scope for a signal too, so the
+        // service's own start-to-close reaping is materialised before the lookup.
+        guard.materialise_due_timeouts_in(&input.domain, signaled_at);
+
+        // An `UnknownResourceFault` message names the resource the lookup failed on and
+        // nothing else: the domain when no domain is stored under that name, otherwise
+        // the requested execution, in the
+        // `WorkflowExecution=[workflowId=.., runId=..]` form every execution-scoped
+        // operation of this service uses.
+        let unknown_execution = || {
+            SignalWorkflowExecutionErrorModeled::UnknownResourceFault(UnknownResourceFault {
+                message: Some(crate::state::unknown_execution_message(
+                    &input.workflow_id,
+                    input.run_id.as_deref().unwrap_or_default(),
+                )),
+            })
+        };
+        let Some(domain) = guard.domains.get_mut(&input.domain) else {
+            return Err(SignalWorkflowExecutionErrorModeled::UnknownResourceFault(
+                UnknownResourceFault {
+                    message: Some(format!("Unknown domain: {}", input.domain)),
+                },
+            )
+            .into());
+        };
+        // An omitted `runId` addresses the one run of this `workflowId` that is still
+        // open: "If a runId isn't specified, then the WorkflowExecutionSignaled event is
+        // recorded in the history of the current open workflow with the matching
+        // workflowId in the domain."
+        let Some(run_id) = domain.resolve_run_id(&input.workflow_id, input.run_id.as_deref())
+        else {
+            return Err(unknown_execution().into());
+        };
+        let Some(execution) = domain
+            .executions
+            .get_mut(&(input.workflow_id.clone(), run_id.clone()))
+        else {
+            return Err(unknown_execution().into());
+        };
+        // "If the specified workflow execution isn't open, this method fails with
+        // UnknownResource." A closed run is therefore refused BEFORE anything is
+        // appended, so its history never grows a signal it could not act on.
+        if !execution.is_open() {
+            return Err(unknown_execution().into());
+        }
+
+        // Amazon SWF Quotas bounds one run's history at
+        // `MAX_HISTORY_EVENTS_PER_EXECUTION` events, and a run that reaches it is
+        // TERMINATED by the service (`cause=EVENT_LIMIT_EXCEEDED`) rather than grown
+        // further. This signal would add the signaled event and the decision task
+        // below, so when there is no room for both the service closes the run instead —
+        // and a closed run is out of this operation's scope, exactly as above. That is
+        // what stops a caller signalling one execution into unbounded memory.
+        if !execution.has_history_room_for(2) {
+            execution.terminate_for_event_limit(signaled_at);
+            domain.release_open_run(&input.workflow_id, &run_id);
+            return Err(unknown_execution().into());
+        }
+
+        execution.append_event(
+            signaled_at,
+            crate::state::EventAttributes::WorkflowExecutionSignaled(
+                WorkflowExecutionSignaledEventAttributes {
+                    signal_name: input.signal_name.clone(),
+                    input: input.input.clone(),
+                    // Both members record a signal sent by ANOTHER workflow execution
+                    // through a SignalExternalWorkflowExecution decision
+                    // ("externalWorkflowExecution: The workflow execution that sent the
+                    // signal. This is set only of the signal was sent by another
+                    // workflow execution"). This call is a client's own, so neither is
+                    // set.
+                    external_workflow_execution: None,
+                    external_initiated_event_id: 0,
+                },
+            ),
+        );
+
+        // "Records a WorkflowExecutionSignaled event in the workflow execution history
+        // and creates a decision task for the workflow execution" — the decision task
+        // is what lets the decider act on the signal. A run that already has one in
+        // flight does not get a second: the signal it just recorded is in the history
+        // that task's decider is handed, which is why SWF batches signals that arrive
+        // while a decision task is outstanding.
+        if execution.open_decision_tasks == 0 {
+            execution.append_event(
+                signaled_at,
+                crate::state::EventAttributes::DecisionTaskScheduled(
+                    DecisionTaskScheduledEventAttributes {
+                        task_list: TaskList {
+                            name: execution.effective_config.task_list.clone(),
+                        },
+                        task_priority: execution.effective_config.task_priority.clone(),
+                        start_to_close_timeout: Some(
+                            execution
+                                .effective_config
+                                .task_start_to_close_timeout
+                                .clone(),
+                        ),
+                        // A decision task's schedule-to-start timeout comes from the
+                        // task list's own registered default, which no implemented
+                        // operation sets in this slice.
+                        schedule_to_start_timeout: None,
+                    },
+                ),
+            );
+            execution.open_decision_tasks = 1;
+        }
+
+        Ok(SignalWorkflowExecutionOutput)
     }
 }

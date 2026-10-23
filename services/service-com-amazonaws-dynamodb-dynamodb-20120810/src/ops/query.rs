@@ -764,11 +764,11 @@ enum Token {
 /// expression can produce. Both refusals are the ordinary `ValidationException`.
 fn tokenize(expression: &str) -> Result<Vec<Token>, crate::state::RequestError> {
     if expression.len() > MAX_EXPRESSION_BYTES {
-        return Err(crate::state::RequestError::Validation(format!(
-            "Invalid KeyConditionExpression: an expression may be at most \
-             {MAX_EXPRESSION_BYTES} bytes, got {}",
-            expression.len()
-        )));
+        // The same refusal every expression member of this service gives, rendered
+        // once in `crate::state` so the envelope cannot drift between them.
+        return Err(crate::state::expression_size_exceeded(
+            "KeyConditionExpression",
+        ));
     }
     let bytes: Vec<char> = expression.chars().collect();
     let mut tokens = Vec::new();

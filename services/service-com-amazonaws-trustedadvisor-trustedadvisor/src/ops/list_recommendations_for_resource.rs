@@ -1,15 +1,40 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListRecommendationsForResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListRecommendationsForResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports every stored recommendation that flagged ONE AWS resource — the one
+//! its `awsResourceArn` names — as `RecommendationForResourceSummary` rows,
+//! filtered by the request's `status` / `pillar` / `checkArn`, in
+//! recommendation-resource ARN order and cut into a page by the shared cursor
+//! helper.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListRecommendationsForResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A row is a (recommendation, flagged resource) pair: the recommendation and
+//! the check behind it supply `recommendationArn`, `checkArn` and `pillars`,
+//! and the flagged resource supplies `awsResourceArn`, `status`,
+//! `exclusionStatus`, `metadata` and `lastUpdatedAt` — so one resource flagged
+//! by several checks reports one row per check.
+//!
+//! The request's ARN is matched against the ARN of the AWS resource each stored
+//! recommendation resource flags
+//! ([`crate::state::ComAmazonawsTrustedadvisorTrustedadvisorState::aws_resource_arn_of`]),
+//! which exists only for a check that is `resourceArnQueryable` — "Indicates
+//! whether this check is supported by the ListRecommendationsForResource API"
+//! (`smithy_query(query="doc",shape="CheckSummary",member="resourceArnQueryable")`),
+//! so a finding of a check that is not addressable by resource ARN is reported
+//! by no ARN.
+//!
+//! A well-formed ARN that no stored recommendation flagged is an EMPTY list,
+//! not a 404: this operation models no `ResourceNotFoundException`, and a
+//! resource Trusted Advisor found nothing wrong with has no recommendations —
+//! which is a normal answer, not a missing resource. An ARN in ANOTHER account
+//! is refused before that ([`crate::state::foreign_resource_refusal`]).
+//!
+//! `language` selects the localized text of a response, and
+//! `RecommendationForResourceSummary` carries none: every member of it is an
+//! ARN, an enum, a timestamp or the resource's own metadata VALUES
+//! (`smithy_query(query="shape",shape="RecommendationForResourceSummary")`), so
+//! this operation reports the same rows whatever `language` asks for — the
+//! faithful answer rather than an accept-and-drop, since there is nothing in
+//! its output to localize.
 //!
 //! ## Shape of an operation
 //!
@@ -90,6 +115,37 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// One (recommendation, flagged resource) pair, as the modelled
+/// `RecommendationForResourceSummary`.
+///
+/// `aws_resource_arn` is the ARN the resource was resolved BY, so the row
+/// reports the resource it was matched on rather than a second rendering of it.
+/// `status`, `exclusionStatus`, `metadata` and `lastUpdatedAt` are the flagged
+/// resource's own — the same values `ListRecommendationResources` reports for
+/// it — while `pillars` is the recommendation's, since a pillar classifies the
+/// recommendation and not one of its resources.
+fn recommendation_for_resource_summary(
+    resource: &crate::state::ResourceEntry,
+    recommendation: &crate::state::RecommendationEntry,
+    check_arn: String,
+    aws_resource_arn: String,
+) -> RecommendationForResourceSummary {
+    RecommendationForResourceSummary {
+        check_arn,
+        recommendation_arn: recommendation.arn.clone(),
+        aws_resource_arn,
+        status: resource.status.clone(),
+        last_updated_at: crate::state::date_time(resource.last_updated_at_millis),
+        exclusion_status: resource.exclusion_status.clone(),
+        metadata: resource
+            .metadata
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+        pillars: recommendation.pillars.clone(),
+    }
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -161,9 +217,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
+        // `ctx` carries only request metadata; this operation reads nothing from it.
+        let _ = ctx;
         // This operation's input names an ARBITRARY AWS resource, so the resource it
         // targets is authorized FIRST: an ARN in another account is refused for that
         // resource, whatever the caller's support plan, because no plan grants an
@@ -174,26 +229,103 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ListRecommendationsForResourceErrorModeled::AccessDeniedException(denied).into(),
             );
         }
-        // The support-level gate is a service-wide stage, so it sits ahead of this
-        // (unwritten) body too: a caller whose account's support plan does not include
-        // the Trusted Advisor API is refused with the modelled `AccessDeniedException`,
-        // which is the WHOLE answer the service gives such a request — no unimplemented
-        // behaviour is involved. An entitled caller still gets the 501 below. See
+        // The support-level gate is a service-wide stage, so it sits ahead of
+        // everything else this handler does — ahead of resolving the resource
+        // ARN and of paginating: a caller whose account's support plan does not
+        // include the Trusted Advisor API is refused with the modelled
+        // `AccessDeniedException` rather than told what the store holds. See
         // [`crate::state::support_level_refusal`].
         if let Some(denied) = crate::state::support_level_refusal(&*self.engine) {
             return Err(
                 ListRecommendationsForResourceErrorModeled::AccessDeniedException(denied).into(),
             );
         }
-        // Implement `ListRecommendationsForResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListRecommendationsForResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListRecommendationsForResource"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                ListRecommendationsForResourceErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the Trusted Advisor store is unavailable".to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+        let state = state.lock();
+
+        // Every stored recommendation resource whose AWS resource is the one
+        // asked about, kept in recommendation-resource ARN order (the resource
+        // map's key order), which is also the pagination order.
+        let matching: Vec<(String, RecommendationForResourceSummary)> = state
+            .recommendation_resources
+            .iter()
+            .filter_map(|(key, resource)| {
+                let aws_resource_arn = state.aws_resource_arn_of(resource)?;
+                if aws_resource_arn != input.aws_resource_arn {
+                    return None;
+                }
+                let recommendation = state.recommendations.get(&resource.recommendation_arn)?;
+                // `RecommendationForResourceSummary$checkArn` is `@required`, so
+                // a recommendation naming no check has no row to report here —
+                // and it is the check that makes a resource ARN resolve at all,
+                // since `aws_resource_arn_of` reads that check's resource type.
+                let check_arn = recommendation.check_arn.clone()?;
+                // The filters: `status` is the flagged resource's status (the
+                // member this row reports), `pillar` is membership in the
+                // recommendation's pillars, and `checkArn` is the check behind
+                // it. An absent filter keeps the row.
+                let kept = input
+                    .status
+                    .as_ref()
+                    .is_none_or(|status| &resource.status == status)
+                    && input.pillar.as_ref().is_none_or(|pillar| {
+                        recommendation.pillars.iter().any(|stored| stored == pillar)
+                    })
+                    && input
+                        .check_arn
+                        .as_ref()
+                        .is_none_or(|check| &check_arn == check);
+                if !kept {
+                    return None;
+                }
+                Some((
+                    key.clone(),
+                    recommendation_for_resource_summary(
+                        resource,
+                        recommendation,
+                        check_arn,
+                        aws_resource_arn,
+                    ),
+                ))
+            })
+            .collect();
+
+        // The cursor's scope names this AWS resource AND this read's filters,
+        // so a token issued for one resource (or under another filter set)
+        // cannot resume another sequence. `language` is deliberately not part of
+        // it: it changes no row and no order.
+        let page = crate::state::paginate(
+            &crate::state::list_scope(
+                &format!("recommendations-for-resource/{}", input.aws_resource_arn),
+                &[
+                    ("status", input.status.as_deref()),
+                    ("pillar", input.pillar.as_deref()),
+                    ("checkArn", input.check_arn.as_deref()),
+                ],
+            ),
+            matching,
+            input.next_token.as_deref(),
+            input.max_results,
+        )
+        .map_err(|_| {
+            ListRecommendationsForResourceErrorModeled::ValidationException(ValidationException {
+                message: "nextToken is not a pagination token this service issued for this list"
+                    .to_string(),
+            })
+        })?;
+
+        Ok(ListRecommendationsForResourceOutput {
+            next_token: page.next_token,
+            recommendation_for_resource_summaries: page.items,
+        })
     }
 }

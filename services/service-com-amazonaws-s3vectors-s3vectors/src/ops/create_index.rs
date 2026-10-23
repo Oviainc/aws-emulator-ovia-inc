@@ -188,6 +188,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )
         .map_err(refusal)?;
         crate::state::validate_resource_name("indexName", &input.index_name).map_err(refusal)?;
+        // The `aws:` tag-key namespace is AWS's own wherever a caller names tags.
+        if let Some(tags) = input.tags.as_ref() {
+            crate::state::validate_tag_keys("tags", tags.keys().map(String::as_str))
+                .map_err(refusal)?;
+        }
 
         let region = crate::state::request_region(ctx.parts());
         let arn = crate::state::index_arn(&region, &bucket_name, &input.index_name);

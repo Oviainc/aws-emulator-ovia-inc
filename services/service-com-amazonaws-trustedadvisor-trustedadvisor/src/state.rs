@@ -41,7 +41,12 @@
 //! [`organization_aggregates_for`](ComAmazonawsTrustedadvisorTrustedadvisorState::organization_aggregates_for)
 //! counts an organization recommendation's by summing those of the member
 //! accounts' recommendations it aggregates — an organization recommendation
-//! stores no resources of its own.
+//! stores no resources of its own. The ARN of the AWS resource a recommendation
+//! flagged — what `ListRecommendationsForResource` looks a resource up by — is
+//! derived the same way, by
+//! [`aws_resource_arn_of`](ComAmazonawsTrustedadvisorTrustedadvisorState::aws_resource_arn_of)
+//! from the resource's own Region and id and the resource TYPE of the check
+//! behind it, so no stored ARN can disagree with them.
 //!
 //! Beside the four maps the store holds the calling account's
 //! [`SupportPlan`] — the whole input to the support-level authorization stage
@@ -207,6 +212,38 @@ pub fn recommendation_resource_arn(recommendation_id: &str, resource_id: &str) -
         "",
         &format!("recommendation-resource/{recommendation_id}/{resource_id}"),
     )
+}
+
+/// The ARN of the AWS resource a check flagged — what
+/// `ListRecommendationsForResource` looks a resource up by and what
+/// `RecommendationForResourceSummary$awsResourceArn` reports.
+///
+/// The ARN form is a property of the RESOURCE TYPE, as AWS publishes it per
+/// service (the Service Authorization Reference's "Resource types" table), so
+/// the mapping is keyed by the CloudFormation type name a check carries in
+/// `CheckSummary$awsResourceTypes`:
+///
+/// * `AWS::EC2::Instance` → `arn:aws:ec2:<region>:<account>:instance/<id>`
+/// * `AWS::EC2::Volume` → `arn:aws:ec2:<region>:<account>:volume/<id>`
+/// * `AWS::RDS::DBInstance` → `arn:aws:rds:<region>:<account>:db:<name>`
+///
+/// `None` for a type this table does not name: the emulator does not know that
+/// type's ARN form, so it reports no ARN for it rather than guessing one that a
+/// caller could not have formed. The account segment is the emulator's
+/// canonical account id, and the Region segment is the resource's own
+/// `regionCode` — an AWS resource ARN is Regional.
+pub fn aws_resource_arn(
+    resource_type: &str,
+    region_code: &str,
+    aws_resource_id: &str,
+) -> Option<String> {
+    let (service, resource) = match resource_type {
+        "AWS::EC2::Instance" => ("ec2", format!("instance/{aws_resource_id}")),
+        "AWS::EC2::Volume" => ("ec2", format!("volume/{aws_resource_id}")),
+        "AWS::RDS::DBInstance" => ("rds", format!("db:{aws_resource_id}")),
+        _ => return None,
+    };
+    Some(::engine::emulator_arn(service, region_code, &resource))
 }
 
 /// The key prefix every resource of `recommendation_arn` shares: that ARN with
@@ -590,6 +627,35 @@ impl ComAmazonawsTrustedadvisorTrustedadvisorState {
         let arn = recommendation.check_arn.as_deref()?;
         let (_, check_id) = arn.split_once(":check/")?;
         self.checks.get(check_id)
+    }
+
+    /// The ARN of the AWS resource a stored recommendation resource flags —
+    /// what `ListRecommendationsForResource` matches its `awsResourceArn`
+    /// against.
+    ///
+    /// DERIVED on every read rather than stored, from the one copy of each of
+    /// its parts: the resource's own `regionCode` and `awsResourceId`, and the
+    /// resource TYPE of the check behind the recommendation that flagged it
+    /// (see [`aws_resource_arn`] for the per-type ARN forms). So a resource can
+    /// never carry an ARN that disagrees with the id and Region a caller can
+    /// also read.
+    ///
+    /// `None` when the check is not `resourceArnQueryable` — "Indicates whether
+    /// this check is supported by the ListRecommendationsForResource API"
+    /// (`smithy_query(query="doc",shape="CheckSummary",member="resourceArnQueryable")`)
+    /// — when it names no resource type, or when that type has no ARN form this
+    /// emulator knows. Such a finding is not addressable by resource ARN, so
+    /// no resource ARN can ever report it.
+    pub fn aws_resource_arn_of(&self, resource: &ResourceEntry) -> Option<String> {
+        let recommendation = self.recommendations.get(&resource.recommendation_arn)?;
+        let check = self.check_of(recommendation)?;
+        if !check.resource_arn_queryable {
+            return None;
+        }
+        // A `resource`-granularity check reports one resource type, so the
+        // first entry is the type of every resource it flags.
+        let resource_type = check.aws_resource_types.first()?;
+        aws_resource_arn(resource_type, &resource.region_code, &resource.aws_resource_id)
     }
 
     /// `pillarSpecificAggregates` for a recommendation, COMPUTED from that

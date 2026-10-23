@@ -1,0 +1,1838 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! The PartiQL statements `ExecuteStatement` runs, parsed into the primitives the
+//! classic item API already works in.
+//!
+//! DynamoDB serves "reads and singleton writes on data stored in DynamoDB, using
+//! PartiQL" (the `ExecuteStatement` doc) over the SAME item store the classic API
+//! reads and writes: a `SELECT` reports the stored items, and `INSERT`, `UPDATE` and
+//! `DELETE` mutate them, so a statement's effect is visible to every later `GetItem`,
+//! `Query` or statement and a classic write is visible to every later `SELECT`.
+//!
+//! This module is the dialect's front end only. A statement is lexed and parsed here
+//! into
+//!
+//! * the table (and optional index) it addresses,
+//! * the item an `INSERT` carries,
+//! * the `WHERE` predicate, RENDERED back into the `ConditionExpression` grammar
+//!   [`super::ParsedCondition`] already parses and evaluates, and
+//! * the `SET`/`REMOVE` clauses, rendered into the `UpdateExpression` grammar
+//!   [`super::ParsedUpdate`] already applies,
+//!
+//! so the VALUE semantics (which comparison holds between which two attribute values,
+//! what an update action does to an item) have exactly one implementation in this
+//! crate, shared with `UpdateItem`, `PutItem` and `DeleteItem`. Rendering goes through
+//! `#name` aliases and `:value` placeholders, so no attribute name or value is ever
+//! spliced into expression text.
+//!
+//! Why the dialect is lexed here rather than taken from a crate: `partiql-parser`
+//! (the PartiQL reference implementation for Rust, 0.15) parses the query language but
+//! NOT the parts DynamoDB's dialect is made of — it rejects `INSERT INTO t VALUE
+//! {'a': 1}`, `UPDATE`/`DELETE` statements, the `?` parameter marker every
+//! `Parameters` entry fills, and numeric literals past what `i64`/`Decimal` hold,
+//! while DynamoDB's `N` carries 38 significant digits. What is left of the dialect
+//! once those are gone is not the dialect, so this grammar — DynamoDB's own, like the
+//! `ConditionExpression` grammar in [`super`] and the `KeyConditionExpression` grammar
+//! in the `Query` handler — is parsed here, and everything a statement cannot say is
+//! refused with a `ValidationException` rather than guessed at.
+//!
+//! Every bound the walk uses is this module's own constant
+//! ([`MAX_STATEMENT_TOKENS`], [`MAX_STATEMENT_DEPTH`]), so neither the token vector
+//! nor the parser's stack is a function of what a caller sends.
+
+use std::cmp::Ordering;
+use std::collections::{BTreeSet, HashMap};
+
+use super::*;
+
+/// The most bytes one statement may hold: `PartiQLStatement` is modelled at most
+/// 8192 bytes, named here so the bound the lexer enforces is this module's own — the
+/// text is refused BEFORE it is collected, the way
+/// [`MAX_EXPRESSION_BYTES`] bounds an expression member.
+pub const MAX_STATEMENT_BYTES: usize = 8192;
+
+/// The most tokens one statement may hold.
+///
+/// `PartiQLStatement` is modelled at most 8192 bytes, and the shortest token a
+/// statement can spell takes a byte and a separator, so this is that ceiling named:
+/// it bounds the token vector before any parsing starts, the way
+/// [`MAX_EXPRESSION_TOKENS`] bounds an expression's.
+pub const MAX_STATEMENT_TOKENS: usize = 4096;
+
+/// How deeply one statement's GRAMMAR may nest — a parenthesised predicate, a `NOT`,
+/// a `list_append`: the same ceiling an expression's parse tree is held to
+/// ([`MAX_EXPRESSION_DEPTH`]), for the same reason — nesting is the caller's choice, so
+/// the parser's stack use must not be. The VALUES a statement carries are held to the
+/// DOCUMENTED [`MAX_ATTRIBUTE_DEPTH`] instead, the ceiling every other write path holds
+/// an attribute value to, so the statement surface and the classic item API accept the
+/// same items.
+pub const MAX_STATEMENT_DEPTH: usize = 16;
+
+/// How a statement this dialect does not spell is refused: a `ValidationException`,
+/// which is what DynamoDB answers a statement it cannot parse with. The statement
+/// itself is not echoed back.
+fn statement_syntax_error() -> RequestError {
+    RequestError::Validation(
+        "Invalid Statement: statement wasn't well formed, could not be parsed".to_string(),
+    )
+}
+
+/// How a statement that parses but asks for something this dialect does not serve is
+/// refused, naming the rule it broke.
+fn statement_refused(detail: &str) -> RequestError {
+    RequestError::Validation(format!("Invalid Statement: {detail}"))
+}
+
+// ===========================================================================
+// The lexer
+// ===========================================================================
+
+/// One lexical token of a PartiQL statement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Token {
+    /// A bare word: a keyword (`SELECT`, `AND`, `NULL`, …), a function name, or a
+    /// table or attribute name written plainly.
+    Word(String),
+    /// A `"double-quoted"` identifier — how a name outside the bare-word character
+    /// set, or one that collides with a keyword, is spelled.
+    Quoted(String),
+    /// A `'single-quoted'` string literal, with `''` standing for one quote.
+    Text(String),
+    /// A numeric literal, exactly as the statement spelled it: the lexeme is kept so
+    /// the stored `N` carries the number it denotes to the documented 38 significant
+    /// digits rather than whatever a primitive could hold.
+    Number(String),
+    /// The `?` marker one `Parameters` entry fills, in order.
+    Parameter,
+    Star,
+    Compare(CompareOp),
+    Open,
+    Close,
+    OpenBracket,
+    CloseBracket,
+    OpenBrace,
+    CloseBrace,
+    /// `<<`, which opens a PartiQL bag — how a statement spells a DynamoDB set.
+    OpenBag,
+    CloseBag,
+    Comma,
+    Dot,
+    Colon,
+    Minus,
+    Plus,
+}
+
+/// Which characters make up a bare word.
+fn is_word_char(character: char) -> bool {
+    character.is_ascii_alphanumeric() || character == '_'
+}
+
+/// Split one statement into tokens, refusing a token count past
+/// [`MAX_STATEMENT_TOKENS`] before any parsing starts.
+fn tokenize(statement: &str) -> Result<Vec<Token>, RequestError> {
+    if statement.len() > MAX_STATEMENT_BYTES {
+        return Err(statement_refused(&format!(
+            "a statement may hold at most {MAX_STATEMENT_BYTES} bytes"
+        )));
+    }
+    let characters: Vec<char> = statement.chars().collect();
+    let mut tokens = Vec::new();
+    let mut at = 0;
+    while at < characters.len() {
+        if tokens.len() >= MAX_STATEMENT_TOKENS {
+            return Err(statement_refused(&format!(
+                "a statement may hold at most {MAX_STATEMENT_TOKENS} tokens"
+            )));
+        }
+        let character = characters[at];
+        match character {
+            c if c.is_whitespace() => at += 1,
+            '\'' | '"' => {
+                let (text, next) = quoted(&characters, at, character)?;
+                tokens.push(if character == '\'' {
+                    Token::Text(text)
+                } else {
+                    Token::Quoted(text)
+                });
+                at = next;
+            }
+            c if c.is_ascii_digit() => {
+                let (lexeme, next) = number(&characters, at);
+                tokens.push(Token::Number(lexeme));
+                at = next;
+            }
+            c if is_word_char(c) => {
+                let start = at;
+                while at < characters.len() && is_word_char(characters[at]) {
+                    at += 1;
+                }
+                tokens.push(Token::Word(characters[start..at].iter().collect()));
+            }
+            '?' => {
+                tokens.push(Token::Parameter);
+                at += 1;
+            }
+            '*' => {
+                tokens.push(Token::Star);
+                at += 1;
+            }
+            '=' => {
+                tokens.push(Token::Compare(CompareOp::Equal));
+                at += 1;
+            }
+            '!' if characters.get(at + 1) == Some(&'=') => {
+                tokens.push(Token::Compare(CompareOp::NotEqual));
+                at += 2;
+            }
+            '<' => {
+                let (token, width) = match characters.get(at + 1) {
+                    Some('<') => (Token::OpenBag, 2),
+                    Some('=') => (Token::Compare(CompareOp::LessOrEqual), 2),
+                    Some('>') => (Token::Compare(CompareOp::NotEqual), 2),
+                    _ => (Token::Compare(CompareOp::Less), 1),
+                };
+                tokens.push(token);
+                at += width;
+            }
+            '>' => {
+                let (token, width) = match characters.get(at + 1) {
+                    Some('>') => (Token::CloseBag, 2),
+                    Some('=') => (Token::Compare(CompareOp::GreaterOrEqual), 2),
+                    _ => (Token::Compare(CompareOp::Greater), 1),
+                };
+                tokens.push(token);
+                at += width;
+            }
+            '(' => {
+                tokens.push(Token::Open);
+                at += 1;
+            }
+            ')' => {
+                tokens.push(Token::Close);
+                at += 1;
+            }
+            '[' => {
+                tokens.push(Token::OpenBracket);
+                at += 1;
+            }
+            ']' => {
+                tokens.push(Token::CloseBracket);
+                at += 1;
+            }
+            '{' => {
+                tokens.push(Token::OpenBrace);
+                at += 1;
+            }
+            '}' => {
+                tokens.push(Token::CloseBrace);
+                at += 1;
+            }
+            ',' => {
+                tokens.push(Token::Comma);
+                at += 1;
+            }
+            '.' => {
+                tokens.push(Token::Dot);
+                at += 1;
+            }
+            ':' => {
+                tokens.push(Token::Colon);
+                at += 1;
+            }
+            '-' => {
+                tokens.push(Token::Minus);
+                at += 1;
+            }
+            '+' => {
+                tokens.push(Token::Plus);
+                at += 1;
+            }
+            _ => return Err(statement_syntax_error()),
+        }
+    }
+    if tokens.is_empty() {
+        return Err(statement_syntax_error());
+    }
+    Ok(tokens)
+}
+
+/// Read one quoted run starting at `at`, where `delimiter` is the quote character: a
+/// doubled delimiter stands for one of itself, which is how both PartiQL string
+/// literals and quoted identifiers escape their quote.
+fn quoted(
+    characters: &[char],
+    at: usize,
+    delimiter: char,
+) -> Result<(String, usize), RequestError> {
+    let mut text = String::new();
+    let mut index = at + 1;
+    while index < characters.len() {
+        let character = characters[index];
+        if character == delimiter {
+            if characters.get(index + 1) == Some(&delimiter) {
+                text.push(delimiter);
+                index += 2;
+                continue;
+            }
+            return Ok((text, index + 1));
+        }
+        text.push(character);
+        index += 1;
+    }
+    // An unterminated literal is a statement that does not parse.
+    Err(statement_syntax_error())
+}
+
+/// Read one numeric lexeme starting at `at`: digits, an optional fraction and an
+/// optional exponent. The TEXT is returned; what number it denotes — and whether the
+/// store can hold it — is [`canonical_number_text`]'s business.
+fn number(characters: &[char], at: usize) -> (String, usize) {
+    let mut index = at;
+    while index < characters.len() && characters[index].is_ascii_digit() {
+        index += 1;
+    }
+    if characters.get(index) == Some(&'.') {
+        index += 1;
+        while index < characters.len() && characters[index].is_ascii_digit() {
+            index += 1;
+        }
+    }
+    if matches!(characters.get(index), Some('e' | 'E')) {
+        let mut lookahead = index + 1;
+        if matches!(characters.get(lookahead), Some('+' | '-')) {
+            lookahead += 1;
+        }
+        if characters.get(lookahead).is_some_and(char::is_ascii_digit) {
+            index = lookahead;
+            while index < characters.len() && characters[index].is_ascii_digit() {
+                index += 1;
+            }
+        }
+    }
+    (characters[at..index].iter().collect(), index)
+}
+
+// ===========================================================================
+// What one statement says
+// ===========================================================================
+
+/// One step of a document path a statement addresses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PathSegment {
+    Name(String),
+    Index(usize),
+}
+
+/// A document path, as a statement spells it: a top-level attribute and the steps
+/// into it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatementPath {
+    /// Never empty, and its first segment is always a name: the parser builds a path
+    /// from an attribute name and only then reads the steps into it.
+    segments: Vec<PathSegment>,
+}
+
+impl StatementPath {
+    /// The top-level attribute this path starts at.
+    fn attribute(&self) -> &str {
+        match self.segments.first() {
+            Some(PathSegment::Name(name)) => name,
+            _ => "",
+        }
+    }
+
+    /// Whether this path addresses one whole top-level attribute, which is what a key
+    /// equality has to.
+    fn is_attribute(&self) -> bool {
+        self.segments.len() == 1
+    }
+
+    /// The value this path addresses inside one item, or `None` when it addresses
+    /// nothing: a step into a value of the wrong type, a name no map holds or an index
+    /// past the end of a list all address nothing.
+    fn read<'i>(&self, item: &'i Item) -> Option<&'i AttributeValue> {
+        let mut segments = self.segments.iter();
+        let PathSegment::Name(first) = segments.next()? else {
+            return None;
+        };
+        let mut value = item.get(first)?;
+        for segment in segments {
+            value = match (segment, value) {
+                (PathSegment::Name(name), AttributeValue::M(entries)) => entries.get(name)?,
+                (PathSegment::Index(index), AttributeValue::L(members)) => members.get(*index)?,
+                _ => return None,
+            };
+        }
+        Some(value)
+    }
+
+    /// What a projection of this path is reported under when the statement states no
+    /// alias: its last named step, which is how PartiQL names a projected path.
+    fn label(&self) -> &str {
+        self.segments
+            .iter()
+            .rev()
+            .find_map(|segment| match segment {
+                PathSegment::Name(name) => Some(name.as_str()),
+                PathSegment::Index(_) => None,
+            })
+            .unwrap_or_default()
+    }
+}
+
+/// One item of a `SELECT`'s projection: the path it reports and the name it reports
+/// it under.
+#[derive(Debug, Clone)]
+pub struct ProjectionItem {
+    path: StatementPath,
+    alias: Option<String>,
+}
+
+/// One operand of a predicate: a path into the item, a value the statement carries,
+/// or the `size` of a path.
+#[derive(Debug, Clone)]
+pub enum PredicateOperand {
+    Path(StatementPath),
+    Value(AttributeValue),
+    Size(StatementPath),
+}
+
+/// One `WHERE` predicate.
+///
+/// `And` and `Or` hold their operands FLAT, so a long chain widens the tree rather
+/// than deepening it — which is also what keeps the rendered expression inside the
+/// depth the native parser allows.
+#[derive(Debug, Clone)]
+pub enum Predicate {
+    All(Vec<Predicate>),
+    Any(Vec<Predicate>),
+    Not(Box<Predicate>),
+    Compare(PredicateOperand, CompareOp, PredicateOperand),
+    Between(PredicateOperand, PredicateOperand, PredicateOperand),
+    In(PredicateOperand, Vec<PredicateOperand>),
+    /// `path IS NULL` when true, `path IS NOT NULL` when false. In PartiQL a path
+    /// that addresses nothing IS NULL too, so this holds for an absent attribute as
+    /// well as for one holding the `NULL` type.
+    IsNull(StatementPath, bool),
+    /// `path IS MISSING` when true, `path IS NOT MISSING` when false.
+    IsMissing(StatementPath, bool),
+    BeginsWith(StatementPath, PredicateOperand),
+    Contains(StatementPath, PredicateOperand),
+    AttributeType(StatementPath, PredicateOperand),
+    /// `attribute_exists` when true, `attribute_not_exists` when false.
+    Exists(StatementPath, bool),
+}
+
+/// One clause of an `UPDATE`.
+#[derive(Debug, Clone)]
+pub enum UpdateClause {
+    /// `SET path = value`, where the value may be an operand, a sum or difference of
+    /// two, or `list_append`.
+    Set(StatementPath, SetExpression),
+    /// `REMOVE path`.
+    Remove(StatementPath),
+    /// `SET path = set_add(path, value)`, the statement form of the `ADD` action.
+    Add(StatementPath, AttributeValue),
+    /// `SET path = set_delete(path, value)`, the statement form of the `DELETE`
+    /// action.
+    Delete(StatementPath, AttributeValue),
+}
+
+/// The right-hand side of one `SET`.
+#[derive(Debug, Clone)]
+pub enum SetExpression {
+    Single(AssignmentOperand),
+    Sum(AssignmentOperand, AssignmentOperand),
+    Difference(AssignmentOperand, AssignmentOperand),
+}
+
+/// One operand of a `SET`.
+#[derive(Debug, Clone)]
+pub enum AssignmentOperand {
+    Path(StatementPath),
+    Value(AttributeValue),
+    ListAppend(Box<AssignmentOperand>, Box<AssignmentOperand>),
+}
+
+/// What a write reports back, as `RETURNING` names it, in the spelling
+/// [`projected_return_values`] reads: the two `MODIFIED` forms are the `UPDATED_*`
+/// projections.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReturnedValues {
+    AllOld,
+    ModifiedOld,
+    AllNew,
+    ModifiedNew,
+}
+
+impl ReturnedValues {
+    /// The `ReturnValue` spelling of this form.
+    pub fn as_return_value(self) -> &'static str {
+        match self {
+            Self::AllOld => "ALL_OLD",
+            Self::ModifiedOld => "UPDATED_OLD",
+            Self::AllNew => "ALL_NEW",
+            Self::ModifiedNew => "UPDATED_NEW",
+        }
+    }
+
+    /// Whether this form reports the item as it stands AFTER the write, which a
+    /// `DELETE` leaves nothing of.
+    pub fn reports_new(self) -> bool {
+        matches!(self, Self::AllNew | Self::ModifiedNew)
+    }
+}
+
+/// A `SELECT`: which stored items to report, and in which order.
+#[derive(Debug, Clone)]
+pub struct SelectStatement {
+    pub table: String,
+    pub index: Option<String>,
+    /// The attributes to report, or `None` for `SELECT *`.
+    pub projection: Option<Vec<ProjectionItem>>,
+    pub filter: Option<Predicate>,
+    /// The key attribute `ORDER BY` names and whether it sorts descending.
+    pub order_by: Option<(String, bool)>,
+}
+
+/// An `INSERT`: the item to add, which must not already be there.
+#[derive(Debug, Clone)]
+pub struct InsertStatement {
+    pub table: String,
+    pub item: Item,
+}
+
+/// An `UPDATE`: which single item to change, how, and what to report.
+#[derive(Debug, Clone)]
+pub struct UpdateStatement {
+    pub table: String,
+    pub clauses: Vec<UpdateClause>,
+    pub filter: Predicate,
+    pub returning: Option<ReturnedValues>,
+}
+
+/// A `DELETE`: which single item to remove, and what to report.
+#[derive(Debug, Clone)]
+pub struct DeleteStatement {
+    pub table: String,
+    pub filter: Predicate,
+    pub returning: Option<ReturnedValues>,
+}
+
+/// One parsed statement.
+#[derive(Debug, Clone)]
+pub enum PartiqlStatement {
+    Select(SelectStatement),
+    Insert(InsertStatement),
+    Update(UpdateStatement),
+    Delete(DeleteStatement),
+}
+
+impl PartiqlStatement {
+    /// The table this statement addresses.
+    pub fn table(&self) -> &str {
+        match self {
+            Self::Select(select) => &select.table,
+            Self::Insert(insert) => &insert.table,
+            Self::Update(update) => &update.table,
+            Self::Delete(delete) => &delete.table,
+        }
+    }
+
+    /// The IAM action this statement performs, which is what a table's
+    /// resource-based policy is read for: PartiQL has its own four actions.
+    pub fn action(&self) -> &'static str {
+        match self {
+            Self::Select(_) => "dynamodb:PartiQLSelect",
+            Self::Insert(_) => "dynamodb:PartiQLInsert",
+            Self::Update(_) => "dynamodb:PartiQLUpdate",
+            Self::Delete(_) => "dynamodb:PartiQLDelete",
+        }
+    }
+}
+
+// ===========================================================================
+// The parser
+// ===========================================================================
+
+/// Parse one statement, resolving each `?` against `parameters` in order.
+pub fn parse_statement(
+    statement: &str,
+    parameters: &[AttributeValue],
+) -> Result<PartiqlStatement, RequestError> {
+    let tokens = tokenize(statement)?;
+    let mut parser = StatementParser {
+        tokens: &tokens,
+        at: 0,
+        parameters,
+        used_parameters: 0,
+        depth: 0,
+    };
+    let parsed = parser.statement()?;
+    if !parser.at_end() {
+        return Err(statement_syntax_error());
+    }
+    // "The parameters for the PartiQL statement, if any" (`Parameters`): a request
+    // that sends more values than the statement has markers for has sent a statement
+    // and a parameter list that do not go together.
+    if parser.used_parameters != parameters.len() {
+        return Err(statement_refused(
+            "the number of parameters in the request and in the statement do not match",
+        ));
+    }
+    Ok(parsed)
+}
+
+/// The recursive-descent parser over one statement's tokens.
+#[derive(Debug)]
+struct StatementParser<'t> {
+    tokens: &'t [Token],
+    at: usize,
+    parameters: &'t [AttributeValue],
+    used_parameters: usize,
+    depth: usize,
+}
+
+impl StatementParser<'_> {
+    fn at_end(&self) -> bool {
+        self.at >= self.tokens.len()
+    }
+
+    fn peek(&self) -> Option<&Token> {
+        self.tokens.get(self.at)
+    }
+
+    fn bump(&mut self) -> Result<&Token, RequestError> {
+        let token = self.tokens.get(self.at).ok_or_else(statement_syntax_error)?;
+        self.at += 1;
+        Ok(token)
+    }
+
+    fn accept(&mut self, token: &Token) -> bool {
+        if self.peek() == Some(token) {
+            self.at += 1;
+            return true;
+        }
+        false
+    }
+
+    fn expect(&mut self, token: &Token) -> Result<(), RequestError> {
+        if self.accept(token) {
+            return Ok(());
+        }
+        Err(statement_syntax_error())
+    }
+
+    /// Whether the next token is this keyword, compared case-insensitively — "SELECT"
+    /// and "select" are one keyword — and never a `"quoted"` identifier, which is how
+    /// a name that collides with a keyword is spelled.
+    fn peek_word(&self, keyword: &str) -> bool {
+        matches!(self.peek(), Some(Token::Word(word)) if word.eq_ignore_ascii_case(keyword))
+    }
+
+    fn accept_word(&mut self, keyword: &str) -> bool {
+        if self.peek_word(keyword) {
+            self.at += 1;
+            return true;
+        }
+        false
+    }
+
+    fn expect_word(&mut self, keyword: &str) -> Result<(), RequestError> {
+        if self.accept_word(keyword) {
+            return Ok(());
+        }
+        Err(statement_syntax_error())
+    }
+
+    /// One identifier: a bare word or a quoted name.
+    fn identifier(&mut self) -> Result<String, RequestError> {
+        match self.bump()? {
+            Token::Word(word) => Ok(word.clone()),
+            Token::Quoted(name) => Ok(name.clone()),
+            _ => Err(statement_syntax_error()),
+        }
+    }
+
+    /// Run `body` one level deeper, refusing a statement whose GRAMMAR nests past
+    /// [`MAX_STATEMENT_DEPTH`] — a parenthesised predicate, a `NOT`, a `list_append`.
+    fn nested<T>(
+        &mut self,
+        body: impl FnOnce(&mut Self) -> Result<T, RequestError>,
+    ) -> Result<T, RequestError> {
+        self.nested_to(MAX_STATEMENT_DEPTH, body)
+    }
+
+    /// Run `body` one level deeper, against the ceiling that governs what is being
+    /// read: the grammar's own ([`MAX_STATEMENT_DEPTH`]) or, for the VALUES a
+    /// statement carries, the documented [`MAX_ATTRIBUTE_DEPTH`] every other write
+    /// path holds an attribute value to — so an item the classic API stores is an
+    /// item a statement can write, and the two surfaces never disagree about one.
+    fn nested_to<T>(
+        &mut self,
+        limit: usize,
+        body: impl FnOnce(&mut Self) -> Result<T, RequestError>,
+    ) -> Result<T, RequestError> {
+        if self.depth >= limit {
+            return Err(statement_refused(&format!(
+                "a statement may nest at most {limit} levels deep"
+            )));
+        }
+        self.depth += 1;
+        let outcome = body(self);
+        self.depth -= 1;
+        outcome
+    }
+
+    /// The statement, by the verb it opens with.
+    fn statement(&mut self) -> Result<PartiqlStatement, RequestError> {
+        if self.accept_word("select") {
+            return self.select().map(PartiqlStatement::Select);
+        }
+        if self.accept_word("insert") {
+            return self.insert().map(PartiqlStatement::Insert);
+        }
+        if self.accept_word("update") {
+            return self.update().map(PartiqlStatement::Update);
+        }
+        if self.accept_word("delete") {
+            return self.delete().map(PartiqlStatement::Delete);
+        }
+        Err(statement_syntax_error())
+    }
+
+    /// `SELECT (* | attribute, …) FROM source [WHERE predicate] [ORDER BY attribute
+    /// [ASC | DESC]]`.
+    fn select(&mut self) -> Result<SelectStatement, RequestError> {
+        let projection = if self.accept(&Token::Star) {
+            None
+        } else {
+            let mut items = Vec::new();
+            loop {
+                let path = self.path()?;
+                let alias = if self.accept_word("as") {
+                    Some(self.identifier()?)
+                } else {
+                    None
+                };
+                items.push(ProjectionItem { path, alias });
+                if !self.accept(&Token::Comma) {
+                    break;
+                }
+            }
+            Some(items)
+        };
+        self.expect_word("from")?;
+        let (table, index) = self.source()?;
+        let filter = self.where_clause()?;
+        let order_by = if self.accept_word("order") {
+            self.expect_word("by")?;
+            let attribute = self.identifier()?;
+            let descending = if self.accept_word("desc") {
+                true
+            } else {
+                self.accept_word("asc");
+                false
+            };
+            if self.peek() == Some(&Token::Comma) {
+                return Err(statement_refused(
+                    "ORDER BY may name one key attribute of the source",
+                ));
+            }
+            Some((attribute, descending))
+        } else {
+            None
+        };
+        Ok(SelectStatement {
+            table,
+            index,
+            projection,
+            filter,
+            order_by,
+        })
+    }
+
+    /// `INSERT INTO source VALUE tuple`.
+    fn insert(&mut self) -> Result<InsertStatement, RequestError> {
+        self.expect_word("into")?;
+        let (table, index) = self.source()?;
+        if index.is_some() {
+            return Err(statement_refused("an INSERT addresses a table, not an index"));
+        }
+        if !self.accept_word("value") {
+            self.expect_word("values")?;
+        }
+        let value = self.value()?;
+        let AttributeValue::M(item) = value else {
+            return Err(statement_refused(
+                "the VALUE an INSERT carries must be a tuple of attribute names and values",
+            ));
+        };
+        Ok(InsertStatement { table, item })
+    }
+
+    /// `UPDATE source (SET assignment, … | REMOVE path, …)+ WHERE predicate
+    /// [RETURNING values]`.
+    fn update(&mut self) -> Result<UpdateStatement, RequestError> {
+        let (table, index) = self.source()?;
+        if index.is_some() {
+            return Err(statement_refused("an UPDATE addresses a table, not an index"));
+        }
+        let mut clauses = Vec::new();
+        loop {
+            if self.accept_word("set") {
+                loop {
+                    clauses.push(self.assignment()?);
+                    if !self.accept(&Token::Comma) {
+                        break;
+                    }
+                }
+                continue;
+            }
+            if self.accept_word("remove") {
+                loop {
+                    clauses.push(UpdateClause::Remove(self.path()?));
+                    if !self.accept(&Token::Comma) {
+                        break;
+                    }
+                }
+                continue;
+            }
+            break;
+        }
+        if clauses.is_empty() {
+            return Err(statement_refused(
+                "an UPDATE must state at least one SET or REMOVE clause",
+            ));
+        }
+        let filter = self.required_where_clause()?;
+        let returning = self.returning()?;
+        Ok(UpdateStatement {
+            table,
+            clauses,
+            filter,
+            returning,
+        })
+    }
+
+    /// `DELETE FROM source WHERE predicate [RETURNING values]`.
+    fn delete(&mut self) -> Result<DeleteStatement, RequestError> {
+        self.expect_word("from")?;
+        let (table, index) = self.source()?;
+        if index.is_some() {
+            return Err(statement_refused("a DELETE addresses a table, not an index"));
+        }
+        let filter = self.required_where_clause()?;
+        let returning = self.returning()?;
+        if returning.is_some_and(ReturnedValues::reports_new) {
+            return Err(statement_refused(
+                "a DELETE can only return the item as it stood before it: ALL OLD or MODIFIED OLD",
+            ));
+        }
+        Ok(DeleteStatement {
+            table,
+            filter,
+            returning,
+        })
+    }
+
+    /// `table` or `table.index`, either part quoted or bare.
+    fn source(&mut self) -> Result<(String, Option<String>), RequestError> {
+        let table = self.identifier()?;
+        let index = if self.accept(&Token::Dot) {
+            Some(self.identifier()?)
+        } else {
+            None
+        };
+        Ok((table, index))
+    }
+
+    /// `RETURNING (ALL | MODIFIED) (OLD | NEW) *`.
+    fn returning(&mut self) -> Result<Option<ReturnedValues>, RequestError> {
+        if !self.accept_word("returning") {
+            return Ok(None);
+        }
+        let modified = if self.accept_word("all") {
+            false
+        } else {
+            self.expect_word("modified")?;
+            true
+        };
+        let new = if self.accept_word("old") {
+            false
+        } else {
+            self.expect_word("new")?;
+            true
+        };
+        self.expect(&Token::Star)?;
+        Ok(Some(match (modified, new) {
+            (false, false) => ReturnedValues::AllOld,
+            (true, false) => ReturnedValues::ModifiedOld,
+            (false, true) => ReturnedValues::AllNew,
+            (true, true) => ReturnedValues::ModifiedNew,
+        }))
+    }
+
+    /// `SET path = expression`, where the expression is one operand, two joined by
+    /// `+` or `-`, or one of the documented functions.
+    fn assignment(&mut self) -> Result<UpdateClause, RequestError> {
+        let path = self.path()?;
+        self.expect(&Token::Compare(CompareOp::Equal))?;
+        // `set_add` and `set_delete` are the statement forms of the ADD and DELETE
+        // update actions, so they are whole clauses rather than values.
+        for (function, is_add) in [("set_add", true), ("set_delete", false)] {
+            if self.peek_word(function) && self.tokens.get(self.at + 1) == Some(&Token::Open) {
+                self.at += 2;
+                let target = self.path()?;
+                if target != path {
+                    return Err(statement_refused(&format!(
+                        "{function} adds to the attribute it is assigned to"
+                    )));
+                }
+                self.expect(&Token::Comma)?;
+                let value = self.value()?;
+                self.expect(&Token::Close)?;
+                return Ok(if is_add {
+                    UpdateClause::Add(path, value)
+                } else {
+                    UpdateClause::Delete(path, value)
+                });
+            }
+        }
+        let left = self.set_operand()?;
+        if self.accept(&Token::Plus) {
+            let right = self.set_operand()?;
+            return Ok(UpdateClause::Set(path, SetExpression::Sum(left, right)));
+        }
+        if self.accept(&Token::Minus) {
+            let right = self.set_operand()?;
+            return Ok(UpdateClause::Set(
+                path,
+                SetExpression::Difference(left, right),
+            ));
+        }
+        Ok(UpdateClause::Set(path, SetExpression::Single(left)))
+    }
+
+    /// One operand of a `SET`: `list_append`, a path, or a value.
+    fn set_operand(&mut self) -> Result<AssignmentOperand, RequestError> {
+        if self.peek_word("list_append") && self.tokens.get(self.at + 1) == Some(&Token::Open) {
+            self.at += 2;
+            let (left, right) = self.nested(|parser| {
+                let left = parser.set_operand()?;
+                parser.expect(&Token::Comma)?;
+                let right = parser.set_operand()?;
+                Ok((left, right))
+            })?;
+            self.expect(&Token::Close)?;
+            return Ok(AssignmentOperand::ListAppend(Box::new(left), Box::new(right)));
+        }
+        if self.starts_path() {
+            return Ok(AssignmentOperand::Path(self.path()?));
+        }
+        Ok(AssignmentOperand::Value(self.value()?))
+    }
+
+    /// `WHERE predicate`, when the statement states one.
+    fn where_clause(&mut self) -> Result<Option<Predicate>, RequestError> {
+        if !self.accept_word("where") {
+            return Ok(None);
+        }
+        self.disjunction().map(Some)
+    }
+
+    /// The `WHERE` an `UPDATE` or a `DELETE` must state: both are singleton writes,
+    /// addressed by the primary key the predicate pins.
+    fn required_where_clause(&mut self) -> Result<Predicate, RequestError> {
+        self.where_clause()?.ok_or_else(|| {
+            statement_refused("an UPDATE or a DELETE must state a WHERE clause naming one item")
+        })
+    }
+
+    fn disjunction(&mut self) -> Result<Predicate, RequestError> {
+        let mut branches = vec![self.conjunction()?];
+        while self.accept_word("or") {
+            branches.push(self.conjunction()?);
+        }
+        Ok(if branches.len() == 1 {
+            branches.remove(0)
+        } else {
+            Predicate::Any(branches)
+        })
+    }
+
+    fn conjunction(&mut self) -> Result<Predicate, RequestError> {
+        let mut branches = vec![self.negation()?];
+        while self.accept_word("and") {
+            branches.push(self.negation()?);
+        }
+        Ok(if branches.len() == 1 {
+            branches.remove(0)
+        } else {
+            Predicate::All(branches)
+        })
+    }
+
+    fn negation(&mut self) -> Result<Predicate, RequestError> {
+        if self.accept_word("not") {
+            let inner = self.nested(Self::negation)?;
+            return Ok(Predicate::Not(Box::new(inner)));
+        }
+        self.primary()
+    }
+
+    fn primary(&mut self) -> Result<Predicate, RequestError> {
+        if self.accept(&Token::Open) {
+            let inner = self.nested(Self::disjunction)?;
+            self.expect(&Token::Close)?;
+            return Ok(inner);
+        }
+        // The documented boolean functions are predicates in their own right.
+        if self.tokens.get(self.at + 1) == Some(&Token::Open) {
+            for function in [
+                "begins_with",
+                "contains",
+                "attribute_type",
+                "attribute_exists",
+                "attribute_not_exists",
+            ] {
+                if self.peek_word(function) {
+                    self.at += 2;
+                    let path = self.path()?;
+                    let predicate = match function {
+                        "attribute_exists" => Predicate::Exists(path, true),
+                        "attribute_not_exists" => Predicate::Exists(path, false),
+                        _ => {
+                            self.expect(&Token::Comma)?;
+                            let operand = self.operand()?;
+                            match function {
+                                "begins_with" => Predicate::BeginsWith(path, operand),
+                                "contains" => Predicate::Contains(path, operand),
+                                _ => Predicate::AttributeType(path, operand),
+                            }
+                        }
+                    };
+                    self.expect(&Token::Close)?;
+                    return Ok(predicate);
+                }
+            }
+        }
+        let left = self.operand()?;
+        if self.accept_word("is") {
+            let negated = self.accept_word("not");
+            let PredicateOperand::Path(path) = left else {
+                return Err(statement_refused(
+                    "IS NULL and IS MISSING read an attribute of the item",
+                ));
+            };
+            if self.accept_word("null") {
+                return Ok(Predicate::IsNull(path, !negated));
+            }
+            self.expect_word("missing")?;
+            return Ok(Predicate::IsMissing(path, !negated));
+        }
+        let negated = self.accept_word("not");
+        if self.accept_word("between") {
+            let low = self.operand()?;
+            self.expect_word("and")?;
+            let high = self.operand()?;
+            let between = Predicate::Between(left, low, high);
+            return Ok(if negated {
+                Predicate::Not(Box::new(between))
+            } else {
+                between
+            });
+        }
+        if self.accept_word("in") {
+            let closing = if self.accept(&Token::Open) {
+                Token::Close
+            } else {
+                self.expect(&Token::OpenBracket)?;
+                Token::CloseBracket
+            };
+            let mut candidates = Vec::new();
+            loop {
+                candidates.push(self.operand()?);
+                if !self.accept(&Token::Comma) {
+                    break;
+                }
+            }
+            self.expect(&closing)?;
+            let membership = Predicate::In(left, candidates);
+            return Ok(if negated {
+                Predicate::Not(Box::new(membership))
+            } else {
+                membership
+            });
+        }
+        if negated {
+            return Err(statement_syntax_error());
+        }
+        let Some(Token::Compare(operator)) = self.peek().cloned() else {
+            return Err(statement_syntax_error());
+        };
+        self.at += 1;
+        let right = self.operand()?;
+        Ok(Predicate::Compare(left, operator, right))
+    }
+
+    /// One comparison operand: `size(path)`, a path, or a value.
+    fn operand(&mut self) -> Result<PredicateOperand, RequestError> {
+        if self.peek_word("size") && self.tokens.get(self.at + 1) == Some(&Token::Open) {
+            self.at += 2;
+            let path = self.path()?;
+            self.expect(&Token::Close)?;
+            return Ok(PredicateOperand::Size(path));
+        }
+        if self.starts_path() {
+            return Ok(PredicateOperand::Path(self.path()?));
+        }
+        Ok(PredicateOperand::Value(self.value()?))
+    }
+
+    /// Whether the next token opens a document path rather than a value: a quoted
+    /// identifier always does, and a bare word does unless it spells one of the
+    /// keyword literals.
+    fn starts_path(&self) -> bool {
+        match self.peek() {
+            Some(Token::Quoted(_)) => true,
+            Some(Token::Word(word)) => !["null", "missing", "true", "false"]
+                .iter()
+                .any(|literal| word.eq_ignore_ascii_case(literal)),
+            _ => false,
+        }
+    }
+
+    /// One document path: an attribute name, then the `.name` and `[index]` steps
+    /// into it.
+    fn path(&mut self) -> Result<StatementPath, RequestError> {
+        let mut segments = vec![PathSegment::Name(self.identifier()?)];
+        loop {
+            if segments.len() > MAX_STATEMENT_DEPTH {
+                return Err(statement_refused(&format!(
+                    "a document path may hold at most {MAX_STATEMENT_DEPTH} steps"
+                )));
+            }
+            if self.accept(&Token::Dot) {
+                segments.push(PathSegment::Name(self.identifier()?));
+                continue;
+            }
+            if self.accept(&Token::OpenBracket) {
+                let Token::Number(lexeme) = self.bump()?.clone() else {
+                    return Err(statement_syntax_error());
+                };
+                let index = lexeme
+                    .parse::<usize>()
+                    .map_err(|_| statement_syntax_error())?;
+                self.expect(&Token::CloseBracket)?;
+                segments.push(PathSegment::Index(index));
+                continue;
+            }
+            break;
+        }
+        Ok(StatementPath { segments })
+    }
+
+    /// One value the statement carries: a literal, a collection of literals, or a
+    /// `?` marker standing for one `Parameters` entry.
+    fn value(&mut self) -> Result<AttributeValue, RequestError> {
+        let value = self.raw_value()?;
+        // A value a statement carries is held to the same rules a stored one is: the
+        // documented nesting depth and this emulator's ceiling on a collection's
+        // members.
+        check_attribute_value("Statement", &value)?;
+        Ok(value)
+    }
+
+    fn raw_value(&mut self) -> Result<AttributeValue, RequestError> {
+        match self.peek().cloned() {
+            Some(Token::Text(text)) => {
+                self.at += 1;
+                Ok(AttributeValue::S(text))
+            }
+            Some(Token::Number(lexeme)) => {
+                self.at += 1;
+                Ok(AttributeValue::N(canonical_number_text(&lexeme)?))
+            }
+            Some(Token::Minus | Token::Plus) => {
+                let negative = self.peek() == Some(&Token::Minus);
+                self.at += 1;
+                let Some(Token::Number(lexeme)) = self.peek().cloned() else {
+                    return Err(statement_syntax_error());
+                };
+                self.at += 1;
+                let signed = if negative {
+                    format!("-{lexeme}")
+                } else {
+                    lexeme
+                };
+                Ok(AttributeValue::N(canonical_number_text(&signed)?))
+            }
+            Some(Token::Parameter) => {
+                self.at += 1;
+                let value = self
+                    .parameters
+                    .get(self.used_parameters)
+                    .cloned()
+                    .ok_or_else(|| {
+                        statement_refused(
+                            "the number of parameters in the request and in the statement do not \
+                             match",
+                        )
+                    })?;
+                self.used_parameters += 1;
+                Ok(value)
+            }
+            Some(Token::OpenBracket) => {
+                self.at += 1;
+                let members = self.nested_to(MAX_ATTRIBUTE_DEPTH, |parser| {
+                    parser.value_list(&Token::CloseBracket)
+                })?;
+                Ok(AttributeValue::L(members))
+            }
+            Some(Token::OpenBag) => {
+                self.at += 1;
+                let members = self
+                    .nested_to(MAX_ATTRIBUTE_DEPTH, |parser| {
+                        parser.value_list(&Token::CloseBag)
+                    })?;
+                set_of(members)
+            }
+            Some(Token::OpenBrace) => {
+                self.at += 1;
+                let entries = self.nested_to(MAX_ATTRIBUTE_DEPTH, Self::tuple_entries)?;
+                Ok(AttributeValue::M(entries))
+            }
+            Some(Token::Word(word)) => {
+                self.at += 1;
+                if word.eq_ignore_ascii_case("null") {
+                    return Ok(AttributeValue::Null(true));
+                }
+                if word.eq_ignore_ascii_case("true") {
+                    return Ok(AttributeValue::Bool(true));
+                }
+                if word.eq_ignore_ascii_case("false") {
+                    return Ok(AttributeValue::Bool(false));
+                }
+                Err(statement_syntax_error())
+            }
+            _ => Err(statement_syntax_error()),
+        }
+    }
+
+    /// The members of a list or bag literal, up to its closing delimiter.
+    fn value_list(&mut self, closing: &Token) -> Result<Vec<AttributeValue>, RequestError> {
+        let mut members = Vec::new();
+        if self.accept(closing) {
+            return Ok(members);
+        }
+        loop {
+            members.push(self.raw_value()?);
+            if !self.accept(&Token::Comma) {
+                break;
+            }
+        }
+        self.expect(closing)?;
+        Ok(members)
+    }
+
+    /// The `'name': value` entries of a tuple literal, up to its closing brace.
+    fn tuple_entries(&mut self) -> Result<Item, RequestError> {
+        let mut entries = Item::new();
+        if self.accept(&Token::CloseBrace) {
+            return Ok(entries);
+        }
+        loop {
+            let name = match self.bump()? {
+                Token::Text(text) => text.clone(),
+                Token::Quoted(name) => name.clone(),
+                _ => return Err(statement_syntax_error()),
+            };
+            self.expect(&Token::Colon)?;
+            let value = self.raw_value()?;
+            if entries.insert(name, value).is_some() {
+                return Err(statement_refused(
+                    "a tuple names each of its attributes once",
+                ));
+            }
+            if !self.accept(&Token::Comma) {
+                break;
+            }
+        }
+        self.expect(&Token::CloseBrace)?;
+        Ok(entries)
+    }
+}
+
+/// The DynamoDB set a `<<…>>` bag denotes: its members decide which of the three set
+/// types it is, and a bag whose members are not all of one scalar type is no set.
+fn set_of(members: Vec<AttributeValue>) -> Result<AttributeValue, RequestError> {
+    if members.is_empty() {
+        return Err(statement_refused("a set must hold at least one member"));
+    }
+    if members
+        .iter()
+        .all(|member| matches!(member, AttributeValue::S(_)))
+    {
+        return Ok(AttributeValue::Ss(
+            members
+                .into_iter()
+                .filter_map(|member| match member {
+                    AttributeValue::S(text) => Some(text),
+                    _ => None,
+                })
+                .collect(),
+        ));
+    }
+    if members
+        .iter()
+        .all(|member| matches!(member, AttributeValue::N(_)))
+    {
+        return Ok(AttributeValue::Ns(
+            members
+                .into_iter()
+                .filter_map(|member| match member {
+                    AttributeValue::N(text) => Some(text),
+                    _ => None,
+                })
+                .collect(),
+        ));
+    }
+    if members
+        .iter()
+        .all(|member| matches!(member, AttributeValue::B(_)))
+    {
+        return Ok(AttributeValue::Bs(
+            members
+                .into_iter()
+                .filter_map(|member| match member {
+                    AttributeValue::B(bytes) => Some(bytes),
+                    _ => None,
+                })
+                .collect(),
+        ));
+    }
+    Err(statement_refused(
+        "the members of a set must all be strings, all numbers or all binary values",
+    ))
+}
+
+// ===========================================================================
+// Rendering back into the expression grammars the item API already evaluates
+// ===========================================================================
+
+/// The substitution tables one rendered expression's `#name` aliases and `:value`
+/// placeholders resolve through.
+#[derive(Debug, Default)]
+struct Rendered {
+    names: HashMap<String, String>,
+    values: HashMap<String, AttributeValue>,
+}
+
+impl Rendered {
+    /// The alias for one attribute name, minted once per distinct name so the same
+    /// name renders the same way wherever it appears.
+    fn alias(&mut self, name: &str) -> String {
+        if let Some((alias, _)) = self
+            .names
+            .iter()
+            .find(|(_, stored)| stored.as_str() == name)
+        {
+            return alias.clone();
+        }
+        let alias = format!("#n{}", self.names.len());
+        self.names.insert(alias.clone(), name.to_string());
+        alias
+    }
+
+    /// The placeholder for one value.
+    fn placeholder(&mut self, value: AttributeValue) -> String {
+        let placeholder = format!(":v{}", self.values.len());
+        self.values.insert(placeholder.clone(), value);
+        placeholder
+    }
+
+    /// One document path, as the expression grammar spells it.
+    fn path(&mut self, path: &StatementPath) -> String {
+        let mut text = String::new();
+        for segment in &path.segments {
+            match segment {
+                PathSegment::Name(name) => {
+                    let alias = self.alias(name);
+                    if !text.is_empty() {
+                        text.push('.');
+                    }
+                    text.push_str(&alias);
+                }
+                PathSegment::Index(index) => {
+                    text.push('[');
+                    text.push_str(&index.to_string());
+                    text.push(']');
+                }
+            }
+        }
+        text
+    }
+
+    fn operand(&mut self, operand: &PredicateOperand) -> String {
+        match operand {
+            PredicateOperand::Path(path) => self.path(path),
+            PredicateOperand::Value(value) => self.placeholder(value.clone()),
+            PredicateOperand::Size(path) => {
+                let path = self.path(path);
+                format!("size({path})")
+            }
+        }
+    }
+
+    /// One predicate, as a `ConditionExpression`.
+    ///
+    /// `AND` and `OR` chains are joined FLAT, and only a branch of lower precedence
+    /// is parenthesised, so the rendered text nests no deeper than the statement did.
+    fn predicate(&mut self, predicate: &Predicate) -> String {
+        match predicate {
+            Predicate::All(branches) => branches
+                .iter()
+                .map(|branch| {
+                    let text = self.predicate(branch);
+                    if matches!(branch, Predicate::Any(_)) {
+                        format!("({text})")
+                    } else {
+                        text
+                    }
+                })
+                .collect::<Vec<String>>()
+                .join(" AND "),
+            Predicate::Any(branches) => branches
+                .iter()
+                .map(|branch| self.predicate(branch))
+                .collect::<Vec<String>>()
+                .join(" OR "),
+            Predicate::Not(inner) => {
+                let text = self.predicate(inner);
+                format!("NOT ({text})")
+            }
+            Predicate::Compare(left, operator, right) => {
+                let left = self.operand(left);
+                let right = self.operand(right);
+                let operator = match operator {
+                    CompareOp::Equal => "=",
+                    CompareOp::NotEqual => "<>",
+                    CompareOp::Less => "<",
+                    CompareOp::LessOrEqual => "<=",
+                    CompareOp::Greater => ">",
+                    CompareOp::GreaterOrEqual => ">=",
+                };
+                format!("{left} {operator} {right}")
+            }
+            Predicate::Between(value, low, high) => {
+                let value = self.operand(value);
+                let low = self.operand(low);
+                let high = self.operand(high);
+                format!("{value} BETWEEN {low} AND {high}")
+            }
+            Predicate::In(value, candidates) => {
+                let value = self.operand(value);
+                let candidates: Vec<String> = candidates
+                    .iter()
+                    .map(|candidate| self.operand(candidate))
+                    .collect();
+                format!("{value} IN ({})", candidates.join(", "))
+            }
+            // In PartiQL a path that addresses nothing is NULL as well, so the
+            // rendered condition holds for an absent attribute too.
+            Predicate::IsNull(path, expected) => {
+                let rendered = self.path(path);
+                let null = self.placeholder(AttributeValue::Null(true));
+                let text =
+                    format!("(attribute_not_exists({rendered}) OR {rendered} = {null})");
+                if *expected {
+                    text
+                } else {
+                    format!("NOT {text}")
+                }
+            }
+            Predicate::IsMissing(path, expected) => {
+                let rendered = self.path(path);
+                if *expected {
+                    format!("attribute_not_exists({rendered})")
+                } else {
+                    format!("attribute_exists({rendered})")
+                }
+            }
+            Predicate::BeginsWith(path, prefix) => {
+                let path = self.path(path);
+                let prefix = self.operand(prefix);
+                format!("begins_with({path}, {prefix})")
+            }
+            Predicate::Contains(path, needle) => {
+                let path = self.path(path);
+                let needle = self.operand(needle);
+                format!("contains({path}, {needle})")
+            }
+            Predicate::AttributeType(path, wanted) => {
+                let path = self.path(path);
+                let wanted = self.operand(wanted);
+                format!("attribute_type({path}, {wanted})")
+            }
+            Predicate::Exists(path, expected) => {
+                let path = self.path(path);
+                if *expected {
+                    format!("attribute_exists({path})")
+                } else {
+                    format!("attribute_not_exists({path})")
+                }
+            }
+        }
+    }
+
+    fn set_operand(&mut self, operand: &AssignmentOperand) -> String {
+        match operand {
+            AssignmentOperand::Path(path) => self.path(path),
+            AssignmentOperand::Value(value) => self.placeholder(value.clone()),
+            AssignmentOperand::ListAppend(left, right) => {
+                let left = self.set_operand(left);
+                let right = self.set_operand(right);
+                format!("list_append({left}, {right})")
+            }
+        }
+    }
+
+    /// The `UPDATE`'s clauses, as an `UpdateExpression`: one section per action kind,
+    /// in the order the grammar names them.
+    fn clauses(&mut self, clauses: &[UpdateClause]) -> String {
+        let mut sets = Vec::new();
+        let mut removes = Vec::new();
+        let mut adds = Vec::new();
+        let mut deletes = Vec::new();
+        for clause in clauses {
+            match clause {
+                UpdateClause::Set(path, expression) => {
+                    let path = self.path(path);
+                    let value = match expression {
+                        SetExpression::Single(operand) => self.set_operand(operand),
+                        SetExpression::Sum(left, right) => {
+                            let left = self.set_operand(left);
+                            let right = self.set_operand(right);
+                            format!("{left} + {right}")
+                        }
+                        SetExpression::Difference(left, right) => {
+                            let left = self.set_operand(left);
+                            let right = self.set_operand(right);
+                            format!("{left} - {right}")
+                        }
+                    };
+                    sets.push(format!("{path} = {value}"));
+                }
+                UpdateClause::Remove(path) => {
+                    let path = self.path(path);
+                    removes.push(path);
+                }
+                UpdateClause::Add(path, value) => {
+                    let path = self.path(path);
+                    let value = self.placeholder(value.clone());
+                    adds.push(format!("{path} {value}"));
+                }
+                UpdateClause::Delete(path, value) => {
+                    let path = self.path(path);
+                    let value = self.placeholder(value.clone());
+                    deletes.push(format!("{path} {value}"));
+                }
+            }
+        }
+        let mut sections = Vec::new();
+        for (keyword, actions) in [
+            ("SET", sets),
+            ("REMOVE", removes),
+            ("ADD", adds),
+            ("DELETE", deletes),
+        ] {
+            if !actions.is_empty() {
+                sections.push(format!("{keyword} {}", actions.join(", ")));
+            }
+        }
+        sections.join(" ")
+    }
+}
+
+/// The statement's `WHERE` predicate as the parsed `ConditionExpression` the item API
+/// evaluates, so one implementation decides which comparison holds between which two
+/// attribute values.
+pub fn parsed_condition(predicate: &Predicate) -> Result<ParsedCondition, RequestError> {
+    let mut rendered = Rendered::default();
+    let text = rendered.predicate(predicate);
+    ParsedCondition::parse(
+        "Statement",
+        &text,
+        Substitutions::new(Some(&rendered.names), Some(&rendered.values)),
+    )
+}
+
+/// The statement's `SET`/`REMOVE` clauses as the parsed `UpdateExpression` the item
+/// API applies, so one implementation decides what each action does to an item.
+pub fn parsed_update(clauses: &[UpdateClause]) -> Result<ParsedUpdate, RequestError> {
+    let mut rendered = Rendered::default();
+    let text = rendered.clauses(clauses);
+    ParsedUpdate::parse(
+        "Statement",
+        &text,
+        Substitutions::new(Some(&rendered.names), Some(&rendered.values)),
+    )
+}
+
+// ===========================================================================
+// What the predicate pins, and where a page resumes
+// ===========================================================================
+
+/// Every `attribute = value` the top level of this predicate requires, which is how a
+/// statement addresses one item: "WHERE" equality on each key attribute.
+///
+/// Only the conjunction at the top level pins anything — an `OR` branch requires none
+/// of its terms — and only a whole top-level attribute compared with a value.
+pub fn pinned_equalities(predicate: &Predicate) -> HashMap<String, AttributeValue> {
+    let mut pinned = HashMap::new();
+    let mut pending = vec![predicate];
+    while let Some(predicate) = pending.pop() {
+        match predicate {
+            Predicate::All(branches) => pending.extend(branches.iter()),
+            Predicate::Compare(left, CompareOp::Equal, right) => {
+                if let Some((name, value)) = equality(left, right) {
+                    pinned.insert(name, value);
+                }
+            }
+            _ => {}
+        }
+    }
+    pinned
+}
+
+/// The attribute and value one `=` comparison pins, whichever side the path is on.
+fn equality(
+    left: &PredicateOperand,
+    right: &PredicateOperand,
+) -> Option<(String, AttributeValue)> {
+    match (left, right) {
+        (PredicateOperand::Path(path), PredicateOperand::Value(value))
+        | (PredicateOperand::Value(value), PredicateOperand::Path(path))
+            if path.is_attribute() =>
+        {
+            Some((path.attribute().to_string(), value.clone()))
+        }
+        _ => None,
+    }
+}
+
+/// The `NextToken` a truncated page reports: the primary key the page stopped on,
+/// encoded so the next request resumes strictly after it.
+///
+/// Each component is its type tag and its bytes in hex — the key's own stored form
+/// (a number's canonical text, a string's UTF-8, a blob's bytes) — so the token
+/// carries nothing but the key and decodes back to exactly it.
+pub fn encode_cursor(key: &ItemKey) -> String {
+    let mut token = encode_key_component(&key.partition);
+    if let Some(sort) = key.sort.as_ref() {
+        token.push('.');
+        token.push_str(&encode_key_component(sort));
+    }
+    token
+}
+
+fn encode_key_component(component: &AttributeValueKey) -> String {
+    match component {
+        AttributeValueKey::S(text) => format!("S{}", hex::encode(text.as_bytes())),
+        AttributeValueKey::N(number) => {
+            format!("N{}", hex::encode(number.canonical_text().as_bytes()))
+        }
+        AttributeValueKey::B(bytes) => format!("B{}", hex::encode(bytes)),
+    }
+}
+
+/// The key a `NextToken` stands for, or the refusal for a token this service did not
+/// mint.
+pub fn decode_cursor(token: &str) -> Result<ItemKey, RequestError> {
+    let mut components = token.split('.');
+    let partition = components
+        .next()
+        .ok_or_else(invalid_next_token)
+        .and_then(decode_key_component)?;
+    let sort = match components.next() {
+        Some(component) => Some(decode_key_component(component)?),
+        None => None,
+    };
+    if components.next().is_some() {
+        return Err(invalid_next_token());
+    }
+    Ok(ItemKey { partition, sort })
+}
+
+fn decode_key_component(component: &str) -> Result<AttributeValueKey, RequestError> {
+    let mut characters = component.chars();
+    let tag = characters.next().ok_or_else(invalid_next_token)?;
+    let bytes = hex::decode(characters.as_str()).map_err(|_| invalid_next_token())?;
+    match tag {
+        'S' => String::from_utf8(bytes)
+            .map(AttributeValueKey::S)
+            .map_err(|_| invalid_next_token()),
+        'N' => String::from_utf8(bytes)
+            .ok()
+            .and_then(|text| NumberKey::parse(&text))
+            .map(AttributeValueKey::N)
+            .ok_or_else(invalid_next_token),
+        'B' => Ok(AttributeValueKey::B(bytes)),
+        _ => Err(invalid_next_token()),
+    }
+}
+
+/// How a `NextToken` that is not one of this service's is refused.
+fn invalid_next_token() -> RequestError {
+    RequestError::Validation("Invalid NextToken".to_string())
+}
+
+// ===========================================================================
+// Reading the stored items a SELECT reports
+// ===========================================================================
+
+/// Which attributes of an item a source reports: every one for the table and for an
+/// `ALL` index, and the projected ones for any other index.
+///
+/// Returns `None` when every attribute is reported.
+pub fn projected_attributes(table: &Table, index: Option<&str>) -> Option<BTreeSet<String>> {
+    let index = index?;
+    let (key_schema, projection) = index_shape(table, index)?;
+    let projection_type = projection.projection_type.as_deref().unwrap_or("ALL");
+    if projection_type == "ALL" {
+        return None;
+    }
+    let mut attributes: BTreeSet<String> = table
+        .key_schema
+        .iter()
+        .chain(key_schema)
+        .map(|element| element.attribute_name.clone())
+        .collect();
+    if projection_type == "INCLUDE" {
+        attributes.extend(projection.non_key_attributes.iter().flatten().cloned());
+    }
+    Some(attributes)
+}
+
+/// One index's key schema and projection, whichever kind of index it is.
+fn index_shape<'t>(
+    table: &'t Table,
+    index: &str,
+) -> Option<(&'t [KeySchemaElement], &'t Projection)> {
+    if let Some(found) = table
+        .global_secondary_indexes
+        .iter()
+        .find(|candidate| candidate.name == index)
+    {
+        return Some((found.key_schema.as_slice(), &found.projection));
+    }
+    table
+        .local_secondary_indexes
+        .iter()
+        .find(|candidate| candidate.name == index)
+        .map(|found| (found.key_schema.as_slice(), &found.projection))
+}
+
+/// Whether `index` is one this table declares.
+pub fn declares_index(table: &Table, index: &str) -> bool {
+    index_shape(table, index).is_some()
+}
+
+/// Whether an item is projected into `index`: an index holds only the items that
+/// carry every attribute its key schema names.
+pub fn index_holds(table: &Table, index: &str, item: &Item) -> bool {
+    index_shape(table, index)
+        .is_some_and(|(key_schema, _)| super::index_covers(key_schema, item))
+}
+
+/// The key attributes a source orders by: the table's own, or the index's plus the
+/// table's.
+pub fn orderable_attributes(table: &Table, index: Option<&str>) -> BTreeSet<String> {
+    let mut attributes: BTreeSet<String> = table
+        .key_schema
+        .iter()
+        .map(|element| element.attribute_name.clone())
+        .collect();
+    if let Some((key_schema, _)) = index.and_then(|index| index_shape(table, index)) {
+        attributes.extend(
+            key_schema
+                .iter()
+                .map(|element| element.attribute_name.clone()),
+        );
+    }
+    attributes
+}
+
+/// Order two items by one attribute, as `ORDER BY` asked: the values compare the way
+/// stored attribute values do, and an item the attribute is absent from sorts before
+/// one that carries it.
+pub fn compare_by_attribute(
+    left: &Item,
+    right: &Item,
+    attribute: &str,
+    descending: bool,
+) -> Ordering {
+    let ordering = match (left.get(attribute), right.get(attribute)) {
+        (Some(left), Some(right)) => {
+            super::compare_values(left, right).unwrap_or(Ordering::Equal)
+        }
+        (Some(_), None) => Ordering::Greater,
+        (None, Some(_)) => Ordering::Less,
+        (None, None) => Ordering::Equal,
+    };
+    if descending {
+        ordering.reverse()
+    } else {
+        ordering
+    }
+}
+
+/// The one item an `UPDATE` or a `DELETE` addresses: the primary key its `WHERE`
+/// clause pins by equality.
+///
+/// "ExecuteStatement allows you to perform reads and SINGLETON writes" (the
+/// operation's doc): a write statement names one item, so a `WHERE` clause that does
+/// not pin every key attribute by equality names no item and is refused rather than
+/// applied to whatever it matches.
+pub fn singleton_key(table: &Table, predicate: &Predicate) -> Result<ItemKey, RequestError> {
+    let pinned = pinned_equalities(predicate);
+    let mut key = Item::new();
+    for element in &table.key_schema {
+        let Some(value) = pinned.get(&element.attribute_name) else {
+            return Err(statement_refused(&format!(
+                "the WHERE clause of a write statement must address one item: it states no \
+                 equality on the key attribute {}",
+                element.attribute_name
+            )));
+        };
+        key.insert(element.attribute_name.clone(), value.clone());
+    }
+    table.key_of_key_map(&key)
+}
+
+/// Just what a statement's projection names, in the item that holds it.
+///
+/// A projection reports one entry per path it names, under the path's last named step
+/// (or the alias the statement gave it), and reports nothing at all for a path the
+/// item does not hold — so `SELECT a, b.c` over an item carrying neither reports an
+/// empty tuple rather than nulls.
+pub fn project_item(item: &Item, projection: Option<&Vec<ProjectionItem>>) -> Item {
+    let Some(projection) = projection else {
+        return item.clone();
+    };
+    projection
+        .iter()
+        .filter_map(|projected| {
+            projected.path.read(item).map(|value| {
+                (
+                    projected
+                        .alias
+                        .clone()
+                        .unwrap_or_else(|| projected.path.label().to_string()),
+                    value.clone(),
+                )
+            })
+        })
+        .collect()
+}

@@ -130,7 +130,11 @@ pub(crate) async fn create_members(
     .await
 }
 
-async fn get_members(router: &Router, detector_id: &str, account_ids: &[&str]) -> (u16, Value) {
+pub(crate) async fn get_members(
+    router: &Router,
+    detector_id: &str,
+    account_ids: &[&str],
+) -> (u16, Value) {
     call(
         router,
         "POST",

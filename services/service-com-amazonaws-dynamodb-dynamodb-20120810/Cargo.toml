@@ -21,6 +21,9 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Exact decimal arithmetic for the `N` attribute type: an `ADD`ed or `SET`-computed
+# number carries up to 38 significant digits, which no primitive float can hold.
+bigdecimal = "0.4"
 # Mints the UUID-format `TableId` DynamoDB generates for every table it creates
 # (`state::new_table_id`).
 uuid = { version = "1", features = ["v4"] }

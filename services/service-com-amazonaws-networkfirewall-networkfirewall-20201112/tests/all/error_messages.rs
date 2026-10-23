@@ -23,28 +23,15 @@ use serde_json::{json, Value};
 use service_com_amazonaws_networkfirewall_networkfirewall_20201112::state;
 
 use crate::harness::{
-    error_code, minimal_policy_document, resource_policy_document, string_at, Harness, ACCOUNT,
-    REGION,
+    error_code, error_message, minimal_policy_document, resource_policy_document, string_at,
+    Harness, ACCOUNT, NOT_FOUND_MESSAGE as NOT_FOUND, REGION,
 };
-
-/// The text every `ResourceNotFoundException` carries, as recorded off the
-/// service: byte-identical across five operations in three fixtures, naming
-/// neither the resource, nor its type, nor its ARN.
-const NOT_FOUND: &str = "No object with the provided name or resource identifier was found";
 
 /// The text a create whose name is already taken is refused with, as recorded.
 const ALREADY_EXISTS: &str = "A resource with the specified name already exists";
 
 /// The text every `InvalidTokenException` carries, as recorded.
 const INVALID_TOKEN: &str = "Update token isn't valid.";
-
-/// The `Message` member of an error body.
-fn error_message(body: &Value) -> String {
-    body.get("Message")
-        .and_then(Value::as_str)
-        .unwrap_or("<no Message>")
-        .to_string()
-}
 
 /// A rule-group ARN in this emulator's form, for a rule group that was never
 /// created.

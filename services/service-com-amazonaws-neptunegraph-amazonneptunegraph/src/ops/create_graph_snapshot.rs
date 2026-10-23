@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateGraphSnapshot
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateGraphSnapshot`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateGraphSnapshot::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: mints a snapshot of a stored graph into the shared store and reports
+//! the stored record. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +157,170 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateGraphSnapshot` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateGraphSnapshotErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateGraphSnapshot"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateGraphSnapshotErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the neptune-graph store is not mounted on this engine".to_string(),
+                },
+            )
+            .into());
+        };
+
+        // `snapshotName`'s modelled pattern opens with a negative lookahead, which the
+        // boundary validator's regex engine cannot compile — and an uncompilable
+        // `@pattern` is treated as matching — so the one input constraint that reaches
+        // this handler unchecked is enforced here, through the same shared rule
+        // `CreateGraph` enforces `graphName` with. Length (1..63) is already refused at
+        // the boundary by the `@length` trait, so the value echoed below is bounded by
+        // the model.
+        if !crate::state::resource_name_is_well_formed(&input.snapshot_name, SNAPSHOT_ID_PREFIX) {
+            return Err(CreateGraphSnapshotErrorModeled::ValidationException(
+                ValidationException {
+                    message: crate::state::validation_envelope(&[
+                        crate::state::constraint_clause(
+                            "snapshotName",
+                            Some(&input.snapshot_name),
+                            &crate::state::pattern_requirement(SNAPSHOT_NAME_PATTERN),
+                        ),
+                    ]),
+                    reason: Some("CONSTRAINT_VIOLATION".to_string()),
+                },
+            )
+            .into());
+        }
+
+        // Nothing caller-sized reaches the store unchecked — the bound on what one
+        // record's tags may hold is stated once, in `crate::state`, and is reached by
+        // every operation that accepts a `tags` map.
+        if let Some(tags) = input.tags.as_ref() {
+            if let Err(message) = crate::state::bound_tags(tags) {
+                return Err(CreateGraphSnapshotErrorModeled::ValidationException(
+                    ValidationException {
+                        message,
+                        reason: Some("CONSTRAINT_VIOLATION".to_string()),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let region = crate::state::request_region(ctx);
+        let now = ::std::time::Instant::now();
+        let mut store = state.lock();
+
+        // A snapshot is taken OF a graph, so the graph has to exist. The lookup
+        // settles the transitions the clock already made due first, so a graph whose
+        // provisioning has come due is snapshottable.
+        let Some(graph) = store.settled_graph(&input.graph_identifier, now) else {
+            return Err(CreateGraphSnapshotErrorModeled::ResourceNotFoundException(
+                crate::state::graph_not_found(&input.graph_identifier),
+            )
+            .into());
+        };
+        let source_graph_id = graph.id.clone();
+        let source_graph_status = graph.status;
+        // A snapshot of an encrypted graph is encrypted with the graph's own key: the
+        // key is a property of the data being snapshotted, not of this request, which
+        // carries no key member at all.
+        let kms_key_identifier = graph.kms_key_identifier.clone();
+
+        // `snapshotName` is unique within the account: a second snapshot by the same
+        // name conflicts with the stored one. Checked before the source graph's status
+        // so a duplicate name is reported as the name conflict it is, whatever the
+        // graph is doing.
+        if let Some(existing) = store.snapshot_names.get(&input.snapshot_name) {
+            return Err(CreateGraphSnapshotErrorModeled::ConflictException(
+                ConflictException {
+                    message: format!(
+                        "a snapshot named '{}' already exists with id {existing}",
+                        input.snapshot_name
+                    ),
+                    reason: None,
+                },
+            )
+            .into());
+        }
+
+        // The store is shared and grows by one snapshot per call, so it has a ceiling
+        // (`crate::state::MAX_SNAPSHOTS`). Reaching it is the condition the model's
+        // `ServiceQuotaExceededException` (402) describes.
+        if store.snapshots.len() >= crate::state::MAX_SNAPSHOTS {
+            return Err(
+                CreateGraphSnapshotErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: format!(
+                            "this emulator holds at most {} graph snapshots; delete a \
+                             snapshot before creating another",
+                            crate::state::MAX_SNAPSHOTS
+                        ),
+                        resource_id: None,
+                        resource_type: Some("GraphSnapshot".to_string()),
+                        service_code: Some(crate::state::ARN_NAMESPACE.to_string()),
+                        quota_code: None,
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Only a serving graph can be snapshotted: while an earlier transition is
+        // still outstanding the graph's data is in flight, which is the same
+        // precondition `UpdateGraph` and `DeleteGraph` state.
+        if source_graph_status != crate::state::GraphStatus::Available {
+            return Err(CreateGraphSnapshotErrorModeled::ConflictException(
+                ConflictException {
+                    message: format!(
+                        "graph {source_graph_id} is in status {} and cannot be snapshotted",
+                        source_graph_status.as_wire()
+                    ),
+                    reason: None,
+                },
+            )
+            .into());
+        }
+
+        let id = store.next_snapshot_id();
+        let snapshot = crate::state::Snapshot {
+            arn: ::engine::emulator_arn(
+                crate::state::ARN_NAMESPACE,
+                &region,
+                &format!("graph-snapshot/{id}"),
+            ),
+            id,
+            name: input.snapshot_name,
+            source_graph_id: source_graph_id.clone(),
+            // The snapshot is not restorable when the call returns; the clock owes the
+            // move to AVAILABLE a fixed span later
+            // (`crate::state::PROVISIONING_SPAN`).
+            status: crate::state::SnapshotStatus::Creating,
+            settles_at: Some(now + crate::state::PROVISIONING_SPAN),
+            snapshot_create_time: ::std::time::SystemTime::now(),
+            kms_key_identifier,
+            tags: input.tags.unwrap_or_default().into_iter().collect(),
+        };
+
+        // Taking a snapshot takes the SOURCE GRAPH through SNAPSHOTTING (a modelled
+        // `GraphStatus` value); the clock owes the move back to AVAILABLE the same span
+        // later, so a caller that reads the graph straight after this call still sees
+        // the transient status.
+        if let Some(graph) = store.graphs.get_mut(&source_graph_id) {
+            graph.begin_transition(crate::state::GraphStatus::Snapshotting, now);
+        }
+
+        // Report the record that was stored, so this response cannot drift from what a
+        // later GetGraphSnapshot answers.
+        let output = Self::Output::from(&snapshot);
+        store.insert_snapshot(snapshot);
+        Ok(output)
     }
 }
+
+/// The prefix the service reserves for snapshot ids, which a `snapshotName` may
+/// therefore not take — the `(?!gs-)` clause of [`SNAPSHOT_NAME_PATTERN`].
+const SNAPSHOT_ID_PREFIX: &str = "gs-";
+
+/// The modelled `SnapshotName` pattern, exactly as the model spells it
+/// (`smithy_query(query="shape",shape="SnapshotName")`): the expression a refusal
+/// reports, enforced by `crate::state::resource_name_is_well_formed` because the
+/// boundary validator's regex engine cannot compile its leading negative lookahead.
+const SNAPSHOT_NAME_PATTERN: &str = "^(?!gs-)[a-z][a-z0-9]*(-[a-z0-9]+)*$";

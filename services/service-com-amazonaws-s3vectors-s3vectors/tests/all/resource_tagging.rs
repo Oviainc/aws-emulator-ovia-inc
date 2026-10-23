@@ -28,106 +28,13 @@ use serde_json::{json, Value};
 use service_com_amazonaws_s3vectors_s3vectors::state::MAX_TAGS_PER_RESOURCE;
 use smithy_server_runtime::MultiServiceRouter;
 
+// The request and assertion layer for the three `/tags/{resourceArn}` URIs is the
+// crate's shared one, in `vector_lifecycle.rs`, so every tag suite drives them
+// through the same helpers.
 use crate::vector_lifecycle::{
-    error_code, expected_bucket_arn, expected_index_arn, ok, router, AUTHORIZATION, REGION,
+    call_uri, encode_label, error_code, expected_bucket_arn, expected_index_arn, keys, list_tags,
+    ok, pairs, reported_tags, router, tag, tag_object, untag, REGION,
 };
-
-/// Percent-encode `value` for a NON-GREEDY `@httpLabel` or an `@httpQuery` entry the
-/// way an AWS SDK does: every byte outside RFC 3986's unreserved set, so an ARN's own
-/// `:` and `/` travel as ONE path segment instead of being read as path structure.
-///
-/// Spelled out here rather than pulled from a crate so this fix adds no dependency
-/// edge to `Cargo.lock`, which every landing fix touches; the sibling tagging suites
-/// of `codeguru-security` and `dlm` do the same.
-fn label(value: &str) -> String {
-    const HEX: &[u8; 16] = b"0123456789ABCDEF";
-    let mut out = String::with_capacity(value.len());
-    for byte in value.as_bytes() {
-        let ch = *byte as char;
-        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '~') {
-            out.push(ch);
-        } else {
-            out.push('%');
-            out.push(HEX[usize::from(byte >> 4)] as char);
-            out.push(HEX[usize::from(byte & 0x0f)] as char);
-        }
-    }
-    out
-}
-
-/// One request on an explicit method and path, returning its status and JSON body.
-async fn send(
-    router: &MultiServiceRouter,
-    method: &str,
-    path_and_query: &str,
-    body: Option<Value>,
-) -> (u16, Value) {
-    let payload = match body {
-        Some(value) => serde_json::to_vec(&value).expect("the request body serializes"),
-        None => Vec::new(),
-    };
-    let request = http::Request::builder()
-        .method(method)
-        .uri(format!(
-            "https://s3vectors.{REGION}.amazonaws.com{path_and_query}"
-        ))
-        .header("authorization", AUTHORIZATION)
-        .header("content-type", "application/json")
-        .body(bytes::Bytes::from(payload))
-        .expect("a well-formed request");
-    let response = router.dispatch(request).await;
-    let status = response.status().as_u16();
-    let payload = response.into_body();
-    let parsed = if payload.is_empty() {
-        Value::Null
-    } else {
-        serde_json::from_slice(&payload).unwrap_or(Value::Null)
-    };
-    (status, parsed)
-}
-
-/// `DELETE /tags/{resourceArn}?tagKeys=…` — `UntagResource`. `tagKeys` is a required
-/// `@httpQuery` list, so it travels as one query entry per key.
-async fn untag(router: &MultiServiceRouter, arn: &str, tag_keys: &[String]) -> (u16, Value) {
-    let query = tag_keys
-        .iter()
-        .map(|key| format!("tagKeys={}", label(key)))
-        .collect::<Vec<_>>()
-        .join("&");
-    send(
-        router,
-        "DELETE",
-        &format!("/tags/{}?{query}", label(arn)),
-        None,
-    )
-    .await
-}
-
-/// `GET /tags/{resourceArn}` — `ListTagsForResource`.
-async fn list_tags(router: &MultiServiceRouter, arn: &str) -> (u16, Value) {
-    send(router, "GET", &format!("/tags/{}", label(arn)), None).await
-}
-
-/// `POST /tags/{resourceArn}` with a `tags` body — `TagResource`.
-async fn tag(router: &MultiServiceRouter, arn: &str, tags: &Value) -> (u16, Value) {
-    send(
-        router,
-        "POST",
-        &format!("/tags/{}", label(arn)),
-        Some(json!({ "tags": tags })),
-    )
-    .await
-}
-
-/// The tag map `ListTagsForResource` reports for `arn`, which must succeed.
-async fn reported_tags(router: &MultiServiceRouter, case: &str, arn: &str) -> Value {
-    let (status, body) = list_tags(router, arn).await;
-    assert_eq!(
-        status, 200,
-        "case {case:?}: ListTagsForResource({arn}) must succeed, got {status} {body}"
-    );
-    body.get("tags").cloned().unwrap_or(Value::Null)
-}
 
 /// The `message` member of an error body, whichever casing the protocol rendered.
 fn error_message(body: &Value) -> String {
@@ -138,45 +45,22 @@ fn error_message(body: &Value) -> String {
         .to_string()
 }
 
-/// A JSON object from key/value pairs, for comparing a reported tag map whole.
-fn tag_object(pairs: &[(String, String)]) -> Value {
-    Value::Object(
-        pairs
-            .iter()
-            .map(|(key, value)| (key.clone(), Value::String(value.clone())))
-            .collect(),
-    )
-}
-
-/// Owned key/value pairs from literals, so a table row can mix literal and generated
-/// keys.
-fn pairs(literal: &[(&str, &str)]) -> Vec<(String, String)> {
-    literal
-        .iter()
-        .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
-        .collect()
-}
-
-/// Owned tag keys from literals.
-fn keys(literal: &[&str]) -> Vec<String> {
-    literal.iter().map(|key| (*key).to_string()).collect()
-}
-
 /// Which kind of resource a `resourceArn` names. Both are tagged resources: "the
 /// tagged resource can be a vector bucket or a vector index".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Kind {
+pub(crate) enum Kind {
     Bucket,
     Index,
 }
 
-/// The bucket and index names every fixture in this suite uses.
-const BUCKET: &str = "tagged-bucket";
-const INDEX: &str = "tagged-index";
+/// The bucket and index names every tag fixture uses.
+pub(crate) const BUCKET: &str = "tagged-bucket";
+/// See [`BUCKET`].
+pub(crate) const INDEX: &str = "tagged-index";
 
 /// Create a vector bucket (and, for [`Kind::Index`], an index in it) carrying `tags`,
 /// and answer with the ARN of the resource the tags are on.
-async fn resource_with_tags(
+pub(crate) async fn resource_with_tags(
     router: &MultiServiceRouter,
     kind: Kind,
     tags: &[(String, String)],
@@ -737,7 +621,7 @@ async fn untag_resource_refuses_tag_keys_outside_the_modelled_bounds() {
         ("an empty key", "tagKeys=".to_string(), false),
         (
             "a character outside the pattern",
-            format!("tagKeys={}", label("no!")),
+            format!("tagKeys={}", encode_label("no!")),
             false,
         ),
     ];
@@ -745,8 +629,8 @@ async fn untag_resource_refuses_tag_keys_outside_the_modelled_bounds() {
     for (case, query, accepted) in &cases {
         let router = router();
         let arn = resource_with_tags(&router, Kind::Bucket, &pairs(&[("team", "web")])).await;
-        let path = format!("/tags/{}?{query}", label(&arn));
-        let (status, body) = send(&router, "DELETE", &path, None).await;
+        let path = format!("/tags/{}?{query}", encode_label(&arn));
+        let (status, body) = call_uri(&router, "DELETE", &path, None).await;
         if *accepted {
             assert_eq!(
                 status, 200,

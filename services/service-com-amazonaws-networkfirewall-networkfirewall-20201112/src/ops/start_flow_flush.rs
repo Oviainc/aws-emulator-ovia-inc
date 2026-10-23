@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartFlowFlush
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartFlowFlush`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartFlowFlush::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: starts a `FLOW_FLUSH` flow operation on a stored firewall,
+//! persisting the scope and filters it was defined with under a freshly minted
+//! `FlowOperationId`, and reports the `IN_PROGRESS` status the operation begins
+//! in. `DescribeFlowOperation` reads the record back.
 //!
 //! ## Shape of an operation
 //!
@@ -179,18 +174,80 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartFlowFlush` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartFlowFlushErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartFlowFlush"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                StartFlowFlushErrorModeled::InternalServerError(InternalServerError {
+                    message: Some("the firewall store is unavailable".to_string()),
+                })
+                .into(),
+            );
+        };
+        let mut state = state.lock();
+
+        // One shared start path for both flow start commands: they take the same
+        // members and differ only in the `FlowOperationType` they record.
+        let (firewall_arn, record) = state
+            .start_flow_operation(
+                crate::state::FLOW_OPERATION_FLUSH,
+                crate::state::FlowOperationRequest {
+                    firewall_arn: input.firewall_arn,
+                    availability_zone: input.availability_zone,
+                    availability_zone_id: input.availability_zone_id,
+                    vpc_endpoint_association_arn: input.vpc_endpoint_association_arn,
+                    vpc_endpoint_id: input.vpc_endpoint_id,
+                    minimum_flow_age_in_seconds: input.minimum_flow_age_in_seconds,
+                    flow_filters: input.flow_filters,
+                },
+                ::std::time::SystemTime::now(),
+            )
+            .map_err(start_flow_breach)?;
+
+        Ok(StartFlowFlushOutput {
+            firewall_arn: Some(firewall_arn),
+            flow_operation_id: Some(record.flow_operation_id),
+            flow_operation_status: Some(record.status),
+        })
     }
+}
+
+/// Map a refused flow start onto this operation's modelled errors.
+///
+/// A scope naming the same Availability Zone twice and a filter list past the
+/// documented ceiling are both "a problem with your request", which the model
+/// classes `InvalidRequestException`; a `FirewallArn` no stored firewall carries
+/// is a resource the request's parameters do not locate, which is
+/// `ResourceNotFoundException`; and this emulator's own retention ceiling is a
+/// volume refusal, for which `ThrottlingException` is the only modelled answer.
+fn start_flow_breach(breach: crate::state::FlowStartBreach) -> StartFlowFlushError {
+    match breach {
+        crate::state::FlowStartBreach::ZoneAmbiguous => {
+            StartFlowFlushErrorModeled::InvalidRequestException(InvalidRequestException {
+                message: Some(crate::state::ZONE_AMBIGUOUS_MESSAGE.to_string()),
+            })
+        }
+        crate::state::FlowStartBreach::TooManyFilters(given) => {
+            StartFlowFlushErrorModeled::InvalidRequestException(InvalidRequestException {
+                message: Some(format!(
+                    "You can use up to {} filters to configure a single flow operation, \
+                     but {given} were given.",
+                    crate::state::MAX_FLOW_FILTERS
+                )),
+            })
+        }
+        crate::state::FlowStartBreach::FirewallNotFound => {
+            StartFlowFlushErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
+            })
+        }
+        crate::state::FlowStartBreach::TooManyOperations => {
+            StartFlowFlushErrorModeled::ThrottlingException(ThrottlingException {
+                message: Some(format!(
+                    "This emulator holds the maximum of {} flow operations for this firewall.",
+                    crate::state::MAX_STORED_FLOW_OPERATIONS
+                )),
+            })
+        }
+    }
+    .into()
 }

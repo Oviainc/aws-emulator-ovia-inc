@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyIdentityIdFormat
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyIdentityIdFormat`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifyIdentityIdFormat::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## What this operation writes
+//!
+//! One principal's EXPLICIT longer-ID (17-character ID) preference for one resource type
+//! — or for every type still within its opt-in period (`all-current`), and for every
+//! principal of the account (`all`) — into
+//! [`crate::state::ComAmazonawsEc2Amazonec2State::id_format_overrides`], the set
+//! `DescribePrincipalIdFormat` reports. "This request can only be used to modify longer
+//! ID settings for resource types that are within the opt-in period", so a type past that
+//! period ([`crate::state::PERMANENT_LONGER_ID_RESOURCE_TYPES`]) is refused rather than
+//! stored.
 //!
 //! ## Shape of an operation
 //!
@@ -172,18 +174,79 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyIdentityIdFormat` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyIdentityIdFormatErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyIdentityIdFormat"))
+        use crate::state;
+
+        // The settings are facts of the account's principals and this store is per account
+        // (`crate::state`'s module docs), so `ctx` carries nothing this operation needs.
+        // This request models no `DryRun` member, so there is no dry run to answer either.
+        let _ = ctx;
+
+        // "The ARN of the principal, which can be an IAM user, IAM role, or the root user.
+        // Specify all to modify the ID format for all IAM users, IAM roles, and the root
+        // user of the account" (`$PrincipalArn`) — anything else names no principal of
+        // this account, so it is refused instead of becoming a row nothing can ever read.
+        let principal = input.principal_arn.as_str();
+        if principal != state::ALL_PRINCIPALS && !state::iam_principal_arn_is_well_formed(principal)
+        {
+            return Err(state::invalid_parameter_value(format!(
+                "Invalid value '{principal}' for PrincipalArn. It must be '{all}', or the \
+                 ARN of the root user, an IAM user or an IAM role of account {account}",
+                all = state::ALL_PRINCIPALS,
+                account = ::engine::emulator_account_id(),
+            )));
+        }
+
+        // "The type of resource: bundle | … | vpn-gateway. Alternatively, use the
+        // all-current option to include all resource types that are currently within their
+        // opt-in period for longer IDs" (`$Resource`). Every other word is refused with
+        // EC2's resource-type code, both the one that is no resource type at all and the
+        // one past its opt-in period, which this request cannot reach either: "This
+        // request can only be used to modify longer ID settings for resource types that
+        // are within the opt-in period".
+        let resources: Vec<&'static str> = if input.resource == state::ALL_CURRENT_RESOURCES {
+            state::OPT_IN_LONGER_ID_RESOURCE_TYPES.to_vec()
+        } else if let Some(resource) = state::opt_in_longer_id_resource_type(&input.resource) {
+            vec![resource]
+        } else {
+            return Err(state::invalid_resource_type_unknown());
+        };
+
+        let store = state::require_service_state(&*self.engine)?;
+        let mut store = store.lock();
+
+        // The byte ceiling before the first write, so a request this operation cannot store
+        // is refused instead of half-applied. Only a principal ARN the store does not hold
+        // yet costs anything: a further setting of one it holds adds a `&'static str` key
+        // out of the catalog and a `bool`. `all` writes the ROOT user's setting rather than
+        // a row for the word itself, so the root user is the principal it may store.
+        let stored_principal = if principal == state::ALL_PRINCIPALS {
+            state::root_principal_arn()
+        } else {
+            principal.to_string()
+        };
+        let charged = store.id_format_principal_bytes(&stored_principal);
+        if store.would_exceed_stored_bytes(charged) {
+            return Err(state::resource_limit_exceeded(format!(
+                "This emulator holds {held} of at most {max} bytes of caller-supplied \
+                 data, so it cannot store {charged} more",
+                held = store.stored_bytes(),
+                max = state::MAX_STORED_BYTES,
+            )));
+        }
+        store.add_stored_bytes(charged);
+
+        // "This setting applies to the principal specified in the request; it does not
+        // apply to the principal that makes the request."
+        if principal == state::ALL_PRINCIPALS {
+            for resource in resources {
+                store.set_id_format_for_all_principals(resource, input.use_long_ids);
+            }
+        } else {
+            for resource in resources {
+                store.set_id_format(principal, resource, input.use_long_ids);
+            }
+        }
+
+        Ok(ModifyIdentityIdFormatOutput)
     }
 }

@@ -1,15 +1,37 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ExecuteStatement
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ExecuteStatement`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: runs one PartiQL statement against the SAME item store the classic
+//! item API reads and writes. A `SELECT` reports the stored items; `INSERT`, `UPDATE`
+//! and `DELETE` mutate them, so a statement's effect is visible to every later
+//! `GetItem`, `Query` or statement, and a classic write is visible to every later
+//! `SELECT`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ExecuteStatement::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The dialect is parsed in [`crate::state::partiql`], which renders the `WHERE`
+//! clause and the `SET`/`REMOVE` clauses back into the `ConditionExpression` and
+//! `UpdateExpression` grammars [`crate::state::ParsedCondition`] and
+//! [`crate::state::ParsedUpdate`] already evaluate — so which comparison holds
+//! between two attribute values, and what an update action does to an item, have one
+//! implementation in this crate, shared with `UpdateItem`, `PutItem` and `DeleteItem`.
+//! Each `?` marker stands for one `Parameters` entry, in order.
+//!
+//! * `INSERT` is a put that must not replace: an item whose primary key is already
+//!   stored is the modelled `DuplicateItemException`.
+//! * `UPDATE` and `DELETE` are SINGLETON writes: the `WHERE` clause must pin every
+//!   key attribute by equality, and a predicate the stored item does not satisfy —
+//!   including a key that holds no item — is `ConditionalCheckFailedException`,
+//!   carrying that item when `ReturnValuesOnConditionCheckFailure=ALL_OLD`.
+//!   `RETURNING (ALL|MODIFIED) (OLD|NEW) *` reports the item through `Items`.
+//! * `SELECT` reads the table, or one of its indexes when the statement qualifies the
+//!   source with `table.index`, holds every candidate to the whole `WHERE` clause,
+//!   orders by a key attribute when `ORDER BY` names one, and pages at `Limit` and at
+//!   the documented 1 MB — reporting `NextToken` and `LastEvaluatedKey` when it
+//!   stopped early.
+//!
+//! Everything the dialect does not spell, and everything this emulator cannot serve
+//! faithfully, is refused with a `ValidationException` rather than guessed at. The
+//! statement's own IAM action (`dynamodb:PartiQLSelect`, `…Insert`, `…Update`,
+//! `…Delete`) is what a table's resource-based policy is read for.
 //!
 //! ## Shape of an operation
 //!
@@ -149,6 +171,14 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+// The store's own page budget, which is what a `SELECT` pages at as well as `Query`
+// and `Scan`: "if the total number of processed items exceeds the maximum dataset size
+// limit of 1 MB, the read stops and results are returned to the user as a
+// LastEvaluatedKey value to continue the read in a subsequent operation" (the
+// `ExecuteStatement` doc). A statement that names no `Limit` therefore cannot pull a
+// whole table into one response.
+use crate::state::MAX_PAGE_BYTES;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -225,18 +255,520 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ExecuteStatement` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ExecuteStatementErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ExecuteStatement"))
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
+
+        // "An optional parameter that returns the item attributes for an
+        // ExecuteStatement operation that failed a condition check"
+        // (`ReturnValuesOnConditionCheckFailure`): the member carries two values.
+        if input.return_values_on_condition_check_failure.is_some()
+            && !matches!(
+                input.return_values_on_condition_check_failure.as_deref(),
+                Some("NONE" | "ALL_OLD")
+            )
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "ReturnValuesOnConditionCheckFailure can only be ALL_OLD or NONE",
+            ));
+        }
+        let return_old_on_failure =
+            input.return_values_on_condition_check_failure.as_deref() == Some("ALL_OLD");
+
+        // A value the statement's `?` markers stand for is held to the same rules a
+        // stored value is — the documented nesting depth, and this emulator's ceiling
+        // on a collection's members — before the statement is parsed, because both
+        // bound the work this request can ask for.
+        let parameters = input.parameters.clone().unwrap_or_default();
+        for (position, value) in parameters.iter().enumerate() {
+            crate::state::check_attribute_value(&format!("Parameters[{position}]"), value)
+                .map_err(lift)?;
+        }
+        let statement =
+            crate::state::parse_statement(&input.statement, &parameters).map_err(lift)?;
+        let name = crate::state::resolve_table_name(statement.table()).map_err(lift)?;
+
+        let mut store = state.lock();
+        store.apply_due_transitions(now);
+        {
+            // A table whose resource-based policy denies the caller this statement's
+            // own action is not read or written at all. PartiQL has its own four
+            // actions, which is what `statement.action()` names.
+            let table = store.active_table(&region, &name, now).map_err(lift)?;
+            if let Some(denial) = crate::state::policy_denial(table, statement.action(), now) {
+                return Err(crate::scaffolded::Scaffolded::access_denied(denial));
+            }
+        }
+        match &statement {
+            crate::state::PartiqlStatement::Select(select) => {
+                select_items(&mut store, &region, &name, now, select, &input)
+            }
+            crate::state::PartiqlStatement::Insert(insert) => {
+                insert_item(&mut store, &region, &name, now, insert, &input)
+            }
+            crate::state::PartiqlStatement::Update(update) => update_item(
+                &mut store,
+                &region,
+                &name,
+                now,
+                update,
+                &input,
+                return_old_on_failure,
+            ),
+            crate::state::PartiqlStatement::Delete(delete) => delete_item(
+                &mut store,
+                &region,
+                &name,
+                now,
+                delete,
+                &input,
+                return_old_on_failure,
+            ),
+        }
+    }
+}
+
+/// This service's store, as the four statement paths below take it.
+type Store = crate::state::ComAmazonawsDynamodbDynamodb20120810State;
+
+/// `SELECT`: the stored items the statement reports, in the order it asked for.
+fn select_items(
+    store: &mut Store,
+    region: &str,
+    name: &str,
+    now: ::std::time::SystemTime,
+    select: &crate::state::SelectStatement,
+    input: &ExecuteStatementInput,
+) -> Result<ExecuteStatementOutput, ExecuteStatementError> {
+    let condition = select
+        .filter
+        .as_ref()
+        .map(crate::state::parsed_condition)
+        .transpose()
+        .map_err(lift)?;
+    let resume = input
+        .next_token
+        .as_deref()
+        .map(crate::state::decode_cursor)
+        .transpose()
+        .map_err(lift)?;
+    let table = store.active_table(region, name, now).map_err(lift)?;
+    if let Some(index) = select.index.as_deref() {
+        if !crate::state::declares_index(table, index) {
+            return Err(lift(crate::state::RequestError::NotFound(
+                "Requested resource not found".to_string(),
+            )));
+        }
+    }
+    // One partition's items are contiguous in the store, so a statement that pins the
+    // partition key by equality reads a range rather than walking the table. The
+    // narrowing is an optimisation only: every candidate is still held to the whole
+    // `WHERE` clause below.
+    let partition = select
+        .index
+        .is_none()
+        .then(|| {
+            let attribute = table.partition_key_name();
+            crate::state::pinned_equalities(select.filter.as_ref()?)
+                .get(attribute)
+                .and_then(|value| table.key_value(attribute, value).ok())
+        })
+        .flatten();
+
+    // "ORDER BY clause can only be used on a key attribute" — a statement that asks
+    // for any other order is refused rather than served in a different one. An order
+    // is also only served over ONE partition: inside a partition the store already
+    // holds the items in sort-key order, so the order asked for is that order or its
+    // reverse, and a page resumed from a `NextToken` continues in exactly it. Across
+    // partitions the two orders differ, so a statement that asks for one without
+    // pinning its partition key is refused instead of answered in another order.
+    if let Some((attribute, _)) = select.order_by.as_ref() {
+        if !crate::state::orderable_attributes(table, select.index.as_deref())
+            .contains(attribute.as_str())
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "ORDER BY is supported only on a key attribute of the source",
+            ));
+        }
+        if partition.is_none() {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "ORDER BY is supported only for a statement whose WHERE clause states an \
+                 equality on the table's partition key",
+            ));
+        }
+    }
+
+    let candidates: Vec<(&crate::state::ItemKey, &crate::state::Item)> = match partition {
+        Some(partition) => table
+            .items
+            .range(crate::state::ItemKey {
+                partition: partition.clone(),
+                sort: None,
+            }..)
+            .take_while(|(key, _)| key.partition == partition)
+            .collect(),
+        None => table.items.iter().collect(),
+    };
+
+    let mut rows: Vec<(&crate::state::ItemKey, &crate::state::Item)> = Vec::new();
+    for (key, item) in candidates {
+        // An index holds only the items that carry every attribute its key schema
+        // names, so a statement reading an index sees exactly those.
+        if let Some(index) = select.index.as_deref() {
+            if !crate::state::index_holds(table, index, item) {
+                continue;
+            }
+        }
+        if let Some(condition) = condition.as_ref() {
+            if !condition.evaluate(Some(item)).map_err(lift)? {
+                continue;
+            }
+        }
+        rows.push((key, item));
+    }
+    if let Some((attribute, descending)) = select.order_by.as_ref() {
+        rows.sort_by(|(_, left), (_, right)| {
+            crate::state::compare_by_attribute(left, right, attribute, *descending)
+        });
+    }
+    if let Some(resume) = resume.as_ref() {
+        // "Set this value to get remaining results" (`NextToken`): the next page
+        // starts strictly after the row the previous one stopped on.
+        match rows.iter().position(|(key, _)| *key == resume) {
+            Some(position) => {
+                rows.drain(..=position);
+            }
+            // The row that page stopped on has since been removed; resume at the
+            // first one that sorts after it IN THE DIRECTION being read. `ORDER BY`
+            // names a key attribute of the source, so the store's own key order is
+            // the order being read, forwards or (for `DESC`) backwards.
+            None => {
+                let descending = select
+                    .order_by
+                    .as_ref()
+                    .is_some_and(|(_, descending)| *descending);
+                rows.retain(|(key, _)| {
+                    if descending {
+                        *key < resume
+                    } else {
+                        *key > resume
+                    }
+                });
+            }
+        }
+    }
+
+    let available = rows.len();
+    let limit = input
+        .limit
+        .map_or(available, |limit| usize::try_from(limit).unwrap_or(0));
+    let mut page_size: i64 = 0;
+    let mut page = 0usize;
+    for (_, item) in rows.iter().take(limit) {
+        // The first row always fits, the way DynamoDB always returns at least one
+        // item it found.
+        if page > 0 && page_size >= MAX_PAGE_BYTES {
+            break;
+        }
+        page_size = page_size.saturating_add(crate::state::item_size(item));
+        page += 1;
+    }
+    let truncated = available > page;
+    rows.truncate(page);
+
+    let stopped_on = rows
+        .last()
+        .map(|(key, item)| ((*key).clone(), table.key_attributes(item)));
+    // An index reports the attributes it PROJECTS — "only the attributes that are
+    // projected into the index are reported" — and the statement's own projection
+    // narrows those further.
+    let projected = crate::state::projected_attributes(table, select.index.as_deref());
+    let items: Vec<crate::state::Item> = rows
+        .iter()
+        .map(|(_, item)| {
+            let held: crate::state::Item = match projected.as_ref() {
+                Some(allowed) => item
+                    .iter()
+                    .filter(|(name, _)| allowed.contains(name.as_str()))
+                    .map(|(name, value)| (name.clone(), value.clone()))
+                    .collect(),
+                None => (*item).clone(),
+            };
+            crate::state::project_item(&held, select.projection.as_ref())
+        })
+        .collect();
+    let (next_token, last_evaluated_key) = match (truncated, stopped_on) {
+        (true, Some((key, map))) => (Some(crate::state::encode_cursor(&key)), Some(map)),
+        _ => (None, None),
+    };
+    Ok(ExecuteStatementOutput {
+        items: Some(items),
+        next_token,
+        last_evaluated_key,
+        consumed_capacity: crate::state::consumed_capacity(
+            input.return_consumed_capacity.as_deref(),
+            name,
+            crate::state::read_capacity_units(page_size, input.consistent_read.unwrap_or(false)),
+        ),
+    })
+}
+
+/// `INSERT`: the item the statement carries, which must not already be stored —
+/// "There was an attempt to insert an item with the same primary key as an item that
+/// already exists in the DynamoDB table" is the modelled `DuplicateItemException`.
+fn insert_item(
+    store: &mut Store,
+    region: &str,
+    name: &str,
+    now: ::std::time::SystemTime,
+    insert: &crate::state::InsertStatement,
+    input: &ExecuteStatementInput,
+) -> Result<ExecuteStatementOutput, ExecuteStatementError> {
+    let mut item = insert.item.clone();
+    for (attribute, value) in &item {
+        crate::state::check_attribute_value(attribute, value).map_err(lift)?;
+    }
+    crate::state::canonicalize_item(&mut item).map_err(lift)?;
+    if crate::state::item_size(&item) > crate::state::MAX_ITEM_SIZE_BYTES {
+        return Err(crate::scaffolded::Scaffolded::validation(
+            crate::state::ITEM_SIZE_EXCEEDED_MESSAGE,
+        ));
+    }
+    let key = {
+        let table = store.active_table(region, name, now).map_err(lift)?;
+        table.check_index_key_limits(&item).map_err(lift)?;
+        table.key_of_item(&item).map_err(lift)?
+    };
+    if store
+        .active_table(region, name, now)
+        .map_err(lift)?
+        .items
+        .contains_key(&key)
+    {
+        return Err(ExecuteStatementErrorModeled::DuplicateItemException(
+            DuplicateItemException {
+                message: Some("Duplicate primary key exists in table".to_string()),
+            },
+        )
+        .into());
+    }
+    store
+        .put_item(region, name, now, key, item.clone())
+        .map_err(lift)?;
+
+    let capacity = store
+        .active_table(region, name, now)
+        .map_err(lift)?
+        .write_capacity(None, Some(&item));
+    Ok(ExecuteStatementOutput {
+        // "If a read operation was used, this property will contain the result of the
+        // read operation … For the write operations this value will be empty"
+        // (`Items`): the member is reported either way, and an INSERT — which states
+        // no RETURNING clause — reports it empty.
+        items: Some(Vec::new()),
+        next_token: None,
+        last_evaluated_key: None,
+        consumed_capacity: crate::state::consumed_write_capacity(
+            input.return_consumed_capacity.as_deref(),
+            name,
+            &capacity,
+        ),
+    })
+}
+
+/// `UPDATE`: the one item the `WHERE` clause pins, changed by the statement's
+/// clauses.
+fn update_item(
+    store: &mut Store,
+    region: &str,
+    name: &str,
+    now: ::std::time::SystemTime,
+    update: &crate::state::UpdateStatement,
+    input: &ExecuteStatementInput,
+    return_old_on_failure: bool,
+) -> Result<ExecuteStatementOutput, ExecuteStatementError> {
+    let condition = crate::state::parsed_condition(&update.filter).map_err(lift)?;
+    let clauses = crate::state::parsed_update(&update.clauses).map_err(lift)?;
+    let (key, partition_key, sort_key) = {
+        let table = store.active_table(region, name, now).map_err(lift)?;
+        (
+            crate::state::singleton_key(table, &update.filter).map_err(lift)?,
+            table.partition_key_name().to_string(),
+            table.sort_key_name().map(ToString::to_string),
+        )
+    };
+    let before = store
+        .active_table(region, name, now)
+        .map_err(lift)?
+        .items
+        .get(&key)
+        .cloned();
+    // The `WHERE` clause is read against the item as it stands BEFORE this write,
+    // which is the only state it can speak about — so a statement whose predicate the
+    // stored item does not satisfy, and one whose key holds no item at all, are both
+    // the modelled `ConditionalCheckFailedException` rather than a write.
+    let satisfied = before
+        .as_ref()
+        .map(|item| condition.evaluate(Some(item)))
+        .transpose()
+        .map_err(lift)?
+        .unwrap_or(false);
+    if !satisfied {
+        return Err(condition_failed(if return_old_on_failure {
+            before
+        } else {
+            None
+        }));
+    }
+
+    let mut item = before.clone().unwrap_or_default();
+    let touched = clauses.apply(&mut item).map_err(lift)?;
+    for attribute in &touched {
+        if attribute.as_str() == partition_key.as_str()
+            || Some(attribute.as_str()) == sort_key.as_deref()
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "One or more parameter values were invalid: Cannot update attribute \
+                 {attribute}. This attribute is part of the key"
+            )));
+        }
+    }
+    // The item the statement leaves is held to exactly what a `PutItem` of it would
+    // be: the documented nesting, the 400 KB item size, and the key limits of every
+    // index it is projected into.
+    for (attribute, value) in &item {
+        crate::state::check_attribute_value(attribute, value).map_err(lift)?;
+    }
+    crate::state::canonicalize_item(&mut item).map_err(lift)?;
+    if crate::state::item_size(&item) > crate::state::MAX_ITEM_SIZE_BYTES {
+        return Err(crate::scaffolded::Scaffolded::validation(
+            crate::state::ITEM_SIZE_EXCEEDED_MESSAGE,
+        ));
+    }
+    store
+        .active_table(region, name, now)
+        .map_err(lift)?
+        .check_index_key_limits(&item)
+        .map_err(lift)?;
+    store
+        .put_item(region, name, now, key, item.clone())
+        .map_err(lift)?;
+
+    let capacity = store
+        .active_table(region, name, now)
+        .map_err(lift)?
+        .write_capacity(before.as_ref(), Some(&item));
+    let reported = crate::state::projected_return_values(
+        update
+            .returning
+            .map(crate::state::ReturnedValues::as_return_value),
+        before.as_ref(),
+        Some(&item),
+        &touched,
+    );
+    Ok(ExecuteStatementOutput {
+        // A write reports `Items` either way: what its `RETURNING` clause asked for,
+        // or nothing when it states none.
+        items: Some(reported.map(|item| vec![item]).unwrap_or_default()),
+        next_token: None,
+        last_evaluated_key: None,
+        consumed_capacity: crate::state::consumed_write_capacity(
+            input.return_consumed_capacity.as_deref(),
+            name,
+            &capacity,
+        ),
+    })
+}
+
+/// `DELETE`: the one item the `WHERE` clause pins, removed from the table.
+fn delete_item(
+    store: &mut Store,
+    region: &str,
+    name: &str,
+    now: ::std::time::SystemTime,
+    delete: &crate::state::DeleteStatement,
+    input: &ExecuteStatementInput,
+    return_old_on_failure: bool,
+) -> Result<ExecuteStatementOutput, ExecuteStatementError> {
+    let condition = crate::state::parsed_condition(&delete.filter).map_err(lift)?;
+    let key = {
+        let table = store.active_table(region, name, now).map_err(lift)?;
+        crate::state::singleton_key(table, &delete.filter).map_err(lift)?
+    };
+    let before = store
+        .active_table(region, name, now)
+        .map_err(lift)?
+        .items
+        .get(&key)
+        .cloned();
+    let satisfied = before
+        .as_ref()
+        .map(|item| condition.evaluate(Some(item)))
+        .transpose()
+        .map_err(lift)?
+        .unwrap_or(false);
+    if !satisfied {
+        return Err(condition_failed(if return_old_on_failure {
+            before
+        } else {
+            None
+        }));
+    }
+    let removed = store.delete_item(region, name, now, &key).map_err(lift)?;
+
+    let capacity = store
+        .active_table(region, name, now)
+        .map_err(lift)?
+        .write_capacity(removed.as_ref(), None);
+    // A delete removes every attribute of the item, so the `MODIFIED OLD` projection
+    // of what it changed IS the item as it stood — both OLD forms report that item.
+    let reported = delete
+        .returning
+        .and_then(|_| removed.clone())
+        .filter(|item| !item.is_empty());
+    Ok(ExecuteStatementOutput {
+        items: Some(reported.map(|item| vec![item]).unwrap_or_default()),
+        next_token: None,
+        last_evaluated_key: None,
+        consumed_capacity: crate::state::consumed_write_capacity(
+            input.return_consumed_capacity.as_deref(),
+            name,
+            &capacity,
+        ),
+    })
+}
+
+/// The refusal a statement whose `WHERE` clause the stored item does not satisfy is
+/// answered with, carrying that item when the request asked for it.
+fn condition_failed(item: Option<crate::state::Item>) -> ExecuteStatementError {
+    ExecuteStatementErrorModeled::ConditionalCheckFailedException(
+        ConditionalCheckFailedException {
+            message: Some(crate::state::CONDITION_FAILED_MESSAGE.to_string()),
+            item,
+        },
+    )
+    .into()
+}
+
+/// The modelled server error for a request that cannot reach this service's store.
+fn store_unavailable() -> ExecuteStatementError {
+    ExecuteStatementErrorModeled::InternalServerError(InternalServerError {
+        message: Some("the DynamoDB table store is unavailable".to_string()),
+    })
+    .into()
+}
+
+/// Lift a store refusal into this operation's error channel.
+fn lift(error: crate::state::RequestError) -> ExecuteStatementError {
+    match error {
+        crate::state::RequestError::NotFound(message) => {
+            ExecuteStatementErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: Some(message),
+            })
+            .into()
+        }
+        crate::state::RequestError::Validation(message) => {
+            crate::scaffolded::Scaffolded::validation(message)
+        }
     }
 }

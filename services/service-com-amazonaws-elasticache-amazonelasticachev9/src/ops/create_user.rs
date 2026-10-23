@@ -270,16 +270,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into())
             }
-            Err(crate::state::TagRefusal::MissingKey) => {
-                // `Tag$Key` "may not be null" — only the VALUE may be. This
-                // operation models `InvalidParameterValueException`, so the
-                // refusal goes through the modelled channel rather than the
-                // synthetic one.
+            Err(crate::state::TagRefusal::InvalidTag(message)) => {
+                // `Tag$Key` "may not be null" — only the VALUE may be, and a
+                // caller's key is bounded and may not carry the reserved `aws:`
+                // prefix. This operation models
+                // `InvalidParameterValueException`, so the refusal goes through
+                // the modelled channel rather than the synthetic one.
                 return Err(CreateUserErrorModeled::InvalidParameterValueException(
                     InvalidParameterValueException {
-                        message: Some(
-                            "Invalid value for Tags: a tag's Key may not be null.".to_string(),
-                        ),
+                        message: Some(message),
                     },
                 )
                 .into())

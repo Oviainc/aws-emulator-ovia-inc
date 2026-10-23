@@ -258,6 +258,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let mut guard = state.lock();
+        // A `workflowId` whose previous run the clock already closed is startable
+        // again, so the service's own start-to-close reaping is materialised before the
+        // already-started guard below reads the open-run index.
+        guard.materialise_due_timeouts_in(&input.domain, crate::state::now());
         let Some(domain) = guard.domains.get_mut(&input.domain) else {
             return Err(StartWorkflowExecutionErrorModeled::UnknownResourceFault(
                 UnknownResourceFault {
@@ -297,14 +301,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // One OPEN run per `workflowId` per domain: a start that collides with a run
         // that is still open is the modelled already-started fault, never a second
         // open run under the same id.
-        if let Some(open_run_id) = domain.open_by_workflow_id.get(&input.workflow_id) {
+        //
+        // The fault's code carries the whole meaning, and the recorded service answer
+        // pairs it with an EMPTY message: the colliding run's identity is not part of
+        // the envelope, so a caller is never handed the `runId` of a run it did not
+        // start. The member is PRESENT and empty rather than absent, which is how the
+        // recorded envelope carries it — do not "simplify" this to `None`.
+        if domain.open_by_workflow_id.contains_key(&input.workflow_id) {
             return Err(
                 StartWorkflowExecutionErrorModeled::WorkflowExecutionAlreadyStartedFault(
                     WorkflowExecutionAlreadyStartedFault {
-                        message: Some(format!(
-                            "WorkflowExecution=[workflowId={}, runId={open_run_id}]",
-                            input.workflow_id
-                        )),
+                        message: Some(String::new()),
                     },
                 )
                 .into(),

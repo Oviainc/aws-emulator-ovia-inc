@@ -169,7 +169,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         crate::state::validate_name("taskList.name", &input.task_list.name)
             .map_err(crate::scaffolded::Scaffolded::validation)?;
 
-        let guard = state.lock();
+        let swept_at = crate::state::now();
+        let mut guard = state.lock();
+        // The count is taken only after the service's own start-to-close reaping is
+        // materialised: a timed-out run is closed, and a closed run has no task waiting
+        // in any list.
+        guard.materialise_due_timeouts_in(&input.domain, swept_at);
         // A task list lives inside a domain, so an unregistered domain name addresses
         // no task list at all: that is the modelled `UnknownResourceFault`. The
         // documented zero ("If you specify a task list that no activity task was ever

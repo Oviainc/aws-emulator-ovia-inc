@@ -31,9 +31,9 @@ pub const PROVISIONING_SPAN: Duration = Duration::from_millis(500);
 ///
 /// Every variant's wire form is one of the modelled `GraphStatus` values
 /// (`crate::ops::types::GRAPH_STATUS_VALUES`). The statuses this slice never
-/// produces (`FAILED`, `IMPORTING`, `RESETTING`, `SNAPSHOTTING`, `STARTING`,
-/// `STOPPED`, `STOPPING`) belong to operations that are still scaffolded, and are
-/// added with them.
+/// produces (`FAILED`, `IMPORTING`, `RESETTING`, `STARTING`, `STOPPED`,
+/// `STOPPING`) belong to operations that are still scaffolded, and are added with
+/// them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GraphStatus {
     /// `CreateGraph` has accepted the graph; it is not usable yet.
@@ -42,6 +42,9 @@ pub enum GraphStatus {
     Available,
     /// `UpdateGraph` has accepted a reconfiguration.
     Updating,
+    /// `CreateGraphSnapshot` has accepted a snapshot of the graph; the graph is
+    /// being snapshotted and is not reconfigurable until that finishes.
+    Snapshotting,
     /// `DeleteGraph` has accepted the deletion.
     Deleting,
 }
@@ -53,6 +56,7 @@ impl GraphStatus {
             Self::Creating => "CREATING",
             Self::Available => "AVAILABLE",
             Self::Updating => "UPDATING",
+            Self::Snapshotting => "SNAPSHOTTING",
             Self::Deleting => "DELETING",
         }
     }
@@ -105,6 +109,69 @@ impl Graph {
     }
 }
 
+/// The lifecycle statuses this slice of the emulator puts a graph snapshot into.
+///
+/// Every variant's wire form is one of the modelled `SnapshotStatus` values
+/// (`crate::ops::types::SNAPSHOT_STATUS_VALUES`). The statuses this slice never
+/// produces (`DELETING`, `FAILED`) belong to operations that are still scaffolded
+/// (`DeleteGraphSnapshot`), and are added with them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotStatus {
+    /// `CreateGraphSnapshot` has accepted the snapshot; it is not restorable yet.
+    Creating,
+    /// The snapshot is complete and restorable.
+    Available,
+}
+
+impl SnapshotStatus {
+    /// This status as the modelled `SnapshotStatus` enum value.
+    pub const fn as_wire(self) -> &'static str {
+        match self {
+            Self::Creating => "CREATING",
+            Self::Available => "AVAILABLE",
+        }
+    }
+}
+
+/// One stored graph snapshot: every member `GetGraphSnapshot` reports, plus the
+/// instant at which the pending `CREATING` -> `AVAILABLE` transition becomes due.
+///
+/// A snapshot is a resource in its own right — it outlives the graph it was taken
+/// from — so it is stored beside the graphs rather than inside the graph record.
+#[derive(Debug, Clone)]
+pub struct Snapshot {
+    pub id: String,
+    pub name: String,
+    pub arn: String,
+    /// The graph the snapshot was taken from. Kept as the graph's id (not a
+    /// borrow), so deleting that graph leaves the snapshot's provenance intact.
+    pub source_graph_id: String,
+    pub status: SnapshotStatus,
+    pub snapshot_create_time: SystemTime,
+    /// The key the source graph's data is encrypted with: a snapshot of an
+    /// encrypted graph is encrypted with the same key.
+    pub kms_key_identifier: Option<String>,
+    pub tags: BTreeMap<String, String>,
+    /// When the pending `CREATING` -> `AVAILABLE` transition falls due. `None` once
+    /// there is nothing outstanding.
+    pub settles_at: Option<Instant>,
+}
+
+impl Snapshot {
+    /// Materialise the transition the clock has already made due.
+    ///
+    /// The same one write a reporting operation may make as [`Graph::settle`]: the
+    /// snapshot would have become `AVAILABLE` at `settles_at` whether or not anybody
+    /// called, so applying it on read is bookkeeping rather than a state change
+    /// caused by the read.
+    pub fn settle(&mut self, now: Instant) {
+        if self.settles_at.is_some_and(|due| now >= due) {
+            self.status = SnapshotStatus::Available;
+            self.settles_at = None;
+        }
+    }
+}
+
 /// Per-service state for com-amazonaws-neptunegraph-amazonneptunegraph. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsNeptunegraphAmazonneptunegraphState {
@@ -114,8 +181,16 @@ pub struct ComAmazonawsNeptunegraphAmazonneptunegraphState {
     /// `graphName` -> graph id: the uniqueness index behind `CreateGraph`'s
     /// `ConflictException`.
     pub graph_names: HashMap<String, String>,
+    /// Every stored snapshot, keyed by its minted `gs-xxxxxxxxxx` id. A `BTreeMap`
+    /// so `ListGraphSnapshots` has one stable total order to page over.
+    pub snapshots: BTreeMap<String, Snapshot>,
+    /// `snapshotName` -> snapshot id: the uniqueness index behind
+    /// `CreateGraphSnapshot`'s `ConflictException`.
+    pub snapshot_names: HashMap<String, String>,
     /// Feeds the graph-id generator, so ids are unique within a store.
     pub id_counter: u64,
+    /// Feeds the snapshot-id generator, so ids are unique within a store.
+    pub snapshot_id_counter: u64,
 }
 
 impl ComAmazonawsNeptunegraphAmazonneptunegraphState {
@@ -124,8 +199,20 @@ impl ComAmazonawsNeptunegraphAmazonneptunegraphState {
     pub fn next_graph_id(&mut self) -> String {
         loop {
             self.id_counter = self.id_counter.wrapping_add(1);
-            let id = encode_graph_id(scramble(self.id_counter) % BASE36_POW10);
+            let id = encode_resource_id("g-", scramble(self.id_counter) % BASE36_POW10);
             if !self.graphs.contains_key(&id) {
+                return id;
+            }
+        }
+    }
+
+    /// Mint an id no snapshot in this store holds, matching the modelled
+    /// `SnapshotId` pattern `^gs-[a-z0-9]{10}$`.
+    pub fn next_snapshot_id(&mut self) -> String {
+        loop {
+            self.snapshot_id_counter = self.snapshot_id_counter.wrapping_add(1);
+            let id = encode_resource_id("gs-", scramble(self.snapshot_id_counter) % BASE36_POW10);
+            if !self.snapshots.contains_key(&id) {
                 return id;
             }
         }
@@ -135,6 +222,13 @@ impl ComAmazonawsNeptunegraphAmazonneptunegraphState {
     pub fn insert_graph(&mut self, graph: Graph) {
         self.graph_names.insert(graph.name.clone(), graph.id.clone());
         self.graphs.insert(graph.id.clone(), graph);
+    }
+
+    /// Store a new snapshot and index its name.
+    pub fn insert_snapshot(&mut self, snapshot: Snapshot) {
+        self.snapshot_names
+            .insert(snapshot.name.clone(), snapshot.id.clone());
+        self.snapshots.insert(snapshot.id.clone(), snapshot);
     }
 
     /// Drop a graph and its name index entry.
@@ -165,6 +259,17 @@ impl ComAmazonawsNeptunegraphAmazonneptunegraphState {
         for graph in self.graphs.values_mut() {
             graph.settle(now);
         }
+        for snapshot in self.snapshots.values_mut() {
+            snapshot.settle(now);
+        }
+    }
+
+    /// Apply the snapshot transition the clock has made due, then borrow one
+    /// snapshot.
+    pub fn settled_snapshot(&mut self, id: &str, now: Instant) -> Option<&Snapshot> {
+        let snapshot = self.snapshots.get_mut(id)?;
+        snapshot.settle(now);
+        Some(snapshot)
     }
 
     /// The tag map of the resource `arn` names, or `None` when this store holds no
@@ -177,19 +282,37 @@ impl ComAmazonawsNeptunegraphAmazonneptunegraphState {
     ///
     /// Tags live on the resource record itself, which is what makes a tag supplied at
     /// create time and one written later by `TagResource` the same bytes, read back by
-    /// this one lookup. A graph is the only taggable resource this slice stores;
-    /// snapshots, private endpoints and tasks join this lookup with the operations that
+    /// this one lookup. Graphs and snapshots are the taggable resources this slice
+    /// stores; private endpoints and tasks join this lookup with the operations that
     /// mint them.
     pub fn tags_of(&self, arn: &str) -> Option<&BTreeMap<String, String>> {
-        self.graphs.values().find(|graph| graph.arn == arn).map(|graph| &graph.tags)
+        self.graphs
+            .values()
+            .find(|graph| graph.arn == arn)
+            .map(|graph| &graph.tags)
+            .or_else(|| {
+                self.snapshots
+                    .values()
+                    .find(|snapshot| snapshot.arn == arn)
+                    .map(|snapshot| &snapshot.tags)
+            })
     }
 
     /// [`Self::tags_of`], mutably: the one place `TagResource`/`UntagResource` write.
     pub fn tags_of_mut(&mut self, arn: &str) -> Option<&mut BTreeMap<String, String>> {
-        self.graphs
+        // Two disjoint maps and one `&mut self`, so which map holds the ARN is
+        // decided by an immutable scan before either is borrowed mutably.
+        if self.graphs.values().any(|graph| graph.arn == arn) {
+            return self
+                .graphs
+                .values_mut()
+                .find(|graph| graph.arn == arn)
+                .map(|graph| &mut graph.tags);
+        }
+        self.snapshots
             .values_mut()
-            .find(|graph| graph.arn == arn)
-            .map(|graph| &mut graph.tags)
+            .find(|snapshot| snapshot.arn == arn)
+            .map(|snapshot| &mut snapshot.tags)
     }
 }
 
@@ -212,6 +335,16 @@ impl ComAmazonawsNeptunegraphAmazonneptunegraphState {
 /// exactly this condition. Set well above any realistic use of a local emulator.
 pub const MAX_GRAPHS: usize = 100;
 
+/// The most snapshots one store holds.
+///
+/// Emulator resource guard, NOT a quota AWS publishes, and the same bound
+/// [`MAX_GRAPHS`] puts on the graph map: the store is shared process-wide and grows
+/// by one entry per `CreateGraphSnapshot`, so without a ceiling repeated calls grow
+/// the emulator's memory without bound. `CreateGraphSnapshot` reports reaching it
+/// with the `ServiceQuotaExceededException` (402) the model declares for exactly
+/// this condition. Set well above any realistic use of a local emulator.
+pub const MAX_SNAPSHOTS: usize = 100;
+
 /// AWS's tagging limit of 50 tags per resource, which this service models as
 /// `TagMap`'s `@length(0..50)`.
 pub const MAX_TAGS: usize = 50;
@@ -227,13 +360,69 @@ pub const MAX_TAG_VALUE_CHARS: usize = 256;
 /// Shared by the id generator's own test and by `ListGraphs`, which refuses a
 /// pagination token that does not name a position in the graph-id space.
 pub fn is_graph_id(value: &str) -> bool {
-    let Some(suffix) = value.strip_prefix("g-") else {
+    is_resource_id(value, "g-")
+}
+
+/// Whether `value` matches the modelled `SnapshotId` pattern `^gs-[a-z0-9]{10}$`.
+pub fn is_snapshot_id(value: &str) -> bool {
+    is_resource_id(value, "gs-")
+}
+
+/// Whether `value` is `prefix` followed by exactly ten `[a-z0-9]` characters — the
+/// shape every resource id of this service has, differing only in its prefix.
+fn is_resource_id(value: &str, prefix: &str) -> bool {
+    let Some(suffix) = value.strip_prefix(prefix) else {
         return false;
     };
     suffix.len() == 10
         && suffix
             .chars()
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+}
+
+/// Whether `name` satisfies this service's resource-name pattern
+/// `^(?!<forbidden_prefix>)[a-z][a-z0-9]*(-[a-z0-9]+)*$`, read literally: not the
+/// prefix the service reserves for its own ids, a lowercase letter first, then
+/// lowercase letters, digits and single interior hyphens, and no trailing hyphen.
+///
+/// `GraphName` and `SnapshotName` spell the same expression with a different
+/// reserved prefix (`g-`, `gs-`), and both open with a negative lookahead the
+/// boundary validator's regex engine cannot compile — an uncompilable `@pattern` is
+/// treated as matching — so this is where that constraint is enforced for every
+/// operation that accepts a name.
+pub fn resource_name_is_well_formed(name: &str, forbidden_prefix: &str) -> bool {
+    if name.starts_with(forbidden_prefix) {
+        return false;
+    }
+    let mut chars = name.chars();
+    if !chars.next().is_some_and(|c| c.is_ascii_lowercase()) {
+        return false;
+    }
+    let mut after_hyphen = false;
+    for c in chars {
+        if c == '-' {
+            // `(-[a-z0-9]+)*` requires at least one alphanumeric between hyphens.
+            if after_hyphen {
+                return false;
+            }
+            after_hyphen = true;
+        } else if c.is_ascii_lowercase() || c.is_ascii_digit() {
+            after_hyphen = false;
+        } else {
+            return false;
+        }
+    }
+    // A trailing hyphen would leave the last group empty.
+    !after_hyphen
+}
+
+/// The region this request was signed for — the region that names the ARN (and, for
+/// a graph, the endpoint) of every resource this service mints. Falls back to the
+/// emulator-wide default region when the request carries no SigV4 credential scope
+/// (request authentication may be off).
+pub fn request_region(ctx: &smithy_server_runtime::OperationContext<'_>) -> String {
+    emulator_server::sigv4_credential_scope(&ctx.parts().headers)
+        .map_or_else(|| "us-east-1".to_string(), |scope| scope.region)
 }
 
 // ---------------------------------------------------------------------------
@@ -268,6 +457,22 @@ pub fn graph_not_found(graph_identifier: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
         message: format!(
             "No graph found for customer [{}] with graph id [{graph_identifier}]",
+            caller_account_id()
+        ),
+    }
+}
+
+/// The modelled `ResourceNotFoundException` for a `snapshotIdentifier` that names no
+/// stored snapshot.
+///
+/// The snapshot namespace is per-account like the graph namespace, so the failure
+/// names the account the lookup was resolved in beside the identifier the request
+/// asked for — the same two facts [`graph_not_found`] reports, and for the same
+/// reason.
+pub fn snapshot_not_found(snapshot_identifier: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: format!(
+            "No snapshot found for customer [{}] with snapshot id [{snapshot_identifier}]",
             caller_account_id()
         ),
     }
@@ -408,9 +613,10 @@ fn scramble(seed: u64) -> u64 {
     z ^ (z >> 31)
 }
 
-/// Spell `value` (already reduced below [`BASE36_POW10`]) as `g-` plus exactly ten
-/// base-36 digits, matching the modelled `GraphId` pattern `^g-[a-z0-9]{10}$`.
-fn encode_graph_id(mut value: u64) -> String {
+/// Spell `value` (already reduced below [`BASE36_POW10`]) as `prefix` plus exactly
+/// ten base-36 digits, matching this service's resource-id patterns (`GraphId`'s
+/// `^g-[a-z0-9]{10}$`, `SnapshotId`'s `^gs-[a-z0-9]{10}$`).
+fn encode_resource_id(prefix: &str, mut value: u64) -> String {
     let mut digits = ['0'; 10];
     for slot in digits.iter_mut().rev() {
         // `from_digit` is total for radix 36 and a remainder below 36, and yields
@@ -418,8 +624,8 @@ fn encode_graph_id(mut value: u64) -> String {
         *slot = char::from_digit((value % 36) as u32, 36).unwrap_or('0');
         value /= 36;
     }
-    let mut id = String::with_capacity(12);
-    id.push_str("g-");
+    let mut id = String::with_capacity(prefix.len() + digits.len());
+    id.push_str(prefix);
     id.extend(digits);
     id
 }
@@ -479,6 +685,32 @@ impl From<&Graph> for crate::ops::types::GraphSummary {
         }
     }
 }
+
+/// The two `*Output` shapes that carry a whole snapshot record are structurally
+/// identical, so one macro renders the stored snapshot into each rather than two
+/// hand-copied field lists that could drift apart. `GraphSnapshotSummary` joins this
+/// list with `ListGraphSnapshots`.
+macro_rules! snapshot_record_output {
+    ($($ty:ident),+ $(,)?) => {$(
+        impl From<&Snapshot> for crate::ops::types::$ty {
+            fn from(snapshot: &Snapshot) -> Self {
+                Self {
+                    id: snapshot.id.clone(),
+                    name: snapshot.name.clone(),
+                    arn: snapshot.arn.clone(),
+                    source_graph_id: Some(snapshot.source_graph_id.clone()),
+                    snapshot_create_time: Some(::aws_smithy_types::DateTime::from(
+                        snapshot.snapshot_create_time,
+                    )),
+                    status: Some(snapshot.status.as_wire().to_string()),
+                    kms_key_identifier: snapshot.kms_key_identifier.clone(),
+                }
+            }
+        }
+    )+};
+}
+
+snapshot_record_output!(CreateGraphSnapshotOutput, GetGraphSnapshotOutput);
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
 ///
@@ -814,5 +1046,215 @@ mod tests {
             "case due: the settled transition must be cleared, got {:?}",
             graph.settles_at
         );
+    }
+
+    /// Every minted snapshot id matches the modelled `SnapshotId` pattern, no id
+    /// repeats, and the graph and snapshot id spaces stay disjoint.
+    #[test]
+    fn minted_snapshot_ids_match_the_modelled_pattern_and_are_unique() {
+        let mut state = ComAmazonawsNeptunegraphAmazonneptunegraphState::default();
+        let mut seen = std::collections::BTreeSet::new();
+        for _ in 0..2_000 {
+            let id = state.next_snapshot_id();
+            assert!(
+                is_snapshot_id(&id),
+                "id {id:?}: expected a match for ^gs-[a-z0-9]{{10}}$"
+            );
+            assert!(
+                !is_graph_id(&id),
+                "id {id:?}: a snapshot id must not also be a graph id"
+            );
+            assert!(seen.insert(id.clone()), "id {id:?}: minted twice");
+        }
+    }
+
+    /// The snapshot-id shape test, over values that break each clause of the pattern.
+    #[test]
+    fn is_snapshot_id_rejects_anything_the_modelled_pattern_rejects() {
+        for (candidate, accepted) in [
+            ("gs-0123456789", true),
+            ("gs-abcdefghij", true),
+            ("gs-zz99zz99zz", true),
+            ("gs-tooshort", false),
+            ("gs-waytoolongforten", false),
+            ("gs-ABCDEFGHIJ", false),
+            ("g-0123456789", false),
+            ("0123456789", false),
+            ("", false),
+        ] {
+            let actual = is_snapshot_id(candidate);
+            assert_eq!(
+                actual, accepted,
+                "case {candidate:?}: expected accepted={accepted}, got {actual}"
+            );
+        }
+    }
+
+    /// The shared resource-name rule, with a row per clause of the modelled pattern
+    /// `^(?!<prefix>)[a-z][a-z0-9]*(-[a-z0-9]+)*$` and a column per reserved prefix
+    /// (`GraphName`'s `g-`, `SnapshotName`'s `gs-`): the lookahead is the only clause
+    /// the two names differ on.
+    #[test]
+    fn the_resource_name_rule_differs_only_in_the_reserved_prefix() {
+        // (candidate, accepted as a graph name, accepted as a snapshot name)
+        let cases: &[(&str, bool, bool)] = &[
+            ("a", true, true),
+            ("g", true, true),
+            ("gs", true, true),
+            ("my-snapshot-1", true, true),
+            ("snapshot9", true, true),
+            // `g-` is reserved for graph ids only, `gs-` for snapshot ids only.
+            ("g-abc", false, true),
+            ("gs-abc", true, false),
+            ("1snapshot", false, false),
+            ("-snapshot", false, false),
+            ("My-Snapshot", false, false),
+            ("my_snapshot", false, false),
+            ("my--snapshot", false, false),
+            ("my-snapshot-", false, false),
+            ("", false, false),
+        ];
+        for (name, as_graph, as_snapshot) in cases {
+            let actual_graph = resource_name_is_well_formed(name, "g-");
+            assert_eq!(
+                actual_graph, *as_graph,
+                "case {name:?} as a graph name: expected accepted={as_graph}, \
+                 got {actual_graph}"
+            );
+            let actual_snapshot = resource_name_is_well_formed(name, "gs-");
+            assert_eq!(
+                actual_snapshot, *as_snapshot,
+                "case {name:?} as a snapshot name: expected accepted={as_snapshot}, \
+                 got {actual_snapshot}"
+            );
+        }
+    }
+
+    /// The ARN lookup resolves a snapshot as well as a graph: both are taggable, and
+    /// each resolves only through the ARN the service minted for it.
+    #[test]
+    fn tags_of_resolves_a_stored_snapshot_by_its_minted_arn() {
+        let mut state = ComAmazonawsNeptunegraphAmazonneptunegraphState::default();
+        let graph_id = "g-0123456789";
+        let graph_arn =
+            ::engine::emulator_arn(ARN_NAMESPACE, "us-east-1", &format!("graph/{graph_id}"));
+        state.insert_graph(sample_graph(graph_id, &graph_arn));
+
+        let snapshot_id = "gs-0123456789";
+        let snapshot_arn = ::engine::emulator_arn(
+            ARN_NAMESPACE,
+            "us-east-1",
+            &format!("graph-snapshot/{snapshot_id}"),
+        );
+        state.insert_snapshot(Snapshot {
+            id: snapshot_id.to_string(),
+            name: "my-snapshot".to_string(),
+            arn: snapshot_arn.clone(),
+            source_graph_id: graph_id.to_string(),
+            status: SnapshotStatus::Available,
+            snapshot_create_time: SystemTime::UNIX_EPOCH,
+            kms_key_identifier: None,
+            tags: [("env".to_string(), "prod".to_string())].into_iter().collect(),
+            settles_at: None,
+        });
+
+        // (case, the ARN a request names, the tag entries it must resolve to)
+        let cases: Vec<(&str, String, Option<usize>)> = vec![
+            ("the snapshot's minted ARN", snapshot_arn.clone(), Some(1)),
+            ("the graph's minted ARN", graph_arn, Some(0)),
+            (
+                "the snapshot id under the graph resource type",
+                ::engine::emulator_arn(ARN_NAMESPACE, "us-east-1", &format!("graph/{snapshot_id}")),
+                None,
+            ),
+            (
+                "the snapshot ARN in another region",
+                ::engine::emulator_arn(
+                    ARN_NAMESPACE,
+                    "eu-west-1",
+                    &format!("graph-snapshot/{snapshot_id}"),
+                ),
+                None,
+            ),
+        ];
+        for (case, candidate, expected) in cases {
+            let actual = state.tags_of(&candidate).map(BTreeMap::len);
+            assert_eq!(
+                actual, expected,
+                "case {case:?} ({candidate:?}): expected {expected:?} tag entries, \
+                 got {actual:?}"
+            );
+            let actual_mut = state.tags_of_mut(&candidate).map(|tags| tags.len());
+            assert_eq!(
+                actual_mut, expected,
+                "case {case:?} ({candidate:?}) mutably: expected {expected:?} tag \
+                 entries, got {actual_mut:?}"
+            );
+        }
+    }
+
+    /// A snapshot's pending transition is owed at a future instant too, so a read
+    /// taken immediately still sees `CREATING`.
+    #[test]
+    fn a_pending_snapshot_transition_settles_only_once_it_is_due() {
+        let now = Instant::now();
+        let mut snapshot = Snapshot {
+            id: "gs-0123456789".to_string(),
+            name: "example".to_string(),
+            arn: "arn".to_string(),
+            source_graph_id: "g-0123456789".to_string(),
+            status: SnapshotStatus::Creating,
+            snapshot_create_time: SystemTime::UNIX_EPOCH,
+            kms_key_identifier: None,
+            tags: BTreeMap::new(),
+            settles_at: Some(now + PROVISIONING_SPAN),
+        };
+
+        snapshot.settle(now);
+        assert_eq!(
+            snapshot.status,
+            SnapshotStatus::Creating,
+            "case not-yet-due: expected CREATING, got {:?}",
+            snapshot.status
+        );
+
+        snapshot.settle(now + PROVISIONING_SPAN);
+        assert_eq!(
+            snapshot.status,
+            SnapshotStatus::Available,
+            "case due: expected AVAILABLE, got {:?}",
+            snapshot.status
+        );
+        assert!(
+            snapshot.settles_at.is_none(),
+            "case due: the settled transition must be cleared, got {:?}",
+            snapshot.settles_at
+        );
+    }
+
+    /// Every status this slice stores renders as one of the values the model
+    /// declares, so no handler can answer a status outside the modelled enum.
+    #[test]
+    fn every_stored_status_is_a_modelled_enum_value() {
+        for status in [
+            GraphStatus::Creating,
+            GraphStatus::Available,
+            GraphStatus::Updating,
+            GraphStatus::Snapshotting,
+            GraphStatus::Deleting,
+        ] {
+            let wire = status.as_wire();
+            assert!(
+                crate::ops::types::GRAPH_STATUS_VALUES.contains(&wire),
+                "case {status:?}: {wire:?} is not a modelled GraphStatus value"
+            );
+        }
+        for status in [SnapshotStatus::Creating, SnapshotStatus::Available] {
+            let wire = status.as_wire();
+            assert!(
+                crate::ops::types::SNAPSHOT_STATUS_VALUES.contains(&wire),
+                "case {status:?}: {wire:?} is not a modelled SnapshotStatus value"
+            );
+        }
     }
 }

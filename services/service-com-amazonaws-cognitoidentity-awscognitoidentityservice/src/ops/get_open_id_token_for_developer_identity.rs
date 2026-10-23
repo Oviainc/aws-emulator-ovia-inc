@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetOpenIdTokenForDeveloperIdentity
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetOpenIdTokenForDeveloperIdentity`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Registers (or retrieves) the identity a BACKEND-authenticated user has in a stored
+//! pool, and mints an OpenID Connect token for it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetOpenIdTokenForDeveloperIdentity::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The `Logins` map names the pool's own `DeveloperProviderName` (the "domain" the pool
+//! was created with) and, as its value, the developer user identifier the backend
+//! authenticated. That pair is one login of the pool, held in the same login index
+//! `GetId` keys a federated login by, so the operation is idempotent per developer user
+//! identifier: the identifier already linked to an identity resolves to that identity, a
+//! fresh one mints a new identity in the pool, and an identifier linked to an identity
+//! OTHER than the one the request names is refused with the modelled
+//! `DeveloperUserAlreadyRegisteredException`.
+//!
+//! The token is minted from the stored identity (see [`crate::state::open_id_token`]) and
+//! recorded in `open_id_tokens`, so the service can later say which identity a token it
+//! issued names and until when.
 //!
 //! ## Shape of an operation
 //!
@@ -113,6 +119,13 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// How long the token this operation mints stays valid when the request names no
+/// `TokenDuration`. From that member's own documentation: "The expiration time of the
+/// token, in seconds. [...] If you don't provide an expiration time, the token is valid
+/// for 15 minutes."
+/// (`smithy_query(query="doc",shape="GetOpenIdTokenForDeveloperIdentityInput",member="TokenDuration")`).
+const DEFAULT_TOKEN_DURATION: ::std::time::Duration = ::std::time::Duration::from_secs(900);
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -187,18 +200,308 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetOpenIdTokenForDeveloperIdentity` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetOpenIdTokenForDeveloperIdentityErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetOpenIdTokenForDeveloperIdentity"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                GetOpenIdTokenForDeveloperIdentityErrorModeled::InternalErrorException(
+                    InternalErrorException {
+                        message: Some("the identity-pool store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // "This API will create the identity in the specified IdentityPoolId", so the pool
+        // has to be one this service holds.
+        let Some(pool) = store.identity_pools.get(&input.identity_pool_id) else {
+            return Err(
+                GetOpenIdTokenForDeveloperIdentityErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "IdentityPool '{}' not found.",
+                            input.identity_pool_id
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The developer provider is "the 'domain' by which Cognito will refer to your
+        // users; you provided this domain while creating/updating the identity pool", so
+        // the developer login this call carries is the `Logins` entry keyed by the POOL's
+        // own `DeveloperProviderName`, and its value is the developer user identifier.
+        // `Logins` is a MAP, so one request cannot carry two entries for one developer
+        // provider: "You can only specify one developer provider as part of the Logins
+        // map" holds by construction. A pool that names no developer provider, or a
+        // `Logins` naming none, is a bad input parameter rather than a missing resource.
+        let Some(developer_provider) = pool.developer_provider_name.clone() else {
+            return Err(
+                GetOpenIdTokenForDeveloperIdentityErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(format!(
+                            "Invalid value for parameter Logins: identity pool '{}' has no \
+                             DeveloperProviderName, so no login can name a developer provider.",
+                            input.identity_pool_id
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+        let Some(developer_user_identifier) = input.logins.get(&developer_provider).cloned() else {
+            return Err(
+                GetOpenIdTokenForDeveloperIdentityErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(format!(
+                            "Invalid value for parameter Logins: it must carry an entry for the \
+                             developer provider '{developer_provider}' of identity pool '{}'.",
+                            input.identity_pool_id
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // Every login the call presents — the developer one and any public provider beside
+        // it — in a stable order.
+        let mut presented: Vec<(String, String)> = input
+            .logins
+            .iter()
+            .map(|(provider, login)| (provider.clone(), login.clone()))
+            .collect();
+        presented.sort();
+        let mut providers: Vec<String> = input.logins.keys().cloned().collect();
+        providers.sort();
+
+        // "When you want to associate a new login with an existing authenticated/
+        // unauthenticated identity, you can do so by providing the existing IdentityId" —
+        // an identity of THIS pool, since an identity never moves between pools.
+        if let Some(identity_id) = &input.identity_id {
+            let belongs_to_pool = store
+                .identities
+                .get(identity_id)
+                .is_some_and(|identity| identity.identity_pool_id == input.identity_pool_id);
+            if !belongs_to_pool {
+                return Err(
+                    GetOpenIdTokenForDeveloperIdentityErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: Some(format!(
+                                "Identity '{identity_id}' not found in identity pool '{}'.",
+                                input.identity_pool_id
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        let registered_to = store
+            .linked_identity(
+                &input.identity_pool_id,
+                &developer_provider,
+                &developer_user_identifier,
+            )
+            .cloned();
+
+        // The identity this call is about: the one the request names, else the one the
+        // developer user identifier is already registered under (which is what makes the
+        // operation idempotent per identifier), else the one another presented login
+        // already resolves to, else none yet — a new identity.
+        let resolved = input
+            .identity_id
+            .clone()
+            .or_else(|| registered_to.clone())
+            .or_else(|| {
+                presented.iter().find_map(|(provider, login)| {
+                    store
+                        .linked_identity(&input.identity_pool_id, provider, login)
+                        .cloned()
+                })
+            });
+
+        // "The provided developer user identifier is already registered with Cognito under
+        // a different identity ID" is exactly this: the identifier is held by an identity
+        // other than the one this call is about.
+        if let (Some(resolved), Some(registered_to)) = (&resolved, &registered_to) {
+            if resolved != registered_to {
+                return Err(
+                    GetOpenIdTokenForDeveloperIdentityErrorModeled::DeveloperUserAlreadyRegisteredException(
+                        DeveloperUserAlreadyRegisteredException {
+                            message: Some(format!(
+                                "The developer user identifier '{developer_user_identifier}' is \
+                                 already registered under identity '{registered_to}'."
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // Logins presented together name ONE account, so a login already linked to a
+        // different identity cannot be part of it — "a user tries to use a login which is
+        // already linked to another account".
+        if let Some(resolved) = &resolved {
+            for (provider, login) in &presented {
+                let linked = store.linked_identity(&input.identity_pool_id, provider, login);
+                if let Some(linked) = linked.filter(|linked| *linked != resolved) {
+                    return Err(
+                        GetOpenIdTokenForDeveloperIdentityErrorModeled::ResourceConflictException(
+                            ResourceConflictException {
+                                message: Some(format!(
+                                    "The login for provider '{provider}' is already linked to \
+                                     identity '{linked}'."
+                                )),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+            }
+        }
+
+        // The stores this call grows carry THIS emulator's own ceilings (`crate::state`),
+        // checked before anything is written. The operation models no limit error, so a
+        // request the emulator cannot store is refused with the modelled throttle rather
+        // than written past the ceiling.
+        if store.pool_login_index_would_overflow(&input.identity_pool_id, &presented) {
+            return Err(
+                GetOpenIdTokenForDeveloperIdentityErrorModeled::TooManyRequestsException(
+                    TooManyRequestsException {
+                        message: Some(format!(
+                            "The maximum number of logins ({}) for the identity pool '{}' has \
+                             been reached.",
+                            crate::state::MAX_LOGINS_PER_POOL, input.identity_pool_id
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        if let Some(resolved) = &resolved {
+            if store.identity_providers_would_overflow(resolved, &providers) {
+                return Err(
+                    GetOpenIdTokenForDeveloperIdentityErrorModeled::TooManyRequestsException(
+                        TooManyRequestsException {
+                            message: Some(format!(
+                                "The maximum number of linked login providers ({}) for the \
+                                 identity '{resolved}' has been reached.",
+                                crate::state::MAX_LOGIN_PROVIDERS_PER_IDENTITY
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        let identity_id = match &resolved {
+            Some(identity_id) => identity_id.clone(),
+            None => {
+                if store.pool_identity_store_is_full(&input.identity_pool_id) {
+                    return Err(
+                        GetOpenIdTokenForDeveloperIdentityErrorModeled::TooManyRequestsException(
+                            TooManyRequestsException {
+                                message: Some(format!(
+                                    "The maximum number of identities ({}) for the identity pool \
+                                     '{}' has been reached.",
+                                    crate::state::MAX_IDENTITIES_PER_POOL,
+                                    input.identity_pool_id
+                                )),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+                // "When you want to create a new identity, the IdentityId should be null":
+                // the identity lives in its pool's region, which the pool's id names.
+                let region = crate::state::region_of(&input.identity_pool_id).to_string();
+                let identity_id = store.new_identity_id(&region);
+                store.identities.insert(
+                    identity_id.clone(),
+                    crate::state::Identity {
+                        identity_id: identity_id.clone(),
+                        identity_pool_id: input.identity_pool_id.clone(),
+                        logins: providers.clone(),
+                        creation_date: now,
+                        last_modified_date: now,
+                    },
+                );
+                store
+                    .identities_by_pool
+                    .entry(input.identity_pool_id.clone())
+                    .or_default()
+                    .push(identity_id.clone());
+                identity_id
+            }
+        };
+
+        // Every presented login now resolves to this identity, however it was reached —
+        // "supplying multiple logins will create an implicit linked account".
+        for (provider, login) in &presented {
+            store.link_login(&input.identity_pool_id, provider, login, &identity_id);
+        }
+
+        // A provider this identity had not been linked to before is a change to the
+        // identity, so it is recorded with the instant it happened.
+        if resolved.is_some() {
+            if let Some(identity) = store.identities.get_mut(&identity_id) {
+                let linked_before = identity.logins.len();
+                for provider in &providers {
+                    if !identity.logins.contains(provider) {
+                        identity.logins.push(provider.clone());
+                    }
+                }
+                if identity.logins.len() != linked_before {
+                    identity.logins.sort();
+                    identity.last_modified_date = now;
+                }
+            }
+        }
+
+        // `TokenDuration` is modelled `range 1..86400`, so a value outside it was refused
+        // before this handler ran; its absence is the documented 15 minutes.
+        let validity = input
+            .token_duration
+            .and_then(|seconds| u64::try_from(seconds).ok())
+            .map_or(DEFAULT_TOKEN_DURATION, ::std::time::Duration::from_secs);
+        let expiration = now + validity;
+        let token = crate::state::open_id_token(
+            &input.identity_pool_id,
+            &identity_id,
+            &providers,
+            now,
+            expiration,
+        );
+
+        // What the clock has already expired is forgotten here, and the store is kept
+        // inside this emulator's own ceiling on outstanding tokens; then this issuance is
+        // recorded, which is what lets the service say later which identity the token it
+        // handed out names.
+        store.record_open_id_token(
+            token.clone(),
+            crate::state::IssuedOpenIdToken {
+                identity_id: identity_id.clone(),
+                identity_pool_id: input.identity_pool_id.clone(),
+                issued_at: now,
+                expiration,
+                principal_tags: input
+                    .principal_tags
+                    .map(|tags| tags.into_iter().collect()),
+            },
+            now,
+        );
+
+        Ok(GetOpenIdTokenForDeveloperIdentityOutput {
+            identity_id: Some(identity_id),
+            token: Some(token),
+        })
     }
 }
