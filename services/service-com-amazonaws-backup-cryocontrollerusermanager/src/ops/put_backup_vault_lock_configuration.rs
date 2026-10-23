@@ -7,6 +7,12 @@
 //! with the configured retention bounds and, when the request named
 //! `ChangeableForDays`, the lock date it makes due.
 //!
+//! The vault is resolved through
+//! [`crate::state::ComAmazonawsBackupCryocontrollerusermanagerState::visible_vault_mut`],
+//! which decides ACCESS before EXISTENCE: a vault-lock action is authorized
+//! against the named vault, so a vault outside the caller's visibility is
+//! refused with 403 `AccessDeniedException` before any existence lookup.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -278,20 +284,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let mut store = state.lock();
-        let Some(vault) = store.vaults.get_mut(&input.backup_vault_name) else {
-            return Err(
-                PutBackupVaultLockConfigurationErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(format!(
-                            "Backup vault {} not found",
-                            input.backup_vault_name
-                        )),
-                        ..Default::default()
-                    },
-                )
-                .into(),
-            );
-        };
+        // A vault-lock action decides ACCESS before EXISTENCE: it is authorized
+        // against the named vault as the resource, so a vault outside the
+        // caller's visibility (never created, deleted, or another account's) is
+        // refused with 403 `AccessDeniedException` and the refusal discloses
+        // nothing about whether that vault exists — instead of reporting the
+        // store lookup's miss as `ResourceNotFoundException`. The decision lives
+        // in `state::visible_vault_mut`, shared with
+        // `DeleteBackupVaultLockConfiguration` and with the vault-scoped reads.
+        //
+        // The parameter checks above run first and are unaffected: each answers
+        // the same `InvalidParameterValueException` whether or not the named
+        // vault exists, so they disclose nothing either.
+        let vault = store.visible_vault_mut(&input.backup_vault_name, None)?;
 
         // "On and after the lock date, the Vault Lock becomes immutable and
         // cannot be changed or deleted" (model doc for `ChangeableForDays`), so

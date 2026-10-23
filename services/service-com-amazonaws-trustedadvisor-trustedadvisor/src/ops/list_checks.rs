@@ -7,9 +7,11 @@
 //! shared cursor helper, so the `@paginated(items=checkSummaries)` contract
 //! walks the whole catalog exactly once.
 //!
-//! `language` is accepted and does not change the text: the catalog carries one
-//! (English) copy of each check's name and description, and inventing a
-//! translation would be fabricating a value the store does not hold.
+//! `language` SELECTS the text: the catalog holds each check's `name` and
+//! `description` once per `RecommendationLanguage`
+//! ([`crate::state::TextCatalog`]), and this handler reports the copy the
+//! request asked for — [`crate::state::DEFAULT_LANGUAGE`] when it named no
+//! language. It is not a filter: which checks are reported never depends on it.
 //!
 //! ## Shape of an operation
 //!
@@ -88,13 +90,16 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-/// The stored check, as the modelled `CheckSummary`.
-fn check_summary(check: &crate::state::Check) -> CheckSummary {
+/// The stored check, as the modelled `CheckSummary`, with its `name` and
+/// `description` in the language the request asked for (`None` when it named
+/// none).
+fn check_summary(check: &crate::state::Check, language: Option<&str>) -> CheckSummary {
+    let text = check.text.text(language);
     CheckSummary {
         id: check.id.clone(),
         arn: check.arn.clone(),
-        name: check.name.clone(),
-        description: check.description.clone(),
+        name: text.name.clone(),
+        description: text.description.clone(),
         pillars: check.pillars.clone(),
         aws_services: check.aws_services.clone(),
         source: check.source.clone(),
@@ -214,7 +219,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     })
                     && input.source.as_ref().is_none_or(|source| &check.source == source)
             })
-            .map(|(id, check)| (id.clone(), check_summary(check)))
+            .map(|(id, check)| {
+                (
+                    id.clone(),
+                    check_summary(check, input.language.as_deref()),
+                )
+            })
             .collect();
 
         let page = crate::state::paginate(

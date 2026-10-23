@@ -280,18 +280,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             };
             folder_names.insert(head);
         }
+        // The git tree object name of a folder, over the entries that live under
+        // it. Absent only if an entry carried a `blobId` that is not an object
+        // name, which a stored snapshot cannot: a success response must never omit
+        // a member the model has computed, so that inconsistency is refused here
+        // the same way `PutFile` and `CreateCommit` refuse it.
+        let tree_id_of = |entries: &std::collections::BTreeMap<String, crate::state::FileEntry>| {
+            crate::state::tree_id(entries).ok_or_else(|| {
+                crate::scaffolded::Scaffolded::validation(
+                    "the repository store holds a file whose blob id is not an object name",
+                )
+            })
+        };
         let sub_folders: Vec<Folder> = folder_names
             .into_iter()
-            .map(|name| Folder {
-                // A sub-folder's `treeId` is the git tree object name of that
-                // sub-folder's own tree, over the entries that live under it.
-                tree_id: Some(crate::state::tree_id(&crate::state::subtree(
-                    &entries, name,
-                ))),
-                absolute_path: Some(absolute(name)),
-                relative_path: Some(name.to_string()),
+            .map(|name| {
+                Ok(Folder {
+                    tree_id: Some(tree_id_of(&crate::state::subtree(&entries, name))?),
+                    absolute_path: Some(absolute(name)),
+                    relative_path: Some(name.to_string()),
+                })
             })
-            .collect();
+            .collect::<Result<Vec<Folder>, GetFolderError>>()?;
 
         Ok(GetFolderOutput {
             commit_id: commit.commit_id.clone(),
@@ -300,7 +310,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             folder_path: input.folder_path.clone(),
             // The git tree object name of this folder's own tree, which for the
             // root folder is the commit's tree id.
-            tree_id: Some(crate::state::tree_id(&entries)),
+            tree_id: Some(tree_id_of(&entries)?),
             // Each list is reported "if any": a kind of entry this folder holds
             // none of is left out rather than sent as an empty list.
             sub_folders: (!sub_folders.is_empty()).then_some(sub_folders),

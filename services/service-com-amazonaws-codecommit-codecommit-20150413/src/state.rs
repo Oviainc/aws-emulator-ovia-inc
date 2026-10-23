@@ -2,19 +2,24 @@
 
 //! Engine state for the com-amazonaws-codecommit-codecommit-20150413 service.
 //!
-//! The store is a map of live repositories, each carrying its own branches,
-//! commits, blobs and the comments posted on its commit comparisons, so every
-//! response an operation returns is a lookup in state rather than a value made up
-//! on the request path.
+//! The store is a map of live repositories, each carrying its own git object
+//! store, branches, tags, the commit projection the control plane reads and the
+//! comments posted on its commit comparisons, so every response an operation
+//! returns is a lookup in state rather than a value made up on the request path.
 //!
-//! Object ids are content-addressed over the git object encoding: `blobId`, `treeId`
-//! and `commitId` hash exactly what git hashes for that object
-//! (`"<kind> <len>\0<payload>"`, with real nested tree objects and git mode bits),
-//! because CodeCommit is a git host and reports git object names. The digest is
-//! SHA-256 truncated to the leading 160 bits, so an id is 40 hex characters wide,
-//! identical content yields the identical id, and changing a parent, tree, author or
-//! message changes the commit id — it is simply not byte-identical to the SHA-1 a git
-//! client would compute for the same object.
+//! A repository has exactly ONE object store ([`Repository::objects`]), keyed by
+//! git object name, and it is what both faces of the service read: the control
+//! plane projects it into the modeled shapes (`GetFile`, `GetBranch`), and the git
+//! smart-HTTP transport in [`crate::service::git_http`] serves and receives the
+//! very same objects. Object ids are therefore real git object names — see
+//! [`git_object`] for the name function — so a `git clone` of content written by
+//! `PutFile` resolves, and a `GetFile` of content written by `git push` resolves.
+//!
+//! The [`Commit`] records in [`Repository::commits`] are a PROJECTION of the
+//! commit objects: each carries the flattened tree snapshot at that commit, so
+//! reading a file at a commit specifier is a lookup rather than a tree walk.
+
+pub mod git_object;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -22,6 +27,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{ApprovalRuleTemplate, Comment, Location, RepositoryMetadata, UserInfo};
+use git_object::{Kind, Object, TreeEntry};
 
 /// The region an ARN or clone URL uses when the request carries no SigV4
 /// credential scope to read one from (an unsigned request).
@@ -61,8 +67,8 @@ pub const FILE_MODE_EXECUTABLE: &str = "EXECUTABLE";
 pub const FILE_MODE_SYMLINK: &str = "SYMLINK";
 
 /// Upper bound on the number of segments in a file path. Not an AWS limit: it
-/// bounds the recursion in [`tree_id`], which walks one level per path segment,
-/// so a pathological path cannot exhaust the stack.
+/// bounds the recursion in [`tree_objects`], which walks one level per path
+/// segment, so a pathological path cannot exhaust the stack.
 pub const MAX_PATH_SEGMENTS: usize = 256;
 
 /// How many repositories the store holds before `CreateRepository` refuses with
@@ -76,16 +82,18 @@ pub const MAX_PATH_SEGMENTS: usize = 256;
 /// record it holds is released by `DeleteRepository`.
 pub const REPOSITORY_QUOTA: usize = 1_000;
 
-/// How many files one repository's tree holds before `PutFile` refuses the write.
+/// How many files one repository's tree holds before `PutFile` refuses the write
+/// and before the git transport refuses a push whose commit carries a larger
+/// tree.
 ///
-/// The emulator's OWN bound, not an AWS limit: a commit stores the whole tree
-/// snapshot, so this is what keeps both the per-request work ([`tree_id`] hashes
-/// that snapshot) and one repository's stored size bounded.
+/// The emulator's OWN bound, not an AWS limit: a commit's projection stores the
+/// whole tree snapshot, so this is what keeps both the per-request work and one
+/// repository's stored size bounded.
 pub const MAX_FILES_PER_TREE: usize = 1_000;
 
-/// How many commits one repository retains. Older commits that are not the tip of
-/// a branch are dropped by [`Repository::prune_history`], together with the blobs
-/// only they referenced, so repeated writes cannot grow the store without end.
+/// How many commits one repository's PROJECTION retains. Older commits that are
+/// not the tip of a ref are dropped by [`Repository::prune_history`], so
+/// repeated writes cannot grow the store without end.
 ///
 /// The emulator's OWN bound, not an AWS limit: CodeCommit keeps all history. A
 /// read at a commit that has been dropped answers `CommitDoesNotExistException`,
@@ -94,7 +102,17 @@ pub const MAX_FILES_PER_TREE: usize = 1_000;
 /// which is what one repository can cost.
 pub const MAX_COMMITS_RETAINED: usize = 256;
 
-/// How many branches one repository holds before `CreateBranch` refuses the write.
+/// How many git objects one repository's object store holds. The emulator's OWN
+/// bound, not an AWS limit: it is what stops a push growing the store without
+/// end, and a push that would pass it is refused by the transport.
+pub const MAX_OBJECTS_PER_REPOSITORY: usize = 20_000;
+
+/// How many bytes of git object payload one repository's object store holds. The
+/// emulator's OWN bound, for the same reason as [`MAX_OBJECTS_PER_REPOSITORY`].
+pub const MAX_OBJECT_BYTES_PER_REPOSITORY: usize = 64 * 1024 * 1024;
+
+/// How many branches one repository holds before `CreateBranch`, or a push
+/// through the git transport, refuses the write.
 ///
 /// The emulator's OWN bound, not an AWS limit: a branch is a caller-named
 /// reference kept for the life of the repository, and
@@ -105,11 +123,127 @@ pub const MAX_COMMITS_RETAINED: usize = 256;
 /// by `DeleteRepository`.
 pub const MAX_BRANCHES_PER_REPOSITORY: usize = 64;
 
+/// How many tags one repository holds before a push refuses to create another.
+///
+/// The emulator's OWN bound, for exactly the reason
+/// [`MAX_BRANCHES_PER_REPOSITORY`] gives and at the same figure: a tag is a
+/// caller-named reference kept for the life of the repository and never pruned,
+/// so it pins history just as a branch does. CodeCommit has no control-plane API
+/// that creates a tag, so the git transport is the only writer.
+pub const MAX_TAGS_PER_REPOSITORY: usize = MAX_BRANCHES_PER_REPOSITORY;
+
 /// The largest total content size of one folder, in bytes. CodeCommit documents
 /// this limit on `FolderContentSizeLimitExceededException`: a commit cannot be
 /// created when a change "results in a folder whose contents exceed the limit of
 /// 6 MB".
 pub const MAX_FOLDER_CONTENT_BYTES: i64 = 6 * 1024 * 1024;
+
+/// The git ref namespace a branch lives in.
+pub const HEADS_PREFIX: &str = "refs/heads/";
+/// The git ref namespace a tag lives in.
+pub const TAGS_PREFIX: &str = "refs/tags/";
+
+/// How many tree entries one request's projection may walk in total, across
+/// every commit it projects.
+///
+/// The emulator's OWN bound, and the bound that holds where the depth and the
+/// file count do not: a git tree is a DAG, so a few tree objects naming one
+/// another present exponentially many paths (see
+/// [`Repository::flatten_tree`]). It is [`MAX_COMMITS_PROJECTED_PER_REQUEST`]
+/// times four times [`MAX_FILES_PER_TREE`] — room for every commit the request
+/// may project to carry a full snapshot and its directories — and it is charged
+/// per entry, so no product of commands, commits and entries escapes it.
+pub const MAX_TREE_ENTRIES_PER_REQUEST: usize =
+    MAX_COMMITS_PROJECTED_PER_REQUEST * 4 * MAX_FILES_PER_TREE;
+
+/// How many commits one request's projection may build.
+///
+/// The emulator's OWN bound: a repository retains at most
+/// [`MAX_COMMITS_RETAINED`] projected commits, so projecting more than that in
+/// one request would only build snapshots that are pruned on the way out.
+pub const MAX_COMMITS_PROJECTED_PER_REQUEST: usize = MAX_COMMITS_RETAINED;
+
+/// How long one request's projection may take before it is refused. The
+/// emulator's own bound, at the same figure as the pack reader's deadline and the
+/// workspace's other caller-driven CPU work: the budgets above bound the work, and
+/// this bounds the time it may take on any machine, so the store lock the
+/// projection runs under is never held for an unbounded span. The projection also
+/// runs off the async worker — see `crate::service`'s `off_the_async_worker`.
+pub const MAX_PROJECTION_SECONDS: u64 = 2;
+
+/// What ONE request's whole projection may still spend: commits, tree entries
+/// and time.
+///
+/// One budget is built per request and threaded through every projection a
+/// request drives ([`Repository::project_history`], and so
+/// [`Repository::flatten_tree`]), because the cost is a PRODUCT: a push carries
+/// many ref updates, each naming a commit whose ancestors each carry a whole tree
+/// snapshot. Per-call caps would bound each factor and none of the product.
+#[derive(Debug)]
+pub struct ProjectionBudget {
+    commits_left: usize,
+    entries_left: usize,
+    deadline: std::time::Instant,
+}
+
+impl Default for ProjectionBudget {
+    fn default() -> Self {
+        Self::for_one_request()
+    }
+}
+
+impl ProjectionBudget {
+    /// The allowance one request gets.
+    pub fn for_one_request() -> Self {
+        Self {
+            commits_left: MAX_COMMITS_PROJECTED_PER_REQUEST,
+            entries_left: MAX_TREE_ENTRIES_PER_REQUEST,
+            deadline: std::time::Instant::now()
+                + std::time::Duration::from_secs(MAX_PROJECTION_SECONDS),
+        }
+    }
+
+    /// Charge one projected commit.
+    fn commit(&mut self) -> Result<(), String> {
+        self.check_deadline()?;
+        self.commits_left = self.commits_left.checked_sub(1).ok_or_else(|| {
+            format!(
+                "this request would project more than the {MAX_COMMITS_PROJECTED_PER_REQUEST} commits this emulator projects at once"
+            )
+        })?;
+        Ok(())
+    }
+
+    /// Charge one tree entry walked.
+    ///
+    /// `pub` because the walks a request drives outside this file are charged to
+    /// the same budget: a push's per-ref closure check
+    /// ([`Repository::first_missing_object_within`]) walks tree entries exactly as
+    /// a projection does, and one request may drive it once per ref it updates, so
+    /// the SUM of every walk is what this bounds.
+    pub fn entry(&mut self) -> Result<(), String> {
+        self.entries_left = self.entries_left.checked_sub(1).ok_or_else(|| {
+            format!(
+                "this request would walk more than the {MAX_TREE_ENTRIES_PER_REQUEST} tree entries this emulator walks at once"
+            )
+        })?;
+        // Checked here as well as per commit: a single commit's tree walk is the
+        // one step that can run long on its own.
+        if self.entries_left.is_multiple_of(1024) {
+            self.check_deadline()?;
+        }
+        Ok(())
+    }
+
+    fn check_deadline(&self) -> Result<(), String> {
+        if std::time::Instant::now() > self.deadline {
+            return Err(format!(
+                "this request took longer than the {MAX_PROJECTION_SECONDS} seconds this emulator spends projecting a push"
+            ));
+        }
+        Ok(())
+    }
+}
 
 /// How many tags one CodeCommit resource carries before a tagging request is
 /// refused with the modelled `TooManyTagsException`.
@@ -392,10 +526,11 @@ pub fn is_reaction_removal(value: &str) -> bool {
 ///
 /// Bounded on every axis a caller drives: at most [`REPOSITORY_QUOTA`]
 /// repositories, each holding at most [`MAX_FILES_PER_TREE`] files per tree,
-/// [`MAX_COMMITS_RETAINED`] commits, [`MAX_BRANCHES_PER_REPOSITORY`] branches and
-/// [`MAX_COMMENTS_PER_REPOSITORY`] comments, with blobs released as soon as no
-/// retained commit references them, and at most
-/// [`APPROVAL_RULE_TEMPLATE_QUOTA`] approval rule templates.
+/// [`MAX_COMMITS_RETAINED`] projected commits, [`MAX_OBJECTS_PER_REPOSITORY`]
+/// git objects, [`MAX_BRANCHES_PER_REPOSITORY`] branches,
+/// [`MAX_TAGS_PER_REPOSITORY`] tags and [`MAX_COMMENTS_PER_REPOSITORY`] comments,
+/// with every object no ref reaches released by [`Repository::prune_history`], and
+/// at most [`APPROVAL_RULE_TEMPLATE_QUOTA`] approval rule templates.
 #[derive(Debug, Default)]
 pub struct ComAmazonawsCodecommitCodecommit20150413State {
     /// Live repositories, keyed by `repositoryName` (unique per account).
@@ -441,15 +576,21 @@ pub struct Repository {
     pub description: Option<String>,
     pub default_branch: Option<String>,
     pub arn: String,
-    pub clone_url_http: String,
-    pub clone_url_ssh: String,
     pub kms_key_id: Option<String>,
     pub creation_date: SystemTime,
     pub last_modified_date: SystemTime,
     pub tags: BTreeMap<String, String>,
+    /// Branches (the `refs/heads/` namespace), keyed by branch name.
     pub branches: BTreeMap<String, Branch>,
+    /// Tags (the `refs/tags/` namespace), keyed by tag name, each naming the
+    /// object the tag points at. CodeCommit has no control-plane API that
+    /// creates a tag; a tag gets here through the git transport.
+    pub git_tags: BTreeMap<String, String>,
+    /// The commit PROJECTION: one record per commit the control plane can read.
     pub commits: BTreeMap<String, Commit>,
-    pub blobs: BTreeMap<String, Vec<u8>>,
+    /// The git object store: every blob, tree, commit and tag this repository
+    /// holds, keyed by object name.
+    pub objects: BTreeMap<String, Object>,
     /// The names of the approval rule templates associated with this repository.
     /// A set, so associating the same template twice is the no-op CodeCommit makes
     /// it, and bounded by [`MAX_TEMPLATES_PER_REPOSITORY`].
@@ -497,6 +638,99 @@ pub struct FileEntry {
     pub blob_id: String,
     pub file_mode: String,
     pub size: i64,
+}
+
+/// The host a URL this emulator announces names when the asking request carries
+/// no address at all — only an in-process caller that builds a path-only URI with
+/// no `Host` does. Loopback is where the emulator binds by default
+/// (`EMULATOR_BIND_ADDRESS`), so the announced URL still names this emulator
+/// rather than a host it does not serve; it is the fallback
+/// `service-com-amazonaws-kinesisvideoarchivedmedia-awsacuityreader` uses for the
+/// same question about its own playback URL.
+const LOOPBACK_HOST: &str = "127.0.0.1";
+
+/// The endpoint a client reached this emulator at: the scheme and authority
+/// every URL the emulator announces for itself has to name.
+///
+/// CodeCommit's `cloneUrlHttp` is the address the repository's git transport
+/// answers on, so in an emulator it is the address THIS emulator answers on —
+/// the endpoint the request arrived at — and not the public AWS git host, which
+/// is a different server entirely and would send a client that follows the URL
+/// off the emulator.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServingEndpoint {
+    pub scheme: String,
+    pub authority: String,
+}
+
+impl ServingEndpoint {
+    /// The endpoint this request arrived at: the `Host` header (or, on HTTP/2,
+    /// the URI authority), under the scheme the request names.
+    ///
+    /// A request that carries neither — only an in-process caller that builds a
+    /// path-only URI with no `Host` — falls back to [`LOOPBACK_HOST`], so every
+    /// URL this service announces names an address this emulator serves and never
+    /// one it does not.
+    pub fn from_request(parts: &::http::request::Parts) -> Self {
+        let authority = parts
+            .headers
+            .get(::http::header::HOST)
+            .and_then(|host| host.to_str().ok())
+            .map(str::to_string)
+            .or_else(|| parts.uri.authority().map(|a| a.as_str().to_string()))
+            .filter(|authority| !authority.is_empty())
+            .unwrap_or_else(|| LOOPBACK_HOST.to_string());
+        let scheme = parts
+            .uri
+            .scheme_str()
+            .or_else(|| {
+                parts
+                    .headers
+                    .get("x-forwarded-proto")
+                    .and_then(|proto| proto.to_str().ok())
+            })
+            // The emulator's own listener serves HTTPS, which is also the only
+            // scheme CodeCommit publishes a clone URL for.
+            .unwrap_or("https")
+            .to_string();
+        Self { scheme, authority }
+    }
+
+    /// The HTTPS clone URL for a repository: the git smart-HTTP endpoint this
+    /// emulator serves for it (see [`crate::service::git_http`]).
+    pub fn clone_url_http(&self, name: &str) -> String {
+        format!("{}://{}/v1/repos/{name}", self.scheme, self.authority)
+    }
+
+    /// The SSH clone URL for a repository, naming the same host.
+    ///
+    /// The emulator serves no SSH transport — there is no SSH listener to bind —
+    /// so this URL names a host that answers git over HTTPS only. It still names
+    /// the emulator rather than the public AWS host, because a client that
+    /// follows it must fail against the emulator instead of being sent to a real
+    /// AWS endpoint where its credentials do not exist. The port is omitted: a
+    /// port in the authority is the HTTP listener's, which an SSH URL must not
+    /// claim.
+    pub fn clone_url_ssh(&self, name: &str) -> String {
+        format!("ssh://{}/v1/repos/{name}", self.host())
+    }
+
+    /// The authority with any `:port` removed.
+    fn host(&self) -> &str {
+        let after_userinfo = self
+            .authority
+            .rsplit_once('@')
+            .map_or(self.authority.as_str(), |(_, host)| host);
+        if after_userinfo.starts_with('[') {
+            // An IPv6 literal keeps its brackets; only a port after them is cut.
+            return after_userinfo
+                .rsplit_once("]:")
+                .map_or(after_userinfo, |(host, _)| &after_userinfo[..host.len() + 1]);
+        }
+        after_userinfo
+            .rsplit_once(':')
+            .map_or(after_userinfo, |(host, _)| host)
+    }
 }
 
 impl Commit {
@@ -655,15 +889,14 @@ impl Repository {
             description,
             default_branch: None,
             arn: ::engine::emulator_arn("codecommit", region, name),
-            clone_url_http: clone_url_http(region, name),
-            clone_url_ssh: clone_url_ssh(region, name),
             kms_key_id,
             creation_date: created,
             last_modified_date: created,
             tags,
             branches: BTreeMap::new(),
+            git_tags: BTreeMap::new(),
             commits: BTreeMap::new(),
-            blobs: BTreeMap::new(),
+            objects: BTreeMap::new(),
             associated_templates: BTreeSet::new(),
             next_commit_sequence: 0,
             comments: BTreeMap::new(),
@@ -675,7 +908,13 @@ impl Repository {
     /// This repository as the modeled `RepositoryMetadata` shape — the one place
     /// that projection is written, so `CreateRepository` and `GetRepository`
     /// cannot disagree about a stored repository.
-    pub fn metadata(&self) -> RepositoryMetadata {
+    ///
+    /// The clone URLs are derived from `endpoint`, the address the ASKING request
+    /// arrived at, because that is the address this emulator's git transport
+    /// answers on; they are not stored, so they cannot go stale when the emulator
+    /// is reached on a different endpoint than the one that created the
+    /// repository.
+    pub fn metadata(&self, endpoint: &ServingEndpoint) -> RepositoryMetadata {
         RepositoryMetadata {
             account_id: Some(self.account_id.clone()),
             repository_id: Some(self.repository_id.clone()),
@@ -684,27 +923,27 @@ impl Repository {
             default_branch: self.default_branch.clone(),
             last_modified_date: Some(to_date_time(self.last_modified_date)),
             creation_date: Some(to_date_time(self.creation_date)),
-            clone_url_http: Some(self.clone_url_http.clone()),
-            clone_url_ssh: Some(self.clone_url_ssh.clone()),
+            clone_url_http: Some(endpoint.clone_url_http(&self.name)),
+            clone_url_ssh: Some(endpoint.clone_url_ssh(&self.name)),
             arn: Some(self.arn.clone()),
             kms_key_id: self.kms_key_id.clone(),
         }
     }
 
     /// Rename this repository, recomputing every field CodeCommit derives from the
-    /// repository name — the ARN and both clone URLs address a repository BY name —
-    /// and moving the last-modified instant to the rename.
+    /// repository name — the ARN addresses a repository BY name — and moving the
+    /// last-modified instant to the rename. Both clone URLs name the repository too,
+    /// and follow the rename for free: they are derived from the stored name and the
+    /// asking request's endpoint on every read (see [`Repository::metadata`]).
     ///
     /// Everything that belongs to the resource rather than to its name (the
     /// repository id, the creation date, the description, the KMS key, the tags, the
-    /// branches, the commits and the blobs) carries over untouched, so a renamed
-    /// repository is the same repository under a new name. The caller re-keys the
-    /// store, which is keyed by `repositoryName`.
+    /// branches, the tags, the commits and the git objects) carries over untouched,
+    /// so a renamed repository is the same repository under a new name. The caller
+    /// re-keys the store, which is keyed by `repositoryName`.
     pub fn rename(&mut self, new_name: &str, renamed: SystemTime) {
         self.name = new_name.to_string();
         self.arn = ::engine::emulator_arn("codecommit", &self.region, new_name);
-        self.clone_url_http = clone_url_http(&self.region, new_name);
-        self.clone_url_ssh = clone_url_ssh(&self.region, new_name);
         self.last_modified_date = renamed;
     }
 
@@ -752,12 +991,269 @@ impl Repository {
         self.commits.get(specifier)
     }
 
+    /// The object this name addresses.
+    pub fn object(&self, id: &str) -> Option<&Object> {
+        self.objects.get(id)
+    }
+
+    /// The bytes of a blob, or `None` when this name is not a blob this
+    /// repository holds.
+    pub fn blob(&self, id: &str) -> Option<&[u8]> {
+        self.objects
+            .get(id)
+            .filter(|object| object.kind == Kind::Blob)
+            .map(|object| object.data.as_slice())
+    }
+
+    /// Store an object, reporting its name. Storing the same object twice is the
+    /// same as storing it once: the name IS the content.
+    pub fn insert_object(&mut self, object: Object) -> String {
+        let id = object.id();
+        self.objects.entry(id.clone()).or_insert(object);
+        id
+    }
+
+    /// Store a file's bytes as a blob, reporting its `blobId`.
+    pub fn insert_blob(&mut self, content: Vec<u8>) -> String {
+        self.insert_object(Object::new(Kind::Blob, content))
+    }
+
+    /// Total payload bytes the object store holds.
+    pub fn object_bytes(&self) -> usize {
+        self.objects
+            .values()
+            .map(|object| object.data.len())
+            .fold(0usize, usize::saturating_add)
+    }
+
+    /// Commit a whole tree snapshot: write the tree objects and the commit
+    /// object, record the commit projection, and report `(commitId, treeId)`.
+    ///
+    /// The blobs the snapshot names must already be stored (see
+    /// [`Repository::insert_blob`]), which is what makes the commit's tree
+    /// complete in the object store and therefore serveable to a git client —
+    /// and what makes every entry's `blobId` an object name, so the tree encodes.
+    /// `None` when one does not.
+    pub fn commit_snapshot(
+        &mut self,
+        files: BTreeMap<String, FileEntry>,
+        parents: Vec<String>,
+        author: UserInfo,
+        committer: UserInfo,
+        message: Option<&str>,
+    ) -> Option<(String, String)> {
+        let (tree_id, trees) = tree_objects(&files)?;
+        for tree in trees {
+            self.insert_object(tree);
+        }
+        let commit = git_object::encode_commit(&git_object::CommitFields {
+            tree: tree_id.clone(),
+            parents: parents.clone(),
+            author: git_identity(&author),
+            committer: git_identity(&committer),
+            message: message.unwrap_or_default().to_string(),
+        });
+        let commit_id = self.insert_object(commit);
+        let sequence = self.next_commit_sequence;
+        self.next_commit_sequence = sequence.saturating_add(1);
+        self.commits.insert(
+            commit_id.clone(),
+            Commit {
+                commit_id: commit_id.clone(),
+                tree_id: tree_id.clone(),
+                parents,
+                message: message.map(str::to_string),
+                author,
+                committer,
+                files,
+                sequence,
+            },
+        );
+        Some((commit_id, tree_id))
+    }
+
+    /// Project the commit object `id` — and its ancestors, as far as the objects
+    /// present and `budget` allow — into [`Repository::commits`], so the control
+    /// plane can read what the git transport stored.
+    ///
+    /// `budget` is ONE request's whole projection allowance, not one call's, so a
+    /// request carrying many ref updates cannot multiply this work: see
+    /// [`ProjectionBudget`].
+    ///
+    /// `Err` names the first commit whose tree the projection cannot hold, or the
+    /// budget it ran past, which is what lets a push be refused instead of
+    /// accepted into a state the control plane could not read.
+    pub fn project_history(
+        &mut self,
+        id: &str,
+        budget: &mut ProjectionBudget,
+    ) -> Result<(), String> {
+        // Oldest-last walk from the tip, stopping at a commit already projected.
+        let mut order: Vec<String> = Vec::new();
+        let mut queue: Vec<String> = vec![id.to_string()];
+        let mut seen: BTreeSet<String> = BTreeSet::new();
+        while let Some(next) = queue.pop() {
+            if !seen.insert(next.clone()) || self.commits.contains_key(&next) {
+                continue;
+            }
+            if order.len() >= MAX_COMMITS_RETAINED {
+                break;
+            }
+            let Some(object) = self.objects.get(&next) else {
+                // An ancestor this repository does not hold: the history ends
+                // here as far as the projection is concerned.
+                continue;
+            };
+            if object.kind != Kind::Commit {
+                return Err(format!("{next} is not a commit"));
+            }
+            let fields = git_object::decode_commit(&object.data)
+                .ok_or_else(|| format!("{next} is not a well-formed commit object"))?;
+            order.push(next);
+            for parent in fields.parents {
+                queue.push(parent);
+            }
+        }
+        // Ancestors first, so a commit's sequence number grows with history and
+        // `prune_history` drops the oldest first.
+        for commit_id in order.into_iter().rev() {
+            self.project_commit(&commit_id, budget)?;
+        }
+        Ok(())
+    }
+
+    /// Project one commit object into [`Repository::commits`].
+    fn project_commit(&mut self, id: &str, budget: &mut ProjectionBudget) -> Result<(), String> {
+        budget.commit()?;
+        let object = self
+            .objects
+            .get(id)
+            .ok_or_else(|| format!("the object {id} is missing"))?;
+        let fields = git_object::decode_commit(&object.data)
+            .ok_or_else(|| format!("{id} is not a well-formed commit object"))?;
+        let files = self.flatten_tree(&fields.tree, budget)?;
+        let (author_name, author_email, author_date) = git_object::split_identity(&fields.author);
+        let (committer_name, committer_email, committer_date) =
+            git_object::split_identity(&fields.committer);
+        let sequence = self.next_commit_sequence;
+        self.next_commit_sequence = sequence.saturating_add(1);
+        self.commits.insert(
+            id.to_string(),
+            Commit {
+                commit_id: id.to_string(),
+                tree_id: fields.tree,
+                parents: fields.parents,
+                message: Some(fields.message).filter(|message| !message.is_empty()),
+                author: UserInfo {
+                    name: Some(author_name),
+                    email: Some(author_email),
+                    date: Some(author_date),
+                },
+                committer: UserInfo {
+                    name: Some(committer_name),
+                    email: Some(committer_email),
+                    date: Some(committer_date),
+                },
+                files,
+                sequence,
+            },
+        );
+        Ok(())
+    }
+
+    /// The flattened snapshot a tree object describes: every file in it, keyed by
+    /// its path from the root.
+    ///
+    /// A gitlink entry (a submodule's commit embedded in a tree) names no blob
+    /// and so is not a file; it is left out of the snapshot.
+    ///
+    /// The walk is charged to `budget`, ONE request's whole projection allowance,
+    /// entry by entry — NOT just bounded by the depth and the file count: a tree
+    /// is a DAG, so a handful of pushed tree objects can name one another and
+    /// present exponentially many paths while inserting no file at all (every leaf
+    /// a gitlink, or an empty tree), and neither the depth nor the file count
+    /// would ever trip. A visited set would be the wrong bound here: two
+    /// directories with identical content legitimately SHARE one tree object, and
+    /// both have to appear in the snapshot, so a repeated subtree must be walked
+    /// again — what is refused is the total work, not the repetition.
+    pub fn flatten_tree(
+        &self,
+        root: &str,
+        budget: &mut ProjectionBudget,
+    ) -> Result<BTreeMap<String, FileEntry>, String> {
+        let mut files = BTreeMap::new();
+        self.flatten_tree_into(root, "", 0, budget, &mut files)?;
+        Ok(files)
+    }
+
+    fn flatten_tree_into(
+        &self,
+        tree_id: &str,
+        prefix: &str,
+        depth: usize,
+        budget: &mut ProjectionBudget,
+        files: &mut BTreeMap<String, FileEntry>,
+    ) -> Result<(), String> {
+        if depth >= MAX_PATH_SEGMENTS {
+            return Err(format!(
+                "the tree {tree_id} is nested deeper than {MAX_PATH_SEGMENTS} levels"
+            ));
+        }
+        let object = self
+            .objects
+            .get(tree_id)
+            .ok_or_else(|| format!("the tree {tree_id} is missing"))?;
+        if object.kind != Kind::Tree {
+            return Err(format!("{tree_id} is not a tree"));
+        }
+        let entries = git_object::decode_tree(&object.data)
+            .ok_or_else(|| format!("{tree_id} is not a well-formed tree object"))?;
+        for entry in entries {
+            // Every entry costs one, whether or not it becomes a file, which is
+            // what bounds a shared-subtree DAG.
+            budget.entry()?;
+            let path = if prefix.is_empty() {
+                entry.name.clone()
+            } else {
+                format!("{prefix}/{}", entry.name)
+            };
+            if entry.is_tree() {
+                self.flatten_tree_into(&entry.id, &path, depth + 1, budget, files)?;
+                continue;
+            }
+            if entry.mode == git_object::MODE_GITLINK {
+                continue;
+            }
+            let size = self
+                .objects
+                .get(&entry.id)
+                .filter(|object| object.kind == Kind::Blob)
+                .ok_or_else(|| format!("the blob {} for {path} is missing", entry.id))?
+                .data
+                .len();
+            if files.len() >= MAX_FILES_PER_TREE {
+                return Err(format!(
+                    "the tree {tree_id} holds more than the {MAX_FILES_PER_TREE} files this emulator keeps per tree"
+                ));
+            }
+            files.insert(
+                path,
+                FileEntry {
+                    blob_id: entry.id,
+                    file_mode: file_mode_of(&entry.mode).to_string(),
+                    size: i64::try_from(size).unwrap_or(i64::MAX),
+                },
+            );
+        }
+        Ok(())
+    }
+
     /// Every commit id reachable from `commit_id` by following parents, including
     /// `commit_id` itself: the history a read at that commit sees. An id whose
     /// commit [`Repository::prune_history`] has dropped is still reported, because
     /// a retained commit's `parents` keeps naming it.
-    pub fn ancestry(&self, commit_id: &str) -> std::collections::BTreeSet<String> {
-        let mut reachable = std::collections::BTreeSet::new();
+    pub fn ancestry(&self, commit_id: &str) -> BTreeSet<String> {
+        let mut reachable = BTreeSet::new();
         let mut pending = vec![commit_id.to_string()];
         while let Some(id) = pending.pop() {
             if !reachable.insert(id.clone()) {
@@ -770,15 +1266,145 @@ impl Repository {
         reachable
     }
 
-    /// Drop the oldest commits beyond [`MAX_COMMITS_RETAINED`], then every blob no
-    /// retained commit references. A branch tip is never dropped, so every branch
-    /// stays readable; an older commit id becomes one the repository no longer
-    /// holds.
-    pub fn prune_history(&mut self) {
-        let tips: std::collections::BTreeSet<String> = self
+    /// Every ref this repository holds, as `(full refname, object name)`, in
+    /// refname order — the order a git client is advertised them in.
+    pub fn refs(&self) -> Vec<(String, String)> {
+        let mut refs: Vec<(String, String)> = self
             .branches
             .values()
-            .map(|branch| branch.commit_id.clone())
+            .map(|branch| (format!("{HEADS_PREFIX}{}", branch.name), branch.commit_id.clone()))
+            .chain(
+                self.git_tags
+                    .iter()
+                    .map(|(name, id)| (format!("{TAGS_PREFIX}{name}"), id.clone())),
+            )
+            .collect();
+        refs.sort();
+        refs
+    }
+
+    /// The commit an annotated tag (or a chain of them) finally points at, or
+    /// `None` when the object is not a tag and not a commit this repository
+    /// holds.
+    pub fn peel(&self, id: &str) -> Option<String> {
+        let mut current = id.to_string();
+        // A tag of a tag of a tag … is bounded, so a cycle cannot spin here.
+        for _ in 0..16 {
+            let object = self.objects.get(&current)?;
+            match object.kind {
+                Kind::Commit => return Some(current),
+                Kind::Tag => current = git_object::decode_tag(&object.data)?.object,
+                _ => return None,
+            }
+        }
+        None
+    }
+
+    /// The first object name `roots` reach that this repository does NOT hold, or
+    /// `None` when the closure is complete.
+    ///
+    /// What a git host checks before it moves a ref: a ref whose closure is
+    /// incomplete is one a later fetch cannot serve, so the push that would create
+    /// it is refused instead.
+    pub fn first_missing_object(&self, roots: &[String]) -> Option<String> {
+        self.reachable_from(roots)
+            .into_iter()
+            .find(|id| !self.objects.contains_key(id))
+    }
+
+    /// [`Repository::first_missing_object`], charged to ONE request's budget.
+    ///
+    /// The form a caller-driven walk uses. A single request may ask for this once
+    /// per ref it updates, so every walk charges the same [`ProjectionBudget`] —
+    /// what is bounded is the whole request's walking, not each walk — and that
+    /// budget's deadline stops a walk that runs long however few entries it has
+    /// visited. `Err` carries the reason, which the caller reports as the refusal.
+    pub fn first_missing_object_within(
+        &self,
+        roots: &[String],
+        budget: &mut ProjectionBudget,
+    ) -> Result<Option<String>, String> {
+        Ok(self
+            .walk_reachable(roots, Some(budget))?
+            .into_iter()
+            .find(|id| !self.objects.contains_key(id)))
+    }
+
+    /// Every object name reachable from `roots`, following commits to their
+    /// trees and parents, trees to their entries and tags to their targets.
+    ///
+    /// Unbudgeted, for this service's OWN walks rather than a caller's: one call
+    /// visits each object at most once, so its cost is bounded by what the
+    /// repository holds ([`MAX_OBJECTS_PER_REPOSITORY`],
+    /// [`MAX_OBJECT_BYTES_PER_REPOSITORY`]). A walk a REQUEST can drive repeatedly
+    /// goes through [`Repository::first_missing_object_within`], which charges a
+    /// budget, because the number of walks is then the caller's to choose.
+    pub fn reachable_from(&self, roots: &[String]) -> BTreeSet<String> {
+        // No budget is charged, so the walk cannot be refused.
+        self.walk_reachable(roots, None).unwrap_or_default()
+    }
+
+    /// The one reachability walk, charged to `budget` when there is one.
+    fn walk_reachable(
+        &self,
+        roots: &[String],
+        mut budget: Option<&mut ProjectionBudget>,
+    ) -> Result<BTreeSet<String>, String> {
+        let mut reached: BTreeSet<String> = BTreeSet::new();
+        let mut queue: Vec<String> = roots.to_vec();
+        while let Some(next) = queue.pop() {
+            if let Some(budget) = budget.as_deref_mut() {
+                // Charged per object TAKEN from the queue, which counts the
+                // entries every tree pushed onto it, so a tree naming many
+                // entries costs what it enqueued.
+                budget.entry()?;
+            }
+            if !reached.insert(next.clone()) {
+                continue;
+            }
+            let Some(object) = self.objects.get(&next) else {
+                continue;
+            };
+            match object.kind {
+                Kind::Blob => {}
+                Kind::Commit => {
+                    if let Some(fields) = git_object::decode_commit(&object.data) {
+                        queue.push(fields.tree);
+                        queue.extend(fields.parents);
+                    }
+                }
+                Kind::Tree => {
+                    if let Some(entries) = git_object::decode_tree(&object.data) {
+                        queue.extend(entries.into_iter().map(|entry| entry.id));
+                    }
+                }
+                Kind::Tag => {
+                    if let Some(fields) = git_object::decode_tag(&object.data) {
+                        queue.push(fields.object);
+                    }
+                }
+            }
+        }
+        Ok(reached)
+    }
+
+    /// Release what no ref reaches, and keep the commit projection bounded.
+    ///
+    /// Objects are kept exactly when a ref reaches them, which is what git's own
+    /// garbage collection does: an object a force-push or a branch deletion
+    /// orphaned is released. The projection additionally drops the oldest commits
+    /// beyond [`MAX_COMMITS_RETAINED`] (never a ref's tip), so an older commit id
+    /// becomes one the repository no longer holds while every ref stays readable.
+    pub fn prune_history(&mut self) {
+        let roots: Vec<String> = self.refs().into_iter().map(|(_, id)| id).collect();
+        let reachable = self.reachable_from(&roots);
+        self.objects.retain(|id, _| reachable.contains(id));
+        self.commits.retain(|id, _| reachable.contains(id));
+
+        let tips: BTreeSet<String> = roots
+            .iter()
+            .filter_map(|id| self.peel(id))
+            .chain(roots.iter().cloned())
             .collect();
         if self.commits.len() > MAX_COMMITS_RETAINED {
             let mut oldest_first: Vec<(u64, String)> = self
@@ -799,12 +1425,6 @@ impl Repository {
                 excess -= 1;
             }
         }
-        let referenced: std::collections::BTreeSet<String> = self
-            .commits
-            .values()
-            .flat_map(|commit| commit.files.values().map(|entry| entry.blob_id.clone()))
-            .collect();
-        self.blobs.retain(|blob_id, _| referenced.contains(blob_id));
     }
 }
 
@@ -1107,16 +1727,6 @@ pub fn is_kms_key_selector(key_id: &str) -> bool {
     is_kms_alias(key_id) || is_kms_key_id(key_id) || is_kms_arn(key_id)
 }
 
-/// The HTTPS clone URL CodeCommit publishes for a repository in a region.
-pub fn clone_url_http(region: &str, name: &str) -> String {
-    format!("https://git-codecommit.{region}.amazonaws.com/v1/repos/{name}")
-}
-
-/// The SSH clone URL CodeCommit publishes for a repository in a region.
-pub fn clone_url_ssh(region: &str, name: &str) -> String {
-    format!("ssh://git-codecommit.{region}.amazonaws.com/v1/repos/{name}")
-}
-
 /// The region this request is addressed to: the SigV4 credential scope's region,
 /// falling back to [`DEFAULT_REGION`] for an unsigned request.
 pub fn region_of(parts: &::http::request::Parts) -> String {
@@ -1168,14 +1778,18 @@ pub fn git_date(time: SystemTime) -> String {
     format!("{secs} +0000")
 }
 
-/// The width of an object id in bytes: a git object name is 20 bytes, written as 40
-/// hex characters.
-const OBJECT_ID_BYTES: usize = 20;
-
 /// Is this a syntactically valid git object id (40 hex characters)?
 pub fn is_object_id(candidate: &str) -> bool {
-    candidate.len() == 2 * OBJECT_ID_BYTES && candidate.bytes().all(|b| b.is_ascii_hexdigit())
+    git_object::is_object_id(candidate)
 }
+
+/// The longest reference name this service accepts.
+///
+/// `BranchName`'s modelled `length`
+/// (`smithy_query(query="operation",operation="CreateBranch")` reports
+/// `len 1..256`): a reference longer than this is one the control plane could not
+/// address, so neither face of the service writes it.
+pub const MAX_REF_NAME: usize = 256;
 
 /// Can `refs/heads/<name>` be a git reference? CodeCommit is a git host, so a
 /// branch name is a reference name: the rules below are git's own
@@ -1185,7 +1799,9 @@ pub fn is_object_id(candidate: &str) -> bool {
 /// The model constrains only the length of `BranchName`
 /// (`smithy_query(query="operation",operation="CreateBranch")` reports
 /// `len 1..256`), so every other malformed name arrives at a handler and is
-/// refused there with `InvalidBranchNameException`.
+/// refused there with `InvalidBranchNameException`. A caller that is not held to
+/// the modelled length by the boundary validator — a git push, whose ref name is
+/// not a modelled member — goes through [`is_valid_ref_name`], which adds it.
 pub fn is_valid_branch_name(name: &str) -> bool {
     // git refuses a bare "@" as a reference name, a name that ends in "/" or
     // ".", the sequences "..", "//" and "@{", and every ASCII control
@@ -1215,6 +1831,19 @@ pub fn is_valid_branch_name(name: &str) -> bool {
     })
 }
 
+/// Can this be the short name of a reference a WRITE may create, in either
+/// namespace (`refs/heads/<name>`, `refs/tags/<name>`)?
+///
+/// [`is_valid_branch_name`]'s rule — git's own `check-ref-format` — plus
+/// [`MAX_REF_NAME`]. One implementation for both faces of the service: a name a
+/// git push can create is exactly a name `CreateBranch` accepts, so the two
+/// cannot disagree about which references a repository may hold. Smithy counts a
+/// string's length in Unicode code points, as the boundary validator does for the
+/// modelled member.
+pub fn is_valid_ref_name(name: &str) -> bool {
+    name.chars().count() <= MAX_REF_NAME && is_valid_branch_name(name)
+}
+
 /// The total content size of the folder a path lives in, over the sizes a tree
 /// snapshot records for that folder's immediate entries.
 pub fn folder_content_bytes(files: &BTreeMap<String, FileEntry>, path: &str) -> i64 {
@@ -1226,19 +1855,9 @@ pub fn folder_content_bytes(files: &BTreeMap<String, FileEntry>, path: &str) -> 
         .fold(0i64, i64::saturating_add)
 }
 
-/// The id of a git object: the git object encoding `"<kind> <len>\0"` plus the
-/// payload, hashed and reported as the 40 hex characters a git object name is wide
-/// (see this module's header for how the digest is formed).
-fn git_object_id(kind: &str, payload: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(format!("{kind} {}\0", payload.len()).as_bytes());
-    hasher.update(payload);
-    ::hex::encode(&hasher.finalize()[..OBJECT_ID_BYTES])
-}
-
 /// The `blobId` of a file's bytes.
 pub fn blob_id(content: &[u8]) -> String {
-    git_object_id("blob", content)
+    git_object::object_id(Kind::Blob, content)
 }
 
 /// The git mode of a modeled `fileMode`: the numeric file mode permission code a
@@ -1247,17 +1866,41 @@ pub fn blob_id(content: &[u8]) -> String {
 /// `smithy_query(query="doc",shape="BlobMetadata",member="mode")`).
 pub fn git_mode(file_mode: &str) -> &'static str {
     match file_mode {
-        FILE_MODE_EXECUTABLE => "100755",
-        FILE_MODE_SYMLINK => "120000",
+        FILE_MODE_EXECUTABLE => git_object::MODE_EXECUTABLE,
+        FILE_MODE_SYMLINK => git_object::MODE_SYMLINK,
         // NORMAL, and anything the enum does not declare, is a regular file.
-        _ => "100644",
+        _ => git_object::MODE_FILE,
     }
 }
 
-/// The `treeId` of a whole tree snapshot: the git tree object over the entries,
-/// recursing into one subtree per path prefix exactly as git does.
-pub fn tree_id(files: &BTreeMap<String, FileEntry>) -> String {
-    let mut payload: Vec<u8> = Vec::new();
+/// The modeled `fileMode` a git tree entry mode names.
+pub fn file_mode_of(mode: &str) -> &'static str {
+    match mode {
+        git_object::MODE_EXECUTABLE => FILE_MODE_EXECUTABLE,
+        git_object::MODE_SYMLINK => FILE_MODE_SYMLINK,
+        _ => FILE_MODE_NORMAL,
+    }
+}
+
+/// The tree objects a whole snapshot is made of: the root's name, and every tree
+/// object (root and nested) the snapshot needs, exactly as git would write them.
+///
+/// `None` when an entry's `blobId` is not an object name, which only a snapshot
+/// built outside this module could carry: every writer here puts an id
+/// [`Repository::insert_blob`] reported.
+pub fn tree_objects(files: &BTreeMap<String, FileEntry>) -> Option<(String, Vec<Object>)> {
+    let mut objects: Vec<Object> = Vec::new();
+    let root = build_tree(files, &mut objects)?;
+    Some((root, objects))
+}
+
+/// The `treeId` of a whole tree snapshot, or `None` when an entry's `blobId` is
+/// not an object name.
+pub fn tree_id(files: &BTreeMap<String, FileEntry>) -> Option<String> {
+    tree_objects(files).map(|(root, _)| root)
+}
+
+fn build_tree(files: &BTreeMap<String, FileEntry>, objects: &mut Vec<Object>) -> Option<String> {
     let mut blobs: BTreeMap<&str, &FileEntry> = BTreeMap::new();
     let mut dirs: BTreeMap<&str, BTreeMap<String, FileEntry>> = BTreeMap::new();
     for (path, entry) in files {
@@ -1273,36 +1916,29 @@ pub fn tree_id(files: &BTreeMap<String, FileEntry>) -> String {
         }
     }
 
-    // git orders tree entries by name, comparing a subtree's name as if it ended
-    // in '/', which is what puts "a.txt" before "a/b" in a tree object.
-    let mut entries: Vec<(String, &'static str, String, String)> = Vec::new();
+    let mut entries: Vec<TreeEntry> = Vec::new();
     for (name, entry) in blobs {
-        entries.push((
-            name.to_string(),
-            git_mode(&entry.file_mode),
-            name.to_string(),
-            entry.blob_id.clone(),
-        ));
+        entries.push(TreeEntry {
+            mode: git_mode(&entry.file_mode).to_string(),
+            name: name.to_string(),
+            id: entry.blob_id.clone(),
+        });
     }
     for (name, subtree) in &dirs {
-        entries.push((
-            format!("{name}/"),
-            "40000",
-            (*name).to_string(),
-            tree_id(subtree),
-        ));
+        entries.push(TreeEntry {
+            mode: git_object::MODE_TREE.to_string(),
+            name: (*name).to_string(),
+            id: build_tree(subtree, objects)?,
+        });
     }
-    entries.sort_by(|left, right| left.0.cmp(&right.0));
-
-    for (_, mode, name, id) in entries {
-        payload.extend_from_slice(format!("{mode} {name}\0").as_bytes());
-        payload.extend_from_slice(&::hex::decode(&id).unwrap_or_default());
-    }
-    git_object_id("tree", &payload)
+    let tree = git_object::encode_tree(entries)?;
+    let id = tree.id();
+    objects.push(tree);
+    Some(id)
 }
 
-/// The `commitId` of a commit: the git commit object over its tree, parents,
-/// author, committer and message.
+/// The `commitId` of a commit: the name of the git commit object over its tree,
+/// parents, author, committer and message.
 pub fn commit_id(
     tree: &str,
     parents: &[String],
@@ -1310,25 +1946,21 @@ pub fn commit_id(
     committer: &UserInfo,
     message: Option<&str>,
 ) -> String {
-    let mut payload = format!("tree {tree}\n");
-    for parent in parents {
-        payload.push_str(&format!("parent {parent}\n"));
-    }
-    payload.push_str(&format!("author {}\n", git_identity(author)));
-    payload.push_str(&format!("committer {}\n", git_identity(committer)));
-    payload.push('\n');
-    if let Some(message) = message {
-        payload.push_str(message);
-    }
-    git_object_id("commit", payload.as_bytes())
+    git_object::encode_commit(&git_object::CommitFields {
+        tree: tree.to_string(),
+        parents: parents.to_vec(),
+        author: git_identity(author),
+        committer: git_identity(committer),
+        message: message.unwrap_or_default().to_string(),
+    })
+    .id()
 }
 
 fn git_identity(user: &UserInfo) -> String {
-    format!(
-        "{} <{}> {}",
+    git_object::join_identity(
         user.name.as_deref().unwrap_or(""),
         user.email.as_deref().unwrap_or(""),
-        user.date.as_deref().unwrap_or("0 +0000")
+        user.date.as_deref().unwrap_or("0 +0000"),
     )
 }
 

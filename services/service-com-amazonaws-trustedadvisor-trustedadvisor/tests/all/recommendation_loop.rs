@@ -256,8 +256,9 @@ async fn list_checks_reports_the_catalog_and_honours_every_filter() {
             &["low-utilization-ec2-instances"],
         ),
         ("?pillar=cost_optimizing&awsService=rds", &["rds-idle-db-instances"]),
-        // `language` selects a translation the store does not hold; it must not
-        // change which checks are reported.
+        // `language` selects which stored copy of the check text is reported
+        // (pinned in `tests/all/localized_text.rs`); it is not a filter, so it
+        // must not change which checks are reported.
         ("?language=ja&source=rds", &["rds-idle-db-instances"]),
     ];
 

@@ -8,6 +8,12 @@
 //! time the engine hands this state out (`state::<T>()` builds it from
 //! `Default`), and every response is computed from it — never from the request.
 //!
+//! The catalog's human-readable text (a check's and a recommendation's `name`
+//! and `description`) is held as a [`TextCatalog`]: one copy per
+//! `RecommendationLanguage`, because `language` on the reporting operations
+//! SELECTS which copy the response reports. A check and the recommendation it
+//! produced share one catalog, so they cannot disagree.
+//!
 //! Three maps, each keyed by the identifier its API looks a resource up by, so
 //! `BTreeMap` iteration order is also the stable pagination order:
 //!
@@ -179,6 +185,87 @@ pub fn date_time(millis: i64) -> ::aws_smithy_types::DateTime {
     ::aws_smithy_types::DateTime::from_millis(millis)
 }
 
+// ---------------------------------------------------------------------------
+// Localized catalog text
+// ---------------------------------------------------------------------------
+
+/// The `RecommendationLanguage` the catalog's text is written in when a request
+/// names no language: `en`, the first value `RecommendationLanguage` declares
+/// (`RECOMMENDATION_LANGUAGE_VALUES` in `ops::types::shared_types`) and the
+/// language AWS answers a request that asks for none in.
+pub const DEFAULT_LANGUAGE: &str = "en";
+
+/// The human-readable text of one catalog entry in ONE language: what a
+/// localizable response member (`CheckSummary$name`/`$description`,
+/// `Recommendation$name`/`$description`, `RecommendationSummary$name`) is copied
+/// from.
+#[derive(Debug, Clone)]
+pub struct LocalizedText {
+    pub name: String,
+    pub description: String,
+}
+
+/// One catalog entry's text in every language the store holds a copy in.
+///
+/// `language` on `ListChecks`, `ListRecommendations`, `GetRecommendation` and
+/// `ListRecommendationResources` is documented as "the ISO 639-1 code for the
+/// language that you want your checks/recommendations to appear in", so it
+/// SELECTS which stored copy of the text a response reports — it is not a
+/// filter and never changes which entries are reported. A language the entry
+/// has no copy in is answered in [`DEFAULT_LANGUAGE`], which every entry holds
+/// by construction.
+#[derive(Debug, Clone)]
+pub struct TextCatalog {
+    /// The text in [`DEFAULT_LANGUAGE`].
+    default: LocalizedText,
+    /// One copy per other language, keyed by its `RecommendationLanguage`
+    /// value.
+    translations: BTreeMap<String, LocalizedText>,
+}
+
+impl TextCatalog {
+    /// A catalog whose [`DEFAULT_LANGUAGE`] copy is `default` and which holds
+    /// `translations` (language, name, description) for the other languages.
+    pub fn new<'a>(
+        default: LocalizedText,
+        translations: impl IntoIterator<Item = (&'a str, &'a str, &'a str)>,
+    ) -> Self {
+        Self {
+            default,
+            translations: translations
+                .into_iter()
+                .filter(|(language, _, _)| *language != DEFAULT_LANGUAGE)
+                .map(|(language, name, description)| {
+                    (
+                        language.to_string(),
+                        LocalizedText {
+                            name: name.to_string(),
+                            description: description.to_string(),
+                        },
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    /// The text to report for a request that asked for `language` (`None` when
+    /// it named none): the stored copy for that language, or the
+    /// [`DEFAULT_LANGUAGE`] copy when this entry holds none.
+    pub fn text(&self, language: Option<&str>) -> &LocalizedText {
+        language
+            .filter(|language| *language != DEFAULT_LANGUAGE)
+            .and_then(|language| self.translations.get(language))
+            .unwrap_or(&self.default)
+    }
+
+    /// Every language this entry holds a copy in, `en` first then the rest in
+    /// language order. Lets a caller see the catalog's coverage without
+    /// reaching into its map.
+    pub fn languages(&self) -> impl Iterator<Item = &str> {
+        std::iter::once(DEFAULT_LANGUAGE).chain(self.translations.keys().map(String::as_str))
+    }
+}
+
 /// A Trusted Advisor check: the catalog entry `ListChecks` reports.
 ///
 /// Enum-typed members (`pillars`, `source`) are held as the wire strings the
@@ -189,8 +276,9 @@ pub fn date_time(millis: i64) -> ::aws_smithy_types::DateTime {
 pub struct Check {
     pub id: String,
     pub arn: String,
-    pub name: String,
-    pub description: String,
+    /// This check's `name`/`description`, one copy per language — read through
+    /// [`TextCatalog::text`] with the request's `language`.
+    pub text: TextCatalog,
     pub pillars: Vec<String>,
     pub aws_services: Vec<String>,
     pub source: String,
@@ -209,8 +297,10 @@ pub struct Check {
 pub struct RecommendationEntry {
     pub id: String,
     pub arn: String,
-    pub name: String,
-    pub description: String,
+    /// This recommendation's `name`/`description`, one copy per language — the
+    /// text of the check that produced it, read through [`TextCatalog::text`]
+    /// with the request's `language`.
+    pub text: TextCatalog,
     pub check_arn: Option<String>,
     pub r#type: String,
     pub status: String,
@@ -484,8 +574,14 @@ struct SeedResource {
 /// resources.
 struct SeedRow {
     check_id: &'static str,
+    /// The check's name in [`DEFAULT_LANGUAGE`].
     name: &'static str,
+    /// The check's description in [`DEFAULT_LANGUAGE`].
     description: &'static str,
+    /// The same text in every OTHER `RecommendationLanguage`, as
+    /// `(language, name, description)`. The catalog's text is localized because
+    /// `language` selects the copy a response reports; see [`TextCatalog`].
+    translations: &'static [(&'static str, &'static str, &'static str)],
     pillars: &'static [&'static str],
     aws_services: &'static [&'static str],
     source: &'static str,
@@ -514,6 +610,75 @@ const SEED: &[SeedRow] = &[
         description: "Checks the Amazon EC2 instances that were running at any time during the \
                       last 14 days and alerts you if the daily CPU utilization was 10% or less \
                       and network I/O was 5 MB or less on 4 or more days.",
+        translations: &[
+            (
+                "de",
+                "Amazon EC2-Instances mit geringer Auslastung",
+                "Prüft die Amazon EC2-Instances, die in den letzten 14 Tagen zu irgendeinem \
+                 Zeitpunkt ausgeführt wurden, und warnt Sie, wenn die tägliche CPU-Auslastung an \
+                 4 oder mehr Tagen höchstens 10 % und die Netzwerk-E/A höchstens 5 MB betrug.",
+            ),
+            (
+                "es",
+                "Instancias de Amazon EC2 con poca utilización",
+                "Comprueba las instancias de Amazon EC2 que estuvieron en ejecución en cualquier \
+                 momento durante los últimos 14 días y le avisa si la utilización diaria de CPU \
+                 fue del 10 % o menos y la E/S de red de 5 MB o menos durante 4 días o más.",
+            ),
+            (
+                "fr",
+                "Instances Amazon EC2 sous-utilisées",
+                "Vérifie les instances Amazon EC2 qui ont fonctionné à un moment quelconque au \
+                 cours des 14 derniers jours et vous alerte si l'utilisation quotidienne du \
+                 processeur a été inférieure ou égale à 10 % et les E/S réseau inférieures ou \
+                 égales à 5 Mo pendant 4 jours ou plus.",
+            ),
+            (
+                "id",
+                "Instans Amazon EC2 dengan Pemanfaatan Rendah",
+                "Memeriksa instans Amazon EC2 yang berjalan kapan saja selama 14 hari terakhir \
+                 dan memberi tahu Anda jika pemanfaatan CPU harian 10% atau kurang dan I/O \
+                 jaringan 5 MB atau kurang selama 4 hari atau lebih.",
+            ),
+            (
+                "it",
+                "Istanze Amazon EC2 con utilizzo ridotto",
+                "Controlla le istanze Amazon EC2 in esecuzione in qualsiasi momento negli ultimi \
+                 14 giorni e invia un avviso se l'utilizzo quotidiano della CPU è stato pari o \
+                 inferiore al 10% e l'I/O di rete pari o inferiore a 5 MB per 4 o più giorni.",
+            ),
+            (
+                "ja",
+                "低使用率の Amazon EC2 インスタンス",
+                "過去 14 日間に稼働していた Amazon EC2 インスタンスを確認し、1 日の CPU 使用率が \
+                 10% 以下で、ネットワーク I/O が 5 MB 以下の日が 4 日以上あった場合に通知します。",
+            ),
+            (
+                "ko",
+                "사용률이 낮은 Amazon EC2 인스턴스",
+                "지난 14일 동안 실행된 Amazon EC2 인스턴스를 확인하고, 일일 CPU 사용률이 10% \
+                 이하이고 네트워크 I/O가 5MB 이하인 날이 4일 이상인 경우 알립니다.",
+            ),
+            (
+                "pt_BR",
+                "Instâncias do Amazon EC2 com baixa utilização",
+                "Verifica as instâncias do Amazon EC2 que estiveram em execução em qualquer \
+                 momento nos últimos 14 dias e emite um alerta se a utilização diária da CPU foi \
+                 de 10% ou menos e a E/S de rede foi de 5 MB ou menos em 4 dias ou mais.",
+            ),
+            (
+                "zh",
+                "低利用率的 Amazon EC2 实例",
+                "检查过去 14 天内任何时间运行过的 Amazon EC2 实例，如果其中有 4 天或更多天的每日 \
+                 CPU 利用率不超过 10% 且网络 I/O 不超过 5 MB，则向您发出警报。",
+            ),
+            (
+                "zh_TW",
+                "使用率偏低的 Amazon EC2 執行個體",
+                "檢查過去 14 天內曾經執行的 Amazon EC2 執行個體，若有 4 天以上的每日 CPU 使用率\
+                 低於或等於 10% 且網路 I/O 低於或等於 5 MB，則發出警示。",
+            ),
+        ],
         pillars: &["cost_optimizing"],
         aws_services: &["ec2"],
         source: "ta_check",
@@ -561,6 +726,68 @@ const SEED: &[SeedRow] = &[
         name: "Amazon EBS Snapshots",
         description: "Checks the age of the snapshots for your Amazon Elastic Block Store \
                       (Amazon EBS) volumes (available or in-use).",
+        translations: &[
+            (
+                "de",
+                "Amazon EBS-Snapshots",
+                "Prüft das Alter der Snapshots Ihrer Amazon Elastic Block Store \
+                 (Amazon EBS)-Volumes (verfügbar oder in Verwendung).",
+            ),
+            (
+                "es",
+                "Instantáneas de Amazon EBS",
+                "Comprueba la antigüedad de las instantáneas de sus volúmenes de Amazon Elastic \
+                 Block Store (Amazon EBS) (disponibles o en uso).",
+            ),
+            (
+                "fr",
+                "Instantanés Amazon EBS",
+                "Vérifie l'ancienneté des instantanés de vos volumes Amazon Elastic Block Store \
+                 (Amazon EBS) (disponibles ou en cours d'utilisation).",
+            ),
+            (
+                "id",
+                "Snapshot Amazon EBS",
+                "Memeriksa usia snapshot volume Amazon Elastic Block Store (Amazon EBS) Anda \
+                 (tersedia atau sedang digunakan).",
+            ),
+            (
+                "it",
+                "Snapshot Amazon EBS",
+                "Controlla l'età degli snapshot dei volumi Amazon Elastic Block Store \
+                 (Amazon EBS) (disponibili o in uso).",
+            ),
+            (
+                "ja",
+                "Amazon EBS スナップショット",
+                "Amazon Elastic Block Store (Amazon EBS) ボリューム (available または in-use) の\
+                 スナップショットの経過日数を確認します。",
+            ),
+            (
+                "ko",
+                "Amazon EBS 스냅샷",
+                "Amazon Elastic Block Store(Amazon EBS) 볼륨(available 또는 in-use)의 스냅샷 \
+                 생성 경과 기간을 확인합니다.",
+            ),
+            (
+                "pt_BR",
+                "Snapshots do Amazon EBS",
+                "Verifica a idade dos snapshots dos volumes do Amazon Elastic Block Store \
+                 (Amazon EBS) (disponíveis ou em uso).",
+            ),
+            (
+                "zh",
+                "Amazon EBS 快照",
+                "检查您的 Amazon Elastic Block Store (Amazon EBS) 卷（available 或 in-use）的\
+                 快照的创建时间。",
+            ),
+            (
+                "zh_TW",
+                "Amazon EBS 快照",
+                "檢查您的 Amazon Elastic Block Store (Amazon EBS) 磁碟區 (available 或 in-use) \
+                 快照的建立時間。",
+            ),
+        ],
         pillars: &["fault_tolerance"],
         aws_services: &["ebs"],
         source: "ta_check",
@@ -607,6 +834,64 @@ const SEED: &[SeedRow] = &[
         name: "IAM Access Key Rotation",
         description: "Checks for active IAM access keys that have not been rotated in the last \
                       90 days.",
+        translations: &[
+            (
+                "de",
+                "Rotation von IAM-Zugriffsschlüsseln",
+                "Prüft, ob aktive IAM-Zugriffsschlüssel in den letzten 90 Tagen nicht rotiert \
+                 wurden.",
+            ),
+            (
+                "es",
+                "Rotación de claves de acceso de IAM",
+                "Busca claves de acceso de IAM activas que no se hayan rotado en los últimos 90 \
+                 días.",
+            ),
+            (
+                "fr",
+                "Rotation des clés d'accès IAM",
+                "Recherche les clés d'accès IAM actives qui n'ont pas fait l'objet d'une rotation \
+                 au cours des 90 derniers jours.",
+            ),
+            (
+                "id",
+                "Rotasi Kunci Akses IAM",
+                "Memeriksa kunci akses IAM aktif yang belum dirotasi dalam 90 hari terakhir.",
+            ),
+            (
+                "it",
+                "Rotazione delle chiavi di accesso IAM",
+                "Verifica la presenza di chiavi di accesso IAM attive che non sono state ruotate \
+                 negli ultimi 90 giorni.",
+            ),
+            (
+                "ja",
+                "IAM アクセスキーのローテーション",
+                "過去 90 日間にローテーションされていないアクティブな IAM アクセスキーを\
+                 確認します。",
+            ),
+            (
+                "ko",
+                "IAM 액세스 키 교체",
+                "지난 90일 동안 교체되지 않은 활성 IAM 액세스 키를 확인합니다.",
+            ),
+            (
+                "pt_BR",
+                "Rotação de chaves de acesso do IAM",
+                "Verifica se há chaves de acesso do IAM ativas que não foram alternadas nos \
+                 últimos 90 dias.",
+            ),
+            (
+                "zh",
+                "IAM 访问密钥轮换",
+                "检查在过去 90 天内未轮换的活动 IAM 访问密钥。",
+            ),
+            (
+                "zh_TW",
+                "IAM 存取金鑰輪換",
+                "檢查在過去 90 天內未輪換的作用中 IAM 存取金鑰。",
+            ),
+        ],
         pillars: &["security"],
         aws_services: &["iam"],
         source: "ta_check",
@@ -631,6 +916,69 @@ const SEED: &[SeedRow] = &[
         name: "Amazon RDS Idle DB Instances",
         description: "Checks the configuration of your Amazon Relational Database Service \
                       (Amazon RDS) for any database (DB) instances that appear to be idle.",
+        translations: &[
+            (
+                "de",
+                "Ungenutzte Amazon RDS-DB-Instances",
+                "Prüft die Konfiguration Ihres Amazon Relational Database Service (Amazon RDS) \
+                 auf Datenbank-Instances (DB), die ungenutzt zu sein scheinen.",
+            ),
+            (
+                "es",
+                "Instancias de base de datos de Amazon RDS inactivas",
+                "Comprueba la configuración de Amazon Relational Database Service (Amazon RDS) \
+                 para detectar instancias de base de datos (BD) que parecen estar inactivas.",
+            ),
+            (
+                "fr",
+                "Instances de base de données Amazon RDS inactives",
+                "Vérifie la configuration de votre Amazon Relational Database Service \
+                 (Amazon RDS) à la recherche d'instances de base de données (BD) qui semblent \
+                 inactives.",
+            ),
+            (
+                "id",
+                "Instans Basis Data Amazon RDS yang Menganggur",
+                "Memeriksa konfigurasi Amazon Relational Database Service (Amazon RDS) Anda untuk \
+                 menemukan instans basis data (DB) yang tampak menganggur.",
+            ),
+            (
+                "it",
+                "Istanze database Amazon RDS inattive",
+                "Controlla la configurazione di Amazon Relational Database Service (Amazon RDS) \
+                 per individuare istanze database (DB) che sembrano inattive.",
+            ),
+            (
+                "ja",
+                "アイドル状態の Amazon RDS DB インスタンス",
+                "Amazon Relational Database Service (Amazon RDS) の設定を確認し、アイドル状態と\
+                 思われるデータベース (DB) インスタンスを検出します。",
+            ),
+            (
+                "ko",
+                "유휴 Amazon RDS DB 인스턴스",
+                "Amazon Relational Database Service(Amazon RDS) 구성에서 유휴 상태로 보이는 \
+                 데이터베이스(DB) 인스턴스를 확인합니다.",
+            ),
+            (
+                "pt_BR",
+                "Instâncias de banco de dados do Amazon RDS inativas",
+                "Verifica a configuração do Amazon Relational Database Service (Amazon RDS) para \
+                 identificar instâncias de banco de dados (BD) que parecem estar inativas.",
+            ),
+            (
+                "zh",
+                "空闲的 Amazon RDS 数据库实例",
+                "检查您的 Amazon Relational Database Service (Amazon RDS) 配置，找出似乎处于\
+                 空闲状态的数据库 (DB) 实例。",
+            ),
+            (
+                "zh_TW",
+                "閒置的 Amazon RDS 資料庫執行個體",
+                "檢查您的 Amazon Relational Database Service (Amazon RDS) 設定，找出似乎處於\
+                 閒置狀態的資料庫 (DB) 執行個體。",
+            ),
+        ],
         pillars: &["cost_optimizing", "performance"],
         aws_services: &["rds"],
         source: "rds",
@@ -703,13 +1051,23 @@ impl Default for ComAmazonawsTrustedadvisorTrustedadvisorState {
             let last_updated_at_millis =
                 SEED_CREATED_AT_MILLIS + DAY_MILLIS * (index as i64 + 1);
 
+            // ONE catalog of localized text per row, shared by the check and
+            // the recommendation it produced, so the two can never report
+            // different text for the same language.
+            let text = TextCatalog::new(
+                LocalizedText {
+                    name: row.name.to_string(),
+                    description: row.description.to_string(),
+                },
+                row.translations.iter().copied(),
+            );
+
             state.checks.insert(
                 row.check_id.to_string(),
                 Check {
                     id: row.check_id.to_string(),
                     arn: check_arn.clone(),
-                    name: row.name.to_string(),
-                    description: row.description.to_string(),
+                    text: text.clone(),
                     pillars: owned(row.pillars),
                     aws_services: owned(row.aws_services),
                     source: row.source.to_string(),
@@ -726,8 +1084,7 @@ impl Default for ComAmazonawsTrustedadvisorTrustedadvisorState {
                 RecommendationEntry {
                     id: recommendation_id.clone(),
                     arn: recommendation_arn.clone(),
-                    name: row.name.to_string(),
-                    description: row.description.to_string(),
+                    text,
                     check_arn: Some(check_arn),
                     r#type: row.recommendation_type.to_string(),
                     status: row.recommendation_status.to_string(),

@@ -270,9 +270,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
 
-        // A rule records configuration changes the recorder captures, so there has to
-        // be a recorder.
-        if store.recorders.is_empty() {
+        // A rule evaluates the configuration changes a CUSTOMER MANAGED recorder
+        // captures, so there has to be one: a service-linked recorder records for the
+        // service it is linked to.
+        if !store.has_customer_managed_recorder() {
             return Err(
                 PutConfigRuleErrorModeled::NoAvailableConfigurationRecorderException(
                     NoAvailableConfigurationRecorderException {

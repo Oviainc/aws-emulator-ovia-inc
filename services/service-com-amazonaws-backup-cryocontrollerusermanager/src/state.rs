@@ -18,10 +18,12 @@
 //! [`VaultView`] is likewise the ONLY vault read projection: `DescribeBackupVault`
 //! and `ListBackupVaults` both answer from it.
 //!
-//! [`ComAmazonawsBackupCryocontrollerusermanagerState::visible_vault`] is the
-//! resolution step every vault-scoped READ shares: it applies the access decision
-//! before the existence lookup, so no read can disclose a vault the caller cannot
-//! see.
+//! [`ComAmazonawsBackupCryocontrollerusermanagerState::visible_vault`] (and its
+//! `_mut` twin, for a call that writes the vault it resolves) is the resolution
+//! step every vault-scoped call AWS Backup authorizes against the named vault
+//! shares — the vault READS and the vault-LOCK actions: it applies the access
+//! decision before the existence lookup, so none of them can disclose a vault the
+//! caller cannot see.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -862,12 +864,44 @@ impl ComAmazonawsBackupCryocontrollerusermanagerState {
         vault_name: &str,
         vault_account_id: Option<&str>,
     ) -> Result<&BackupVault, crate::scaffolded::AccessDeniedException> {
-        let own_account =
-            vault_account_id.is_none_or(|account| account == ::engine::emulator_account_id());
+        let own_account = Self::is_own_account(vault_account_id);
         self.vaults
             .get(vault_name)
             .filter(|_| own_account)
             .ok_or_else(crate::scaffolded::AccessDeniedException::insufficient_privileges)
+    }
+
+    /// The SAME decision for a vault-scoped call that WRITES the vault it resolves.
+    ///
+    /// AWS Backup authorizes a vault-lock action (`PutBackupVaultLockConfiguration`,
+    /// `DeleteBackupVaultLockConfiguration`) against the named vault as the resource,
+    /// so a vault-lock call naming a vault outside the caller's visibility is refused
+    /// for lack of privileges and told nothing about whether that vault exists —
+    /// exactly as a vault-scoped read is. Both paths therefore share ONE decision
+    /// rather than each deciding for itself.
+    ///
+    /// The vault-lock inputs model no `BackupVaultAccountId` (`smithy_query(
+    /// query="operation", operation="PutBackupVaultLockConfiguration")` lists
+    /// `BackupVaultName` plus the three day counts only), so those handlers pass
+    /// `None`; the parameter is kept so that every vault-scoped resolution, read or
+    /// write, states the account it is scoped to.
+    pub fn visible_vault_mut(
+        &mut self,
+        vault_name: &str,
+        vault_account_id: Option<&str>,
+    ) -> Result<&mut BackupVault, crate::scaffolded::AccessDeniedException> {
+        let own_account = Self::is_own_account(vault_account_id);
+        self.vaults
+            .get_mut(vault_name)
+            .filter(|_| own_account)
+            .ok_or_else(crate::scaffolded::AccessDeniedException::insufficient_privileges)
+    }
+
+    /// Whether a `BackupVaultAccountId` names the one account whose vaults this
+    /// emulator holds ([`engine::emulator_account_id`]); `None` is the caller's own
+    /// account, so it always does.
+    fn is_own_account(vault_account_id: Option<&str>) -> bool {
+        vault_account_id.is_none_or(|account| account == ::engine::emulator_account_id())
     }
 
     /// Materialise the transition the clock has already made due, for ONE job.

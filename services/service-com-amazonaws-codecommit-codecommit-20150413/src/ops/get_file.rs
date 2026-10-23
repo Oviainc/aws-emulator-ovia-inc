@@ -244,7 +244,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )),
             })
         })?;
-        let content = repository.blobs.get(&entry.blob_id).ok_or_else(|| {
+        let content = repository.blob(&entry.blob_id).ok_or_else(|| {
             // A retained commit always keeps the blobs its tree references, so this
             // is an internal inconsistency rather than anything the caller did —
             // refused the same way as an unreachable store.
@@ -260,7 +260,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             file_path,
             file_mode: entry.file_mode.clone(),
             file_size: entry.size,
-            file_content: content.clone(),
+            file_content: content.to_vec(),
         })
     }
 }

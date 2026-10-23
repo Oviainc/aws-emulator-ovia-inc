@@ -51,8 +51,12 @@ mod differences;
 mod file_commit_history;
 #[path = "all/folder_listing.rs"]
 mod folder_listing;
+#[path = "all/git_transport.rs"]
+mod git_transport;
 #[path = "all/harness.rs"]
 mod harness;
+#[path = "all/object_store_bounds.rs"]
+mod object_store_bounds;
 #[path = "all/repositories_for_approval_rule_template.rs"]
 mod repositories_for_approval_rule_template;
 #[path = "all/repository_description.rs"]

@@ -703,9 +703,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // the same way an unreachable store is refused, rather than
                     // writing an empty file and answering success.
                     let content = repository
-                        .blobs
-                        .get(&source_entry.blob_id)
-                        .cloned()
+                        .blob(&source_entry.blob_id)
+                        .map(<[u8]>::to_vec)
                         .ok_or_else(|| {
                             crate::scaffolded::Scaffolded::validation(format!(
                                 "the content of the source file {source_path} is not in the \
@@ -846,8 +845,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "A commit must contain at least one change." The tree id is the object
         // name of the whole snapshot, so an unchanged tree has the parent's id.
+        // Both sides are built the same way, so a snapshot whose entries name no
+        // object (which a stored one cannot) compares unequal rather than silently
+        // matching.
         let tree_id = crate::state::tree_id(&files);
-        if tree_id == base_tree_id {
+        if tree_id.is_some() && tree_id == base_tree_id {
             return Err(CreateCommitErrorModeled::NoChangeException(NoChangeException {
                 message: Some(
                     "the commit cannot be created because it makes no change to the repository"
@@ -887,6 +889,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::MAX_FILES_PER_TREE
             )));
         }
+        // The bound on the STORE, not on one request: the two checks above bound
+        // what a single commit carries, and this is what bounds the object store
+        // that successive commits grow. Every commit's objects are retained for as
+        // long as a ref reaches them, because a `git clone` has to be able to serve
+        // a branch's whole history (see `crate::state::Repository::prune_history`),
+        // so a branch tip pins its whole chain and nothing evicts it. It is the
+        // emulator's own bound — the model has no error for it — charged BEFORE the
+        // write and counting what this commit would add, with the same comparison
+        // `PutFile` and a pushed pack (`crate::service::git_http`) use: a write
+        // that would take the store PAST the cap is refused. The count is
+        // conservative: a blob the store already holds is counted too, and the tree
+        // and commit objects the snapshot writes besides are bounded by
+        // `MAX_FILES_PER_TREE` above.
+        let added_bytes = new_blobs
+            .values()
+            .map(Vec::len)
+            .fold(0usize, usize::saturating_add);
+        if repository.objects.len().saturating_add(new_blobs.len())
+            > crate::state::MAX_OBJECTS_PER_REPOSITORY
+            || repository.object_bytes().saturating_add(added_bytes)
+                > crate::state::MAX_OBJECT_BYTES_PER_REPOSITORY
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "the commit would take this repository past the {} objects and {} object bytes this emulator holds",
+                crate::state::MAX_OBJECTS_PER_REPOSITORY,
+                crate::state::MAX_OBJECT_BYTES_PER_REPOSITORY
+            )));
+        }
 
         let now = std::time::SystemTime::now();
         let user = UserInfo {
@@ -895,30 +925,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             date: Some(crate::state::git_date(now)),
         };
         let parents: Vec<String> = parent.into_iter().collect();
-        let commit_id = crate::state::commit_id(
-            &tree_id,
-            &parents,
-            &user,
-            &user,
-            input.commit_message.as_deref(),
-        );
-
-        let sequence = repository.next_commit_sequence;
-        repository.next_commit_sequence = sequence.saturating_add(1);
-        repository.blobs.extend(new_blobs);
-        repository.commits.insert(
-            commit_id.clone(),
-            crate::state::Commit {
-                commit_id: commit_id.clone(),
-                tree_id: tree_id.clone(),
-                parents,
-                message: input.commit_message.clone(),
-                author: user.clone(),
-                committer: user,
+        // Store the blobs this commit wrote, then the whole tree and the commit, as
+        // git objects: the ids reported here are those objects' names, and the
+        // objects themselves are what the git transport serves for a clone.
+        for (_, content) in new_blobs {
+            repository.insert_blob(content);
+        }
+        let (commit_id, tree_id) = repository
+            .commit_snapshot(
                 files,
-                sequence,
-            },
-        );
+                parents,
+                user.clone(),
+                user,
+                input.commit_message.as_deref(),
+            )
+            .ok_or_else(|| {
+                // Every entry carries a `blobId` this store reported for a blob it
+                // holds, so the tree always encodes; a snapshot that did not is an
+                // internal inconsistency, refused like an unreachable store.
+                crate::scaffolded::Scaffolded::validation(
+                    "the repository store holds a file whose blob id is not an object name",
+                )
+            })?;
         repository.branches.insert(
             input.branch_name.clone(),
             crate::state::Branch {
@@ -931,8 +959,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             repository.default_branch = Some(input.branch_name.clone());
         }
         repository.last_modified_date = now;
-        // Keep the history bounded: the oldest non-tip commits, and the blobs only
-        // they referenced, are released here.
+        // Keep the history bounded: the oldest commits no ref reaches are dropped
+        // here, together with every git object no remaining ref reaches.
         repository.prune_history();
 
         Ok(CreateCommitOutput {

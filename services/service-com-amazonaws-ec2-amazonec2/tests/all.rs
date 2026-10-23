@@ -15,6 +15,8 @@
 mod allowed_images_settings;
 #[path = "all/application_status.rs"]
 mod application_status;
+#[path = "all/associate_address.rs"]
+mod associate_address;
 #[path = "all/availability_zones.rs"]
 mod availability_zones;
 #[path = "all/byoip_cidr_lifecycle.rs"]

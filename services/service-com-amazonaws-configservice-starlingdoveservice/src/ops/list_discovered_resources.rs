@@ -255,9 +255,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let store = state.lock();
 
-        // Resources are discovered by a configuration recorder, so reporting what has
-        // been discovered needs one to exist.
-        if store.recorders.is_empty() {
+        // The resources this listing reports are the Amazon Web Services resources a
+        // CUSTOMER MANAGED configuration recorder discovers, so reporting them needs
+        // one to exist: a service-linked recorder records for the service it is linked
+        // to and does not stand in for one.
+        if !store.has_customer_managed_recorder() {
             return Err(
                 ListDiscoveredResourcesErrorModeled::NoAvailableConfigurationRecorderException(
                     NoAvailableConfigurationRecorderException {
