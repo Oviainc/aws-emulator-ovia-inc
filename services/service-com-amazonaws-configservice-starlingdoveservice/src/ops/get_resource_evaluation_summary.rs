@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetResourceEvaluationSummary
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetResourceEvaluationSummary`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the summary of one proactive resource evaluation `StartResourceEvaluation`
+//! started: the evaluation context and resource details it ran against, its mode, the
+//! status its execution has reached and, once it has finished, the compliance it
+//! places the resource at.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetResourceEvaluationSummary::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A READ ONLY: every member is derived from the evaluation persisted in
+//! [`crate::state`], from the Config rules that account holds, and from the clock.
+//! Nothing here writes, and nothing synthesises a verdict for rule logic this
+//! emulator did not run — see [`evaluation_outcome`].
 //!
 //! ## Shape of an operation
 //!
@@ -65,19 +65,19 @@
 //!
 //! ## Output
 //!
-//! * `Compliance` (ComplianceType, one of: COMPLIANT | INSUFFICIENT_DATA | NON_COMPLIANT |
-//!   NOT_APPLICABLE) — The compliance status of the resource evaluation summary.
-//! * `EvaluationContext` (EvaluationContext) — Returns an EvaluationContext object.
-//! * `EvaluationMode` (EvaluationMode, one of: DETECTIVE | PROACTIVE) — Lists results of the
-//!   mode that you requested to retrieve the resource evaluation summary. The valid values
-//!   are Detective or Proactive.
-//! * `EvaluationStartTimestamp` (Date) — The start timestamp when Config rule starts
-//!   evaluating compliance for the provided resource details.
-//! * `EvaluationStatus` (EvaluationStatus) — Returns an EvaluationStatus object.
-//! * `ResourceDetails` (ResourceDetails) — Returns a ResourceDetails object.
 //! * `ResourceEvaluationId` (ResourceEvaluationId, len 1..128) — The unique
 //!   ResourceEvaluationId of Amazon Web Services resource execution for which you want to
 //!   retrieve the evaluation summary.
+//! * `EvaluationMode` (EvaluationMode, one of: DETECTIVE | PROACTIVE) — Lists results of
+//!   the mode that you requested to retrieve the resource evaluation summary. The valid
+//!   values are Detective or Proactive.
+//! * `EvaluationStatus` (EvaluationStatus) — Returns an EvaluationStatus object.
+//! * `EvaluationStartTimestamp` (Date) — The start timestamp when Config rule starts
+//!   evaluating compliance for the provided resource details.
+//! * `Compliance` (ComplianceType, one of: COMPLIANT | NON_COMPLIANT | NOT_APPLICABLE |
+//!   INSUFFICIENT_DATA) — The compliance status of the resource evaluation summary.
+//! * `EvaluationContext` (EvaluationContext) — Returns an EvaluationContext object.
+//! * `ResourceDetails` (ResourceDetails) — Returns a ResourceDetails object.
 //!
 //! ## Errors
 //!
@@ -155,18 +155,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetResourceEvaluationSummary` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetResourceEvaluationSummaryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetResourceEvaluationSummary"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE)
+        })?;
+
+        let id = input.resource_evaluation_id;
+        let store = state.lock();
+        let Some(evaluation) = store.resource_evaluations.get(&id) else {
+            return Err(
+                GetResourceEvaluationSummaryErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::no_such_resource_evaluation_message(&id)),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // Every member below is DERIVED from the persisted execution, the Config
+        // rules this account holds and the current instant: the status the clock has
+        // moved the execution to, and the compliance only a finished execution
+        // reports.
+        let (evaluation_status, compliance) = crate::state::summary_of(
+            evaluation,
+            store.config_rules.values(),
+            ::std::time::SystemTime::now(),
+        );
+
+        Ok(GetResourceEvaluationSummaryOutput {
+            resource_evaluation_id: Some(evaluation.id.clone()),
+            evaluation_mode: Some(evaluation.evaluation_mode.clone()),
+            evaluation_status: Some(evaluation_status),
+            evaluation_start_timestamp: Some(crate::state::timestamp(evaluation.started_at)),
+            compliance,
+            evaluation_context: evaluation.evaluation_context_identifier.as_ref().map(
+                |identifier| EvaluationContext {
+                    evaluation_context_identifier: Some(identifier.clone()),
+                },
+            ),
+            resource_details: Some(evaluation.resource_details.clone()),
+        })
     }
 }

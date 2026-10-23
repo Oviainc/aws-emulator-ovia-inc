@@ -225,7 +225,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if comment.deleted {
             return Err(UpdateCommentErrorModeled::CommentDeletedException(
                 CommentDeletedException {
-                    message: Some(crate::state::comment_deleted_message("modify")),
+                    message: Some(crate::state::comment_deleted_message(None)),
                 },
             )
             .into());

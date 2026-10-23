@@ -285,6 +285,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let mut removed = store.clusters.remove(position);
+        // The configuration a final snapshot captures is the cluster as it stood
+        // when this call arrived, admin credentials included: a restore from
+        // that snapshot rebuilds exactly this cluster. Cloned before the record
+        // is marked `deleting` and its password dropped.
+        let source = final_identifier.as_ref().map(|_| removed.clone());
         removed.cluster.cluster_status = Some(st::STATUS_DELETING.to_string());
         removed.cluster.cluster_availability_status =
             Some(st::availability_status(st::STATUS_DELETING).to_string());
@@ -303,6 +308,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             store.snapshots.push(st::StoredSnapshot {
                 snapshot,
                 available_at: started + st::PROVISIONING_SPAN,
+                source,
             });
         }
 

@@ -23,6 +23,13 @@
 //! instant is stored on the record and materialised by whichever read first runs after
 //! it; nothing sleeps for it.
 //!
+//! Nothing is written until the connector role RESOLVES: it must name a role of this
+//! account ([`crate::state::pass_role_refusal`], reported as this operation's own 400
+//! `InvalidParameterException`) and be one IAM holds whose trust policy lets the SSM
+//! service principal assume it
+//! ([`crate::state::service_principal_trust_violation`]) — a registration whose connector
+//! IAM wiring could not work is refused rather than stored.
+//!
 //! Shared types live in `super::types`; the error channel in `crate::scaffolded`.
 //!
 //! ---
@@ -83,12 +90,15 @@
 //! * `ServerException` (HTTP 500) — These errors are usually caused by a server-side issue.
 //! * `ServiceUnavailableException` (HTTP 503) — The service is unavailable. Back off and
 //!   retry the operation.
+//! * `InvalidRequestException` (HTTP 400) — widened in through `extra_errors` (see below):
+//!   the model's `errors` list for this operation omits it, but the SERVICE models it and
+//!   it is what a connector role Amazon EKS cannot use is refused with.
 
 #[allow(unused_imports)]
 use super::types::*;
 use crate::state::{
-    self, ClusterRecord, CONNECTOR_ACTIVATION_WINDOW, MAX_CLUSTERS, MAX_STORED_CLUSTERS,
-    STATUS_PENDING,
+    self, ClusterRecord, CONNECTOR_ACTIVATION_WINDOW, CONNECTOR_ROLE_ARN_REFUSAL,
+    CONNECTOR_SERVICE_PRINCIPAL, MAX_CLUSTERS, MAX_STORED_CLUSTERS, STATUS_PENDING,
 };
 use std::time::SystemTime;
 
@@ -103,12 +113,22 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-eks-awswesleyfrontend.j
 // here — hence the `RegisterClusterError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.eks#RegisterCluster")]
+//
+// `InvalidRequestException` — a shape this SERVICE models ("The request is invalid given
+// the state of the cluster"), and other operations declare, which this one does not list —
+// is widened in through `extra_errors`: it is what the recorded service answers when the
+// connector role it is given cannot be used, and it carries the `clusterName` of the
+// registration that was refused.
+#[smithy_macros::operation_error(
+    "com.amazonaws.eks#RegisterCluster",
+    extra_errors = ["InvalidRequestException"]
+)]
 #[derive(Debug)]
 pub enum RegisterClusterErrorModeled {
     AccessDeniedException(AccessDeniedException),
     ClientException(ClientException),
     InvalidParameterException(InvalidParameterException),
+    InvalidRequestException(InvalidRequestException),
     ResourceInUseException(ResourceInUseException),
     ResourceLimitExceededException(ResourceLimitExceededException),
     ResourcePropagationDelayException(ResourcePropagationDelayException),
@@ -129,73 +149,6 @@ impl From<RegisterClusterErrorModeled> for RegisterClusterError {
     fn from(modeled: RegisterClusterErrorModeled) -> Self {
         crate::scaffolded::Scaffolded::Modeled(modeled)
     }
-}
-
-/// Why a `connectorConfig.roleArn` cannot be used to connect a cluster.
-///
-/// The two cases are client-visible and different: a value that is not an IAM ARN at
-/// all is a malformed PARAMETER, while a well-formed IAM ARN naming something this
-/// caller cannot have Amazon EKS assume on its behalf is a PERMISSION failure.
-#[derive(Debug)]
-enum RoleRefusal {
-    /// Not an IAM ARN at all.
-    NotAnIamArn,
-    /// A well-formed IAM ARN this caller cannot pass to Amazon EKS, and why.
-    ///
-    /// The split is drawn at one question: is the value an IAM ARN? Everything
-    /// past that — which account and partition it belongs to, and what it names
-    /// within IAM — is about WHAT the caller is asking Amazon EKS to assume, so
-    /// an IAM ARN whose resource is `role/` with no name after it lands here
-    /// rather than on [`Self::NotAnIamArn`]: it is a well-formed IAM ARN, and it
-    /// names no role this caller could pass.
-    NotPassable(String),
-}
-
-/// Validate `role_arn` as the IAM role Amazon EKS is to assume for the connector.
-///
-/// The connector role is a role Amazon EKS assumes on the caller's behalf, so what is
-/// checked is that the value names a role THIS caller can pass: a well-formed IAM role
-/// ARN of the caller's own partition and account. The `region` field is not read — IAM
-/// is global, so an IAM ARN carries none.
-///
-/// What is NOT checked is whether such a role exists and trusts the connector: that
-/// lives in IAM, which this emulator does not reach from here, so a structurally
-/// passable role is accepted rather than guessed about. `service_common::arn::vendor`
-/// reads only the vendor field; this rule needs the partition, the account and the
-/// resource type too, so the parse is here.
-fn validate_connector_role(
-    role_arn: &str,
-    partition: &str,
-    account: &str,
-) -> Result<(), RoleRefusal> {
-    // `splitn(6, ':')` leaves the whole resource — colons included — as the last field.
-    let fields: Vec<&str> = role_arn.splitn(6, ':').collect();
-    let [literal, arn_partition, vendor, _region, arn_account, resource] = fields.as_slice()
-    else {
-        return Err(RoleRefusal::NotAnIamArn);
-    };
-    if *literal != "arn" || arn_partition.is_empty() || *vendor != "iam" || resource.is_empty() {
-        return Err(RoleRefusal::NotAnIamArn);
-    }
-    // An IAM role's resource field is `role/<path><name>`; any other identity
-    // (`user/`, `group/`, `instance-profile/`) is not something a service assumes.
-    let role_name = resource.strip_prefix("role/").unwrap_or_default();
-    if role_name.is_empty() {
-        return Err(RoleRefusal::NotPassable(format!(
-            "{role_arn} does not name an IAM role"
-        )));
-    }
-    if arn_partition != &partition {
-        return Err(RoleRefusal::NotPassable(format!(
-            "{role_arn} is in partition {arn_partition}, not {partition}"
-        )));
-    }
-    if arn_account != &account {
-        return Err(RoleRefusal::NotPassable(format!(
-            "{role_arn} belongs to account {arn_account}, not {account}"
-        )));
-    }
-    Ok(())
 }
 
 /// The `RegisterCluster` operation.
@@ -269,33 +222,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
-        // The partition every ARN this emulator mints carries, read off the cluster ARN
-        // just built rather than written out again, and the single account it serves.
-        let partition = arn.split(':').nth(1).unwrap_or_default();
-        let account = ::engine::emulator_account_id();
+        // The connector role has to name a role of this account and partition, which is
+        // the same question [`state::pass_role_refusal`] answers for every role this
+        // service is handed. A registration REPORTS it differently from a create,
+        // though, and that is what the recording shows: 400 `InvalidParameterException`
+        // with the fixed sentence [`CONNECTOR_ROLE_ARN_REFUSAL`], not the 403 pass-role
+        // refusal `CreateCluster` answers — the connector role is a parameter of the
+        // registration rather than a role this call passes to a control plane it
+        // provisions. One sentence for the whole class: a value that is not an ARN, an
+        // ARN of another account or partition, and an IAM ARN naming something other
+        // than a role are all "the provided roleArn is invalid".
         let role_arn = input.connector_config.role_arn.clone();
-        match validate_connector_role(&role_arn, partition, account) {
-            Ok(()) => {}
-            Err(RoleRefusal::NotAnIamArn) => {
-                return Err(invalid_parameter(format!(
-                    "connectorConfig.roleArn must be an IAM role ARN of the form \
-                     arn:{partition}:iam::{account}:role/<name>, got {role_arn}"
-                )));
-            }
-            // A role the caller cannot pass is a permission failure, not a bad
-            // parameter: Amazon EKS would have to assume a role this principal may not
-            // hand it.
-            Err(RoleRefusal::NotPassable(why)) => {
-                return Err(RegisterClusterErrorModeled::AccessDeniedException(
-                    AccessDeniedException {
-                        message: Some(format!(
-                            "You don't have permissions to pass connectorConfig.roleArn to \
-                             Amazon EKS: {why}"
-                        )),
-                    },
-                )
-                .into());
-            }
+        if state::pass_role_refusal(&role_arn).is_some() {
+            return Err(invalid_parameter(CONNECTOR_ROLE_ARN_REFUSAL.to_string()));
+        }
+
+        // And then whether it is a role Amazon EKS could actually USE for the connector:
+        // the cluster is registered as a Systems Manager managed instance, so the role
+        // has to exist in IAM and its trust policy has to let the SSM service principal
+        // ([`CONNECTOR_SERVICE_PRINCIPAL`]) assume it. IAM is what holds roles, so IAM is
+        // asked ([`state::service_principal_trust_violation`]); the registration is
+        // refused with the state error the recorded service answers, naming the role at
+        // fault, and nothing is written. It runs before the store is locked: it is a call
+        // out to another service.
+        if let Some(why) = state::service_principal_trust_violation(
+            ctx,
+            &region,
+            &role_arn,
+            CONNECTOR_SERVICE_PRINCIPAL,
+        )
+        .await
+        {
+            // `clusterName` is left UNSET, as the recorded refusal leaves it: no cluster
+            // was registered, so there is none to name — the message names the role,
+            // which is what the caller has to fix.
+            return Err(RegisterClusterErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(why),
+                    ..Default::default()
+                },
+            )
+            .into());
         }
 
         let mut guard = store.lock();

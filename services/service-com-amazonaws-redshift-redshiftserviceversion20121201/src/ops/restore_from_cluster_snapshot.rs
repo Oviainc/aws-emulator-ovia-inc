@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RestoreFromClusterSnapshot
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RestoreFromClusterSnapshot`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RestoreFromClusterSnapshot::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates a NEW cluster from a snapshot this service holds and inserts it into
+//! the store in the `creating` status, reporting `RestoreStatus` beside it.
+//!
+//! Every attribute of the new cluster comes from the configuration the snapshot
+//! captured of the cluster it was taken of — node type and count, admin user,
+//! database, engine version, port, retention periods, maintenance window — with
+//! the members this request names overriding them, and with the identity-derived
+//! values (endpoint address, namespace ARN, default Availability Zone) computed
+//! for the NEW identifier. The documented exception is security and parameter
+//! groups: "the new cluster is created with the default cluster security and
+//! parameter groups", so those are never inherited from the source.
 //!
 //! ## Shape of an operation
 //!
@@ -376,18 +379,550 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RestoreFromClusterSnapshot` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RestoreFromClusterSnapshotErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RestoreFromClusterSnapshot"))
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(
+                RestoreFromClusterSnapshotErrorModeled::DependentServiceUnavailableFault(
+                    DependentServiceUnavailableFault {
+                        message: Some(st::STORE_UNAVAILABLE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let region = st::request_region(ctx);
+        let started = ::std::time::Instant::now();
+        let created_at = ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now());
+
+        if let Err(message) = st::check_identifier(
+            st::CLUSTER_IDENTIFIER_RULE,
+            "ClusterIdentifier",
+            &input.cluster_identifier,
+        ) {
+            return Err(crate::scaffolded::Scaffolded::validation(message));
+        }
+
+        // "You must specify this parameter or snapshotArn, but not both."
+        let snapshot_identifier = input
+            .snapshot_identifier
+            .as_deref()
+            .filter(|value| !value.is_empty());
+        let snapshot_arn = input
+            .snapshot_arn
+            .as_deref()
+            .filter(|value| !value.is_empty());
+        match (snapshot_identifier, snapshot_arn) {
+            (None, None) => {
+                return Err(crate::scaffolded::Scaffolded::validation(
+                    "Either SnapshotIdentifier or SnapshotArn must be supplied.",
+                ))
+            }
+            (Some(_), Some(_)) => {
+                return Err(crate::scaffolded::Scaffolded::validation(
+                    "SnapshotIdentifier and SnapshotArn cannot both be supplied; specify one or the other.",
+                ))
+            }
+            _ => {}
+        }
+
+        // `OwnerAccount` is "the Amazon Web Services account used to create or
+        // copy the snapshot", needed only for a snapshot this account does not
+        // own. This emulator holds one account's snapshots and models no
+        // cross-account restore authorization, so a request naming any other
+        // owner is refused with the modelled access fault rather than served
+        // from the local record.
+        if let Some(owner) = input.owner_account.as_deref() {
+            if owner != ::engine::emulator_account_id() {
+                return Err(
+                    RestoreFromClusterSnapshotErrorModeled::AccessToSnapshotDeniedFault(
+                        AccessToSnapshotDeniedFault {
+                            message: Some(format!(
+                                "The owner of the specified snapshot, account {owner}, has not authorized this account to access it."
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // A restore that also exchanges a reserved node, or that joins an IAM
+        // Identity Center application, needs a record this service does not
+        // hold: nothing creates a reserved node, a reserved node offering or an
+        // IDC application here, so any id names none of them. Each is refused
+        // with the modelled not-found fault rather than quietly ignored.
+        if let Some(reserved_node_id) = input.reserved_node_id.as_deref() {
+            return Err(
+                RestoreFromClusterSnapshotErrorModeled::ReservedNodeNotFoundFault(
+                    ReservedNodeNotFoundFault {
+                        message: Some(format!("Reserved node {reserved_node_id} not found.")),
+                    },
+                )
+                .into(),
+            );
+        }
+        if let Some(offering_id) = input.target_reserved_node_offering_id.as_deref() {
+            return Err(
+                RestoreFromClusterSnapshotErrorModeled::ReservedNodeOfferingNotFoundFault(
+                    ReservedNodeOfferingNotFoundFault {
+                        message: Some(format!(
+                            "Reserved node offering {offering_id} does not exist."
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        if let Some(application_arn) = input.redshift_idc_application_arn.as_deref() {
+            return Err(
+                RestoreFromClusterSnapshotErrorModeled::RedshiftIdcApplicationNotExistsFault(
+                    RedshiftIdcApplicationNotExistsFault {
+                        message: Some(format!(
+                            "The Redshift IDC application {application_arn} doesn't exist."
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let mut store = state.lock();
+        store.settle(started);
+
+        let Some(stored) = store
+            .snapshot_located(snapshot_identifier, snapshot_arn)
+            .cloned()
+        else {
+            return Err(
+                RestoreFromClusterSnapshotErrorModeled::ClusterSnapshotNotFoundFault(
+                    ClusterSnapshotNotFoundFault {
+                        message: Some(format!(
+                            "Cluster snapshot {} not found.",
+                            snapshot_identifier.or(snapshot_arn).unwrap_or_default()
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+        let snapshot = &stored.snapshot;
+        // `SnapshotClusterIdentifier` is "the name of the cluster the source
+        // snapshot was created from", so a request that names a different
+        // cluster names no snapshot.
+        if let Some(wanted) = input.snapshot_cluster_identifier.as_deref() {
+            if snapshot.cluster_identifier.as_deref() != Some(wanted) {
+                return Err(
+                    RestoreFromClusterSnapshotErrorModeled::ClusterSnapshotNotFoundFault(
+                        ClusterSnapshotNotFoundFault {
+                            message: Some(format!(
+                                "Cluster snapshot {} of cluster {wanted} not found.",
+                                snapshot.snapshot_identifier.as_deref().unwrap_or_default()
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+        // Only a finished snapshot holds the data a cluster is rebuilt from:
+        // `InvalidClusterSnapshotStateFault` is "the specified cluster snapshot
+        // is not in the available state".
+        if snapshot.status.as_deref() != Some(st::STATUS_AVAILABLE) {
+            return Err(
+                RestoreFromClusterSnapshotErrorModeled::InvalidClusterSnapshotStateFault(
+                    InvalidClusterSnapshotStateFault {
+                        message: Some(format!(
+                            "Cluster snapshot {} is in the {} state, not {}.",
+                            snapshot.snapshot_identifier.as_deref().unwrap_or_default(),
+                            snapshot.status.as_deref().unwrap_or_default(),
+                            st::STATUS_AVAILABLE
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        // Identity before capacity, as in `CreateCluster`: a restore onto an
+        // identifier that already names a cluster would create nothing.
+        if store.cluster(&input.cluster_identifier).is_some() {
+            return Err(
+                RestoreFromClusterSnapshotErrorModeled::ClusterAlreadyExistsFault(
+                    ClusterAlreadyExistsFault {
+                        message: Some(format!(
+                            "Cluster already exists: {}",
+                            input.cluster_identifier
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        if store.clusters.len() >= st::CLUSTER_QUOTA {
+            return Err(
+                RestoreFromClusterSnapshotErrorModeled::ClusterQuotaExceededFault(
+                    ClusterQuotaExceededFault {
+                        message: Some(format!(
+                            "The request would exceed the allowed number of clusters ({}).",
+                            st::CLUSTER_QUOTA
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        // The group a cluster joins has to exist. Parameter groups are records
+        // this store holds, so a named one can be checked; cluster security
+        // groups and subnet groups are not modelled by this service yet, so a
+        // request naming one of those is taken at its word.
+        let parameter_group_name = match input.cluster_parameter_group_name.as_deref() {
+            Some(requested) => {
+                let name = st::normalized_parameter_group_name(requested);
+                if store.parameter_group(&name).is_none() {
+                    return Err(
+                        RestoreFromClusterSnapshotErrorModeled::ClusterParameterGroupNotFoundFault(
+                            ClusterParameterGroupNotFoundFault {
+                                message: Some(format!(
+                                    "Cluster parameter group not found: {requested}"
+                                )),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+                Some(name)
+            }
+            None => None,
+        };
+
+        // The configuration the snapshot captured of its source cluster, for
+        // everything the `Snapshot` shape models no member for. Absent only for
+        // a snapshot record taken of no cluster this store holds, in which case
+        // each value falls back to this service's documented default.
+        let source = stored.source.as_ref().map(|stored| &stored.cluster);
+
+        // "The number of nodes specified when provisioning the restored
+        // cluster": absent, the snapshot's own node count. The cluster type the
+        // count describes is resolved by the rule `CreateCluster` shares.
+        let (cluster_type, number_of_nodes) = match st::resolve_cluster_shape(
+            None,
+            input.number_of_nodes.or(snapshot.number_of_nodes),
+            None,
+        ) {
+            Ok(shape) => shape,
+            Err(message) => return Err(crate::scaffolded::Scaffolded::validation(message)),
+        };
+
+        // "Default: The value selected for the cluster from which the snapshot
+        // was taken." This operation models no `InvalidRetentionPeriodFault`, so
+        // an out-of-range period is refused as a bad request.
+        let automated_retention = input
+            .automated_snapshot_retention_period
+            .or_else(|| source.and_then(|cluster| cluster.automated_snapshot_retention_period))
+            .unwrap_or(st::DEFAULT_AUTOMATED_RETENTION);
+        if !(st::AUTOMATED_RETENTION_BOUNDS.0..=st::AUTOMATED_RETENTION_BOUNDS.1)
+            .contains(&automated_retention)
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "Invalid value for AutomatedSnapshotRetentionPeriod: {automated_retention}. It must be a value from {} to {}.",
+                st::AUTOMATED_RETENTION_BOUNDS.0, st::AUTOMATED_RETENTION_BOUNDS.1
+            )));
+        }
+        let manual_retention = input
+            .manual_snapshot_retention_period
+            .or(snapshot.manual_snapshot_retention_period)
+            .unwrap_or(st::MANUAL_RETENTION_INDEFINITE);
+        if manual_retention != st::MANUAL_RETENTION_INDEFINITE
+            && !(st::MANUAL_RETENTION_BOUNDS.0..=st::MANUAL_RETENTION_BOUNDS.1)
+                .contains(&manual_retention)
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "Invalid value for ManualSnapshotRetentionPeriod: {manual_retention}. It must be either {} or an integer between {} and {}.",
+                st::MANUAL_RETENTION_INDEFINITE,
+                st::MANUAL_RETENTION_BOUNDS.0,
+                st::MANUAL_RETENTION_BOUNDS.1
+            )));
+        }
+
+        let identifier = input.cluster_identifier.clone();
+        let cluster_version = snapshot
+            .cluster_version
+            .clone()
+            .or_else(|| source.and_then(|cluster| cluster.cluster_version.clone()))
+            .unwrap_or_else(|| st::DEFAULT_CLUSTER_VERSION.to_string());
+        // "If ManageMasterPassword is false or not set, Amazon Redshift uses the
+        // admin credentials the cluster had at the time the snapshot was taken"
+        // — including the way those credentials were held, so a snapshot of a
+        // cluster whose password Secrets Manager managed restores into one that
+        // manages its own secret, named for the NEW cluster.
+        let manage_master_password = input
+            .manage_master_password
+            .unwrap_or_else(|| snapshot.master_password_secret_arn.is_some());
+        let hsm_requested = input.hsm_client_certificate_identifier.is_some()
+            || input.hsm_configuration_identifier.is_some();
+        let subnet_group_name = input
+            .cluster_subnet_group_name
+            .clone()
+            .or_else(|| source.and_then(|cluster| cluster.cluster_subnet_group_name.clone()));
+
+        let cluster = Cluster {
+            cluster_identifier: Some(identifier.clone()),
+            node_type: input
+                .node_type
+                .clone()
+                .or_else(|| snapshot.node_type.clone()),
+            cluster_status: Some(st::STATUS_CREATING.to_string()),
+            cluster_availability_status: Some(
+                st::availability_status(st::STATUS_CREATING).to_string(),
+            ),
+            // The admin user and the database come out of the snapshot: they are
+            // part of the data it holds, and this request names neither.
+            master_username: snapshot.master_username.clone(),
+            db_name: Some(
+                snapshot
+                    .db_name
+                    .clone()
+                    .unwrap_or_else(|| st::DEFAULT_DB_NAME.to_string()),
+            ),
+            endpoint: Some(Endpoint {
+                // Derived from the NEW identifier: the restored cluster is
+                // reached at its own hostname, not the source's.
+                address: Some(st::endpoint_address(&identifier, &region)),
+                // "Default: The same port as the original cluster."
+                port: Some(
+                    input
+                        .port
+                        .or(snapshot.port)
+                        .unwrap_or(st::DEFAULT_PORT),
+                ),
+                vpc_endpoints: None,
+            }),
+            // The restored cluster is created now; the instant the SOURCE was
+            // created stays on the snapshot.
+            cluster_create_time: Some(created_at),
+            automated_snapshot_retention_period: Some(automated_retention),
+            manual_snapshot_retention_period: Some(manual_retention),
+            // "the new cluster is created with the default cluster security and
+            // parameter groups": the source's memberships are NOT inherited, so
+            // a request that names none gets the account's default groups,
+            // exactly as `CreateCluster` renders them.
+            cluster_security_groups: Some(
+                input
+                    .cluster_security_groups
+                    .clone()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|name| ClusterSecurityGroupMembership {
+                        cluster_security_group_name: Some(name),
+                        status: Some("active".to_string()),
+                    })
+                    .collect(),
+            ),
+            vpc_security_groups: Some(
+                input
+                    .vpc_security_group_ids
+                    .clone()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|id| VpcSecurityGroupMembership {
+                        vpc_security_group_id: Some(id),
+                        status: Some("active".to_string()),
+                    })
+                    .collect(),
+            ),
+            cluster_parameter_groups: Some(vec![ClusterParameterGroupStatus {
+                parameter_group_name: Some(
+                    parameter_group_name
+                        .unwrap_or_else(|| st::default_parameter_group(&cluster_version)),
+                ),
+                parameter_apply_status: Some("in-sync".to_string()),
+                cluster_parameter_status_list: None,
+            }]),
+            cluster_subnet_group_name: subnet_group_name.clone(),
+            vpc_id: subnet_group_name.as_deref().map(st::derived_vpc_id),
+            // "Default: A random, system-chosen Availability Zone" — the
+            // emulator's choice, derived from the new identifier so it is stable
+            // across reads.
+            availability_zone: Some(
+                input
+                    .availability_zone
+                    .clone()
+                    .unwrap_or_else(|| st::default_availability_zone(&identifier, &region)),
+            ),
+            // "Default: The value selected for the cluster from which the
+            // snapshot was taken."
+            preferred_maintenance_window: Some(
+                input
+                    .preferred_maintenance_window
+                    .clone()
+                    .or_else(|| source.and_then(|cluster| cluster.preferred_maintenance_window.clone()))
+                    .unwrap_or_else(|| st::default_maintenance_window(&identifier)),
+            ),
+            cluster_version: Some(cluster_version),
+            // "Default: true"
+            allow_version_upgrade: Some(
+                input
+                    .allow_version_upgrade
+                    .or_else(|| source.and_then(|cluster| cluster.allow_version_upgrade))
+                    .unwrap_or(true),
+            ),
+            number_of_nodes: Some(number_of_nodes),
+            // "Default: false"
+            publicly_accessible: Some(
+                input
+                    .publicly_accessible
+                    .or_else(|| source.and_then(|cluster| cluster.publicly_accessible))
+                    .unwrap_or(false),
+            ),
+            encrypted: Some(
+                input
+                    .encrypted
+                    .or(snapshot.encrypted)
+                    .unwrap_or(false),
+            ),
+            // The restore this call started. Only `Status` is reported: the
+            // other members are documented as "only updated when you restore to
+            // DC2 node types", and this service measures no transfer.
+            restore_status: Some(RestoreStatus {
+                status: Some(st::RESTORE_STATUS_RESTORING.to_string()),
+                ..Default::default()
+            }),
+            hsm_status: if hsm_requested {
+                Some(HsmStatus {
+                    hsm_client_certificate_identifier: input
+                        .hsm_client_certificate_identifier
+                        .clone(),
+                    hsm_configuration_identifier: input.hsm_configuration_identifier.clone(),
+                    status: Some("active".to_string()),
+                })
+            } else {
+                source.and_then(|cluster| cluster.hsm_status.clone())
+            },
+            // An Elastic IP belongs to one cluster at a time, so it is taken
+            // from the request alone and never inherited from the source.
+            elastic_ip_status: input.elastic_ip.clone().map(|ip| ElasticIpStatus {
+                elastic_ip: Some(ip),
+                status: Some("active".to_string()),
+            }),
+            tags: Some(
+                source
+                    .and_then(|cluster| cluster.tags.clone())
+                    .unwrap_or_default(),
+            ),
+            kms_key_id: input
+                .kms_key_id
+                .clone()
+                .or_else(|| snapshot.kms_key_id.clone()),
+            // "Default: false"
+            enhanced_vpc_routing: Some(
+                input
+                    .enhanced_vpc_routing
+                    .or(snapshot.enhanced_vpc_routing)
+                    .unwrap_or(false),
+            ),
+            iam_roles: Some(match input.iam_roles.clone() {
+                Some(roles) => roles
+                    .into_iter()
+                    .map(|arn| ClusterIamRole {
+                        iam_role_arn: Some(arn),
+                        apply_status: Some("in-sync".to_string()),
+                    })
+                    .collect(),
+                None => source
+                    .and_then(|cluster| cluster.iam_roles.clone())
+                    .unwrap_or_default(),
+            }),
+            // "When you take a snapshot, the snapshot inherits the
+            // MaintenanceTrack value from the cluster", so the restored cluster
+            // joins the snapshot's track unless the request names another.
+            maintenance_track_name: Some(
+                input
+                    .maintenance_track_name
+                    .clone()
+                    .or_else(|| snapshot.maintenance_track_name.clone())
+                    .unwrap_or_else(|| st::DEFAULT_MAINTENANCE_TRACK.to_string()),
+            ),
+            snapshot_schedule_identifier: input
+                .snapshot_schedule_identifier
+                .clone()
+                .or_else(|| source.and_then(|cluster| cluster.snapshot_schedule_identifier.clone())),
+            availability_zone_relocation_status: Some(
+                input
+                    .availability_zone_relocation
+                    .map(|on| if on { "enabled" } else { "disabled" }.to_string())
+                    .or_else(|| {
+                        source.and_then(|cluster| {
+                            cluster.availability_zone_relocation_status.clone()
+                        })
+                    })
+                    .unwrap_or_else(|| "disabled".to_string()),
+            ),
+            // The restored cluster holds its own copy of the data, so it is its
+            // own namespace.
+            cluster_namespace_arn: Some(st::namespace_arn(&identifier, &region)),
+            default_iam_role_arn: input
+                .default_iam_role_arn
+                .clone()
+                .or_else(|| source.and_then(|cluster| cluster.default_iam_role_arn.clone())),
+            master_password_secret_arn: manage_master_password
+                .then(|| st::master_password_secret_arn(&identifier, &region)),
+            master_password_secret_kms_key_id: manage_master_password
+                .then(|| {
+                    input
+                        .master_password_secret_kms_key_id
+                        .clone()
+                        .or_else(|| snapshot.master_password_secret_kms_key_id.clone())
+                })
+                .flatten(),
+            ip_address_type: Some(
+                input
+                    .ip_address_type
+                    .clone()
+                    .or_else(|| source.and_then(|cluster| cluster.ip_address_type.clone()))
+                    .unwrap_or_else(|| "ipv4".to_string()),
+            ),
+            multi_az: Some(
+                input
+                    .multi_az
+                    .map(|on| if on { "Enabled" } else { "Disabled" }.to_string())
+                    .or_else(|| source.and_then(|cluster| cluster.multi_az.clone()))
+                    .unwrap_or_else(|| "Disabled".to_string()),
+            ),
+            catalog_arn: input
+                .catalog_name
+                .as_deref()
+                .map(|name| ::engine::emulator_arn("glue", &region, &format!("catalog/{name}")))
+                .or_else(|| source.and_then(|cluster| cluster.catalog_arn.clone())),
+            extra_compute_for_automatic_optimization: Some(
+                source
+                    .and_then(|cluster| cluster.extra_compute_for_automatic_optimization.clone())
+                    .unwrap_or_else(|| false.to_string()),
+            ),
+            // `AquaConfigurationStatus` "is retired. It does not set the AQUA
+            // configuration status", and `AdditionalInfo` is "Reserved.", so
+            // neither member changes the cluster this call creates.
+            ..Default::default()
+        };
+
+        store.clusters.push(st::StoredCluster {
+            cluster: cluster.clone(),
+            cluster_type,
+            // "the admin credentials the cluster had at the time the snapshot
+            // was taken", unless Secrets Manager now manages them. Stored off
+            // the `Cluster` shape, which models no password member.
+            master_user_password: (!manage_master_password)
+                .then(|| {
+                    stored
+                        .source
+                        .as_ref()
+                        .and_then(|source| source.master_user_password.clone())
+                })
+                .flatten(),
+            available_at: started + st::PROVISIONING_SPAN,
+        });
+
+        Ok(RestoreFromClusterSnapshotOutput {
+            cluster: Some(cluster),
+        })
     }
 }

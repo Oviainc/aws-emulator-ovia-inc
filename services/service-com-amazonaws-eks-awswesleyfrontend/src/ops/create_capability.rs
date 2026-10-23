@@ -128,7 +128,7 @@
 use super::types::*;
 use crate::state::{
     self, CapabilityRecord, CAPABILITY_ACTIVATION_DELAY, CAPABILITY_STATUS_CREATING,
-    CAPABILITY_TYPE_ACK, CAPABILITY_TYPE_ARGOCD, STATUS_ACTIVE,
+    CAPABILITY_TYPE_ACK, CAPABILITY_TYPE_ARGOCD, EKS_SERVICE_PRINCIPAL, STATUS_ACTIVE,
 };
 use std::time::SystemTime;
 
@@ -303,10 +303,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let now = SystemTime::now();
+
+        // AUTHORIZATION BEFORE THE PARENT RESOURCE: `roleArn` is a role the capability
+        // has Amazon EKS assume ("This role must have a trust policy that allows the EKS
+        // service principal to assume it"), so it is subject to the same two rules every
+        // caller-supplied role of this service is — whether this caller may pass it at
+        // all ([`state::pass_role_refusal`]), and then whether it is a role IAM holds
+        // that lets the Amazon EKS service principal assume it
+        // ([`state::service_principal_trust_violation`]). Both run before the store is
+        // locked: the second is a call out to IAM, and an authorization failure precedes
+        // any report about the cluster the request named.
+        match state::pass_role_refusal(&input.role_arn) {
+            None => {}
+            Some(why) => {
+                return Err(CreateCapabilityErrorModeled::AccessDeniedException(
+                    AccessDeniedException { message: Some(why) },
+                )
+                .into());
+            }
+        }
+        if let Some(why) = state::service_principal_trust_violation(
+            ctx,
+            &region,
+            &input.role_arn,
+            EKS_SERVICE_PRINCIPAL,
+        )
+        .await
+        {
+            return Err(invalid_parameter(format!("roleArn {why}")));
+        }
+
         let mut guard = store.lock();
         guard.materialize_due_transitions(now);
 
-        // THE PARENT RESOURCE FIRST: a capability hangs off ONE cluster in the region
+        // THE PARENT RESOURCE NEXT: a capability hangs off ONE cluster in the region
         // the request is signed for, so a `clusterName` this store does not hold is
         // answered with the one rule this resource has for an unknown parent — the
         // same 404 `DescribeCapability`, `DeleteCapability` and `ListCapabilities`

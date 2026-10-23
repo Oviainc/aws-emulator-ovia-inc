@@ -270,6 +270,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.snapshots.push(st::StoredSnapshot {
             snapshot: snapshot.clone(),
             available_at: started + st::PROVISIONING_SPAN,
+            // The configuration of the cluster AS IT IS NOW, so a later
+            // `RestoreFromClusterSnapshot` rebuilds this instant rather than
+            // whatever the source cluster has become by then.
+            source: Some(stored_cluster),
         });
 
         Ok(CreateClusterSnapshotOutput {

@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetRuleGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetRuleGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reads a stored rule group back, by its ARN or by its (Scope, Name, Id) triple.
+//! This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetRuleGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -173,18 +167,72 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetRuleGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetRuleGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetRuleGroup"))
+        // A read: `ctx` carries only request metadata, which this operation does not
+        // need, and nothing here writes to the store.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetRuleGroupErrorModeled::WAFInternalErrorException(
+                WAFInternalErrorException {
+                    message: Some("the wafv2 store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let state = state.lock();
+
+        // Two addressing forms, as the model declares: every member is optional, and
+        // a rule group is named EITHER by its ARN or by the (Scope, Name, Id) triple.
+        let entry = if let Some(arn) = input.arn.as_deref() {
+            // The model names two different ARN failures: malformed, and naming
+            // nothing that exists.
+            if !crate::state::is_wafv2_resource_arn(arn) {
+                return Err(GetRuleGroupErrorModeled::WAFInvalidParameterException(
+                    crate::state::invalid_arn_exception(arn),
+                )
+                .into());
+            }
+            match state.arn_index.get(arn) {
+                Some(crate::state::ResourceRef::RuleGroup { scope, id }) => {
+                    state.rule_groups.get(&(scope.clone(), id.clone()))
+                }
+                // An ARN that resolves to something else is not a rule group ARN.
+                Some(crate::state::ResourceRef::WebAcl { .. })
+                | Some(crate::state::ResourceRef::IpSet { .. })
+                | None => None,
+            }
+        } else {
+            match (
+                input.scope.as_deref(),
+                input.name.as_deref(),
+                input.id.as_deref(),
+            ) {
+                (Some(scope), Some(name), Some(id)) => state.rule_group(scope, name, id),
+                _ => {
+                    return Err(GetRuleGroupErrorModeled::WAFInvalidParameterException(
+                        crate::state::invalid_parameter_exception(
+                            crate::state::FIELD_RULE_GROUP,
+                            "ARN",
+                            "a rule group is addressed by its ARN or by its name, scope and id",
+                        ),
+                    )
+                    .into());
+                }
+            }
+        };
+
+        let Some(entry) = entry else {
+            // Whether the request named an ARN or a (Name, Scope, Id) triple, the
+            // body is the exception type's constant sentence: WAF does not echo what
+            // was looked up.
+            return Err(GetRuleGroupErrorModeled::WAFNonexistentItemException(
+                crate::state::nonexistent_item_exception(),
+            )
+            .into());
+        };
+
+        Ok(GetRuleGroupOutput {
+            rule_group: Some(entry.rule_group.clone()),
+            lock_token: Some(entry.lock_token.clone()),
+        })
     }
 }
