@@ -29,6 +29,8 @@ mod custom_action_job_results;
 mod custom_action_jobs;
 #[path = "all/custom_action_types.rs"]
 mod custom_action_types;
+#[path = "all/delete_custom_action_type.rs"]
+mod delete_custom_action_type;
 #[path = "all/execution_engine.rs"]
 mod execution_engine;
 #[path = "all/pipeline_lifecycle.rs"]

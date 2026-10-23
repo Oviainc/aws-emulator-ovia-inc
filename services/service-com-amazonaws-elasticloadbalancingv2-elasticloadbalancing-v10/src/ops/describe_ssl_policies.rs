@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeSSLPolicies
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeSSLPolicies`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeSSLPolicies::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the predefined TLS security policies this service publishes — the catalogue
+//! in [`POLICY_CATALOGUE`] — filtered by `Names` and `LoadBalancerType` and paged by
+//! `PageSize`/`Marker`. A name the catalogue does not carry is the modelled
+//! `SSLPolicyNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -144,18 +140,421 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeSSLPolicies` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeSSLPoliciesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeSSLPolicies"))
+        // The predefined security policies are the service's own published catalogue,
+        // not a resource this store holds, so nothing is read from the engine or the
+        // request metadata here. Both are bound so the signature stays the one every
+        // operation in this crate carries.
+        let _ = (ctx, &self.engine);
+
+        // `Names` selects by name, in the order the request listed them and without
+        // repeating a name listed twice; a name the catalogue does not carry is the
+        // modelled refusal.
+        let mut selected: Vec<&PolicyEntry> = match input.names.as_deref() {
+            Some(names) => {
+                let mut chosen: Vec<&PolicyEntry> = Vec::new();
+                for name in names {
+                    let Some(entry) = POLICY_CATALOGUE
+                        .iter()
+                        .find(|candidate| candidate.name == name)
+                    else {
+                        return Err(not_found());
+                    };
+                    if !chosen.iter().any(|already| already.name == entry.name) {
+                        chosen.push(entry);
+                    }
+                }
+                chosen
+            }
+            None => POLICY_CATALOGUE.iter().collect(),
+        };
+
+        // `LoadBalancerType`: "The default lists the SSL policies for all load
+        // balancers", so an absent member filters nothing, and a stated one keeps the
+        // policies that support that type.
+        if let Some(load_balancer_type) = input.load_balancer_type.as_deref() {
+            selected.retain(|entry| entry.load_balancer_types.contains(&load_balancer_type));
+        }
+
+        let (page, next_marker) =
+            crate::state::paginate(selected, input.marker.as_deref(), input.page_size).map_err(
+                |_| {
+                    crate::scaffolded::Scaffolded::validation(
+                        "The marker is not valid: it must be a NextMarker from a previous page of this collection",
+                    )
+                },
+            )?;
+
+        Ok(DescribeSSLPoliciesOutput {
+            ssl_policies: Some(page.iter().map(|entry| entry.to_shape()).collect()),
+            next_marker,
+        })
     }
 }
+
+/// The modelled refusal for a `Names` entry the catalogue does not carry.
+///
+/// The status and the code are the model's own (`SSLPolicyNotFoundException`,
+/// `@httpError 400`, `awsQueryError` code `SSLPolicyNotFound`:
+/// `smithy_query(query="operation",operation="DescribeSSLPolicies")`). The message is
+/// the service's FIXED string for this refusal — it names no policy, so nothing about
+/// the request goes into it.
+fn not_found() -> DescribeSSLPoliciesError {
+    DescribeSSLPoliciesErrorModeled::SSLPolicyNotFoundException(SSLPolicyNotFoundException {
+        message: Some("One or more SSL policies not found".to_string()),
+    })
+    .into()
+}
+
+/// One predefined security policy: its name, the TLS protocol versions it negotiates,
+/// its ciphers in priority order, and the load balancer types it can be set on.
+struct PolicyEntry {
+    name: &'static str,
+    ssl_protocols: &'static [&'static str],
+    /// Ciphers in AWS's own priority order. The reported `Cipher$Priority` is the
+    /// 1-based position in this list, which is what that order MEANS, rather than a
+    /// second number kept beside it.
+    ciphers: &'static [&'static str],
+    load_balancer_types: &'static [&'static str],
+}
+
+impl PolicyEntry {
+    /// This entry as the modelled `SslPolicy`.
+    fn to_shape(&self) -> SslPolicy {
+        SslPolicy {
+            name: Some(self.name.to_string()),
+            ssl_protocols: Some(self.ssl_protocols.iter().map(|p| p.to_string()).collect()),
+            ciphers: Some(
+                self.ciphers
+                    .iter()
+                    .enumerate()
+                    .map(|(index, name)| Cipher {
+                        name: Some(name.to_string()),
+                        priority: Some(i32::try_from(index + 1).unwrap_or(i32::MAX)),
+                    })
+                    .collect(),
+            ),
+            supported_load_balancer_types: Some(
+                self.load_balancer_types
+                    .iter()
+                    .map(|t| t.to_string())
+                    .collect(),
+            ),
+        }
+    }
+}
+
+/// The TLS protocol versions, as `SslProtocol` strings, of a policy that negotiates
+/// everything from TLS 1.0 up.
+const TLS_FROM_1_0: &[&str] = &["TLSv1", "TLSv1.1", "TLSv1.2"];
+/// …from TLS 1.1 up.
+const TLS_FROM_1_1: &[&str] = &["TLSv1.1", "TLSv1.2"];
+/// …TLS 1.2 only.
+const TLS_1_2_ONLY: &[&str] = &["TLSv1.2"];
+/// …TLS 1.3 added, from TLS 1.0 up.
+const TLS13_FROM_1_0: &[&str] = &["TLSv1", "TLSv1.1", "TLSv1.2", "TLSv1.3"];
+/// …TLS 1.3 added, from TLS 1.1 up.
+const TLS13_FROM_1_1: &[&str] = &["TLSv1.1", "TLSv1.2", "TLSv1.3"];
+/// …TLS 1.3 added, TLS 1.2 up.
+const TLS13_FROM_1_2: &[&str] = &["TLSv1.2", "TLSv1.3"];
+/// …TLS 1.3 only.
+const TLS13_ONLY: &[&str] = &["TLSv1.3"];
+
+/// Every predefined policy in this catalogue can be set on an HTTPS listener of an
+/// Application Load Balancer and on a TLS listener of a Network Load Balancer. No
+/// policy names `gateway`: a Gateway Load Balancer has no TLS listener to set one on,
+/// which is why `LoadBalancerType=gateway` reports an empty catalogue.
+const APPLICATION_AND_NETWORK: &[&str] = &["application", "network"];
+
+/// The 18 ciphers of the default predefined policy, in priority order.
+const DEFAULT_CIPHERS: &[&str] = &[
+    "ECDHE-ECDSA-AES128-GCM-SHA256",
+    "ECDHE-RSA-AES128-GCM-SHA256",
+    "ECDHE-ECDSA-AES128-SHA256",
+    "ECDHE-RSA-AES128-SHA256",
+    "ECDHE-ECDSA-AES128-SHA",
+    "ECDHE-RSA-AES128-SHA",
+    "ECDHE-ECDSA-AES256-GCM-SHA384",
+    "ECDHE-RSA-AES256-GCM-SHA384",
+    "ECDHE-ECDSA-AES256-SHA384",
+    "ECDHE-RSA-AES256-SHA384",
+    "ECDHE-RSA-AES256-SHA",
+    "ECDHE-ECDSA-AES256-SHA",
+    "AES128-GCM-SHA256",
+    "AES128-SHA256",
+    "AES128-SHA",
+    "AES256-GCM-SHA384",
+    "AES256-SHA256",
+    "AES256-SHA",
+];
+
+/// [`DEFAULT_CIPHERS`] plus the 3DES cipher only the oldest predefined policy carries.
+const LEGACY_CIPHERS: &[&str] = &[
+    "ECDHE-ECDSA-AES128-GCM-SHA256",
+    "ECDHE-RSA-AES128-GCM-SHA256",
+    "ECDHE-ECDSA-AES128-SHA256",
+    "ECDHE-RSA-AES128-SHA256",
+    "ECDHE-ECDSA-AES128-SHA",
+    "ECDHE-RSA-AES128-SHA",
+    "ECDHE-ECDSA-AES256-GCM-SHA384",
+    "ECDHE-RSA-AES256-GCM-SHA384",
+    "ECDHE-ECDSA-AES256-SHA384",
+    "ECDHE-RSA-AES256-SHA384",
+    "ECDHE-RSA-AES256-SHA",
+    "ECDHE-ECDSA-AES256-SHA",
+    "AES128-GCM-SHA256",
+    "AES128-SHA256",
+    "AES128-SHA",
+    "AES256-GCM-SHA384",
+    "AES256-SHA256",
+    "AES256-SHA",
+    "DES-CBC3-SHA",
+];
+
+/// The ciphers of the TLS-1.2-only policy: the SHA-1 suites of
+/// [`DEFAULT_CIPHERS`] dropped.
+const TLS_1_2_CIPHERS: &[&str] = &[
+    "ECDHE-ECDSA-AES128-GCM-SHA256",
+    "ECDHE-RSA-AES128-GCM-SHA256",
+    "ECDHE-ECDSA-AES128-SHA256",
+    "ECDHE-RSA-AES128-SHA256",
+    "ECDHE-ECDSA-AES256-GCM-SHA384",
+    "ECDHE-RSA-AES256-GCM-SHA384",
+    "ECDHE-ECDSA-AES256-SHA384",
+    "ECDHE-RSA-AES256-SHA384",
+    "AES128-GCM-SHA256",
+    "AES128-SHA256",
+    "AES256-GCM-SHA384",
+    "AES256-SHA256",
+];
+
+/// The forward-secrecy ciphers: [`DEFAULT_CIPHERS`] with every static-RSA suite
+/// dropped, so only the ECDHE key exchanges remain — in the same relative order, which
+/// is what keeps a cipher's priority the same across the policies that share a suite.
+const FORWARD_SECRECY_CIPHERS: &[&str] = &[
+    "ECDHE-ECDSA-AES128-GCM-SHA256",
+    "ECDHE-RSA-AES128-GCM-SHA256",
+    "ECDHE-ECDSA-AES128-SHA256",
+    "ECDHE-RSA-AES128-SHA256",
+    "ECDHE-ECDSA-AES128-SHA",
+    "ECDHE-RSA-AES128-SHA",
+    "ECDHE-ECDSA-AES256-GCM-SHA384",
+    "ECDHE-RSA-AES256-GCM-SHA384",
+    "ECDHE-ECDSA-AES256-SHA384",
+    "ECDHE-RSA-AES256-SHA384",
+    "ECDHE-RSA-AES256-SHA",
+    "ECDHE-ECDSA-AES256-SHA",
+];
+
+/// [`FORWARD_SECRECY_CIPHERS`] restricted to its SHA-2 suites, which is the cipher list
+/// of the first restricted forward-secrecy policy.
+const FORWARD_SECRECY_RESTRICTED_SHA2_CIPHERS: &[&str] = &[
+    "ECDHE-ECDSA-AES128-GCM-SHA256",
+    "ECDHE-RSA-AES128-GCM-SHA256",
+    "ECDHE-ECDSA-AES128-SHA256",
+    "ECDHE-RSA-AES128-SHA256",
+    "ECDHE-ECDSA-AES256-GCM-SHA384",
+    "ECDHE-RSA-AES256-GCM-SHA384",
+    "ECDHE-ECDSA-AES256-SHA384",
+    "ECDHE-RSA-AES256-SHA384",
+];
+
+/// The restricted forward-secrecy ciphers of the newest such policy: AEAD suites only.
+const FORWARD_SECRECY_RESTRICTED_AEAD_CIPHERS: &[&str] = &[
+    "ECDHE-ECDSA-AES128-GCM-SHA256",
+    "ECDHE-RSA-AES128-GCM-SHA256",
+    "ECDHE-ECDSA-AES256-GCM-SHA384",
+    "ECDHE-RSA-AES256-GCM-SHA384",
+];
+
+/// The TLS 1.3 cipher suites, which every TLS13 policy lists first.
+const TLS13_SUITES: &[&str] = &[
+    "TLS_AES_128_GCM_SHA256",
+    "TLS_AES_256_GCM_SHA384",
+    "TLS_CHACHA20_POLY1305_SHA256",
+];
+
+/// The TLS13 policies' SHA-2 cipher list: [`TLS13_SUITES`] then the ECDHE SHA-2 TLS 1.2
+/// suites.
+const TLS13_SHA2_CIPHERS: &[&str] = &[
+    "TLS_AES_128_GCM_SHA256",
+    "TLS_AES_256_GCM_SHA384",
+    "TLS_CHACHA20_POLY1305_SHA256",
+    "ECDHE-ECDSA-AES128-GCM-SHA256",
+    "ECDHE-RSA-AES128-GCM-SHA256",
+    "ECDHE-ECDSA-AES128-SHA256",
+    "ECDHE-RSA-AES128-SHA256",
+    "ECDHE-ECDSA-AES256-GCM-SHA384",
+    "ECDHE-RSA-AES256-GCM-SHA384",
+    "ECDHE-ECDSA-AES256-SHA384",
+    "ECDHE-RSA-AES256-SHA384",
+];
+
+/// The TLS13 policies that also negotiate TLS 1.0 or 1.1 carry the whole
+/// [`DEFAULT_CIPHERS`] list behind [`TLS13_SUITES`], since a SHA-1 suite is what those
+/// older protocol versions need.
+const TLS13_FULL_CIPHERS: &[&str] = &[
+    "TLS_AES_128_GCM_SHA256",
+    "TLS_AES_256_GCM_SHA384",
+    "TLS_CHACHA20_POLY1305_SHA256",
+    "ECDHE-ECDSA-AES128-GCM-SHA256",
+    "ECDHE-RSA-AES128-GCM-SHA256",
+    "ECDHE-ECDSA-AES128-SHA256",
+    "ECDHE-RSA-AES128-SHA256",
+    "ECDHE-ECDSA-AES128-SHA",
+    "ECDHE-RSA-AES128-SHA",
+    "ECDHE-ECDSA-AES256-GCM-SHA384",
+    "ECDHE-RSA-AES256-GCM-SHA384",
+    "ECDHE-ECDSA-AES256-SHA384",
+    "ECDHE-RSA-AES256-SHA384",
+    "ECDHE-RSA-AES256-SHA",
+    "ECDHE-ECDSA-AES256-SHA",
+    "AES128-GCM-SHA256",
+    "AES128-SHA256",
+    "AES128-SHA",
+    "AES256-GCM-SHA384",
+    "AES256-SHA256",
+    "AES256-SHA",
+];
+
+/// The restricted TLS13 policy's cipher list: [`TLS13_SUITES`] then the AEAD ECDHE
+/// suites.
+const TLS13_RESTRICTED_CIPHERS: &[&str] = &[
+    "TLS_AES_128_GCM_SHA256",
+    "TLS_AES_256_GCM_SHA384",
+    "TLS_CHACHA20_POLY1305_SHA256",
+    "ECDHE-ECDSA-AES128-GCM-SHA256",
+    "ECDHE-RSA-AES128-GCM-SHA256",
+    "ECDHE-ECDSA-AES256-GCM-SHA384",
+    "ECDHE-RSA-AES256-GCM-SHA384",
+];
+
+/// The predefined security policies this service publishes, in the order a page walks
+/// them (the order of this table, which is stable across calls — pagination resumes by
+/// position).
+///
+/// A PUBLISHED CATALOGUE, not emulator state: `DescribeSSLPolicies` is documented as
+/// "Describes the specified policies or all policies used for SSL negotiation"
+/// (`smithy_query(query="doc",shape="DescribeSSLPolicies")`), and no operation in this
+/// model creates, changes or deletes one — the model has no `SslPolicy` lifecycle at
+/// all, so nothing a caller does can alter what this reports. The names, the protocol
+/// versions, the cipher priority order and the supported load balancer types are the
+/// ones Elastic Load Balancing publishes for its predefined policies ("Security
+/// policies" in the Application Load Balancers Guide and in the Network Load Balancers
+/// Guide, which this operation's own model documentation points at).
+///
+/// AWS adds predefined policies over time (the FIPS family and the post-quantum family
+/// are the newest), so this table is the set this emulator publishes rather than a claim
+/// that AWS publishes no others: a policy whose cipher list no source here states is left
+/// out instead of invented, and `Names` naming it is the modelled `SSLPolicyNotFound`
+/// rather than a guess.
+const POLICY_CATALOGUE: &[PolicyEntry] = &[
+    // The default policy for a new HTTPS or TLS listener.
+    PolicyEntry {
+        name: "ELBSecurityPolicy-2016-08",
+        ssl_protocols: TLS_FROM_1_0,
+        ciphers: DEFAULT_CIPHERS,
+        load_balancer_types: APPLICATION_AND_NETWORK,
+    },
+    PolicyEntry {
+        name: "ELBSecurityPolicy-2015-05",
+        ssl_protocols: TLS_FROM_1_0,
+        ciphers: DEFAULT_CIPHERS,
+        load_balancer_types: APPLICATION_AND_NETWORK,
+    },
+    PolicyEntry {
+        name: "ELBSecurityPolicy-TLS-1-0-2015-04",
+        ssl_protocols: TLS_FROM_1_0,
+        ciphers: LEGACY_CIPHERS,
+        load_balancer_types: APPLICATION_AND_NETWORK,
+    },
+    PolicyEntry {
+        name: "ELBSecurityPolicy-TLS-1-1-2017-01",
+        ssl_protocols: TLS_FROM_1_1,
+        ciphers: DEFAULT_CIPHERS,
+        load_balancer_types: APPLICATION_AND_NETWORK,
+    },
+    PolicyEntry {
+        name: "ELBSecurityPolicy-TLS-1-2-2017-01",
+        ssl_protocols: TLS_1_2_ONLY,
+        ciphers: TLS_1_2_CIPHERS,
+        load_balancer_types: APPLICATION_AND_NETWORK,
+    },
+    PolicyEntry {
+        name: "ELBSecurityPolicy-TLS-1-2-Ext-2018-06",
+        ssl_protocols: TLS_1_2_ONLY,
+        ciphers: DEFAULT_CIPHERS,
+        load_balancer_types: APPLICATION_AND_NETWORK,
+    },
+    PolicyEntry {
+        name: "ELBSecurityPolicy-FS-2018-06",
+        ssl_protocols: TLS_FROM_1_0,
+        ciphers: FORWARD_SECRECY_CIPHERS,
+        load_balancer_types: APPLICATION_AND_NETWORK,
+    },
+    PolicyEntry {
+        name: "ELBSecurityPolicy-FS-1-1-2019-08",
+        ssl_protocols: TLS_FROM_1_1,
+        ciphers: FORWARD_SECRECY_CIPHERS,
+        load_balancer_types: APPLICATION_AND_NETWORK,
+    },
+    PolicyEntry {
+        name: "ELBSecurityPolicy-FS-1-2-2019-08",
+        ssl_protocols: TLS_1_2_ONLY,
+        ciphers: FORWARD_SECRECY_CIPHERS,
+        load_balancer_types: APPLICATION_AND_NETWORK,
+    },
+    PolicyEntry {
+        name: "ELBSecurityPolicy-FS-1-2-Res-2019-08",
+        ssl_protocols: TLS_1_2_ONLY,
+        ciphers: FORWARD_SECRECY_RESTRICTED_SHA2_CIPHERS,
+        load_balancer_types: APPLICATION_AND_NETWORK,
+    },
+    PolicyEntry {
+        name: "ELBSecurityPolicy-FS-1-2-Res-2020-10",
+        ssl_protocols: TLS_1_2_ONLY,
+        ciphers: FORWARD_SECRECY_RESTRICTED_AEAD_CIPHERS,
+        load_balancer_types: APPLICATION_AND_NETWORK,
+    },
+    PolicyEntry {
+        name: "ELBSecurityPolicy-TLS13-1-0-2021-06",
+        ssl_protocols: TLS13_FROM_1_0,
+        ciphers: TLS13_FULL_CIPHERS,
+        load_balancer_types: APPLICATION_AND_NETWORK,
+    },
+    PolicyEntry {
+        name: "ELBSecurityPolicy-TLS13-1-1-2021-06",
+        ssl_protocols: TLS13_FROM_1_1,
+        ciphers: TLS13_FULL_CIPHERS,
+        load_balancer_types: APPLICATION_AND_NETWORK,
+    },
+    PolicyEntry {
+        name: "ELBSecurityPolicy-TLS13-1-2-2021-06",
+        ssl_protocols: TLS13_FROM_1_2,
+        ciphers: TLS13_SHA2_CIPHERS,
+        load_balancer_types: APPLICATION_AND_NETWORK,
+    },
+    PolicyEntry {
+        name: "ELBSecurityPolicy-TLS13-1-2-Ext1-2021-06",
+        ssl_protocols: TLS13_FROM_1_2,
+        ciphers: TLS13_FULL_CIPHERS,
+        load_balancer_types: APPLICATION_AND_NETWORK,
+    },
+    PolicyEntry {
+        name: "ELBSecurityPolicy-TLS13-1-2-Ext2-2021-06",
+        ssl_protocols: TLS13_FROM_1_2,
+        ciphers: TLS13_FULL_CIPHERS,
+        load_balancer_types: APPLICATION_AND_NETWORK,
+    },
+    PolicyEntry {
+        name: "ELBSecurityPolicy-TLS13-1-2-Res-2021-06",
+        ssl_protocols: TLS13_FROM_1_2,
+        ciphers: TLS13_RESTRICTED_CIPHERS,
+        load_balancer_types: APPLICATION_AND_NETWORK,
+    },
+    PolicyEntry {
+        name: "ELBSecurityPolicy-TLS13-1-3-2021-06",
+        ssl_protocols: TLS13_ONLY,
+        ciphers: TLS13_SUITES,
+        load_balancer_types: APPLICATION_AND_NETWORK,
+    },
+];

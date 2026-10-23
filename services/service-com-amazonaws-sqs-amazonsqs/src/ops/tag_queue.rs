@@ -192,9 +192,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .filter(|name| store.queues.contains_key(*name))
             .map(str::to_string)
             .ok_or_else(|| {
-                TagQueueErrorModeled::QueueDoesNotExist(state::queue_does_not_exist(
-                    &input.queue_url,
-                ))
+                TagQueueErrorModeled::QueueDoesNotExist(state::queue_does_not_exist())
             })?;
 
         let queue = store

@@ -784,10 +784,13 @@ async fn an_acls_minimum_engine_version_follows_every_membership_change() {
             "DuplicateUserNameFault",
         ),
         (
+            // AWS answers the COMBINATION fault here: the delta contradicts the
+            // membership it is applied to. A name the REQUEST repeats is the
+            // duplicate-name fault above, so the two report different mistakes.
             "a member added that is already one",
             json!({ "ACLName": "moving-acl", "UserNamesToAdd": ["iam-one"] }),
             400,
-            "DuplicateUserNameFault",
+            "InvalidParameterCombinationException",
         ),
         (
             "a member removed that is not one",

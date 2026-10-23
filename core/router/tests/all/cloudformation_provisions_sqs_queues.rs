@@ -22,6 +22,14 @@
 //! The deletion half and the refusal half are rows of the same rule: deleting the stack
 //! deletes the queues it created, and a queue SQS REFUSES to create leaves the stack
 //! `CREATE_FAILED` naming the resource rather than publishing a dangling url.
+//!
+//! The UPDATE half is the same rule for a stack that already has the queue: **a deployment
+//! that re-declares a resource it created with a different configuration applies that
+//! change through the owning service's own update API, and the stack reaches its completed
+//! status with the resource's identity untouched.** For a queue the configuration is its
+//! attributes and its tags, so the change is a `SetQueueAttributes` plus a
+//! `TagQueue`/`UntagQueue` — never a replacement, and never a completed stack whose
+//! change went nowhere.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -212,6 +220,423 @@ async fn create_and_settle(
         "case {case:?}: expected HTTP 200 from DescribeStacks, got {status} with body {body}"
     );
     body
+}
+
+/// Update a stack with a new template, wait past its transition, and answer the
+/// `DescribeStacks` body.
+async fn update_and_settle(
+    router: &MultiServiceRouter,
+    case: &str,
+    stack_name: &str,
+    template: &str,
+) -> String {
+    let (status, body) = cloudformation(
+        router,
+        "UpdateStack",
+        &[("StackName", stack_name), ("TemplateBody", template)],
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected HTTP 200 from UpdateStack, got {status} with body {body}"
+    );
+    tokio::time::sleep(PAST_THE_STACK_SPAN).await;
+    let (status, body) =
+        cloudformation(router, "DescribeStacks", &[("StackName", stack_name)]).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected HTTP 200 from DescribeStacks, got {status} with body {body}"
+    );
+    body
+}
+
+/// Every attribute SQS reports for the queue at `url`.
+async fn reported_attributes(
+    router: &MultiServiceRouter,
+    case: &str,
+    url: &str,
+) -> BTreeMap<String, String> {
+    let reported = sqs_ok(
+        router,
+        case,
+        "GetQueueAttributes",
+        json!({"QueueUrl": url, "AttributeNames": ["All"]}),
+    )
+    .await;
+    reported
+        .get("Attributes")
+        .and_then(Value::as_object)
+        .map(|attributes| {
+            attributes
+                .iter()
+                .filter_map(|(name, value)| {
+                    value.as_str().map(|value| (name.clone(), value.to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The tags SQS reports for the queue at `url`. A queue with no tag reports no `Tags`
+/// member at all, which is the empty map here.
+async fn reported_tags(
+    router: &MultiServiceRouter,
+    case: &str,
+    url: &str,
+) -> BTreeMap<String, String> {
+    let reported = sqs_ok(router, case, "ListQueueTags", json!({"QueueUrl": url})).await;
+    reported
+        .get("Tags")
+        .and_then(Value::as_object)
+        .map(|tags| {
+            tags.iter()
+                .filter_map(|(key, value)| {
+                    value.as_str().map(|value| (key.clone(), value.to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The template one of the update rows deploys: one `AWS::SQS::Queue` carrying
+/// `properties`, publishing its url.
+fn one_queue_template(properties: &str) -> String {
+    format!(
+        r#"{{"Resources":{{"Queue":{{"Type":"AWS::SQS::Queue","Properties":{properties}}}}},
+             "Outputs":{{"QueueUrl":{{"Value":{{"Ref":"Queue"}}}}}}}}"#
+    )
+}
+
+/// One row of the in-place update table: the properties the queue is created with, the
+/// properties the update declares for it, and what SQS must report once the update
+/// completes.
+struct UpdateRow {
+    case: &'static str,
+    stack_name: &'static str,
+    /// The name the template declares for the queue, or `None` where CloudFormation
+    /// generates it — a resource kept by its identity either way, so the update applies to
+    /// the queue the create made.
+    declared_name: Option<&'static str>,
+    /// The `Properties` object the create declares, as template text.
+    created: &'static str,
+    /// The `Properties` object the update declares, as template text.
+    updated: &'static str,
+    /// Attributes `GetQueueAttributes` must report after the update.
+    expected_attributes: &'static [(&'static str, &'static str)],
+    /// The tag map `ListQueueTags` must report after the update.
+    expected_tags: &'static [(&'static str, &'static str)],
+}
+
+/// The rows differ along what the rule generalises over: which attribute changes, whether
+/// the update CHANGES a declared property, ADDS one the create did not declare or re-values
+/// several at once, the form of the value (integer, boolean, opaque text, a JSON object),
+/// whether the change is to the queue's attributes or to its tags (added, re-valued and
+/// dropped), and whether the template named the queue or CloudFormation generated the name.
+/// No row changes the queue's NAME, which is what makes each change an in-place one rather
+/// than a replacement.
+const UPDATE_ROWS: &[UpdateRow] = &[
+    UpdateRow {
+        case: "an integer attribute given a new value",
+        stack_name: "update-integer-stack",
+        declared_name: Some("update-integer-queue"),
+        created: r#"{"QueueName":"update-integer-queue","VisibilityTimeout":60}"#,
+        updated: r#"{"QueueName":"update-integer-queue","VisibilityTimeout":120}"#,
+        expected_attributes: &[("VisibilityTimeout", "120")],
+        expected_tags: &[],
+    },
+    UpdateRow {
+        case: "an attribute of a queue whose name CloudFormation generated",
+        stack_name: "update-generated-stack",
+        declared_name: None,
+        created: r#"{"MessageRetentionPeriod":600}"#,
+        updated: r#"{"MessageRetentionPeriod":1200,"DelaySeconds":3}"#,
+        expected_attributes: &[("MessageRetentionPeriod", "1200"), ("DelaySeconds", "3")],
+        expected_tags: &[],
+    },
+    UpdateRow {
+        case: "attributes the create never declared are added",
+        stack_name: "update-added-stack",
+        declared_name: Some("update-added-queue"),
+        created: r#"{"QueueName":"update-added-queue","VisibilityTimeout":60}"#,
+        updated: r#"{"QueueName":"update-added-queue","VisibilityTimeout":60,
+             "DelaySeconds":10,"ReceiveMessageWaitTimeSeconds":20}"#,
+        expected_attributes: &[
+            ("VisibilityTimeout", "60"),
+            ("DelaySeconds", "10"),
+            ("ReceiveMessageWaitTimeSeconds", "20"),
+        ],
+        expected_tags: &[],
+    },
+    UpdateRow {
+        case: "several attributes at once, one of them a policy written as an object",
+        stack_name: "update-several-stack",
+        declared_name: Some("update-several-queue"),
+        created: r#"{"QueueName":"update-several-queue","VisibilityTimeout":30,
+             "MessageRetentionPeriod":600,
+             "Policy":{"Version":"2012-10-17","Statement":[]}}"#,
+        updated: r#"{"QueueName":"update-several-queue","VisibilityTimeout":43200,
+             "MessageRetentionPeriod":1209600,
+             "Policy":{"Version":"2012-10-17","Statement":[{"Effect":"Allow"}]}}"#,
+        expected_attributes: &[
+            ("VisibilityTimeout", "43200"),
+            ("MessageRetentionPeriod", "1209600"),
+            // The object the update declared, as the compact JSON string the attribute is
+            // documented to carry, with its members in the order the template wrote them.
+            (
+                "Policy",
+                r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow"}]}"#,
+            ),
+        ],
+        expected_tags: &[],
+    },
+    UpdateRow {
+        case: "a boolean attribute flipped and an opaque text attribute re-pointed",
+        stack_name: "update-boolean-stack",
+        declared_name: Some("update-boolean-queue"),
+        created: r#"{"QueueName":"update-boolean-queue","SqsManagedSseEnabled":false,
+             "KmsMasterKeyId":"alias/aws/sqs"}"#,
+        updated: r#"{"QueueName":"update-boolean-queue","SqsManagedSseEnabled":true,
+             "KmsMasterKeyId":"alias/stack-managed"}"#,
+        expected_attributes: &[
+            ("SqsManagedSseEnabled", "true"),
+            ("KmsMasterKeyId", "alias/stack-managed"),
+        ],
+        expected_tags: &[],
+    },
+    UpdateRow {
+        case: "tags only: one added, one re-valued, one dropped",
+        stack_name: "update-tags-stack",
+        declared_name: Some("update-tags-queue"),
+        created: r#"{"QueueName":"update-tags-queue",
+             "Tags":[{"Key":"team","Value":"platform"},{"Key":"env","Value":"staging"},
+               {"Key":"retire","Value":"soon"}]}"#,
+        updated: r#"{"QueueName":"update-tags-queue",
+             "Tags":[{"Key":"team","Value":"payments"},{"Key":"env","Value":"staging"},
+               {"Key":"owner","Value":"core"}]}"#,
+        // No attribute was declared on either side, so the queue keeps the documented
+        // CreateQueue default.
+        expected_attributes: &[("VisibilityTimeout", "30")],
+        expected_tags: &[("env", "staging"), ("owner", "core"), ("team", "payments")],
+    },
+    UpdateRow {
+        case: "an attribute and the tags changed in the same update",
+        stack_name: "update-both-stack",
+        declared_name: Some("update-both-queue"),
+        created: r#"{"QueueName":"update-both-queue","MessageRetentionPeriod":60,
+             "Tags":[{"Key":"team","Value":"platform"}]}"#,
+        updated: r#"{"QueueName":"update-both-queue","MessageRetentionPeriod":86400,
+             "Tags":[{"Key":"team","Value":"platform"},{"Key":"tier","Value":"gold"}]}"#,
+        expected_attributes: &[("MessageRetentionPeriod", "86400")],
+        expected_tags: &[("team", "platform"), ("tier", "gold")],
+    },
+];
+
+/// An update that changes a mutable property of an `AWS::SQS::Queue` the stack already
+/// created is APPLIED to that queue and the stack reaches `UPDATE_COMPLETE`: the queue
+/// keeps its identity and everything it holds (nothing is replaced), and SQS reports the
+/// configuration the new template declares.
+#[tokio::test]
+async fn an_update_applies_changed_queue_properties_in_place() {
+    let router = build_router();
+
+    for row in UPDATE_ROWS {
+        let case = row.case;
+        let body = create_and_settle(
+            &router,
+            case,
+            row.stack_name,
+            &one_queue_template(row.created),
+        )
+        .await;
+        assert_eq!(
+            xml_text(&body, "StackStatus").as_deref(),
+            Some("CREATE_COMPLETE"),
+            "case {case:?}: expected the stack to complete before the update, got {body}"
+        );
+        let url = outputs_of(&body)
+            .get("QueueUrl")
+            .unwrap_or_else(|| panic!("case {case:?}: no QueueUrl output in {body}"))
+            .clone();
+        // The name the stack gave the queue: the declared one, or CloudFormation's
+        // generated `<stack>-<logical id>-<suffix>`, which the update must keep.
+        let queue_name = match row.declared_name {
+            Some(declared) => {
+                assert_eq!(
+                    url,
+                    queue_url(declared),
+                    "case {case:?}: expected the declared queue's url"
+                );
+                declared.to_string()
+            }
+            None => {
+                let name = url.rsplit('/').next().unwrap_or_default().to_string();
+                assert!(
+                    is_generated_name(&name, row.stack_name, "Queue"),
+                    "case {case:?}: expected a generated <stack>-<logical id>-<suffix> name, \
+                     got {name:?}"
+                );
+                name
+            }
+        };
+
+        // What the queue is before the update: the instant it was created, and one message
+        // it holds. A REPLACED queue would carry neither afterwards.
+        let created_timestamp = reported_attributes(&router, case, &url)
+            .await
+            .get("CreatedTimestamp")
+            .cloned()
+            .unwrap_or_else(|| panic!("case {case:?}: no CreatedTimestamp for {url}"));
+        let payload = format!("before the update of {queue_name}");
+        sqs_ok(
+            &router,
+            case,
+            "SendMessage",
+            json!({"QueueUrl": url, "MessageBody": payload}),
+        )
+        .await;
+
+        let body = update_and_settle(
+            &router,
+            case,
+            row.stack_name,
+            &one_queue_template(row.updated),
+        )
+        .await;
+        let reason = xml_text(&body, "StackStatusReason").unwrap_or_default();
+        assert_eq!(
+            (
+                xml_text(&body, "StackStatus").as_deref(),
+                reason.as_str()
+            ),
+            (Some("UPDATE_COMPLETE"), ""),
+            "case {case:?}: expected the update to be applied in place, got {body}"
+        );
+
+        // The configuration the update declared is the configuration the queue has, and
+        // every attribute it did not name is left alone.
+        let attributes = reported_attributes(&router, case, &url).await;
+        for (attribute, value) in row.expected_attributes {
+            assert_eq!(
+                attributes.get(*attribute).map(String::as_str),
+                Some(*value),
+                "case {case:?}: expected {attribute}={value} after the update, got {attributes:?}"
+            );
+        }
+        let tags = reported_tags(&router, case, &url).await;
+        let expected_tags: BTreeMap<String, String> = row
+            .expected_tags
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect();
+        assert_eq!(
+            tags, expected_tags,
+            "case {case:?}: expected the declared tag map after the update"
+        );
+
+        // The same queue, not a new one: the name still resolves to the same url, the
+        // queue was created at the same instant, and the message sent before the update is
+        // still there.
+        let resolved = sqs_ok(
+            &router,
+            case,
+            "GetQueueUrl",
+            json!({"QueueName": queue_name}),
+        )
+        .await;
+        assert_eq!(
+            resolved.get("QueueUrl").and_then(Value::as_str),
+            Some(url.as_str()),
+            "case {case:?}: expected the update to keep the queue's url, got {resolved}"
+        );
+        assert_eq!(
+            attributes.get("CreatedTimestamp").map(String::as_str),
+            Some(created_timestamp.as_str()),
+            "case {case:?}: expected the queue the stack created, not a replacement"
+        );
+        let received = sqs_ok(
+            &router,
+            case,
+            "ReceiveMessage",
+            json!({"QueueUrl": url, "MaxNumberOfMessages": 10}),
+        )
+        .await;
+        let bodies: Vec<&str> = received
+            .get("Messages")
+            .and_then(Value::as_array)
+            .map(|messages| {
+                messages
+                    .iter()
+                    .filter_map(|message| message.get("Body").and_then(Value::as_str))
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert_eq!(
+            bodies,
+            vec![payload.as_str()],
+            "case {case:?}: expected the in-place update to keep the queue's messages, got \
+             {received}"
+        );
+    }
+}
+
+/// A property the update NO LONGER declares would have to be reset to Amazon SQS's own
+/// documented default, which `SetQueueAttributes` cannot be asked for: the update is
+/// refused naming that property rather than reported as applied, and the queue keeps the
+/// value it has — so no stack ever reports a queue configured differently from its
+/// declaration.
+#[tokio::test]
+async fn an_update_that_drops_a_declared_property_is_refused_rather_than_dropped() {
+    let router = build_router();
+    let case = "an update that stops declaring VisibilityTimeout";
+    let stack_name = "update-dropped-stack";
+    let queue_name = "update-dropped-queue";
+
+    let body = create_and_settle(
+        &router,
+        case,
+        stack_name,
+        &one_queue_template(
+            r#"{"QueueName":"update-dropped-queue","VisibilityTimeout":90,"DelaySeconds":5}"#,
+        ),
+    )
+    .await;
+    assert_eq!(
+        xml_text(&body, "StackStatus").as_deref(),
+        Some("CREATE_COMPLETE"),
+        "case {case:?}: expected the stack to complete before the update, got {body}"
+    );
+    let url = queue_url(queue_name);
+
+    let body = update_and_settle(
+        &router,
+        case,
+        stack_name,
+        &one_queue_template(r#"{"QueueName":"update-dropped-queue","DelaySeconds":5}"#),
+    )
+    .await;
+    assert_eq!(
+        xml_text(&body, "StackStatus").as_deref(),
+        Some("UPDATE_FAILED"),
+        "case {case:?}: expected the update to be refused rather than silently dropped, got \
+         {body}"
+    );
+    let reason = xml_text(&body, "StackStatusReason").unwrap_or_default();
+    assert!(
+        reason.contains("Queue") && reason.contains("VisibilityTimeout"),
+        "case {case:?}: expected the reason to name the resource and the property it will not \
+         reset, got {reason:?}"
+    );
+
+    // The queue is exactly as it was: nothing was applied by the refused update.
+    let attributes = reported_attributes(&router, case, &url).await;
+    assert_eq!(
+        (
+            attributes.get("VisibilityTimeout").map(String::as_str),
+            attributes.get("DelaySeconds").map(String::as_str)
+        ),
+        (Some("90"), Some("5")),
+        "case {case:?}: expected the queue to keep the configuration it has, got {attributes:?}"
+    );
 }
 
 /// The url a queue named `name` is addressed at in this emulator.

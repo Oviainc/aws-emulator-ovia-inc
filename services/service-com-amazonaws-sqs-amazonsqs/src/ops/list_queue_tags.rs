@@ -159,9 +159,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let queue = state::queue_name_from_url(&input.queue_url)
             .and_then(|name| store.queues.get(name))
             .ok_or_else(|| {
-                ListQueueTagsErrorModeled::QueueDoesNotExist(state::queue_does_not_exist(
-                    &input.queue_url,
-                ))
+                ListQueueTagsErrorModeled::QueueDoesNotExist(state::queue_does_not_exist())
             })?;
 
         // "The list of all tags added to the specified queue" is an OPTIONAL member, so

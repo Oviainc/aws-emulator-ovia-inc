@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateMultipartUpload
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateMultipartUpload`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateMultipartUpload::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: an initiation records a multipart upload in this service's state
+//! ([`crate::state::MultipartUpload`]) and answers with the upload id the store minted
+//! for it, which `ListParts` reads the upload back by.
 //!
 //! ## Shape of an operation
 //!
@@ -265,14 +260,21 @@ use super::types::*;
 // `CreateMultipartUploadError` enum is never produced.
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-s3-amazons3.json");
 
-// The operation's MODELED errors. `#[operation_error]` accepts only variants the
-// model declares for this operation, so the scaffold's `NotImplemented` cannot live
-// here — hence the `CreateMultipartUploadError` alias below. An operation that models no errors
-// generates an UNINHABITED enum here, which is correct and expected: there is nothing
-// to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.s3#CreateMultipartUpload")]
+// The operation's MODELED errors — this operation declares NONE
+// (`smithy_query(query="operation",operation="CreateMultipartUpload")` reports an empty
+// error list), so the enum is widened with `extra_errors` by the one shape this SERVICE
+// models for the failure an initiation really has: `Bucket` is an `@httpLabel` naming a
+// bucket that may not exist, and without `NoSuchBucket` an upload initiated into a bucket
+// this emulator does not hold would have to be answered as a success — an upload no later
+// `ListParts` could read back. The shape is this service's own
+// (`com.amazonaws.s3#NoSuchBucket`, "The specified bucket does not exist", HTTP 404).
+#[smithy_macros::operation_error(
+    "com.amazonaws.s3#CreateMultipartUpload",
+    extra_errors = ["NoSuchBucket"]
+)]
 #[derive(Debug)]
 pub enum CreateMultipartUploadErrorModeled {
+    NoSuchBucket(NoSuchBucket),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -326,18 +328,295 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateMultipartUpload` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateMultipartUploadErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // An initiation needs nothing from the request beyond its deserialized input.
+        let _ = ctx;
+
+        // What this emulator cannot carry out faithfully, refused rather than answered
+        // with an upload id that would claim it. Each member decides something about the
+        // object the upload completes into that nothing here performs:
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateMultipartUpload"))
+        // * the SSE-C members carry a customer-provided KEY. S3 "doesn't store the
+        //   encryption key you provide", and every later part upload and read has to
+        //   carry it again — so serving them would mean keeping a key S3 does not keep,
+        //   or serving parts whose key was never checked. `PutObject` and `GetObject`
+        //   refuse them for the same reason, so no object here is addressed by one.
+        // * the Object Lock members decide whether a later delete is allowed; no
+        //   retention or hold is emulated.
+        // * `RequestPayer` asks to be charged for the request; nothing here charges a
+        //   requester, so `RequestCharged` is never reported either.
+        //
+        // The SSE / SSE-KMS members are NOT in this list: they name the encryption
+        // CONFIGURATION the upload is initiated under, which is recorded with it below
+        // and reported back by this response and by `ListParts`. Neither is
+        // `x-amz-tagging`, whose tag set is stored on the upload, nor the checksum
+        // members, which name the algorithm the upload is configured for and are recorded
+        // and reported as exactly that — a configuration, never a checksum value this
+        // handler did not compute. The ACL and `x-amz-grant-*` members are not refused
+        // either, for the same reason `PutObject` does not refuse them: this store keeps
+        // no per-object ACL, so nothing is claimed about them.
+        if let Some(unserved) = unserved_feature(&input) {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
+                "CreateMultipartUpload with {unserved}"
+            )));
+        }
+
+        // "If the account ID that you provide does not match the actual owner of the
+        // bucket, the request fails with the HTTP status code 403 Forbidden (access
+        // denied)" — `CreateMultipartUploadRequest$ExpectedBucketOwner`, judged the way
+        // `PutObject` and `HeadObject` judge it: this emulator serves one account, so the
+        // owner of every bucket it holds is that account.
+        if input
+            .expected_bucket_owner
+            .as_deref()
+            .is_some_and(|expected| expected != ::engine::emulator_account_id())
+        {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                "AccessDenied",
+                403,
+                "Access Denied",
+            ));
+        }
+
+        // `ServerSideEncryption` is an enum member, so the boundary refuses a value
+        // outside the published set before this handler runs; this guard is what keeps a
+        // RECORDED algorithm inside that set if a request ever parses to something else,
+        // exactly as `PutObject`'s own does.
+        if let Some(algorithm) = input.server_side_encryption.as_deref() {
+            if !SERVER_SIDE_ENCRYPTION_VALUES.contains(&algorithm) {
+                return Err(crate::scaffolded::Scaffolded::unmodeled(
+                    crate::state::INVALID_ARGUMENT_CODE,
+                    crate::state::INVALID_ARGUMENT_STATUS,
+                    format!(
+                        "x-amz-server-side-encryption must be one of \
+                         {SERVER_SIDE_ENCRYPTION_VALUES:?}, got {algorithm:?}"
+                    ),
+                ));
+            }
+        }
+
+        // The encryption configuration this upload is initiated under, taken from the
+        // modelled members the request carried — the CONFIGURATION, not a key and not a
+        // ciphertext, the same record `PutObject` keeps on a stored object.
+        let encryption = crate::state::ObjectEncryption {
+            sse_algorithm: input.server_side_encryption.clone(),
+            kms_key_id: input.ssekms_key_id.clone(),
+            kms_encryption_context: input.ssekms_encryption_context.clone(),
+            bucket_key_enabled: input.bucket_key_enabled,
+        };
+        // "This parameter is allowed if and only if SSEAlgorithm is set to aws:kms or
+        // aws:kms:dsse" (`ApplyServerSideEncryptionByDefault$KMSMasterKeyID`): each of the
+        // three names something only SSE-KMS has, so one of them beside another algorithm
+        // — or beside none — is a parameter that is not valid for this request, which S3
+        // answers with `InvalidArgument` (400). `PutObject` refuses it identically.
+        if !encryption.uses_kms() {
+            if let Some(member) = encryption.kms_only_member() {
+                return Err(crate::scaffolded::Scaffolded::unmodeled(
+                    crate::state::INVALID_ARGUMENT_CODE,
+                    crate::state::INVALID_ARGUMENT_STATUS,
+                    format!(
+                        "{member} is only valid with a server-side encryption algorithm \
+                         of {}",
+                        crate::state::KMS_SSE_ALGORITHMS.join(" or ")
+                    ),
+                ));
+            }
+        }
+
+        // "The tag-set for the object. The tag-set must be encoded as URL Query
+        // parameters" (`CreateMultipartUploadRequest$Tagging`) — read as the URL-encoded
+        // query string it is declared to be and judged against an OBJECT's published
+        // tag-set limits, the same seam `PutObject` judges its own header through, so one
+        // header cannot mean two different things. AWS refuses these with `InvalidTag`, a
+        // code this service's model declares no shape for, so the refusal goes out through
+        // the framework's 400 `ValidationException` channel — and BEFORE anything is
+        // recorded, so a refused initiation leaves the bucket's uploads untouched.
+        let tags = match input.tagging.as_deref() {
+            Some(header) => {
+                match crate::state::tag_set_from_header(
+                    header,
+                    crate::state::OBJECT_TAG_SET_LIMITS,
+                ) {
+                    Ok(tags) => tags,
+                    Err(rejection) => {
+                        return Err(crate::scaffolded::Scaffolded::validation(
+                            rejection.to_string(),
+                        ))
+                    }
+                }
+            }
+            None => Vec::new(),
+        };
+
+        let upload = crate::state::MultipartUpload {
+            key: input.key.clone(),
+            // Read here, where the upload comes into being, so `Initiated` is the moment
+            // the store accepted it.
+            initiated_at: ::std::time::SystemTime::now(),
+            // "By default, Amazon S3 uses the STANDARD Storage Class to store newly
+            // created objects" — the same default a one-shot write takes.
+            storage_class: input
+                .storage_class
+                .clone()
+                .unwrap_or_else(|| crate::state::DEFAULT_STORAGE_CLASS.to_string()),
+            content_type: input.content_type.clone(),
+            cache_control: input.cache_control.clone(),
+            content_disposition: input.content_disposition.clone(),
+            content_encoding: input.content_encoding.clone(),
+            content_language: input.content_language.clone(),
+            expires: input.expires.clone(),
+            website_redirect_location: input.website_redirect_location.clone(),
+            metadata: input
+                .metadata
+                .clone()
+                .unwrap_or_default()
+                .into_iter()
+                .collect(),
+            tags,
+            encryption: encryption.clone(),
+            checksum_algorithm: input.checksum_algorithm.clone(),
+            checksum_type: input.checksum_type.clone(),
+        };
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Without the store the upload cannot be recorded at all, and no modelled
+            // error says that, so the documented code for "we could not carry out the
+            // request" goes out rather than a 501, which would claim this operation is
+            // unwritten.
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::INTERNAL_ERROR_CODE,
+                crate::state::INTERNAL_ERROR_STATUS,
+                "the shared S3 store is unreachable from this engine",
+            ));
+        };
+
+        // The store reports what the initiation did, because it may refuse: a bucket this
+        // emulator does not hold, an over-long key, metadata past what one object may
+        // carry, and the two ceilings that keep its in-progress uploads bounded. Each is
+        // answered as a refusal, so nothing is recorded and the caller is told.
+        let outcome = {
+            let mut store = state.lock();
+            store.create_multipart_upload(&input.bucket, upload)
+        };
+        let Some(outcome) = outcome else {
+            return Err(CreateMultipartUploadErrorModeled::NoSuchBucket(NoSuchBucket {}).into());
+        };
+        let upload_id = match outcome {
+            crate::state::MultipartUploadCreation::Initiated { upload_id } => upload_id,
+            // "The name for a key is a sequence of Unicode characters whose UTF-8
+            // encoding is at most 1,024 bytes long" (Amazon S3 User Guide). A longer key
+            // is `KeyTooLongError` with HTTP 400 (Amazon S3 "Error responses", list of
+            // error codes); the model declares no shape for it, so it goes out through the
+            // unmodelled channel with the code and status S3 sends.
+            crate::state::MultipartUploadCreation::KeyTooLong { bytes } => {
+                return Err(crate::scaffolded::Scaffolded::unmodeled(
+                    "KeyTooLongError",
+                    400,
+                    format!(
+                        "Your key is too long: {bytes} bytes, past the {} bytes a key may \
+                         carry",
+                        crate::state::MAX_OBJECT_KEY_BYTES
+                    ),
+                ));
+            }
+            // "Within the PUT request header, the user-defined metadata is limited to 2
+            // KB in size" (Amazon S3 User Guide). Past it S3 answers `MetadataTooLarge`
+            // with HTTP 400 (same list of error codes), a code this model declares no
+            // shape for either.
+            crate::state::MultipartUploadCreation::MetadataTooLarge { bytes } => {
+                return Err(crate::scaffolded::Scaffolded::unmodeled(
+                    "MetadataTooLarge",
+                    400,
+                    format!(
+                        "Your metadata headers exceed the maximum allowed metadata size: \
+                         {bytes} bytes, past {}",
+                        crate::state::MAX_OBJECT_METADATA_BYTES
+                    ),
+                ));
+            }
+            // The emulator's own ceilings, not AWS quotas (S3 bounds the number of
+            // concurrent multipart uploads not at all), so no AWS error code describes
+            // them: they go out through the framework's 400 `ValidationException` channel,
+            // the same channel `PutObject` answers its own ceilings through.
+            crate::state::MultipartUploadCreation::UploadCountReached => {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "the bucket {:?} already has the maximum of {} multipart uploads this \
+                     emulator keeps in progress per bucket; complete or abort one before \
+                     initiating an upload of {:?}",
+                    input.bucket,
+                    crate::state::MAX_MULTIPART_UPLOADS_PER_BUCKET,
+                    input.key
+                )));
+            }
+            crate::state::MultipartUploadCreation::TotalUploadCountReached => {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "this emulator already has the maximum of {} multipart uploads in \
+                     progress across every bucket; complete or abort one before initiating \
+                     an upload of {:?}",
+                    crate::state::MAX_MULTIPART_UPLOADS_TOTAL,
+                    input.key
+                )));
+            }
+        };
+
+        Ok(CreateMultipartUploadOutput {
+            // "The name of the bucket to which the multipart upload was initiated" and
+            // "Object key for which the multipart upload was initiated": the address the
+            // upload was recorded under, which is the one the request named (this emulator
+            // holds no access point, so there is no alias to report instead).
+            bucket: Some(input.bucket.clone()),
+            key: Some(input.key.clone()),
+            // "ID for the initiated multipart upload" — the id the STORE minted and
+            // recorded, so every later part, completion or abort request names the upload
+            // this call really created.
+            upload_id: Some(upload_id),
+            // The encryption configuration the upload was recorded under, reported back
+            // the way `PutObject` reports a stored object's: these are the recorded
+            // values, so an initiation that named no encryption reports none rather than a
+            // default nothing applied.
+            server_side_encryption: encryption.sse_algorithm.clone(),
+            ssekms_key_id: encryption.kms_key_id.clone(),
+            ssekms_encryption_context: encryption.kms_encryption_context.clone(),
+            bucket_key_enabled: encryption.bucket_key_enabled,
+            // "The algorithm that was used to create a checksum of the object" and the
+            // checksum type: the configuration the upload was recorded with, echoed from
+            // the store, and nothing is reported when the request named none. No checksum
+            // VALUE is reported anywhere: nothing here computes one.
+            checksum_algorithm: input.checksum_algorithm.clone(),
+            checksum_type: input.checksum_type.clone(),
+            // Everything else this output can carry describes something no upload here
+            // has: `AbortDate` and `AbortRuleId` are reported only for a bucket with a
+            // lifecycle rule that aborts incomplete multipart uploads (this emulator
+            // records no lifecycle configuration), the SSE-C members are refused above,
+            // and `RequestCharged` reports a Requester Pays charge nothing here makes.
+            ..CreateMultipartUploadOutput::default()
+        })
     }
+}
+
+/// The feature `input` asks for that this emulator does not serve, if any — named for the
+/// 501 that refuses it, the way `HeadObject` names its own.
+fn unserved_feature(input: &CreateMultipartUploadInput) -> Option<&'static str> {
+    [
+        (
+            input.sse_customer_algorithm.is_some(),
+            "SSECustomerAlgorithm",
+        ),
+        (input.sse_customer_key.is_some(), "SSECustomerKey"),
+        (input.object_lock_mode.is_some(), "ObjectLockMode"),
+        (
+            input.object_lock_retain_until_date.is_some(),
+            "ObjectLockRetainUntilDate",
+        ),
+        (
+            input.object_lock_legal_hold_status.is_some(),
+            "ObjectLockLegalHoldStatus",
+        ),
+        (
+            input.object_lock_event_hold.is_some(),
+            "ObjectLockEventHold",
+        ),
+        (input.request_payer.is_some(), "RequestPayer"),
+    ]
+    .into_iter()
+    .find_map(|(asked, name)| asked.then_some(name))
 }

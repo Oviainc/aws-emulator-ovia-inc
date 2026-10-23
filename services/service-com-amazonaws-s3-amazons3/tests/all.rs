@@ -47,6 +47,8 @@ mod head_object_read_back;
 mod list_buckets;
 #[path = "all/listing_encoding_type.rs"]
 mod listing_encoding_type;
+#[path = "all/multipart_upload_initiation.rs"]
+mod multipart_upload_initiation;
 #[path = "all/object_and_policy.rs"]
 mod object_and_policy;
 #[path = "all/object_and_tagging_roundtrip.rs"]

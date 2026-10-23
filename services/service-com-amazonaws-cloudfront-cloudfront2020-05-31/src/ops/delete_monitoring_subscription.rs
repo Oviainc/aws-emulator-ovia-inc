@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteMonitoringSubscription
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteMonitoringSubscription`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteMonitoringSubscription::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Releases the monitoring subscription the distribution the route names carries, so a
+//! later `GetMonitoringSubscription` answers `NoSuchMonitoringSubscription` and a later
+//! `CreateMonitoringSubscription` may associate one again. A distribution the store does
+//! not hold is `NoSuchDistribution`; one that carries no subscription is
+//! `NoSuchMonitoringSubscription` — there is nothing to disable. Nothing else on the
+//! distribution changes: a monitoring subscription is a sub-resource of it, not a member
+//! of its configuration.
 //!
 //! ## Shape of an operation
 //!
@@ -139,18 +138,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteMonitoringSubscription` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteMonitoringSubscriptionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteMonitoringSubscription"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::store_unavailable());
+        };
+        let _ = ctx;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.settle(now);
+
+        // "The ID of the distribution that you are disabling metrics for": an id this
+        // store holds no distribution for names nothing to disable them on.
+        let Some(distribution) = store.distributions.get_mut(&input.distribution_id) else {
+            return Err(DeleteMonitoringSubscriptionErrorModeled::NoSuchDistribution(
+                crate::state::no_such_distribution(),
+            )
+            .into());
+        };
+
+        // A distribution that carries no subscription has no additional metrics to
+        // disable, so this names nothing to delete — checked BEFORE anything is written,
+        // so the refusal path leaves the record exactly as it was.
+        if distribution.monitoring_subscription.is_none() {
+            return Err(
+                DeleteMonitoringSubscriptionErrorModeled::NoSuchMonitoringSubscription(
+                    crate::state::no_such_monitoring_subscription(),
+                )
+                .into(),
+            );
+        }
+        distribution.monitoring_subscription = None;
+
+        // The model gives this operation no output members: the release itself is the
+        // whole answer.
+        Ok(DeleteMonitoringSubscriptionOutput {})
     }
 }

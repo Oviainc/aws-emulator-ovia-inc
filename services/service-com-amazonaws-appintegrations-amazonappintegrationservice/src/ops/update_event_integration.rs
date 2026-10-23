@@ -153,10 +153,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| {
                 UpdateEventIntegrationErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(format!(
-                            "No event integration named {} exists.",
-                            input.name
-                        )),
+                        message: Some(crate::state::event_integration_not_found(&input.name)),
                     },
                 )
             })?;

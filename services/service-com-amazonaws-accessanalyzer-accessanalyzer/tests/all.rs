@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/access_preview.rs"]
 mod access_preview;
+#[path = "all/access_preview_findings.rs"]
+mod access_preview_findings;
 #[path = "all/analyzer_lifecycle.rs"]
 mod analyzer_lifecycle;
 #[path = "all/archive_rule_update.rs"]

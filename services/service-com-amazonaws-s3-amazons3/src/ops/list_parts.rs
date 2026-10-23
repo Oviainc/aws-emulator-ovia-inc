@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListParts
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListParts`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListParts::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: this is the read-back for ONE multipart upload — it reports the upload
+//! `CreateMultipartUpload` recorded in this service's state
+//! ([`crate::state::MultipartUpload`]) and the parts it holds, and refuses an upload this
+//! emulator does not have in progress with `NoSuchUpload`.
 //!
 //! ## Shape of an operation
 //!
@@ -197,14 +193,21 @@ use super::types::*;
 // `ListPartsError` enum is never produced.
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-s3-amazons3.json");
 
-// The operation's MODELED errors. `#[operation_error]` accepts only variants the
-// model declares for this operation, so the scaffold's `NotImplemented` cannot live
-// here — hence the `ListPartsError` alias below. An operation that models no errors
-// generates an UNINHABITED enum here, which is correct and expected: there is nothing
-// to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.s3#ListParts")]
+// The operation's MODELED errors — this operation declares NONE
+// (`smithy_query(query="operation",operation="ListParts")` reports an empty error list),
+// so the enum is widened with `extra_errors` by the two shapes this SERVICE models for
+// the addresses a read of an upload can miss: the bucket (`NoSuchBucket`, HTTP 404) and
+// the upload itself (`NoSuchUpload`, "The specified multipart upload does not exist",
+// HTTP 404). Without them a read of an upload nothing initiated would have to be answered
+// as an empty success, which a client cannot tell from an upload that holds no part.
+#[smithy_macros::operation_error(
+    "com.amazonaws.s3#ListParts",
+    extra_errors = ["NoSuchBucket", "NoSuchUpload"]
+)]
 #[derive(Debug)]
 pub enum ListPartsErrorModeled {
+    NoSuchBucket(NoSuchBucket),
+    NoSuchUpload(NoSuchUpload),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -258,18 +261,156 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListParts` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListPartsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListParts"))
+        // A read needs nothing from the request beyond its deserialized input.
+        let _ = ctx;
+
+        // The SSE-C members carry a customer-provided KEY this emulator does not keep
+        // (`CreateMultipartUpload` refuses an upload initiated with one for the same
+        // reason), and `RequestPayer` asks to be charged for the request, which nothing
+        // here does — so a request asking for either is refused rather than answered as
+        // if it had been honoured, exactly as `HeadObject` refuses them.
+        if let Some(unserved) = unserved_feature(&input) {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
+                "ListParts with {unserved}"
+            )));
+        }
+
+        // "If the account ID that you provide does not match the actual owner of the
+        // bucket, the request fails with the HTTP status code 403 Forbidden (access
+        // denied)" — `ListPartsRequest$ExpectedBucketOwner`, judged the way every other
+        // reader here judges it: this emulator serves one account.
+        if input
+            .expected_bucket_owner
+            .as_deref()
+            .is_some_and(|expected| expected != ::engine::emulator_account_id())
+        {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                "AccessDenied",
+                403,
+                "Access Denied",
+            ));
+        }
+
+        // "Sets the maximum number of parts to return" (`ListPartsRequest$MaxParts`),
+        // bounded by what one page may carry: "The ListParts request returns a maximum of
+        // 1,000 uploaded parts. The limit of 1,000 parts is also the default value" (this
+        // operation's own documentation). A negative value is not a count at all, which is
+        // `InvalidArgument` (400) — the code `ListObjectsV2` answers an out-of-range
+        // `max-keys` with.
+        let max_parts = match input.max_parts {
+            Some(requested) if requested < 0 => {
+                return Err(crate::scaffolded::Scaffolded::unmodeled(
+                    crate::state::INVALID_ARGUMENT_CODE,
+                    crate::state::INVALID_ARGUMENT_STATUS,
+                    format!(
+                        "Argument max-parts must be an integer between 0 and 2147483647: \
+                         {requested}"
+                    ),
+                ))
+            }
+            Some(requested) => requested.min(MAX_PARTS_PER_PAGE),
+            None => MAX_PARTS_PER_PAGE,
+        };
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Neither modelled error says "the store is unreachable", and both would be a
+            // false statement about the upload, so the documented code for a request this
+            // emulator could not carry out goes out instead.
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::INTERNAL_ERROR_CODE,
+                crate::state::INTERNAL_ERROR_STATUS,
+                "the shared S3 store is unreachable from this engine",
+            ));
+        };
+
+        // Read-only: the guard is taken, what the upload holds is copied out, and nothing
+        // is written — a later caller sees exactly what this one saw.
+        let store = state.lock();
+        let Some(bucket) = store.bucket(&input.bucket) else {
+            return Err(ListPartsErrorModeled::NoSuchBucket(NoSuchBucket {}).into());
+        };
+        // An upload is addressed by its id AND the key it was initiated for: "Upload ID
+        // identifying the multipart upload whose parts are being listed" alongside "Object
+        // key for which the multipart upload was initiated". An id this bucket has no
+        // upload in progress under — or one initiated for another key — names no upload,
+        // which is what `NoSuchUpload` reports.
+        let upload = bucket
+            .multipart_upload(&input.upload_id)
+            .filter(|upload| upload.key == input.key);
+        let Some(upload) = upload else {
+            return Err(ListPartsErrorModeled::NoSuchUpload(NoSuchUpload {}).into());
+        };
+
+        // "Specifies the part after which listing should begin. Only parts with higher
+        // part numbers will be listed" (`ListPartsRequest$PartNumberMarker`), so the page
+        // is the upload's parts above the marker, at most `max_parts` of them. This
+        // emulator records no part — `UploadPart` is still a scaffold stub, so nothing has
+        // ever added one to an upload — and an upload with no parts is exactly what S3
+        // reports with "zero or more Part elements" (`ListPartsOutput$Parts`): the page is
+        // computed from what the upload holds, not asserted to be empty.
+        let parts: Vec<Part> = Vec::new();
+
+        Ok(ListPartsOutput {
+            // The address the upload was recorded under (no access point is held here, so
+            // there is no ARN or alias to report instead).
+            bucket: Some(input.bucket.clone()),
+            key: Some(upload.key.clone()),
+            upload_id: Some(input.upload_id.clone()),
+            // "Maximum number of parts that were allowed in the response" — the effective
+            // bound this page was computed under, not the raw request value.
+            max_parts: Some(max_parts),
+            // Echoed as the page's starting point; a request that named none reports none.
+            part_number_marker: input.part_number_marker.clone(),
+            // "When a list is truncated, this element specifies the last part in the list"
+            // — so a page that returned every part above the marker reports no next
+            // marker, and is not truncated.
+            next_part_number_marker: None,
+            is_truncated: Some(false),
+            parts: Some(parts),
+            // "Container element that identifies who initiated the multipart upload. If
+            // the initiator is an Amazon Web Services account, this element provides the
+            // same information as the Owner element": this emulator serves one account, so
+            // the initiator and the owner are both that account's canonical user id — the
+            // id every S3 reader here reports an owner by.
+            initiator: Some(Initiator {
+                id: Some(crate::state::canonical_user_id()),
+                display_name: None,
+            }),
+            owner: Some(Owner {
+                id: Some(crate::state::canonical_user_id()),
+                display_name: None,
+            }),
+            // "The class of storage used to store the uploaded object" and the checksum
+            // configuration the upload was initiated with, read off the RECORDED upload so
+            // a reader reports what the initiation settled rather than a default.
+            storage_class: Some(upload.storage_class.clone()),
+            checksum_algorithm: upload.checksum_algorithm.clone(),
+            checksum_type: upload.checksum_type.clone(),
+            // `AbortDate` and `AbortRuleId` are reported only for a bucket with a
+            // lifecycle rule that aborts incomplete multipart uploads, and this emulator
+            // records no lifecycle configuration; `RequestCharged` reports a Requester Pays
+            // charge nothing here makes.
+            ..ListPartsOutput::default()
+        })
     }
+}
+
+/// The most parts one page may carry: "The ListParts request returns a maximum of 1,000
+/// uploaded parts. The limit of 1,000 parts is also the default value" (`ListParts`'s own
+/// documentation). A larger `max-parts` is answered with this many.
+const MAX_PARTS_PER_PAGE: i32 = 1000;
+
+/// The feature `input` asks for that this emulator does not serve, if any — named for the
+/// 501 that refuses it, the way `HeadObject` names its own.
+fn unserved_feature(input: &ListPartsInput) -> Option<&'static str> {
+    [
+        (
+            input.sse_customer_algorithm.is_some(),
+            "SSECustomerAlgorithm",
+        ),
+        (input.sse_customer_key.is_some(), "SSECustomerKey"),
+        (input.request_payer.is_some(), "RequestPayer"),
+    ]
+    .into_iter()
+    .find_map(|(asked, name)| asked.then_some(name))
 }

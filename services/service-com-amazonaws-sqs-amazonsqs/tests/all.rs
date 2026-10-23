@@ -19,6 +19,8 @@ mod message_lifecycle;
 mod message_plane;
 #[path = "all/queue_configuration.rs"]
 mod queue_configuration;
+#[path = "all/queue_does_not_exist.rs"]
+mod queue_does_not_exist;
 #[path = "all/queue_tags.rs"]
 mod queue_tags;
 #[path = "all/state_roundtrip.rs"]
