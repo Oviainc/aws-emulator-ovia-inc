@@ -64,8 +64,9 @@ const PLANS_WITH_THE_API: &[SupportPlan] = &[
 
 /// An `OrganizationRecommendationIdentifier` the modelled pattern admits
 /// (`^arn:[\w-]+:trustedadvisor:::organization-recommendation\/[\w-]+$`, len 20..200).
-/// The organization operations are still scaffolded, so an entitled caller gets their
-/// 501 — the gate is what must answer ahead of it.
+/// It names no seeded organization recommendation, so an entitled caller gets the
+/// operation's own answer for an unknown identifier (404) or, where the operation is
+/// still scaffolded, its 501 — the gate is what must answer ahead of either.
 const ORGANIZATION_RECOMMENDATION: &str =
     "arn:aws:trustedadvisor:::organization-recommendation/00000000-0000-0000-0000-000000000000";
 

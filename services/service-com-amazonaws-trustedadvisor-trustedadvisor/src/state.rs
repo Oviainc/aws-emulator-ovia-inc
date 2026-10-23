@@ -14,7 +14,7 @@
 //! SELECTS which copy the response reports. A check and the recommendation it
 //! produced share one catalog, so they cannot disagree.
 //!
-//! Three maps, each keyed by the identifier its API looks a resource up by, so
+//! Four maps, each keyed by the identifier its API looks a resource up by, so
 //! `BTreeMap` iteration order is also the stable pagination order:
 //!
 //! * [`checks`](ComAmazonawsTrustedadvisorTrustedadvisorState::checks) — keyed by check id.
@@ -25,6 +25,10 @@
 //! * [`recommendation_resources`](ComAmazonawsTrustedadvisorTrustedadvisorState::recommendation_resources) —
 //!   keyed by recommendation-resource ARN, which is what
 //!   `BatchUpdateRecommendationResourceExclusion` names its entries by.
+//! * [`organization_recommendations`](ComAmazonawsTrustedadvisorTrustedadvisorState::organization_recommendations) —
+//!   keyed by organization-recommendation ARN, which is what
+//!   `GetOrganizationRecommendation` and
+//!   `UpdateOrganizationRecommendationLifecycle` take as their `@httpLabel`.
 //!
 //! A recommendation does NOT keep a list of its resource ARNs: a resource
 //! carries its owning `recommendation_arn`, so
@@ -32,9 +36,13 @@
 //! derives the set from the one copy rather than keeping a second one that
 //! could disagree. For the same reason `resourcesAggregates` is never stored:
 //! [`aggregates_for`](ComAmazonawsTrustedadvisorTrustedadvisorState::aggregates_for)
-//! counts the recommendation's own resources on every read.
+//! counts the recommendation's own resources on every read, and
+//! [`organization_aggregates_for`](ComAmazonawsTrustedadvisorTrustedadvisorState::organization_aggregates_for)
+//! counts an organization recommendation's by summing those of the member
+//! accounts' recommendations it aggregates — an organization recommendation
+//! stores no resources of its own.
 //!
-//! Beside the three maps the store holds the calling account's
+//! Beside the four maps the store holds the calling account's
 //! [`SupportPlan`] — the whole input to the support-level authorization stage
 //! [`support_level_refusal`], which every operation applies before it resolves
 //! an identifier or writes anything. An operation whose input names an AWS
@@ -116,8 +124,17 @@ pub const EXCLUSION_EXCLUDED: &str = "excluded";
 
 /// The `RecommendationType` whose lifecycle `UpdateRecommendationLifecycle` can
 /// move: its model doc says "This API only supports prioritized
-/// recommendations".
+/// recommendations". `UpdateOrganizationRecommendationLifecycle` carries the
+/// same sentence, so the two share this value.
 pub const RECOMMENDATION_TYPE_PRIORITY: &str = "priority";
+
+/// The one `UpdateRecommendationLifecycleStage` value that RESOLVES a
+/// recommendation (see `UPDATE_RECOMMENDATION_LIFECYCLE_STAGE_VALUES` in
+/// `ops::types::shared_types`): the stage on which an update stamps
+/// `resolvedAt`, documented "When the Recommendation was resolved". Shared by
+/// the account-level and the organization-level lifecycle update, which model
+/// the same stage enum.
+pub const LIFECYCLE_STAGE_RESOLVED: &str = "resolved";
 
 /// The one `RecommendationPillar`
 /// `RecommendationPillarSpecificAggregates` reports an aggregate for: that
@@ -164,6 +181,19 @@ pub fn recommendation_arn(recommendation_id: &str) -> String {
         "",
         &format!("recommendation/{recommendation_id}"),
     )
+}
+
+/// An organization-recommendation ARN:
+/// `arn:aws:trustedadvisor:::organization-recommendation/<id>`, matching
+/// `OrganizationRecommendationArn`'s
+/// `^arn:[\w-]+:trustedadvisor:::organization-recommendation\/[\w-]+$`.
+///
+/// Formatted here rather than through `engine::emulator_arn`, which always
+/// writes the account segment: an organization recommendation spans the
+/// organization's accounts, so its ARN carries an EMPTY account — the same
+/// reason [`check_arn`] is formatted by hand.
+pub fn organization_recommendation_arn(organization_recommendation_id: &str) -> String {
+    format!("arn:aws:trustedadvisor:::organization-recommendation/{organization_recommendation_id}")
 }
 
 /// A recommendation-resource ARN:
@@ -337,6 +367,47 @@ pub struct RecommendationEntry {
     pub update_reason_code: Option<String>,
 }
 
+/// A recommendation for the accounts of an AWS Organizations organization: the
+/// unit `GetOrganizationRecommendation` and
+/// `UpdateOrganizationRecommendationLifecycle` work on.
+///
+/// The organization-level view of one check's findings, so it carries the same
+/// classification members as the account-level [`RecommendationEntry`] and
+/// shares that check's [`TextCatalog`]. It stores NO resources of its own:
+/// `member_recommendation_arns` names the accounts' recommendations it
+/// aggregates, and
+/// [`organization_aggregates_for`](ComAmazonawsTrustedadvisorTrustedadvisorState::organization_aggregates_for)
+/// counts their resources on every read.
+#[derive(Debug, Clone)]
+pub struct OrganizationRecommendationEntry {
+    pub id: String,
+    pub arn: String,
+    /// This recommendation's `name`/`description` — the text of the check that
+    /// produced it. `GetOrganizationRecommendation` models no `language`, so
+    /// the organization operations report the [`DEFAULT_LANGUAGE`] copy.
+    pub text: TextCatalog,
+    pub check_arn: Option<String>,
+    pub r#type: String,
+    pub status: String,
+    pub lifecycle_stage: Option<String>,
+    pub pillars: Vec<String>,
+    pub source: String,
+    pub aws_services: Vec<String>,
+    /// The ARNs of the member accounts' recommendations this organization
+    /// recommendation aggregates — keys of
+    /// [`recommendations`](ComAmazonawsTrustedadvisorTrustedadvisorState::recommendations).
+    /// The emulator presents exactly one account
+    /// (`engine::EMULATOR_ACCOUNT_ID`), so the seed records that account's
+    /// recommendation for the same check; the member set is a list so an
+    /// organization with more accounts needs no second shape.
+    pub member_recommendation_arns: Vec<String>,
+    pub created_at_millis: i64,
+    pub last_updated_at_millis: i64,
+    pub resolved_at_millis: Option<i64>,
+    pub update_reason: Option<String>,
+    pub update_reason_code: Option<String>,
+}
+
 /// One AWS resource a recommendation flagged.
 #[derive(Debug, Clone)]
 pub struct ResourceEntry {
@@ -371,6 +442,8 @@ pub struct ComAmazonawsTrustedadvisorTrustedadvisorState {
     pub recommendations: BTreeMap<String, RecommendationEntry>,
     /// Keyed by recommendation-resource ARN.
     pub recommendation_resources: BTreeMap<String, ResourceEntry>,
+    /// Keyed by organization-recommendation ARN.
+    pub organization_recommendations: BTreeMap<String, OrganizationRecommendationEntry>,
     /// The AWS Support plan the calling account holds — the whole input to the
     /// support-level gate [`support_level_refusal`] applies ahead of every
     /// operation.
@@ -458,6 +531,42 @@ impl ComAmazonawsTrustedadvisorTrustedadvisorState {
         }
     }
 
+    /// `resourcesAggregates` for an organization recommendation, SUMMED over
+    /// the member accounts' recommendations it aggregates: an organization
+    /// recommendation owns no resources, so its counters are the counters of
+    /// those recommendations' resources, counted on every read.
+    ///
+    /// An ARN naming no stored organization recommendation aggregates nothing,
+    /// so every counter is zero — a caller never reaches this without
+    /// resolving the ARN first, which answers `ResourceNotFoundException`.
+    pub fn organization_aggregates_for(
+        &self,
+        organization_recommendation_arn: &str,
+    ) -> RecommendationResourcesAggregates {
+        let mut total = RecommendationResourcesAggregates {
+            ok_count: 0,
+            warning_count: 0,
+            error_count: 0,
+            excluded_count: Some(0),
+        };
+        let members = self
+            .organization_recommendations
+            .get(organization_recommendation_arn)
+            .map(|entry| entry.member_recommendation_arns.as_slice())
+            .unwrap_or_default();
+        for member in members {
+            let aggregates = self.aggregates_for(member);
+            total.ok_count += aggregates.ok_count;
+            total.warning_count += aggregates.warning_count;
+            total.error_count += aggregates.error_count;
+            total.excluded_count = Some(
+                total.excluded_count.unwrap_or_default()
+                    + aggregates.excluded_count.unwrap_or_default(),
+            );
+        }
+        total
+    }
+
     /// The check a recommendation was produced from, or `None` for a
     /// recommendation that names no check (`Recommendation$checkArn` is
     /// optional) or names one the store does not hold.
@@ -497,6 +606,44 @@ impl ComAmazonawsTrustedadvisorTrustedadvisorState {
         &self,
         recommendation_arn: &str,
     ) -> Option<RecommendationPillarSpecificAggregates> {
+        let (savings, spend) = self.cost_totals(recommendation_arn)?;
+        Some(cost_aggregate(savings, spend))
+    }
+
+    /// `pillarSpecificAggregates` for an ORGANIZATION recommendation, computed
+    /// the same way over the member accounts' recommendations it aggregates:
+    /// the cost totals of each member are summed and the percentage is taken
+    /// from those sums, so the organization's figure is the organization's own
+    /// ratio rather than an average of ratios.
+    ///
+    /// `Some(..)` exactly when at least one member recommendation optimizes the
+    /// cost pillar, for the reason [`Self::pillar_aggregates_for`] gives: the
+    /// structure models only `costOptimizing`.
+    pub fn organization_pillar_aggregates_for(
+        &self,
+        organization_recommendation_arn: &str,
+    ) -> Option<RecommendationPillarSpecificAggregates> {
+        let entry = self
+            .organization_recommendations
+            .get(organization_recommendation_arn)?;
+        let mut totals: Option<(f64, f64)> = None;
+        for member in &entry.member_recommendation_arns {
+            if let Some((savings, spend)) = self.cost_totals(member) {
+                let (total_savings, total_spend) = totals.unwrap_or((0.0, 0.0));
+                totals = Some((total_savings + savings, total_spend + spend));
+            }
+        }
+        let (savings, spend) = totals?;
+        Some(cost_aggregate(savings, spend))
+    }
+
+    /// The cost totals of one recommendation's resources — the sum of the
+    /// per-resource saving the check reports in its
+    /// [`METADATA_ESTIMATED_MONTHLY_SAVINGS`] column, and the sum of their
+    /// [`ResourceEntry::estimated_monthly_spend`] — or `None` when the
+    /// recommendation does not optimize the cost pillar and so has no cost
+    /// aggregate at all.
+    fn cost_totals(&self, recommendation_arn: &str) -> Option<(f64, f64)> {
         let entry = self.recommendations.get(recommendation_arn)?;
         if !entry
             .pillars
@@ -522,18 +669,24 @@ impl ComAmazonawsTrustedadvisorTrustedadvisorState {
                 .unwrap_or(0.0);
             spend += resource.estimated_monthly_spend.unwrap_or(0.0);
         }
+        Some((savings, spend))
+    }
+}
 
-        let percent = if spend > 0.0 {
-            savings / spend * 100.0
-        } else {
-            0.0
-        };
-        Some(RecommendationPillarSpecificAggregates {
-            cost_optimizing: Some(RecommendationCostOptimizingAggregates {
-                estimated_monthly_savings: savings,
-                estimated_percent_monthly_savings: percent,
-            }),
-        })
+/// The cost pillar aggregate for `savings` out of `spend`: the savings as
+/// reported, and as a percentage of the spend — zero when nothing is being
+/// spent, since no percentage of zero spend is defined.
+fn cost_aggregate(savings: f64, spend: f64) -> RecommendationPillarSpecificAggregates {
+    let percent = if spend > 0.0 {
+        savings / spend * 100.0
+    } else {
+        0.0
+    };
+    RecommendationPillarSpecificAggregates {
+        cost_optimizing: Some(RecommendationCostOptimizingAggregates {
+            estimated_monthly_savings: savings,
+            estimated_percent_monthly_savings: percent,
+        }),
     }
 }
 
@@ -1180,6 +1333,7 @@ impl Default for ComAmazonawsTrustedadvisorTrustedadvisorState {
             checks: BTreeMap::new(),
             recommendations: BTreeMap::new(),
             recommendation_resources: BTreeMap::new(),
+            organization_recommendations: BTreeMap::new(),
             support_plan: SupportPlan::Basic,
         };
         for (index, row) in SEED.iter().enumerate() {
@@ -1224,6 +1378,36 @@ impl Default for ComAmazonawsTrustedadvisorTrustedadvisorState {
                 RecommendationEntry {
                     id: recommendation_id.clone(),
                     arn: recommendation_arn.clone(),
+                    text: text.clone(),
+                    check_arn: Some(check_arn.clone()),
+                    r#type: row.recommendation_type.to_string(),
+                    status: row.recommendation_status.to_string(),
+                    lifecycle_stage: row.lifecycle_stage.map(str::to_string),
+                    pillars: owned(row.pillars),
+                    source: row.source.to_string(),
+                    aws_services: owned(row.aws_services),
+                    created_at_millis: SEED_CREATED_AT_MILLIS,
+                    last_updated_at_millis,
+                    resolved_at_millis: None,
+                    update_reason: None,
+                    update_reason_code: None,
+                },
+            );
+
+            // The organization-level view of the same check: one organization
+            // recommendation per row, aggregating the member accounts'
+            // recommendations for that check (here the emulator's one
+            // account). Its classification members are the check's, so the two
+            // views of one finding cannot disagree.
+            let organization_recommendation_id =
+                format!("{}-organization-recommendation", row.check_id);
+            let organization_arn =
+                organization_recommendation_arn(&organization_recommendation_id);
+            state.organization_recommendations.insert(
+                organization_arn.clone(),
+                OrganizationRecommendationEntry {
+                    id: organization_recommendation_id,
+                    arn: organization_arn,
                     text,
                     check_arn: Some(check_arn),
                     r#type: row.recommendation_type.to_string(),
@@ -1232,6 +1416,7 @@ impl Default for ComAmazonawsTrustedadvisorTrustedadvisorState {
                     pillars: owned(row.pillars),
                     source: row.source.to_string(),
                     aws_services: owned(row.aws_services),
+                    member_recommendation_arns: vec![recommendation_arn.clone()],
                     created_at_millis: SEED_CREATED_AT_MILLIS,
                     last_updated_at_millis,
                     resolved_at_millis: None,

@@ -155,7 +155,7 @@ pub(crate) fn label(value: &str) -> String {
 
 /// `arn:aws:trustedadvisor:::check/<id>` — the ARN pattern `CheckSummary$arn`
 /// declares (no account segment).
-fn check_arn(check_id: &str) -> String {
+pub(crate) fn check_arn(check_id: &str) -> String {
     format!("arn:aws:trustedadvisor:::check/{check_id}")
 }
 
@@ -179,7 +179,7 @@ pub(crate) fn resource_arn(check_id: &str, resource_id: &str) -> String {
 }
 
 /// The `field` of every member of the `list` in a response body.
-fn field_of_each(body: &Value, list: &str, field: &str) -> Vec<String> {
+pub(crate) fn field_of_each(body: &Value, list: &str, field: &str) -> Vec<String> {
     body[list]
         .as_array()
         .unwrap_or_else(|| panic!("response has no {list} array: {body}"))
@@ -205,7 +205,7 @@ pub(crate) fn error_code(body: &Value) -> &str {
 /// protocol wrote: restJson1's default epoch-seconds number, or an RFC 3339
 /// string. Read through this helper so the assertions are about the INSTANT and
 /// not about the encoding.
-fn timestamp_secs(value: &Value) -> f64 {
+pub(crate) fn timestamp_secs(value: &Value) -> f64 {
     if let Some(number) = value.as_f64() {
         return number;
     }
