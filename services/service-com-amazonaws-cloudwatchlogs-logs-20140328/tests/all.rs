@@ -15,6 +15,8 @@
 mod deletion_protection;
 #[path = "all/harness.rs"]
 mod harness;
+#[path = "all/ingestion_window.rs"]
+mod ingestion_window;
 #[path = "all/log_core_loop.rs"]
 mod log_core_loop;
 #[path = "all/log_group_auth_and_encryption.rs"]

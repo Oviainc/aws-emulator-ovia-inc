@@ -160,3 +160,37 @@ pub fn now_ms() -> i64 {
     )
     .expect("the epoch milliseconds fit in an i64")
 }
+
+/// An in-window base timestamp: one hour before the ingestion clock. `PutLogEvents`
+/// admits each event against a clock-relative ingestion window (14 days in the past to
+/// 2 hours in the future), so a suite whose subject is NOT that window stamps its events
+/// from this base plus a small offset and stays comfortably inside it. The window itself
+/// is the subject of `tests/all/ingestion_window.rs`.
+pub fn base_ms() -> i64 {
+    now_ms() - 60 * 60 * 1_000
+}
+
+/// A log group plus one stream, both created, with a retention in days when one is
+/// given. The whole of this target's core loop starts from this pair, so it lives here
+/// rather than once per suite.
+pub async fn group_with_stream(
+    logs: &Logs,
+    group: &str,
+    stream: &str,
+    retention_in_days: Option<i64>,
+) {
+    logs.ok("CreateLogGroup", &serde_json::json!({"logGroupName": group}))
+        .await;
+    if let Some(days) = retention_in_days {
+        logs.ok(
+            "PutRetentionPolicy",
+            &serde_json::json!({"logGroupName": group, "retentionInDays": days}),
+        )
+        .await;
+    }
+    logs.ok(
+        "CreateLogStream",
+        &serde_json::json!({"logGroupName": group, "logStreamName": stream}),
+    )
+    .await;
+}

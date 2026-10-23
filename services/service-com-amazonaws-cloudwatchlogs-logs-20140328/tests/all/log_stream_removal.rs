@@ -14,7 +14,7 @@
 
 use serde_json::{json, Value};
 
-use crate::harness::Logs;
+use crate::harness::{base_ms, Logs};
 
 /// Per-event storage overhead a log group's `storedBytes` counts. Source: the
 /// `PutLogEvents` quota — a batch's size "is calculated as the sum of all event messages
@@ -107,12 +107,15 @@ async fn group_with_streams(logs: &Logs, group: &str, streams: usize) -> Vec<Vec
         // Stream 0 stays empty, so "a stream nothing was written to" is a row too.
         let messages = messages_for(index, index);
         if !messages.is_empty() {
+            // Clock-relative, so the batch stays inside the ingestion window whenever
+            // this suite runs; the window itself is tested in `ingestion_window.rs`.
+            let base = base_ms();
             let events: Vec<Value> = messages
                 .iter()
                 .enumerate()
                 .map(|(position, message)| {
                     json!({
-                        "timestamp": 1_700_000_000_000i64 + i64::try_from(position).expect("fits"),
+                        "timestamp": base + i64::try_from(position).expect("fits"),
                         "message": message,
                     })
                 })
@@ -318,7 +321,7 @@ async fn a_removed_stream_can_be_created_again() {
             &json!({
                 "logGroupName": group,
                 "logStreamName": name,
-                "logEvents": [{"timestamp": 1_700_000_000_000i64, "message": message}],
+                "logEvents": [{"timestamp": base_ms(), "message": message}],
             }),
         )
         .await;

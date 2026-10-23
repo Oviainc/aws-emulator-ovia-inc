@@ -16,7 +16,7 @@
 
 use serde_json::{json, Value};
 
-use crate::harness::Logs;
+use crate::harness::{base_ms, Logs};
 
 /// Log group names spanning the forms `LogGroupName`'s pattern
 /// (`^[\.\-_/#A-Za-z0-9]+$`) admits: a path, a dotted name, a single character, and one
@@ -95,7 +95,7 @@ async fn protection_blocks_the_delete_until_it_is_disabled() {
                 &json!({
                     "logGroupName": name,
                     "logStreamName": "stream-1",
-                    "logEvents": [{"timestamp": 1_700_000_000_000i64, "message": "kept"}],
+                    "logEvents": [{"timestamp": base_ms(), "message": "kept"}],
                 }),
             )
             .await;
