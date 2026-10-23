@@ -46,6 +46,23 @@ fn lookup_requests(id: &str) -> Vec<(&'static str, Value)> {
     vec![
         ("GetEnvironment", json!({ "environmentId": id })),
         ("ListEnvironmentVlans", json!({ "environmentId": id })),
+        (
+            "CreateEntitlement",
+            json!({
+                "environmentId": id,
+                "connectorId": "cnctr-0123456789",
+                "entitlementType": "WINDOWS_SERVER",
+                "vmIds": ["vm-1"],
+            }),
+        ),
+        (
+            "ListVmEntitlements",
+            json!({
+                "environmentId": id,
+                "connectorId": "cnctr-0123456789",
+                "entitlementType": "WINDOWS_SERVER",
+            }),
+        ),
         ("DeleteEnvironment", json!({ "environmentId": id })),
     ]
 }

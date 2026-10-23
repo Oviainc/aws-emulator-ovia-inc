@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListVmEntitlements
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListVmEntitlements`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListVmEntitlements::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the Windows Server License entitlements of one environment out of
+//! [`crate::state`] — the records [`crate::ops::create_entitlement`] stored — filtered
+//! to the requested connector and entitlement type, with any status change the clock
+//! has made due already applied. An `environmentId` this service holds no environment
+//! for in the request's Region is a `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -101,11 +97,17 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-evs-amazonelasticvmware
 // here — hence the `ListVmEntitlementsError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.evs#ListVmEntitlements")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.evs#ListVmEntitlements",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum ListVmEntitlementsErrorModeled {
     ResourceNotFoundException(ResourceNotFoundException),
     ValidationException(ValidationException),
+    /// Widened in from the service's own error set (this operation does not list it):
+    /// the one honest answer when this service's store cannot be reached at all.
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -159,18 +161,76 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListVmEntitlements` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListVmEntitlementsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListVmEntitlements"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListVmEntitlementsErrorModeled::InternalServerException(InternalServerException {
+                message: "The Amazon EVS environment store is unavailable.".to_string(),
+            })
+        })?;
+        let region = crate::state::request_region(ctx.parts());
+
+        // The cursor is the store key of the entitlement the next page starts at.
+        let start_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(crate::state::decode_page_token(token).map_err(|error| {
+                ListVmEntitlementsErrorModeled::ValidationException(
+                    crate::state::invalid_next_token(error),
+                )
+            })?),
+        };
+        // "If you specify MaxResults in the request, the response includes information
+        // up to the limit specified"; absent, the page is bounded by the top of the
+        // modelled range. Clamped here as well, so the bound holds locally and not only
+        // because the boundary validator enforced the modelled 1..100 range.
+        let page_size = input
+            .max_results
+            .unwrap_or(crate::state::MAX_PAGE_SIZE)
+            .clamp(1, crate::state::MAX_PAGE_SIZE) as usize;
+
+        let mut state = state.lock();
+        // Reporting only: this materialises the entitlement status changes the clock
+        // already owed, which were due whether or not anybody listed them.
+        state.materialise_due_transitions();
+
+        // Regional resource: the entitlements of an environment are only listable at
+        // the endpoint of the Region that environment was created in.
+        let environment = state
+            .environment_in_region(&region, &input.environment_id)
+            .ok_or_else(|| {
+                ListVmEntitlementsErrorModeled::ResourceNotFoundException(
+                    crate::state::environment_not_found(&input.environment_id),
+                )
+            })?;
+
+        // "Returns existing entitlements for virtual machines associated with the
+        // specified environment and connector": the connector and the entitlement type
+        // the request names are a filter on the environment's records, not a lookup key
+        // of their own.
+        let mut matching = environment
+            .entitlements
+            .range::<str, _>((
+                match start_at.as_deref() {
+                    Some(cursor) => std::ops::Bound::Included(cursor),
+                    None => std::ops::Bound::Unbounded,
+                },
+                std::ops::Bound::Unbounded,
+            ))
+            .filter(|(_, entitlement)| {
+                entitlement.connector_id == input.connector_id
+                    && entitlement.entitlement_type == input.entitlement_type
+            });
+        let entitlements: Vec<VmEntitlement> = matching
+            .by_ref()
+            .take(page_size)
+            .map(|(_, entitlement)| entitlement.to_wire(&input.environment_id))
+            .collect();
+        // The next page starts at the first entitlement this one did not report.
+        let next_token = matching
+            .next()
+            .map(|(key, _)| crate::state::encode_page_token(key));
+
+        Ok(ListVmEntitlementsOutput {
+            next_token,
+            entitlements: Some(entitlements),
+        })
     }
 }

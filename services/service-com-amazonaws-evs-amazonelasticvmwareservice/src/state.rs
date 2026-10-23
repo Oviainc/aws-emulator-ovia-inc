@@ -19,6 +19,7 @@ use smithy_server_runtime::{Violation, ViolationKind};
 use crate::ops::types::{
     Check, ConnectivityInfo, EipAssociation, Environment, EnvironmentSummary, LicenseInfo,
     ResourceNotFoundException, ServiceAccessSecurityGroups, ValidationException, VcfHostnames, Vlan,
+    VmEntitlement,
 };
 
 /// The `EnvironmentState` / `VlanState` values this service moves a resource through.
@@ -48,9 +49,24 @@ pub const REASON_OTHER: &str = "other";
 /// `EnvironmentResource` the model binds these operations to.
 pub const RESOURCE_TYPE_ENVIRONMENT: &str = "environment";
 
+/// The `EntitlementStatus` values a stored entitlement moves through.
+///
+/// The model declares `CREATING | CREATED | DELETED | AT_RISK | ENTITLEMENT_REMOVED |
+/// CREATE_FAILED` (`smithy_query(query="shape", shape="EntitlementStatus")`). The two
+/// named here are the ones `CreateEntitlement` produces: an entitlement is `CREATING`
+/// while the service validates the virtual machine ("This is an asynchronous
+/// operation. Amazon EVS validates the specified virtual machines before starting
+/// usage tracking", `CreateEntitlement` doc) and `CREATED` once usage tracking has
+/// started. The other values belong to the operations that produce them
+/// (`DeleteEntitlement` still answers 501).
+pub const ENTITLEMENT_CREATING: &str = "CREATING";
+/// See [`ENTITLEMENT_CREATING`].
+pub const ENTITLEMENT_CREATED: &str = "CREATED";
+
 /// How long after the call that starts it a lifecycle transition comes due
 /// (`CREATING` -> `CREATED` after `CreateEnvironment`, `DELETING` -> `DELETED`
-/// after `DeleteEnvironment`).
+/// after `DeleteEnvironment`, an entitlement's `CREATING` -> `CREATED` after
+/// `CreateEntitlement`).
 ///
 /// CHOSEN, not documented: no Amazon EVS document states how long a real
 /// environment takes to build, and a real one takes hours. The span is
@@ -172,6 +188,138 @@ impl PendingTransition {
     }
 }
 
+/// The status change the clock owes a stored entitlement: the instant it becomes
+/// due, the wall-clock time the change is owed at, and the `EntitlementStatus` the
+/// entitlement moves to.
+///
+/// Separate from [`PendingTransition`] because an entitlement runs on its own clock:
+/// one created long after its environment settled still owes the asynchronous
+/// validation `CreateEntitlement` documents.
+#[derive(Debug, Clone)]
+pub struct PendingEntitlementStatus {
+    /// When the change becomes due. Compared against `Instant::now()`; never slept on.
+    pub due_at: Instant,
+    /// The wall-clock instant, in epoch milliseconds, the change is owed at.
+    pub due_at_ms: i64,
+    /// The `EntitlementStatus` the entitlement moves to.
+    pub status: &'static str,
+}
+
+impl PendingEntitlementStatus {
+    /// The change `CreateEntitlement` starts, due [`TRANSITION_DELAY`] after the call.
+    pub fn starting_now(status: &'static str) -> Self {
+        Self {
+            due_at: Instant::now() + TRANSITION_DELAY,
+            due_at_ms: now_ms() + TRANSITION_DELAY.as_millis() as i64,
+            status,
+        }
+    }
+}
+
+/// The store key of one entitlement inside its environment: the connector it was
+/// created through and the virtual machine it entitles.
+///
+/// That pair is what identifies an entitlement — `CreateEntitlement`,
+/// `ListVmEntitlements` and `DeleteEntitlement` all address entitlements by
+/// `connectorId` plus `vmIds`, and `CreateEntitlement` is `@idempotent`, so a second
+/// create for the same pair must find the same record. `/` separates the two parts
+/// because neither `^(cnctr-[a-zA-Z0-9]{10})$` nor `^vm-[0-9]+$` can contain one, so
+/// no two distinct pairs share a key.
+pub fn entitlement_key(connector_id: &str, vm_id: &str) -> String {
+    format!("{connector_id}/{vm_id}")
+}
+
+/// One Windows Server License entitlement, as `CreateEntitlement` stored it: the
+/// record of a virtual machine whose Windows Server usage Amazon EVS tracks.
+#[derive(Debug, Clone)]
+pub struct StoredEntitlement {
+    /// The VMware vSphere virtual machine managed object ID the entitlement covers.
+    pub vm_id: String,
+    /// The connector the entitlement was created through.
+    pub connector_id: String,
+    /// The `EntitlementType` the entitlement was created with — the model declares
+    /// only `WINDOWS_SERVER`.
+    pub entitlement_type: String,
+    /// The `EntitlementStatus` the entitlement is in.
+    pub status: String,
+    /// Epoch milliseconds the entitlement record was created at.
+    pub created_at_ms: i64,
+    /// Epoch milliseconds usage tracking started at ("The date and time that the
+    /// entitlement started", `startedAt` doc): set when the entitlement reaches
+    /// `CREATED`, and absent while the virtual machine is still being validated.
+    pub started_at_ms: Option<i64>,
+    /// The status change the clock owes this entitlement, if any.
+    pub pending: Option<PendingEntitlementStatus>,
+}
+
+impl StoredEntitlement {
+    /// A new entitlement for `vm_id`, as `CreateEntitlement` mints one: `CREATING`
+    /// until the validation the clock owes it comes due.
+    pub fn creating(
+        connector_id: &str,
+        vm_id: &str,
+        entitlement_type: &str,
+        created_at_ms: i64,
+        pending: PendingEntitlementStatus,
+    ) -> Self {
+        Self {
+            vm_id: vm_id.to_string(),
+            connector_id: connector_id.to_string(),
+            entitlement_type: entitlement_type.to_string(),
+            status: ENTITLEMENT_CREATING.to_string(),
+            created_at_ms,
+            started_at_ms: None,
+            pending: Some(pending),
+        }
+    }
+
+    /// Apply the owed status change if `now` has reached its due instant.
+    ///
+    /// The change was owed at that instant whether or not anybody called, so a
+    /// reporting operation may materialise it. The stamp it writes is the stored due
+    /// instant and never the reading instant, so two reads report the same `startedAt`.
+    pub fn materialise_due_transition(&mut self, now: Instant) {
+        let Some(pending) = self.pending.clone().filter(|pending| now >= pending.due_at) else {
+            return;
+        };
+        self.status = pending.status.to_string();
+        if pending.status == ENTITLEMENT_CREATED {
+            // Usage tracking starts when the entitlement is created, which is the
+            // instant the asynchronous validation was owed at.
+            self.started_at_ms = Some(pending.due_at_ms);
+        }
+        self.pending = None;
+    }
+
+    /// This entitlement as the modelled `VmEntitlement` shape, reported for the
+    /// environment that holds it.
+    ///
+    /// Three members are deliberately absent, because nothing in this emulator
+    /// produces a value for them:
+    ///
+    /// * `vmName` — a virtual machine's name lives in the vCenter inventory, which
+    ///   this emulator does not run, so there is nothing to read it from.
+    /// * `lastSyncedAt` — no vCenter is contacted, so no sync has happened; a
+    ///   timestamp here would claim work nothing performed.
+    /// * `stoppedAt` and `errorDetail` — usage tracking has not stopped and no
+    ///   entitlement has failed: `DeleteEntitlement`, the operation that stops it,
+    ///   still answers 501.
+    pub fn to_wire(&self, environment_id: &str) -> VmEntitlement {
+        VmEntitlement {
+            vm_id: Some(self.vm_id.clone()),
+            environment_id: Some(environment_id.to_string()),
+            connector_id: Some(self.connector_id.clone()),
+            vm_name: None,
+            r#type: Some(self.entitlement_type.clone()),
+            status: Some(self.status.clone()),
+            last_synced_at: None,
+            started_at: self.started_at_ms.map(timestamp),
+            stopped_at: None,
+            error_detail: None,
+        }
+    }
+}
+
 /// One VLAN subnet of an environment, materialised from an `initialVlans` entry.
 #[derive(Debug, Clone)]
 pub struct StoredVlan {
@@ -274,30 +422,51 @@ pub struct StoredEnvironment {
     pub requested_hosts: Vec<crate::ops::types::HostInfoForCreate>,
     /// Environment checks, the roll-up [`Self::environment_status`] reports.
     pub checks: Vec<Check>,
+    /// The Windows Server License entitlements created in this environment, keyed by
+    /// [`entitlement_key`]. A `BTreeMap` so `ListVmEntitlements` has one stable order
+    /// to page over, and bounded by [`MAX_ENTITLEMENTS_PER_ENVIRONMENT`].
+    pub entitlements: BTreeMap<String, StoredEntitlement>,
     /// The lifecycle transition the clock owes this environment, if any.
     pub pending: Option<PendingTransition>,
 }
 
 impl StoredEnvironment {
-    /// Apply the owed lifecycle transition if `now` has reached its due instant.
+    /// Apply the owed lifecycle transition if `now` has reached its due instant, and
+    /// the status change every entitlement of this environment is owed with it.
     ///
     /// The transition was owed at that instant whether or not anybody called, so a
     /// reporting operation may materialise it: it only makes a change the clock had
     /// already made due visible.
     pub fn materialise_due_transition(&mut self, now: Instant) {
-        let Some(pending) = self.pending.as_ref() else {
-            return;
-        };
-        if now < pending.due_at {
-            return;
+        if let Some(pending) = self.pending.clone().filter(|pending| now >= pending.due_at) {
+            self.state = pending.environment_state.to_string();
+            self.modified_at_ms = pending.due_at_ms;
+            for vlan in &mut self.vlans {
+                vlan.vlan_state = pending.vlan_state.to_string();
+                vlan.modified_at_ms = pending.due_at_ms;
+            }
+            self.pending = None;
         }
-        self.state = pending.environment_state.to_string();
-        self.modified_at_ms = pending.due_at_ms;
-        for vlan in &mut self.vlans {
-            vlan.vlan_state = pending.vlan_state.to_string();
-            vlan.modified_at_ms = pending.due_at_ms;
+        // Each entitlement runs on its own clock: one created after the environment
+        // settled has no environment transition left to ride on.
+        for entitlement in self.entitlements.values_mut() {
+            entitlement.materialise_due_transition(now);
         }
-        self.pending = None;
+    }
+
+    /// The earliest instant at which this environment, or one of its entitlements,
+    /// still owes a change — `None` when nothing is owed.
+    pub fn next_transition_at(&self) -> Option<Instant> {
+        self.pending
+            .iter()
+            .map(|pending| pending.due_at)
+            .chain(
+                self.entitlements
+                    .values()
+                    .filter_map(|entitlement| entitlement.pending.as_ref())
+                    .map(|pending| pending.due_at),
+            )
+            .min()
     }
 
     /// `environmentStatus`: the roll-up of the environment's `checks`, which
@@ -389,6 +558,19 @@ impl StoredEnvironment {
 /// one, and this is far above any ordinary workflow.
 pub const MAX_ENVIRONMENTS: usize = 256;
 
+/// The most entitlements one environment holds — the cap that bounds caller-driven
+/// growth of an environment's entitlement map.
+///
+/// `vmIds` is capped at 100 per `CreateEntitlement` call by the model, but nothing
+/// bounds the number of calls, so the store needs a maximum of its own: past this cap
+/// a create is refused with the operation's modelled `ValidationException`, never by
+/// evicting a live record (`DeleteEntitlement` is what removes one).
+///
+/// The number is the emulator's own bound, not a contract: Amazon EVS publishes no
+/// per-environment entitlement quota, and this is far above the VM count of any
+/// ordinary workflow.
+pub const MAX_ENTITLEMENTS_PER_ENVIRONMENT: usize = 1024;
+
 /// Per-service state for com-amazonaws-evs-amazonelasticvmwareservice. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsEvsAmazonelasticvmwareserviceState {
@@ -450,10 +632,10 @@ impl ComAmazonawsEvsAmazonelasticvmwareserviceState {
         let mut next_transition_at: Option<Instant> = None;
         for environment in self.environments.values_mut() {
             environment.materialise_due_transition(now);
-            if let Some(pending) = environment.pending.as_ref() {
+            if let Some(due_at) = environment.next_transition_at() {
                 next_transition_at = Some(match next_transition_at {
-                    Some(earliest) => earliest.min(pending.due_at),
-                    None => pending.due_at,
+                    Some(earliest) => earliest.min(due_at),
+                    None => due_at,
                 });
             }
         }

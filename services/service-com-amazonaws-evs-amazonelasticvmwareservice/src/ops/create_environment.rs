@@ -378,6 +378,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             vlans,
             requested_hosts,
             checks: Vec::new(),
+            entitlements: std::collections::BTreeMap::new(),
             pending: Some(crate::state::PendingTransition::starting_now(
                 crate::state::STATE_CREATED,
                 crate::state::STATE_CREATED,

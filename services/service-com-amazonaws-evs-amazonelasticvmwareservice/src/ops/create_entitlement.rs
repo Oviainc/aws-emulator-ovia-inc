@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateEntitlement
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateEntitlement`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Creates a Windows Server License entitlement per requested virtual machine in a
+//! stored Amazon EVS environment and reports the records it persisted, which
+//! [`crate::ops::list_vm_entitlements`] reads back. An `environmentId` this service
+//! holds no live environment for in the request's Region is a
+//! `ResourceNotFoundException`, and nothing is stored for it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateEntitlement::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The entitlement starts `CREATING` and the clock owes it the move to `CREATED`:
+//! "This is an asynchronous operation. Amazon EVS validates the specified virtual
+//! machines before starting usage tracking." The operation is `@idempotent`, so the
+//! (connector, VM) pair is the identity of an entitlement and a repeat call for a VM
+//! already entitled through the same connector reports the stored record.
+//!
+//! `connectorId` is persisted on the record and scopes it, but is not checked against
+//! a connector: this service stores no connector records yet
+//! (`CreateEnvironmentConnector` / `ListEnvironmentConnectors` still answer 501), so
+//! there is nothing to check it against. That precondition belongs with the connector
+//! slice, beside the environment lookup below.
 //!
 //! ## Shape of an operation
 //!
@@ -101,12 +109,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-evs-amazonelasticvmware
 // here — hence the `CreateEntitlementError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.evs#CreateEntitlement")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.evs#CreateEntitlement",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum CreateEntitlementErrorModeled {
     ResourceNotFoundException(ResourceNotFoundException),
     ThrottlingException(ThrottlingException),
     ValidationException(ValidationException),
+    /// Widened in from the service's own error set (this operation does not list it):
+    /// the one honest answer when this service's store cannot be reached at all.
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -160,18 +174,112 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateEntitlement` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateEntitlementErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateEntitlement"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateEntitlementErrorModeled::InternalServerException(InternalServerException {
+                message: "The Amazon EVS environment store is unavailable.".to_string(),
+            })
+        })?;
+        // `clientToken` is read and ignored on purpose: "This parameter is not used in
+        // Amazon EVS currently. If you supply input for this parameter, it will have no
+        // effect." (`clientToken` doc). The operation is idempotent through the stored
+        // records instead — see the entry match below.
+        let _ = &input.client_token;
+        let region = crate::state::request_region(ctx.parts());
+        let created_at_ms = crate::state::now_ms();
+
+        let mut state = state.lock();
+        // Reporting only: this materialises the state changes the clock already owed,
+        // which were due whether or not anybody called, so the environment is in the
+        // state that is due at this instant before the create is evaluated.
+        state.materialise_due_transitions();
+
+        // Regional resource: an environment exists at the endpoint of the Region it was
+        // created in, so an entitlement can only be created in one from that Region. An
+        // environment that has reached DELETED is gone as far as a create is concerned:
+        // "The resource might not be specified correctly, or it may have a state of
+        // DELETED" (`ResourceNotFoundException` doc).
+        let environment = state
+            .environment_in_region_mut(&region, &input.environment_id)
+            .filter(|environment| environment.state != crate::state::STATE_DELETED)
+            .ok_or_else(|| {
+                CreateEntitlementErrorModeled::ResourceNotFoundException(
+                    crate::state::environment_not_found(&input.environment_id),
+                )
+            })?;
+        let environment_id = environment.environment_id.clone();
+
+        // One entitlement per DISTINCT requested virtual machine: the (connector, VM)
+        // pair identifies an entitlement, so a `vmIds` list naming the same VM twice
+        // names one entitlement. `vmIds` holds at most 100 entries (modelled len
+        // 1..100), which bounds this scan.
+        let mut wanted: Vec<&str> = Vec::with_capacity(input.vm_ids.len());
+        for vm_id in &input.vm_ids {
+            if !wanted.contains(&vm_id.as_str()) {
+                wanted.push(vm_id.as_str());
+            }
+        }
+
+        // The store's own bound on how many entitlements one environment holds. Refused
+        // with the operation's modelled ValidationException, naming the member whose
+        // entries cannot be admitted: the operation models no quota error.
+        let fresh = wanted
+            .iter()
+            .filter(|vm_id| {
+                !environment
+                    .entitlements
+                    .contains_key(&crate::state::entitlement_key(&input.connector_id, vm_id))
+            })
+            .count();
+        if environment.entitlements.len() + fresh > crate::state::MAX_ENTITLEMENTS_PER_ENVIRONMENT {
+            return Err(CreateEntitlementErrorModeled::ValidationException(
+                crate::state::field_validation_error(
+                    "vmIds",
+                    &format!(
+                        "names {fresh} virtual machine(s) that environment {environment_id} has \
+                         no entitlement for, which would take it past the {} entitlements it \
+                         can hold",
+                        crate::state::MAX_ENTITLEMENTS_PER_ENVIRONMENT
+                    ),
+                ),
+            )
+            .into());
+        }
+
+        // "This is an asynchronous operation. Amazon EVS validates the specified virtual
+        // machines before starting usage tracking": a new entitlement is CREATING, and
+        // the clock owes it the move to CREATED. One pending change for the whole call,
+        // so every entitlement a single request creates comes due together.
+        let pending =
+            crate::state::PendingEntitlementStatus::starting_now(crate::state::ENTITLEMENT_CREATED);
+        let due_at = pending.due_at;
+        let mut minted = false;
+        let mut entitlements = Vec::with_capacity(wanted.len());
+        for vm_id in wanted {
+            let key = crate::state::entitlement_key(&input.connector_id, vm_id);
+            let entitlement = match environment.entitlements.entry(key) {
+                std::collections::btree_map::Entry::Vacant(slot) => {
+                    minted = true;
+                    slot.insert(crate::state::StoredEntitlement::creating(
+                        &input.connector_id,
+                        vm_id,
+                        &input.entitlement_type,
+                        created_at_ms,
+                        pending.clone(),
+                    ))
+                }
+                // The operation is `@idempotent`: a VM already entitled through this
+                // connector keeps the record it has, and the call reports that record
+                // rather than creating a second one.
+                std::collections::btree_map::Entry::Occupied(taken) => taken.into_mut(),
+            };
+            entitlements.push(entitlement.to_wire(&environment_id));
+        }
+        if minted {
+            state.note_transition_due(due_at);
+        }
+
+        Ok(CreateEntitlementOutput {
+            entitlements: Some(entitlements),
+        })
     }
 }
