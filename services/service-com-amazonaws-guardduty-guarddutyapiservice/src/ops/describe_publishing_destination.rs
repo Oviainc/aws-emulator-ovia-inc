@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribePublishingDestination
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribePublishingDestination`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports the publishing destination `CreatePublishingDestination`
+//! persisted in [`crate::state`], materialising the `PENDING_VERIFICATION` ->
+//! `PUBLISHING` transition the clock already owes.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribePublishingDestination::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +148,65 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribePublishingDestination` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribePublishingDestinationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribePublishingDestination"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                DescribePublishingDestinationErrorModeled::InternalServerErrorException(
+                    crate::state::state_unavailable(),
+                )
+                .into(),
+            );
+        };
+
+        let region = crate::state::request_region(ctx);
+        // A report. The lock is taken MUTABLY only to materialise the status change
+        // the CLOCK already made due (see `PublishingDestinationRecord::settle`);
+        // nothing here depends on the caller, and no later caller sees anything
+        // this read chose.
+        let mut state = state.lock();
+        let now = crate::state::now_millis();
+        let Some(detector) = state.detector_in_mut(&region, &input.detector_id) else {
+            return Err(bad_request(crate::state::detector_id_rejection(
+                &input.detector_id,
+            )));
+        };
+        let Some(destination) = detector
+            .publishing_destinations
+            .get_mut(&input.destination_id)
+        else {
+            return Err(bad_request(crate::state::destination_id_rejection(
+                &input.destination_id,
+            )));
+        };
+        destination.settle(now);
+
+        Ok(DescribePublishingDestinationOutput {
+            destination_id: destination.id.clone(),
+            destination_type: destination.destination_type.clone(),
+            status: destination.status.clone(),
+            publishing_failure_start_timestamp: destination.publishing_failure_start_millis,
+            destination_properties: DestinationProperties {
+                destination_arn: Some(destination.destination_arn.clone()),
+                kms_key_arn: Some(destination.kms_key_arn.clone()),
+                expected_bucket_owner: destination.expected_bucket_owner.clone(),
+            },
+            // `TagMap` carries `len 1..200`
+            // (`smithy_query(operation="DescribePublishingDestination")`), so an
+            // untagged destination reports no member rather than an empty map.
+            tags: Some(
+                destination
+                    .tags
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect::<std::collections::HashMap<_, _>>(),
+            )
+            .filter(|tags| !tags.is_empty()),
+        })
     }
+}
+
+/// Refuse the request the way GuardDuty does: HTTP 400 under the
+/// `InvalidInputException` class, in both the body's `__type` and its `type`
+/// member.
+fn bad_request(message: impl Into<String>) -> DescribePublishingDestinationError {
+    crate::scaffolded::Scaffolded::invalid_input(message)
 }

@@ -26,7 +26,8 @@
 //! Two more things the store holds, each read by a layer rather than by one handler:
 //!
 //! * the recorded EXECUTIONS of an export ([`StoredExecution`]), which `GetExecution`
-//!   reports. Nothing in this emulator creates one — see that type's own note.
+//!   reports one of and `ListExecutions` pages over. Nothing in this emulator creates
+//!   one — see that type's own note.
 //!
 //! [`authorization`] is beside them: who a request speaks for and whether IAM lets it do
 //! what it asks, for the operations whose model declares `AccessDeniedException`. It holds
@@ -160,8 +161,8 @@ pub struct ComAmazonawsBcmdataexportsAwsbillingandcostmanagementdataexportsState
     pub exports: BTreeMap<String, StoredExport>,
     /// The recorded executions, keyed by `(export ARN, execution id)` — the pair
     /// `GetExecution` addresses one by. `BTreeMap` so the executions of one export are a
-    /// contiguous range in one stable order, which is the order `ListExecutions` will page
-    /// over once it is implemented (it is still a stub, under its own issue).
+    /// contiguous range in one stable order, which is the order `ListExecutions` pages
+    /// over.
     pub executions: BTreeMap<(String, String), StoredExecution>,
 }
 
@@ -170,6 +171,22 @@ impl ComAmazonawsBcmdataexportsAwsbillingandcostmanagementdataexportsState {
     pub fn execution(&self, export_arn: &str, execution_id: &str) -> Option<&StoredExecution> {
         self.executions
             .get(&(export_arn.to_string(), execution_id.to_string()))
+    }
+
+    /// The recorded executions OF ONE EXPORT, in execution-id order.
+    ///
+    /// The store is keyed by `(export ARN, execution id)`, so the executions of one export
+    /// are the contiguous range that starts at that ARN's smallest possible key: the walk
+    /// visits each of them exactly once, in one stable order, and visits no execution of
+    /// any other export.
+    pub fn executions_of<'a>(
+        &'a self,
+        export_arn: &'a str,
+    ) -> impl Iterator<Item = &'a StoredExecution> + 'a {
+        self.executions
+            .range((export_arn.to_string(), String::new())..)
+            .take_while(move |((arn, _), _)| arn == export_arn)
+            .map(|(_, execution)| execution)
     }
 
     /// Record `execution`, replacing any earlier record of the same execution of the same
@@ -339,40 +356,66 @@ const PAGE_TOKEN_TAG_LEN: usize = 8;
 /// cannot be read as anything else.
 const PAGE_TOKEN_DOMAIN: &[u8] = b"bcm-data-exports/page-token/v1\0";
 
-/// Which listing a page token belongs to. A token is bound to its listing as well as to
-/// its position, because the paginated listings page over different key spaces
-/// (`ListExports` over export ARNs, `ListTagsForResource` over an export's tag keys,
-/// `ListTables` over the table catalog's names): a token handed to the wrong listing
-/// names a position in a sequence it was never cut from, and must be refused rather than
-/// resumed at some unrelated offset.
+/// Which SEQUENCE a page token names a position in: the listing that cut it and, where
+/// that listing pages over the contents of one resource, which resource's contents.
+///
+/// A token is bound to that sequence as well as to its position, because the paginated
+/// listings page over different key spaces (`ListExports` over export ARNs,
+/// `ListTagsForResource` over one export's tag keys, `ListTables` over the table catalog's
+/// names, `ListExecutions` over one export's execution ids): a token handed to a sequence
+/// it was never cut from names a position in some other sequence — a tag key where an
+/// execution id is expected, or a position in a DIFFERENT export's executions — and must
+/// be refused rather than resumed at an unrelated offset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PageTokenKind {
+pub enum PageTokenKind<'a> {
     /// `ListExports`, paging over the export ARNs in [`ComAmazonawsBcmdataexportsAwsbillingandcostmanagementdataexportsState::exports`].
     Exports,
-    /// `ListTagsForResource`, paging over one export's tag keys.
-    ResourceTags,
+    /// `ListTagsForResource`, paging over the tag keys of the export `resource_arn` names.
+    ResourceTags {
+        /// The export whose tags this token walks.
+        resource_arn: &'a str,
+    },
     /// `ListTables`, paging over the table names of [`TABLE_CATALOG`].
     Tables,
+    /// `ListExecutions`, paging over the execution ids of the export `export_arn` names.
+    Executions {
+        /// The export whose executions this token walks.
+        export_arn: &'a str,
+    },
 }
 
-impl PageTokenKind {
-    /// The bytes that distinguish this listing inside the tag's preimage.
-    fn domain(self) -> &'static [u8] {
+impl PageTokenKind<'_> {
+    /// Mix the bytes that distinguish this sequence into the tag's preimage.
+    ///
+    /// A per-resource listing mixes the resource's ARN as well as the listing, and every
+    /// field is NUL-terminated — an ARN of this service cannot contain a NUL (the modelled
+    /// `Arn` pattern admits none), so no two sequences share a preimage.
+    fn mix(self, hasher: &mut ::sha2::Sha256) {
+        use ::sha2::Digest;
         match self {
-            Self::Exports => b"Exports\0",
-            Self::ResourceTags => b"ResourceTags\0",
-            Self::Tables => b"Tables\0",
+            Self::Exports => hasher.update(b"Exports\0"),
+            Self::ResourceTags { resource_arn } => {
+                hasher.update(b"ResourceTags\0");
+                hasher.update(resource_arn.as_bytes());
+                hasher.update(b"\0");
+            }
+            Self::Tables => hasher.update(b"Tables\0"),
+            Self::Executions { export_arn } => {
+                hasher.update(b"Executions\0");
+                hasher.update(export_arn.as_bytes());
+                hasher.update(b"\0");
+            }
         }
     }
 }
 
 /// The integrity tag of `key` for `kind`: the leading [`PAGE_TOKEN_TAG_LEN`] bytes of
-/// SHA-256 over the service domain separator, the listing, and the key.
-fn page_token_tag(kind: PageTokenKind, key: &str) -> Vec<u8> {
+/// SHA-256 over the service domain separator, the sequence, and the key.
+fn page_token_tag(kind: PageTokenKind<'_>, key: &str) -> Vec<u8> {
     use ::sha2::Digest;
     let mut hasher = ::sha2::Sha256::new();
     hasher.update(PAGE_TOKEN_DOMAIN);
-    hasher.update(kind.domain());
+    kind.mix(&mut hasher);
     hasher.update(key.as_bytes());
     hasher.finalize()[..PAGE_TOKEN_TAG_LEN].to_vec()
 }
@@ -381,16 +424,16 @@ fn page_token_tag(kind: PageTokenKind, key: &str) -> Vec<u8> {
 /// followed by the key, hex-encoded. Opaque — a client cannot read a position out of it
 /// and must hand it back verbatim — and self-verifying, so a token this listing never
 /// issued is rejected instead of being read as some arbitrary position in it.
-fn encode_page_token(kind: PageTokenKind, key: &str) -> String {
+fn encode_page_token(kind: PageTokenKind<'_>, key: &str) -> String {
     let mut bytes = page_token_tag(kind, key);
     bytes.extend_from_slice(key.as_bytes());
     ::hex::encode(bytes)
 }
 
 /// The key a token issued by [`encode_page_token`] for `kind` names, or `None` when this
-/// listing never issued it: not hex, too short to carry a tag, not UTF-8, or carrying a
-/// tag that does not match the listing and position it claims.
-fn decode_page_token(kind: PageTokenKind, token: &str) -> Option<String> {
+/// sequence never issued it: not hex, too short to carry a tag, not UTF-8, or carrying a
+/// tag that does not match the sequence and position it claims.
+fn decode_page_token(kind: PageTokenKind<'_>, token: &str) -> Option<String> {
     let bytes = ::hex::decode(token).ok()?;
     if bytes.len() < PAGE_TOKEN_TAG_LEN {
         return None;
@@ -403,11 +446,11 @@ fn decode_page_token(kind: PageTokenKind, token: &str) -> Option<String> {
 /// One page of `items` (ordered by their keys): at most `max_results` values starting at
 /// the key `token` names, plus the token that resumes immediately after the page.
 ///
-/// `None` when `token` was not issued by the `kind` listing — the caller answers that
+/// `None` when `token` was not issued by the `kind` sequence — the caller answers that
 /// with the modelled `ValidationException`. The returned token is `None` on the last
 /// page, so a paginating client stops.
 pub fn page<T: Clone>(
-    kind: PageTokenKind,
+    kind: PageTokenKind<'_>,
     items: &[(String, T)],
     max_results: Option<i32>,
     token: Option<&str>,

@@ -43,6 +43,8 @@ mod member_accounts;
 mod member_association;
 #[path = "all/modeled_constraint_refusals.rs"]
 mod modeled_constraint_refusals;
+#[path = "all/publishing_destination_lifecycle.rs"]
+mod publishing_destination_lifecycle;
 #[path = "all/request_region_partition_bounds.rs"]
 mod request_region_partition_bounds;
 #[path = "all/sample_finding_catalog.rs"]
