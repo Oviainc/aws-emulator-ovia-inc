@@ -152,26 +152,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::state as batch;
 
-        let _ = ctx;
         let Some(state) = batch::service_state(&*self.engine) else {
             return Err(CancelJobErrorModeled::ServerException(batch::unreachable_state()).into());
         };
         let now = batch::now_millis();
-        let mut state = state.lock();
-        // Materialise what the clock owed BEFORE cancelling, so the job is judged on the
-        // status it has at `now` rather than on the one it had when it was last looked
-        // at: a job that already reached a terminal status is not dragged back out of it,
-        // and one that already left `RUNNABLE` is not cancelled after the fact.
-        state.materialize_due(now);
+        // The store's lock lives in THIS block and no longer, so nothing holds it while
+        // the state changes below are published (that call reaches another service
+        // in-process).
+        {
+            let mut state = state.lock();
+            // Materialise what the clock owed BEFORE cancelling, so the job is judged on
+            // the status it has at `now` rather than on the one it had when it was last
+            // looked at: a job that already reached a terminal status is not dragged back
+            // out of it, and one that already left `RUNNABLE` is not cancelled after the
+            // fact.
+            state.materialize_due(now);
 
-        // `state::cancel_job` keeps the documented cases apart: `SUBMITTED`/`RUNNABLE`
-        // are cancelled now, `PENDING` records the cancel for the clock to materialise
-        // when the dependencies complete, `STARTING`/`RUNNING` and a job that is already
-        // terminal are left alone, and an unknown job id cancels nothing. The operation
-        // succeeds for all of them — "the API operation still succeeds, even if no job is
-        // cancelled" — so the outcome is not an error channel and no modelled error is
-        // raised here.
-        let _outcome: batch::CancelOutcome = state.cancel_job(&input.job_id, &input.reason, now);
+            // `state::cancel_job` keeps the documented cases apart: `SUBMITTED`/`RUNNABLE`
+            // are cancelled now, `PENDING` records the cancel for the clock to materialise
+            // when the dependencies complete, `STARTING`/`RUNNING` and a job that is
+            // already terminal are left alone, and an unknown job id cancels nothing. The
+            // operation succeeds for all of them — "the API operation still succeeds, even
+            // if no job is cancelled" — so the outcome is not an error channel and no
+            // modelled error is raised here.
+            let _outcome: batch::CancelOutcome =
+                state.cancel_job(&input.job_id, &input.reason, now);
+        }
+        batch::publish_job_state_changes(ctx, &*self.engine, &batch::request_region(ctx)).await;
 
         Ok(CancelJobOutput {})
     }

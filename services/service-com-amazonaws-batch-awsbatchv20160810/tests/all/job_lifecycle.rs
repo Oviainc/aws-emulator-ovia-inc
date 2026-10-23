@@ -63,6 +63,15 @@ fn status_rank(status: &str) -> u8 {
 
 /// One emulator: the batch service mounted on one shared engine, reached the way a
 /// client reaches it.
+///
+/// EventBridge and SQS are mounted BESIDE Batch on that same engine, because Batch
+/// publishes a `Batch Job State Change` event onto the account's default event bus on
+/// every job transition (`state::publish_job_state_changes`), reaching EventBridge
+/// through the in-process callback, and a rule on that bus delivers the event to its SQS
+/// queue targets: with neither mounted there is nowhere to publish, so the publication
+/// path would not be exercised at all. Each claims only requests scoped to its own
+/// signing name (`events`, `sqs`), so no Batch request below is routed any differently
+/// for their presence.
 pub(crate) struct Batch {
     router: smithy_server_runtime::MultiServiceRouter,
     /// The SAME engine the mounted service holds, so a test can read or seed the store
@@ -76,6 +85,12 @@ impl Batch {
         let mut router = smithy_server_runtime::MultiServiceRouter::new();
         router.set_request_authentication(false);
         router.register_service(EmulatedService::new(Arc::clone(&engine)));
+        router.register_service(
+            service_com_amazonaws_eventbridge_awsevents::EmulatedService::new(Arc::clone(&engine)),
+        );
+        router.register_service(service_com_amazonaws_sqs_amazonsqs::EmulatedService::new(
+            Arc::clone(&engine),
+        ));
         Self { router, engine }
     }
 
@@ -86,6 +101,67 @@ impl Batch {
         &self,
     ) -> engine::ServiceState<state::ComAmazonawsBatchAwsbatchv20160810State> {
         state::service_state(&*self.engine).expect("the batch store is reachable")
+    }
+
+    /// The EventBridge store mounted beside Batch: the buses, their rules, and the
+    /// routing log `PutEvents` appends what it routed to.
+    pub(crate) fn event_bus_store(
+        &self,
+    ) -> engine::ServiceState<
+        service_com_amazonaws_eventbridge_awsevents::state::ComAmazonawsEventbridgeAwseventsState,
+    > {
+        self.engine.state()
+    }
+
+    /// Call one EventBridge operation the way a client does: `awsJson1_1`, `POST /`
+    /// with `X-Amz-Target: AWSEvents.<Operation>` and an `events`-scoped credential.
+    pub(crate) async fn events(&self, operation: &str, body: Value) -> (u16, Value) {
+        self.rpc("events", "AWSEvents", "1.1", operation, body).await
+    }
+
+    /// Call one SQS operation the way a client does: `awsJson1_0`, `POST /` with
+    /// `X-Amz-Target: AmazonSQS.<Operation>` and an `sqs`-scoped credential.
+    pub(crate) async fn sqs(&self, operation: &str, body: Value) -> (u16, Value) {
+        self.rpc("sqs", "AmazonSQS", "1.0", operation, body).await
+    }
+
+    /// One `awsJson` RPC call against the service whose signing name is `signing_name`.
+    async fn rpc(
+        &self,
+        signing_name: &str,
+        target_prefix: &str,
+        json_version: &str,
+        operation: &str,
+        body: Value,
+    ) -> (u16, Value) {
+        let credential = format!(
+            "AKIDTEST/20240101/{REGION}/{signing_name}/aws4_request, SignedHeaders=host, \
+             Signature=0000"
+        );
+        let host = format!("{signing_name}.{REGION}.amazonaws.com");
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("host", &host)
+            .header("content-type", format!("application/x-amz-json-{json_version}"))
+            .header("x-amz-target", format!("{target_prefix}.{operation}"))
+            .header(
+                "authorization",
+                format!("AWS4-HMAC-SHA256 Credential={credential}"),
+            )
+            .body(Bytes::from(body.to_string()))
+            .expect("a well-formed request");
+        let response = self.router.dispatch(request).await;
+        let status = response.status().as_u16();
+        let bytes = response.into_body();
+        let decoded = if bytes.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&bytes).unwrap_or_else(|_| {
+                Value::String(String::from_utf8_lossy(bytes.as_ref()).into_owned())
+            })
+        };
+        (status, decoded)
     }
 
     /// POST `uri` with `body` as JSON; answer the status and the decoded body.
@@ -985,7 +1061,13 @@ async fn list_jobs_honours_the_documented_selectors_and_filters() {
             .await;
         ids.push(submitted["jobId"].as_str().unwrap_or_default().to_string());
     }
+    // The two submits need not land in the same millisecond (a submit also publishes the
+    // job's state change), so a `BEFORE_CREATED_AT` bound meant to cover BOTH jobs is
+    // taken from the LATER of the two instants rather than from the first job's.
     let created_at = describe_job(&batch, &ids[0]).await["createdAt"]
+        .as_i64()
+        .unwrap_or_default();
+    let last_created_at = describe_job(&batch, &ids[1]).await["createdAt"]
         .as_i64()
         .unwrap_or_default();
 
@@ -1023,7 +1105,7 @@ async fn list_jobs_honours_the_documented_selectors_and_filters() {
         ),
         (
             "BEFORE_CREATED_AT keeps jobs created at or before the bound",
-            json!([{"name": "BEFORE_CREATED_AT", "values": [(created_at + 1).to_string()]}]),
+            json!([{"name": "BEFORE_CREATED_AT", "values": [(last_created_at + 1).to_string()]}]),
             vec!["Report-alpha", "report-beta"],
         ),
         (

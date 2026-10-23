@@ -23,6 +23,15 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 # Opaque list page tokens are hex-encoded so they are URL- and header-safe.
 hex = { workspace = true }
+# `arn`: the ONE parse of a caller-supplied resource ARN, shared with every other
+# service \u2014 a rule's target ARN is read through it rather than split here.
+service-common = { path = "../common" }
+# The AWS SDK for SQS, driven over the in-process callback
+# (`OperationContext::callback`): a rule delivers a matched event to its SQS queue
+# targets with `SendMessage` (`ops::put_events::deliver`). Only the generated
+# client is needed — the emulator supplies the transport, so the SDK's own HTTPS
+# stack and runtime are left out.
+aws-sdk-sqs = { version = "1", default-features = false }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -30,6 +39,10 @@ emulator-core-build-support = { workspace = true }
 [dev-dependencies]
 sha2 = { workspace = true }
 hex = { workspace = true }
+# SQS is mounted beside EventBridge on one engine in the delivery tests, because a
+# rule's target is an SQS queue and a delivery is asserted where a client sees it:
+# on the queue.
+service-com-amazonaws-sqs-amazonsqs = { workspace = true }
 
 [lints]
 workspace = true

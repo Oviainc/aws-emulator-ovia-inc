@@ -390,6 +390,74 @@ async fn a_non_integer_attribute_accepts_exactly_the_values_its_documentation_li
     }
 }
 
+/// An attribute value whose FORM admits text of any length — a policy document, or an
+/// opaque key id — is bounded: the store keeps it for the queue's lifetime, so a value
+/// at the documented ceiling is accepted and one byte past it is refused.
+///
+/// The ceiling is the one AWS publishes for the largest of them ("The policy size is
+/// limited to 8,192 bytes", the `Policy` attribute's documentation), which this suite
+/// spells out rather than importing, so a wrong constant cannot make the rows pass.
+#[tokio::test]
+async fn an_unbounded_attribute_value_is_refused_past_the_documented_ceiling() {
+    const CEILING: usize = 8 * 1024;
+    let router = emulator();
+    // Each row builds a value of an exact byte length: a JSON document for the policy
+    // attributes, plain text for the key id. The rows differ along the attribute, its
+    // kind, and whether the length is at the ceiling or one byte past it.
+    let json_of = |len: usize| {
+        let overhead = r#"{"Pad":""}"#.len();
+        format!(r#"{{"Pad":"{}"}}"#, "p".repeat(len - overhead))
+    };
+    let rows: Vec<(&str, String, bool)> = vec![
+        ("Policy", json_of(CEILING), true),
+        ("Policy", json_of(CEILING + 1), false),
+        ("RedrivePolicy", json_of(CEILING), true),
+        ("RedrivePolicy", json_of(CEILING + 1), false),
+        ("RedriveAllowPolicy", json_of(CEILING), true),
+        ("RedriveAllowPolicy", json_of(CEILING + 1), false),
+        ("KmsMasterKeyId", "k".repeat(CEILING), true),
+        ("KmsMasterKeyId", "k".repeat(CEILING + 1), false),
+    ];
+
+    for (index, (attribute, value, accepted)) in rows.iter().enumerate() {
+        assert_eq!(
+            value.len(),
+            if *accepted { CEILING } else { CEILING + 1 },
+            "case {attribute} #{index}: the row's value must be exactly at or past the ceiling"
+        );
+        let name = format!("bounded-{index}");
+        let attributes = json!({ attribute.to_string(): value.clone() });
+        let (status, parsed) = create(&router, &name, &attributes).await;
+        if *accepted {
+            assert_eq!(
+                status, 200,
+                "case {attribute} at {} bytes: expected HTTP 200, got {status} with {parsed}",
+                value.len()
+            );
+        } else {
+            assert_eq!(
+                (status, error_code(&parsed).as_str()),
+                (400, "InvalidAttributeValue"),
+                "case {attribute} at {} bytes: expected a 400 InvalidAttributeValue, got \
+                 {status} with {parsed}",
+                value.len()
+            );
+            let (status, parsed) = call(
+                &router,
+                "ListQueues",
+                &json!({ "QueueNamePrefix": name.clone() }),
+            )
+            .await;
+            assert_eq!(status, 200, "case {attribute}: ListQueues got {parsed}");
+            assert!(
+                parsed["QueueUrls"].as_array().is_none_or(Vec::is_empty),
+                "case {attribute} at {} bytes: a refused create must store nothing, got {parsed}",
+                value.len()
+            );
+        }
+    }
+}
+
 /// An attribute name that does not exist, one that is reported rather than set, one
 /// that may be supplied only at create, and one that applies only to FIFO queues are
 /// all refused as `InvalidAttributeName` — on whichever call supplied it.
