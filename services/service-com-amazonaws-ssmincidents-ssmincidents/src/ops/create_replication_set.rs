@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateReplicationSet
+//!
 //! Refused UNCONDITIONALLY as deprecated: Amazon Web Services stopped accepting new
 //! Incident Manager customers on November 7, 2025, and `CreateReplicationSet` now fails
 //! every call with the error code `UnsupportedOperationException`. No replication set is

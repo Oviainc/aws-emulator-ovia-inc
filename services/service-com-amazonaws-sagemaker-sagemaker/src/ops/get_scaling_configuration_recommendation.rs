@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetScalingConfigurationRecommendation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetScalingConfigurationRecommendation`'s real behaviour. Implement it here — this is
+//! IMPLEMENTED: refuses a request that names neither (or both) of `RecommendationId` and
+//! `EndpointName` with a 400 `ValidationException` — the model says of each one
+//! "Specify either this field or the `<other>` field." — then resolves the job and the
+//! recommendation in `crate::state`, refusing either when absent with the modelled
+//! `ResourceNotFound`, and computes the scaling configuration from the benchmarked
+//! recommendation and the request's utilisation target and traffic objective. This is
 //! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetScalingConfigurationRecommendation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -131,6 +129,15 @@ impl From<GetScalingConfigurationRecommendationErrorModeled> for GetScalingConfi
     }
 }
 
+/// How many instances carry `load` invocations per minute when one instance takes
+/// `per_instance` of them: the load divided by the per-instance figure, rounded up,
+/// and never fewer than one instance.
+fn capacity_for(load: i32, per_instance: i32) -> i32 {
+    let load = u64::try_from(load).unwrap_or_default();
+    let per_instance = u64::try_from(per_instance).unwrap_or(1).max(1);
+    i32::try_from(load.div_ceil(per_instance).max(1)).unwrap_or(i32::MAX)
+}
+
 /// The `GetScalingConfigurationRecommendation` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -165,20 +172,124 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetScalingConfigurationRecommendation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetScalingConfigurationRecommendationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetScalingConfigurationRecommendation"))
+        // Reporting only: this operation computes a recommendation from what the job
+        // store already holds and writes nothing, so it needs no request metadata.
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        let target_cpu = input
+            .target_cpu_utilization_per_core
+            .unwrap_or(crate::state::DEFAULT_TARGET_CPU_UTILIZATION_PER_CORE);
+
+        // The model says of `RecommendationId` "Specify either this field or the
+        // EndpointName field", and the same of `EndpointName`: exactly one of them picks
+        // the recommendation. That is a rule about the REQUEST, needing no state, so it
+        // is judged before anything is looked up — a request that names neither (or
+        // both) is malformed whether or not the job it names exists. The operation models
+        // no error for it, so it is a 400 `ValidationException`.
+        match (&input.recommendation_id, &input.endpoint_name) {
+            (None, None) => {
+                return Err(crate::scaffolded::Scaffolded::validation(
+                    "Specify either RecommendationId or EndpointName.",
+                ));
+            }
+            (Some(_), Some(_)) => {
+                return Err(crate::scaffolded::Scaffolded::validation(
+                    "Specify either RecommendationId or EndpointName, not both.",
+                ));
+            }
+            _ => {}
+        }
+
+        let store = state.lock();
+        // `InferenceRecommendationsJobName` names the resource this call reports on, and
+        // a job this account holds none of is the modelled `ResourceNotFound`.
+        let job_name = &input.inference_recommendations_job_name;
+        let Some(job) = store.inference_recommendations_jobs.get(job_name) else {
+            return Err(GetScalingConfigurationRecommendationErrorModeled::ResourceNotFound(
+                ResourceNotFound {
+                    message: Some(format!(
+                        "Inference recommendations job {job_name} does not exist."
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // Both members name "one of the recommendations returned by the job specified in
+        // the InferenceRecommendationsJobName field", so a value that matches none of
+        // that job's recommendations is not found.
+        let recommendation = job.recommendations.iter().find(|candidate| {
+            match (&input.recommendation_id, &input.endpoint_name) {
+                (Some(id), _) => &candidate.recommendation_id == id,
+                (_, Some(endpoint)) => &candidate.endpoint_name == endpoint,
+                _ => false,
+            }
+        });
+        let Some(recommendation) = recommendation else {
+            return Err(GetScalingConfigurationRecommendationErrorModeled::ResourceNotFound(
+                ResourceNotFound {
+                    message: Some(format!(
+                        "Inference recommendations job {job_name} has no recommendation for \
+                         the requested endpoint or recommendation id."
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // What one instance is asked to take: the load the job benchmarked on that
+        // instance type, scaled by the utilisation the caller wants to run it at.
+        let per_instance = i64::from(recommendation.max_invocations_per_minute)
+            * i64::from(target_cpu)
+            / 100;
+        let per_instance = i32::try_from(per_instance.max(1)).unwrap_or(i32::MAX);
+
+        // The capacity band follows the traffic the caller anticipates. With no
+        // objective named there is nothing to plan for beyond the load that was
+        // benchmarked, which one instance carries.
+        let objective = input.scaling_policy_objective.clone();
+        let min_capacity = objective
+            .as_ref()
+            .and_then(|objective| objective.min_invocations_per_minute)
+            .map_or(1, |load| capacity_for(load, per_instance));
+        let max_capacity = objective
+            .as_ref()
+            .and_then(|objective| objective.max_invocations_per_minute)
+            .map_or(min_capacity, |load| {
+                capacity_for(load, per_instance).max(min_capacity)
+            });
+
+        Ok(GetScalingConfigurationRecommendationOutput {
+            inference_recommendations_job_name: Some(job.name.clone()),
+            recommendation_id: Some(recommendation.recommendation_id.clone()),
+            endpoint_name: Some(recommendation.endpoint_name.clone()),
+            target_cpu_utilization_per_core: Some(target_cpu),
+            scaling_policy_objective: objective,
+            metric: Some(ScalingPolicyMetric {
+                invocations_per_instance: Some(per_instance),
+                model_latency: Some(recommendation.model_latency_millis),
+            }),
+            dynamic_scaling_configuration: Some(DynamicScalingConfiguration {
+                min_capacity: Some(min_capacity),
+                max_capacity: Some(max_capacity),
+                scale_in_cooldown: Some(crate::state::RECOMMENDED_SCALING_COOLDOWN_SECONDS),
+                scale_out_cooldown: Some(crate::state::RECOMMENDED_SCALING_COOLDOWN_SECONDS),
+                scaling_policies: Some(vec![ScalingPolicy::TargetTracking(
+                    TargetTrackingScalingPolicyConfiguration {
+                        metric_specification: Some(MetricSpecification::Predefined(
+                            PredefinedMetricSpecification {
+                                predefined_metric_type: Some(
+                                    crate::state::PREDEFINED_SCALING_METRIC.to_string(),
+                                ),
+                            },
+                        )),
+                        target_value: Some(f64::from(per_instance)),
+                    },
+                )]),
+            }),
+        })
     }
 }

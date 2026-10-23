@@ -28,13 +28,12 @@ use crate::comprehend_client::{error_code, error_message, Comprehend, ACCOUNT_ID
 
 /// The lifecycle order a job's status may only move forward along.
 ///
-/// The terminal status of a started sentiment-detection job is `FAILED`, not
-/// `COMPLETED`: running it means reading the documents from the Amazon S3 location
-/// `InputDataConfig` names, scoring each one's sentiment and writing the scored
-/// output back, and this emulator does not perform that batch run for the sentiment
-/// family (`StartDominantLanguageDetectionJob` is the family whose run it does
-/// perform — see `dominant_language_jobs`). The suites below assert that modelled
-/// failure and the `Message` that names what was not performed.
+/// A started sentiment-detection job ends `FAILED` in THIS suite, whose emulator
+/// mounts no object storage: running it means reading the documents from the Amazon
+/// S3 location `InputDataConfig` names, scoring each one's sentiment and writing the
+/// scored output back, and nothing answers those calls here, so the run reports what
+/// it could not read. `key_phrases_job_run` is the suite that mounts object storage
+/// and asserts a run that completes and the archive it wrote.
 const LIFECYCLE: &[&str] = &["SUBMITTED", "IN_PROGRESS", "FAILED"];
 
 /// The terminal status a started job reaches, as `JOB_STATUS_VALUES` spells it.
@@ -403,13 +402,14 @@ async fn a_job_status_only_moves_forward_and_ends_in_the_modelled_failure() {
                 properties["EndTime"].as_f64().is_some_and(|t| t > 0.0),
                 "case \"lifecycle\": a terminal job must carry an EndTime, got {properties}"
             );
-            // The reason the batch run could not be performed, naming both S3
-            // locations the submission pointed at.
+            // The reason the run could not be carried out, naming the location the
+            // input documents were to be read from. No object storage answers this
+            // suite's emulator, so the run's own listing is what failed: the job
+            // reports that, rather than a COMPLETED run nothing performed.
             let message = properties["Message"].as_str().unwrap_or_default();
             for expected in [
                 "s3://other-bucket/corpus/",
-                "s3://other-bucket/results/",
-                "was not performed",
+                "Could not list the input documents",
             ] {
                 assert!(
                     message.contains(expected),

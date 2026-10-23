@@ -60,6 +60,13 @@ aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", 
 # the operation").
 tar = "0.4"
 flate2 = "1"
+# CSV reader for the `COMPREHEND_CSV` training data CreateDocumentClassifier fits a
+# custom model on: label(s) in the first column, the document in the second, with
+# RFC 4180 quoting the format allows.
+csv = "1.3"
+# The stop-word lists the key-phrase extractor splits a document into candidate
+# phrases at (Rose et al.'s candidate rule), one list per language Comprehend names.
+stop-words = "0.8"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

@@ -27,6 +27,8 @@ mod codedeploy_deployment_outcome;
 mod codedeploy_lifecycle;
 #[path = "all/deployment_configs.rs"]
 mod deployment_configs;
+#[path = "all/delete_deployment_group.rs"]
+mod delete_deployment_group;
 #[path = "all/deployment_group_defaults.rs"]
 mod deployment_group_defaults;
 #[path = "all/deployment_group_update.rs"]

@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteResourcePolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteResourcePolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED. Removes the resource-based policy a custom model carries and answers
+//! an empty 200; a model that carries none is an idempotent no-op, and an ARN that
+//! names no model is 404 `ResourceNotFoundException`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteResourcePolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The policy lives on the model's own record
+//! ([`crate::state::DocumentClassifier::resource_policy`]), so this removes exactly
+//! what `PutResourcePolicy` attached and `DescribeResourcePolicy` reports.
 //!
 //! ## Shape of an operation
 //!
@@ -70,6 +68,10 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use std::time::SystemTime;
+
+use crate::state::RESOURCE_NOT_FOUND_MESSAGE;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -141,18 +143,60 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteResourcePolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteResourcePolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteResourcePolicy"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteResourcePolicyErrorModeled::InternalServerException(InternalServerException {
+                message: Some("The service store is unavailable. Retry your request.".to_string()),
+            })
+        })?;
+
+        let now = SystemTime::now();
+        let mut store = state.lock();
+        // Delete from a store whose clock-owed changes are already materialised, so a
+        // model whose deletion has completed is gone here too.
+        store.settle_document_classifiers(now);
+
+        // The ARN has to name a model that exists — the "specified resource ARN was
+        // not found" this operation models, with the service's fixed message and
+        // nothing from the request echoed back.
+        let Some(model) = store.custom_model_mut(&input.resource_arn) else {
+            return Err(DeleteResourcePolicyErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(RESOURCE_NOT_FOUND_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        };
+
+        // `PolicyRevisionId` is "the revision ID of the policy to delete": a request
+        // naming a revision the model does not currently carry is deleting a version
+        // that is no longer there, which is the invalid request this operation
+        // models. A request naming none deletes whatever is attached — and a model
+        // carrying no policy has nothing to remove, which is the plain empty 200 a
+        // delete of an absent policy answers.
+        if let Some(expected) = input.policy_revision_id.as_deref() {
+            let matches = model
+                .resource_policy
+                .as_ref()
+                .is_some_and(|policy| policy.revision_id.eq_ignore_ascii_case(expected));
+            if !matches {
+                return Err(DeleteResourcePolicyErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some(
+                            "The policy revision ID in the request does not match the \
+                             revision ID of the policy attached to the resource. Read the \
+                             policy back for its current revision ID and try again."
+                                .to_string(),
+                        ),
+                        reason: None,
+                        detail: None,
+                    },
+                )
+                .into());
+            }
+        }
+        model.resource_policy = None;
+
+        Ok(DeleteResourcePolicyOutput {})
     }
 }

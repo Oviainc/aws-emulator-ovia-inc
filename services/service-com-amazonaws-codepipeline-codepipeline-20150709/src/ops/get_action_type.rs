@@ -69,6 +69,24 @@
 //!
 //! * `ActionTypeNotFoundException` (HTTP 400) — The specified action type cannot be found.
 //! * `ValidationException` (HTTP 400) — The validation was specified in an invalid format.
+//!
+//! ## The rule this handler is
+//!
+//! This operation REPORTS the definition the service holds for the action type the
+//! four input members identify, in the Region the call was signed for, and refuses
+//! with `ActionTypeNotFoundException` when it holds none. It is a read: nothing about
+//! the store changes, whichever way it answers.
+//!
+//! The definitions live in
+//! [`ComAmazonawsCodepipelineCodepipeline20150709State::declared_action_type`](crate::state::ComAmazonawsCodepipelineCodepipeline20150709State::declared_action_type),
+//! keyed by the same [`ActionTypeKey`](crate::state::ActionTypeKey) every other
+//! action-type rule of this service is keyed by, and written by `UpdateActionType`.
+//! They are NOT the action-type catalog `ListActionTypes` reports: a definition is a
+//! provider's integration-model declaration of an action type (its executor, its
+//! properties, the accounts it is shared with), so an action type the catalog names
+//! has no definition until one is stored for it. `ValidationException` stays
+//! unreachable from here: every modelled constraint on the input is refused before
+//! this handler runs.
 
 #[allow(unused_imports)]
 use super::types::*;

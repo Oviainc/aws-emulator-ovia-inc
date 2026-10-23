@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetTransformer
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetTransformer`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetTransformer::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: reports the log-group level transformer stored on the log group
+//! `logGroupIdentifier` names, as `PutTransformer` configured it. This is the ONLY file
+//! to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +148,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetTransformer` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetTransformerErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetTransformer"))
+        // `ctx` carries only request metadata, and this operation reports: it reads the
+        // store and writes nothing.
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetTransformerError::from(GetTransformerErrorModeled::ServiceUnavailableException(
+                ServiceUnavailableException {
+                    message: Some("the log store is unavailable".to_string()),
+                },
+            ))
+        })?;
+        let store = state.lock();
+
+        // "Specify either the name or ARN of the log group to return transformer
+        // information for", so an ARN resolves to the name the store is keyed by.
+        let log_group_name =
+            crate::state::log_group_name_from_identifier(&input.log_group_identifier).to_string();
+
+        let not_found = |resource_kind: &str| {
+            GetTransformerError::from(GetTransformerErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::resource_not_found_message(resource_kind)),
+                },
+            ))
+        };
+
+        let Some(group) = store.log_groups.get(&log_group_name) else {
+            return Err(not_found("log group"));
+        };
+
+        // "This operation returns data only for transformers created at the log group
+        // level": until one has been created for this group there is no transformer to
+        // report, which is a missing resource rather than an empty response. An
+        // account-level transformer is read through `DescribeAccountPolicies` and is not
+        // reported here even when one would apply to this group.
+        let Some(transformer) = group.transformer.as_ref() else {
+            return Err(not_found("transformer"));
+        };
+
+        Ok(GetTransformerOutput {
+            // "The ARN of the log group that you specified in your request" — the ARN of
+            // the group, whichever form the request named it by. The form without the
+            // trailing `:*` is the one the modelled `LogGroupIdentifier` pattern admits.
+            log_group_identifier: Some(group.log_group_arn.clone()),
+            creation_time: Some(transformer.creation_time_ms),
+            last_modified_time: Some(transformer.last_modified_time_ms),
+            transformer_config: Some(transformer.processors.clone()),
+        })
     }
 }

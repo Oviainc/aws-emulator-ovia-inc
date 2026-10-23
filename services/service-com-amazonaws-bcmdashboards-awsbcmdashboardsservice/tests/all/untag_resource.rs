@@ -6,7 +6,8 @@
 //! request names and nothing else — a key the resource does not carry is a no-op, so the
 //! call is idempotent, every tag whose key the request did not name keeps its value and
 //! its position in the stored list, and an ARN that names no stored resource is refused
-//! with the modelled `ResourceNotFoundException` instead of silently succeeding. It is a
+//! with `ResourceNotFoundException` (HTTP 400, as `tests/all/resource_not_found.rs` pins)
+//! instead of silently succeeding. It is a
 //! rule about a RESOURCE: `ResourceArn` names a `dashboard` or a `scheduled-report`, and
 //! both obey it.
 //!
@@ -358,8 +359,8 @@ async fn untagging_an_unknown_resource_is_refused() {
         )
         .await;
         assert_eq!(
-            status, 404,
-            "case {label}: expected 404, got {status}: {answered}"
+            status, 400,
+            "case {label}: expected 400, got {status}: {answered}"
         );
         assert!(
             error_code(&answered).contains("ResourceNotFoundException"),

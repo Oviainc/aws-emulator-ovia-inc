@@ -4,7 +4,8 @@
 //!
 //! This holds the REST API resource tree the control plane persists — a `RestApi`, the
 //! `Resource`s under it (including the implicit root resource every API is created
-//! with), the `Method`s put on those resources and the API's `Stage`s — beside the
+//! with), the `Method`s put on those resources, the API's `Stage`s and the gateway
+//! responses a developer has customized on it — beside the
 //! account's `ApiKey` records. Every handler in `src/ops/` computes
 //! its response from these records; nothing is synthesised per request.
 //!
@@ -16,8 +17,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::ops::types::{
-    CanarySettings, DocumentationPartLocation, EndpointConfiguration, GetIntegrationOutput,
-    GetMethodResponseOutput, MethodSetting, MethodSnapshot,
+    CanarySettings, DocumentationPartLocation, EndpointConfiguration, GetGatewayResponseOutput,
+    GetIntegrationOutput, GetMethodResponseOutput, MethodSetting, MethodSnapshot,
 };
 
 /// Per-service state for com-amazonaws-apigateway-backplanecontrolservice. A handler reaches it through [`service_state`].
@@ -71,6 +72,15 @@ pub struct RestApiEntry {
     pub stages: BTreeMap<String, StageEntry>,
     /// Every `Deployment` of this API, keyed by deployment id: what a stage points at.
     pub deployments: BTreeMap<String, DeploymentEntry>,
+    /// The gateway responses a developer has CUSTOMIZED on this API, keyed by their
+    /// `responseType`; written by `PutGatewayResponse` and reported by
+    /// `GetGatewayResponse`.
+    ///
+    /// A type with no entry here is not missing: the API still has a gateway response
+    /// for it, the one API Gateway generates itself, which
+    /// [`default_gateway_response`] builds. So this map holds only the customizations,
+    /// and a stored record is always reported with `defaultResponse: false`.
+    pub gateway_responses: BTreeMap<String, GetGatewayResponseOutput>,
     /// Every `DocumentationPart` of this API, keyed by documentation part id: the
     /// records `CreateDocumentationPart` and `ImportDocumentationParts` write and
     /// `GetDocumentationPart` / `GetDocumentationParts` report.
@@ -379,6 +389,79 @@ pub fn defaulted_endpoint_configuration(
     });
     configuration.types = Some(types);
     configuration
+}
+
+// ---------------------------------------------------------------------------
+// Gateway responses
+//
+// Every API has a gateway response for EVERY modelled `GatewayResponseType` from the
+// moment it is created: until a developer customizes one, it is the response API
+// Gateway generates itself, reported with `defaultResponse: true`. Only the
+// customizations are stored (`RestApiEntry::gateway_responses`); the generated ones are
+// derived from the catalog below, so a read of an uncustomized type and a read of a
+// customized one answer from one rule.
+// ---------------------------------------------------------------------------
+
+/// The HTTP status code the gateway response API Gateway GENERATES carries, per
+/// `GatewayResponseType`.
+///
+/// Hand-written because the model carries the type's values and nothing else:
+/// `smithy_query(query="shape", shape="com.amazonaws.apigateway#GatewayResponseType")`
+/// lists the 21 values with no status code attached, and `GatewayResponse$statusCode`
+/// documents only the member. Source: the API Gateway Developer Guide's gateway
+/// response table ("Setting up gateway responses to customize error responses"), which
+/// lists each response type beside the status code of the response API Gateway returns
+/// for it. `DEFAULT_4XX` and `DEFAULT_5XX` are the two rows that carry NO status code of
+/// their own — each is a fallback for a whole class of responses, which keep their own
+/// code — so they are absent here, which is why [`default_gateway_status_code`] answers
+/// an `Option`.
+const DEFAULT_GATEWAY_STATUS_CODES: &[(&str, &str)] = &[
+    ("ACCESS_DENIED", "403"),
+    ("API_CONFIGURATION_ERROR", "500"),
+    ("AUTHORIZER_CONFIGURATION_ERROR", "500"),
+    ("AUTHORIZER_FAILURE", "500"),
+    ("BAD_REQUEST_BODY", "400"),
+    ("BAD_REQUEST_PARAMETERS", "400"),
+    ("EXPIRED_TOKEN", "403"),
+    ("INTEGRATION_FAILURE", "504"),
+    ("INTEGRATION_TIMEOUT", "504"),
+    ("INVALID_API_KEY", "403"),
+    ("INVALID_SIGNATURE", "403"),
+    ("MISSING_AUTHENTICATION_TOKEN", "403"),
+    ("QUOTA_EXCEEDED", "429"),
+    ("REQUEST_TOO_LARGE", "413"),
+    ("RESOURCE_NOT_FOUND", "404"),
+    ("THROTTLED", "429"),
+    ("UNAUTHORIZED", "401"),
+    ("UNSUPPORTED_MEDIA_TYPE", "415"),
+    ("WAF_FILTERED", "403"),
+];
+
+/// The status code [`DEFAULT_GATEWAY_STATUS_CODES`] gives `response_type`, or `None` for
+/// a type that has none (`DEFAULT_4XX`, `DEFAULT_5XX`) and for a value the catalog does
+/// not name.
+///
+/// Shared by the operations that write and read a gateway response, so the status code a
+/// `PutGatewayResponse` that set none stores is the one a read of the uncustomized type
+/// would have reported.
+pub fn default_gateway_status_code(response_type: &str) -> Option<&'static str> {
+    DEFAULT_GATEWAY_STATUS_CODES
+        .iter()
+        .find(|(kind, _)| *kind == response_type)
+        .map(|(_, status)| *status)
+}
+
+/// The gateway response an API reports for `response_type` while no customization is
+/// stored for it: the one API Gateway generates, so `defaultResponse` is `true`, the
+/// status code is the type's own, and neither caller-supplied map is set.
+pub fn default_gateway_response(response_type: &str) -> GetGatewayResponseOutput {
+    GetGatewayResponseOutput {
+        response_type: Some(response_type.to_string()),
+        status_code: default_gateway_status_code(response_type).map(str::to_string),
+        response_parameters: None,
+        response_templates: None,
+        default_response: true,
+    }
 }
 
 /// The characters an API Gateway id is built from: lowercase alphanumerics.

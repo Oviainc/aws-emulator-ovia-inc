@@ -233,6 +233,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // must provide a RedactionConfig definition that includes the PiiEntityTypes
         // parameter." A request asking for redaction without saying WHAT to redact
         // cannot be carried out, so no job is minted for it.
+        //
+        // The message is the service's own fixed text for this reason code, including
+        // the remediation clause AWS always appends to it: nothing in it is derived
+        // from the request, so the sentence is written out here in full rather than
+        // summarised.
         if input.mode == REDACTION_MODE {
             let entity_types = input
                 .redaction_config
@@ -244,9 +249,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         InvalidRequestException {
                             message: Some(format!(
                                 "INPUT_CONFIG_INVALID_FOR_MODE: A RedactionConfig definition \
-                                 that includes the PiiEntityTypes parameter is required for \
-                                 PII detection requests that set the Mode parameter to \
-                                 {REDACTION_MODE}."
+                                 is required for PII detection requests that set the Mode \
+                                 parameter to {REDACTION_MODE}. Add a RedactionConfig \
+                                 definition to your request, including a non-empty list of \
+                                 PII entity types to redact, and try again."
                             )),
                             reason: None,
                             detail: None,

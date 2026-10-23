@@ -184,15 +184,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // stored invocation is simply absent.
         let mut store = state.lock();
         let Some(invocation) = store.invocation_mut(&input.invocation_arn) else {
-            return Err(GetDataAutomationStatusErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!(
-                        "No data automation invocation found for {}",
-                        input.invocation_arn
-                    )),
-                },
-            )
-            .into());
+            // 400, not the 404 the shape's advisory `@httpError` declares: see
+            // `crate::scaffolded::Scaffolded::ClientError`.
+            return Err(crate::scaffolded::Scaffolded::client_error(
+                GetDataAutomationStatusErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::INVOCATION_NOT_FOUND_MESSAGE.to_string()),
+                    },
+                ),
+            ));
         };
 
         invocation.advance_to(::std::time::SystemTime::now());

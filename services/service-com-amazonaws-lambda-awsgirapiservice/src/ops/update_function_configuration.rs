@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateFunctionConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateFunctionConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateFunctionConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Modifies the settings of a function's UNPUBLISHED (`$LATEST`) version: every member
+//! the request carries replaces the stored value, every member it omits leaves the
+//! stored value alone, and the call mints a new `RevisionId` and a new `LastModified`
+//! for the configuration it leaves behind. The answer is the stored configuration read
+//! back, so `GetFunctionConfiguration` reports exactly what this call persisted.
 //!
 //! ## Shape of an operation
 //!
@@ -351,18 +348,378 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateFunctionConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateFunctionConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateFunctionConfiguration"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(service_exception(
+                "Lambda state is not reachable on this engine",
+            ));
+        };
+
+        let reference = crate::state::parse_function_reference(&input.function_name)
+            .ok_or_else(|| {
+                invalid_parameter(format!(
+                    "1 validation error detected: Value '{}' at 'functionName' failed to \
+                     satisfy constraint: Member must satisfy one of the documented name \
+                     formats (name, name:qualifier, partial ARN or function ARN)",
+                    input.function_name
+                ))
+            })?;
+
+        // "These settings can vary between versions of a function and are locked when
+        // you publish a version. You can't modify the configuration of a published
+        // version, only the unpublished version." A name qualified with anything but the
+        // unpublished version therefore names a configuration no update can touch.
+        if let Some(qualifier) = reference
+            .qualifier
+            .as_deref()
+            .filter(|qualifier| *qualifier != crate::state::VERSION_LATEST)
+        {
+            return Err(invalid_parameter(format!(
+                "UpdateFunctionConfiguration modifies the unpublished {latest} configuration, \
+                 and the qualifier '{qualifier}' in 'functionName' names a published version \
+                 or an alias",
+                latest = crate::state::VERSION_LATEST
+            )));
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx);
+        let mut store = state.lock();
+
+        // A request naming no stored function is refused for THAT before any of its
+        // members is judged, so an update of an absent function is the 404 whatever else
+        // it carries. The record itself is taken mutably further down, because resolving
+        // `Layers` below reads the layer slice of this same store.
+        if !store.functions.contains_key(&reference.name) {
+            return Err(not_found(&region, &reference.name));
+        }
+
+        // "A list of function layers to add to the function's execution environment.
+        // Specify each layer by its ARN, including the version." Each entry names a layer
+        // version `PublishLayerVersion` persisted, so the configuration holds what that
+        // record resolves to rather than what the request said.
+        let layers = match input.layers.as_deref() {
+            Some(layers) => {
+                Some(crate::state::resolve_function_layers(&store, layers).map_err(invalid_parameter)?)
+            }
+            None => None,
+        };
+        // "Environment variables that are accessible from function code during
+        // execution", under the same quota every operation that accepts a set of them
+        // applies.
+        let environment = match input.environment.as_ref() {
+            Some(environment) => Some(
+                crate::state::environment_variables(Some(environment))
+                    .map_err(invalid_parameter)?,
+            ),
+            None => None,
+        };
+
+        let record = store
+            .functions
+            .get_mut(&reference.name)
+            .ok_or_else(|| not_found(&region, &reference.name))?;
+        record.materialize(now);
+
+        // `StateReasonCode`'s own `Creating` value: "When the code is Creating, you can't
+        // invoke or modify the function."
+        if record.state == crate::state::STATE_PENDING {
+            return Err(resource_conflict(format!(
+                "The operation cannot be performed at this time. The function is currently in \
+                 the following state: {}",
+                record.state
+            )));
+        }
+
+        // "When you update a function, Lambda provisions an instance of the function and
+        // its supporting resources. [...] During this time, you can't modify the
+        // function, but you can still invoke it."
+        if record.update_in_progress() {
+            return Err(resource_conflict(format!(
+                "The operation cannot be performed at this time. An update is in progress for \
+                 resource: {}",
+                record.arn
+            )));
+        }
+
+        // "Update the function only if the revision ID matches the ID that's specified.
+        // Use this option to avoid modifying a function that has changed since you last
+        // read it." A mismatch is the one failure `PreconditionFailedException` is
+        // modelled for.
+        if let Some(expected) = input
+            .revision_id
+            .as_deref()
+            .filter(|expected| *expected != record.config.revision_id)
+        {
+            return Err(
+                UpdateFunctionConfigurationErrorModeled::PreconditionFailedException(
+                    PreconditionFailedException {
+                        r#type: None,
+                        message: Some(format!(
+                            "The RevisionId provided ({expected}) does not match the latest \
+                             RevisionId for the Lambda function. Call the GetFunction API to \
+                             retrieve the latest RevisionId for your resource."
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Which members a package type admits is the same rule `CreateFunction`
+        // documents: "Specifying a runtime results in an error if you're deploying a
+        // function using a container image", and for a container image "You do not need
+        // to specify the handler and runtime properties" — while the container image
+        // overrides belong to a container image and nothing else. Only the `Runtime`
+        // refusal is stated by the model as an error in so many words; the `Handler` and
+        // `ImageConfig` refusals are the same rule carried to the other two members a
+        // package type does not admit, and `CreateFunction` already refuses both of them.
+        let is_image = record.config.package_type == crate::state::PACKAGE_TYPE_IMAGE;
+        if is_image && input.runtime.is_some() {
+            return Err(invalid_parameter(
+                "Runtime cannot be set for a function whose PackageType is Image".to_string(),
+            ));
+        }
+        if is_image && input.handler.is_some() {
+            return Err(invalid_parameter(
+                "Handler cannot be set for a function whose PackageType is Image".to_string(),
+            ));
+        }
+        if !is_image && input.image_config.is_some() {
+            return Err(invalid_parameter(
+                "ImageConfig can only be set for a function whose PackageType is Image"
+                    .to_string(),
+            ));
+        }
+
+        // Every member the request carries replaces the stored value, and every member
+        // it omits leaves the stored value alone.
+        let config = &mut record.config;
+        if let Some(role) = input.role {
+            config.role = role;
+        }
+        if let Some(runtime) = input.runtime {
+            config.runtime = Some(runtime);
+        }
+        if let Some(handler) = input.handler {
+            config.handler = Some(handler);
+        }
+        if let Some(description) = input.description {
+            config.description = Some(description);
+        }
+        if let Some(timeout) = input.timeout {
+            config.timeout = timeout;
+        }
+        if let Some(memory_size) = input.memory_size {
+            config.memory_size = memory_size;
+        }
+        if let Some(environment) = environment {
+            config.environment = environment;
+        }
+        if let Some(layers) = layers {
+            config.layers = layers;
+        }
+        if let Some(storage) = input.ephemeral_storage {
+            config.ephemeral_storage_mb = storage.size;
+        }
+        // `TracingConfig` carries nothing but the mode, so a request that names the
+        // member without one asks for no change to it.
+        if let Some(mode) = input.tracing_config.and_then(|tracing| tracing.mode) {
+            config.tracing_mode = mode;
+        }
+        if let Some(kms_key_arn) = input.kms_key_arn {
+            config.kms_key_arn = Some(kms_key_arn);
+        }
+        if let Some(vpc_config) = input.vpc_config {
+            config.vpc_config = Some(vpc_config);
+        }
+        if let Some(dead_letter_config) = input.dead_letter_config {
+            config.dead_letter_config = Some(dead_letter_config);
+        }
+        if let Some(file_system_configs) = input.file_system_configs {
+            config.file_system_configs = file_system_configs;
+        }
+        if let Some(image_config) = input.image_config {
+            config.image_config = Some(image_config);
+        }
+        // `SnapStart` carries nothing but `ApplyOn`, so the same rule as `TracingConfig`
+        // above applies to it.
+        if let Some(apply_on) = input.snap_start.and_then(|snap_start| snap_start.apply_on) {
+            config.snap_start_apply_on = Some(apply_on);
+        }
+        if let Some(logging_config) = input.logging_config {
+            config.logging_config = Some(logging_config);
+        }
+        if let Some(capacity_provider_config) = input.capacity_provider_config {
+            config.capacity_provider_config = Some(capacity_provider_config);
+        }
+        if let Some(durable_config) = input.durable_config {
+            config.durable_config = Some(durable_config);
+        }
+        // `TenancyConfig` is the one setting this operation models no member for:
+        // "Tenant isolation configuration cannot be modified after function creation."
+
+        // A new revision is minted on every change to a function's configuration, and
+        // `LastModified` is "The date and time that the function was last updated".
+        config.revision_id = crate::state::mint_revision_id();
+        config.last_modified = crate::state::iso8601(now);
+
+        // "When you update a function, Lambda provisions an instance of the function and
+        // its supporting resources. [...] The LastUpdateStatus, LastUpdateStatusReason,
+        // and LastUpdateStatusReasonCode fields in the response from
+        // GetFunctionConfiguration indicate when the update is complete and the function
+        // is processing events with the new configuration." The move back to
+        // `Successful` is owed by the clock at `last_update_due`, and nothing waits for
+        // it here.
+        record.last_update_status =
+            Some(crate::state::LAST_UPDATE_STATUS_IN_PROGRESS.to_string());
+        record.last_update_due = Some(now + crate::state::UPDATE_DELAY);
+
+        // Answered by reading the record back out of the store, so
+        // `GetFunctionConfiguration` reports exactly what this call persisted.
+        let stored = record.config.clone();
+        Ok(function_configuration(
+            record.configuration(crate::state::VERSION_LATEST, &stored),
+        ))
+    }
+}
+
+/// The modelled 400 this operation answers a request it cannot satisfy with.
+fn invalid_parameter(message: String) -> UpdateFunctionConfigurationError {
+    UpdateFunctionConfigurationErrorModeled::InvalidParameterValueException(
+        InvalidParameterValueException {
+            r#type: None,
+            message: Some(message),
+        },
+    )
+    .into()
+}
+
+/// The modelled 404 this operation answers a `FunctionName` it holds no record of with.
+fn not_found(region: &str, name: &str) -> UpdateFunctionConfigurationError {
+    UpdateFunctionConfigurationErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        r#type: None,
+        message: Some(format!(
+            "Function not found: {}",
+            crate::state::function_arn(region, name)
+        )),
+    })
+    .into()
+}
+
+/// The modelled 409 this operation answers with while the function cannot be modified:
+/// "The resource already exists, or another operation is in progress."
+fn resource_conflict(message: String) -> UpdateFunctionConfigurationError {
+    UpdateFunctionConfigurationErrorModeled::ResourceConflictException(ResourceConflictException {
+        r#type: None,
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The modelled 500 for a store this handler cannot reach.
+fn service_exception(message: &str) -> UpdateFunctionConfigurationError {
+    UpdateFunctionConfigurationErrorModeled::ServiceException(ServiceException {
+        r#type: None,
+        message: Some(message.to_string()),
+    })
+    .into()
+}
+
+/// Re-key the `FunctionConfiguration` [`crate::state`] builds onto this operation's own
+/// output struct.
+///
+/// The model gives `UpdateFunctionConfiguration` the very same `FunctionConfiguration`
+/// output shape as `CreateFunction`, but the generated types name one struct per
+/// operation, so the two are distinct Rust types over identical members. The values are
+/// therefore computed in ONE place
+/// ([`crate::state::FunctionRecord::configuration`]) and only moved across here.
+/// Destructuring without `..` is deliberate: a member added to the shape fails to
+/// compile here rather than silently dropping out of this operation's answer.
+fn function_configuration(
+    configuration: CreateFunctionOutput,
+) -> UpdateFunctionConfigurationOutput {
+    let CreateFunctionOutput {
+        function_name,
+        function_arn,
+        runtime,
+        role,
+        handler,
+        code_size,
+        description,
+        timeout,
+        memory_size,
+        last_modified,
+        code_sha256,
+        version,
+        vpc_config,
+        dead_letter_config,
+        environment,
+        kms_key_arn,
+        tracing_config,
+        master_arn,
+        revision_id,
+        layers,
+        state,
+        state_reason,
+        state_reason_code,
+        last_update_status,
+        last_update_status_reason,
+        last_update_status_reason_code,
+        file_system_configs,
+        signing_profile_version_arn,
+        signing_job_arn,
+        package_type,
+        image_config_response,
+        architectures,
+        ephemeral_storage,
+        snap_start,
+        runtime_version_config,
+        logging_config,
+        tenancy_config,
+        capacity_provider_config,
+        config_sha256,
+        durable_config,
+    } = configuration;
+    UpdateFunctionConfigurationOutput {
+        function_name,
+        function_arn,
+        runtime,
+        role,
+        handler,
+        code_size,
+        description,
+        timeout,
+        memory_size,
+        last_modified,
+        code_sha256,
+        version,
+        vpc_config,
+        dead_letter_config,
+        environment,
+        kms_key_arn,
+        tracing_config,
+        master_arn,
+        revision_id,
+        layers,
+        state,
+        state_reason,
+        state_reason_code,
+        last_update_status,
+        last_update_status_reason,
+        last_update_status_reason_code,
+        file_system_configs,
+        signing_profile_version_arn,
+        signing_job_arn,
+        package_type,
+        image_config_response,
+        architectures,
+        ephemeral_storage,
+        snap_start,
+        runtime_version_config,
+        logging_config,
+        tenancy_config,
+        capacity_provider_config,
+        config_sha256,
+        durable_config,
     }
 }

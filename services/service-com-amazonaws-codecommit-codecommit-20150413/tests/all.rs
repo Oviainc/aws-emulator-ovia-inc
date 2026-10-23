@@ -51,6 +51,8 @@ mod differences;
 mod file_commit_history;
 #[path = "all/folder_listing.rs"]
 mod folder_listing;
+#[path = "all/git_object_ids.rs"]
+mod git_object_ids;
 #[path = "all/git_transport.rs"]
 mod git_transport;
 #[path = "all/harness.rs"]

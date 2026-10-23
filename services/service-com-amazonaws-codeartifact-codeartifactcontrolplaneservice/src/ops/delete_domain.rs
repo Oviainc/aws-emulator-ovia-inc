@@ -1,9 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteDomain
-//! Removes a domain from [`crate::state`] and answers with the record as it was just
-//! before removal. A domain must be empty to be deleted: one that still holds
-//! repositories is a `ConflictException` (409), so the delete is never partial.
+//! Removes a domain from [`crate::state`] and answers with its POST-delete description:
+//! the same projection every other read builds, with `status` at the terminal `Deleted`.
+//! A domain must be empty to be deleted: one that still holds repositories is a
+//! `ConflictException` (409), so the delete is never partial.
+//!
+//! The disappearance of the named domain is the operation's goal, not a precondition, so
+//! a domain this account does not hold is NOT refused: the call succeeds with HTTP 200
+//! carrying no `domain`, which is also what the model says, listing no not-found error
+//! for this operation at all.
 //!
 //! ## Shape of an operation
 //!
@@ -86,21 +92,16 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-codeartifact-codeartifa
 // here — hence the `DeleteDomainError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-// `ResourceNotFoundException` is widened in with `extra_errors`: CodeArtifact answers a
-// `DeleteDomain` for a domain it does not hold with that error (404), but this
-// operation's shape does not list it. It IS a service-modelled shape (every other
-// domain-scoped operation declares it), so widening names an existing error rather than
-// inventing one.
-#[smithy_macros::operation_error(
-    "com.amazonaws.codeartifact#DeleteDomain",
-    extra_errors = ["ResourceNotFoundException"]
-)]
+// This operation models NO not-found error (no `ResourceNotFoundException` among its
+// errors — `smithy_query(query="operation",operation="DeleteDomain")`), which is why the
+// handler below cannot refuse a domain it does not hold: there is no error shape for it
+// to answer with, and deleting what is already gone is success.
+#[smithy_macros::operation_error("com.amazonaws.codeartifact#DeleteDomain")]
 #[derive(Debug)]
 pub enum DeleteDomainErrorModeled {
     AccessDeniedException(AccessDeniedException),
     ConflictException(ConflictException),
     InternalServerException(InternalServerException),
-    ResourceNotFoundException(ResourceNotFoundException),
     ThrottlingException(ThrottlingException),
     ValidationException(ValidationException),
 }
@@ -167,22 +168,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
 
-        // Resolve and refuse FIRST, so a refused delete removes nothing; the record the
-        // response reports is projected here, while the domain is still held.
-        let description = match store.domain(&input.domain, input.domain_owner.as_deref()) {
-            None => {
-                return Err(DeleteDomainErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: crate::state::domain_not_found_message(
-                            &input.domain,
-                            input.domain_owner.as_deref(),
-                        ),
-                        resource_id: Some(input.domain.clone()),
-                        resource_type: Some("domain".to_string()),
-                    },
-                )
-                .into());
-            }
+        // Resolve and refuse FIRST, so a refused delete removes nothing.
+        match store.domain(&input.domain, input.domain_owner.as_deref()) {
+            // Nothing to remove: the caller's goal — this account holding no such domain —
+            // already holds, so the delete is idempotent and answers 200 with no `domain`
+            // description to report. (A `domainOwner` that does not own the domain lands
+            // here too: this account still holds no domain of that name.)
+            None => return Ok(DeleteDomainOutput { domain: None }),
             // A domain is deletable only once it is empty; its repositories have to be
             // deleted first.
             Some(domain) if !domain.repositories.is_empty() => {
@@ -193,15 +185,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 })
                 .into());
             }
-            Some(domain) => domain.description(),
-        };
+            Some(_) => {}
+        }
 
-        // Answer with the record as it was just before removal — and remove it, so the
-        // next DescribeDomain / ListDomains no longer sees it.
-        store.domains.remove(&input.domain);
+        // Remove it, so the next DescribeDomain / ListDomains no longer sees it, and answer
+        // with the removed record's POST-delete description: `status` is the terminal
+        // `Deleted` the domain reached by this call, not the `Active` it carried while held.
+        let removed = store.domains.remove(&input.domain);
 
         Ok(DeleteDomainOutput {
-            domain: Some(description),
+            domain: removed.as_ref().map(crate::state::Domain::deleted_description),
         })
     }
 }

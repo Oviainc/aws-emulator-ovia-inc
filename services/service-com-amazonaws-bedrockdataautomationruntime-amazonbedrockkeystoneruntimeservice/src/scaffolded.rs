@@ -196,6 +196,26 @@ pub enum Scaffolded<E> {
     /// `MalformedQueryString` rather than `ValidationException`, so a client
     /// matching on the error code there sees two codes for one logical failure.
     ValidationException(ValidationException),
+    /// A modelled error of this service answered with the awsJson1_1 CLIENT-error
+    /// status, HTTP 400, instead of the status the error shape's advisory
+    /// `smithy.api#httpError` trait declares.
+    ///
+    /// HAND-WRITTEN, unlike the rest of this file: keep it if the scaffold generator
+    /// ever re-renders here.
+    ///
+    /// It exists because the shape's `@httpError` and this service's own wire disagree.
+    /// `ResourceNotFoundException` carries `@httpError 404`, but the recorded AWS wire
+    /// for every operation of this service that resolves a caller-supplied ARN answers
+    /// an unknown ARN with HTTP 400 and `__type ResourceNotFoundException` — the
+    /// awsJson1_1 shape of a client error, where the status says only "the caller is at
+    /// fault" and the body's `__type` carries which fault it is. A client branches on
+    /// that code, so only the status differs from [`Self::Modeled`]: the serialized
+    /// body, the error code and the awsQuery code all stay the modelled error's own.
+    ///
+    /// Use it ONLY for a client error whose recorded status is known to differ from the
+    /// model. An error with no such evidence stays [`Self::Modeled`] and keeps the
+    /// status its shape declares.
+    ClientError(E),
 }
 
 impl<E> Scaffolded<E> {
@@ -221,13 +241,19 @@ impl<E> Scaffolded<E> {
     pub fn validation(message: impl Into<String>) -> Self {
         Self::ValidationException(ValidationException::new(message))
     }
+
+    /// Answer `error` with HTTP 400 rather than the status its shape's `@httpError`
+    /// trait declares. See [`Self::ClientError`] for when that is right.
+    pub fn client_error(error: E) -> Self {
+        Self::ClientError(error)
+    }
 }
 
 impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NotImplemented(e) => write!(f, "{e}"),
-            Self::Modeled(e) => write!(f, "{e}"),
+            Self::Modeled(e) | Self::ClientError(e) => write!(f, "{e}"),
             Self::ValidationException(e) => write!(f, "{e}"),
         }
     }
@@ -239,7 +265,7 @@ impl<E: std::error::Error + 'static> std::error::Error for Scaffolded<E> {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::NotImplemented(e) => e.source(),
-            Self::Modeled(e) => e.source(),
+            Self::Modeled(e) | Self::ClientError(e) => e.source(),
             Self::ValidationException(e) => e.source(),
         }
     }
@@ -253,7 +279,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
     fn as_serializable(&self) -> &dyn SerializableStruct {
         match self {
             Self::NotImplemented(e) => e,
-            Self::Modeled(e) => e.as_serializable(),
+            Self::Modeled(e) | Self::ClientError(e) => e.as_serializable(),
             Self::ValidationException(e) => e,
         }
     }
@@ -261,7 +287,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
     fn variant_schema(&self) -> &'static Schema {
         match self {
             Self::NotImplemented(_) => &NOT_IMPLEMENTED_SCHEMA,
-            Self::Modeled(e) => e.variant_schema(),
+            Self::Modeled(e) | Self::ClientError(e) => e.variant_schema(),
             Self::ValidationException(_) => &VALIDATION_EXCEPTION_SCHEMA,
         }
     }
@@ -273,7 +299,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
     fn shape_name(&self) -> &'static str {
         match self {
             Self::NotImplemented(_) => "NotImplemented",
-            Self::Modeled(e) => e.shape_name(),
+            Self::Modeled(e) | Self::ClientError(e) => e.shape_name(),
             Self::ValidationException(_) => "ValidationException",
         }
     }
@@ -287,6 +313,9 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::NotImplemented(_) => 501,
             Self::Modeled(e) => e.http_status(),
             Self::ValidationException(_) => 400,
+            // The one variant that does NOT take the modelled status: see
+            // `Scaffolded::ClientError`.
+            Self::ClientError(_) => 400,
         }
     }
 
@@ -296,7 +325,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             // no `awsQueryError` trait to honour. The 501 + `<Code>NotImplemented`
             // envelope carries the signal on the query protocols too.
             Self::NotImplemented(_) => None,
-            Self::Modeled(e) => e.query_error_code(),
+            Self::Modeled(e) | Self::ClientError(e) => e.query_error_code(),
             // Same reason: the synthetic shape carries no `awsQueryError` trait.
             Self::ValidationException(_) => None,
         }

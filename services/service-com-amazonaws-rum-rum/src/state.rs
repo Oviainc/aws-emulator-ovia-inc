@@ -409,6 +409,21 @@ impl AppMonitorRecord {
         }
     }
 
+    /// Remove the destination the `(Destination, DestinationArn)` pair
+    /// `destination`/`destination_arn` names — the identity
+    /// `DeleteRumMetricsDestination` addresses one by. `None` when this monitor holds no
+    /// such destination, which the caller renders as `ResourceNotFoundException`. Keyed
+    /// through [`metric_destination_key`], so the delete, the put and the listing cannot
+    /// disagree about which destination a request means.
+    pub fn remove_metric_destination(
+        &mut self,
+        destination: &str,
+        destination_arn: Option<&str>,
+    ) -> Option<MetricDestinationRecord> {
+        self.metric_destinations
+            .remove(&metric_destination_key(destination, destination_arn))
+    }
+
     /// The revision id of this monitor's stored resource policy, or `None` while it
     /// carries no policy.
     pub fn policy_revision_id(&self) -> Option<String> {
@@ -808,6 +823,30 @@ pub fn app_monitor_not_found(name_or_id: &str) -> ResourceNotFoundException {
 /// The literal the app-monitor not-found message starts with, ahead of the requested
 /// name or id.
 pub const NOT_FOUND_MESSAGE_PREFIX: &str = "Resource not found ";
+
+/// `ResourceNotFoundException` for a destination the named app monitor does not have —
+/// what `DeleteRumMetricsDestination` answers for a `(Destination, DestinationArn)` pair
+/// the monitor holds no record under.
+///
+/// The message is built from the request: the destination kind it named, and the Evidently
+/// experiment ARN only where there is one to name. Like every other not-found body of this
+/// service it carries `message` ALONE — `resourceName`/`resourceType` are off the wire for
+/// this shape (see [`crate::ops::types::ResourceNotFoundException`]).
+pub fn metric_destination_not_found(
+    app_monitor_name: &str,
+    destination: &str,
+    destination_arn: Option<&str>,
+) -> ResourceNotFoundException {
+    let message = match destination_arn {
+        Some(arn) => format!(
+            "App monitor {app_monitor_name} has no {destination} metrics destination {arn}."
+        ),
+        None => {
+            format!("App monitor {app_monitor_name} has no {destination} metrics destination.")
+        }
+    };
+    ResourceNotFoundException { message }
+}
 
 /// The name of the CloudWatch Logs group an app monitor's telemetry is copied into.
 ///

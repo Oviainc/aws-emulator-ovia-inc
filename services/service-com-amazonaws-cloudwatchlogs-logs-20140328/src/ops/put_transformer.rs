@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutTransformer
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutTransformer`'s real behaviour. Implement it here — this is
+//! Implemented: stores the log-group level transformer `transformerConfig` describes on
+//! the log group `logGroupIdentifier` names, so `GetTransformer` reports it back. This is
 //! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutTransformer::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -191,18 +185,96 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutTransformer` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutTransformerErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // `ctx` carries only request metadata: a transformer is identified by nothing but
+        // the log group it is created for, which `input` names.
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            PutTransformerError::from(
+                PutTransformerErrorModeled::ServiceUnavailableException(
+                    ServiceUnavailableException {
+                        message: Some("the log store is unavailable".to_string()),
+                    },
+                ),
+            )
+        })?;
+        let mut store = state.lock();
+
+        // Every processor in the pipeline names exactly one transformation: `Processor` is
+        // "the information about one processor in a log transformer" and the config is "an
+        // array of processors, where each processor applies one type of transformation".
+        // The refusal is built from the request — it names the processor's position and
+        // what that processor named — because no modelled constraint can express it.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutTransformer"))
+        // The shape of `transformerConfig` is checked BEFORE the log group is looked up,
+        // the way the modelled constraints on the same member are: a request the service
+        // cannot read as a transformer is refused for that, whether or not the group it
+        // names happens to exist, so the refusal does not depend on store contents.
+        for (at, processor) in input.transformer_config.iter().enumerate() {
+            let named = crate::state::processor_transformations(processor);
+            if named.len() != 1 {
+                let listed = if named.is_empty() {
+                    "none".to_string()
+                } else {
+                    named.join(", ")
+                };
+                return Err(PutTransformerErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(format!(
+                            "transformerConfig[{at}] must name exactly one processor, named {listed}"
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // "Specify either the name or ARN of the log group to create the transformer
+        // for", so an ARN resolves to the name the store is keyed by.
+        let log_group_name =
+            crate::state::log_group_name_from_identifier(&input.log_group_identifier).to_string();
+
+        // "Creates or updates a log transformer for a single log group": there is no
+        // group to attach the pipeline to until that group exists.
+        let Some(group) = store.log_groups.get_mut(&log_group_name) else {
+            return Err(PutTransformerErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::resource_not_found_message("log group")),
+                },
+            )
+            .into());
+        };
+
+        // "You can create transformers only for the log groups in the Standard log
+        // class": a group in any other class cannot carry one, which is the operation
+        // being invalid on that resource rather than a parameter being wrong.
+        if group.log_group_class != crate::state::TRANSFORMER_LOG_GROUP_CLASS {
+            return Err(PutTransformerErrorModeled::InvalidOperationException(
+                InvalidOperationException {
+                    message: Some(format!(
+                        "a transformer can be created only for a log group in the {} log class, and this log group is in the {} log class",
+                        crate::state::TRANSFORMER_LOG_GROUP_CLASS, group.log_group_class
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // An update keeps the transformer's creation time — it is the same transformer,
+        // reconfigured — and only a put that creates one stamps it with now. Either way
+        // this put is the last modification, and the config replaces the stored one
+        // wholesale rather than merging into it.
+        let now_ms = crate::state::now_ms();
+        let creation_time_ms = group
+            .transformer
+            .as_ref()
+            .map_or(now_ms, |existing| existing.creation_time_ms);
+        group.transformer = Some(crate::state::TransformerRecord {
+            processors: input.transformer_config,
+            creation_time_ms,
+            last_modified_time_ms: now_ms,
+        });
+
+        Ok(PutTransformerOutput)
     }
 }

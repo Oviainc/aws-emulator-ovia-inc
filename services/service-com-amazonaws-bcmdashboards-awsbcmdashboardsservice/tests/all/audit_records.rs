@@ -263,7 +263,7 @@ async fn refused_state_changes_are_audited_with_their_outcome() {
         (
             "UpdateDashboard",
             json!({"arn": absent, "name": "Nothing To Update"}),
-            404,
+            400,
             absent,
             "ResourceNotFoundException",
         ),
@@ -277,7 +277,7 @@ async fn refused_state_changes_are_audited_with_their_outcome() {
         (
             "UntagResource",
             json!({"resourceArn": absent, "resourceTagKeys": ["env"]}),
-            404,
+            400,
             absent,
             "ResourceNotFoundException",
         ),

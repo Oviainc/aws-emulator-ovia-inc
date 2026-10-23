@@ -100,3 +100,20 @@ In every cluster the status and the error code both diverge, and the actual body
 4. Re-replay each bundled cause to confirm the fix closes all six: bedrock-data-automation-runtime-get-status-resource-not-found#task#1 (GetDataAutomationStatus), bedrock-data-automation-runtime-sync-invoke-inline-bytes#task#1 (InvokeDataAutomation), bedrock-data-automation-runtime-tag-operations-resource-not-found#task#1 (TagResource), #task#2 (ListTagsForResource), #task#3 (UntagResource).
 5. Also re-replay the remaining cluster members: bedrock-data-automation-runtime-invoke-async-validation-errors#task#1/#task#2/#task#3, bedrock-data-automation-runtime-get-status-validation-error#task#1, bedrock-data-automation-runtime-sync-invoke-s3-input-output#task#1, bedrock-data-automation-runtime-tag-resource-pattern-validation-error#task#1/#task#2/#task#3.
 6. Expected after fix: each step is dispatched to the bedrock-data-automation-runtime handlers and returns the recorded status and modeled error code; no response carries __type AmbiguousService.
+
+## Resolution
+
+Fixed: the service's `can_handle` now claims through the shared Bedrock-family rule
+(`service_common::bedrock::claims_request` with this model's own service shape id), so an
+`awsJson1_1` request naming `AmazonBedrockKeystoneRuntimeService` on the root path reaches
+these handlers instead of being refused as `500 AmbiguousService`, and all six operations
+answer their modelled contracts (400 `ValidationException` for a submission naming no
+extraction target, 400 `ResourceNotFoundException` for an ARN naming no stored invocation,
+200 for an accepted submission; the synchronous `InvokeDataAutomation` keeps an honest 501
+for the extraction itself). `replay_issue_units` answers `passed` — 8 fixtures / 14 steps,
+all 18 `Issue-Key`s `fixed` — and the behaviour is pinned by
+`core/router/tests/all/bedrock_signing_name_routing.rs` (every operation dispatched with
+the whole family mounted) and the crate's own
+`tests/all/data_automation_invocations.rs`.
+
+

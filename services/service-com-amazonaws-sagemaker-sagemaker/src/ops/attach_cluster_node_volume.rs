@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AttachClusterNodeVolume
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AttachClusterNodeVolume`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AttachClusterNodeVolume::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: validates the `ClusterArn` against `crate::state` — a cluster this
+//! account does not hold, or one that is not `InService`, is a 400 `ValidationException`
+//! — then resolves the node by `NodeId` inside that cluster, refusing a node it does not
+//! own with the modelled `ResourceNotFound`, and attaches the volume, answering the
+//! attachment it already holds when the same volume is attached again. The
+//! already-attached-elsewhere check is scoped to the cluster the `ClusterArn` names,
+//! which is the only cluster this request addresses: this emulator models no EBS volume
+//! inventory outside a HyperPod cluster's nodes. This is the ONLY
+//! file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -161,18 +161,122 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AttachClusterNodeVolume` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AttachClusterNodeVolumeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AttachClusterNodeVolume"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // The `ClusterArn` is a request parameter saying WHERE to attach, and it is
+        // checked before anything else: a precondition the request fails is a 400
+        // `ValidationException`, since the operation's modelled `ResourceNotFound`
+        // belongs to the node the cluster owns.
+        let Some(cluster) = store.cluster_by_arn_mut(&input.cluster_arn) else {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "Specified cluster not found: {}.",
+                input.cluster_arn
+            )));
+        };
+        // Documented on `ClusterArn`: "Your cluster must use EKS as the orchestration and
+        // be in the InService state." The `Creating` -> `InService` transition the clock
+        // already owes is materialised first, since it was due at this instant whether or
+        // not anybody called.
+        cluster.settle_status(now);
+        if cluster.status != crate::state::STATUS_IN_SERVICE {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "Cluster {} is {} and must be {} to attach a volume.",
+                cluster.arn,
+                cluster.status,
+                crate::state::STATUS_IN_SERVICE
+            )));
+        }
+        // Transitions the clock already owes this cluster's nodes and their attachments,
+        // so what this call reads and reports is what a describe would report at the same
+        // instant.
+        for node in cluster.nodes.values_mut() {
+            node.settle_status(now);
+            node.settle_attachments(now);
+        }
+
+        let cluster_arn = cluster.arn.clone();
+        // An EBS volume attaches to one instance at a time, so the node holding this
+        // volume — if any node does — is found BEFORE the target node is borrowed to
+        // write, which keeps this handler to one mutable lookup.
+        let holder = cluster
+            .nodes
+            .values()
+            .find(|node| node.volume_attachments.contains_key(&input.volume_id))
+            .map(|node| {
+                (
+                    node.logical_id.clone(),
+                    node.instance_id
+                        .clone()
+                        .unwrap_or_else(|| node.logical_id.clone()),
+                )
+            });
+
+        let Some(node) = cluster.node_by_instance_id_mut(&input.node_id) else {
+            // The node is a resource the cluster owns, so a node the cluster does not
+            // have is the modelled `ResourceNotFound`.
+            return Err(AttachClusterNodeVolumeErrorModeled::ResourceNotFound(ResourceNotFound {
+                message: Some(format!(
+                    "Cluster {cluster_arn} has no node {}.",
+                    input.node_id
+                )),
+            })
+            .into());
+        };
+        // A volume another node of this cluster holds is not available for this one, and
+        // the operation models no error for that.
+        if let Some((holder_logical_id, holder_label)) = holder {
+            if holder_logical_id != node.logical_id {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "Volume {} is already attached to node {holder_label} and is not \
+                     available.",
+                    input.volume_id
+                )));
+            }
+        }
+        let held = node.volume_attachments.get(&input.volume_id).cloned();
+        let attached_now = held.is_none();
+        let attachment = match held {
+            // Already attached to THIS node: the attachment the earlier call made is the
+            // answer, with whatever status the clock has settled it to. Attaching twice
+            // would hand the same volume a second device name.
+            Some(attachment) => attachment,
+            None => {
+                let Some(device_name) = node.free_device_name() else {
+                    return Err(crate::scaffolded::Scaffolded::validation(format!(
+                        "Node {} has no free device name left for another volume.",
+                        input.node_id
+                    )));
+                };
+                let attachment = crate::state::VolumeAttachment {
+                    volume_id: input.volume_id.clone(),
+                    device_name: device_name.to_string(),
+                    status: crate::state::VOLUME_STATUS_ATTACHING.to_string(),
+                    attach_time: now,
+                    attached_at: now + crate::state::TRANSIENT_STATE_SETTLES_AFTER,
+                };
+                node.volume_attachments
+                    .insert(input.volume_id.clone(), attachment.clone());
+                attachment
+            }
+        };
+        drop(store);
+
+        // Recorded only when this call actually attached something: replaying the
+        // attachment an earlier call made changed nothing, and a change log that says
+        // otherwise is a change log that cannot be trusted.
+        if attached_now {
+            crate::state::record_state_change(Self::NAME, &cluster_arn, ctx);
+        }
+        Ok(AttachClusterNodeVolumeOutput {
+            cluster_arn,
+            node_id: input.node_id,
+            volume_id: attachment.volume_id,
+            attach_time: crate::state::timestamp(attachment.attach_time),
+            status: attachment.status,
+            device_name: attachment.device_name,
+        })
     }
 }

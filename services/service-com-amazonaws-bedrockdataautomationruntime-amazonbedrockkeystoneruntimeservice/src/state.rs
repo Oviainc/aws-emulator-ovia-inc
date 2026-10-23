@@ -12,7 +12,9 @@
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, SystemTime};
 
-use crate::ops::types::{Blueprint, EncryptionConfiguration, NotificationConfiguration, Tag};
+use crate::ops::types::{
+    Blueprint, DataAutomationConfiguration, EncryptionConfiguration, NotificationConfiguration, Tag,
+};
 
 /// The region every ARN this service mints falls back to when the request carries no
 /// SigV4 credential scope to read one from (an unsigned, host-routed request).
@@ -47,6 +49,183 @@ pub const IN_PROGRESS_FOR: Duration = Duration::from_millis(300);
 /// The modelled `TagList` bound (`@length(min: 0, max: 200)`): the most tags one
 /// resource can carry.
 pub const MAX_TAGS: usize = 200;
+
+/// The modelled `TagKey` pattern, verbatim (`smithy_query` shape `TagKey`).
+///
+/// Stated here because it has to be applied by hand: see [`tag_key_is_well_formed`].
+pub const TAG_KEY_PATTERN: &str = r"^(?!aws:)[\p{L}\p{Z}\p{N}_.:/=+\-@]*$";
+
+/// The tag-key prefix the modelled `TagKey` pattern excludes with its negative
+/// lookahead — the namespace AWS reserves for its own tags. Stated for the refusal
+/// documentation; the pattern itself is what [`tag_key_is_well_formed`] applies.
+pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
+
+/// The characters the modelled [`TAG_KEY_PATTERN`]'s class lists literally, beside the
+/// three Unicode general categories it names.
+const TAG_KEY_PUNCTUATION: [char; 8] = ['_', '.', ':', '/', '=', '+', '-', '@'];
+
+/// Whether `c` is admitted by the character-class half of [`TAG_KEY_PATTERN`]
+/// (`[\p{L}\p{Z}\p{N}_.:/=+\-@]`), applied as the Unicode general categories the class
+/// names:
+///
+/// * `\p{N}` is `char::is_numeric` exactly (`Nd`, `Nl`, `No`).
+/// * `\p{Z}` is `char::is_whitespace` MINUS the control characters: `White_Space` is
+///   `\p{Z}` plus `\t`, `\n`, `\u{b}`, `\u{c}`, `\r` and `\u{85}`, every one of which is
+///   a control character, so subtracting `char::is_control` leaves the separators alone.
+/// * `\p{L}` is `char::is_alphabetic` up to `Alphabetic`'s wider definition: that property
+///   is `\p{L}` plus `Nl` — already admitted through `\p{N}` — plus `Other_Alphabetic`,
+///   which is combining marks. A key carrying a combining mark is therefore accepted where
+///   AWS's class would refuse it; erring toward accepting an exotic mark is the direction
+///   the framework's own constraint walk takes for a pattern it cannot apply
+///   (`vendor/smithy-schema-server/src/constraints.rs` treats such a pattern as matching
+///   every value), and it keeps this check from refusing a key on a Unicode table
+///   difference.
+fn is_tag_key_char(c: char) -> bool {
+    c.is_alphabetic()
+        || c.is_numeric()
+        || (c.is_whitespace() && !c.is_control())
+        || TAG_KEY_PUNCTUATION.contains(&c)
+}
+
+/// Whether `key` satisfies the modelled [`TAG_KEY_PATTERN`].
+///
+/// This one modelled constraint cannot be left to the framework's boundary walk: the
+/// pattern opens with the negative lookahead `(?!aws:)`, which the walk's regex engine
+/// cannot compile, and a `@pattern` that fails to compile is treated as matching EVERY
+/// value — which drops the character-class half of the pattern along with the lookahead
+/// (`vendor/smithy-schema-server/src/constraints.rs`). So the pattern is applied here,
+/// verbatim, by the three operations that accept a tag key (`InvokeDataAutomationAsync`
+/// and `TagResource` through `tags`, `UntagResource` through `tagKeys`).
+///
+/// It is applied as the pattern's two independent halves rather than through a
+/// look-around regex engine, because the pattern's ONLY look-around is its leading
+/// `(?!aws:)`, which states exactly "the key does not begin with
+/// [`RESERVED_TAG_KEY_PREFIX`]" — a prefix test. What remains is the plain character
+/// class [`is_tag_key_char`] applies to every character, anchored at both ends by `*$`,
+/// so the whole modelled constraint is enforced without a second regex engine in the
+/// dependency graph.
+pub fn tag_key_is_well_formed(key: &str) -> bool {
+    !key.starts_with(RESERVED_TAG_KEY_PREFIX) && key.chars().all(is_tag_key_char)
+}
+
+/// The requirement clause this service states for a `@pattern` violation: the declared
+/// pattern WITHOUT its outer `^`/`$` anchors, which a Smithy `@pattern` does not need
+/// (the trait is a find, not a full match).
+///
+/// The anchor stripping itself is `service_common::validation::unanchored` — the staged,
+/// shared home for that rendering, which drops the pair only when it wraps the WHOLE
+/// expression and is not an escaped `$`, so an alternation that anchors each branch
+/// (`^a$|^b$`) is left alone rather than mangled.
+///
+/// PENDING MIGRATION: the REQUIREMENT half below (the sentence per `ViolationKind`, with
+/// [`violation_clause`], [`validation_envelope`] and `service::clause_for_violation`) is
+/// this service's inlined copy of a service-independent validation-wording rule that
+/// `services/common/src/validation.rs` stages but does not state yet — its "Still to
+/// migrate here" section lists it as not yet there, so there is no shared helper to call
+/// for it today. The fix that owns the migration (~24 crates carry the same copy) moves
+/// those rules there and calls them from here. The note is left here, as that module
+/// asks, because this change does not own that migration.
+pub fn pattern_requirement(pattern: &str) -> String {
+    let unanchored = service_common::validation::unanchored(pattern);
+    format!("Member must satisfy regular expression pattern: {unanchored}")
+}
+
+/// One clause of a refusal, as this service words it: the member it names and the
+/// requirement that member failed, with the offending value NOT echoed.
+///
+/// Pending the migration noted on [`pattern_requirement`].
+///
+/// `path` is the framework's own input-path form (segments joined with `.`, with `member`
+/// for the step from a list into its element).
+pub fn violation_clause(path: &str, requirement: &str) -> String {
+    format!("Value at '{path}' failed to satisfy constraint: {requirement}")
+}
+
+/// The whole `ValidationException` message around one or more [`violation_clause`]s, in
+/// the AWS envelope (`1 validation error detected: …` / `N validation errors detected:
+/// …; …`).
+///
+/// The envelope itself is a service dialect, but the clause halves it joins are not:
+/// pending the migration noted on [`pattern_requirement`].
+///
+/// The ONE place this service's refusal envelope is written: the boundary walk's
+/// refusals reach it through `service::override_refusal`, and a rule the walk cannot
+/// express (the `TagKey` lookahead) reaches it through [`malformed_tag_key_message`], so
+/// one logical failure cannot read two different ways depending on which side caught it.
+pub fn validation_envelope(clauses: &[String]) -> String {
+    match clauses.len() {
+        1 => format!("1 validation error detected: {}", clauses[0]),
+        n => format!("{n} validation errors detected: {}", clauses.join("; ")),
+    }
+}
+
+/// The `ValidationException` message for a tag key outside [`TAG_KEY_PATTERN`], at input
+/// path `path`.
+pub fn malformed_tag_key_message(path: &str) -> String {
+    validation_envelope(&[violation_clause(
+        path,
+        &pattern_requirement(TAG_KEY_PATTERN),
+    )])
+}
+
+/// Why a submission that names neither a data-automation project nor an inline blueprint
+/// is refused.
+///
+/// This service's own fixed string for that refusal: it carries NOTHING from the
+/// request, so reproducing it is fidelity rather than fitting one recorded call. What a
+/// client branches on is the HTTP 400 and the `ValidationException` code.
+pub const MISSING_PROJECT_OR_BLUEPRINTS: &str =
+    "At least one of project or inline blueprints must be provided in the request.";
+
+/// Why a submission that names BOTH a data-automation project and an inline blueprint is
+/// refused. A fixed string on the same footing as [`MISSING_PROJECT_OR_BLUEPRINTS`].
+///
+/// NO RECORDING covers this half of the rule: the corpus only records the "names
+/// neither" refusal. It is stated because the two members describe two different
+/// extraction targets and the service has no documented tie-break, but a later recording
+/// showing AWS accepting both should settle it — and would change only this branch of
+/// [`extraction_target_refusal`], not the "names neither" one the corpus pins.
+pub const BOTH_PROJECT_AND_BLUEPRINTS: &str =
+    "Only one of project or inline blueprints can be provided in the request.";
+
+/// The refusal a submission's extraction members earn, or `None` when they are
+/// acceptable.
+///
+/// A data-automation submission has to say WHAT to extract, and it says so in exactly
+/// ONE of two places: a data-automation project
+/// (`dataAutomationConfiguration.dataAutomationProjectArn`) or an inline `blueprints`
+/// list. Naming neither describes no extraction; naming both describes two, and the
+/// service does not choose between them. Both members are individually optional in the
+/// model — no Smithy trait expresses "exactly one of" — so this cross-member rule is the
+/// service's, and it is single-homed here because BOTH invoke operations
+/// (`InvokeDataAutomation` and `InvokeDataAutomationAsync`) apply it identically.
+///
+/// `blueprints` carries `@length(min: 1)`, so an empty list is already refused by the
+/// boundary walk; it counts here as "no inline blueprint" so the rule holds whatever
+/// reaches a handler.
+pub fn extraction_target_refusal(
+    data_automation_configuration: Option<&DataAutomationConfiguration>,
+    blueprints: Option<&[Blueprint]>,
+) -> Option<&'static str> {
+    let names_project = data_automation_configuration
+        .is_some_and(|configuration| !configuration.data_automation_project_arn.is_empty());
+    let names_blueprint = blueprints.is_some_and(|blueprints| !blueprints.is_empty());
+    match (names_project, names_blueprint) {
+        (false, false) => Some(MISSING_PROJECT_OR_BLUEPRINTS),
+        (true, true) => Some(BOTH_PROJECT_AND_BLUEPRINTS),
+        _ => None,
+    }
+}
+
+/// What this service answers when a caller-supplied ARN names no retained invocation —
+/// the one message behind `ResourceNotFoundException` for every operation here that
+/// resolves an ARN (`GetDataAutomationStatus`, `TagResource`, `ListTagsForResource`,
+/// `UntagResource`).
+///
+/// It is the service's own fixed string and carries NOTHING from the request: the ARN
+/// the caller sent is not interpolated, because this service does not echo it back. Kept
+/// in one place so the four readers cannot drift apart.
+pub const INVOCATION_NOT_FOUND_MESSAGE: &str = "Data Automation Invocation ARN not found.";
 
 /// The most invocation records this emulator retains at once.
 ///

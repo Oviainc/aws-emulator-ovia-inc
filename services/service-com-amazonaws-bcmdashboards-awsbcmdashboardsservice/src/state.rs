@@ -51,6 +51,15 @@ pub const SCHEDULED_REPORT_ARN_SEGMENT: &str = ":scheduled-report/";
 /// normal use never meets it, while the store a caller can grow stays bounded.
 pub const MAX_DASHBOARDS: usize = 1_000;
 
+/// How the TAGGING path words a `ResourceArn` that resolves to no stored resource.
+///
+/// A constant, carrying nothing from the request — which is what the recorded
+/// `ListTagsForResource` not-found answer says, verbatim. Both tagging operations that
+/// resolve an ARN through this state's `resource_tags` / `resource_tags_mut`
+/// word that one refusal the same way; the ARN itself travels in the answer's `resourceId`
+/// member, not in the text (see `crate::scaffolded::Scaffolded::resource_not_found`).
+pub const TAGGING_RESOURCE_NOT_FOUND_MESSAGE: &str = "Resource not found";
+
 /// One stored dashboard.
 ///
 /// `widgets` holds the modelled [`Widget`] shape verbatim — including the widget
@@ -247,8 +256,8 @@ impl ComAmazonawsBcmdashboardsAwsbcmdashboardsserviceState {
     /// one of them resolves it here rather than reaching into the resource maps
     /// itself. `ResourceArn`'s pattern admits both resource types this service
     /// stores — `dashboard/...` and `scheduled-report/...` — so both are looked up
-    /// here; an ARN neither map holds resolves to `None` and the caller answers its
-    /// modelled `ResourceNotFoundException`.
+    /// here; an ARN neither map holds resolves to `None` and the caller answers it with
+    /// `crate::scaffolded::Scaffolded::resource_not_found`.
     pub fn resource_tags(&self, resource_arn: &str) -> Option<&[ResourceTag]> {
         if let Some(dashboard) = self.dashboards.get(resource_arn) {
             return Some(dashboard.resource_tags.as_slice());
@@ -275,7 +284,7 @@ impl ComAmazonawsBcmdashboardsAwsbcmdashboardsserviceState {
 
     /// The resource-based policy document attached to the dashboard `resource_arn`
     /// names, or `None` when this service holds no dashboard under that ARN (the
-    /// caller answers that with its modelled `ResourceNotFoundException`).
+    /// caller answers that with `crate::scaffolded::Scaffolded::resource_not_found`).
     ///
     /// A dashboard with no policy attached resolves to the empty document, which is
     /// what the modelled `policyDocument` member's 0-character minimum admits: a

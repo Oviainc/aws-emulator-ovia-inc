@@ -267,6 +267,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 tags: input.tags.unwrap_or_default(),
                 creation_time: now,
                 in_service_at: now + crate::state::CLUSTER_IN_SERVICE_AFTER,
+                // A cluster is created with no nodes: provisioning the instances a group
+                // asks for is work this emulator does not do, so the nodes a cluster
+                // holds are the ones `BatchAddClusterNodes` added to it.
+                nodes: ::std::collections::BTreeMap::new(),
+                node_additions: ::std::collections::BTreeMap::new(),
             },
         );
         drop(store);

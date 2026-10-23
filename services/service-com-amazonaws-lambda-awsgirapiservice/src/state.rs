@@ -49,10 +49,12 @@ use base64::Engine as _;
 use sha2::Digest as _;
 
 use crate::ops::types::{
-    AccountLimit, AccountUsage, AliasRoutingConfiguration, Cors, CreateAliasOutput,
-    CreateFunctionOutput, EnvironmentResponse, EphemeralStorage, FunctionCodeLocation,
-    GetLayerVersionOutput, Layer, LayerVersionContentOutput, PutFunctionConcurrencyOutput,
-    ResolvedS3Object, TracingConfigResponse,
+    AccountLimit, AccountUsage, AliasRoutingConfiguration, CapacityProviderConfig, Cors,
+    CreateAliasOutput, CreateFunctionOutput, DeadLetterConfig, DurableConfig, Environment,
+    EnvironmentResponse, EphemeralStorage, FileSystemConfig, FunctionCodeLocation,
+    GetLayerVersionOutput, ImageConfig, ImageConfigResponse, Layer, LayerVersionContentOutput,
+    LoggingConfig, PutFunctionConcurrencyOutput, ResolvedS3Object, SnapStartResponse,
+    TenancyConfig, TracingConfigResponse, VpcConfig, VpcConfigResponse,
 };
 
 /// The ARN namespace this service stamps into every ARN it mints
@@ -92,6 +94,15 @@ pub const STATE_REASON_CREATING: &str = "The function is being created.";
 /// function is still `Pending`.
 pub const LAST_UPDATE_STATUS_SUCCESSFUL: &str = "Successful";
 
+/// The `LastUpdateStatus` a function carries while an update is still being applied,
+/// from the model's `LastUpdateStatus` enum. `UpdateFunctionConfiguration`'s own
+/// documentation describes the window it covers: "When you update a function, Lambda
+/// provisions an instance of the function and its supporting resources. [...] During
+/// this time, you can't modify the function, but you can still invoke it. The
+/// LastUpdateStatus [...] fields in the response from GetFunctionConfiguration indicate
+/// when the update is complete".
+pub const LAST_UPDATE_STATUS_IN_PROGRESS: &str = "InProgress";
+
 /// How long after `CreateFunction` the move from `Pending` to `Active` becomes due.
 ///
 /// An EMULATOR-CHOSEN span (the real provisioning time depends on the package and on
@@ -99,6 +110,29 @@ pub const LAST_UPDATE_STATUS_SUCCESSFUL: &str = "Successful";
 /// non-zero, so a caller that acts immediately after `CreateFunction` still observes
 /// the `Pending` state the model documents and the state errors that go with it.
 pub const ACTIVATION_DELAY: Duration = Duration::from_millis(500);
+
+/// How long after `UpdateFunctionConfiguration` the move from
+/// [`LAST_UPDATE_STATUS_IN_PROGRESS`] to [`LAST_UPDATE_STATUS_SUCCESSFUL`] becomes due.
+///
+/// An EMULATOR-CHOSEN span, for the same reason as [`ACTIVATION_DELAY`]: the real time
+/// to provision a new instance of the function is not in the model ("If your function
+/// connects to a VPC, this process can take a minute"). It is deliberately non-zero, so
+/// a caller that modifies the function again immediately still meets the refusal the
+/// same documentation describes ("During this time, you can't modify the function").
+pub const UPDATE_DELAY: Duration = Duration::from_millis(500);
+
+/// The `SnapStart$ApplyOn` value that asks Lambda to snapshot an initialized execution
+/// environment, from the model's `SnapStartApplyOn` enum (`PublishedVersions | None`).
+pub const SNAP_START_APPLY_ON_PUBLISHED_VERSIONS: &str = "PublishedVersions";
+
+/// `SnapStartResponse$OptimizationStatus` values, from the model's
+/// `SnapStartOptimizationStatus` enum (`On | Off`). The member reports, "When you
+/// provide a qualified Amazon Resource Name (ARN), this response element indicates
+/// whether SnapStart is activated for the specified function version", so a version
+/// whose configuration applies SnapStart reports `On` and everything else reports `Off`.
+pub const SNAP_START_OPTIMIZATION_STATUS_ON: &str = "On";
+/// See [`SNAP_START_OPTIMIZATION_STATUS_ON`].
+pub const SNAP_START_OPTIMIZATION_STATUS_OFF: &str = "Off";
 
 /// The default `MemorySize`, in MB: "The default value is 128 MB", as AWS documents
 /// for the member (the model carries only its 128..32768 range).
@@ -305,6 +339,30 @@ pub struct FunctionConfig {
     pub last_modified: String,
     /// The revision this configuration is at.
     pub revision_id: String,
+    /// The VPC the function is attached to, when the caller named one.
+    pub vpc_config: Option<VpcConfig>,
+    /// The dead-letter queue for failed asynchronous invocations, when the caller named
+    /// one.
+    pub dead_letter_config: Option<DeadLetterConfig>,
+    /// The file systems the function mounts, in the order the caller named them (the
+    /// model's `FileSystemConfigList` holds at most one).
+    pub file_system_configs: Vec<FileSystemConfig>,
+    /// The container image overrides, when the caller named any.
+    pub image_config: Option<ImageConfig>,
+    /// `SnapStart$ApplyOn`, when the caller set it.
+    pub snap_start_apply_on: Option<String>,
+    /// The CloudWatch Logs configuration, when the caller named one.
+    pub logging_config: Option<LoggingConfig>,
+    /// The capacity provider that manages this function's compute, when the caller
+    /// named one.
+    pub capacity_provider_config: Option<CapacityProviderConfig>,
+    /// The durable-execution settings, when the caller named them.
+    pub durable_config: Option<DurableConfig>,
+    /// The tenant isolation settings, when the caller named them. `CreateFunction` is
+    /// the only operation that sets this one: "Tenant isolation configuration cannot be
+    /// modified after function creation", and `UpdateFunctionConfiguration` models no
+    /// member for it.
+    pub tenancy_config: Option<TenancyConfig>,
 }
 
 /// One published version of a function: its frozen configuration plus when it was
@@ -784,6 +842,9 @@ pub struct FunctionRecord {
     pub state_reason_code: Option<String>,
     /// The model's `LastUpdateStatus`, first set once creation completes.
     pub last_update_status: Option<String>,
+    /// When the move from [`LAST_UPDATE_STATUS_IN_PROGRESS`] to
+    /// [`LAST_UPDATE_STATUS_SUCCESSFUL`] becomes due, while an update is in flight.
+    pub last_update_due: Option<SystemTime>,
     /// When the move to [`STATE_ACTIVE`] becomes due.
     pub active_due: SystemTime,
     /// Function-level tags, as supplied.
@@ -824,16 +885,21 @@ pub struct FunctionRecord {
 impl FunctionRecord {
     /// Bring this record up to whatever the clock has already made due.
     ///
-    /// The ONLY transition it applies is the one the clock owed at `now`: a function
-    /// that has finished provisioning becomes `Active`. It would have been owed at the
-    /// same instant even if nobody had called, so applying it on a read reports the
-    /// truth rather than inventing a change.
+    /// The ONLY transitions it applies are the ones the clock owed at `now`: a function
+    /// that has finished provisioning becomes `Active`, and an update that has finished
+    /// being applied becomes `Successful`. Both would have been owed at the same instant
+    /// even if nobody had called, so applying them on a read reports the truth rather
+    /// than inventing a change.
     pub fn materialize(&mut self, now: SystemTime) {
         if self.state == STATE_PENDING && now >= self.active_due {
             self.state = STATE_ACTIVE.to_string();
             self.state_reason = None;
             self.state_reason_code = None;
             self.last_update_status = Some(LAST_UPDATE_STATUS_SUCCESSFUL.to_string());
+        }
+        if self.last_update_due.is_some_and(|due| now >= due) {
+            self.last_update_status = Some(LAST_UPDATE_STATUS_SUCCESSFUL.to_string());
+            self.last_update_due = None;
         }
         // The same rule for the asynchronous event queue: a queued event whose delivery
         // attempt the clock has already made due has had that attempt, and this emulator
@@ -847,6 +913,17 @@ impl FunctionRecord {
                     AsyncInvocationOutcome::Failed(ASYNC_NOT_EXECUTED_REASON.to_string());
             }
         }
+    }
+
+    /// Whether an update of this function is still being applied — the window
+    /// `UpdateFunctionConfiguration` documents as "During this time, you can't modify
+    /// the function, but you can still invoke it".
+    ///
+    /// Read it only after [`FunctionRecord::materialize`], so an update the clock has
+    /// already settled is not reported as still in flight.
+    #[must_use]
+    pub fn update_in_progress(&self) -> bool {
+        self.last_update_due.is_some()
     }
 
     /// Queue one asynchronous invocation of `version` carrying `payload`, accepted at
@@ -993,12 +1070,73 @@ impl FunctionRecord {
             state: Some(self.state.clone()),
             state_reason: self.state_reason.clone(),
             state_reason_code: self.state_reason_code.clone(),
-            last_update_status: self.last_update_status.clone(),
+            last_update_status: if version == VERSION_LATEST {
+                self.last_update_status.clone()
+            } else {
+                // `LastUpdateStatus` is "The status of the last update that was
+                // performed on the function", and the update
+                // `UpdateFunctionConfiguration` describes is applied to the UNPUBLISHED
+                // version only ("You can't modify the configuration of a published
+                // version, only the unpublished version"). A published version froze its
+                // configuration before any such update began, so it is not the thing
+                // being updated and reports the settled status rather than the in-flight
+                // one.
+                self.last_update_status.as_ref().map(|status| {
+                    if status == LAST_UPDATE_STATUS_IN_PROGRESS {
+                        LAST_UPDATE_STATUS_SUCCESSFUL.to_string()
+                    } else {
+                        status.clone()
+                    }
+                })
+            },
             package_type: Some(config.package_type.clone()),
             architectures: Some(config.architectures.clone()),
             ephemeral_storage: Some(EphemeralStorage {
                 size: config.ephemeral_storage_mb,
             }),
+            // `VpcConfig` goes in and `VpcConfigResponse` comes out: the two differ only
+            // by the `VpcId` of the VPC the subnets belong to, which lives in EC2. This
+            // emulator resolves no EC2 state, so it reports no id it did not look up.
+            vpc_config: config.vpc_config.as_ref().map(|vpc| VpcConfigResponse {
+                subnet_ids: vpc.subnet_ids.clone(),
+                security_group_ids: vpc.security_group_ids.clone(),
+                vpc_id: None,
+                ipv6_allowed_for_dual_stack: vpc.ipv6_allowed_for_dual_stack,
+            }),
+            dead_letter_config: config.dead_letter_config.clone(),
+            // A function the caller mounted no file system on carries no
+            // `FileSystemConfigs` member at all, for the same reason as `Layers` above.
+            file_system_configs: (!config.file_system_configs.is_empty())
+                .then(|| config.file_system_configs.clone()),
+            // `ImageConfigResponse` wraps the stored overrides together with the error
+            // of resolving them; nothing here resolves an image, so there is no error
+            // to report.
+            image_config_response: config.image_config.clone().map(|image_config| {
+                ImageConfigResponse {
+                    image_config: Some(image_config),
+                    error: None,
+                }
+            }),
+            snap_start: config
+                .snap_start_apply_on
+                .clone()
+                .map(|apply_on| SnapStartResponse {
+                    optimization_status: Some(
+                        if version != VERSION_LATEST
+                            && apply_on == SNAP_START_APPLY_ON_PUBLISHED_VERSIONS
+                        {
+                            SNAP_START_OPTIMIZATION_STATUS_ON
+                        } else {
+                            SNAP_START_OPTIMIZATION_STATUS_OFF
+                        }
+                        .to_string(),
+                    ),
+                    apply_on: Some(apply_on),
+                }),
+            logging_config: config.logging_config.clone(),
+            capacity_provider_config: config.capacity_provider_config.clone(),
+            durable_config: config.durable_config.clone(),
+            tenancy_config: config.tenancy_config.clone(),
             ..CreateFunctionOutput::default()
         }
     }
@@ -1548,6 +1686,36 @@ pub fn code_sha256(bytes: &[u8]) -> String {
 #[must_use]
 pub fn mint_revision_id() -> String {
     ::uuid::Uuid::new_v4().to_string()
+}
+
+/// AWS's published Lambda quota for environment variables: 4 KB for all of a function's
+/// environment variables combined.
+pub const MAX_ENVIRONMENT_BYTES: usize = 4 * 1024;
+
+/// The environment variables an `Environment` member asks a function to hold, ordered so
+/// a read reports them deterministically.
+///
+/// `Err` carries the message of the refusal: the set is larger than the documented
+/// quota. Every operation that accepts an `Environment` applies the same quota, so the
+/// check lives here rather than once per operation.
+pub fn environment_variables(
+    environment: Option<&Environment>,
+) -> Result<BTreeMap<String, String>, String> {
+    let variables: BTreeMap<String, String> = environment
+        .and_then(|environment| environment.variables.clone())
+        .map(|variables| variables.into_iter().collect())
+        .unwrap_or_default();
+    let size: usize = variables
+        .iter()
+        .map(|(name, value)| name.len() + value.len())
+        .sum();
+    if size > MAX_ENVIRONMENT_BYTES {
+        return Err(format!(
+            "Environment.Variables must be smaller than {MAX_ENVIRONMENT_BYTES} bytes for all \
+             environment variables combined, and this request's are {size} bytes"
+        ));
+    }
+    Ok(variables)
 }
 
 /// A `FunctionName` the wire accepted, split into the parts that identify a record.

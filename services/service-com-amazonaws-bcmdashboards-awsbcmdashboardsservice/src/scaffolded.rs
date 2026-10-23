@@ -40,6 +40,18 @@
 //! place it can return an error its own model does not declare — `validation` above,
 //! for a service whose model carries no client-input error. Delete the wrapper and the
 //! handler has no way to refuse a bad request at all.
+//!
+//! ## This service's not-found answer
+//!
+//! That last point is why [`Scaffolded::resource_not_found`] lives here too. The model
+//! declares `ResourceNotFoundException` with `@httpError 404` and a single `message`
+//! member, but every recorded not-found answer of this service is HTTP **400**, and the
+//! recorded `GetDashboard` body also carries a `resourceId` member holding the ARN the
+//! request addressed. Neither is expressible through the generated modelled variant — its
+//! status comes from the model's `@httpError` and its shape from the model's member list —
+//! so the wire answer is rendered from the [`ResourceNotFound`] shape written out below,
+//! under the same wire error code the modelled shape puts on the wire. Every handler of
+//! this service answers a missing resource through that one constructor.
 
 use aws_smithy_schema::serde::{SerdeError, SerializableStruct, ShapeSerializer};
 use aws_smithy_schema::{Schema, ShapeId, ShapeType};
@@ -177,6 +189,104 @@ impl SerializableStruct for ValidationException {
     }
 }
 
+/// The wire error code (`__type`) of this service's not-found answer — the SAME code the
+/// model's `com.amazonaws.bcmdashboards#ResourceNotFoundException` puts on the wire, which
+/// is what the recordings carry; only the status line and the member set differ from what
+/// the model implies. See [`ResourceNotFound`].
+pub const RESOURCE_NOT_FOUND_CODE: &str = "ResourceNotFoundException";
+
+/// The HTTP status this service answers a not-found with.
+///
+/// The model's `@httpError` on `ResourceNotFoundException` is 404, but every recorded
+/// not-found answer of this service — on the dashboard read, the dashboard update, the
+/// tagging read and the scheduled-report read alike — is HTTP **400**, and the recording is
+/// the wire record. Keeping the modelled 404 makes SDK middleware and proxies, which branch
+/// on the status line before they parse the body, treat a modelled client error as a
+/// routing/endpoint failure.
+pub const RESOURCE_NOT_FOUND_STATUS: u16 = 400;
+
+/// The `message` member of this service's not-found error shape.
+static RESOURCE_NOT_FOUND_MESSAGE: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "smithy.framework#BcmDashboardsResourceNotFound$message",
+        "smithy.framework",
+        "message",
+    ),
+    ShapeType::String,
+    "message",
+    0,
+)
+.with_xml_name("Message");
+
+/// The `resourceId` member of this service's not-found error shape: the identifier the
+/// refused request addressed. NOT a member the model declares on
+/// `ResourceNotFoundException` — the recorded wire body carries it, which is why the shape
+/// below is written out here instead of the modelled one being reused.
+static RESOURCE_NOT_FOUND_RESOURCE_ID: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "smithy.framework#BcmDashboardsResourceNotFound$resourceId",
+        "smithy.framework",
+        "resourceId",
+    ),
+    ShapeType::String,
+    "resourceId",
+    1,
+)
+.with_xml_name("ResourceId");
+
+/// Schema for this service's not-found error shape: `{message, resourceId}`.
+///
+/// In the `smithy.framework` namespace, and under a name no model declares, for the same
+/// reason as [`NOT_IMPLEMENTED_SCHEMA`]: the shape must not collide with a modeled one. It
+/// shapes only the BODY; the wire error code and the status travel beside it, from
+/// [`RESOURCE_NOT_FOUND_CODE`] and [`RESOURCE_NOT_FOUND_STATUS`].
+pub static RESOURCE_NOT_FOUND_SCHEMA: Schema = Schema::new_struct(
+    ShapeId::from_static(
+        "smithy.framework#BcmDashboardsResourceNotFound",
+        "smithy.framework",
+        "BcmDashboardsResourceNotFound",
+    ),
+    ShapeType::Structure,
+    &[&RESOURCE_NOT_FOUND_MESSAGE, &RESOURCE_NOT_FOUND_RESOURCE_ID],
+);
+
+/// The payload of this service's not-found answer: which resource the request addressed,
+/// and this operation's own wording for not finding it.
+///
+/// `resource_id` is the identifier the REQUEST carried, echoed so a client reporting which
+/// resource was missing has it without re-parsing the message.
+#[derive(Debug, Clone)]
+pub struct ResourceNotFound {
+    pub message: String,
+    pub resource_id: String,
+}
+
+impl ResourceNotFound {
+    /// A not-found answer for `resource_id`, worded by `message`.
+    pub fn new(resource_id: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            resource_id: resource_id.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for ResourceNotFound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{RESOURCE_NOT_FOUND_CODE}: {}", self.message)
+    }
+}
+
+impl std::error::Error for ResourceNotFound {}
+
+impl SerializableStruct for ResourceNotFound {
+    fn serialize_members(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
+        s.write_string(&RESOURCE_NOT_FOUND_MESSAGE, self.message.as_str())?;
+        s.write_string(&RESOURCE_NOT_FOUND_RESOURCE_ID, self.resource_id.as_str())?;
+        Ok(())
+    }
+}
+
 /// An operation's error channel: either the synthetic scaffold signal, or one of the
 /// operation's own modeled errors.
 #[derive(Debug)]
@@ -185,6 +295,11 @@ pub enum Scaffolded<E> {
     NotImplemented(NotImplemented),
     /// A modeled error the operation declares. Renders with the model's own status.
     Modeled(E),
+    /// The ARN the request addressed names no resource this service stores. Renders as
+    /// HTTP 400 (not the modelled 404) with the error code `ResourceNotFoundException`
+    /// and a `resourceId` member echoing that ARN — the recorded wire answer, which the
+    /// modelled shape cannot express. See [`Scaffolded::resource_not_found`].
+    ResourceNotFound(ResourceNotFound),
     /// The request was refused as invalid. Renders as HTTP 400 with the error code
     /// `ValidationException`.
     ///
@@ -221,6 +336,22 @@ impl<E> Scaffolded<E> {
     pub fn validation(message: impl Into<String>) -> Self {
         Self::ValidationException(ValidationException::new(message))
     }
+
+    /// Answer "this service stores no resource under that ARN": HTTP 400 with the error
+    /// code `ResourceNotFoundException` and a `resourceId` member carrying the ARN the
+    /// request addressed.
+    ///
+    /// EVERY not-found answer of this service goes through here rather than through the
+    /// operation's modelled `ResourceNotFoundException` variant, which the generated enum
+    /// renders at the model's `@httpError` 404 and whose shape declares `message` alone —
+    /// neither of which is what the recorded service answers. `message` stays the
+    /// operation's own wording; `resource_id` is the request's identifier, echoed.
+    pub fn resource_not_found(
+        resource_id: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self::ResourceNotFound(ResourceNotFound::new(resource_id, message))
+    }
 }
 
 impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
@@ -228,6 +359,7 @@ impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
         match self {
             Self::NotImplemented(e) => write!(f, "{e}"),
             Self::Modeled(e) => write!(f, "{e}"),
+            Self::ResourceNotFound(e) => write!(f, "{e}"),
             Self::ValidationException(e) => write!(f, "{e}"),
         }
     }
@@ -240,6 +372,7 @@ impl<E: std::error::Error + 'static> std::error::Error for Scaffolded<E> {
         match self {
             Self::NotImplemented(e) => e.source(),
             Self::Modeled(e) => e.source(),
+            Self::ResourceNotFound(e) => e.source(),
             Self::ValidationException(e) => e.source(),
         }
     }
@@ -254,6 +387,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(e) => e,
             Self::Modeled(e) => e.as_serializable(),
+            Self::ResourceNotFound(e) => e,
             Self::ValidationException(e) => e,
         }
     }
@@ -262,6 +396,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(_) => &NOT_IMPLEMENTED_SCHEMA,
             Self::Modeled(e) => e.variant_schema(),
+            Self::ResourceNotFound(_) => &RESOURCE_NOT_FOUND_SCHEMA,
             Self::ValidationException(_) => &VALIDATION_EXCEPTION_SCHEMA,
         }
     }
@@ -274,6 +409,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(_) => "NotImplemented",
             Self::Modeled(e) => e.shape_name(),
+            Self::ResourceNotFound(_) => RESOURCE_NOT_FOUND_CODE,
             Self::ValidationException(_) => "ValidationException",
         }
     }
@@ -286,6 +422,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(_) => 501,
             Self::Modeled(e) => e.http_status(),
+            Self::ResourceNotFound(_) => RESOURCE_NOT_FOUND_STATUS,
             Self::ValidationException(_) => 400,
         }
     }
@@ -297,6 +434,9 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             // envelope carries the signal on the query protocols too.
             Self::NotImplemented(_) => None,
             Self::Modeled(e) => e.query_error_code(),
+            // Same reason: the synthetic shape carries no `awsQueryError` trait (and this
+            // service speaks awsJson, so nothing reads it).
+            Self::ResourceNotFound(_) => None,
             // Same reason: the synthetic shape carries no `awsQueryError` trait.
             Self::ValidationException(_) => None,
         }

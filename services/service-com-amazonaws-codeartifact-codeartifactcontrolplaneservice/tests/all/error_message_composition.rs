@@ -178,10 +178,11 @@ async fn seed_repository(router: &MultiServiceRouter, domain: &str, repository: 
 /// domain where it has one, and the account the request addressed the domain to.
 ///
 /// The rows differ along what the rule generalises over: the resource kind (domain,
-/// repository), the operation that refuses (describe, delete, list, create, and a create
-/// whose UPSTREAM names a missing repository), whether `domainOwner` was omitted, pinned
-/// to the account served, or pinned to another account, and the extremes of the modelled
-/// name lengths (2 and 50 for a domain, 2 and 100 for a repository).
+/// repository), the operation that refuses (describe, delete — of the DOMAIN SCOPE it
+/// addresses, since the absence of a delete's own target is not a refusal — list, create,
+/// and a create whose UPSTREAM names a missing repository), whether `domainOwner` was
+/// omitted, pinned to the account served, or pinned to another account, and the extremes
+/// of the modelled name lengths (2 and 50 for a domain, 2 and 100 for a repository).
 #[tokio::test]
 async fn not_found_refusals_name_the_resource_its_parent_and_the_owning_account() {
     let router = emulator();
@@ -235,9 +236,9 @@ async fn not_found_refusals_name_the_resource_its_parent_and_the_owning_account(
             message: domain_not_found(&shortest_domain, ACCOUNT),
         },
         Case {
-            label: "DeleteDomain, absent domain".to_string(),
+            label: "DeleteRepository, absent domain".to_string(),
             method: "DELETE",
-            uri: format!("/v1/domain?domain={longest_domain}"),
+            uri: format!("/v1/repository?domain={longest_domain}&repository={held_repo}"),
             body: None,
             answer: NOT_FOUND,
             message: domain_not_found(&longest_domain, ACCOUNT),
@@ -288,14 +289,6 @@ async fn not_found_refusals_name_the_resource_its_parent_and_the_owning_account(
             label: "DescribeRepository, absent repository, owner pinned".to_string(),
             method: "GET",
             uri: format!("/v1/repository?domain={held}&repository=ab&domain-owner={ACCOUNT}"),
-            body: None,
-            answer: NOT_FOUND,
-            message: repository_not_found(held, ACCOUNT, "ab"),
-        },
-        Case {
-            label: "DeleteRepository, absent repository".to_string(),
-            method: "DELETE",
-            uri: format!("/v1/repository?domain={held}&repository=ab"),
             body: None,
             answer: NOT_FOUND,
             message: repository_not_found(held, ACCOUNT, "ab"),

@@ -83,6 +83,9 @@ fn stored_app(
         arn: format!(
             "arn:aws:sagemaker:us-east-1:{ACCOUNT}:partner-app/{app_id}",
         ),
+        // Where the app is served, which `CreatePartnerAppPresignedUrl` builds its URL
+        // on: the host shape SageMaker gives a partner app, carrying the app's own id.
+        base_url: format!("https://{app_id}.us-east-1.partner-app.sagemaker.aws"),
         app_id,
         name: name.to_string(),
         app_type: app_type.to_string(),
@@ -93,6 +96,8 @@ fn stored_app(
             Some(span) => now + span,
             None => now + Duration::from_secs(3_600),
         },
+        // No presigned URL has been minted for a freshly stored app.
+        grants: Vec::new(),
     }
 }
 

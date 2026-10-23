@@ -503,6 +503,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // source's resource tree only, so a cloned API starts with neither.
             stages: BTreeMap::new(),
             deployments: BTreeMap::new(),
+            // A new API customizes no gateway response: every response type reports the
+            // one API Gateway generates until `PutGatewayResponse` stores a
+            // customization for it. A clone copies the source's resource tree only, so a
+            // cloned API starts with none either.
+            gateway_responses: BTreeMap::new(),
             // Nor with any documentation part: `CreateDocumentationPart` and
             // `ImportDocumentationParts` are what write them, and a clone copies the
             // source's resource tree only.

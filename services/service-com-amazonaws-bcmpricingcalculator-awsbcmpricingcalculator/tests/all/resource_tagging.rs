@@ -22,17 +22,20 @@ use service_com_amazonaws_bcmpricingcalculator_awsbcmpricingcalculator::{
 
 use crate::bill_scenario_lifecycle::{error_code, Emulator};
 
-/// The region every ARN this harness builds carries: the one the harness's SigV4
-/// credential scope names (`.../us-east-1/bcm-pricing-calculator/aws4_request`), which is
-/// the region `state::request_region` reads a resource's ARN from.
-const HARNESS_REGION: &str = "us-east-1";
-
 /// The ARN of a resource of `kind` (an ARN resource-type segment, e.g.
-/// `state::WORKLOAD_ESTIMATE_ARN_TYPE`) with this id, built the way a client builds one:
-/// through `engine::emulator_arn`, whose account segment is the single account this
-/// emulator presents.
+/// `state::WORKLOAD_ESTIMATE_ARN_TYPE`) with this id, built the way a client holding one
+/// of this service's ARNs sends it back: through `engine::emulator_arn`, whose account
+/// segment is the single account this emulator presents, with the empty region segment a
+/// partitional service's ARNs carry (`state::ARN_REGION`).
 fn resource_arn(kind: &str, id: &str) -> String {
-    engine::emulator_arn(state::ARN_NAMESPACE, HARNESS_REGION, &format!("{kind}/{id}"))
+    resource_arn_in_region(kind, id, state::ARN_REGION)
+}
+
+/// The same ARN with `region` written into its region field — a form the `Arn` pattern
+/// (`[-a-z0-9]*`) admits and which addresses the same resource, since this service's
+/// resources are not region-scoped.
+fn resource_arn_in_region(kind: &str, id: &str, region: &str) -> String {
+    engine::emulator_arn(state::ARN_NAMESPACE, region, &format!("{kind}/{id}"))
 }
 
 /// Create a bill scenario and return its id, failing the test if the call did not
@@ -403,17 +406,19 @@ async fn untagging_removes_only_the_keys_it_names() {
     }
 }
 
-/// RULE: an operation that addresses a resource by ARN resolves it to the resource whose
-/// ARN it is; an ARN that names no live resource of this account is refused with the
-/// modelled `ResourceNotFoundException` (HTTP 404) naming the ARN it looked for and the
-/// kind of resource that ARN addresses — never a 200.
+/// RULE: an operation that addresses a resource by ARN resolves it by the identity that
+/// ARN names — partition, account, resource type and resource id — so an ARN that
+/// addresses no live resource of this account is refused, under HTTP 400 and with the
+/// service's fixed unresolvable-ARN message, never with a 200 and never with the 404 that
+/// would tell a client to create the resource and retry.
 ///
-/// The table spans the ways an ARN can fail to name a live resource: a well-formed id that
-/// was never minted, the id of a resource of the OTHER kind, a resource that has been
-/// deleted, a resource kind this service cannot yet create, another account's ARN, and
-/// another region's.
+/// The table spans the ways an ARN can fail to address a live resource: a well-formed id
+/// that was never minted, the id of a resource of the OTHER kind, a resource that has
+/// been deleted, a resource kind this service cannot yet create, another account's ARN,
+/// another partition's, and — since the region field does not select a resource — an
+/// absent id with a region written into it, which is refused the same way.
 #[tokio::test]
-async fn an_arn_naming_no_live_resource_is_a_not_found() {
+async fn an_arn_addressing_no_live_resource_is_refused_with_a_400() {
     let emulator = Emulator::new();
     let estimate = create_estimate(&emulator, "live", Some(json!({ "env": "test" }))).await;
     let scenario = create_scenario(&emulator, "livescenario", None).await;
@@ -427,57 +432,54 @@ async fn an_arn_naming_no_live_resource_is_a_not_found() {
     );
 
     let never_minted = "00000000-0000-0000-0000-000000000000";
-    let cases: Vec<(&str, String, &str)> = vec![
+    let cases: Vec<(&str, String)> = vec![
         (
             "never minted",
             resource_arn(state::WORKLOAD_ESTIMATE_ARN_TYPE, never_minted),
-            state::WORKLOAD_ESTIMATE_RESOURCE_TYPE,
         ),
         (
             "the other kind's id",
             resource_arn(state::WORKLOAD_ESTIMATE_ARN_TYPE, &scenario),
-            state::WORKLOAD_ESTIMATE_RESOURCE_TYPE,
         ),
         (
             "an estimate id read as a scenario",
             resource_arn(state::BILL_SCENARIO_ARN_TYPE, &estimate),
-            state::BILL_SCENARIO_RESOURCE_TYPE,
         ),
         (
             "deleted",
             resource_arn(state::WORKLOAD_ESTIMATE_ARN_TYPE, &deleted),
-            state::WORKLOAD_ESTIMATE_RESOURCE_TYPE,
         ),
         // A kind this service models but cannot yet create: `CreateBillEstimate` is still
         // a scaffold stub, so the store holds none.
-        (
-            "a kind nothing creates yet",
-            resource_arn("bill-estimate", never_minted),
-            "BillEstimate",
-        ),
+        ("a kind nothing creates yet", resource_arn("bill-estimate", never_minted)),
         // Another account's ARN: this emulator presents exactly one account.
         (
             "another account",
             format!(
-                "arn:aws:{}:{HARNESS_REGION}:111111111111:{}/{estimate}",
+                "arn:aws:{}::111111111111:{}/{estimate}",
                 state::ARN_NAMESPACE,
                 state::WORKLOAD_ESTIMATE_ARN_TYPE
             ),
-            state::WORKLOAD_ESTIMATE_RESOURCE_TYPE,
         ),
-        // Another region's: a resource lives in the region its ARN names.
+        // Another partition's: `Arn`'s pattern admits `aws-cn`, and a resource of one
+        // partition is not a resource of another.
         (
-            "another region",
-            engine::emulator_arn(
+            "another partition",
+            format!(
+                "arn:aws-cn:{}::{}:{}/{estimate}",
                 state::ARN_NAMESPACE,
-                "eu-west-1",
-                &format!("{}/{estimate}", state::WORKLOAD_ESTIMATE_ARN_TYPE),
+                engine::emulator_account_id(),
+                state::WORKLOAD_ESTIMATE_ARN_TYPE
             ),
-            state::WORKLOAD_ESTIMATE_RESOURCE_TYPE,
+        ),
+        // A region in the region field changes nothing about an id that names nothing.
+        (
+            "never minted, with a region",
+            resource_arn_in_region(state::WORKLOAD_ESTIMATE_ARN_TYPE, never_minted, "eu-west-1"),
         ),
     ];
 
-    for (case, arn, resource_type) in cases {
+    for (case, arn) in cases {
         for (operation, request) in [
             ("ListTagsForResource", json!({ "arn": arn.clone() })),
             (
@@ -491,23 +493,33 @@ async fn an_arn_naming_no_live_resource_is_a_not_found() {
         ] {
             let (status, body) = emulator.call(operation, request).await;
             assert_eq!(
-                status, 404,
-                "case {case} op={operation}: expected 404, got {status} with {body}"
+                status, 400,
+                "case {case} op={operation}: expected 400, got {status} with {body}"
             );
+            // The status and the error code are independent facts of the wire: the
+            // recorded service answers the not-found shape under that 400.
             assert_eq!(
                 error_code(&body),
                 "ResourceNotFoundException",
                 "case {case} op={operation}: expected ResourceNotFoundException, got {body}"
             );
             assert_eq!(
+                body["message"].as_str(),
+                Some(state::UNRESOLVABLE_ARN_MESSAGE),
+                "case {case} op={operation}: expected the fixed unresolvable-ARN message, got {body}"
+            );
+            assert!(
+                !body["message"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains(arn.as_str()),
+                "case {case} op={operation}: expected the message not to echo the requested ARN, got {body}"
+            );
+            // The requested ARN is reported in the member modelled for it.
+            assert_eq!(
                 body["resourceId"].as_str(),
                 Some(arn.as_str()),
-                "case {case} op={operation}: expected the error to name the ARN looked for, got {body}"
-            );
-            assert_eq!(
-                body["resourceType"].as_str(),
-                Some(resource_type),
-                "case {case} op={operation}: expected the error to name the resource kind, got {body}"
+                "case {case} op={operation}: expected resourceId to name the ARN looked for, got {body}"
             );
         }
     }
@@ -520,6 +532,91 @@ async fn an_arn_naming_no_live_resource_is_a_not_found() {
         expected_map(&[("env", "test")]),
         "expected the live estimate to keep its tags, got {listed:?}"
     );
+}
+
+/// RULE: the region field of one of this service's ARNs does not select a resource — the
+/// service is partitional, its own ARNs leave that field empty, and its `Arn` pattern
+/// admits any region text there — so every tagging operation addresses the SAME resource
+/// whichever region form a client sends.
+///
+/// The table spans the kind of resource and the region forms a client can send: the empty
+/// one the service mints, the region this emulator is called in, and another region
+/// entirely.
+#[tokio::test]
+async fn the_region_field_of_an_arn_does_not_select_a_resource() {
+    // The region forms: `ARN_REGION` is what this service's own ARNs carry; the others
+    // are region texts the `Arn` pattern's `[-a-z0-9]*` admits.
+    let regions = [state::ARN_REGION, "us-east-1", "eu-west-1", "ap-southeast-2"];
+
+    for kind in [
+        state::WORKLOAD_ESTIMATE_ARN_TYPE,
+        state::BILL_SCENARIO_ARN_TYPE,
+    ] {
+        let emulator = Emulator::new();
+        let id = if kind == state::BILL_SCENARIO_ARN_TYPE {
+            create_scenario(&emulator, "regions", None).await
+        } else {
+            create_estimate(&emulator, "regions", None).await
+        };
+
+        // One key per region form, so what each form wrote is visible in the one map.
+        let key_for = |index: usize| format!("written-by-form-{index}");
+
+        for (index, region) in regions.iter().enumerate() {
+            let case = format!("kind={kind} region={region:?}");
+            let arn = resource_arn_in_region(kind, &id, region);
+            let (status, body) = emulator
+                .call(
+                    "TagResource",
+                    json!({ "arn": arn.clone(), "tags": { key_for(index): region } }),
+                )
+                .await;
+            assert_eq!(
+                status, 200,
+                "case {case}: expected TagResource 200, got {status} with {body}"
+            );
+        }
+
+        // Every write landed on the ONE resource, so each form reads back all of them.
+        let want: BTreeMap<String, String> = regions
+            .iter()
+            .enumerate()
+            .map(|(index, region)| (key_for(index), (*region).to_string()))
+            .collect();
+        for region in regions {
+            let case = format!("kind={kind} region={region:?}");
+            let arn = resource_arn_in_region(kind, &id, region);
+            let listed = listed_tags(&emulator, &arn, &case).await;
+            assert_eq!(
+                listed, want,
+                "case {case}: expected every region form to report {want:?}, got {listed:?}"
+            );
+        }
+
+        // And untagging through one form removes from the same map the others read.
+        let (status, body) = emulator
+            .call(
+                "UntagResource",
+                json!({
+                    "arn": resource_arn_in_region(kind, &id, "eu-west-1"),
+                    "tagKeys": [key_for(0), key_for(1)],
+                }),
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "kind={kind}: expected UntagResource 200, got {status} with {body}"
+        );
+        let remaining = listed_tags(&emulator, &resource_arn(kind, &id), "after untagging").await;
+        let want_remaining: BTreeMap<String, String> = [2usize, 3]
+            .iter()
+            .map(|index| (key_for(*index), regions[*index].to_string()))
+            .collect();
+        assert_eq!(
+            remaining, want_remaining,
+            "kind={kind}: expected {want_remaining:?} to remain, got {remaining:?}"
+        );
+    }
 }
 
 /// RULE: a tag key carrying the prefix AWS reserves for its own tags cannot be set by a
@@ -813,7 +910,9 @@ async fn an_expired_resource_is_gone_from_the_tagging_surface() {
             estimate.expires_at = aws_smithy_types::DateTime::from_secs(state::now_secs() + offset);
         }
 
-        let expected_status = if expected_live { 200 } else { 404 };
+        // Gone from this surface means the ARN addresses nothing, which is the 400 of
+        // `an_arn_addressing_no_live_resource_is_refused_with_a_400`.
+        let expected_status = if expected_live { 200 } else { 400 };
         for operation in ["ListTagsForResource", "UntagResource", "TagResource"] {
             let request = match operation {
                 "TagResource" => json!({ "arn": arn.clone(), "tags": { "env": "prod" } }),
