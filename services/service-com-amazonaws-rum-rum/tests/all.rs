@@ -23,6 +23,8 @@ mod list_tags_for_resource;
 mod metrics_destinations;
 #[path = "all/resource_policy.rs"]
 mod resource_policy;
+#[path = "all/resource_tagging.rs"]
+mod resource_tagging;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/state_roundtrip.rs"]

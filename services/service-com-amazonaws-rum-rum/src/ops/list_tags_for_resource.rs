@@ -3,8 +3,8 @@
 //! @op ListTagsForResource
 //! Displays the tags associated with a CloudWatch RUM resource: the tag map of the stored
 //! app monitor whose ARN the request's `ResourceArn` is (app monitors are RUM's only
-//! taggable resource), read off the ONE record `CreateAppMonitor` seeds, `UntagResource`
-//! writes and `GetAppMonitor` reports. It writes nothing.
+//! taggable resource), read off the ONE record `CreateAppMonitor` seeds, `TagResource` and
+//! `UntagResource` write and `GetAppMonitor` reports. It writes nothing.
 //!
 //! ## How a `ResourceArn` is read
 //!
@@ -14,9 +14,9 @@
 //! ARN differing in any component — partition, service, region, account, resource type or
 //! name — names a resource this emulator does not hold and is refused with HTTP 404 under
 //! this frontend's own wire code (see `NOT_FOUND_ERROR_CODE`), exactly as the sibling
-//! `UntagResource` refuses it. A `ResourceArn` that is not an ARN at all fails the
-//! member's modelled pattern at the boundary and is reworded for every tagging operation
-//! in [`crate::service`] as that frontend's 400 `BadRequestException`.
+//! `TagResource` and `UntagResource` refuse it. A `ResourceArn` that is not an ARN at all
+//! fails the member's modelled pattern at the boundary and is reworded for every tagging
+//! operation in [`crate::service`] as that frontend's 400 `BadRequestException`.
 //!
 //! ## Shape of an operation
 //!
@@ -75,6 +75,12 @@
 //! * `InternalServerException` (HTTP 500) — Internal service exception.
 //! * `ResourceNotFoundException` (HTTP 404) — Resource not found.
 //! * `ValidationException` (HTTP 400) — One of the arguments for the request is not valid.
+//!
+//! ## What this handler answers
+//!
+//! `@readonly`: the reported map is the ONE tag map the addressed app monitor holds
+//! (`AppMonitorRecord::tags`) — exactly what `CreateAppMonitor$Tags` and `TagResource`
+//! wrote and `UntagResource` removed from — and nothing is written.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -108,8 +114,8 @@ pub enum ListTagsForResourceErrorModeled {
 /// "NotFoundException"`) for the sibling tagging operation, and it is specific to the
 /// ARN-addressed tagging operations: RUM's app-monitor operations, addressed by `Name`, do
 /// answer `ResourceNotFoundException`. A client branches on the code it is SENT, so this
-/// operation sends the one its frontend sends — the same one `UntagResource` sends, since
-/// one frontend cannot word one condition two ways.
+/// operation sends the one its frontend sends — the same one `TagResource` and
+/// `UntagResource` send, since one frontend cannot word one condition two ways.
 const NOT_FOUND_ERROR_CODE: &str = "NotFoundException";
 
 /// This operation's error channel, as the generated `impl Operation` names it
