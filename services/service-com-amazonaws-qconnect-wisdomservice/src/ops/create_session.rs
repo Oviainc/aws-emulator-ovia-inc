@@ -9,6 +9,26 @@
 //! `origin` = `CUSTOMER`, which is what the model documents for it. A replayed
 //! `clientToken` answers with the session that token already created.
 //!
+//! ## The authorization decision runs BEFORE input validation
+//!
+//! That 401 is an AUTHORIZATION decision, and an authorization decision is made before
+//! the request's members are validated against the model's constraints: a caller this
+//! service cannot authorize for the assistant the path names is told it may not act on
+//! it, whether or not the same request would also fail a `@pattern`, a `@length` or a
+//! `@required` check. So the answer does not depend on which of the two faults the
+//! request carries, and a client refused for permissions is never told its input is
+//! malformed instead.
+//!
+//! The framework's request walk validates before any handler runs
+//! (deserialize → validate → `handle`), so [`handle`](CreateSession::handle) below is
+//! reached only by a request that already passed validation — an `assistantId` outside
+//! the modelled `UuidOrArn` pattern would never get there. The decision therefore also
+//! sits in front of the walk, in [`CreateSessionAuthorization`], which the service's
+//! `override_operation` seam (`crate::service`) consults for every request this route
+//! names. The two agree by construction: both ask the same state for the same parent and
+//! answer with the same modelled error, so an authorized caller's request walks on and
+//! an unauthorized one gets 401 from whichever of them sees it first.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -137,6 +157,188 @@ impl From<CreateSessionErrorModeled> for CreateSessionError {
     }
 }
 
+/// The modelled `UnauthorizedException` (HTTP 401) this operation refuses an
+/// unauthorized caller with, worded from the service's one fixed sentence for the
+/// condition.
+fn unauthorized() -> CreateSessionError {
+    CreateSessionErrorModeled::UnauthorizedException(UnauthorizedException {
+        message: Some(crate::state::MESSAGE_UNAUTHORIZED.to_string()),
+    })
+    .into()
+}
+
+/// THE authorization decision for this operation: the `assistantId` of the parent the
+/// caller may act on, or `None` when it may not.
+///
+/// A session exists only inside an assistant, so acting on a session is acting on that
+/// assistant; an assistant this account does not hold is one the caller has no
+/// permission on, which is the modelled `UnauthorizedException`. (The read paths —
+/// `GetAssistant`, `GetSession` — resolve the resource instead and answer
+/// `ResourceNotFoundException`; this path authorizes first, which is what the recorded
+/// wire answer for a session create under an assistant the caller does not hold shows.)
+///
+/// One function, called from both places the decision is made — the pre-walk
+/// [`CreateSessionAuthorization`] and [`CreateSession::handle`] — so the two can never
+/// disagree about who is authorized.
+fn authorized_parent(
+    store: &crate::state::ComAmazonawsQconnectWisdomserviceState,
+    assistant_label: &str,
+) -> Option<String> {
+    store
+        .assistant(assistant_label)
+        .map(|assistant| assistant.assistant_id.clone())
+}
+
+/// The `{assistantId}` label of this operation's modelled URI, as the segment of the
+/// request path the pattern puts it at: the model names which segment carries it
+/// (`@http(uri: "/assistants/{assistantId}/sessions")`), so nothing here hardcodes a
+/// position. `None` when the path is not this route's shape at all.
+///
+/// The segment is percent-decoded, because a `UuidOrArn` label addressed by ARN travels
+/// with its slashes escaped — the same decoding the framework's own httpLabel binding
+/// does, so this reads the value the handler would have seen.
+fn assistant_label(request_uri: &str) -> Option<String> {
+    const LABEL: &str = "{assistantId}";
+
+    let pattern = super::types::CREATE_SESSION_INPUT_SCHEMA.http()?.uri();
+    let pattern = pattern.split('?').next().unwrap_or(pattern);
+    let path = request_uri.split(['?', '#']).next().unwrap_or(request_uri);
+
+    let mut templates = pattern.split('/');
+    let mut segments = path.split('/');
+    let mut found = None;
+    loop {
+        match (templates.next(), segments.next()) {
+            (None, None) => return found,
+            (Some(template), Some(segment)) if template == LABEL => {
+                found = Some(::smithy_server_runtime::percent_decode(segment));
+            }
+            (Some(template), Some(segment)) if template == segment => {}
+            // A literal that does not match, or one side running out first: not this
+            // route, so there is no label to read.
+            _ => return None,
+        }
+    }
+}
+
+/// `CreateSession`'s authorization decision, made BEFORE the framework validates the
+/// request against the model's member constraints.
+///
+/// The framework's request walk is deserialize → validate → `handle`, so a handler
+/// cannot refuse a request whose members do not validate: the walk has already answered
+/// 400 `ValidationException`. An authorization refusal must not depend on that — a
+/// caller refused for permissions is refused for permissions whatever else its request
+/// carries — so this type sits in front of the walk. The service's `override_operation`
+/// seam (`crate::service`) hands a request to it when it names this route and the caller
+/// is not authorized for the assistant in its path, and it answers the operation's own
+/// modelled `UnauthorizedException` (HTTP 401) without reading or validating the rest of
+/// the request.
+///
+/// It is an author-written operation, so it declares no auth schemes of its own: the
+/// router keeps verifying the request signature against the schemes the MODEL names for
+/// `CreateSession` (see [`ErasedOperation::auth_schemes`]'s contract).
+pub struct CreateSessionAuthorization<Eng> {
+    engine: ::std::sync::Arc<Eng>,
+}
+
+impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CreateSessionAuthorization<Eng> {
+    /// Construct from the shared engine, like every operation in this crate.
+    pub fn new(engine: ::std::sync::Arc<Eng>) -> Self {
+        Self { engine }
+    }
+
+    /// Whether `request` — already resolved to the operation named by `routing_key` — is
+    /// a `CreateSession` this service cannot authorize, and so one this type answers
+    /// instead of the walk.
+    ///
+    /// `false` for every other operation, for a path this route's URI pattern does not
+    /// match, and for a caller that IS authorized: those requests walk normally, so an
+    /// authorized caller still gets the modelled `ValidationException` for input the
+    /// model refuses.
+    pub fn refuses(
+        &self,
+        routing_key: &str,
+        request: &::aws_smithy_runtime_api::http::Request,
+    ) -> bool {
+        if routing_key != <CreateSession<Eng> as ::smithy_server_runtime::Operation>::NAME {
+            return false;
+        }
+        let Some(label) = assistant_label(request.uri()) else {
+            return false;
+        };
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // No store to decide against: leave the request to the walk rather than
+            // refusing a caller this service cannot judge.
+            return false;
+        };
+        let store = state.lock();
+        let unauthorized = authorized_parent(&store, &label).is_none();
+        drop(store);
+        unauthorized
+    }
+}
+
+impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>
+    ::smithy_server_runtime::ErasedOperation for CreateSessionAuthorization<Eng>
+{
+    fn run<'r>(
+        &'r self,
+        svc: &'r dyn ::smithy_server_runtime::Service,
+        req: &'r ::aws_smithy_runtime_api::http::Request,
+        ctx: &'r ::smithy_server_runtime::OperationContext<'r>,
+    ) -> ::smithy_server_runtime::BoxFuture<'r, ::aws_smithy_runtime_api::http::Response> {
+        use ::smithy_server_runtime::OperationError;
+
+        ::std::boxed::Box::pin(async move {
+            // The request itself is not read: the refusal is the same for every request
+            // this caller could have sent to this route.
+            let _ = req;
+            let started = ::std::time::Instant::now();
+            let recording = ::emulator_telemetry::recording_active();
+            let request_metadata = recording
+                .then(|| {
+                    ::smithy_server_runtime::RequestTelemetry::from_headers(&ctx.parts().headers)
+                        .into_metadata()
+                })
+                .flatten();
+
+            // Rendered through the service's own wire protocol, exactly as the walk
+            // renders a modeled error the handler returned, so the envelope, the
+            // `x-amzn-errortype` header and the status all come from the model.
+            let error = unauthorized();
+            let definition = svc.definition();
+            let response = definition
+                .protocol()
+                .serialize_error(
+                    error.as_serializable(),
+                    error.variant_schema(),
+                    error.shape_name(),
+                    error.http_status(),
+                )
+                .unwrap_or_else(|failed| definition.framework_error_response(failed));
+
+            // Counted as the operation it refused, with the same classification the
+            // walk would have recorded for the same modeled error.
+            if recording {
+                let handle = ::emulator_telemetry::OperationHandle::folded(
+                    ctx.identity().signing_name_static(),
+                    <CreateSession<Eng> as ::smithy_server_runtime::Operation>::NAME,
+                );
+                ::emulator_telemetry::record_generated_operation_with_handle(
+                    &handle,
+                    started.elapsed(),
+                    Some(::emulator_telemetry::OperationFailure::classify(
+                        response.status().as_u16(),
+                        error.shape_name(),
+                    )),
+                    request_metadata,
+                );
+            }
+            response
+        })
+    }
+}
+
 /// The `CreateSession` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -183,25 +385,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
 
-        // The parent is resolved first: a session exists only inside an assistant. The
-        // recorded wire answer for a session create whose assistant this account does
-        // not hold is the modelled `UnauthorizedException` (HTTP 401), not a not-found:
-        // this path authorizes the caller against the parent assistant before resolving
-        // it, so an assistant that is not there is a caller that may not act on it. The
-        // read paths (`GetAssistant`, `GetSession`) resolve the resource first and
-        // answer `ResourceNotFoundException` (404).
-        let Some(assistant_id) = store
-            .assistant(&input.assistant_id)
-            .map(|assistant| assistant.assistant_id.clone())
-        else {
-            return Err(CreateSessionErrorModeled::UnauthorizedException(
-                UnauthorizedException {
-                    message: Some(crate::state::MESSAGE_UNAUTHORIZED.to_string()),
-                },
-            )
-            .into());
+        // The parent is resolved first: a session exists only inside an assistant, and
+        // the decision whether this caller may act on it is `authorized_parent`'s — the
+        // same function the pre-walk `CreateSessionAuthorization` asks, so a request
+        // that reaches here and one refused in front of the walk get the same answer.
+        // The read paths (`GetAssistant`, `GetSession`) resolve the resource first and
+        // answer `ResourceNotFoundException` (404) instead.
+        let Some(assistant_id) = authorized_parent(&store, &input.assistant_id) else {
+            return Err(unauthorized());
         };
-
         // A replayed `@idempotencyToken` answers with the session it already created
         // under THIS assistant rather than creating a second one. The token is scoped to
         // this operation and this parent, so the same token on another create is another

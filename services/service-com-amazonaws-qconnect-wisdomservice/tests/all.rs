@@ -15,6 +15,8 @@
 mod assistant_configuration;
 #[path = "all/assistant_lifecycle.rs"]
 mod assistant_lifecycle;
+#[path = "all/authorization_precedence.rs"]
+mod authorization_precedence;
 #[path = "all/enum_value_refusal.rs"]
 mod enum_value_refusal;
 #[path = "all/knowledge_base_lifecycle.rs"]

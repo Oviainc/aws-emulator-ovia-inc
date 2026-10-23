@@ -112,6 +112,12 @@ fn claims_endpoint_traffic(parts: &http::request::Parts) -> bool {
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// `CreateSession`'s authorization decision, which is made BEFORE the framework
+    /// walk validates the request — see [`Service::override_operation`] below and the
+    /// type's own docs in `crate::ops::create_session`. Held here because
+    /// `override_operation` hands back a borrowed operation, so the one it may name has
+    /// to live as long as the service.
+    create_session_authorization: crate::ops::create_session::CreateSessionAuthorization<Eng>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -120,6 +126,8 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
+            create_session_authorization:
+                crate::ops::create_session::CreateSessionAuthorization::new(Arc::clone(&engine)),
             entry: crate::ServiceDefinition::new(engine),
         }
     }
@@ -166,8 +174,31 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // correctly; `None` (the default) lets the generated routing table resolve
         // it. `req` is the whole request, so a decision that depends on the body —
         // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
-        None
+        //
+        // This seam is ALSO the only point in front of the framework walk, which is
+        // deserialize → validate → `handle`: an operation whose answer must not depend
+        // on whether the request's members validate has to be decided here, because by
+        // the time a handler runs the walk has already refused a request the model's
+        // constraints reject with 400 `ValidationException`.
+        //
+        // ONE class needs that: an AUTHORIZATION refusal. A caller this service cannot
+        // authorize for the resource a request's path names is refused for permissions
+        // whatever else that request carries — a path label outside its `@pattern`, a
+        // body member outside a `@length`, an absent `@required` member — so the
+        // authorization decision is evaluated before member validation and its modelled
+        // error is what the caller sees. `CreateSession` is the one operation this
+        // service decides authorization for (it is the only one that answers the
+        // modelled `UnauthorizedException`, against the parent assistant a session lives
+        // in); every other operation resolves its resource instead and answers
+        // `ResourceNotFoundException`, which is a resource decision and stays BEHIND
+        // validation, so nothing else is routed here.
+        //
+        // The routing key is resolved through the generated table's own protocol, so
+        // this names no route pattern of its own.
+        let routing_key = self.definition().protocol().routing_key(req).ok()?;
+        self.create_session_authorization
+            .refuses(routing_key, req)
+            .then_some(&self.create_session_authorization as &dyn ErasedOperation)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {

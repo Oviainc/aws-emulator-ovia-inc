@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Upserts tags onto a stored resource, in [`crate::state`]: each requested key is
+//! created with its value, or has its value replaced when the resource already carries
+//! that key, and every key the resource carries that the request does not name is left
+//! alone. A following `ListTagsForResource` reports exactly the merged set.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Three rules this handler enforces beyond the modelled constraints:
+//!
+//! * The resource must exist: an ARN no stored resource carries earns the modelled
+//!   `ResourceNotFoundException` (404), and existence is decided BEFORE the tag count
+//!   is, so a resource that does not exist is never reported as over its tag limit.
+//! * An ARN outside the caller's own account earns `AccessDeniedException` (403),
+//!   decided before the resource is resolved — see [`crate::state::authorize_resource_arn`].
+//! * A request that would leave the resource holding more than
+//!   [`crate::state::MAX_TAGS_PER_RESOURCE`] tags earns the modelled
+//!   `TooManyTagsException` (400) and writes NOTHING, so a refused call leaves the
+//!   stored tags exactly as they were.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +156,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        let _ = ctx;
+        // The account boundary is evaluated BEFORE the resource is resolved: an ARN
+        // outside the caller's account is refused with the modelled
+        // `AccessDeniedException` (403) whatever is stored under it, so a client can
+        // tell "not permitted" from "does not exist".
+        crate::state::authorize_resource_arn(Self::NAME, &input.resource_arn)
+            .map_err(TagResourceErrorModeled::AccessDeniedException)?;
+        let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            TagResourceError::Modeled(TagResourceErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the approval-team store is unavailable".to_string(),
+                },
+            ))
+        })?;
+        let mut state = store.lock();
+        state.materialize_due(::std::time::SystemTime::now());
+
+        let Some(tags) = state.resource_tags_mut(&input.resource_arn) else {
+            return Err(TagResourceErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("No resource found for ARN '{}'.", input.resource_arn),
+                },
+            )
+            .into());
+        };
+
+        // Whether the merged set fits is decided before anything is written, so a
+        // refused call leaves the resource's tags exactly as they were. A key the
+        // resource already carries is an update, not an addition, so it does not count
+        // against the limit twice.
+        let merged = crate::state::merged_tag_count(tags, input.tags.keys().map(String::as_str));
+        if merged > crate::state::MAX_TAGS_PER_RESOURCE {
+            return Err(TagResourceErrorModeled::TooManyTagsException(TooManyTagsException {
+                message: format!(
+                    "The request would leave {merged} tags on the resource, more than the \
+                     maximum of {} tags allowed per resource. Remove some tags, and try again.",
+                    crate::state::MAX_TAGS_PER_RESOURCE
+                ),
+                resource_name: Some(input.resource_arn.clone()),
+            })
+            .into());
+        }
+
+        for (key, value) in &input.tags {
+            tags.insert(key.clone(), value.clone());
+        }
+
+        // Tagging is not a version of the resource: `UpdateApprovalTeam` is what mints a
+        // new team version, so neither `VersionId` nor `LastUpdateTime` moves here.
+        Ok(TagResourceOutput {})
     }
 }

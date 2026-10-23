@@ -78,6 +78,15 @@ pub const MAX_ROUTES_PER_API: usize = 300;
 /// AWS's published API Gateway quota is 300 integrations per API.
 pub const MAX_INTEGRATIONS_PER_API: usize = 300;
 
+/// The most models one api may hold, after which CreateModel is refused.
+///
+/// An EMULATOR growth bound, not a figure AWS publishes: API Gateway publishes per-api
+/// quotas for the other child resources of an api (300 routes, 300 integrations) and
+/// this takes the same bound for models, so no loop of CreateModel calls can grow this
+/// store without end. Cite the routes/integrations quotas for those; do not cite this
+/// as a published models quota.
+pub const MAX_MODELS_PER_API: usize = 300;
+
 /// The most deployments one api may hold, after which CreateDeployment is refused.
 ///
 /// API Gateway publishes a quota of 500 deployments per API, so this is the faithful
@@ -166,6 +175,11 @@ pub struct Api {
     pub integration_id_seed: u64,
     /// This api's stages, keyed by `StageName`. Reserved for the stage slice.
     pub stages: BTreeMap<String, Stage>,
+    /// This api's models, keyed by `ModelId`.
+    pub models: BTreeMap<String, Model>,
+    /// Drives [`Api::mint_model_id`]. Per-api, for the same reason as
+    /// [`Api::route_id_seed`]: a `ModelId` is unique within its api.
+    pub model_id_seed: u64,
     /// This api's deployments, keyed by `DeploymentId`.
     pub deployments: BTreeMap<String, Deployment>,
     /// Drives [`Api::mint_deployment_id`]. Per-api, for the same reason as
@@ -186,6 +200,13 @@ impl Api {
     pub fn mint_integration_id(&mut self) -> String {
         self.integration_id_seed = self.integration_id_seed.wrapping_add(1);
         mint_id(self.integration_id_seed)
+    }
+
+    /// Mint a fresh `ModelId` for this api: ten lowercase alphanumerics, never one
+    /// this api already minted.
+    pub fn mint_model_id(&mut self) -> String {
+        self.model_id_seed = self.model_id_seed.wrapping_add(1);
+        mint_id(self.model_id_seed)
     }
 
     /// Mint a fresh `DeploymentId` for this api: ten lowercase alphanumerics, never
@@ -367,6 +388,112 @@ impl Integration {
             tls_config: self.tls_config.clone(),
         }
     }
+}
+
+/// A persisted `Model` resource, owned by its parent [`Api`].
+///
+/// The record keeps the schema SOURCE the create accepted, verbatim: every reader of
+/// the model reports the document the caller supplied, and [`Model::to_wire`] projects
+/// the record onto the modelled shape the handlers serialize.
+#[derive(Debug, Clone, Default)]
+pub struct Model {
+    pub model_id: String,
+    pub name: String,
+    pub content_type: Option<String>,
+    pub description: Option<String>,
+    pub schema: String,
+}
+
+impl Model {
+    /// Project the record onto the modelled `Model` shape.
+    pub fn to_wire(&self) -> wire::Model {
+        wire::Model {
+            content_type: self.content_type.clone(),
+            description: self.description.clone(),
+            model_id: Some(self.model_id.clone()),
+            name: self.name.clone(),
+            schema: Some(self.schema.clone()),
+        }
+    }
+}
+
+/// Is `name` a `Model$Name` the service accepts?
+///
+/// "The name of the model. Must be alphanumeric" (`CreateModel$Name`), so a name
+/// carrying anything but letters and digits is refused. The length bounds (1..128) are
+/// the modelled constraint and are already refused before a handler runs, so this is
+/// only the alphabet.
+///
+/// `CreateModel` and `UpdateModel` both route through here: the requirement is a
+/// property of the request, so it cannot differ between the two.
+pub fn model_name_is_alphanumeric(name: &str) -> bool {
+    !name.is_empty() && name.chars().all(|character| character.is_ascii_alphanumeric())
+}
+
+/// Does `content_type` name a media type whose schema language is JSON Schema?
+///
+/// A JSON media type is one whose subtype is `json` or ends in `+json`
+/// (RFC 6839's `+json` structured syntax suffix), with any parameters
+/// (`; charset=utf-8`) ignored. A model that names NO content type is a JSON model
+/// too: `application/json` is the content type the service's own documentation gives
+/// for a model (`Model$ContentType`: "for example, \"application/json\"").
+pub fn is_json_media_type(content_type: Option<&str>) -> bool {
+    let Some(content_type) = content_type else {
+        return true;
+    };
+    let media_type = content_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    let subtype = media_type.split('/').nth(1).unwrap_or_default();
+    subtype == "json" || subtype.ends_with("+json")
+}
+
+/// Refuse a `Schema` that is not a schema document of the model's content type.
+///
+/// For a JSON model (see [`is_json_media_type`]) the schema is a JSON Schema document:
+/// "For application/json models, this should be JSON schema draft 4 model"
+/// (`CreateModel$Schema`), and "A JSON Schema is a JSON document, and that document
+/// MUST be an object" (JSON Schema draft-04, section 3.2). A schema that does not
+/// parse as JSON, or parses as a value that is not an object, is therefore no JSON
+/// Schema at all and nothing reading the model could treat it as one.
+///
+/// A model of any OTHER content type carries a schema in that content type's own
+/// language, which this service has no reader for, so its schema is stored verbatim
+/// rather than refused for not being JSON.
+///
+/// What this does NOT do is check a document against the whole of draft-04 — that
+/// every keyword is one draft-04 defines and carries a value of the type draft-04
+/// gives it. A partial schema is legitimate input (`{}` matches everything), and the
+/// document is handed back verbatim by every reader of the model.
+///
+/// `Ok(())` or the message for the operation's `BadRequestException`: it names the
+/// member and what was wrong with it, and echoes no schema back.
+pub fn validate_model_schema(content_type: Option<&str>, schema: &str) -> Result<(), String> {
+    if !is_json_media_type(content_type) {
+        return Ok(());
+    }
+    let document: ::serde_json::Value = ::serde_json::from_str(schema)
+        .map_err(|error| format!("Invalid model specified: Schema is not valid JSON: {error}"))?;
+    if document.is_object() {
+        return Ok(());
+    }
+    // The JSON type the schema turned out to be, so the caller can see what it sent
+    // without the document being echoed back.
+    let kind = match document {
+        ::serde_json::Value::Null => "null",
+        ::serde_json::Value::Bool(_) => "a boolean",
+        ::serde_json::Value::Number(_) => "a number",
+        ::serde_json::Value::String(_) => "a string",
+        ::serde_json::Value::Array(_) => "an array",
+        ::serde_json::Value::Object(_) => "an object",
+    };
+    Err(format!(
+        "Invalid model specified: Schema is not a valid JSON schema document: a JSON schema \
+         is a JSON object, but this Schema is {kind}."
+    ))
 }
 
 /// A persisted `Stage`. Reserved so the stage operations can land without a state

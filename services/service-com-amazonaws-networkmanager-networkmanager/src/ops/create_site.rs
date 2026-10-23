@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateSite
-//! Creates a new site in a global network: refuses an unknown `GlobalNetworkId` with
-//! `ResourceNotFoundException` (404), otherwise mints the `SiteId`/`SiteArn`, stamps
+//! Creates a new site in a global network: refuses a `GlobalNetworkId` that names no
+//! stored global network as a field-validation failure on that member
+//! (`ValidationException`, 400), otherwise mints the `SiteId`/`SiteArn`, stamps
 //! `CreatedAt`, and stores the record `GetSites` answers from. This is the ONLY file to
 //! touch for this operation.
 //!
@@ -167,13 +168,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // A site only exists inside a global network, so an unknown parent is a 404
-        // rather than a site with a dangling back-reference.
+        // A site only exists inside a global network, so an unknown parent is refused
+        // rather than stored with a dangling back-reference. The create validates the
+        // references its input carries before anything is minted, so a `GlobalNetworkId`
+        // that names nothing is a FIELD failure on that member — `ValidationException`
+        // (400) with `Reason=FieldValidationFailed` and a `Fields` entry naming it — not
+        // the missing-resource answer an operation acting on an existing resource gives.
         if !store.global_networks.contains_key(&input.global_network_id) {
-            return Err(CreateSiteErrorModeled::ResourceNotFoundException(
-                crate::state::resource_not_found(
+            return Err(CreateSiteErrorModeled::ValidationException(
+                crate::state::unknown_reference(
+                    crate::state::FIELD_GLOBAL_NETWORK_ID,
                     crate::state::GLOBAL_NETWORK_KIND,
-                    &input.global_network_id,
                 ),
             )
             .into());
