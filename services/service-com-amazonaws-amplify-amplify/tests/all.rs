@@ -19,6 +19,8 @@ mod app_branch_projection;
 mod app_branch_updates;
 #[path = "all/branch_deletion_visibility.rs"]
 mod branch_deletion_visibility;
+#[path = "all/branch_duplicate_refusal.rs"]
+mod branch_duplicate_refusal;
 #[path = "all/branch_jobs.rs"]
 mod branch_jobs;
 #[path = "all/branch_revision_echo.rs"]
