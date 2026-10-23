@@ -35,6 +35,8 @@ mod method_response;
 mod patch_updates;
 #[path = "all/query_value_coercion.rs"]
 mod query_value_coercion;
+#[path = "all/resource_tagging.rs"]
+mod resource_tagging;
 #[path = "all/rest_api_defaults.rs"]
 mod rest_api_defaults;
 #[path = "all/rest_api_identifier_refusals.rs"]

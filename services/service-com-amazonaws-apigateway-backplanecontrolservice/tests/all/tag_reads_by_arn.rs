@@ -38,7 +38,7 @@ const REGION: &str = "us-east-1";
 /// An API Gateway ARN for the resource portion `path`. API Gateway's own ARNs carry an
 /// EMPTY account segment — `arn:aws:apigateway:{region}::/restapis/{id}` — which is the
 /// form an SDK puts in a tag call's `resourceArn`.
-fn apigateway_arn(path: &str) -> String {
+pub(crate) fn apigateway_arn(path: &str) -> String {
     format!("arn:aws:apigateway:{REGION}::{path}")
 }
 
@@ -47,12 +47,12 @@ fn apigateway_arn(path: &str) -> String {
 /// and covers the `:` and `/` of an ARN, so the whole ARN travels as `%3A`/`%2F` inside
 /// ONE path segment of `/tags/{resourceArn}`. The encoding itself is the
 /// `percent-encoding` crate's.
-fn encode_label(value: &str) -> String {
+pub(crate) fn encode_label(value: &str) -> String {
     percent_encoding::utf8_percent_encode(value, percent_encoding::NON_ALPHANUMERIC).to_string()
 }
 
 /// `GetTags` for `arn`.
-async fn get_tags(gateway: &Gateway, arn: &str) -> Answer {
+pub(crate) async fn get_tags(gateway: &Gateway, arn: &str) -> Answer {
     gateway
         .call("GET", &format!("/tags/{}", encode_label(arn)), None)
         .await
