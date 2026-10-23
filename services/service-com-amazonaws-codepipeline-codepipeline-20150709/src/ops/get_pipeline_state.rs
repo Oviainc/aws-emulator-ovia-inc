@@ -172,7 +172,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(GetPipelineStateOutput {
             pipeline_name: Some(pipeline.declaration.name.clone()),
             pipeline_version: Some(pipeline.version),
-            stage_states: Some(pipeline.stage_states()),
+            stage_states: Some(pipeline.stage_states(&state.action_revisions)),
             created: Some(crate::state::to_date_time(pipeline.created)),
             updated: Some(crate::state::to_date_time(pipeline.updated)),
         })
