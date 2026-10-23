@@ -20,7 +20,8 @@ use std::collections::{BTreeMap, HashMap};
 use crate::ops::types::{
     AutomationRulesAction, AutomationRulesFindingFieldsUpdate, AutomationRulesFindingFilters,
     AwsSecurityFinding, BooleanFilter, DateFilter, DateRange, FindingHistoryUpdate, Note,
-    NumberFilter, Severity, Standard, StandardsManagedBy, StringFilter, Workflow,
+    NumberFilter, Severity, Standard, StandardsManagedBy, StandardsSubscription, StringFilter,
+    Workflow,
 };
 
 /// The hub resource is one per account and Region, named `hub/default`.
@@ -683,6 +684,39 @@ pub fn settle_standards(
         if record.standards_status == STANDARDS_STATUS_PENDING && now >= record.ready_due_nanos {
             record.standards_status = STANDARDS_STATUS_READY.to_string();
         }
+    }
+}
+
+/// The published standard a `StandardsArn` names for a request in `region`, or `None`
+/// when no standard of the catalog carries that ARN there. The single definition of
+/// which `StandardsArn` values an account can enable, so every operation that takes
+/// one resolves it the same way.
+pub fn standard_by_arn(region: &str, standards_arn: &str) -> Option<StandardDefinition> {
+    STANDARDS_CATALOG
+        .into_iter()
+        .find(|definition| standard_arn(region, definition) == standards_arn)
+}
+
+/// One stored subscription as the modelled `StandardsSubscription` every operation
+/// that reports a subscription answers with, so `BatchEnableStandards` and
+/// `GetEnabledStandards` cannot describe the same resource differently.
+pub fn standards_subscription_view(
+    key: &StandardsSubscriptionKey,
+    record: &StandardsSubscriptionRecord,
+) -> StandardsSubscription {
+    StandardsSubscription {
+        standards_subscription_arn: record.standards_subscription_arn.clone(),
+        standards_arn: key.standards_arn.clone(),
+        standards_input: record.standards_input.clone(),
+        standards_status: record.standards_status.clone(),
+        standards_controls_updatable: Some(
+            standards_controls_updatable(&record.standards_status).to_string(),
+        ),
+        // `StandardsStatusReason` reports why a standard could not be enabled or
+        // disabled; a subscription that is enabling or enabled has no reason to
+        // report.
+        standards_status_reason: None,
+        provider: Some(record.provider.clone()),
     }
 }
 
