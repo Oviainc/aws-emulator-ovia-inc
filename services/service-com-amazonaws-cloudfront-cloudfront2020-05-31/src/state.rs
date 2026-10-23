@@ -2068,6 +2068,38 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
         stored.deployed_due = now + PROPAGATION_DELAY;
         Some(stored)
     }
+
+    /// Replace the comment of the key value store `name` names, and report the record as
+    /// it now stands.
+    ///
+    /// `KeyValueStore$Comment` is the only member `UpdateKeyValueStore` submits, so the
+    /// stored comment becomes the one submitted, `LastModifiedTime` becomes `now` — "when
+    /// the resource last changed" — and the version token is freshly minted, so the token
+    /// the caller sent no longer satisfies an `If-Match` against this store.
+    ///
+    /// The store's identity (name, id, ARN) and its PROVISIONING progress are untouched:
+    /// changing a comment neither re-provisions the store's data plane nor renames it, so
+    /// [`StoredKeyValueStore::status`] and [`StoredKeyValueStore::ready_due`] stay as the
+    /// create left them and the clock still owes the same transition at the same instant.
+    ///
+    /// `None` when the store holds no such key value store, checked BEFORE the mint so a
+    /// version token is never spent on a store that is not there.
+    pub fn apply_key_value_store_comment(
+        &mut self,
+        name: &str,
+        comment: String,
+        now: SystemTime,
+    ) -> Option<&StoredKeyValueStore> {
+        if !self.key_value_stores.contains_key(name) {
+            return None;
+        }
+        let etag = self.next_etag();
+        let stored = self.key_value_stores.get_mut(name)?;
+        stored.comment = comment;
+        stored.last_modified_time = now;
+        stored.etag = etag;
+        Some(stored)
+    }
 }
 
 /// Why a create was refused, for the calling operation to report as its own modelled

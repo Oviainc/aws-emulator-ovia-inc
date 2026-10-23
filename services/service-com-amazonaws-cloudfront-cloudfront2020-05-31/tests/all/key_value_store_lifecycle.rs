@@ -41,7 +41,7 @@ use crate::distribution_lifecycle::{
 // ---------------------------------------------------------------------------
 
 /// `POST /2020-05-31/key-value-store` with the request document `body`.
-async fn create_key_value_store(router: &MultiServiceRouter, body: &str) -> Answer {
+pub(crate) async fn create_key_value_store(router: &MultiServiceRouter, body: &str) -> Answer {
     call(
         router,
         "POST",
@@ -53,7 +53,7 @@ async fn create_key_value_store(router: &MultiServiceRouter, body: &str) -> Answ
 }
 
 /// `GET /2020-05-31/key-value-store/{Name}`.
-async fn describe_key_value_store(router: &MultiServiceRouter, name: &str) -> Answer {
+pub(crate) async fn describe_key_value_store(router: &MultiServiceRouter, name: &str) -> Answer {
     call(
         router,
         "GET",
@@ -70,18 +70,18 @@ async fn describe_key_value_store(router: &MultiServiceRouter, name: &str) -> An
 
 /// One `CreateKeyValueStore` request a client submits.
 #[derive(Debug, Clone)]
-struct Create {
-    case: &'static str,
-    name: String,
+pub(crate) struct Create {
+    pub(crate) case: &'static str,
+    pub(crate) name: String,
     /// `Comment`, or `None` to leave the optional member out of the document entirely.
-    comment: Option<String>,
+    pub(crate) comment: Option<String>,
     /// `Tags.Items`, as `(Key, Value)` pairs.
-    tags: Vec<(String, String)>,
+    pub(crate) tags: Vec<(String, String)>,
 }
 
 impl Create {
     /// The `CreateKeyValueStoreRequest` XML a client sends for this create.
-    fn xml(&self) -> String {
+    pub(crate) fn xml(&self) -> String {
         let mut out = format!(
             "<CreateKeyValueStoreRequest xmlns=\"http://cloudfront.amazonaws.com/doc/{API_VERSION}/\">"
         );
@@ -112,7 +112,7 @@ impl Create {
 }
 
 /// Escape the five entities XML predefines, so a comment may carry any text.
-fn escape(text: &str) -> String {
+pub(crate) fn escape(text: &str) -> String {
     text.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
@@ -171,7 +171,7 @@ fn create_table() -> Vec<Create> {
 
 /// Whether `value` has the shape of a CloudFront version token (`ETag`): `E` followed by
 /// 13 uppercase alphanumerics, the shape this service's own ids and tokens take.
-fn is_version_token(value: &str) -> bool {
+pub(crate) fn is_version_token(value: &str) -> bool {
     match value.strip_prefix('E') {
         Some(body) => {
             body.len() == 13
@@ -184,7 +184,7 @@ fn is_version_token(value: &str) -> bool {
 }
 
 /// The text of one member of the `KeyValueStore` document, or a panic naming the case.
-fn member(store: &Node, name: &str, case: &str, raw: &str) -> String {
+pub(crate) fn member(store: &Node, name: &str, case: &str, raw: &str) -> String {
     store
         .text_at(name)
         .unwrap_or_else(|| panic!("case {case}: the answer carries no {name}: {raw}"))
