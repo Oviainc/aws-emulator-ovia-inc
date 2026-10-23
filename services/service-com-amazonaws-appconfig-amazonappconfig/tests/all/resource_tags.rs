@@ -59,8 +59,9 @@ fn pct(value: &str) -> String {
 }
 
 /// A deterministic string of `length` ASCII letters, for exercising a documented length
-/// bound rather than one hand-picked spelling.
-fn filler(length: usize, seed: u8) -> String {
+/// bound rather than one hand-picked spelling. `pub(crate)` because the other suites in
+/// this target exercise the same bounds.
+pub(crate) fn filler(length: usize, seed: u8) -> String {
     (0..length)
         .map(|index| char::from(b'a' + ((index as u8).wrapping_add(seed) % 26)))
         .collect()
@@ -88,7 +89,7 @@ async fn tag(router: &MultiServiceRouter, resource_arn: &str, tags: &Value) -> A
 }
 
 /// `GET /tags/{ResourceArn}`.
-async fn list_tags(router: &MultiServiceRouter, resource_arn: &str) -> Answer {
+pub(crate) async fn list_tags(router: &MultiServiceRouter, resource_arn: &str) -> Answer {
     json_call(
         router,
         "GET",
@@ -141,9 +142,10 @@ async fn reported_tags(
 }
 
 /// One ARN this emulator mints for an AppConfig resource: the resource portion is the
-/// `/`-separated type/id path rooted at the owning application, which is what
+/// `/`-separated type/id path rooted at the owning application (or at the resource type,
+/// for a resource that has no owning application), which is what
 /// `crate::state::parse_resource_arn` reads.
-fn arn(resource: &str) -> String {
+pub(crate) fn arn(resource: &str) -> String {
     engine::emulator_arn("appconfig", REGION, resource)
 }
 

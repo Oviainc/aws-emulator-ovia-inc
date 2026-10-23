@@ -41,6 +41,10 @@ pub const GROWTH_LINEAR: &str = "LINEAR";
 /// See [`GROWTH_LINEAR`].
 pub const GROWTH_EXPONENTIAL: &str = "EXPONENTIAL";
 
+/// The `ReplicateTo` value meaning the strategy is saved nowhere but AppConfig, from
+/// `REPLICATE_TO_VALUES` in `crate::ops::types`.
+pub const REPLICATE_TO_NONE: &str = "NONE";
+
 /// `DeploymentEventType` values this service records, from
 /// `DEPLOYMENT_EVENT_TYPE_VALUES` in `crate::ops::types`.
 pub const EVENT_DEPLOYMENT_STARTED: &str = "DEPLOYMENT_STARTED";
@@ -198,8 +202,9 @@ pub fn first_tag_key_rejection(tags: &HashMap<String, String>) -> Option<String>
 /// portions are `/`-separated type/id pairs rooted at the owning application
 /// (`application/<id>`, `application/<id>/environment/<id>`,
 /// `application/<id>/configurationprofile/<id>`,
-/// `application/<id>/environment/<id>/deployment/<number>`), which is what
-/// [`parse_resource_arn`] reads.
+/// `application/<id>/environment/<id>/deployment/<number>`) or, for a resource that has no
+/// owning application, at the resource type itself (`deploymentstrategy/<id>`), which is
+/// what [`parse_resource_arn`] reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaggedResource<'arn> {
     /// `application/<application id>`.
@@ -220,6 +225,12 @@ pub enum TaggedResource<'arn> {
         environment_id: &'arn str,
         deployment_number: i32,
     },
+    /// `deploymentstrategy/<deployment strategy id>`. A deployment strategy belongs to
+    /// the account rather than to an application, so its resource portion is rooted at
+    /// the type.
+    DeploymentStrategy {
+        deployment_strategy_id: &'arn str,
+    },
 }
 
 /// The resource `resource_arn` addresses, or `None` when it addresses nothing whose tags
@@ -230,10 +241,11 @@ pub enum TaggedResource<'arn> {
 /// account, [`::engine::EMULATOR_ACCOUNT_ID`], and its store is not partitioned by
 /// region), so what is read is the service namespace — which must be
 /// [`SERVICE_NAMESPACE`] — and the resource portion. An ARN naming an AppConfig resource
-/// type whose tags this service does not persist (a deployment strategy, a hosted
-/// configuration version, an extension or an extension association: no record this
-/// service stores for one carries a tag map) answers `None`, exactly as an ARN naming a
-/// resource that does not exist does.
+/// type whose tags this service does not persist (a hosted configuration version, an
+/// extension or an extension association: no record this service stores for one carries a
+/// tag map) answers `None`, exactly as an ARN naming a resource that does not exist does —
+/// which includes a predefined `AppConfig.*` deployment strategy, since this service stores
+/// no record for one.
 pub fn parse_resource_arn(resource_arn: &str) -> Option<TaggedResource<'_>> {
     let mut sections = resource_arn.splitn(6, ':');
     let prefix = sections.next()?;
@@ -282,6 +294,11 @@ pub fn parse_resource_arn(resource_arn: &str) -> Option<TaggedResource<'_>> {
                 // AppConfig numbers a deployment, so a resource portion whose last
                 // segment is not a deployment number addresses no deployment.
                 deployment_number: number.parse().ok()?,
+            })
+        }
+        ["deploymentstrategy", deployment_strategy_id] if named(deployment_strategy_id) => {
+            Some(TaggedResource::DeploymentStrategy {
+                deployment_strategy_id,
             })
         }
         _ => None,
@@ -378,6 +395,11 @@ pub struct DeploymentStrategy {
     pub growth_factor: f32,
     pub final_bake_time_in_minutes: i32,
     pub replicate_to: String,
+    /// The metadata `CreateDeploymentStrategy` was asked to assign to this strategy.
+    /// Held like an application's or an environment's tags: the `DeploymentStrategy`
+    /// shape carries none, so they are reported by the tagging operations rather than
+    /// by the strategy readers.
+    pub tags: HashMap<String, String>,
 }
 
 impl From<&PredefinedStrategy> for DeploymentStrategy {
@@ -391,7 +413,8 @@ impl From<&PredefinedStrategy> for DeploymentStrategy {
             growth_type: predefined.growth_type.to_string(),
             growth_factor: predefined.growth_factor,
             final_bake_time_in_minutes: predefined.final_bake_time_in_minutes,
-            replicate_to: "NONE".to_string(),
+            replicate_to: REPLICATE_TO_NONE.to_string(),
+            tags: HashMap::new(),
         }
     }
 }
@@ -870,8 +893,9 @@ impl ComAmazonawsAppconfigAmazonappconfigState {
     /// Answers `false`, having stored nothing, when this service already holds
     /// [`MAX_DEPLOYMENT_STRATEGIES`] of them — the bound that keeps a loop of create
     /// calls from growing the emulator's heap without limit. `CreateDeploymentStrategy`
-    /// (still a 501 of its own) is the caller this exists for; replacing a strategy that
-    /// already exists under the same id is not growth and is always allowed.
+    /// is the caller this exists for, and answers that `false` with the
+    /// `ServiceQuotaExceededException` it models; replacing a strategy that already
+    /// exists under the same id is not growth and is always allowed.
     pub fn try_insert_strategy(&mut self, strategy: DeploymentStrategy) -> bool {
         let replacing = self.deployment_strategies.contains_key(&strategy.id);
         if !replacing && self.deployment_strategies.len() >= MAX_DEPLOYMENT_STRATEGIES {
@@ -968,6 +992,11 @@ impl ComAmazonawsAppconfigAmazonappconfigState {
                     .get(&deployment_number)?
                     .tags,
             ),
+            // Only a strategy this account CREATED has a record here; a predefined
+            // `AppConfig.*` one is not stored, so it carries no tag map.
+            TaggedResource::DeploymentStrategy {
+                deployment_strategy_id,
+            } => Some(&self.deployment_strategies.get(deployment_strategy_id)?.tags),
         }
     }
 
@@ -1012,6 +1041,14 @@ impl ComAmazonawsAppconfigAmazonappconfigState {
                     .get_mut(environment_id)?
                     .deployments
                     .get_mut(&deployment_number)?
+                    .tags,
+            ),
+            TaggedResource::DeploymentStrategy {
+                deployment_strategy_id,
+            } => Some(
+                &mut self
+                    .deployment_strategies
+                    .get_mut(deployment_strategy_id)?
                     .tags,
             ),
         }

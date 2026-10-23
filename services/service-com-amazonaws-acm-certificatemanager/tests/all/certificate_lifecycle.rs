@@ -97,6 +97,26 @@ pub(crate) async fn call_in_region(
     operation: &str,
     body: &Value,
 ) -> (u16, Value) {
+    call_raw(
+        router,
+        region,
+        operation,
+        serde_json::to_vec(body).expect("the request body serializes"),
+    )
+    .await
+}
+
+/// Call one operation signed for `region` with `body` as the EXACT request bytes.
+///
+/// The byte-level form is what a test about the order of a request's own members
+/// needs: a `serde_json::Value` is a map, so the order its members reach the service
+/// in is the map's, not the test's.
+pub(crate) async fn call_raw(
+    router: &MultiServiceRouter,
+    region: &str,
+    operation: &str,
+    body: Vec<u8>,
+) -> (u16, Value) {
     let request = http::Request::builder()
         .method("POST")
         .uri("/")
@@ -110,9 +130,7 @@ pub(crate) async fn call_in_region(
                  SignedHeaders=host;x-amz-target, Signature=0000"
             ),
         )
-        .body(Bytes::from(
-            serde_json::to_vec(body).expect("the request body serializes"),
-        ))
+        .body(Bytes::from(body))
         .expect("a valid request");
     let response = router.dispatch(request).await;
     let status = response.status().as_u16();

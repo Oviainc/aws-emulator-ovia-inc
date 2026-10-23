@@ -249,7 +249,8 @@ fn seed(engine: &engine::InMemoryEngine) -> Seeded {
                 payer_responsibility_type: Some("vpc-endpoint-account".to_string()),
             }],
             tags: fixture.tags,
-        });
+        })
+        .expect("the store must have room for the seeded connection");
         endpoint_ids.push(endpoint_id);
         connection_ids.push(connection_id);
     }
@@ -384,7 +385,8 @@ async fn every_stored_connection_is_reported_and_a_later_write_is_visible() {
             gateway_load_balancer_arns: Vec::new(),
             payer_responsibilities: Vec::new(),
             tags: vec![tag("Name", "late")],
-        });
+        })
+        .expect("the store must have room for the seeded connection");
         endpoint_id
     };
 
@@ -625,7 +627,8 @@ async fn every_documented_state_selects_the_connection_in_that_state() {
                 gateway_load_balancer_arns: Vec::new(),
                 payer_responsibilities: Vec::new(),
                 tags: Vec::new(),
-            });
+            })
+            .expect("the store must have room for the seeded connection");
             endpoint_ids.push((documented, modelled, endpoint_id));
         }
     }
@@ -824,7 +827,8 @@ async fn a_page_size_above_the_maximum_returns_at_most_one_thousand() {
                 gateway_load_balancer_arns: Vec::new(),
                 payer_responsibilities: Vec::new(),
                 tags: Vec::new(),
-            });
+            })
+            .expect("the store must have room for the seeded connections");
         }
     }
 

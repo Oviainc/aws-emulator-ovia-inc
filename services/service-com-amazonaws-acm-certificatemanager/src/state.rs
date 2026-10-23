@@ -908,6 +908,16 @@ pub fn certificate_resource_message(resource_arn: &str, certificate_operation: &
 /// an issued certificate reports the same sentence.
 pub const NOT_ISSUED_MESSAGE: &str = "The selected certificate is not Issued and/or Valid.";
 
+/// The refusal sentence for a pagination token the service did not issue.
+///
+/// A `NextToken` is opaque and belongs to the page that issued it, so a token this
+/// service cannot read as one of its own names no position to resume from. The
+/// sentence comes from ACM's recorded behaviour: one constant sentence for the whole
+/// class, naming neither the token nor what was wrong with it — a caller cannot
+/// repair an opaque value, it can only restart the walk. Rendered here so every
+/// paginated read that answers this class reports the same sentence.
+pub const INVALID_NEXT_TOKEN_MESSAGE: &str = "Invalid next token.";
+
 /// The `ValidationException` message for an operation asked of a certificate export
 /// was never allowed for, built from the ARN the request asked for.
 ///
@@ -1481,6 +1491,11 @@ pub fn acme_endpoint_detail(endpoint: &AcmeEndpointRecord) -> AcmeEndpoint {
 /// record `certificate_detail` and `certificate_summary` project, split into the
 /// X.509 attributes and the ACM metadata that operation's filters select on.
 ///
+/// Every member here is the value the FILTER on that member compares, so a
+/// certificate a filter kept reports the value that kept it — a client that
+/// re-reads the attribute it filtered on sees what it asked for, and this
+/// projection and the filter cannot drift into two vocabularies for one attribute.
+///
 /// Members that belong to something this service never does stay absent, and are the
 /// members the search filters correspondingly keep nothing on:
 ///
@@ -1511,11 +1526,14 @@ pub fn certificate_search_result(cert: &Certificate) -> CertificateSearchResult 
                     .map(|name| GeneralName::DnsName(name.clone()))
                     .collect(),
             ),
-            // These attributes are "extracted from the certificate" (`X509Attributes`
-            // doc), so the key algorithm is reported in the same X.509 descriptor
-            // spelling the certificate's detail uses, not in the model enum's
-            // underscored spelling the search FILTERS are written in.
-            key_algorithm: Some(detail_key_algorithm(&cert.key_algorithm)),
+            // A search result reports each attribute as the value the FILTER on that
+            // attribute selects on, so a certificate a filter kept reports the value
+            // that kept it: `X509AttributeFilter.KeyAlgorithm` compares the stored
+            // `KeyAlgorithm` in the model enum's spelling (`EC_prime256v1`), which is
+            // therefore the spelling reported here. Only the certificate's DETAIL
+            // carries the X.509 descriptor spelling (see [`detail_key_algorithm`]),
+            // which no filter is written in.
+            key_algorithm: Some(cert.key_algorithm.clone()),
             // The X.509 key-usage extensions of an issued certificate; absent while
             // the record carries none.
             key_usages: (!cert.key_usages.is_empty()).then(|| cert.key_usages.clone()),

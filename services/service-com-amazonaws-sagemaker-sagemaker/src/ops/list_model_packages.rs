@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListModelPackages
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListModelPackages`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListModelPackages::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -123,6 +114,47 @@ impl From<ListModelPackagesErrorModeled> for ListModelPackagesError {
     }
 }
 
+/// `ModelPackageType`'s members, as the member's own doc describes them: `Unversioned`
+/// lists only packages registered under a `ModelPackageName`, `Versioned` only the
+/// versions registered into a model package group, and `Both` lists either. Named here so
+/// the selection below compares no bare string literal; the accepted SET is the generated
+/// `MODEL_PACKAGE_TYPE_VALUES`, so a refusal stays in step with the model.
+const PACKAGE_TYPE_UNVERSIONED: &str = "Unversioned";
+/// See [`PACKAGE_TYPE_UNVERSIONED`].
+const PACKAGE_TYPE_VERSIONED: &str = "Versioned";
+
+/// `ModelPackageSortBy`'s `Name` member, named here for the same reason as
+/// [`PACKAGE_TYPE_UNVERSIONED`]: the sort below selects a key by a named member rather
+/// than by a bare string literal.
+const SORT_BY_NAME: &str = "Name";
+
+/// `SortOrder`'s default ON THIS OPERATION: "The sort order for the results. The default
+/// is `Ascending`." (`ListModelPackagesInput$SortOrder`'s own model doc, reproduced in
+/// this file's header).
+///
+/// It is NOT `crate::state::DEFAULT_SORT_ORDER`, which is `Descending` because that is
+/// what `ListModels` and `ListEndpoints` document: the two operations genuinely differ,
+/// so this one reads its default from its own member rather than from the shared
+/// constant. `SortBy`'s default ("The default is `CreationTime`.") does agree with the
+/// shared `crate::state::DEFAULT_SORT_BY`, so that one is reused.
+const DOCUMENTED_DEFAULT_SORT_ORDER: &str = "Ascending";
+
+/// The `ModelPackageType` a request that names none selects.
+///
+/// `ModelPackageType`'s doc makes `UNVERSIONED` the default ("This is the default value
+/// if no `ModelPackageType` is specified"). `ModelPackageGroupName`'s doc, though, makes
+/// that filter one "that returns only model VERSIONS that belong to the specified model
+/// group" — and a version is never unversioned, so keeping the unversioned default
+/// alongside a group filter would make that member select nothing it documents. A request
+/// that names a group therefore defaults to `Versioned`; one that names no group defaults
+/// to `Unversioned`. An explicit `ModelPackageType` always wins.
+fn default_package_type(group_filter: Option<&str>) -> &'static str {
+    match group_filter {
+        Some(_) => PACKAGE_TYPE_VERSIONED,
+        None => PACKAGE_TYPE_UNVERSIONED,
+    }
+}
+
 /// The `ListModelPackages` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -159,18 +191,207 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListModelPackages` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListModelPackagesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListModelPackages"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        let sort_by = input
+            .sort_by
+            .as_deref()
+            .unwrap_or(crate::state::DEFAULT_SORT_BY);
+        if !MODEL_PACKAGE_SORT_BY_VALUES.contains(&sort_by) {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "SortBy must be one of {}; got \"{sort_by}\".",
+                MODEL_PACKAGE_SORT_BY_VALUES.join(", ")
+            )));
+        }
+        let sort_order = input
+            .sort_order
+            .as_deref()
+            .unwrap_or(DOCUMENTED_DEFAULT_SORT_ORDER);
+        if !ORDER_KEY_VALUES.contains(&sort_order) {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "SortOrder must be one of {}; got \"{sort_order}\".",
+                ORDER_KEY_VALUES.join(", ")
+            )));
+        }
+        let descending = sort_order == crate::state::ORDER_DESCENDING;
+
+        // Each filter that selects on one member of a modelled enum accepts exactly the
+        // members the model declares; anything else is refused rather than quietly
+        // matching nothing.
+        if let Some(approval) = input.model_approval_status.as_deref() {
+            if !MODEL_APPROVAL_STATUS_VALUES.contains(&approval) {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "ModelApprovalStatus must be one of {}; got \"{approval}\".",
+                    MODEL_APPROVAL_STATUS_VALUES.join(", ")
+                )));
+            }
+        }
+        if let Some(kind) = input.model_package_type.as_deref() {
+            if !MODEL_PACKAGE_TYPE_VALUES.contains(&kind) {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "ModelPackageType must be one of {}; got \"{kind}\".",
+                    MODEL_PACKAGE_TYPE_VALUES.join(", ")
+                )));
+            }
+        }
+
+        // `ModelPackageGroupName` is an `ArnOrName`, so a caller may name the group by
+        // its ARN; the store keys versions by the group's NAME.
+        let group_filter = input
+            .model_package_group_name
+            .as_deref()
+            .map(crate::state::name_from_arn_or_name);
+        let package_type = input
+            .model_package_type
+            .as_deref()
+            .unwrap_or_else(|| default_package_type(group_filter));
+
+        let after = input.creation_time_after.map(crate::state::timestamp_key);
+        let before = input.creation_time_before.map(crate::state::timestamp_key);
+
+        let mut store = state.lock();
+
+        // The one write a reporting call makes: every registration the clock already
+        // owed. Each was due at its stored instant whether or not anybody listed the
+        // packages, so this listing reports the status a `DescribeModelPackage` at the
+        // same instant reports instead of a status the package has already left.
+        let now = ::std::time::SystemTime::now();
+        let mut settled: Vec<String> = Vec::new();
+        for package in store.model_packages.values_mut() {
+            if package.settle_status(now) {
+                settled.push(package.arn.clone());
+            }
+        }
+
+        let mut matching: Vec<&crate::state::ModelPackage> = store
+            .model_packages
+            .values()
+            .filter(|package| match package_type {
+                // A version registered into a group carries a version number; an
+                // unversioned registration carries none. `Both` selects either.
+                PACKAGE_TYPE_VERSIONED => package.version.is_some(),
+                PACKAGE_TYPE_UNVERSIONED => package.version.is_none(),
+                _ => true,
+            })
+            .filter(|package| {
+                group_filter.is_none_or(|group| package.group_name.as_deref() == Some(group))
+            })
+            .filter(|package| {
+                input
+                    .name_contains
+                    .as_deref()
+                    .is_none_or(|needle| package.name.contains(needle))
+            })
+            .filter(|package| {
+                input
+                    .model_approval_status
+                    .as_deref()
+                    .is_none_or(|approval| package.model_approval_status.as_deref() == Some(approval))
+            })
+            .filter(|package| {
+                // Both bounds are inclusive, as the rest of this service's listings apply
+                // them, so a timestamp copied straight out of a prior response's
+                // `CreationTime` still selects the package carrying it.
+                let created =
+                    crate::state::timestamp_key(crate::state::timestamp(package.creation_time));
+                after.is_none_or(|bound| created >= bound)
+                    && before.is_none_or(|bound| created <= bound)
+            })
+            .collect();
+        // `SortOrder` reverses the SORT KEY only. The tie-break stays
+        // `(ModelPackageName, ModelPackageVersion)` ascending in both directions, so the
+        // versions of one group — which share both a name and, within a sub-millisecond
+        // burst, a creation instant — keep one order whichever way the page is sorted, and
+        // a `NextToken` resolved against a freshly computed result set lands on the same
+        // boundary. The version is compared as a NUMBER, so version 10 follows version 9.
+        matching.sort_by(|left, right| {
+            let by_key = if sort_by == SORT_BY_NAME {
+                left.name.cmp(&right.name)
+            } else {
+                crate::state::timestamp_key(crate::state::timestamp(left.creation_time)).cmp(
+                    &crate::state::timestamp_key(crate::state::timestamp(right.creation_time)),
+                )
+            };
+            let by_key = if descending { by_key.reverse() } else { by_key };
+            by_key
+                .then_with(|| left.name.cmp(&right.name))
+                .then_with(|| left.version.cmp(&right.version))
+        });
+
+        // The token names the package the previous page stopped at by its store key
+        // (`<group>/<version>` for a version, the bare name otherwise), which is what
+        // identifies one record among the versions sharing a name. A token naming no
+        // boundary of this result set is refused — and the refusal is carried to the end
+        // of the call rather than returned here, so the transitions settled above leave
+        // their records on EVERY exit path instead of changing the store unrecorded.
+        let resumed = match input.next_token.as_deref() {
+            None => Ok(0),
+            Some(token) => crate::state::decode_page_token(token)
+                .and_then(|key| matching.iter().position(|package| package.key() == key))
+                .map(|resumed_after| resumed_after + 1)
+                .ok_or_else(|| {
+                    crate::scaffolded::Scaffolded::validation(
+                        "NextToken does not name a page boundary of this result set; \
+                         restart the listing without it.",
+                    )
+                }),
+        };
+
+        let outcome = resumed.map(|start| {
+            // `MaxResults` caps the page, and so does the service's own ceiling: an absent
+            // or larger `MaxResults` still cannot make one call serialise the whole store.
+            // The token below is emitted whenever anything is left, so a paginating client
+            // walks the full result set exactly once either way.
+            let start = start.min(matching.len());
+            let page_size = input
+                .max_results
+                .map_or(crate::state::MAX_PAGE_SIZE, |max| {
+                    max.clamp(1, crate::state::MAX_PAGE_SIZE)
+                })
+                .unsigned_abs() as usize;
+            let end = start.saturating_add(page_size).min(matching.len());
+            let page = &matching[start..end];
+
+            let next_token = match page.last() {
+                // A token only where a further page exists, so a paginating client stops.
+                Some(last) if end < matching.len() => {
+                    Some(crate::state::encode_page_token(&last.key()))
+                }
+                _ => None,
+            };
+
+            ListModelPackagesOutput {
+                model_package_summary_list: page
+                    .iter()
+                    .map(|package| ModelPackageSummary {
+                        // `ModelPackageName` is documented unconditionally ("The name of
+                        // the model package"), unlike `ModelPackageGroupName` and
+                        // `ModelPackageVersion`, which their docs qualify with "if the
+                        // model package is a versioned model" — so a version reports its
+                        // group's name here too, as `DescribeModelPackage` does.
+                        model_package_name: Some(package.name.clone()),
+                        model_package_group_name: package.group_name.clone(),
+                        model_package_version: package.version,
+                        model_package_arn: package.arn.clone(),
+                        model_package_description: package.description.clone(),
+                        creation_time: crate::state::timestamp(package.creation_time),
+                        model_package_status: package.status.clone(),
+                        model_approval_status: package.model_approval_status.clone(),
+                        model_life_cycle: package.model_life_cycle.clone(),
+                        model_package_registration_type: package.registration_type.clone(),
+                    })
+                    .collect(),
+                next_token,
+            }
+        });
+        drop(store);
+
+        for arn in &settled {
+            // A transition is a state change, so it leaves the same record a create does
+            // rather than happening unobservably on a read path.
+            crate::state::record_state_change(Self::NAME, arn, ctx);
+        }
+        outcome
     }
 }

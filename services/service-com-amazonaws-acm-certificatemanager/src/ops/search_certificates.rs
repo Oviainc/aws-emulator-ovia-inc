@@ -314,18 +314,32 @@ const METADATA_PATH: &str = "FilterStatement.Filter.AcmCertificateMetadataFilter
 ///
 /// A CHOSEN bound, not a documented one: the model caps an `And`/`Or` list at 15
 /// elements but says nothing about depth, and a statement tree is walked recursively
-/// — once to validate it and once per stored certificate to evaluate it — so an
-/// unbounded tree from one request would decide how deep this process recurses and how
-/// much work every certificate costs. It is enforced BEFORE any certificate is
-/// matched, so the evaluation walk is bounded by the same number, and it is far above
-/// any statement a caller writes.
-const MAX_STATEMENT_DEPTH: usize = 20;
+/// — once to READ it, once to validate it and once per stored certificate to evaluate
+/// it — so an unbounded tree from one request would decide how deep this process
+/// recurses and how much work every certificate costs. The READER enforces it first
+/// (`CertificateFilterStatement`'s `DeserializableStruct` impl, which recurses on the
+/// native stack), so a statement past the bound never becomes a value at all; this
+/// walk re-checks it because a statement can also be built in-process, and it is far
+/// above any statement a caller writes.
+pub(crate) const MAX_STATEMENT_DEPTH: usize = 20;
 
 /// The most filter nodes one `FilterStatement` may hold, bounding the work each
 /// stored certificate costs — a CHOSEN bound for the same reason as
-/// [`MAX_STATEMENT_DEPTH`], and more than the model's 15-element lists hold at three
-/// levels of nesting.
-const MAX_STATEMENT_NODES: usize = 10_000;
+/// [`MAX_STATEMENT_DEPTH`], enforced at the same two places, and more than the
+/// model's 15-element lists hold at three levels of nesting.
+pub(crate) const MAX_STATEMENT_NODES: usize = 10_000;
+
+/// The refusal for a statement nested deeper than [`MAX_STATEMENT_DEPTH`], rendered
+/// here so the reader and this walk state one bound in one sentence.
+pub(crate) fn statement_depth_message() -> String {
+    format!("FilterStatement may nest at most {MAX_STATEMENT_DEPTH} levels of And, Or and Not")
+}
+
+/// The refusal for a statement carrying more than [`MAX_STATEMENT_NODES`] nodes,
+/// rendered here for the same reason as [`statement_depth_message`].
+pub(crate) fn statement_nodes_message() -> String {
+    format!("FilterStatement may carry at most {MAX_STATEMENT_NODES} filters")
+}
 
 /// Refuse a filter statement no certificate could be compared against.
 ///
@@ -372,14 +386,10 @@ fn validate_nested(
     remaining_nodes: &mut usize,
 ) -> Result<(), SearchCertificatesError> {
     if depth > MAX_STATEMENT_DEPTH {
-        return Err(validation_exception(format!(
-            "FilterStatement may nest at most {MAX_STATEMENT_DEPTH} levels of And, Or and Not"
-        )));
+        return Err(validation_exception(statement_depth_message()));
     }
     let Some(left) = remaining_nodes.checked_sub(1) else {
-        return Err(validation_exception(format!(
-            "FilterStatement may carry at most {MAX_STATEMENT_NODES} filters"
-        )));
+        return Err(validation_exception(statement_nodes_message()));
     };
     *remaining_nodes = left;
     match statement {

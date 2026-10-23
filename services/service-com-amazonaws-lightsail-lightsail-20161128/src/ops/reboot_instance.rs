@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RebootInstance
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RebootInstance`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Restarts a stored instance in place: the record — and with it every address the
+//! store assigned the instance — is left exactly as it is, and the restart is
+//! recorded in the operation log.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RebootInstance::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -163,18 +159,95 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RebootInstance` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RebootInstanceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RebootInstance"))
+        let _ = ctx;
+
+        let name = input.instance_name;
+        let now = crate::state::now_ms();
+
+        crate::state::with_state(&*self.engine, |store| {
+            // Read the one stored record this call is about. A reboot restarts the
+            // instance's operating system IN PLACE, so nothing on the record is
+            // rewritten: a Lightsail instance is an EC2 instance, and the EC2 user
+            // guide's "Reboot your instance" says a rebooted instance "remains on
+            // the same host computer and maintains its public DNS name, private IP
+            // address, and any data on its instance store volumes" — unlike a stop
+            // and start, after which Lightsail assigns a new public IP address (the
+            // modelled `StopInstance` documentation). The record is therefore read,
+            // not taken mutably.
+            let Some(instance) = store.instance(&name) else {
+                return Err(not_found(&name));
+            };
+            let location = instance.location.clone();
+            let state = instance.state;
+
+            // There has to be a running operating system to restart: an instance
+            // that is stopped, or on its way down, has none, so the request is
+            // refused rather than quietly doing nothing. EC2 refuses that reboot as
+            // `IncorrectInstanceState`; Lightsail's modelled counterpart for a call
+            // its resource's state does not allow is `OperationFailureException`. An
+            // instance that is still coming up is already on its way to serving,
+            // which is what the caller asked for, so it is accepted.
+            if state == crate::state::STOPPED || state == crate::state::STOPPING {
+                return Err(operation_failure(format!(
+                    "The instance {name} is {}: an instance can be rebooted only while it \
+                     is {} or coming up. Start it instead.",
+                    state.name,
+                    crate::state::RUNNING.name,
+                )));
+            }
+
+            // The restart itself is what the log records. It is answered
+            // non-terminal — the instance goes down and comes back up after the call
+            // returns — and the clock owes it its `Succeeded` status, exactly as it
+            // does for every other mutating Lightsail call.
+            //
+            // `operations` is a list because other Lightsail calls act on several
+            // resources at once; `RebootInstance` acts on exactly one instance, so it
+            // answers exactly one entry, located where that instance is.
+            let operation = store.start_operation(
+                now,
+                crate::state::OPERATION_TYPE_REBOOT_INSTANCE,
+                crate::state::RESOURCE_TYPE_INSTANCE,
+                &name,
+                &location,
+                Some(now.saturating_add(crate::state::STATE_TRANSITION_MILLIS)),
+            );
+            Ok(RebootInstanceOutput {
+                operations: Some(vec![operation.view()]),
+            })
+        })
+        .ok_or_else(unavailable)?
     }
+}
+
+/// No instance of that name is stored: Lightsail's `DoesNotExist` rejection —
+/// HTTP 400, wire error `NotFoundException`, body `code` `DoesNotExist` and a
+/// message naming the resource type and the requested name.
+fn not_found(name: &str) -> RebootInstanceError {
+    crate::scaffolded::Scaffolded::resource_does_not_exist(
+        crate::state::RESOURCE_TYPE_INSTANCE,
+        name,
+    )
+}
+
+/// Lightsail's refusal of a well-formed request the instance's state does not
+/// allow: the modelled `OperationFailureException` — HTTP 400, "Lightsail throws
+/// this exception when an operation fails to execute" — whose message names the
+/// instance and the state it is in.
+fn operation_failure(message: String) -> RebootInstanceError {
+    RebootInstanceErrorModeled::OperationFailureException(OperationFailureException {
+        message: Some(message),
+        ..Default::default()
+    })
+    .into()
+}
+
+/// The store is unreachable — the engine is not the shared in-memory one. A
+/// modelled server fault, never a fresh engine.
+fn unavailable() -> RebootInstanceError {
+    RebootInstanceErrorModeled::ServiceException(ServiceException {
+        message: Some("the Lightsail instance store is unavailable".to_string()),
+        ..Default::default()
+    })
+    .into()
 }

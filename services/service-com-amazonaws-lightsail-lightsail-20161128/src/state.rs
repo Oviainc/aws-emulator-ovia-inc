@@ -336,6 +336,8 @@ pub const OPERATION_TYPE_START_INSTANCE: &str = "StartInstance";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_STOP_INSTANCE: &str = "StopInstance";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
+pub const OPERATION_TYPE_REBOOT_INSTANCE: &str = "RebootInstance";
+/// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_DELETE_INSTANCE: &str = "DeleteInstance";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_CREATE_DOMAIN: &str = "CreateDomain";
@@ -6183,6 +6185,14 @@ impl ComAmazonawsLightsailLightsail20161128State {
             &hex[16..20],
             &hex[20..32]
         )
+    }
+
+    /// The log entry `id` names, for a reporting operation.
+    ///
+    /// The log is append-only and bounded, so this is a linear scan of at most
+    /// [`MAX_OPERATION_HISTORY`] entries.
+    pub fn operation(&self, id: &str) -> Option<&StoredOperation> {
+        self.operations.iter().find(|entry| entry.id == id)
     }
 
     /// Append `operation` to the log, dropping the oldest entries past

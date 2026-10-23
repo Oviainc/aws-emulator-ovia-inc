@@ -37,6 +37,8 @@ mod certificate_search;
 mod certificate_tag_removal;
 #[path = "all/certificate_validation_state_machine.rs"]
 mod certificate_validation_state_machine;
+#[path = "all/refusal_codes_and_search_projection.rs"]
+mod refusal_codes_and_search_projection;
 #[path = "all/resend_validation_email.rs"]
 mod resend_validation_email;
 #[path = "all/resource_tagging.rs"]

@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDeploymentStrategy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDeploymentStrategy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDeploymentStrategy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a deployment strategy from the rollout criteria the request carries and stores
+//! it under this account, so a later `GetDeploymentStrategy` — and every
+//! `StartDeployment` naming the minted id — reads the record this call persisted.
 //!
 //! ## Shape of an operation
 //!
@@ -191,20 +186,108 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDeploymentStrategy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDeploymentStrategyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDeploymentStrategy"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateDeploymentStrategyErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("AppConfig state is not reachable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+        // Every tag key this request would store is checked through the same function
+        // `TagResource` refuses through, and before anything is written.
+        if let Some(reason) = input
+            .tags
+            .as_ref()
+            .and_then(crate::state::first_tag_key_rejection)
+        {
+            return Err(CreateDeploymentStrategyErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(reason),
+                    reason: None,
+                    details: None,
+                },
+            )
+            .into());
+        }
+
+        let mut store = state.lock();
+
+        // Every bound the model declares on these members — the 0..1440 minutes, the
+        // 1..100 growth factor, the name's and the description's lengths, the two enums
+        // and the tag map's size — is refused by the schema walk before this handler
+        // runs, so what is left to decide here is what an ABSENT optional member means.
+        let id = store.mint_id();
+        let strategy = crate::state::DeploymentStrategy {
+            id: id.clone(),
+            name: input.name,
+            description: input.description,
+            deployment_duration_in_minutes: input.deployment_duration_in_minutes,
+            // The model declares no default for `GrowthType`, but a strategy paces its
+            // rollout by one of the two algorithms that enum names, so a request
+            // stating neither gets the one that adds a flat percentage of targets per
+            // interval: `LINEAR`, the growth type all but one of AppConfig's own
+            // predefined strategies carry (`state::PREDEFINED_DEPLOYMENT_STRATEGIES`).
+            growth_type: input
+                .growth_type
+                .unwrap_or_else(|| crate::state::GROWTH_LINEAR.to_string()),
+            growth_factor: input.growth_factor,
+            final_bake_time_in_minutes: input.final_bake_time_in_minutes,
+            // `ReplicateTo` says where AppConfig ALSO saves the strategy ("Save the
+            // deployment strategy to a Systems Manager (SSM) document"), so a request
+            // naming nowhere replicates nowhere — the enum's `NONE`, which is what
+            // every predefined strategy carries too.
+            replicate_to: input
+                .replicate_to
+                .unwrap_or_else(|| crate::state::REPLICATE_TO_NONE.to_string()),
+            tags: input.tags.unwrap_or_default(),
+        };
+
+        // `try_insert_strategy` is the only way into the created-strategy map, and it
+        // refuses a write past `state::MAX_DEPLOYMENT_STRATEGIES` so a loop of create
+        // calls cannot grow this emulator's heap without limit. `mint_id` never answers
+        // an id another resource already holds, so a refusal here is that bound and
+        // nothing else.
+        if !store.try_insert_strategy(strategy) {
+            return Err(
+                CreateDeploymentStrategyErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(format!(
+                            "Cannot create another deployment strategy: this account already \
+                             holds the maximum of {} deployment strategies.",
+                            crate::state::MAX_DEPLOYMENT_STRATEGIES
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Answered by reading the strategy back out of the store, so this response
+        // cannot report anything a later `GetDeploymentStrategy` does not.
+        let Some(stored) = store.resolve_strategy(&id) else {
+            return Err(CreateDeploymentStrategyErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "The deployment strategy could not be re-read after it was stored"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        Ok(CreateDeploymentStrategyOutput {
+            id: Some(stored.id),
+            name: Some(stored.name),
+            description: stored.description,
+            deployment_duration_in_minutes: stored.deployment_duration_in_minutes,
+            growth_type: Some(stored.growth_type),
+            growth_factor: Some(stored.growth_factor),
+            final_bake_time_in_minutes: stored.final_bake_time_in_minutes,
+            replicate_to: Some(stored.replicate_to),
+        })
     }
 }

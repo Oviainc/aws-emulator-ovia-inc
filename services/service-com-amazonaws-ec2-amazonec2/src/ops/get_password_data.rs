@@ -1,15 +1,38 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetPasswordData
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetPasswordData`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetPasswordData::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: reports the password data EC2 holds for one instance of the calling
+//! account — the instance's own id, read back off the stored record, and the
+//! `PasswordData` blob, which is empty for an instance whose password is not
+//! available. An id outside the form EC2 issues is `InvalidInstanceID.Malformed` and an
+//! id inside that form which names no instance of the account is
+//! `InvalidInstanceID.NotFound` (both from [`crate::state::require_known_instance`],
+//! which is where that form is read), answered before `DryRun`, so a dry run reports
+//! whether the request WOULD have succeeded.
+//!
+//! ## Why the password data is empty
+//!
+//! EC2's Windows boot agent generates the administrator password once, at boot, and EC2
+//! keeps it ENCRYPTED under the PUBLIC KEY of the key pair the launch named; the caller
+//! decrypts it with the private half it kept ("The password is encrypted using the key
+//! pair that you specified when you launched the instance. You must provide the
+//! corresponding key pair file"). This emulator holds no key pair material: `CreateKeyPair`
+//! and `ImportKeyPair` are still scaffolds (`issues/.../*-ec2-createkeypair-stub.md`,
+//! `issues/.../*-ec2-importkeypair-stub.md`), so no key pair exists for a launch to name
+//! and there is no public key to encrypt a password under. A blob no caller could ever
+//! decrypt would be a FABRICATED password rather than a password, so what this reports is
+//! the answer the model documents for an instance whose password is not available:
+//! "Returns an empty string if the password is not available"
+//! (`GetPasswordDataResult$PasswordData`). The encryption step belongs here, over the
+//! public key of the named key pair, the day key pairs carry one.
+//!
+//! `Timestamp` is "the time the data was last updated", so it is reported only for data
+//! that exists: an instance the service holds no password data for has no instant at
+//! which that data was last written, and the member is optional in the model.
+//!
+//! This operation REPORTS; it writes nothing at all. Two calls about one instance answer
+//! the same thing, and a read can never change what a later caller sees.
 //!
 //! ## Shape of an operation
 //!
@@ -146,18 +169,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetPasswordData` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetPasswordDataErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetPasswordData"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{require_known_instance, require_service_state};
+
+        // Nothing about this answer depends on the request's Region or headers: the
+        // password data of an instance is a fact of that instance.
+        let _ = ctx;
+
+        let state = require_service_state(&*self.engine)?;
+        // A SHARED read: this operation reports and never writes, so it takes the
+        // guard only to read the instance store through it.
+        let store = state.lock();
+
+        // A malformed id before an unknown one, the order EC2 answers the two in.
+        require_known_instance(&store, &input.instance_id)?;
+
+        // DryRun sits AFTER the instance has been resolved: the flag asks whether the
+        // request WOULD have succeeded, so one naming an instance that does not exist
+        // is refused with that reason instead.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        // `require_known_instance` just resolved the id, so the lookup cannot miss;
+        // the `NotFound` keeps that invariant local rather than unwrapping.
+        let instance = store
+            .instances
+            .get(&input.instance_id)
+            .ok_or_else(|| Scaffolded::invalid_instance_id_not_found(&input.instance_id))?;
+
+        Ok(GetPasswordDataOutput {
+            // The id is read back off the stored record rather than echoed from the
+            // request, so the response names the instance the service resolved.
+            instance_id: Some(instance.instance_id.clone()),
+            // No key pair material exists for a launch to have named, so EC2 would hold
+            // no encrypted password for this instance: the documented empty string. See
+            // the module docs for why anything else here would be a fabrication.
+            password_data: Some(String::new()),
+            // "The time the data was last updated" — there is no data, so there is no
+            // such instant to report.
+            timestamp: None,
+        })
     }
 }

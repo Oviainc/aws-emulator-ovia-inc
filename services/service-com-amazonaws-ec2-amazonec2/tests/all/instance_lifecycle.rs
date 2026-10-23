@@ -1102,7 +1102,9 @@ async fn describe_instances_resolves_each_supported_filter() {
 async fn an_unknown_resource_id_is_refused_by_every_operation() {
     let ec2 = Ec2::new();
     let known = launch_one(&ec2, Vec::new()).await;
-    let unknown = "i-00000000000000000";
+    // Well formed and not the null id (which EC2 refuses as malformed), so every
+    // operation here has to look it up and find nothing.
+    let unknown = "i-00000000000000999";
 
     let cases: Vec<(&str, Vec<(String, String)>)> = vec![
         ("DescribeInstances", vec![p("InstanceId.1", unknown)]),
@@ -1413,10 +1415,14 @@ async fn dry_run_refuses_with_412_and_changes_nothing() {
     // DryRun says "this WOULD have succeeded", so a request that would in fact have
     // been refused is refused with that reason rather than answered 412. The id
     // resolution the five id-taking operations do only reads state.
-    let unresolvable: [(&str, &str); 2] = [
-        ("i-00000000000000000", "InvalidInstanceID.NotFound"),
+    let unresolvable: [(&str, &str); 3] = [
+        ("i-00000000000000999", "InvalidInstanceID.NotFound"),
         ("i-nope", "InvalidInstanceID.Malformed"),
-    ];    for (bad_id, code) in unresolvable {
+        // The null id is not an id EC2 issues, so it is refused by syntax rather
+        // than reported missing.
+        ("i-00000000000000000", "InvalidInstanceID.Malformed"),
+    ];
+    for (bad_id, code) in unresolvable {
         for action in [
             "DescribeInstances",
             "StartInstances",

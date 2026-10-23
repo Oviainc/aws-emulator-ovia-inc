@@ -8,6 +8,13 @@
 //! method publishes. Nothing here is echoed from the request beyond the certificate it
 //! names — `RequestCertificate` wrote those records, and this operation reads them.
 //!
+//! Every defect of the request's own parameters — a `CertificateArn` that names no ACM
+//! certificate, a `NextToken` this service did not issue — is ONE refusal class with
+//! one code, the `ValidationException` (HTTP 400) this service models for input that
+//! does not satisfy its constraints; the older `InvalidArgsException` this operation's
+//! modelled list names is not what it answers. A well-formed ARN no record answers to
+//! is a different class and keeps `ResourceNotFoundException`.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -83,6 +90,9 @@
 //! * `ResourceNotFoundException` (HTTP 400) — The specified certificate cannot be found in
 //!   the caller's account or the caller's account cannot be found.
 //! * `ThrottlingException` (HTTP 400) — The request was denied because it exceeded a quota.
+//! * `ValidationException` (HTTP 400) — widened in through `extra_errors` (see below): the
+//!   shape this SERVICE models for input that does not satisfy its constraints, and the
+//!   code this operation answers a bad `CertificateArn` or `NextToken` with.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -98,13 +108,24 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-acm-certificatemanager.
 // here — hence the `ListCertificateDomainValidationsError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.acm#ListCertificateDomainValidations")]
+//
+// `ValidationException` is widened in through `extra_errors`: this SERVICE models that
+// shape ("The supplied input failed to satisfy constraints of an Amazon Web Services
+// service") and this operation answers every defect of its own request parameters with
+// it, while its model's `errors` list names only the older `InvalidArgsException`.
+// Widening keeps the refusal on the code clients branch on rather than on the one the
+// incomplete list would predict.
+#[smithy_macros::operation_error(
+    "com.amazonaws.acm#ListCertificateDomainValidations",
+    extra_errors = ["ValidationException"]
+)]
 #[derive(Debug)]
 pub enum ListCertificateDomainValidationsErrorModeled {
     AccessDeniedException(AccessDeniedException),
     InvalidArgsException(InvalidArgsException),
     ResourceNotFoundException(ResourceNotFoundException),
     ThrottlingException(ThrottlingException),
+    ValidationException(ValidationException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -170,19 +191,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `CertificateArn` must name an ACM CERTIFICATE. The member's `@pattern` is a
         // find, not an anchored match, so an ARN that merely begins with an ACM
-        // certificate ARN reaches this handler and is classified here. This operation
-        // models no `InvalidArnException`, so the refusal is `InvalidArgsException` —
-        // "One or more of request parameters specified is not valid" — with the same
-        // sentence every certificate-lookup path in this service renders.
+        // certificate ARN reaches this handler and is classified here. Every defect of
+        // this operation's own request parameters is one refusal class and gets one
+        // code, `ValidationException` (see [`invalid_request`]), with the same sentence
+        // every certificate-lookup path in this service renders for an ARN that names
+        // no certificate.
         if crate::state::certificate_id_from_arn(&input.certificate_arn).is_none() {
-            return Err(
-                ListCertificateDomainValidationsErrorModeled::InvalidArgsException(
-                    InvalidArgsException {
-                        message: Some(crate::state::invalid_arn_message(&input.certificate_arn)),
-                    },
-                )
-                .into(),
-            );
+            return Err(invalid_request(crate::state::invalid_arn_message(
+                &input.certificate_arn,
+            ))
+            .into());
         }
 
         let resume_after = input
@@ -346,19 +364,26 @@ fn encode_next_token(certificate_arn: &str, domain_name: &str) -> String {
     hex::encode(format!("{certificate_arn}{CURSOR_SEPARATOR}{domain_name}"))
 }
 
-/// The refusal for a `NextToken` this service did not issue for this certificate.
+/// This operation's refusal of its own request parameters: a value it cannot use, in
+/// any of the ways a value can fail to be usable.
 ///
-/// `InvalidArgsException` is the operation's modelled error for a request parameter
-/// that is not valid, and the token is one.
-fn invalid_next_token() -> ListCertificateDomainValidationsErrorModeled {
-    ListCertificateDomainValidationsErrorModeled::InvalidArgsException(InvalidArgsException {
-        message: Some(
-            "NextToken is not a token this service issued for this certificate".to_string(),
-        ),
+/// `ValidationException` — "The supplied input failed to satisfy constraints of an
+/// Amazon Web Services service" — is the shape this service models for that class and
+/// the code this operation answers it with, so the ARN check and the token check report
+/// one code between them rather than one each. It is reached through `extra_errors`
+/// because the operation's own modelled list omits the shape.
+fn invalid_request(message: impl Into<String>) -> ListCertificateDomainValidationsErrorModeled {
+    ListCertificateDomainValidationsErrorModeled::ValidationException(ValidationException {
+        message: Some(message.into()),
     })
 }
 
-/// The domain name a `NextToken` resumes after, or `InvalidArgsException` when the
+/// The refusal for a `NextToken` this service did not issue for this certificate.
+fn invalid_next_token() -> ListCertificateDomainValidationsErrorModeled {
+    invalid_request(crate::state::INVALID_NEXT_TOKEN_MESSAGE)
+}
+
+/// The domain name a `NextToken` resumes after, or [`invalid_next_token`] when the
 /// token did not come from [`encode_next_token`] for `certificate_arn`.
 ///
 /// Every step is fallible on purpose: the token is caller-supplied, so no value read

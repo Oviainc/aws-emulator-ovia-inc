@@ -1265,8 +1265,9 @@ async fn deployment_numbers_increase_per_environment() {
     // A strategy with no deployment duration and no final bake time, so its
     // deployments reach a terminal state as soon as the clock allows and this suite
     // can start a second deployment into the same environment without waiting out a
-    // predefined strategy's minutes. `CreateDeploymentStrategy` is still a stub, so the
-    // strategy is seeded through the same bounded entry point that operation will use.
+    // predefined strategy's minutes. Seeded through the same bounded entry point
+    // `CreateDeploymentStrategy` writes through, so this suite exercises the deployment
+    // numbering rather than that operation.
     let immediate = "imm0001";
     assert!(
         state::service_state(&*engine)
@@ -1280,7 +1281,8 @@ async fn deployment_numbers_increase_per_environment() {
                 growth_type: state::GROWTH_LINEAR.to_string(),
                 growth_factor: 100.0,
                 final_bake_time_in_minutes: 0,
-                replicate_to: "NONE".to_string(),
+                replicate_to: state::REPLICATE_TO_NONE.to_string(),
+                tags: std::collections::HashMap::new(),
             }),
         "case \"seed the immediate strategy\": the first created strategy is inside the bound"
     );
@@ -1444,7 +1446,8 @@ fn created_deployment_strategies_are_bounded() {
         growth_type: state::GROWTH_LINEAR.to_string(),
         growth_factor: 50.0,
         final_bake_time_in_minutes: 0,
-        replicate_to: "NONE".to_string(),
+        replicate_to: state::REPLICATE_TO_NONE.to_string(),
+        tags: std::collections::HashMap::new(),
     };
 
     for index in 0..state::MAX_DEPLOYMENT_STRATEGIES {
@@ -1540,7 +1543,8 @@ fn a_deployment_schedule_terminates_for_any_stored_growth_factor() {
             growth_type: growth_type.to_string(),
             growth_factor,
             final_bake_time_in_minutes: 5,
-            replicate_to: "NONE".to_string(),
+            replicate_to: state::REPLICATE_TO_NONE.to_string(),
+            tags: std::collections::HashMap::new(),
         };
 
         // Reaching this line at all is half the assertion: a schedule that did not

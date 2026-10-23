@@ -46,6 +46,8 @@ mod ec2_query;
 mod elastic_ip_addresses;
 #[path = "all/fast_launch_images.rs"]
 mod fast_launch_images;
+#[path = "all/get_password_data.rs"]
+mod get_password_data;
 #[path = "all/images.rs"]
 mod images;
 #[path = "all/instance_lifecycle.rs"]

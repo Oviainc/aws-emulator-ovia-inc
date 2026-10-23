@@ -49,6 +49,8 @@ mod lineage_associations;
 mod lineage_context_lifecycle;
 #[path = "all/list_endpoints.rs"]
 mod list_endpoints;
+#[path = "all/list_model_packages.rs"]
+mod list_model_packages;
 #[path = "all/mlflow_app_lifecycle.rs"]
 mod mlflow_app_lifecycle;
 #[path = "all/model_card_governance.rs"]
