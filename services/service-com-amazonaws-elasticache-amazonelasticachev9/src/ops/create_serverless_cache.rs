@@ -474,8 +474,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A created cache is NOT ready: it answers `CREATING`, and the clock
         // owes it `AVAILABLE` once the transition span has passed.
+        let name = new.name.clone();
+        let serverless_cache = store.insert_serverless_cache(new).to_modeled();
+        // Creating a serverless cache is one of the events this service
+        // records; see `crate::state::EventRecord`.
+        store.record_event(
+            crate::state::SOURCE_TYPE_SERVERLESS_CACHE,
+            &name,
+            "Serverless cache created",
+            now,
+        );
         Ok(CreateServerlessCacheOutput {
-            serverless_cache: Some(store.insert_serverless_cache(new).to_modeled()),
+            serverless_cache: Some(serverless_cache),
         })
     }
 }

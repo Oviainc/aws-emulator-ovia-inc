@@ -22,6 +22,13 @@
 //! `CreateSnapshot` mints one from a stored cluster and `DescribeSnapshots`
 //! reports it, so [`SnapshotRecord`] below is the one copy both read.
 //!
+//! Beside the resources sits the event log: every change this service makes to
+//! one of them records an [`EventRecord`], and `DescribeEvents` reports that log
+//! over the window a request asks for. The log is the one copy, kept beside the
+//! resources rather than on them, because an event outlives the resource it is
+//! about and because a status change the CLOCK materialises
+//! ([`CacheClusterRecord::settle`]) has to record one too.
+//!
 //! Beside those customer-created resources sit the catalogs this service
 //! publishes rather than mints: the service updates AWS releases for its cache
 //! engines, the cache engines and versions themselves, and the ENGINE DEFAULT
@@ -72,17 +79,17 @@
 
 use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::{
     Authentication, AuthenticationMode, AvailabilityZone, CacheCluster, CacheEngineVersion,
     CacheNode, CacheNodeTypeSpecificParameter, CacheNodeTypeSpecificValue, CacheParameterGroup,
     CacheParameterGroupStatus, CacheSubnetGroup, CacheUsageLimits, CreateUserOutput,
-    DestinationDetails, Endpoint, LogDeliveryConfiguration, LogDeliveryConfigurationRequest,
-    NodeGroup, NodeGroupConfiguration, NodeGroupMember, NodeSnapshot, NotificationConfiguration,
-    Parameter, PendingModifiedValues, RecurringCharge, ReplicationGroup, ReservedCacheNode,
-    ReservedCacheNodesOffering, ScaleConfig, SecurityGroupMembership, ServerlessCache,
-    ServiceUpdate, Snapshot, Subnet, Tag,
+    DestinationDetails, Endpoint, Event, LogDeliveryConfiguration,
+    LogDeliveryConfigurationRequest, NodeGroup, NodeGroupConfiguration, NodeGroupMember,
+    NodeSnapshot, NotificationConfiguration, Parameter, PendingModifiedValues, RecurringCharge,
+    ReplicationGroup, ReservedCacheNode, ReservedCacheNodesOffering, ScaleConfig,
+    SecurityGroupMembership, ServerlessCache, ServiceUpdate, Snapshot, Subnet, Tag,
 };
 
 /// The region a request is treated as having been made in when its SigV4
@@ -334,6 +341,42 @@ pub const STATUS_DELETING: &str = "deleting";
 /// See [`STATUS_CREATING`]: the status a cluster carries while a snapshot of it
 /// is being taken.
 pub const STATUS_SNAPSHOTTING: &str = "snapshotting";
+
+/// The `SourceType` values this service records an event under, from the
+/// model's `SourceType` enum (`smithy_query(query="shape",shape="SourceType")`:
+/// `cache-cluster | cache-parameter-group | cache-security-group |
+/// cache-subnet-group | replication-group | serverless-cache |
+/// serverless-cache-snapshot | user | user-group`).
+///
+/// Only the resources this service both persists and changes can be the origin
+/// of an event; the rest belong to operations that are still scaffolded 501s
+/// and will record their own events when they land, and a published catalog
+/// (service updates, reserved-cache-node offerings, the engines' default
+/// parameter groups) is never changed by a call, so nothing happens to it to
+/// record. A snapshot of a cluster is reported under the CLUSTER it was taken
+/// from, which is the source the event happened to — the enum has no member
+/// for a cache-cluster snapshot.
+pub const SOURCE_TYPE_CACHE_CLUSTER: &str = "cache-cluster";
+/// See [`SOURCE_TYPE_CACHE_CLUSTER`].
+pub const SOURCE_TYPE_CACHE_SUBNET_GROUP: &str = "cache-subnet-group";
+/// See [`SOURCE_TYPE_CACHE_CLUSTER`].
+pub const SOURCE_TYPE_SERVERLESS_CACHE: &str = "serverless-cache";
+/// See [`SOURCE_TYPE_CACHE_CLUSTER`].
+pub const SOURCE_TYPE_USER: &str = "user";
+/// See [`SOURCE_TYPE_CACHE_CLUSTER`].
+pub const SOURCE_TYPE_REPLICATION_GROUP: &str = "replication-group";
+/// See [`SOURCE_TYPE_CACHE_CLUSTER`].
+pub const SOURCE_TYPE_CACHE_PARAMETER_GROUP: &str = "cache-parameter-group";
+
+/// The window `DescribeEvents` reports when the request bounds neither end of
+/// it, as the operation documents: "By default, only the events occurring
+/// within the last hour are returned."
+pub const DEFAULT_EVENT_WINDOW: Duration = Duration::from_secs(60 * 60);
+
+/// How long a recorded event is kept, and so the furthest back
+/// `DescribeEvents` can look, as the operation documents: "you can retrieve up
+/// to 14 days' worth of events if necessary."
+pub const EVENT_RETENTION: Duration = Duration::from_secs(14 * 24 * 60 * 60);
 
 /// What `Snapshot$SnapshotSource` reports — "whether the snapshot is from an
 /// automatic backup (`automated`) or was created manually (`manual`)".
@@ -1569,9 +1612,11 @@ pub fn decode_marker(marker: &str) -> Option<String> {
 pub fn page_size_within(max_records: Option<i32>, default: i32, max: i32) -> Result<usize, String> {
     let requested = max_records.unwrap_or(default);
     if !(MAX_RECORDS_MIN..=max).contains(&requested) {
+        // The wording ElastiCache itself answers a `MaxRecords` outside the
+        // bounds its member documents with: the member's own constraint,
+        // stated in the service's words, with the operation's own maximum.
         return Err(format!(
-            "Invalid value {requested} for MaxRecords: must be at least {MAX_RECORDS_MIN} and no \
-             more than {max}."
+            "Invalid value for max records. Must be between {MAX_RECORDS_MIN} and {max}"
         ));
     }
     Ok(usize::try_from(requested).unwrap_or(MAX_RECORDS_MIN as usize))
@@ -1662,6 +1707,67 @@ pub fn validate_num_cache_nodes(engine: &str, num: i32) -> Result<(), String> {
         "Invalid value {num} for NumCacheNodes: a {engine} cluster must have \
          {REDIS_NUM_CACHE_NODES} cache node."
     ))
+}
+
+/// A status change that has just been materialised by a settle: the instant it
+/// fell due, the status the record carried until then, and the one it carries
+/// from then on.
+///
+/// Handed back so the one place a transition becomes real is also the place the
+/// event recording it is written, dated at the instant the clock owed the
+/// change rather than at the call that happened to notice it.
+#[derive(Debug, Clone)]
+pub struct SettledTransition {
+    pub due: SystemTime,
+    pub from: String,
+    pub to: String,
+}
+
+/// One event this service recorded: something that happened to a resource of
+/// it, at the instant it happened.
+///
+/// The log is the one copy `DescribeEvents` reports, and it outlives the
+/// resource an event is about: ElastiCache still reports the events of a
+/// cluster that has since been deleted.
+#[derive(Debug, Clone)]
+pub struct EventRecord {
+    /// `Event$SourceIdentifier`: "the identifier for the source of the event.
+    /// For example, if the event occurred at the cluster level, the identifier
+    /// would be the name of the cluster."
+    pub source_identifier: String,
+    /// One of [`SOURCE_TYPE_CACHE_CLUSTER`] / [`SOURCE_TYPE_CACHE_SUBNET_GROUP`].
+    pub source_type: String,
+    pub message: String,
+    /// `Event$Date`: "the date and time when the event occurred."
+    pub at: SystemTime,
+}
+
+impl EventRecord {
+    /// This record as the modelled `Event`.
+    pub fn to_modeled(&self) -> Event {
+        Event {
+            source_identifier: Some(self.source_identifier.clone()),
+            source_type: Some(self.source_type.clone()),
+            message: Some(self.message.clone()),
+            date: Some(::aws_smithy_types::DateTime::from(self.at)),
+        }
+    }
+}
+
+/// The key an event is stored under: the instant it happened, then the sequence
+/// it was recorded in.
+///
+/// Ordering the key by time is what puts the log in the chronological order
+/// `DescribeEvents` reports and its `Marker` indexes into; the sequence breaks
+/// the tie between two events recorded within the same millisecond, so no event
+/// can displace another. Both fields are zero-padded so the `BTreeMap`'s
+/// lexicographic order over the keys IS their numeric order.
+pub fn event_key(at: SystemTime, seq: u64) -> String {
+    let millis = at
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    format!("{millis:020}-{seq:020}")
 }
 
 // ---------------------------------------------------------------------------
@@ -2680,23 +2786,27 @@ impl CacheClusterRecord {
     }
 
     /// Materialise the status change the clock owes this cluster, if `now` is
-    /// past its due instant.
+    /// past its due instant, and hand back the change it made.
     ///
     /// This is the ONE write a reporting operation may make: the transition was
     /// owed at this instant whether or not anybody called. Nothing else about
-    /// the cluster moves.
-    pub fn settle(&mut self, now: SystemTime) {
-        let Some(pending) = self.pending_status.as_ref() else {
-            return;
-        };
+    /// the cluster moves. `None` means the clock owed nothing.
+    pub fn settle(&mut self, now: SystemTime) -> Option<SettledTransition> {
+        let pending = self.pending_status.as_ref()?;
         if now < pending.due {
-            return;
+            return None;
         }
+        let settled = SettledTransition {
+            due: pending.due,
+            from: self.status.clone(),
+            to: pending.status.clone(),
+        };
         self.status = pending.status.clone();
         self.pending_status = None;
         if self.status == STATUS_AVAILABLE {
             self.set_node_status(STATUS_AVAILABLE);
         }
+        Some(settled)
     }
 
     /// Start the span after which the clock owes this cluster `available`,
@@ -3233,20 +3343,25 @@ impl ReplicationGroupRecord {
     }
 
     /// Materialise the status change the clock owes this group, if `now` is
-    /// past its due instant. See [`CacheClusterRecord::settle`]: this is the one
-    /// write a reporting operation may make.
-    pub fn settle(&mut self, now: SystemTime) {
-        let Some(pending) = self.pending_status.as_ref() else {
-            return;
-        };
+    /// past its due instant, and hand back the change it made. See
+    /// [`CacheClusterRecord::settle`]: this is the one write a reporting
+    /// operation may make.
+    pub fn settle(&mut self, now: SystemTime) -> Option<SettledTransition> {
+        let pending = self.pending_status.as_ref()?;
         if now < pending.due {
-            return;
+            return None;
         }
+        let settled = SettledTransition {
+            due: pending.due,
+            from: self.status.clone(),
+            to: pending.status.clone(),
+        };
         self.status = pending.status.clone();
         self.pending_status = None;
         for shard in &mut self.node_groups {
             shard.status = self.status.clone();
         }
+        Some(settled)
     }
 
     /// This record as the modelled `ReplicationGroup`.
@@ -3940,16 +4055,21 @@ impl ServerlessCacheRecord {
     }
 
     /// Materialise the status change the clock owes this cache, if `now` is past
-    /// its due instant; see [`CacheClusterRecord::settle`].
-    pub fn settle(&mut self, now: SystemTime) {
-        let Some(pending) = self.pending_status.as_ref() else {
-            return;
-        };
+    /// its due instant, and hand back the change it made; see
+    /// [`CacheClusterRecord::settle`].
+    pub fn settle(&mut self, now: SystemTime) -> Option<SettledTransition> {
+        let pending = self.pending_status.as_ref()?;
         if now < pending.due {
-            return;
+            return None;
         }
+        let settled = SettledTransition {
+            due: pending.due,
+            from: self.status.clone(),
+            to: pending.status.clone(),
+        };
         self.status = pending.status.clone();
         self.pending_status = None;
+        Some(settled)
     }
 
     /// This record as the modelled `ServerlessCache`.
@@ -4212,17 +4332,21 @@ impl SnapshotRecord {
     }
 
     /// Materialise the status change the clock owes this snapshot, if `now` is
-    /// past its due instant. The one write a reporting operation may make; see
-    /// [`CacheClusterRecord::settle`].
-    pub fn settle(&mut self, now: SystemTime) {
-        let Some(pending) = self.pending_status.as_ref() else {
-            return;
-        };
+    /// past its due instant, and hand back the change it made. The one write a
+    /// reporting operation may make; see [`CacheClusterRecord::settle`].
+    pub fn settle(&mut self, now: SystemTime) -> Option<SettledTransition> {
+        let pending = self.pending_status.as_ref()?;
         if now < pending.due {
-            return;
+            return None;
         }
+        let settled = SettledTransition {
+            due: pending.due,
+            from: self.status.clone(),
+            to: pending.status.clone(),
+        };
         self.status = pending.status.clone();
         self.pending_status = None;
+        Some(settled)
     }
 
     /// This record as the modelled `Snapshot`.
@@ -5102,6 +5226,14 @@ pub struct ComAmazonawsElasticacheAmazonelasticachev9State {
     /// rather than an account creating them, so the store holds the catalog
     /// from the moment it comes up — see [`published_service_updates`].
     pub service_updates: BTreeMap<String, ServiceUpdateRecord>,
+    /// Every event this service recorded, keyed by [`event_key`] so the map's
+    /// order IS the chronological order `DescribeEvents` reports and its
+    /// `Marker` indexes into. The log is kept beside the resources rather than
+    /// on them, because an event outlives the resource it is about.
+    pub events: BTreeMap<String, EventRecord>,
+    /// The counter that breaks the tie between two events recorded in the same
+    /// millisecond; see [`event_key`].
+    pub event_seq: u64,
     /// Every stored RBAC user, keyed by its (lowercased) `UserId` — the
     /// resource's identity in this API — including the built-in `default` user
     /// [`built_in_users`] stocks the store with. A `BTreeMap`, so `DescribeUsers`
@@ -5162,6 +5294,8 @@ impl Default for ComAmazonawsElasticacheAmazonelasticachev9State {
             cache_parameter_groups: default_parameter_groups(),
             snapshots: BTreeMap::new(),
             service_updates: published_service_updates(SystemTime::now()),
+            events: BTreeMap::new(),
+            event_seq: 0,
             users: built_in_users(),
             cache_engine_versions: published_cache_engine_versions(),
             dns_token_seq: 0,
@@ -5414,9 +5548,24 @@ impl ComAmazonawsElasticacheAmazonelasticachev9State {
         id: &str,
         now: SystemTime,
     ) -> Option<&mut CacheClusterRecord> {
-        let cluster = self.cache_clusters.get_mut(id)?;
-        cluster.settle(now);
-        Some(cluster)
+        // Deliberately two lookups: the first settles the record and ends its
+        // borrow so the event the transition records can be written to the log
+        // beside it, the second hands the caller the settled record back.
+        let settled = {
+            let cluster = self.cache_clusters.get_mut(id)?;
+            cluster
+                .settle(now)
+                .map(|settled| (cluster.cache_cluster_id.clone(), settled))
+        };
+        if let Some((cache_cluster_id, settled)) = settled {
+            self.record_transition(
+                SOURCE_TYPE_CACHE_CLUSTER,
+                &cache_cluster_id,
+                "Cache cluster",
+                &settled,
+            );
+        }
+        self.cache_clusters.get_mut(id)
     }
 
     /// The snapshot `name` names (the stored, lowercased name), with any status
@@ -5436,21 +5585,145 @@ impl ComAmazonawsElasticacheAmazonelasticachev9State {
     /// Materialise every status change the clock owes, for a caller that is
     /// about to report on all of them.
     pub fn settle_all(&mut self, now: SystemTime) {
+        let mut settled: Vec<(String, SettledTransition)> = Vec::new();
         for cluster in self.cache_clusters.values_mut() {
-            cluster.settle(now);
+            if let Some(transition) = cluster.settle(now) {
+                settled.push((cluster.cache_cluster_id.clone(), transition));
+            }
         }
+        let mut snapshots: Vec<(String, Option<String>, SettledTransition)> = Vec::new();
+        let mut caches: Vec<(String, SettledTransition)> = Vec::new();
+        let mut groups: Vec<(String, SettledTransition)> = Vec::new();
         for group in self.replication_groups.values_mut() {
-            group.settle(now);
+            if let Some(transition) = group.settle(now) {
+                groups.push((group.replication_group_id.clone(), transition));
+            }
         }
         for cache in self.serverless_caches.values_mut() {
-            cache.settle(now);
+            if let Some(transition) = cache.settle(now) {
+                caches.push((cache.name.clone(), transition));
+            }
         }
         for snapshot in self.snapshots.values_mut() {
-            snapshot.settle(now);
+            if let Some(transition) = snapshot.settle(now) {
+                snapshots.push((
+                    snapshot.snapshot_name.clone(),
+                    snapshot.cache_cluster_id.clone(),
+                    transition,
+                ));
+            }
         }
+        // A reservation is not an event source: `SourceType` has no member for
+        // one, so its settled state change records nothing.
         for reservation in self.reserved_cache_nodes.values_mut() {
             reservation.settle(now);
         }
+        for (cache_cluster_id, transition) in settled {
+            self.record_transition(
+                SOURCE_TYPE_CACHE_CLUSTER,
+                &cache_cluster_id,
+                "Cache cluster",
+                &transition,
+            );
+        }
+        for (name, transition) in caches {
+            self.record_transition(
+                SOURCE_TYPE_SERVERLESS_CACHE,
+                &name,
+                "Serverless cache",
+                &transition,
+            );
+        }
+        for (replication_group_id, transition) in groups {
+            self.record_transition(
+                SOURCE_TYPE_REPLICATION_GROUP,
+                &replication_group_id,
+                "Replication group",
+                &transition,
+            );
+        }
+        for (snapshot_name, cache_cluster_id, transition) in snapshots {
+            // A snapshot is reported under the CLUSTER it was taken from, which
+            // is the source the event happened to; see
+            // [`SOURCE_TYPE_CACHE_CLUSTER`]. One taken of a replication group
+            // has no source cluster, and its own name is the only source left
+            // to report it under.
+            self.record_transition(
+                SOURCE_TYPE_CACHE_CLUSTER,
+                cache_cluster_id.as_deref().unwrap_or(&snapshot_name),
+                &format!("Snapshot {snapshot_name}"),
+                &transition,
+            );
+        }
+        self.expire_events(now);
+    }
+
+    /// Append one event to the log, dated at the instant it happened.
+    ///
+    /// The one place an event is written, so every recorded event carries a key
+    /// minted the same way and the log cannot gain two entries under one key.
+    pub fn record_event(
+        &mut self,
+        source_type: &str,
+        source_identifier: &str,
+        message: impl Into<String>,
+        at: SystemTime,
+    ) {
+        // Monotonic, and saturating rather than wrapping so the tie-break can
+        // never run backwards into a key the log already holds. One `u64` is
+        // more events than a process can record.
+        self.event_seq = self.event_seq.saturating_add(1);
+        let key = event_key(at, self.event_seq);
+        self.events.insert(
+            key,
+            EventRecord {
+                source_identifier: source_identifier.to_string(),
+                source_type: source_type.to_string(),
+                message: message.into(),
+                at,
+            },
+        );
+        // Retention is owed by the clock, so it is materialised on the write
+        // path as well as on the read one: a store that is written to and never
+        // described is bounded by [`EVENT_RETENTION`] all the same.
+        self.expire_events(at);
+    }
+
+    /// Record the event a resource's materialised status change is: `subject`
+    /// is what the resource is called in an event's text, and `settled` is the
+    /// change the clock made, which the event is dated at.
+    ///
+    /// The one place a transition is worded, so every resource's transitions
+    /// read the same way.
+    fn record_transition(
+        &mut self,
+        source_type: &str,
+        source_identifier: &str,
+        subject: &str,
+        settled: &SettledTransition,
+    ) {
+        self.record_event(
+            source_type,
+            source_identifier,
+            format!(
+                "{subject} status changed from {} to {}",
+                settled.from, settled.to
+            ),
+            settled.due,
+        );
+    }
+
+    /// Drop every event older than [`EVENT_RETENTION`].
+    ///
+    /// Expiry is owed by the clock alone — due at this instant whether or not
+    /// anybody called — so materialising it is the one write `DescribeEvents`
+    /// makes, and it is what bounds the log. [`Self::record_event`] prunes too,
+    /// so a store that is only written to is bounded as well.
+    pub fn expire_events(&mut self, now: SystemTime) {
+        let Some(cutoff) = now.checked_sub(EVENT_RETENTION) else {
+            return;
+        };
+        self.events.retain(|_, event| event.at >= cutoff);
     }
 
     /// How many CUSTOM cache parameter groups this account holds — the count
