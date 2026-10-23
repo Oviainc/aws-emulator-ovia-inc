@@ -36,4 +36,11 @@ Replay any of the blocked units above and observe it fail on that refusal
 ## Update: the `rum|ListRumMetricsDestinations|NotImplemented` key is fixed
 `ListRumMetricsDestinations` was implemented, and its `//! SCAFFOLDED, NOT IMPLEMENTED:` census line deleted, as the read-back half of the `PutRumMetricsDestination` stub fix (`issues/things-that-now-work/20261022T205048Z-rum-putrummetricsdestination-stub.md`): it pages the per-app-monitor destinations map that put writes, 404s an app monitor that does not exist, and refuses a `NextToken` it never issued. It no longer answers 501, so the "Description", "Evidence" and "Steps to Reproduce" above describe the state of the code BEFORE that change.
 
-This record stays open for its SECOND key only — `rum.put-rum-metrics-destination-access-denied|_poll_succeeds#8|AssertionError`, the authorization behaviour this service still does not evaluate (see also `issues/things-that-do-not-work/20261022T205048Z-rum-performs-no-authorization-evaluation-and-does-not.md`).
+## Update: this record is resolved, and why it sits here
+Both of this record's keys are answered as far as this record's own subject — the `ListRumMetricsDestinations` stub — reaches:
+
+- `rum|ListRumMetricsDestinations|NotImplemented`: fixed, as the update above says.
+- `rum.put-rum-metrics-destination-access-denied|_poll_succeeds#8|AssertionError`: the polled call answered 501 forever while the operation was a scaffold; with `PutRumMetricsDestination` and `ListRumMetricsDestinations` implemented it succeeds. The `AccessDeniedException` that unit ends on needs authorization evaluation, which has since landed service-wide (`src/state/authorization.rs`: the caller is resolved through STS's own store, its identity-based documents are read out of IAM's store, and the decision is the shared `service_common::iam_authorization` evaluation of `(action, resource, principal)` against the app monitor's resource policy). `ListRumMetricsDestinations` makes that decision per call for `rum:ListRumMetricsDestinations` on the app monitor's ARN, so the 403 this unit expects now comes from evaluating the policies in force rather than from the shape of the request.
+
+`DeleteRumMetricsDestination`, which the other blocked unit (`rum.delete-rum-metrics-destination-unknown-conflict`) calls after the listing, was implemented together with this record's closure, so neither unit is left on a 501 from this operation family.
+

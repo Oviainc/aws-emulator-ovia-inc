@@ -173,7 +173,7 @@ impl Emulator {
             body.push('&');
             body.push_str(name);
             body.push('=');
-            body.push_str(&form_encode(value));
+            body.push_str(&super::support::percent_encoded(value));
         }
         let request = http::Request::builder()
             .method("POST")
@@ -389,22 +389,6 @@ impl Emulator {
             String::from_utf8_lossy(&reply.body)
         );
     }
-}
-
-/// Percent-encode one `application/x-www-form-urlencoded` component, leaving only RFC
-/// 3986's unreserved characters literal — so a policy document's braces and quotes survive
-/// the round trip.
-fn form_encode(value: &str) -> String {
-    let mut encoded = String::with_capacity(value.len());
-    for byte in value.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                encoded.push(byte as char)
-            }
-            other => encoded.push_str(&format!("%{other:02X}")),
-        }
-    }
-    encoded
 }
 
 /// The text of the first `<name>…</name>` element of an awsQuery response.
@@ -881,6 +865,130 @@ async fn each_operation_is_authorized_against_its_own_action() {
             "case {case:?}: expected HTTP 200, got {} {:?}",
             reply.status,
             String::from_utf8_lossy(&reply.body)
+        );
+    }
+}
+
+/// `DeleteRumMetricsDestination` is authorized against `rum:DeleteRumMetricsDestination`
+/// on the app monitor's ARN, like every other operation of this service — and a refused
+/// delete removes nothing.
+///
+/// It needs its own case rather than a row in the table above because the request only
+/// reaches a 200 when the destination it names is already stored, so each row has to put
+/// one first. The rule generalises over the destination kind, so both are rows.
+#[tokio::test]
+async fn deleting_a_metrics_destination_is_authorized_and_a_refusal_removes_nothing() {
+    // (case, the destination's `Destination`, its `DestinationArn` when it has one)
+    let rows: [(&str, &str, Option<String>); 2] = [
+        ("CloudWatch", "CloudWatch", None),
+        (
+            "Evidently",
+            "Evidently",
+            Some(engine::emulator_arn(
+                "evidently",
+                REGION,
+                "experiment/authorized",
+            )),
+        ),
+    ];
+    for (index, (case, destination, destination_arn)) in rows.iter().enumerate() {
+        let emulator = Emulator::new();
+        let monitor = format!("destination-auth-{index}");
+        emulator.create_monitor(&monitor).await;
+
+        let mut put_body = json!({"Destination": destination});
+        let mut query = format!("destination={destination}");
+        if let Some(arn) = destination_arn {
+            put_body["DestinationArn"] = json!(arn);
+            put_body["IamRoleArn"] = json!(engine::emulator_arn("iam", "", "role/rum-writer"));
+            // A query value carrying an ARN's `:` and `/` reaches the server percent-encoded.
+            query.push_str(&format!(
+                "&destinationArn={}",
+                super::support::percent_encoded(arn)
+            ));
+        }
+        let path = format!("/rummetrics/{monitor}/metricsdestination");
+        let reply = emulator
+            .rum(ACCOUNT_KEY, "POST", &path, Some(put_body))
+            .await;
+        assert_eq!(
+            reply.status, 200,
+            "case {case:?}: seeding the destination must succeed, got {} {:?}",
+            reply.status,
+            String::from_utf8_lossy(&reply.body)
+        );
+
+        let refused_key = emulator
+            .assumed_role_key(
+                &format!("destination-refused-{index}"),
+                Some(&identity_policy(&statement(
+                    "Allow",
+                    "rum:PutRumMetricsDestination",
+                    "*",
+                ))),
+            )
+            .await;
+        let allowed_key = emulator
+            .assumed_role_key(
+                &format!("destination-allowed-{index}"),
+                Some(&identity_policy(&statement(
+                    "Allow",
+                    "rum:DeleteRumMetricsDestination",
+                    "*",
+                ))),
+            )
+            .await;
+
+        // A principal allowed the PUT action may not delete: the decision is made action
+        // by action.
+        let delete_path = format!("{path}?{query}");
+        let reply = emulator
+            .rum(&refused_key, "DELETE", &delete_path, None)
+            .await;
+        assert_eq!(
+            reply.status, 403,
+            "case {case:?}: expected HTTP 403 for a principal allowed only the put, got {} {:?}",
+            reply.status,
+            String::from_utf8_lossy(&reply.body)
+        );
+        assert_eq!(
+            reply.error_code(case),
+            "AccessDeniedException",
+            "case {case:?}: expected AccessDeniedException, got {:?}",
+            String::from_utf8_lossy(&reply.body)
+        );
+
+        // The refused delete removed nothing: the destination is still reported.
+        let listed = emulator.rum(ACCOUNT_KEY, "GET", &path, None).await;
+        assert_eq!(
+            listed.json(case)["Destinations"]
+                .as_array()
+                .map(Vec::len)
+                .unwrap_or_default(),
+            1,
+            "case {case:?}: a refused delete must leave the destination stored, got {:?}",
+            String::from_utf8_lossy(&listed.body)
+        );
+
+        // The principal allowed exactly this action may delete it.
+        let reply = emulator
+            .rum(&allowed_key, "DELETE", &delete_path, None)
+            .await;
+        assert_eq!(
+            reply.status, 200,
+            "case {case:?}: expected HTTP 200 for a principal allowed the delete, got {} {:?}",
+            reply.status,
+            String::from_utf8_lossy(&reply.body)
+        );
+        let listed = emulator.rum(ACCOUNT_KEY, "GET", &path, None).await;
+        assert_eq!(
+            listed.json(case)["Destinations"]
+                .as_array()
+                .map(Vec::len)
+                .unwrap_or_default(),
+            0,
+            "case {case:?}: the authorized delete must remove the destination, got {:?}",
+            String::from_utf8_lossy(&listed.body)
         );
     }
 }

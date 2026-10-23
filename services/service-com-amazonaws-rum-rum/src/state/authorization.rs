@@ -89,6 +89,9 @@ pub const PUT_RUM_METRICS_DESTINATION: &str = "rum:PutRumMetricsDestination";
 /// `rum:ListRumMetricsDestinations`.
 pub const LIST_RUM_METRICS_DESTINATIONS: &str = "rum:ListRumMetricsDestinations";
 
+/// `rum:DeleteRumMetricsDestination`.
+pub const DELETE_RUM_METRICS_DESTINATION: &str = "rum:DeleteRumMetricsDestination";
+
 /// `logs:PutResourcePolicy`, the CloudWatch Logs action a caller must hold for RUM to
 /// turn on log delivery on its behalf: enabling `CwLogEnabled` makes RUM install a
 /// resource policy on the vended log group in the caller's account, so the caller has to
