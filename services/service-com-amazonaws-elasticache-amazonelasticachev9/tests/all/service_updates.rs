@@ -42,7 +42,7 @@ struct WireUpdate {
 /// Seconds since the epoch of a timestamp as the awsQuery serializer rendered
 /// it. Both renderings a timestamp member can take are accepted, so the test
 /// pins the instant rather than the protocol's spelling of it.
-fn epoch_secs(case: &str, member: &str, text: &str) -> i64 {
+pub(crate) fn epoch_secs(case: &str, member: &str, text: &str) -> i64 {
     DateTime::from_str(text, Format::DateTime)
         .or_else(|_| DateTime::from_str(text, Format::EpochSeconds))
         .unwrap_or_else(|err| panic!("case {case}: {member} {text:?} is not a timestamp: {err}"))
@@ -51,7 +51,7 @@ fn epoch_secs(case: &str, member: &str, text: &str) -> i64 {
 
 /// Now, in seconds since the epoch — the clock the reported statuses are read
 /// against.
-fn now_secs() -> i64 {
+pub(crate) fn now_secs() -> i64 {
     i64::try_from(
         SystemTime::now()
             .duration_since(UNIX_EPOCH)

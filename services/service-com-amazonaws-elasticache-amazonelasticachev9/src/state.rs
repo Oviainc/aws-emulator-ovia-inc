@@ -59,11 +59,18 @@
 //! `DescribeUsers` reports it, over the one [`UserRecord`] map below, which also
 //! holds the built-in `default` user every account already has.
 //!
-//! Everything else in this service (user groups, migrations, update actions,
-//! and the parameter-group operations that would change a parameter's value) is
-//! still a scaffolded 501 and owns its own gap issue; where a member of an
-//! implemented operation belongs to one of those resources, the comment beside
-//! it says so.
+//! The update action is this service's one resource nothing creates: it exists
+//! for every (published service update, cluster-or-replication-group) pair the
+//! update applies to, so `DescribeUpdateActions` crosses the catalog with
+//! [`ComAmazonawsElasticacheAmazonelasticachev9State::update_action_targets`]
+//! and reports a pair with no [`UpdateActionRecord`] as `not-applied`;
+//! `BatchApplyUpdateAction` and `BatchStopUpdateAction` are what store a record
+//! for one, and the clock carries it from there.
+//!
+//! Everything else in this service (user groups, migrations, and the
+//! parameter-group operations that would change a parameter's value) is still a
+//! scaffolded 501 and owns its own gap issue; where a member of an implemented
+//! operation belongs to one of those resources, the comment beside it says so.
 //!
 //! The serverless cache is another customer-created resource this store holds:
 //! `CreateServerlessCache` mints one and `DescribeServerlessCaches` reports it.
@@ -88,9 +95,10 @@ use crate::ops::types::{
     DestinationDetails, Endpoint, Event, LogDeliveryConfiguration,
     LogDeliveryConfigurationRequest, NodeGroup, NodeGroupConfiguration, NodeGroupMember,
     NodeSnapshot, NotificationConfiguration, Parameter, PendingModifiedValues,
+    CacheNodeUpdateStatus, NodeGroupMemberUpdateStatus, NodeGroupUpdateStatus,
     ProcessedUpdateAction, RecurringCharge, ReplicationGroup, ReservedCacheNode,
     ReservedCacheNodesOffering, ScaleConfig, SecurityGroupMembership, ServerlessCache,
-    ServiceUpdate, Snapshot, Subnet, Tag, UnprocessedUpdateAction,
+    ServiceUpdate, Snapshot, Subnet, Tag, UnprocessedUpdateAction, UpdateAction,
 };
 
 /// The region a request is treated as having been made in when its SigV4
@@ -4804,6 +4812,42 @@ fn update_action_stoppable(status: &str) -> bool {
     )
 }
 
+/// True when an update action has finished running on its nodes: `complete`
+/// (the update ran to the end) or `stopped` (it was stopped), the two statuses
+/// the clock owes nothing beyond. These are the statuses a node reports an
+/// update END date for — `NodeUpdateEndDate` is "the end date of the update for
+/// a node", and an update still under way has none.
+fn update_action_finished(status: &str) -> bool {
+    matches!(status, UPDATE_ACTION_COMPLETE | UPDATE_ACTION_STOPPED)
+}
+
+/// `SlaMet`'s values (`smithy_query(query="shape", shape="SlaMet")`: `yes | no
+/// | n/a`), as `UpdateAction$SlaMet` documents them: "If yes, all nodes in the
+/// replication group have been updated by the recommended apply-by date. If no,
+/// at least one node in the replication group have not been updated by the
+/// recommended apply-by date."
+///
+/// `n/a` is the third value, and the answer while the question has none yet: the
+/// recommended apply-by date has not passed and the update has not finished, so
+/// no node is late.
+pub const SLA_MET_YES: &str = "yes";
+/// See [`SLA_MET_YES`].
+pub const SLA_MET_NO: &str = "no";
+/// See [`SLA_MET_YES`].
+pub const SLA_MET_NOT_APPLICABLE: &str = "n/a";
+
+/// `NodeUpdateInitiatedBy`'s values (`smithy_query(query="shape",
+/// shape="NodeUpdateInitiatedBy")`: `system | customer`), which "reflects
+/// whether the update was initiated by the customer or automatically applied".
+///
+/// Every update action this service starts was asked for by a
+/// `BatchApplyUpdateAction` call, so `customer` is what it reports. `system`
+/// belongs to the automatic apply after the recommended apply-by date, which no
+/// operation in this API schedules and this emulator therefore never runs — an
+/// action nothing applied stays [`UPDATE_ACTION_NOT_APPLIED`] however long the
+/// clock carries it past that date, and reports no initiator at all.
+pub const NODE_UPDATE_INITIATED_BY_CUSTOMER: &str = "customer";
+
 /// Which of the two resource lists a batch update-action call named a resource
 /// in: `ProcessedUpdateAction` / `UnprocessedUpdateAction` report a cache
 /// cluster's id and a replication group's under different members, each kind is
@@ -5091,6 +5135,21 @@ pub struct UpdateActionRecord {
     pub status: String,
     /// The status change the clock owes this action, if any.
     pub pending_status: Option<PendingTransition>,
+    /// When the `BatchApplyUpdateAction` call that started this run asked for
+    /// it, which is what `NodeUpdateInitiatedDate` ("the date when the update is
+    /// triggered") reports. A stop acts on the run already under way, so it
+    /// keeps the instant the apply set.
+    pub started_at: SystemTime,
+    /// When this action's status last changed — set by the call that moved it
+    /// and by [`Self::settle`] to the instant the clock made the change due, so
+    /// `UpdateActionStatusModifiedDate` reports when the change HAPPENED rather
+    /// than when somebody read it.
+    pub status_modified_at: SystemTime,
+    /// When the update actually started running on this action's nodes: the
+    /// instant it reached [`UPDATE_ACTION_IN_PROGRESS`], which is what
+    /// `NodeUpdateStartDate` reports. `None` for a run that was stopped before
+    /// it got that far, which never ran on a node.
+    pub in_progress_at: Option<SystemTime>,
 }
 
 impl UpdateActionRecord {
@@ -5106,6 +5165,12 @@ impl UpdateActionRecord {
                 return;
             }
             self.status = pending.status;
+            // The change fell due at `pending.due`, so that — and not the
+            // instant of the call that noticed it — is when the status changed.
+            self.status_modified_at = pending.due;
+            if self.status == UPDATE_ACTION_IN_PROGRESS {
+                self.in_progress_at = Some(pending.due);
+            }
             self.pending_status =
                 next_update_action_status(&self.status).map(|next| PendingTransition {
                     due: pending.due + UPDATE_ACTION_TRANSITION,
@@ -5122,6 +5187,279 @@ impl UpdateActionRecord {
             service_update_name: Some(self.service_update_name.clone()),
             update_action_status: Some(self.status.clone()),
         }
+    }
+}
+
+/// One shard of a replication group an update action runs on: the shard's
+/// `NodeGroupId` and its members' `(CacheClusterId, CacheNodeId)`, which is what
+/// `NodeGroupMemberUpdateStatus` reports a node by.
+#[derive(Debug, Clone)]
+pub struct UpdateActionNodeGroup {
+    pub node_group_id: String,
+    pub members: Vec<(String, String)>,
+}
+
+/// The nodes a service update runs on for one resource — which is also WHICH
+/// node-level list reports them.
+///
+/// `UpdateAction` carries two: `CacheNodeUpdateStatus` is "the status of the
+/// service update on the cache node", reported by `CacheNodeId` alone, and
+/// `NodeGroupUpdateStatus` is "the status of the service update on the node
+/// group", whose members name their cluster as well. A cache cluster's update
+/// action has the first, a replication group's the second.
+#[derive(Debug, Clone)]
+pub enum UpdateActionNodes {
+    /// One `CacheNodeId` per node of a cache cluster.
+    CacheNodes(Vec<String>),
+    /// One entry per node group (shard) of a replication group.
+    NodeGroups(Vec<UpdateActionNodeGroup>),
+}
+
+impl UpdateActionNodes {
+    /// How many nodes the update has to run on, which is the denominator of
+    /// `UpdateAction$NodesUpdated` — "the progress of the service update on the
+    /// replication group".
+    fn count(&self) -> usize {
+        match self {
+            Self::CacheNodes(ids) => ids.len(),
+            Self::NodeGroups(groups) => groups.iter().map(|group| group.members.len()).sum(),
+        }
+    }
+}
+
+/// One resource a published service update can have an update action for: the
+/// identity the action is reported under, the engine that decides which updates
+/// apply to it, when it came into existence and the nodes the update runs on.
+#[derive(Debug, Clone)]
+pub struct UpdateActionTarget {
+    /// Which of `UpdateAction`'s two id members reports this resource.
+    pub kind: UpdateActionResource,
+    /// The stored id: the key an update action is held under, and the id
+    /// reported under `CacheClusterId` / `ReplicationGroupId`.
+    pub id: String,
+    /// The resource's cache engine, which `ServiceUpdate$Engine` ("the
+    /// Elasticache engine to which the update applies") is matched against.
+    pub engine: String,
+    /// When the resource was created: an update is available to a resource only
+    /// once the resource exists, which is what
+    /// [`update_action_view`] dates `UpdateActionAvailableDate` from.
+    pub created_at: SystemTime,
+    pub nodes: UpdateActionNodes,
+}
+
+impl UpdateActionTarget {
+    /// The key this resource's action for `service_update_name` is held under in
+    /// [`ComAmazonawsElasticacheAmazonelasticachev9State::update_actions`].
+    pub fn action_key(
+        &self,
+        service_update_name: &str,
+    ) -> (String, UpdateActionResource, String) {
+        (
+            service_update_name.to_string(),
+            self.kind,
+            self.id.clone(),
+        )
+    }
+}
+
+/// The node-level view of an update action: the status and the instants every
+/// node the action runs on carries.
+///
+/// This service moves an update action as a whole rather than node by node —
+/// nothing in this API addresses one node of an update — so every node of the
+/// resource carries the action's own status and instants, and the two per-node
+/// lists are this one view repeated for each node the resource holds.
+#[derive(Debug, Clone)]
+struct NodeUpdateView {
+    status: String,
+    /// `NodeUpdateStartDate` / `NodeUpdateInitiatedDate`: the instant the update
+    /// started running on the node, and the instant it was triggered on it.
+    start_date: Option<SystemTime>,
+    end_date: Option<SystemTime>,
+    initiated_by: Option<String>,
+    initiated_date: Option<SystemTime>,
+    status_modified_date: SystemTime,
+}
+
+impl NodeUpdateView {
+    /// The node-level view of `action`, which is `None` for a pair nothing has
+    /// applied; `available` is when its action became
+    /// [`UPDATE_ACTION_NOT_APPLIED`], which is the only status change such a
+    /// pair has had.
+    fn of(action: Option<&UpdateActionRecord>, available: SystemTime) -> Self {
+        let Some(action) = action else {
+            return Self {
+                status: UPDATE_ACTION_NOT_APPLIED.to_string(),
+                start_date: None,
+                end_date: None,
+                initiated_by: None,
+                initiated_date: None,
+                status_modified_date: available,
+            };
+        };
+        Self {
+            status: action.status.clone(),
+            start_date: action.in_progress_at,
+            // "The end date of the update for a node": only a run that has
+            // finished has one.
+            end_date: update_action_finished(&action.status).then_some(action.status_modified_at),
+            initiated_by: Some(NODE_UPDATE_INITIATED_BY_CUSTOMER.to_string()),
+            initiated_date: Some(action.started_at),
+            status_modified_date: action.status_modified_at,
+        }
+    }
+
+    /// This view as the modelled `CacheNodeUpdateStatus` of the node
+    /// `cache_node_id` names.
+    fn to_cache_node(&self, cache_node_id: &str) -> CacheNodeUpdateStatus {
+        CacheNodeUpdateStatus {
+            cache_node_id: Some(cache_node_id.to_string()),
+            node_update_status: Some(self.status.clone()),
+            // Applying a service update deletes no node, so there is no
+            // deletion date to report.
+            node_deletion_date: None,
+            node_update_start_date: self.start_date.map(::aws_smithy_types::DateTime::from),
+            node_update_end_date: self.end_date.map(::aws_smithy_types::DateTime::from),
+            node_update_initiated_by: self.initiated_by.clone(),
+            node_update_initiated_date: self.initiated_date.map(::aws_smithy_types::DateTime::from),
+            node_update_status_modified_date: Some(::aws_smithy_types::DateTime::from(
+                self.status_modified_date,
+            )),
+        }
+    }
+
+    /// This view as the modelled `NodeGroupMemberUpdateStatus` of one node group
+    /// member: the same status and instants, reported with the member's cluster.
+    fn to_node_group_member(
+        &self,
+        cache_cluster_id: &str,
+        cache_node_id: &str,
+    ) -> NodeGroupMemberUpdateStatus {
+        let node = self.to_cache_node(cache_node_id);
+        NodeGroupMemberUpdateStatus {
+            cache_cluster_id: Some(cache_cluster_id.to_string()),
+            cache_node_id: node.cache_node_id,
+            node_update_status: node.node_update_status,
+            node_deletion_date: node.node_deletion_date,
+            node_update_start_date: node.node_update_start_date,
+            node_update_end_date: node.node_update_end_date,
+            node_update_initiated_by: node.node_update_initiated_by,
+            node_update_initiated_date: node.node_update_initiated_date,
+            node_update_status_modified_date: node.node_update_status_modified_date,
+        }
+    }
+}
+
+/// `UpdateAction$SlaMet` for an action in `status`: whether the update ran on
+/// every node by the service update's recommended apply-by date.
+///
+/// A finished update met the SLA when it finished before that date and missed it
+/// otherwise; one that has not finished has missed it only once the date has
+/// passed, and until then the question has no answer yet
+/// ([`SLA_MET_NOT_APPLICABLE`]).
+fn sla_met(
+    update: &ServiceUpdateRecord,
+    status: &str,
+    status_modified: SystemTime,
+    now: SystemTime,
+) -> &'static str {
+    if status == UPDATE_ACTION_COMPLETE {
+        if status_modified <= update.recommended_apply_by_date {
+            SLA_MET_YES
+        } else {
+            SLA_MET_NO
+        }
+    } else if now > update.recommended_apply_by_date {
+        SLA_MET_NO
+    } else {
+        SLA_MET_NOT_APPLICABLE
+    }
+}
+
+/// The modelled `UpdateAction` for one (service update, resource) pair: what
+/// `DescribeUpdateActions` reports about applying `update` to `target`.
+///
+/// `action` is the record a batch call persisted, or `None` for a pair nothing
+/// has started — which IS the `not-applied` status the API reports for it, so
+/// the view is computed from the published update and the stored resource rather
+/// than requiring a record to exist. Node-level status is reported only when the
+/// request asked for it: `ShowNodeLevelUpdateStatus` "dictates whether to
+/// include node level update status in the response".
+pub fn update_action_view(
+    update: &ServiceUpdateRecord,
+    target: &UpdateActionTarget,
+    action: Option<&UpdateActionRecord>,
+    now: SystemTime,
+    show_node_level_status: bool,
+) -> UpdateAction {
+    // "The date that the service update is available to a replication group":
+    // the update is available to a resource once BOTH exist, so a resource
+    // created after the update was released gains the action when it was
+    // created.
+    let available = update.release_date.max(target.created_at);
+    let node_view = NodeUpdateView::of(action, available);
+    let status = node_view.status.clone();
+    let total = target.nodes.count();
+    // "The progress of the service update on the replication group", read off
+    // the node-level statuses: every node of the resource carries the action's
+    // own status, so the nodes the update has run on are all of them once it is
+    // complete and none of them before.
+    let updated = if status == UPDATE_ACTION_COMPLETE { total } else { 0 };
+    let (node_groups, cache_nodes) = match (&target.nodes, show_node_level_status) {
+        (_, false) => (None, None),
+        (UpdateActionNodes::CacheNodes(ids), true) => (
+            None,
+            Some(
+                ids.iter()
+                    .map(|id| node_view.to_cache_node(id))
+                    .collect::<Vec<CacheNodeUpdateStatus>>(),
+            ),
+        ),
+        (UpdateActionNodes::NodeGroups(groups), true) => (
+            Some(
+                groups
+                    .iter()
+                    .map(|group| NodeGroupUpdateStatus {
+                        node_group_id: Some(group.node_group_id.clone()),
+                        node_group_member_update_status: Some(
+                            group
+                                .members
+                                .iter()
+                                .map(|(cluster, node)| {
+                                    node_view.to_node_group_member(cluster, node)
+                                })
+                                .collect(),
+                        ),
+                    })
+                    .collect::<Vec<NodeGroupUpdateStatus>>(),
+            ),
+            None,
+        ),
+    };
+    UpdateAction {
+        replication_group_id: (target.kind == UpdateActionResource::ReplicationGroup)
+            .then(|| target.id.clone()),
+        cache_cluster_id: (target.kind == UpdateActionResource::CacheCluster)
+            .then(|| target.id.clone()),
+        service_update_name: Some(update.service_update_name.clone()),
+        service_update_release_date: Some(::aws_smithy_types::DateTime::from(update.release_date)),
+        service_update_severity: Some(update.severity.clone()),
+        service_update_status: Some(update.status(now).to_string()),
+        service_update_recommended_apply_by_date: Some(::aws_smithy_types::DateTime::from(
+            update.recommended_apply_by_date,
+        )),
+        service_update_type: Some(update.update_type.clone()),
+        update_action_available_date: Some(::aws_smithy_types::DateTime::from(available)),
+        update_action_status: Some(status.clone()),
+        nodes_updated: Some(format!("{updated}/{total}")),
+        update_action_status_modified_date: Some(::aws_smithy_types::DateTime::from(
+            node_view.status_modified_date,
+        )),
+        sla_met: Some(sla_met(update, &status, node_view.status_modified_date, now).to_string()),
+        node_group_update_status: node_groups,
+        cache_node_update_status: cache_nodes,
+        estimated_update_time: Some(update.estimated_update_time.clone()),
+        engine: Some(update.engine.clone()),
     }
 }
 
@@ -6137,12 +6475,12 @@ impl ComAmazonawsElasticacheAmazonelasticachev9State {
             // The status the command acts on is the one the clock has carried
             // the stored action to; a pair with no record has never been
             // applied.
-            let status = match self.update_actions.get_mut(&action_key) {
+            let (status, previous) = match self.update_actions.get_mut(&action_key) {
                 Some(action) => {
                     action.settle(now);
-                    action.status.clone()
+                    (action.status.clone(), Some(action.clone()))
                 }
-                None => UPDATE_ACTION_NOT_APPLIED.to_string(),
+                None => (UPDATE_ACTION_NOT_APPLIED.to_string(), None),
             };
             let next = match command {
                 UpdateActionCommand::Apply if update_action_in_flight(&status) => {
@@ -6189,6 +6527,23 @@ impl ComAmazonawsElasticacheAmazonelasticachev9State {
                     due: now + UPDATE_ACTION_TRANSITION,
                     status: after.to_string(),
                 }),
+                // An apply STARTS a run, so the run's instants are this call's;
+                // a stop acts on the run already under way and keeps them, so
+                // the node-level dates it reports still say when that run was
+                // triggered and when it reached the nodes.
+                started_at: match command {
+                    UpdateActionCommand::Apply => now,
+                    UpdateActionCommand::Stop => {
+                        previous.as_ref().map_or(now, |earlier| earlier.started_at)
+                    }
+                },
+                in_progress_at: match command {
+                    UpdateActionCommand::Apply => None,
+                    UpdateActionCommand::Stop => {
+                        previous.as_ref().and_then(|earlier| earlier.in_progress_at)
+                    }
+                },
+                status_modified_at: now,
             };
             // The entry is read back out of the map, so the response reports
             // the action this service persisted rather than a copy beside it.
@@ -6202,6 +6557,68 @@ impl ComAmazonawsElasticacheAmazonelasticachev9State {
             results.processed.push(stored.to_processed());
         }
         Some(results)
+    }
+
+    /// Every resource this account holds that a published service update can
+    /// have an update action for, in a stable order (the cache clusters by id,
+    /// then the replication groups by id).
+    ///
+    /// An update action is NOT a resource a caller creates: ElastiCache has one
+    /// for each (published service update, resource) pair the update applies to,
+    /// which is why `DescribeUpdateActions` reports a pair nothing has started
+    /// as [`UPDATE_ACTION_NOT_APPLIED`]. The pairs are built from this list and
+    /// the published catalog on every read rather than stored, so a resource
+    /// created or deleted between two describes changes the answer exactly as it
+    /// does in the API — and the stored [`UpdateActionRecord`]s are only the
+    /// pairs a batch call has moved off that status.
+    ///
+    /// A member cluster of a replication group is an ordinary cache cluster in
+    /// this store's one map, so it appears here in its own right: the batch
+    /// operations accept its id and persist an action under it, and a report
+    /// that left it out would hide that action.
+    pub fn update_action_targets(&self) -> Vec<UpdateActionTarget> {
+        let clusters = self.cache_clusters.values().map(|cluster| UpdateActionTarget {
+            kind: UpdateActionResource::CacheCluster,
+            id: cluster.cache_cluster_id.clone(),
+            engine: cluster.engine.clone(),
+            created_at: cluster.created_at,
+            nodes: UpdateActionNodes::CacheNodes(
+                cluster
+                    .nodes
+                    .iter()
+                    .map(|node| node.cache_node_id.clone())
+                    .collect(),
+            ),
+        });
+        let groups = self
+            .replication_groups
+            .values()
+            .map(|group| UpdateActionTarget {
+                kind: UpdateActionResource::ReplicationGroup,
+                id: group.replication_group_id.clone(),
+                engine: group.engine.clone(),
+                created_at: group.created_at,
+                nodes: UpdateActionNodes::NodeGroups(
+                    group
+                        .node_groups
+                        .iter()
+                        .map(|shard| UpdateActionNodeGroup {
+                            node_group_id: shard.node_group_id.clone(),
+                            members: shard
+                                .members
+                                .iter()
+                                .map(|member| {
+                                    (
+                                        member.cache_cluster_id.clone(),
+                                        member.cache_node_id.clone(),
+                                    )
+                                })
+                                .collect(),
+                        })
+                        .collect(),
+                ),
+            });
+        clusters.chain(groups).collect()
     }
 
     /// How many CUSTOM cache parameter groups this account holds — the count

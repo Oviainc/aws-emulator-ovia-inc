@@ -1,10 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeUpdateActions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeUpdateActions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
 //! broken". Replace the `Err(..)` in [`DescribeUpdateActions::handle`] with real behaviour and
 //! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
@@ -159,18 +155,232 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeUpdateActions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeUpdateActionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeUpdateActions"))
+        // "Returns details of the update actions" — a reporting operation. An
+        // update action is not a resource a caller creates: this service has
+        // one for every (published service update, resource) pair the update
+        // applies to, so the page is computed from the published catalog, the
+        // stored clusters and replication groups, and the action records the
+        // batch operations persisted. The one write it makes is materialising
+        // the status changes the clock already owed, through `settle_all`.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+
+        // `MaxRecords` and `Marker` carry no modelled constraint, so the
+        // boundary validator passes anything; this operation models
+        // `InvalidParameterValueException` for a value it cannot serve, which is
+        // the channel for both.
+        let page_size =
+            crate::state::unbounded_page_size(input.max_records).map_err(invalid_parameter_value)?;
+        // A `Marker` only ever travels back unchanged, so one this service did
+        // not mint is a bad parameter value rather than an empty page.
+        let resume_from = match input.marker.as_deref() {
+            Some(marker) => match crate::state::decode_marker(marker) {
+                Some(key) => Some(key),
+                None => {
+                    return Err(invalid_parameter_value(format!(
+                        "Invalid value {marker} for Marker."
+                    )))
+                }
+            },
+            None => None,
+        };
+
+        // `Engine` is "the Elasticache engine to which the update applies.
+        // Either Valkey, Redis OSS or Memcached" — a plain string the boundary
+        // validator does not constrain, so a value naming no cache engine is
+        // refused here rather than reported as an empty page.
+        let engine = match input.engine.as_deref() {
+            Some(engine) => {
+                Some(crate::state::normalize_engine(engine).map_err(invalid_parameter_value)?)
+            }
+            None => None,
+        };
+
+        // `ServiceUpdateTimeRange` "filters update actions from the service
+        // updates that are in available status during the time range", so an
+        // update is kept when its availability window — release date to end
+        // date — overlaps the range. Either bound may be left open.
+        let range = input.service_update_time_range.unwrap_or_default();
+        let window_start = match range.start_time {
+            Some(at) => Some(instant("StartTime", at)?),
+            None => None,
+        };
+        let window_end = match range.end_time {
+            Some(at) => Some(instant("EndTime", at)?),
+            None => None,
+        };
+        if let (Some(start), Some(end)) = (window_start, window_end) {
+            if start > end {
+                return Err(invalid_parameter_combination(
+                    "StartTime must not be later than EndTime: the two bound one time interval."
+                        .to_string(),
+                ));
+            }
+        }
+
+        // The two status filters. Both members are modelled enums, so a value
+        // outside `ServiceUpdateStatus` / `UpdateActionStatus` is already
+        // refused by the boundary validator and cannot reach here.
+        let update_statuses = input.service_update_status.unwrap_or_default();
+        let action_statuses = input.update_action_status.unwrap_or_default();
+
+        // `CacheClusterIds` / `ReplicationGroupIds` narrow the answer to the
+        // resources they name. Every identifier in this API "is stored as a
+        // lowercase string", so the filter resolves the same way a describe of
+        // that resource does. A request that names neither list reports every
+        // resource this account holds.
+        let cache_cluster_ids = lowercased(input.cache_cluster_ids);
+        let replication_group_ids = lowercased(input.replication_group_ids);
+        let names_resources = !cache_cluster_ids.is_empty() || !replication_group_ids.is_empty();
+
+        // `ShowNodeLevelUpdateStatus` "dictates whether to include node level
+        // update status in the response".
+        let show_node_level_status = input.show_node_level_update_status.unwrap_or(false);
+        // `ServiceUpdateName` is "the unique ID of the service update". This
+        // operation models no not-found fault, so a name the published catalog
+        // does not hold reports no update action rather than being refused.
+        let service_update_name = input.service_update_name.as_deref();
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.settle_all(now);
+
+        let targets = store.update_action_targets();
+        let mut page: Vec<UpdateAction> = Vec::new();
+        let mut marker = None;
+        'pairs: for (name, update) in &store.service_updates {
+            if service_update_name.is_some_and(|wanted| wanted != name)
+                || engine.as_deref().is_some_and(|wanted| wanted != update.engine)
+                || (!update_statuses.is_empty()
+                    && !update_statuses
+                        .iter()
+                        .any(|status| status == update.status(now)))
+                // An update whose window had closed before the range opened, or
+                // had not opened when the range closed, was not available
+                // during it.
+                || window_start.is_some_and(|start| update.end_date <= start)
+                || window_end.is_some_and(|end| update.release_date > end)
+            {
+                continue;
+            }
+            for target in &targets {
+                // `ServiceUpdate$Engine` is the engine the update applies to,
+                // so an update released for one engine is no action on a
+                // resource running another.
+                if target.engine != update.engine {
+                    continue;
+                }
+                if names_resources {
+                    let named = match target.kind {
+                        crate::state::UpdateActionResource::CacheCluster => &cache_cluster_ids,
+                        crate::state::UpdateActionResource::ReplicationGroup => {
+                            &replication_group_ids
+                        }
+                    };
+                    if !named.contains(&target.id) {
+                        continue;
+                    }
+                }
+                // The action the batch operations persisted for this pair, or
+                // `None` for one nothing has started — which is the
+                // `not-applied` status this operation reports for it.
+                let action = store.update_actions.get(&target.action_key(name));
+                let status = action.map_or(crate::state::UPDATE_ACTION_NOT_APPLIED, |action| {
+                    action.status.as_str()
+                });
+                if !action_statuses.is_empty()
+                    && !action_statuses.iter().any(|wanted| wanted == status)
+                {
+                    continue;
+                }
+                let key = page_key(name, target);
+                if resume_from.as_ref().is_some_and(|from| key < *from) {
+                    continue;
+                }
+                if page.len() == page_size {
+                    // More records exist than `MaxRecords`, so the response
+                    // carries the marker the next call resumes from — the key of
+                    // the first pair this page did not report.
+                    marker = Some(crate::state::encode_marker(&key));
+                    break 'pairs;
+                }
+                page.push(crate::state::update_action_view(
+                    update,
+                    target,
+                    action,
+                    now,
+                    show_node_level_status,
+                ));
+            }
+        }
+
+        Ok(DescribeUpdateActionsOutput {
+            marker,
+            update_actions: Some(page),
+        })
     }
+}
+
+/// The identifiers a filter list names, lowercased — the form every identifier
+/// in this API is stored in.
+fn lowercased(ids: Option<Vec<String>>) -> Vec<String> {
+    ids.unwrap_or_default()
+        .iter()
+        .map(|id| id.to_ascii_lowercase())
+        .collect()
+}
+
+/// The total-order key one (service update, resource) pair occupies in a page.
+///
+/// The order the pairs are reported in — by service update name, then by the
+/// kind of resource, then by the resource's id — spelled as one string, so a
+/// `Marker` can carry the place a page stopped at. The separator is a character
+/// no identifier in this API holds, so no two pairs share a key and the keys
+/// compare in exactly the order the pairs are generated in.
+fn page_key(service_update_name: &str, target: &crate::state::UpdateActionTarget) -> String {
+    let kind = match target.kind {
+        crate::state::UpdateActionResource::CacheCluster => "cache-cluster",
+        crate::state::UpdateActionResource::ReplicationGroup => "replication-group",
+    };
+    format!("{service_update_name}/{kind}/{}", target.id)
+}
+
+/// `message` as this operation's modelled `InvalidParameterValueException`.
+fn invalid_parameter_value(message: String) -> DescribeUpdateActionsError {
+    DescribeUpdateActionsErrorModeled::InvalidParameterValueException(
+        InvalidParameterValueException {
+            message: Some(message),
+        },
+    )
+    .into()
+}
+
+/// `message` as this operation's modelled
+/// `InvalidParameterCombinationException`, which is what "two or more
+/// incompatible parameters were specified" is refused with.
+fn invalid_parameter_combination(message: String) -> DescribeUpdateActionsError {
+    DescribeUpdateActionsErrorModeled::InvalidParameterCombinationException(
+        InvalidParameterCombinationException {
+            message: Some(message),
+        },
+    )
+    .into()
+}
+
+/// The instant a modelled timestamp names, or the refusal for one this service
+/// cannot read as an instant.
+fn instant(
+    member: &str,
+    at: ::aws_smithy_types::DateTime,
+) -> Result<::std::time::SystemTime, DescribeUpdateActionsError> {
+    ::std::time::SystemTime::try_from(at).map_err(|_| {
+        invalid_parameter_value(format!(
+            "Invalid value {} for {member}: not an instant this service can read.",
+            at.secs()
+        ))
+    })
 }

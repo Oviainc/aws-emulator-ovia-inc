@@ -61,3 +61,7 @@ mod harness;
 mod users;
 #[path = "all/describe_users.rs"]
 mod describe_users;
+
+// Appended for the same reason: the `DescribeUpdateActions` suite.
+#[path = "all/describe_update_actions.rs"]
+mod describe_update_actions;
