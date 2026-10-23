@@ -44,7 +44,8 @@
 //! This service uses that channel for the awsQuery service-level errors its
 //! model declares no shape for but its own documentation (or its recorded
 //! behaviour) names: `ValidationError`, `InvalidParameterValue`,
-//! `MissingRequiredParameter`, `MissingParameter` and `InternalFailure`. See
+//! `InvalidParameterCombination`, `MissingRequiredParameter`, `MissingParameter`
+//! and `InternalFailure`. See
 //! [`Scaffolded::Service`].
 
 use aws_smithy_schema::serde::{SerdeError, SerializableStruct, ShapeSerializer};
@@ -221,6 +222,16 @@ pub static SERVICE_ERROR_SCHEMA: Schema = Schema::new_struct(
 /// wrapper already carries the errors a model does not declare.
 pub const INVALID_PARAMETER_VALUE: &str = "InvalidParameterValue";
 
+/// `InvalidParameterCombination`: the values the request supplied cannot be used
+/// TOGETHER — the parameter is well formed on its own, but what it names cannot be
+/// reconciled with the rest of the request.
+///
+/// The awsQuery family's code for exactly that case, and the one Elastic Beanstalk's
+/// recorded `CreateApplicationVersion` answers when the `SourceBundle` the request
+/// pairs with the version cannot be downloaded from Amazon S3. Like the codes around
+/// it, the model declares no error shape for it.
+pub const INVALID_PARAMETER_COMBINATION: &str = "InvalidParameterCombination";
+
 /// `ValidationError`: the request itself does not satisfy the rules the MODEL
 /// declares — a value outside an enumerated set, outside a `@length` or `@range`
 /// bound, or outside a `@pattern`. It is the code the awsQuery family's
@@ -343,6 +354,16 @@ impl<E> Scaffolded<E> {
     pub fn invalid_parameter_value(message: impl Into<String>) -> Self {
         Self::Service(ServiceError {
             code: INVALID_PARAMETER_VALUE,
+            status: 400,
+            message: message.into(),
+        })
+    }
+
+    /// Refuse the request with HTTP 400 [`INVALID_PARAMETER_COMBINATION`]: the
+    /// values the request supplied cannot be used together.
+    pub fn invalid_parameter_combination(message: impl Into<String>) -> Self {
+        Self::Service(ServiceError {
+            code: INVALID_PARAMETER_COMBINATION,
             status: 400,
             message: message.into(),
         })

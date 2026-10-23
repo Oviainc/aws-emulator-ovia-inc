@@ -5,10 +5,12 @@
 //! `Creating` until the clock makes the build completion due. This is the ONLY file to
 //! touch for this operation.
 //!
-//! The platform definition archive named by `PlatformDefinitionBundle` is NOT read and no
-//! builder environment is launched, so every value a built platform would report from the
-//! archive (its category, maintainer, operating system, languages, frameworks) and the
-//! `Builder` of the response are absent rather than invented.
+//! The platform definition archive named by `PlatformDefinitionBundle` is DOWNLOADED —
+//! a create whose archive object storage cannot hand back is refused — but its contents
+//! are not interpreted and no builder environment is launched, so every value a built
+//! platform would report from the archive (its category, maintainer, operating system,
+//! languages, frameworks) and the `Builder` of the response are absent rather than
+//! invented.
 //!
 //! ## Shape of an operation
 //!
@@ -153,6 +155,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let region = crate::state::request_region(ctx);
+        // "PlatformDefinitionBundle: The location of the platform definition archive
+        // in Amazon S3" — the version is built FROM that archive, so Elastic Beanstalk
+        // downloads it while serving this call and refuses the request when it cannot,
+        // before any platform version is recorded. The code is the one the recorded
+        // refusal carries for this operation: the bundle parameter names something
+        // that cannot be used.
+        if let Some(message) = crate::state::archive_download_refusal(
+            ctx,
+            &region,
+            &input.platform_definition_bundle,
+        )
+        .await
+        {
+            return Err(CreatePlatformVersionError::invalid_parameter_value(message));
+        }
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             CreatePlatformVersionError::internal_failure(
                 "the Elastic Beanstalk store is unavailable",

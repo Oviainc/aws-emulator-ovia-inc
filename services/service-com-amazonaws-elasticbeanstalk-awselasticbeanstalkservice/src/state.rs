@@ -679,6 +679,174 @@ pub fn storage_bucket_name(region: &str) -> String {
     )
 }
 
+/// The Amazon S3 error codes that say the object a read named IS NOT THERE: the
+/// bucket does not exist, or the key does not. `NoSuchBucket` and `NoSuchKey` are the
+/// codes Amazon S3's own model declares for a read
+/// (`smithy_query(query="operation", operation="GetObject")` on the S3 model), and
+/// `NotFound` is what a HEAD — which carries no error document to name them in —
+/// reports instead. All three are answered with HTTP 404.
+const ABSENT_ARCHIVE_CODES: &[&str] = &["NoSuchBucket", "NoSuchKey", "NoSuchVersion", "NotFound"];
+
+/// The HTTP status Amazon S3 answers a read of an object that IS NOT THERE with —
+/// an absent bucket and an absent key are both a 404 — and the status it answers a
+/// read it does not PERMIT with. These two are what the service can conclude
+/// something about the caller's archive from; every other answer says nothing about
+/// it (see [`archive_download_refusal`]).
+const ARCHIVE_ABSENT_STATUS: u16 = 404;
+/// See [`ARCHIVE_ABSENT_STATUS`].
+const ARCHIVE_DENIED_STATUS: u16 = 403;
+
+/// The Amazon S3 error codes that say the read of the OBJECT was not PERMITTED, from
+/// Amazon S3's published REST error-code list (both are answered with HTTP 403).
+///
+/// A 403 is only about the archive when it is one of these: a code about the
+/// CREDENTIALS the read was signed with (`InvalidAccessKeyId`,
+/// `SignatureDoesNotMatch`, and the emulator's own authentication refusal) says
+/// nothing about the caller's object, so it falls to the logged branch in
+/// [`archive_download_refusal`] rather than telling a client its archive is
+/// unreadable.
+const DENIED_ARCHIVE_CODES: &[&str] = &["AccessDenied", "AllAccessDisabled"];
+
+/// The reason a refusal carries when the failed read named no HTTP status to take a
+/// reason phrase from: an archive the service could not read is, at minimum, not
+/// there.
+const ARCHIVE_NOT_FOUND_REASON: &str = "Not Found";
+
+/// The message Elastic Beanstalk refuses a create whose Amazon S3 archive it could
+/// not download with, built from the request:
+///
+/// ```text
+/// Unable to download from S3 location (Bucket: <bucket>  Key: <key>). Reason: <reason>
+/// ```
+///
+/// Two spaces before `Key:`, as the recorded `CreateApplicationVersion` and
+/// `CreatePlatformVersion` refusals carry it. The bucket and the key are the
+/// request's own, and the reason is the HTTP reason phrase of the Amazon S3 read
+/// that failed.
+pub fn unable_to_download_message(bucket: &str, key: &str, reason: &str) -> String {
+    format!("Unable to download from S3 location (Bucket: {bucket}  Key: {key}). Reason: {reason}")
+}
+
+/// The Amazon S3 client an operation reads a caller-named archive's metadata through,
+/// over the in-process callback into this same emulator.
+///
+/// The callback is the framework's documented seam for calling another emulated
+/// service: it routes in process, so no network client is configured here and this
+/// crate names no other service's crate. `region` is the request's own signing
+/// region, so the read happens where the caller's own Amazon S3 requests go.
+fn s3_client(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+) -> ::aws_sdk_s3::Client {
+    let config = ::aws_sdk_s3::Config::builder()
+        .behavior_version(::aws_sdk_s3::config::BehaviorVersion::latest())
+        .region(::aws_sdk_s3::config::Region::new(region.to_string()))
+        .endpoint_url(format!("https://s3.{region}.amazonaws.com"))
+        // The in-process transport routes on the request's own path, and a
+        // virtual-host bucket name is not a host this emulator resolves, so the
+        // request addresses its bucket in the path.
+        .force_path_style(true)
+        .credentials_provider(ctx.callback().aws_credentials_provider())
+        .http_client(ctx.callback().http_client())
+        // The transport is in-process: there is nothing to retry, time out or watch
+        // for a stalled stream, and each of those would need a sleep implementation
+        // this client is not given. The same goes for caching the identity: the
+        // credentials are handed over directly.
+        .retry_config(::aws_sdk_s3::config::retry::RetryConfig::disabled())
+        .timeout_config(::aws_sdk_s3::config::timeout::TimeoutConfig::disabled())
+        .identity_cache(::aws_sdk_s3::config::IdentityCache::no_cache())
+        .stalled_stream_protection(::aws_sdk_s3::config::StalledStreamProtectionConfig::disabled())
+        .build();
+    ::aws_sdk_s3::Client::from_conf(config)
+}
+
+/// The refusal message for the Amazon S3 archive at `location`, or `None` when object
+/// storage says the archive is there and readable.
+///
+/// Elastic Beanstalk builds a resource FROM the archive a create names
+/// (`CreateApplicationVersion$SourceBundle`, `CreatePlatformVersion$PlatformDefinitionBundle`),
+/// so it reads that archive while serving the create and refuses the request when it
+/// cannot — which is why a typo'd bucket or key is a 400 at the create rather than a
+/// resource a client believes is deployable. The read goes to object storage, in
+/// process: nothing here decides from the SHAPE of the bucket or key whether the
+/// archive exists.
+///
+/// It is a `HeadObject`, not a `GetObject`: "a HEAD request has the same options as a
+/// GET operation on an object" and answers the same existence and authorization
+/// verdict, with NO body — so whether the archive can be read is settled without ever
+/// materialising a caller-sized object in this process. Nothing here interprets the
+/// archive's contents, so its bytes are never needed. Exactly one such read per
+/// request, no loop, nothing retained.
+///
+/// The read is a read: it changes nothing a later caller sees, in this service's
+/// store or in object storage.
+///
+/// A refusal is only ever grounded in an answer about the OBJECT, which is what the
+/// two statuses below are: 404 (the bucket or the key is not there) and 403 carrying
+/// one of [`DENIED_ARCHIVE_CODES`]. Anything else says nothing about the caller's
+/// archive — an emulator assembled without object storage answers the router's own
+/// `UnknownService`, an authentication refusal is about the signer, and a transport
+/// failure answers nothing at all — so it is logged and the create proceeds.
+pub async fn archive_download_refusal(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    location: &S3Location,
+) -> Option<String> {
+    use ::aws_smithy_types::error::metadata::ProvideErrorMetadata;
+
+    let bucket = location.s3_bucket.as_deref().unwrap_or_default();
+    let key = location.s3_key.as_deref().unwrap_or_default();
+    // A location that names no bucket, or no key, names no Amazon S3 object at all:
+    // there is nothing to read and nothing to ask object storage about.
+    if bucket.is_empty() || key.is_empty() {
+        return Some(unable_to_download_message(
+            bucket,
+            key,
+            ARCHIVE_NOT_FOUND_REASON,
+        ));
+    }
+    let failure = match s3_client(ctx, region)
+        .head_object()
+        .bucket(bucket)
+        .key(key)
+        .send()
+        .await
+    {
+        // The archive is there and readable, so the create goes ahead.
+        Ok(_) => return None,
+        Err(failure) => failure,
+    };
+    let status = failure
+        .raw_response()
+        .map(|response| response.status().as_u16());
+    let code = failure.code().unwrap_or_default().to_string();
+    let about_the_object = match status {
+        Some(ARCHIVE_ABSENT_STATUS) => ABSENT_ARCHIVE_CODES.contains(&code.as_str()),
+        Some(ARCHIVE_DENIED_STATUS) => DENIED_ARCHIVE_CODES.contains(&code.as_str()),
+        _ => false,
+    };
+    if !about_the_object {
+        ::tracing::warn!(
+            bucket,
+            key,
+            code = %code,
+            status = ?status,
+            detail = %::aws_smithy_types::error::display::DisplayErrorContext(&failure),
+            "the Amazon S3 read of a caller-named archive answered nothing about the object, \
+             so the create was not refused for it",
+        );
+        return None;
+    }
+    // The reason the refusal carries is the HTTP reason phrase of the read that
+    // failed (404 -> `Not Found`, 403 -> `Forbidden`), so it is read off the status
+    // Amazon S3 answered rather than written out per error code.
+    let reason = status
+        .and_then(|status| ::http::StatusCode::from_u16(status).ok())
+        .and_then(|status| status.canonical_reason())
+        .unwrap_or(ARCHIVE_NOT_FOUND_REASON);
+    Some(unable_to_download_message(bucket, key, reason))
+}
+
 /// `arn:aws:elasticbeanstalk:<region>:<account>:application/<name>`.
 pub fn application_arn(region: &str, application_name: &str) -> String {
     ::engine::emulator_arn(

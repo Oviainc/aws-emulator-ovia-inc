@@ -88,9 +88,29 @@ pub(crate) struct Emulator {
 
 impl Emulator {
     pub(crate) fn new() -> Self {
+        Self::over_engine(false)
+    }
+
+    /// A fresh emulator with the S3 service mounted beside Elastic Beanstalk on the
+    /// SAME engine — which is what the assembled emulator does.
+    ///
+    /// `CreateApplicationVersion` and `CreatePlatformVersion` DOWNLOAD the Amazon S3
+    /// archive their request names, by calling object storage in process, so a suite
+    /// that drives either one against a real archive needs object storage answering.
+    pub(crate) fn with_object_storage() -> Self {
+        Self::over_engine(true)
+    }
+
+    /// The one construction path both constructors use, so they cannot drift.
+    fn over_engine(with_object_storage: bool) -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.register_service(eb::EmulatedService::new(Arc::clone(&engine)));
+        if with_object_storage {
+            router.register_service(service_com_amazonaws_s3_amazons3::EmulatedService::new(
+                Arc::clone(&engine),
+            ));
+        }
         Self { router, engine }
     }
 
@@ -138,6 +158,47 @@ impl Emulator {
             .body(bytes::Bytes::from(form.join("&")))
             .expect("a well-formed request");
         Answer::of(self.router.dispatch(request).await)
+    }
+
+    /// Send one path-style request to the emulator's S3 front door, returning the
+    /// HTTP status.
+    ///
+    /// S3 is a REST service: the bucket and key live in the URI and the body is the
+    /// object's own bytes, so this is a raw request rather than an `Action=` form.
+    /// The credential scope names `s3`, which is what the router claims on.
+    pub(crate) async fn s3(&self, method: &str, path: &str, body: &[u8]) -> u16 {
+        let authorization = format!(
+            "AWS4-HMAC-SHA256 Credential=AKIDTESTEXAMPLE/20261021/{TEST_REGION}/s3/aws4_request, \
+             SignedHeaders=host, Signature=0123456789abcdef"
+        );
+        let request = http::Request::builder()
+            .method(method)
+            .uri(path)
+            .header("authorization", authorization)
+            .body(bytes::Bytes::copy_from_slice(body))
+            .expect("a well-formed request");
+        self.router.dispatch(request).await.status().as_u16()
+    }
+
+    /// Store `body` at `key` in `bucket` in the emulator's object storage, creating
+    /// the bucket first, so a create that DOWNLOADS that archive finds it there.
+    ///
+    /// Both writes go over the S3 front door, so the object an Elastic Beanstalk
+    /// create reads is one object storage really holds. Available only on an
+    /// emulator built by [`Emulator::with_object_storage`]; on any other the S3
+    /// request reaches no service and this panics rather than letting a suite assert
+    /// against an archive that was never stored.
+    pub(crate) async fn put_object(&self, bucket: &str, key: &str, body: &[u8]) {
+        let created = self.s3("PUT", &format!("/{bucket}"), b"").await;
+        assert_eq!(
+            created, 200,
+            "seeding s3://{bucket}: expected 200 from CreateBucket, got {created}"
+        );
+        let stored = self.s3("PUT", &format!("/{bucket}/{key}"), body).await;
+        assert_eq!(
+            stored, 200,
+            "seeding s3://{bucket}/{key}: expected 200 from PutObject, got {stored}"
+        );
     }
 }
 
