@@ -853,6 +853,82 @@ async fn resolved_configuration_substitutes_the_executions_pipeline_variables() 
     }
 }
 
+/// Substitution is ONE pass over the declared value: a reference is replaced by the
+/// value the execution resolved for that variable, and what the replacement itself
+/// contains is never re-scanned — so a chain of variables cannot expand, and a value
+/// that looks like a reference is reported literally. A reference this emulator
+/// cannot resolve still leaves the member absent.
+#[tokio::test]
+async fn resolved_configuration_substitutes_in_one_pass() {
+    // (case, the pipeline's variable declarations, the configuration value declared,
+    //  the resolvedConfiguration expected)
+    let cases: Vec<(&str, Value, &str, Value)> = vec![
+        (
+            "a variable whose value is itself a reference is substituted literally",
+            json!([
+                {"name": "Env", "defaultValue": "#{variables.Other}"},
+                {"name": "Other", "defaultValue": "prod"},
+            ]),
+            "#{variables.Env}",
+            json!({"Key": "#{variables.Other}"}),
+        ),
+        (
+            "a chain of three variables expands exactly one step",
+            json!([
+                {"name": "A", "defaultValue": "#{variables.B}"},
+                {"name": "B", "defaultValue": "#{variables.C}"},
+                {"name": "C", "defaultValue": "end"},
+            ]),
+            "#{variables.A}",
+            json!({"Key": "#{variables.B}"}),
+        ),
+        (
+            "the reverse declaration order expands exactly one step too",
+            json!([
+                {"name": "C", "defaultValue": "end"},
+                {"name": "B", "defaultValue": "#{variables.C}"},
+                {"name": "A", "defaultValue": "#{variables.B}"},
+            ]),
+            "#{variables.A}",
+            json!({"Key": "#{variables.B}"}),
+        ),
+        (
+            "an unterminated reference has no resolved form",
+            json!([{"name": "Env", "defaultValue": "staging"}]),
+            "#{variables.Env",
+            Value::Null,
+        ),
+        (
+            "a reference to a variable the pipeline does not declare has none either",
+            json!([{"name": "Env", "defaultValue": "staging"}]),
+            "#{variables.Missing}",
+            Value::Null,
+        ),
+    ];
+
+    for (case, variables, configured, expected) in cases {
+        let emulator = Emulator::new();
+        let mut declared_action = action("Src", None);
+        declared_action["configuration"] = json!({"Key": configured});
+        let mut declaration = pipeline("demo", vec![stage("Source", vec![declared_action])]);
+        declaration["variables"] = variables;
+
+        let name = create(&emulator, &declaration).await;
+        start(&emulator, &name).await;
+        let page = emulator
+            .ok("ListActionExecutions", &json!({"pipelineName": name}))
+            .await;
+        let detail = details(&page)
+            .first()
+            .unwrap_or_else(|| panic!("case {case:?}: the started action is reported, got {page}"))
+            .clone();
+        assert_eq!(
+            detail["input"]["resolvedConfiguration"], expected,
+            "case {case:?}: unexpected resolvedConfiguration, got {detail}"
+        );
+    }
+}
+
 /// Listing action executions reports the same thing twice and changes nothing a later
 /// caller sees — it starts no action, no execution, and touches no stored pipeline.
 #[tokio::test]

@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListExecutions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListExecutions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListExecutions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Lists the recorded executions OF ONE EXPORT: one `ExecutionReference` per execution
+//! the store holds for the `ExportArn`, in a stable execution-id order, honouring
+//! `MaxResults` and resuming exactly where a previous page ended. An `ExportArn` naming no
+//! export answers the modelled `ResourceNotFoundException`. A reporting operation
+//! (`@readonly` — smithy_query operation `ListExecutions`): it writes nothing.
+//!
+//! IMPLEMENTED. This is the ONLY file to touch for this operation; the notes below on
+//! reaching this service's state and the modelled contract still apply.
+//!
+//! NOTE on what this emulator holds: an execution is the record of a data-plane DELIVERY
+//! — a query run against the billing data and a file written to the caller's S3 bucket —
+//! and this emulator runs no such delivery, so nothing records an execution and this
+//! operation pages over what `crate::state::StoredExecution` holds rather than reporting a
+//! status for work nothing performed. For an export whose deliveries nothing recorded that
+//! is an empty page, which is also what AWS answers for an export that has not run yet —
+//! never a fabricated execution. `GetExecution` reads one execution out of the same store.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +159,69 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListExecutions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListExecutionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListExecutions"))
+        // Which executions are reported is decided by the request's ARN and paging members
+        // alone; nothing about the request's metadata selects them.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListExecutionsErrorModeled::InternalServerException(InternalServerException {
+                message: "The export store is unavailable.".to_string(),
+            })
+        })?;
+
+        let references: Vec<(String, ExecutionReference)> = {
+            let store = state.lock();
+            // The export is resolved first: "Lists the historical executions for the
+            // export" (smithy_query operation `ListExecutions`), so an ARN naming no
+            // export has no execution sequence to page over and is the modelled 404 — not
+            // an empty page, which would report that an existing export has never run.
+            if !store.exports.contains_key(&input.export_arn) {
+                return Err(ListExecutionsErrorModeled::ResourceNotFoundException(
+                    crate::state::export_not_found(&input.export_arn),
+                )
+                .into());
+            }
+            store
+                .executions_of(&input.export_arn)
+                .map(|execution| {
+                    (
+                        execution.execution_id.clone(),
+                        ExecutionReference {
+                            execution_id: execution.execution_id.clone(),
+                            execution_status: execution.status.clone(),
+                        },
+                    )
+                })
+                .collect()
+        };
+
+        let (executions, next_token) = crate::state::page(
+            // The token names a position among THIS export's executions, so one cut from
+            // another listing, or from another export's executions, is refused rather than
+            // resumed at an unrelated offset.
+            crate::state::PageTokenKind::Executions {
+                export_arn: &input.export_arn,
+            },
+            &references,
+            input.max_results,
+            input.next_token.as_deref(),
+        )
+        .ok_or_else(|| {
+            ListExecutionsErrorModeled::ValidationException(ValidationException {
+                message: "NextToken is not a pagination token issued by this service."
+                    .to_string(),
+                reason: Some(crate::state::VALIDATION_REASON_FIELD_FAILED.to_string()),
+                fields: Some(vec![ValidationExceptionField {
+                    name: "NextToken".to_string(),
+                    message: "The token must be one returned by a previous ListExecutions \
+                              call for this export."
+                        .to_string(),
+                }]),
+            })
+        })?;
+
+        Ok(ListExecutionsOutput {
+            executions: Some(executions),
+            next_token,
+        })
     }
 }

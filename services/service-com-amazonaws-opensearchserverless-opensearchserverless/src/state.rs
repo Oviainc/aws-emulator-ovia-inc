@@ -26,7 +26,8 @@ use crate::ops::types::{
     CreateCollectionDetail, CreateCollectionGroupDetail, CurrentCapacity, DeleteCollectionDetail,
     FipsEndpoints, IamFederationConfigOptions, IamIdentityCenterConfigOptions,
     LifecyclePolicyDetail, LifecyclePolicyErrorDetail, SamlConfigOptions, SecurityConfigDetail,
-    SecurityConfigSummary, SecurityPolicyDetail, Tag, UpdateCollectionGroupDetail, VectorOptions,
+    SecurityConfigSummary, SecurityPolicyDetail, SecurityPolicySummary, Tag,
+    UpdateCollectionGroupDetail, VectorOptions,
 };
 
 /// This service's ARN namespace, from the model's `aws.api#service` trait
@@ -258,6 +259,47 @@ pub const DEFAULT_PAGE_SIZE: i32 = 20;
 /// The largest page a listing serves: the maximum of `maxResults`' own
 /// `@range(min: 1, max: 100)`.
 pub const MAX_PAGE_SIZE: i32 = 100;
+
+/// The most `resource` filter entries a listing evaluates: the modelled maximum of
+/// `ListSecurityPoliciesRequest$resource`'s own `@length(min: 1, max: 1000)`. Enforced
+/// HERE as well as at the boundary, so the work a filter drives is bounded by this code
+/// rather than by what the validator ahead of it happens to check.
+pub const MAX_RESOURCE_FILTER_ENTRIES: usize = 1000;
+
+/// The longest resource pattern a filter entry, or a stored policy's own `Resource`
+/// entry, may be, in BYTES.
+///
+/// EMULATOR RESOURCE GUARD, not an AWS limit: `Resource` carries no `@length`
+/// (`smithy_query(query="shape", shape="Resource")`), so without this the length of a
+/// pattern — a factor in the cost of every comparison below — is the caller's to choose.
+/// 1024 is far past any real resource name: the longest form is
+/// `index/<collection>/<index>`, whose collection half is a `CollectionName` of at most 32
+/// characters.
+pub const MAX_RESOURCE_PATTERN_LENGTH: usize = 1024;
+
+/// The most `Resource` entries one stored policy document contributes to a listing's
+/// filtering.
+///
+/// EMULATOR RESOURCE GUARD, not an AWS limit: a `PolicyDocument` is up to 20480
+/// characters, which is room for thousands of short `Resource` entries, and that count
+/// multiplies the comparisons a filter drives. A real encryption or network policy names a
+/// handful, so a document past this contributes its first [`MAX_POLICY_RESOURCES`] entries
+/// and no more.
+pub const MAX_POLICY_RESOURCES: usize = 200;
+
+/// The most resource-pattern matching WORK one listing request performs, in bytes
+/// scanned.
+///
+/// EMULATOR RESOURCE GUARD, not an AWS limit, and the one that bounds the PRODUCT the
+/// factors above each bound a side of: records of a type, times filter entries, times the
+/// resources a document names, times the cost of one comparison. The budget counts WORK
+/// rather than comparisons, because one comparison of two wildcard-heavy patterns is not
+/// one of two plain names: see [`resource_overlap_work`]. 100 million byte-scans is around
+/// a tenth of a second, and far past any real listing (a thousand filter entries against
+/// twenty policies naming a handful of short resources each is under ten million); a
+/// request that would exceed it is refused with the modelled `ValidationException` instead
+/// of running on, in the spirit of [`MAX_DOCUMENT_DEPTH`].
+pub const MAX_RESOURCE_FILTER_WORK: usize = 100_000_000;
 
 /// The most `clientToken` replay entries this emulator keeps.
 ///
@@ -861,6 +903,36 @@ impl SecurityPolicyRecord {
         }
     }
 
+    /// The `SecurityPolicySummary` body for this record — the shape `ListSecurityPolicies`
+    /// pages over. It is `SecurityPolicyDetail` without the policy document itself, so a
+    /// listing and a read cannot disagree about the members they share.
+    pub fn summary(&self) -> SecurityPolicySummary {
+        SecurityPolicySummary {
+            r#type: Some(self.kind.clone()),
+            name: Some(self.name.clone()),
+            policy_version: Some(self.policy_version.clone()),
+            description: self.description.clone(),
+            created_date: Some(self.created_date),
+            last_modified_date: Some(self.last_modified_date),
+        }
+    }
+
+    /// What a listing needs of this record, COPIED OUT of the store: the summary it
+    /// reports and the resources its rules name. Taking this copy is the whole of a
+    /// listing's work under the state lock, so the pattern matching a `resource` filter
+    /// drives runs outside it and one caller's filter cannot block another request.
+    ///
+    /// Bounded by construction: a type holds at most
+    /// [`MAX_SECURITY_POLICIES_PER_TYPE`] records and a document contributes at most
+    /// [`MAX_POLICY_RESOURCES`] entries.
+    pub fn listing_entry(&self) -> SecurityPolicyListingEntry {
+        SecurityPolicyListingEntry {
+            summary: self.summary(),
+            name: self.name.clone(),
+            resources: policy_document_resources(&self.policy),
+        }
+    }
+
     /// Apply `write` to this record; see [`PolicyWrite`] for the rule it follows.
     pub fn apply(&mut self, write: PolicyWrite) {
         write.apply(
@@ -870,6 +942,241 @@ impl SecurityPolicyRecord {
             &mut self.last_modified_date,
         );
     }
+}
+
+/// The `Resource` entries a policy document's rules name, in document order.
+///
+/// What the model cannot express: `PolicyDocument` is text with a character class, so the
+/// resources a policy applies to live in its CONTENT. AWS's "Network access for Amazon
+/// OpenSearch Serverless" and "Encryption at rest for Amazon OpenSearch Serverless"
+/// document that content as a `Rules` list whose every rule carries a `ResourceType` and
+/// the `Resource` entries it applies to — an encryption policy being one such object and a
+/// network policy a LIST of them — which is why both forms are walked here. The resource
+/// entry already carries its own type (`collection/<name>`, `index/<collection>/<index>`),
+/// so a rule's `ResourceType` adds nothing to what a resource filter can select on.
+///
+/// Nothing is validated here: a document that is not in that form simply names no
+/// resources, because `CreateSecurityPolicy` accepts any JSON document a caller signs.
+///
+/// At most [`MAX_POLICY_RESOURCES`] entries are collected, so the length of this list is
+/// never chosen by whoever wrote the document.
+pub fn policy_document_resources(document: &::aws_smithy_types::Document) -> Vec<String> {
+    let mut resources = Vec::new();
+    collect_policy_resources(document, 1, &mut resources);
+    resources
+}
+
+/// [`policy_document_resources`] at `depth`, bounded by [`MAX_DOCUMENT_DEPTH`] for the
+/// same reason [`document_from_json`] is, by [`MAX_POLICY_RESOURCES`] in how many entries
+/// it collects and by [`MAX_RESOURCE_PATTERN_LENGTH`] in how long one may be: the document
+/// is caller-supplied.
+fn collect_policy_resources(
+    document: &::aws_smithy_types::Document,
+    depth: usize,
+    resources: &mut Vec<String>,
+) {
+    use ::aws_smithy_types::Document;
+    if depth > MAX_DOCUMENT_DEPTH || resources.len() >= MAX_POLICY_RESOURCES {
+        return;
+    }
+    match document {
+        // A network policy is a list of rule-carrying objects.
+        Document::Array(entries) => {
+            for entry in entries {
+                collect_policy_resources(entry, depth + 1, resources);
+            }
+        }
+        Document::Object(members) => {
+            let Some(Document::Array(rules)) = members.get("Rules") else {
+                return;
+            };
+            for rule in rules {
+                let Document::Object(rule) = rule else {
+                    continue;
+                };
+                let Some(Document::Array(named)) = rule.get("Resource") else {
+                    continue;
+                };
+                resources.extend(
+                    named
+                        .iter()
+                        .filter_map(|resource| match resource {
+                            // A resource entry past the pattern bound is dropped rather
+                            // than matched: its length is whoever wrote the document's to
+                            // choose, and it is a factor in every comparison's cost.
+                            Document::String(resource)
+                                if resource.len() <= MAX_RESOURCE_PATTERN_LENGTH =>
+                            {
+                                Some(resource.clone())
+                            }
+                            _ => None,
+                        })
+                        .take(MAX_POLICY_RESOURCES.saturating_sub(resources.len())),
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
+/// One stored security policy as a listing sees it: the summary it reports, the
+/// `PolicyName` that is its place in the listing's order, and the resources its rules
+/// name. Built by [`SecurityPolicyRecord::listing_entry`] under the state lock and used
+/// after it is released.
+#[derive(Debug, Clone)]
+pub struct SecurityPolicyListingEntry {
+    /// The `SecurityPolicySummary` the listing reports for this policy.
+    pub summary: SecurityPolicySummary,
+    /// The `PolicyName`, which is this listing's page cursor.
+    pub name: String,
+    /// The resources the policy's rules name; see [`policy_document_resources`].
+    pub resources: Vec<String>,
+}
+
+/// A security policy listing is of ONE `type` (the member is required), inside which the
+/// `PolicyName` is unique — so the name is this entry's place in that listing's order.
+impl Paged for SecurityPolicyListingEntry {
+    fn page_cursor(&self) -> &str {
+        &self.name
+    }
+}
+
+/// The entries of `candidates` that apply to at least one resource `filter` names — what a
+/// listing's `resource` filter selects — or the `ValidationException` message for a filter
+/// this emulator will not evaluate.
+///
+/// A filter entry and a policy resource meet when the resource sets they denote OVERLAP;
+/// see [`resource_patterns_overlap`]. An entry whose policy names no resource at all (its
+/// rules carry none, or its document is not in the documented rule form) applies to
+/// nothing a filter can name, so a filtered listing leaves it out while an unfiltered one
+/// still reports it.
+///
+/// Every factor of the work is bounded BEFORE it runs: the filter's length and each
+/// entry's length are refused past [`MAX_RESOURCE_FILTER_ENTRIES`] and
+/// [`MAX_RESOURCE_PATTERN_LENGTH`], a document contributes at most
+/// [`MAX_POLICY_RESOURCES`] resources of at most that same length, and the PRODUCT — the
+/// work this one request performs, charged per comparison by
+/// [`resource_overlap_work`] — is capped by [`MAX_RESOURCE_FILTER_WORK`], which trips into
+/// the same refusal rather than running on.
+pub fn resource_filtered(
+    candidates: Vec<SecurityPolicyListingEntry>,
+    filter: &[String],
+) -> Result<Vec<SecurityPolicyListingEntry>, String> {
+    if filter.len() > MAX_RESOURCE_FILTER_ENTRIES {
+        return Err(format!(
+            "resource must name at most {MAX_RESOURCE_FILTER_ENTRIES} resources, got {}",
+            filter.len()
+        ));
+    }
+    if let Some(entry) = filter
+        .iter()
+        .find(|entry| entry.len() > MAX_RESOURCE_PATTERN_LENGTH)
+    {
+        return Err(format!(
+            "a resource entry must be at most {MAX_RESOURCE_PATTERN_LENGTH} bytes, got {}",
+            entry.len()
+        ));
+    }
+
+    let mut budget = MAX_RESOURCE_FILTER_WORK;
+    let mut kept = Vec::new();
+    for candidate in candidates {
+        let mut applies = false;
+        for wanted in filter {
+            for resource in &candidate.resources {
+                // Charged BEFORE the comparison, so the budget bounds work done rather
+                // than work already spent.
+                let Some(left) = budget.checked_sub(resource_overlap_work(resource, wanted))
+                else {
+                    return Err(format!(
+                        "resource names more, or more wildcarded, resources than this \
+                         listing matches ({MAX_RESOURCE_FILTER_WORK} bytes of matching); \
+                         name fewer resources"
+                    ));
+                };
+                budget = left;
+                if resource_patterns_overlap(resource, wanted) {
+                    applies = true;
+                    break;
+                }
+            }
+            if applies {
+                break;
+            }
+        }
+        if applies {
+            kept.push(candidate);
+        }
+    }
+    Ok(kept)
+}
+
+/// An upper bound, in bytes scanned, on what [`resource_patterns_overlap`] does for one
+/// pair — the unit [`MAX_RESOURCE_FILTER_WORK`] is spent in.
+///
+/// [`resource_pattern_matches`] walks one pattern's literal runs over the other string, so
+/// its cost is at most the number of those runs times that string's length, and the
+/// overlap test does it in both directions. Two plain names therefore cost their own
+/// length, while a pattern full of wildcards costs what it really takes.
+fn resource_overlap_work(left: &str, right: &str) -> usize {
+    let runs = |pattern: &str| pattern.matches('*').count() + 1;
+    let span = left.len() + right.len();
+    (runs(left) + runs(right)).saturating_mul(span)
+}
+
+/// True when `left` matches `right` read as a plain resource name, or `right` matches
+/// `left` read as one.
+///
+/// Both sides are resource patterns in the form AWS's policy and filter documentation
+/// uses: a resource name in which `*` stands for any run of characters ("you can use a
+/// wildcard"), and nothing else is special. A filter entry is itself such a pattern, so
+/// the test is symmetric — an exact filter meets a wildcard policy resource, and a
+/// wildcard filter meets an exact one.
+///
+/// That is exactly "the resource sets the two denote overlap" whenever at most one side
+/// carries a wildcard, and whenever both wildcards are trailing ones, which is the form
+/// AWS documents ("you can use a wildcard at the end"). Two patterns wildcarded in the
+/// MIDDLE can denote a common resource without either matching the other as a literal
+/// (`*-prod` and `logs-*` both denote `logs-prod`); this answers false for that pair
+/// rather than solving pattern-against-pattern intersection.
+pub fn resource_patterns_overlap(left: &str, right: &str) -> bool {
+    resource_pattern_matches(left, right) || resource_pattern_matches(right, left)
+}
+
+/// True when the resource `name` is one `pattern` denotes.
+///
+/// `*` is the only metacharacter, so this is a single left-to-right walk of the pattern's
+/// literal runs over `name`: the first run must start it, the last must end it, and each
+/// run between must occur after the one before. It compiles nothing and allocates nothing,
+/// so the cost of one comparison is linear in the two strings rather than in a matcher
+/// built from caller text.
+///
+/// Not `services/common`'s `iam_authorization::wildcard_match`, which implements IAM's
+/// pattern language: that one also treats `?` as a single-character wildcard, and a `?` in
+/// an OpenSearch Serverless resource name is a literal character, so reusing it would make
+/// this listing select policies whose rules name a different resource.
+fn resource_pattern_matches(pattern: &str, name: &str) -> bool {
+    if !pattern.contains('*') {
+        return pattern == name;
+    }
+    let mut runs = pattern.split('*').peekable();
+    let first = runs.next().unwrap_or_default();
+    let Some(mut rest) = name.strip_prefix(first) else {
+        return false;
+    };
+    while let Some(run) = runs.next() {
+        if runs.peek().is_none() {
+            // The pattern's last run must END `name`; an empty one is a trailing `*`,
+            // which the rest of `name` satisfies whatever it is.
+            return run.is_empty() || rest.ends_with(run);
+        }
+        match rest.find(run) {
+            // `find` answers a byte offset at a character boundary.
+            Some(at) => rest = &rest[at + run.len()..],
+            None => return false,
+        }
+    }
+    true
 }
 
 /// The `SecurityConfigId` the configuration `name` carries under `kind`:

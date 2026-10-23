@@ -17,6 +17,8 @@ mod catalog_dictionary;
 mod catalog_published_text;
 #[path = "all/catalog_schema.rs"]
 mod catalog_schema;
+#[path = "all/execution_listing.rs"]
+mod execution_listing;
 #[path = "all/execution_lookup.rs"]
 mod execution_lookup;
 #[path = "all/export_definition_validation.rs"]
