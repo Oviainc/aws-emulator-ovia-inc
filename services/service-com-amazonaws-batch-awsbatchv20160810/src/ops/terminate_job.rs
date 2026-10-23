@@ -6,8 +6,13 @@
 //! `DescribeJobs` observes the termination. The model's own doc splits the two cases it
 //! records on the job: a job in `STARTING` or `RUNNING` is terminated
 //! (`isTerminated`), a job that has not progressed that far is cancelled
-//! (`isCancelled`). A job that is already in a terminal status is left exactly as it is,
-//! and an unknown `jobId` is a `ClientException`.
+//! (`isCancelled`). A job that is already in a terminal status is left exactly as it is.
+//!
+//! A `jobId` this service holds no job for is ACCEPTED: the operation models an empty
+//! output and ending work that is not there is already the state the caller asked for, so
+//! the call answers 200, fabricates no job (a later `DescribeJobs` still reports none for
+//! that id) and leaves the store untouched — exactly as `CancelJob` beside it treats an
+//! unknown id. That is what makes a blind retry or a teardown path safe to call.
 //!
 //! This is the ONLY file to touch for this operation.
 //!
@@ -157,13 +162,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `state::terminate_job` keeps the documented SUBMITTED/PENDING/RUNNABLE ->
         // cancelled, STARTING/RUNNING -> terminated distinction, leaves a job that is
-        // already terminal alone, and keeps the clock index in step.
-        if !state.terminate_job(&input.job_id, &input.reason, now) {
-            return Err(TerminateJobErrorModeled::ClientException(batch::client_exception(
-                format!("Job {} does not exist", input.job_id),
-            ))
-            .into());
-        }
+        // already terminal alone, and keeps the clock index in step. It answers whether
+        // the store held the job at all, which this operation does not report: an id it
+        // holds no job for leaves nothing to end, and nothing is created for it.
+        let _ = state.terminate_job(&input.job_id, &input.reason, now);
 
         Ok(TerminateJobOutput {})
     }

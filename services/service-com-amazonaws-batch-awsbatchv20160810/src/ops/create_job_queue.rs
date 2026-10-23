@@ -209,7 +209,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         if state.job_queues.contains_key(&input.job_queue_name) {
             return Err(CreateJobQueueErrorModeled::ClientException(batch::client_exception(
-                format!("Object already exists: job queue {}", input.job_queue_name),
+                batch::OBJECT_ALREADY_EXISTS,
             ))
             .into());
         }

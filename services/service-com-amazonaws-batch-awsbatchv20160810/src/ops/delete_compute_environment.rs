@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteComputeEnvironment
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteComputeEnvironment`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteComputeEnvironment::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Deletes a compute environment this service holds.
+//!
+//! The operation is a MUTATION with two preconditions the model's own doc states:
+//! "Before you can delete a compute environment, you must set its state to DISABLED with
+//! the UpdateComputeEnvironment API operation and disassociate it from any job queues
+//! with the UpdateJobQueue API operation." A request that breaks either, or that names an
+//! environment this service does not hold, is refused with the modelled `ClientException`
+//! (HTTP 400) and changes nothing.
+//!
+//! A delete AWS accepts does not make the environment vanish inside the call: it moves to
+//! the non-terminal `DELETING` status and the removal is owed by the CLOCK
+//! ([`crate::state::JOB_PHASE_MILLIS`] later), so a caller that describes straight after
+//! the delete still sees `DELETING` the way AWS Batch reports it.
 //!
 //! ## Shape of an operation
 //!
@@ -141,18 +146,69 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteComputeEnvironment` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteComputeEnvironmentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteComputeEnvironment"))
+        use crate::state as batch;
+
+        let _ = ctx;
+        let Some(state) = batch::service_state(&*self.engine) else {
+            return Err(DeleteComputeEnvironmentErrorModeled::ServerException(
+                batch::unreachable_state(),
+            )
+            .into());
+        };
+        let now = batch::now_millis();
+        let mut state = state.lock();
+        state.materialize_due(now);
+
+        let Some(name) = state.compute_environment_name(&input.compute_environment) else {
+            return Err(DeleteComputeEnvironmentErrorModeled::ClientException(
+                batch::client_exception(format!(
+                    "Compute environment {} does not exist",
+                    input.compute_environment
+                )),
+            )
+            .into());
+        };
+        let Some(environment) = state.compute_environments.get(&name) else {
+            return Err(DeleteComputeEnvironmentErrorModeled::ServerException(
+                batch::unreachable_state(),
+            )
+            .into());
+        };
+        // A delete already accepted is in flight: repeating it asks for a removal the
+        // clock already owes, so it is the same success and changes nothing.
+        if environment.status == batch::STATUS_DELETING {
+            return Ok(DeleteComputeEnvironmentOutput {});
+        }
+        if environment.state != batch::STATE_DISABLED {
+            return Err(DeleteComputeEnvironmentErrorModeled::ClientException(
+                batch::client_exception(format!(
+                    "Cannot delete compute environment {name} while its state is {}: set it \
+                     to {} with UpdateComputeEnvironment first",
+                    environment.state,
+                    batch::STATE_DISABLED
+                )),
+            )
+            .into());
+        }
+        let attached = state.queues_using_compute_environment(&environment.arn);
+        if !attached.is_empty() {
+            return Err(DeleteComputeEnvironmentErrorModeled::ClientException(
+                batch::client_exception(format!(
+                    "Cannot delete, found existing JobQueue relationship: {}",
+                    attached.join(", ")
+                )),
+            )
+            .into());
+        }
+
+        // Accepted: the environment enters DELETING now and stops existing when that
+        // move falls due (`state::materialize_due`).
+        if let Some(environment) = state.compute_environments.get_mut(&name) {
+            environment.status = batch::STATUS_DELETING.to_string();
+            environment.status_reason = None;
+            environment.status_due_at = Some(now + batch::JOB_PHASE_MILLIS);
+        }
+
+        Ok(DeleteComputeEnvironmentOutput {})
     }
 }

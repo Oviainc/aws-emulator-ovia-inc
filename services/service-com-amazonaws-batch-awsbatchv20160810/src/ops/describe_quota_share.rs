@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeQuotaShare
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeQuotaShare`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeQuotaShare::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the quota share a `quotaShareArn` names, from what `CreateQuotaShare` stored.
+//!
+//! Two refusals, and they are DIFFERENT: a `quotaShareArn` that carries no
+//! `job-queue/<queue>/quota-share/<share>` path is not a quota share ARN at all, while an
+//! ARN of that shape naming nothing stored is well-formed but unknown. Both are the
+//! modelled `ClientException` (HTTP 400), each saying which it is, in the frontend
+//! envelope AWS is recorded to word the quota-share refusals in.
+//!
+//! A REPORTING operation: it materialises what the clock already owed (the share's
+//! `CREATING` -> `VALID` move) and writes nothing else, so two reads at one instant answer
+//! alike.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +155,52 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeQuotaShare` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeQuotaShareErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeQuotaShare"))
+        use crate::state as batch;
+
+        let _ = ctx;
+        let Some(state) = batch::service_state(&*self.engine) else {
+            return Err(
+                DescribeQuotaShareErrorModeled::ServerException(batch::unreachable_state()).into(),
+            );
+        };
+        let now = batch::now_millis();
+        let mut state = state.lock();
+        state.materialize_due(now);
+
+        // A value that is not a quota share ARN at all is its OWN refusal: it names no
+        // job queue and no share, so there is nothing to look up.
+        if batch::parse_quota_share_arn(&input.quota_share_arn).is_none() {
+            return Err(DescribeQuotaShareErrorModeled::ClientException(
+                batch::client_exception_enveloped(format!(
+                    "{} is not valid, Quota Share arn should match a valid Quota Share arn \
+                     pattern arn:aws:{}:<region>:<account>:job-queue/<job-queue-name>/\
+                     quota-share/<quota-share-name>.",
+                    input.quota_share_arn,
+                    batch::ARN_SERVICE
+                )),
+            )
+            .into());
+        }
+        let Some(share) = state.quota_shares.get(&input.quota_share_arn) else {
+            return Err(DescribeQuotaShareErrorModeled::ClientException(
+                batch::client_exception_enveloped(format!(
+                    "{} does not exist.",
+                    input.quota_share_arn
+                )),
+            )
+            .into());
+        };
+
+        Ok(DescribeQuotaShareOutput {
+            quota_share_name: Some(share.name.clone()),
+            quota_share_arn: Some(share.arn.clone()),
+            job_queue_arn: Some(share.job_queue_arn.clone()),
+            capacity_limits: Some(share.capacity_limits.clone()),
+            resource_sharing_configuration: Some(share.resource_sharing_configuration.clone()),
+            preemption_configuration: Some(share.preemption_configuration.clone()),
+            state: Some(share.state.clone()),
+            status: Some(share.status.clone()),
+            tags: share.tags.clone(),
+        })
     }
 }

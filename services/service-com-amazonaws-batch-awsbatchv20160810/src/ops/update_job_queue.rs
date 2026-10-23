@@ -225,6 +225,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ))
             })?;
 
+        // A queue whose deletion the clock already owes cannot be updated: the delete was
+        // accepted, so there is nothing left to configure.
+        if stored.status == batch::STATUS_DELETING {
+            return Err(UpdateJobQueueErrorModeled::ClientException(batch::client_exception(
+                format!(
+                    "Job queue {name} is {} and can't be updated",
+                    batch::STATUS_DELETING
+                ),
+            ))
+            .into());
+        }
+
         // A `computeEnvironmentOrder` the request carries REPLACES the stored order, so
         // each entry must resolve to a compute environment this emulator holds, and is
         // stored as that environment's ARN (what `CreateJobQueue` stores and

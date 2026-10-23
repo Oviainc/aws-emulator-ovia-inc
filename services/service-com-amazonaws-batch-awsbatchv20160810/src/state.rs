@@ -46,10 +46,11 @@ use crate::ops::types::{
     CapacityLimit, ClientException, ComputeEnvironmentOrder, ComputeResource,
     ConsumableResourceProperties, ContainerDetail, ContainerOverrides, ContainerProperties,
     EcsProperties, EcsSettings, EksConfiguration, FairsharePolicy, JobDefinition, JobDependency,
-    JobStateTimeLimitAction, JobTimeout, KeyValuePair, NodeProperties, QuotaSharePolicy,
-    ResourceRequirement, RetryStrategy, ServerException, ServiceEnvironmentOrder,
-    ServiceJobPreemptionConfiguration, ServiceJobRetryStrategy, ServiceJobTimeout, ShareAttributes,
-    UpdatePolicy,
+    JobStateTimeLimitAction, JobTimeout, KeyValuePair, NodeProperties,
+    QuotaShareCapacityLimit, QuotaSharePolicy, QuotaSharePreemptionConfiguration,
+    QuotaShareResourceSharingConfiguration, ResourceRequirement, RetryStrategy, ServerException,
+    ServiceEnvironmentOrder, ServiceJobPreemptionConfiguration, ServiceJobRetryStrategy,
+    ServiceJobTimeout, ShareAttributes, UpdatePolicy,
 };
 
 /// This service's ARN namespace and sigv4 signing name (`OPERATIONS.md`).
@@ -106,6 +107,12 @@ pub mod limits {
     /// modelled `ClientException` past this point rather than growing without bound.
     pub const MAX_CONSUMABLE_RESOURCES: usize = 500;
 
+    /// Quota shares kept at once. An EMULATOR bound (AWS publishes no quota for this
+    /// resource): `CreateQuotaShare` fills the store and anyone can repeat it, so a create
+    /// past this answers the modelled `ClientException`. Sized like the other per-Region
+    /// Batch resources above.
+    pub const MAX_QUOTA_SHARES: usize = 50;
+
     /// Service jobs kept at once, the same emulator bound as [`MAX_JOBS`] and with the
     /// same eviction-before-refusal rule
     /// ([`super::ComAmazonawsBatchAwsbatchv20160810State::insert_service_job`]).
@@ -123,9 +130,30 @@ pub fn quota_message(resource: &str, maximum: usize) -> String {
     format!("Too many {resource}: this emulator stores at most {maximum}")
 }
 
+/// What AWS Batch answers when a `Create*` names an object it already holds: the bare
+/// detail `CreateComputeEnvironment` is recorded to state for a duplicate name, with no
+/// resource name interpolated into it.
+pub const OBJECT_ALREADY_EXISTS: &str = "Object already exists";
+
+/// What `CreateJobQueue` answers when its `computeEnvironmentOrder` names a compute
+/// environment it cannot attach — the bare detail AWS is recorded to state, which names
+/// the requirement rather than the environment.
+pub const COMPUTE_ENVIRONMENTS_NOT_ATTACHABLE: &str =
+    "Compute Environments must be created and valid before attaching them to a job queue";
+
+/// What `DescribeJobDefinitions` answers for a `nextToken` it did not issue — the bare
+/// detail AWS is recorded to state.
+pub const NEXT_TOKEN_NOT_PROCESSABLE: &str = "Error processing next token";
+
 /// `statusReason` of a job whose container could not be run here.
 pub const NO_CONTAINER_RUNTIME_REASON: &str =
     "This emulator has no container runtime, so the job's container was never started";
+
+/// `statusReason` of a job the deletion of its job queue ended.
+///
+/// `DeleteJobQueue`'s own doc: "All jobs in the queue are eventually terminated when you
+/// delete a job queue."
+pub const JOB_QUEUE_DELETED_REASON: &str = "The job queue this job was submitted to was deleted";
 
 /// `statusReason` of a service job whose work nothing here dispatched.
 ///
@@ -163,11 +191,16 @@ pub const STATUS_CREATING: &str = "CREATING";
 pub const STATUS_UPDATING: &str = "UPDATING";
 /// `CEStatus`/`JQStatus` value of a created resource.
 pub const STATUS_VALID: &str = "VALID";
+/// `CEStatus`/`JQStatus` value a resource carries while the deletion a `Delete*` call
+/// started is still owed by the clock.
+pub const STATUS_DELETING: &str = "DELETING";
 /// `CEState`/`JQState` default: a resource is created enabled unless asked otherwise.
 pub const STATE_ENABLED: &str = "ENABLED";
-/// `CEState`/`JQState` of a resource that accepts no new work. `JQState`'s own doc:
-/// "If the job queue state is `DISABLED`, new jobs can't be added to the queue, but jobs
-/// already in the queue can finish."
+/// `CEState`/`JQState` of a resource that accepts no new work, and the state a resource
+/// must carry before it can be deleted (`DeleteComputeEnvironment`: "you must set its
+/// state to DISABLED"; `DeleteJobQueue`: submissions must first be disabled with
+/// `UpdateJobQueue`). `JQState`'s own doc: "If the job queue state is `DISABLED`, new
+/// jobs can't be added to the queue, but jobs already in the queue can finish."
 pub const STATE_DISABLED: &str = "DISABLED";
 /// `JobDefinition$status` of a revision `RegisterJobDefinition` created and nothing has
 /// deregistered.
@@ -204,6 +237,12 @@ pub const MAX_JOB_DEFINITION_NAME_LEN: usize = 128;
 /// letters, numbers, hyphens (-), and underscores (_)." The model types the member as a
 /// plain `String`, so the framework cannot refuse a bad one.
 pub const MAX_SERVICE_ENVIRONMENT_NAME_LEN: usize = 128;
+
+/// The longest `quotaShareName` the service accepts, from the member's doc: "The name of
+/// the quota share. It can be up to 128 characters long. It can contain uppercase and
+/// lowercase letters, numbers, hyphens (-), and underscores (_)." The model types the
+/// member as a plain `String`, so the framework cannot refuse a bad one.
+pub const MAX_QUOTA_SHARE_NAME_LEN: usize = 128;
 
 /// The longest `jobName` the service accepts, from the member's doc (`SubmitJob$jobName`,
 /// `SubmitServiceJob$jobName`): "It can be up to 128 characters long. It can contain
@@ -446,6 +485,26 @@ pub fn service_environment_arn(region: &str, name: &str) -> String {
     )
 }
 
+/// `arn:aws:batch:<region>:<account>:job-queue/<queue>/quota-share/<name>` — a quota
+/// share is named under the job queue it is associated with, which is the ARN pattern
+/// `DescribeQuotaShare` matches a `quotaShareArn` against.
+pub fn quota_share_arn(region: &str, job_queue_name: &str, name: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!("job-queue/{job_queue_name}/quota-share/{name}"),
+    )
+}
+
+/// The `(job queue name, quota share name)` a well-formed `quotaShareArn` names, or
+/// `None` when the value carries no `job-queue/<queue>/quota-share/<share>` path — which
+/// is a DIFFERENT refusal from an ARN of the right shape naming nothing stored.
+pub fn parse_quota_share_arn(value: &str) -> Option<(&str, &str)> {
+    let resource = arn_resource_id(value, "job-queue")?;
+    let (queue, share) = resource.split_once("/quota-share/")?;
+    (!queue.is_empty() && !share.is_empty() && !share.contains('/')).then_some((queue, share))
+}
+
 /// `arn:aws:batch:<region>:<account>:scheduling-policy/<name>` — the format
 /// `CreateSchedulingPolicy$arn` documents ("The format is
 /// aws:Partition:batch:Region:Account:scheduling-policy/Name").
@@ -565,6 +624,32 @@ pub struct JobQueue {
     pub job_queue_type: Option<String>,
     pub tags: Option<HashMap<String, String>>,
     pub job_state_time_limit_actions: Option<Vec<JobStateTimeLimitAction>>,
+}
+
+/// A quota share, exactly as `CreateQuotaShare` stored it.
+///
+/// Keyed by its ARN, which is the only identifier `DescribeQuotaShare` takes
+/// (`quotaShareArn`), and nested under the job queue the share is associated with — what
+/// that ARN names ([`quota_share_arn`]). AWS Batch returns a fresh quota share in the
+/// non-terminal `CREATING` status, so the move to `VALID` is owed by the clock
+/// ([`QuotaShare::status_due_at`]).
+#[derive(Debug, Clone)]
+pub struct QuotaShare {
+    pub name: String,
+    pub arn: String,
+    /// The ARN of the job queue the create's `jobQueue` resolved to (by name or by ARN).
+    pub job_queue_arn: String,
+    pub capacity_limits: Vec<QuotaShareCapacityLimit>,
+    pub resource_sharing_configuration: QuotaShareResourceSharingConfiguration,
+    pub preemption_configuration: QuotaSharePreemptionConfiguration,
+    /// `QuotaShareState`: `ENABLED` unless the create asked for `DISABLED` ("The default
+    /// state is `ENABLED`").
+    pub state: String,
+    /// `QuotaShareStatus`.
+    pub status: String,
+    /// Set while the `CREATING` -> `VALID` move is still owed by the clock.
+    pub status_due_at: Option<i64>,
+    pub tags: Option<HashMap<String, String>>,
 }
 
 /// A submitted job: the request's own members, the definition it resolved to, and
@@ -750,12 +835,12 @@ enum Advanced {
 /// response's request id reports for an absent one.
 const ABSENT_REQUEST_ID: &str = "None";
 
-/// How Batch words a `ClientException` its frontend raises: the detail of what
-/// was wrong, wrapped in `Error executing request, Exception : <detail>,
-/// RequestId: <id>`.
+/// How Batch words the `ClientException`s its frontend WRAPS: the detail of what was
+/// wrong, inside `Error executing request, Exception : <detail>, RequestId: <id>`.
 ///
-/// Every refusal this service raises for a request it understood but cannot
-/// accept goes through here, so one wording rule covers all of them.
+/// Only the refusals AWS is recorded to wrap are worded this way; see
+/// [`client_exception`] for the bare form and [`client_exception_enveloped`] for the
+/// wrapped one.
 pub fn client_exception_message(detail: &str) -> String {
     format!("Error executing request, Exception : {detail}, RequestId: {ABSENT_REQUEST_ID}")
 }
@@ -891,6 +976,10 @@ pub struct ComAmazonawsBatchAwsbatchv20160810State {
     pub consumable_resources: HashMap<String, ConsumableResource>,
     /// Consumable resource ARN -> name, so `name or ARN` members resolve both ways.
     pub consumable_resources_by_arn: HashMap<String, String>,
+    /// Quota shares by ARN — the only identifier `DescribeQuotaShare` takes. Bounded by
+    /// [`limits::MAX_QUOTA_SHARES`], and a share goes when the job queue it hangs off
+    /// does.
+    pub quota_shares: BTreeMap<String, QuotaShare>,
     /// Job ids per queue ARN, in submission order, backing `ListJobs`.
     pub jobs_by_queue: HashMap<String, Vec<String>>,
     /// Service jobs by service job id, the records `DescribeServiceJob` reports and
@@ -951,6 +1040,28 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
         }
         let id = arn_resource_id(name_or_arn, "job-queue")?;
         self.job_queues.contains_key(id).then(|| id.to_string())
+    }
+
+    /// The names of the job queues whose `computeEnvironmentOrder` still names the
+    /// compute environment `arn`.
+    ///
+    /// `DeleteComputeEnvironment`'s own doc requires the environment to be disassociated
+    /// "from any job queues with the UpdateJobQueue API operation" before it can be
+    /// deleted, so the delete answers the modelled refusal while this is non-empty.
+    pub fn queues_using_compute_environment(&self, arn: &str) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .job_queues
+            .values()
+            .filter(|queue| {
+                queue
+                    .compute_environment_order
+                    .iter()
+                    .any(|entry| entry.compute_environment == arn)
+            })
+            .map(|queue| queue.name.clone())
+            .collect();
+        names.sort();
+        names
     }
 
     /// The consumable resource `name_or_arn` names, resolved by name or by ARN — the two
@@ -1023,6 +1134,11 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
     /// The normalisation rule is shared by every operation that accepts the list
     /// (`CreateJobQueue`, `UpdateJobQueue`), so a queue reports the ARN whichever form
     /// named the environment.
+    ///
+    /// An environment this service holds nothing for, and one whose deletion the clock
+    /// already owes (so it can never be valid again), are the SAME refusal, and AWS states
+    /// it as the requirement rather than as the entry it was given:
+    /// [`COMPUTE_ENVIRONMENTS_NOT_ATTACHABLE`].
     pub fn resolve_compute_environment_order(
         &self,
         entries: &[ComputeEnvironmentOrder],
@@ -1030,14 +1146,10 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
         entries
             .iter()
             .map(|entry| {
-                let environment = self.compute_environment(&entry.compute_environment).ok_or_else(
-                    || {
-                        format!(
-                            "Compute environment {} does not exist",
-                            entry.compute_environment
-                        )
-                    },
-                )?;
+                let environment = self
+                    .compute_environment(&entry.compute_environment)
+                    .filter(|environment| environment.status != STATUS_DELETING)
+                    .ok_or_else(|| COMPUTE_ENVIRONMENTS_NOT_ATTACHABLE.to_string())?;
                 Ok(ComputeEnvironmentOrder {
                     order: entry.order,
                     compute_environment: environment.arn.clone(),
@@ -1147,35 +1259,85 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
     ///
     /// Safe for a reporting operation to call: it writes only what was due at
     /// `now` whether or not anybody called, so a later caller sees exactly what
-    /// this caller saw.
+    /// this caller saw. That includes the LAST step of a deletion a `Delete*` call
+    /// already started: a resource it moved to `DELETING` stops existing when that move
+    /// falls due, which was owed at the same instant even if nobody had called.
     ///
-    /// The work one call does is bounded. The compute environment, job queue and service
-    /// environment stores are capped by [`limits::MAX_COMPUTE_ENVIRONMENTS`],
-    /// [`limits::MAX_JOB_QUEUES`] and [`limits::MAX_SERVICE_ENVIRONMENTS`],
+    /// The work one call does is bounded. The compute environment, job queue, service
+    /// environment and quota share stores are capped by [`limits::MAX_COMPUTE_ENVIRONMENTS`],
+    /// [`limits::MAX_JOB_QUEUES`], [`limits::MAX_SERVICE_ENVIRONMENTS`] and
+    /// [`limits::MAX_QUOTA_SHARES`],
     /// and the jobs are reached through the due index rather than by scanning: a call
     /// materialises the transitions that have actually fallen due — each of which happens
     /// once in a job's life — plus the jobs waiting on a job that just finished.
     pub fn materialize_due(&mut self, now: i64) {
-        // A compute environment's pending move is to `VALID`, whether it is leaving
-        // `CREATING` (a create) or `UPDATING` (an update).
+        // A resource the clock owes a move either settles into `VALID` — whether it is
+        // leaving `CREATING` (a create) or `UPDATING` (an update) — or, when a `Delete*`
+        // call put it into `DELETING`, stops existing: the same clock-owed transition,
+        // so they are materialised in the same pass.
+        let mut deleted_environments: Vec<String> = Vec::new();
         for environment in self.compute_environments.values_mut() {
             if environment.status_due_at.is_some_and(|due| due <= now) {
-                environment.status = STATUS_VALID.to_string();
                 environment.status_due_at = None;
+                if environment.status == STATUS_DELETING {
+                    deleted_environments.push(environment.name.clone());
+                } else {
+                    environment.status = STATUS_VALID.to_string();
+                }
+            }
+        }
+        for name in deleted_environments {
+            if let Some(removed) = self.compute_environments.remove(&name) {
+                self.compute_environments_by_arn.remove(&removed.arn);
             }
         }
         // A queue leaves its transient status (`CREATING` after a create, `UPDATING`
-        // after an update) for `VALID` once the span the clock owes has elapsed.
+        // after an update) for `VALID` once the span the clock owes has elapsed, and
+        // stops existing when the deletion a `DeleteJobQueue` started falls due.
+        let mut deleted_queues: Vec<String> = Vec::new();
         for queue in self.job_queues.values_mut() {
             if queue.status_due_at.is_some_and(|due| due <= now) {
-                queue.status = STATUS_VALID.to_string();
                 queue.status_due_at = None;
+                if queue.status == STATUS_DELETING {
+                    deleted_queues.push(queue.name.clone());
+                } else {
+                    queue.status = STATUS_VALID.to_string();
+                }
+            }
+        }
+        for name in deleted_queues {
+            if let Some(removed) = self.job_queues.remove(&name) {
+                self.job_queues_by_arn.remove(&removed.arn);
+                // "All jobs in the queue are eventually terminated when you delete a job
+                // queue" (`DeleteJobQueue`): the queue's removal is when that falls due.
+                for id in self.jobs_by_queue.remove(&removed.arn).unwrap_or_default() {
+                    let live = self
+                        .jobs
+                        .get(&id)
+                        .is_some_and(|job| !is_terminal_status(&job.status));
+                    if live {
+                        if let Some(job) = self.jobs.get_mut(&id) {
+                            job.is_terminated = true;
+                        }
+                        self.finish_job(&id, JOB_FAILED, JOB_QUEUE_DELETED_REASON, now);
+                    }
+                }
+                // The quota shares that hang off the queue go with it: their ARNs are
+                // nested under one nothing resolves any more.
+                self.quota_shares
+                    .retain(|_, share| share.job_queue_arn != removed.arn);
             }
         }
         for environment in self.service_environments.values_mut() {
             if environment.status_due_at.is_some_and(|due| due <= now) {
                 environment.status = STATUS_VALID.to_string();
                 environment.status_due_at = None;
+            }
+        }
+        for share in self.quota_shares.values_mut() {
+            if share.status_due_at.is_some_and(|due| due <= now) {
+                share.status = STATUS_VALID.to_string();
+                share.status_due_at = None;
             }
         }
         self.advance_jobs(now);
@@ -1854,11 +2016,25 @@ fn parse_job_definition_reference(reference: &str) -> Option<(&str, Option<i32>)
     }
 }
 
-/// A `ClientException` for `detail` — the 400 every implemented operation answers an
-/// unknown, duplicate, invalid or over-quota request with, worded the way Batch's
-/// frontend words one ([`client_exception_message`]), so one wording rule covers every
-/// refusal this service raises.
+/// A `ClientException` whose message is `detail` exactly as the code raising it states
+/// it — the 400 an unknown, duplicate, invalid or over-quota request answers with.
+///
+/// AWS Batch does NOT wrap every refusal in its frontend envelope: the recorded
+/// refusals of `CreateJobQueue` ([`COMPUTE_ENVIRONMENTS_NOT_ATTACHABLE`]),
+/// `CreateComputeEnvironment` ([`OBJECT_ALREADY_EXISTS`]) and `DescribeJobDefinitions`
+/// ([`NEXT_TOKEN_NOT_PROCESSABLE`]) carry the detail alone. So the envelope is chosen
+/// per refusal, at the site that raises it ([`client_exception_enveloped`]), rather than
+/// applied to all of them here.
 pub fn client_exception(detail: impl AsRef<str>) -> ClientException {
+    ClientException {
+        message: Some(detail.as_ref().to_string()),
+    }
+}
+
+/// A `ClientException` whose message is `detail` inside Batch's frontend envelope
+/// ([`client_exception_message`]) — for the refusals AWS is recorded to wrap, such as
+/// `RegisterJobDefinition`'s missing properties object and the quota-share refusals.
+pub fn client_exception_enveloped(detail: impl AsRef<str>) -> ClientException {
     ClientException {
         message: Some(client_exception_message(detail.as_ref())),
     }

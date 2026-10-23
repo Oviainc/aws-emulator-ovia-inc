@@ -422,8 +422,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         };
 
-        let managed = environment.ce_type == batch::CE_TYPE_MANAGED;
-        // `computeResources` is "details of the compute resources MANAGED by the compute
+        // A resource whose deletion the clock already owes cannot be updated: the delete
+        // was accepted, so there is nothing left to configure.
+        if environment.status == batch::STATUS_DELETING {
+            return Err(refuse(format!(
+                "Compute environment {} is {} and can't be updated",
+                environment.name,
+                batch::STATUS_DELETING
+            )));
+        }
+
+        let managed = environment.ce_type == batch::CE_TYPE_MANAGED;        // `computeResources` is "details of the compute resources MANAGED by the compute
         // environment", so only a MANAGED environment has any to update.
         if input.compute_resources.is_some() && !managed {
             return Err(refuse(format!(

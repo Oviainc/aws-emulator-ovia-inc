@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteJobQueue
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteJobQueue`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteJobQueue::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Deletes a job queue this service holds.
+//!
+//! The operation is a MUTATION with one precondition the model's own doc states: "You
+//! must first disable submissions for a queue with the UpdateJobQueue operation", so a
+//! queue whose state is still `ENABLED`, like a `jobQueue` this service does not hold, is
+//! refused with the modelled `ClientException` (HTTP 400) and nothing changes.
+//!
+//! A delete AWS accepts does not make the queue vanish inside the call: it moves to the
+//! non-terminal `DELETING` status and the removal is owed by the CLOCK
+//! ([`crate::state::JOB_PHASE_MILLIS`] later), which is also when "all jobs in the queue
+//! are eventually terminated" falls due.
 //!
 //! ## Shape of an operation
 //!
@@ -139,18 +142,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteJobQueue` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteJobQueueErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteJobQueue"))
+        use crate::state as batch;
+
+        let _ = ctx;
+        let Some(state) = batch::service_state(&*self.engine) else {
+            return Err(
+                DeleteJobQueueErrorModeled::ServerException(batch::unreachable_state()).into(),
+            );
+        };
+        let now = batch::now_millis();
+        let mut state = state.lock();
+        state.materialize_due(now);
+
+        let Some(name) = state.job_queue_name(&input.job_queue) else {
+            return Err(DeleteJobQueueErrorModeled::ClientException(batch::client_exception(
+                format!("Job queue {} does not exist", input.job_queue),
+            ))
+            .into());
+        };
+        let Some(queue) = state.job_queues.get(&name) else {
+            return Err(
+                DeleteJobQueueErrorModeled::ServerException(batch::unreachable_state()).into(),
+            );
+        };
+        // A delete already accepted is in flight: repeating it asks for a removal the
+        // clock already owes, so it is the same success and changes nothing.
+        if queue.status == batch::STATUS_DELETING {
+            return Ok(DeleteJobQueueOutput {});
+        }
+        if queue.state != batch::STATE_DISABLED {
+            return Err(DeleteJobQueueErrorModeled::ClientException(batch::client_exception(
+                format!(
+                    "Cannot delete job queue {name} while its state is {}: disable submissions \
+                     with UpdateJobQueue first",
+                    queue.state
+                ),
+            ))
+            .into());
+        }
+
+        // Accepted: the queue enters DELETING now and stops existing when that move
+        // falls due (`state::materialize_due`).
+        if let Some(queue) = state.job_queues.get_mut(&name) {
+            queue.status = batch::STATUS_DELETING.to_string();
+            queue.status_reason = None;
+            queue.status_due_at = Some(now + batch::JOB_PHASE_MILLIS);
+        }
+
+        Ok(DeleteJobQueueOutput {})
     }
 }

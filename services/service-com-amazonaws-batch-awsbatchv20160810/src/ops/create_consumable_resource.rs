@@ -199,9 +199,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // resource. Must be unique."
         if state.consumable_resources.contains_key(&name) {
             return Err(CreateConsumableResourceErrorModeled::ClientException(
-                batch::client_exception(format!(
-                    "Object already exists: consumable resource {name}"
-                )),
+                batch::client_exception(batch::OBJECT_ALREADY_EXISTS),
             )
             .into());
         }

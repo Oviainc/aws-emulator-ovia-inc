@@ -183,10 +183,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .contains_key(&input.service_environment_name)
         {
             return Err(CreateServiceEnvironmentErrorModeled::ClientException(
-                batch::client_exception(format!(
-                    "Object already exists: service environment {}",
-                    input.service_environment_name
-                )),
+                batch::client_exception(batch::OBJECT_ALREADY_EXISTS),
             )
             .into());
         }

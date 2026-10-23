@@ -570,7 +570,9 @@ async fn job_submission_lifecycle_round_trips_through_persisted_state() {
         "case submit by definition ARN: the named revision is kept, got {detail}"
     );
 
-    // Terminating an unknown job is refused.
+    // Terminating a job id the service holds none for is ACCEPTED, and fabricates
+    // nothing: the empty 200 the operation models, and the id is still unknown to
+    // DescribeJobs below.
     let (status, body) = batch
         .call(
             "/v1/terminatejob",
@@ -578,8 +580,8 @@ async fn job_submission_lifecycle_round_trips_through_persisted_state() {
         )
         .await;
     assert_eq!(
-        status, 400,
-        "case terminate an unknown job: expected 400, got {status} {body}"
+        status, 200,
+        "case terminate an unknown job: expected the empty 200, got {status} {body}"
     );
 
     // 8. An unknown job id is omitted from DescribeJobs, not an error.
@@ -1091,7 +1093,8 @@ async fn list_jobs_honours_the_documented_selectors_and_filters() {
     );
 
     // Refusals: no selector, two selectors, two filters, an unknown filter name, an
-    // unparseable timestamp, an unknown queue.
+    // unparseable timestamp. A filter TARGET the service does not hold is not among them:
+    // it is an empty page (asserted below), and only a filter-SELECTION error is refused.
     for (case, body) in [
         ("no selector", json!({})),
         (
@@ -1119,13 +1122,29 @@ async fn list_jobs_honours_the_documented_selectors_and_filters() {
                 "filters": [{"name": "AFTER_CREATED_AT", "values": ["not-a-number"]}],
             }),
         ),
-        ("an unknown queue", json!({"jobQueue": "no-such-queue"})),
-        ("an unknown array parent", json!({"arrayJobId": "no-such-job"})),
     ] {
         let (status, decoded) = batch.call("/v1/listjobs", body).await;
         assert_eq!(
             status, 400,
             "case list with {case}: expected 400, got {status} {decoded}"
+        );
+    }
+
+    // A filter target that names nothing stored selects nothing: HTTP 200 with an empty
+    // `jobSummaryList`, never a refusal.
+    for (case, body) in [
+        ("an unknown queue", json!({"jobQueue": "no-such-queue"})),
+        ("an unknown array parent", json!({"arrayJobId": "no-such-job"})),
+        (
+            "an unknown multi-node parent",
+            json!({"multiNodeJobId": "no-such-job"}),
+        ),
+    ] {
+        let listed = batch.ok("/v1/listjobs", body).await;
+        assert_eq!(
+            listed["jobSummaryList"].as_array().map(Vec::len),
+            Some(0),
+            "case list with {case}: expected an empty list, got {listed}"
         );
     }
 

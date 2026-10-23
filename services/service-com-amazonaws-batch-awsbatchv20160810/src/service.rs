@@ -41,9 +41,36 @@
 //! do not write it; editing the entry would let this file drift from the model.
 
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, ErasedOperation, Refusal, Refused, Service, Violation,
 };
 use std::sync::Arc;
+
+/// The error code AWS answers a refusal of this service's TAG MAP with.
+///
+/// Tagging is served by the Tagris frontend rather than by Batch's own request
+/// validator, and its refusal of a tag map outside the bounds `TagrisTagsMap` declares
+/// (`@length(min: 1, max: 50)`) is HTTP 400 `BadRequestException` — the code recorded for
+/// a 51-entry `tags` map on a Batch resource.
+const TAG_REFUSAL_CODE: &str = "BadRequestException";
+
+/// The error code AWS answers every OTHER refusal of a Batch request with.
+///
+/// This service's model declares exactly two errors on every operation —
+/// `ClientException` (HTTP 400) and `ServerException` (HTTP 500) — so a client-side
+/// refusal is a `ClientException`, whoever found it. The framework's synthetic
+/// `ValidationException` is not in Batch's error set at all, so an SDK branching on the
+/// code cannot match it.
+const REFUSAL_CODE: &str = "ClientException";
+
+/// The input member Batch's tag map arrives on, on every operation that takes one
+/// (`TagResource$tags`, `CreateJobQueue$tags`, `RegisterJobDefinition$tags`, …).
+const TAGS_MEMBER: &str = "tags";
+
+/// Whether `violation` is about the tag map (the member itself, or a key or value inside
+/// it), which is what makes the refusal Tagris's rather than Batch's.
+fn is_tag_violation(violation: &Violation) -> bool {
+    violation.path == TAGS_MEMBER || violation.path.starts_with(&format!("{TAGS_MEMBER}."))
+}
 
 /// The `com-amazonaws-batch-awsbatchv20160810` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -97,16 +124,34 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // required member, or a value outside a declared bound) so this service can
+        // answer with a code a Batch client actually branches on. The framework's
+        // synthetic `ValidationException` is in no Batch operation's error set, so BOTH
+        // the code and the message are replaced here:
+        //
+        // * a refusal of the tag map is Tagris's, HTTP 400 `BadRequestException` — the
+        //   code recorded for a 51-entry `tags` map;
+        // * every other refusal is the `ClientException` (HTTP 400) the model declares.
+        //
+        // The message stays the one the framework built from the request: it names the
+        // member and the constraint it failed, which is what the caller has to fix.
+        // Authentication refusals keep the framework's wording (403 is not a Batch
+        // error shape at all).
+        match refusal {
+            Refusal::Invalid(violations) => {
+                let code = if violations.iter().any(is_tag_violation) {
+                    TAG_REFUSAL_CODE
+                } else {
+                    REFUSAL_CODE
+                };
+                Some(Refused {
+                    code: code.to_string(),
+                    message: aws_smithy_schema_server::envelope(violations)
+                        .unwrap_or_else(|| "invalid request".to_string()),
+                })
+            }
+            _ => None,
+        }
     }
 
     fn override_routing_error(

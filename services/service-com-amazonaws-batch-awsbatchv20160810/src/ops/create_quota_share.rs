@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateQuotaShare
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateQuotaShare`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateQuotaShare::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates a quota share on one of this service's job queues.
+//!
+//! The share is stored under the ARN it is given —
+//! `arn:aws:batch:<region>:<account>:job-queue/<queue>/quota-share/<name>`
+//! ([`crate::state::quota_share_arn`]) — because that ARN is the only identifier
+//! `DescribeQuotaShare` takes, and the create answers with the name and that ARN.
+//!
+//! A request naming a `jobQueue` this service does not hold is refused with the modelled
+//! `ClientException` (HTTP 400), and so is a name the queue already carries a share for.
+//! AWS is recorded to word the quota-share refusals in Batch's frontend envelope
+//! ([`crate::state::client_exception_enveloped`]).
+//!
+//! AWS Batch hands a fresh quota share back in the non-terminal `CREATING` status, so the
+//! move to `VALID` is owed by the CLOCK ([`crate::state::JOB_PHASE_MILLIS`] later) and is
+//! materialised by whoever reads it next, never by the read itself.
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +167,92 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateQuotaShare` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateQuotaShareErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateQuotaShare"))
+        use crate::state as batch;
+
+        let Some(state) = batch::service_state(&*self.engine) else {
+            return Err(
+                CreateQuotaShareErrorModeled::ServerException(batch::unreachable_state()).into(),
+            );
+        };
+        let region = batch::request_region(ctx);
+        let now = batch::now_millis();
+        let mut state = state.lock();
+        state.materialize_due(now);
+
+        // `quotaShareName` is a plain `String` in the model, so the framework admits
+        // anything: the charset and length the member documents are applied here ("up to
+        // 128 characters long … uppercase and lowercase letters, numbers, hyphens (-),
+        // and underscores (_)").
+        if !batch::is_valid_resource_name(&input.quota_share_name, batch::MAX_QUOTA_SHARE_NAME_LEN)
+        {
+            return Err(CreateQuotaShareErrorModeled::ClientException(
+                batch::client_exception_enveloped(format!(
+                    "quotaShareName must be 1 to {} letters, numbers, hyphens (-) or \
+                     underscores (_).",
+                    batch::MAX_QUOTA_SHARE_NAME_LEN
+                )),
+            )
+            .into());
+        }
+        // The list is required, so the framework proves it is PRESENT; an empty one
+        // allocates no capacity at all, which is not a share this service can hold.
+        if input.capacity_limits.is_empty() {
+            return Err(CreateQuotaShareErrorModeled::ClientException(
+                batch::client_exception_enveloped(
+                    "capacityLimits must name at least one capacity limit.",
+                ),
+            )
+            .into());
+        }
+
+        let Some(queue) = state.job_queue(&input.job_queue) else {
+            return Err(CreateQuotaShareErrorModeled::ClientException(
+                batch::client_exception_enveloped(format!(
+                    "{} does not exist.",
+                    input.job_queue
+                )),
+            )
+            .into());
+        };
+        let queue_arn = queue.arn.clone();
+        let queue_name = queue.name.clone();
+        let arn = batch::quota_share_arn(&region, &queue_name, &input.quota_share_name);
+        if state.quota_shares.contains_key(&arn) {
+            return Err(CreateQuotaShareErrorModeled::ClientException(
+                batch::client_exception_enveloped(batch::OBJECT_ALREADY_EXISTS),
+            )
+            .into());
+        }
+        if state.quota_shares.len() >= batch::limits::MAX_QUOTA_SHARES {
+            return Err(CreateQuotaShareErrorModeled::ClientException(
+                batch::client_exception_enveloped(batch::quota_message(
+                    "quota shares",
+                    batch::limits::MAX_QUOTA_SHARES,
+                )),
+            )
+            .into());
+        }
+
+        let share = batch::QuotaShare {
+            name: input.quota_share_name.clone(),
+            arn: arn.clone(),
+            job_queue_arn: queue_arn,
+            capacity_limits: input.capacity_limits,
+            resource_sharing_configuration: input.resource_sharing_configuration,
+            preemption_configuration: input.preemption_configuration,
+            // "The default state is ENABLED" (`CreateQuotaShare$state`).
+            state: input
+                .state
+                .unwrap_or_else(|| batch::STATE_ENABLED.to_string()),
+            status: batch::STATUS_CREATING.to_string(),
+            status_due_at: Some(now + batch::JOB_PHASE_MILLIS),
+            tags: input.tags,
+        };
+        state.quota_shares.insert(arn.clone(), share);
+
+        Ok(CreateQuotaShareOutput {
+            quota_share_name: Some(input.quota_share_name),
+            quota_share_arn: Some(arn),
+        })
     }
 }

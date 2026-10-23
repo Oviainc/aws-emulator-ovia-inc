@@ -201,9 +201,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The cursor names the first key of THIS page; a token this service did not
         // mint names no key and is refused rather than silently restarting the scan.
         let cursor = match input.next_token.as_deref() {
-            Some(token) => Some(crate::state::decode_page_token(token).ok_or_else(|| {
-                client_exception("nextToken is not a token returned by DescribeJobDefinitions")
-            })?),
+            Some(token) => Some(
+                crate::state::decode_page_token(token)
+                    .ok_or_else(|| client_exception(crate::state::NEXT_TOKEN_NOT_PROCESSABLE))?,
+            ),
             None => None,
         };
 
@@ -277,10 +278,13 @@ fn selects(selector: &str, definition: &JobDefinition) -> bool {
 }
 
 /// A refusal of a request this service understood but cannot accept: the modelled
-/// `ClientException` (HTTP 400), worded as Batch's frontend words one.
+/// `ClientException` (HTTP 400), carrying `detail` as the refusing code states it.
+///
+/// Bare, not in Batch's frontend envelope: this operation's recorded refusal of a
+/// `nextToken` it did not issue is the bare `Error processing next token`
+/// ([`crate::state::NEXT_TOKEN_NOT_PROCESSABLE`]), so the envelope is not this
+/// operation's wording (see [`crate::state::client_exception`]).
 fn client_exception(detail: &str) -> DescribeJobDefinitionsError {
-    DescribeJobDefinitionsErrorModeled::ClientException(ClientException {
-        message: Some(crate::state::client_exception_message(detail)),
-    })
-    .into()
+    DescribeJobDefinitionsErrorModeled::ClientException(crate::state::client_exception(detail))
+        .into()
 }

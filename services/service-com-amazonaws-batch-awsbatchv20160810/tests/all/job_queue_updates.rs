@@ -36,9 +36,10 @@ use crate::job_lifecycle::{
     arn, compute_environment, container_properties, describe_job, job_definition, job_queue, Batch,
 };
 
-/// The envelope every `ClientException` this service raises is worded in
-/// (`state::client_exception_message`).
-const REFUSAL_PREFIX: &str = "Error executing request, Exception : ";
+/// The envelope AWS Batch wraps only the refusals it is recorded to wrap in — so a
+/// refusal these handlers raise must NOT carry it (`state::client_exception` states the
+/// detail bare, `state::client_exception_enveloped` is the opt-in wrapper).
+const REFUSAL_ENVELOPE: &str = "Error executing request";
 
 /// The one `JobQueueDetail` for `reference` (a queue name or ARN).
 async fn describe_queue(batch: &Batch, reference: &str) -> Value {
@@ -390,8 +391,8 @@ async fn refused_updates_change_nothing() {
         );
         let message = answered["message"].as_str().unwrap_or_default();
         assert!(
-            message.starts_with(REFUSAL_PREFIX),
-            "case {case}: expected a ClientException worded like Batch's, got {answered}"
+            !message.is_empty() && !message.starts_with(REFUSAL_ENVELOPE),
+            "case {case}: expected the bare detail the handler states, got {answered}"
         );
 
         let after = describe_queue(&batch, &queue_arn).await;
@@ -632,8 +633,9 @@ async fn a_disabled_queue_accepts_no_new_jobs() {
         if status == 400 {
             let message = answered["message"].as_str().unwrap_or_default();
             assert!(
-                message.starts_with(REFUSAL_PREFIX),
-                "case {case}: expected a ClientException worded like Batch's, got {answered}"
+                message.contains("DISABLED") && !message.starts_with(REFUSAL_ENVELOPE),
+                "case {case}: expected the bare detail naming the queue's state, got \
+                 {answered}"
             );
         }
     }

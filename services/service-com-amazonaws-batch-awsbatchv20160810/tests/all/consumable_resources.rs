@@ -303,12 +303,14 @@ async fn a_create_the_service_cannot_accept_is_refused_and_stores_nothing() {
         (
             "a name already stored",
             json!({"consumableResourceName": "taken", "totalQuantity": 99}),
-            "taken",
+            // A duplicate name is the one refusal that names no member: AWS answers the
+            // bare `Object already exists` (`state::OBJECT_ALREADY_EXISTS`).
+            "Object already exists",
         ),
         (
             "a name already stored, with no other member",
             json!({"consumableResourceName": "taken"}),
-            "taken",
+            "Object already exists",
         ),
         (
             "an empty name",

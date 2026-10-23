@@ -226,11 +226,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .compute_environments
             .contains_key(&input.compute_environment_name)
         {
+            // The bare detail AWS is recorded to state for a duplicate name: it names the
+            // collision, not the object (`state::OBJECT_ALREADY_EXISTS`).
             return Err(CreateComputeEnvironmentErrorModeled::ClientException(
-                batch::client_exception(format!(
-                    "Object already exists: compute environment {}",
-                    input.compute_environment_name
-                )),
+                batch::client_exception(batch::OBJECT_ALREADY_EXISTS),
             )
             .into());
         }

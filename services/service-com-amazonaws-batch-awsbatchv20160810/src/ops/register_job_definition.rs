@@ -8,8 +8,9 @@
 //! record back.
 //!
 //! A request the model admits but the service does not accept is refused with the
-//! modelled `ClientException` (HTTP 400), worded the way Batch's frontend words one
-//! ([`crate::state::client_exception_message`]), and nothing is stored. The rules
+//! modelled `ClientException` (HTTP 400), inside the frontend envelope AWS is recorded to
+//! wrap THIS operation's refusals in ([`crate::state::client_exception_enveloped`]), and
+//! nothing is stored. The rules
 //! applied are the ones this service's own model documents — among them the
 //! `executionRoleArn` doc, "For jobs that run on Fargate resources, you must provide
 //! an execution role", which is checked for EVERY container-properties object a job
@@ -263,9 +264,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     && input.ecs_properties.is_none()
                     && input.eks_properties.is_none()
                 {
+                    // The detail AWS is recorded to state for this refusal, verbatim.
                     return Err(client_exception(
-                        "containerProperties, ecsProperties or eksProperties is required for \
-                         job definitions of type container",
+                        "ECS ContainerProperties, ecsProperties, or eksProperties is required \
+                         when using type container.",
                     ));
                 }
             }
@@ -429,10 +431,15 @@ const CONTAINER: &str = "container";
 const MULTINODE: &str = "multinode";
 
 /// A refusal of a request this service understood but cannot accept: the modelled
-/// `ClientException` (HTTP 400), worded as Batch's frontend words one.
+/// `ClientException` (HTTP 400), with `detail` inside Batch's frontend envelope.
+///
+/// This operation's refusals are the ones AWS is recorded to WRAP — the missing
+/// properties object comes back as `Error executing request, Exception : ECS
+/// ContainerProperties, …, RequestId: …` — so the envelope is this operation's wording
+/// (see [`crate::state::client_exception_enveloped`]).
 fn client_exception(detail: &str) -> RegisterJobDefinitionError {
-    RegisterJobDefinitionErrorModeled::ClientException(ClientException {
-        message: Some(crate::state::client_exception_message(detail)),
-    })
+    RegisterJobDefinitionErrorModeled::ClientException(crate::state::client_exception_enveloped(
+        detail,
+    ))
     .into()
 }
