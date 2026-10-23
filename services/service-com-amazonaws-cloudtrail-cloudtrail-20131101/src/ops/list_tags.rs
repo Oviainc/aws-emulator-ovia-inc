@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTags
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTags`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTags::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the tag set stored for each resource the request's `ResourceIdList` names
+//! — a trail, an event data store, a dashboard or a channel ARN — in the order the
+//! request names them. It is the READER for every tag write in this service:
+//! `CreateTrail` / `CreateDashboard` seed a tag set and `RemoveTags` drops keys from
+//! it, and this operation is where a caller sees the result. An ARN that is not one of
+//! the four taggable forms, or that names no stored resource, is refused with the
+//! modelled error for its kind rather than reported as a resource with no tags.
 //!
 //! ## Shape of an operation
 //!
@@ -106,6 +105,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::{TaggableArn, TaggableArnRejection};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -115,13 +115,23 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-cloudtrail-cloudtrail-2
 
 // The operation's MODELED errors. `#[operation_error]` accepts only variants the
 // model declares for this operation, so the scaffold's `NotImplemented` cannot live
-// here — hence the `ListTagsError` alias below. An operation that models no errors
+// here — hence the `ListTagsError` channel below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.cloudtrail#ListTags")]
+//
+// `ChannelNotFoundException` is widened in through `extra_errors`: the service models
+// the shape (`AddTags` / `RemoveTags` / `GetChannel` list it) and `ListTags` is
+// recorded answering a channel ARN that names no channel with it, but the model's
+// `ListTags` error list omits it — and the code a client branches on is the one the
+// service SENDS.
+#[smithy_macros::operation_error(
+    "com.amazonaws.cloudtrail#ListTags",
+    extra_errors = ["ChannelNotFoundException"]
+)]
 #[derive(Debug)]
 pub enum ListTagsErrorModeled {
     ChannelARNInvalidException(ChannelARNInvalidException),
+    ChannelNotFoundException(ChannelNotFoundException),
     CloudTrailARNInvalidException(CloudTrailARNInvalidException),
     EventDataStoreARNInvalidException(EventDataStoreARNInvalidException),
     EventDataStoreNotFoundException(EventDataStoreNotFoundException),
@@ -138,6 +148,13 @@ pub enum ListTagsErrorModeled {
 /// This operation's error channel, as the generated `impl Operation` names it
 /// (`crate::ops::list_tags::ListTagsError`). Wrapping the modeled enum is what
 /// lets a scaffolded operation answer 501 for one whose model declares no errors at all.
+///
+/// This operation is implemented, so it never answers the 501. What it does need from
+/// the wrapper is its other two channels:
+/// [`crate::scaffolded::Scaffolded::ModeledWithStatus`] for a modelled error CloudTrail
+/// answers with a status its `@httpError` does not declare (see [`not_found`]), and
+/// `ValidationException` for the one refusal this operation's model carries no shape
+/// for — more ARNs than one call may name.
 pub type ListTagsError = crate::scaffolded::Scaffolded<ListTagsErrorModeled>;
 
 /// Lets `?` and `.into()` lift a modeled failure into the error channel, so an
@@ -147,6 +164,63 @@ pub type ListTagsError = crate::scaffolded::Scaffolded<ListTagsErrorModeled>;
 impl From<ListTagsErrorModeled> for ListTagsError {
     fn from(modeled: ListTagsErrorModeled) -> Self {
         crate::scaffolded::Scaffolded::Modeled(modeled)
+    }
+}
+
+/// The modelled error a malformed `ResourceIdList` entry is refused with: the
+/// kind-specific invalid-ARN shape where the model declares one, and
+/// `ResourceTypeNotSupportedException` for a CloudTrail ARN naming a resource type
+/// that carries no tags. Every one of them is a modelled 400, so none needs a status
+/// of its own.
+fn arn_rejection(rejection: TaggableArnRejection) -> ListTagsErrorModeled {
+    let message = Some(rejection.message());
+    match rejection {
+        TaggableArnRejection::ChannelArn(_) => {
+            ListTagsErrorModeled::ChannelARNInvalidException(ChannelARNInvalidException { message })
+        }
+        TaggableArnRejection::EventDataStoreArn(_) => {
+            ListTagsErrorModeled::EventDataStoreARNInvalidException(
+                EventDataStoreARNInvalidException { message },
+            )
+        }
+        TaggableArnRejection::CloudTrailArn(_) => {
+            ListTagsErrorModeled::CloudTrailARNInvalidException(CloudTrailARNInvalidException {
+                message,
+            })
+        }
+        TaggableArnRejection::UnsupportedResourceType { .. } => {
+            ListTagsErrorModeled::ResourceTypeNotSupportedException(
+                ResourceTypeNotSupportedException { message },
+            )
+        }
+    }
+}
+
+/// The refusal for an ARN that names no stored resource: the kind-specific not-found
+/// shape for a channel and an event data store, and the generic
+/// `ResourceNotFoundException` for a trail and a dashboard.
+///
+/// The two kind-specific shapes are the ones the model marks `@httpError(404)` and
+/// CloudTrail answers with [`crate::state::TAGGING_REFUSAL_STATUS`], so they travel
+/// through the wrapper's status override; `ResourceNotFoundException` is a modelled
+/// 400 already.
+fn not_found(arn: &TaggableArn, resource_id: &str) -> ListTagsError {
+    let message = Some(arn.listed_not_found_message(resource_id));
+    match arn {
+        TaggableArn::Channel { .. } => crate::scaffolded::Scaffolded::modeled_with_status(
+            ListTagsErrorModeled::ChannelNotFoundException(ChannelNotFoundException { message }),
+            crate::state::TAGGING_REFUSAL_STATUS,
+        ),
+        TaggableArn::EventDataStore { .. } => crate::scaffolded::Scaffolded::modeled_with_status(
+            ListTagsErrorModeled::EventDataStoreNotFoundException(EventDataStoreNotFoundException {
+                message,
+            }),
+            crate::state::TAGGING_REFUSAL_STATUS,
+        ),
+        TaggableArn::Trail { .. } | TaggableArn::Dashboard { .. } => {
+            ListTagsErrorModeled::ResourceNotFoundException(ResourceNotFoundException { message })
+                .into()
+        }
     }
 }
 
@@ -186,18 +260,64 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTags` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTagsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTags"))
+        // Every entry of `ResourceIdList` is an ARN, which carries its resource's
+        // Region itself, so nothing about this call depends on how it was signed.
+        let _ = ctx;
+
+        if input.resource_id_list.len() > crate::state::LIST_TAGS_RESOURCE_LIMIT {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "ResourceIdList names {} ARNs; one ListTags call has a limit of {} ARNs",
+                input.resource_id_list.len(),
+                crate::state::LIST_TAGS_RESOURCE_LIMIT
+            )));
+        }
+
+        // `NextToken` is "Reserved for future use", and a page carries every ARN the
+        // request named, so no call this service serves ever mints one: a token the
+        // caller invented continues nothing.
+        if let Some(token) = input.next_token.as_deref().filter(|t| !t.is_empty()) {
+            return Err(ListTagsErrorModeled::InvalidTokenException(
+                InvalidTokenException {
+                    message: Some(format!(
+                        "NextToken '{token}' is not a token this service issued: ListTags \
+                         reports every ARN the request names in one page"
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListTagsErrorModeled::UnsupportedOperationException(UnsupportedOperationException {
+                message: Some(
+                    "ListTags needs the CloudTrail resource registry, which this engine \
+                     does not carry"
+                        .to_string(),
+                ),
+            })
+        })?;
+        let store = state.lock();
+
+        // One entry per ARN the request named, in the order it named them. A malformed
+        // ARN, or one naming no stored resource, refuses the WHOLE call: a reply that
+        // dropped it silently would read as "that resource carries no tags".
+        let mut resource_tags = Vec::with_capacity(input.resource_id_list.len());
+        for resource_id in &input.resource_id_list {
+            let arn = crate::state::parse_taggable_arn(resource_id)
+                .map_err(|rejection| ListTagsError::from(arn_rejection(rejection)))?;
+            let Some(tags) = store.resource_tags(&arn) else {
+                return Err(not_found(&arn, resource_id));
+            };
+            resource_tags.push(ResourceTag {
+                resource_id: Some(resource_id.clone()),
+                tags_list: Some(tags.to_vec()),
+            });
+        }
+
+        Ok(ListTagsOutput {
+            resource_tag_list: Some(resource_tags),
+            // See the `NextToken` refusal above: there is never a further page.
+            next_token: None,
+        })
     }
 }

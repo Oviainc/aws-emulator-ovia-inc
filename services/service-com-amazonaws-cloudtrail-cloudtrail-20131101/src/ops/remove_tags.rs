@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RemoveTags
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RemoveTags`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RemoveTags::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Drops the named tag keys from the resource the request's `ResourceId` ARN names —
+//! a trail, an event data store, a dashboard or a channel. The tag set it writes is
+//! the one `CreateTrail` / `CreateDashboard` seed and `ListTags` reports, so a removal
+//! is visible to every later read; an ARN that is not one of the four taggable forms,
+//! or that names no stored resource, is refused with the modelled error for its kind
+//! rather than answered as a silent success.
 //!
 //! ## Shape of an operation
 //!
@@ -114,6 +112,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::{TaggableArn, TaggableArnRejection};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -123,9 +122,11 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-cloudtrail-cloudtrail-2
 
 // The operation's MODELED errors. `#[operation_error]` accepts only variants the
 // model declares for this operation, so the scaffold's `NotImplemented` cannot live
-// here — hence the `RemoveTagsError` alias below. An operation that models no errors
+// here — hence the `RemoveTagsError` channel below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
-// to construct until the model says otherwise.
+// to construct until the model says otherwise. Every declared error stays listed even
+// where this handler does not construct it: the list is the model's, not the
+// handler's.
 #[smithy_macros::operation_error("com.amazonaws.cloudtrail#RemoveTags")]
 #[derive(Debug)]
 pub enum RemoveTagsErrorModeled {
@@ -149,6 +150,11 @@ pub enum RemoveTagsErrorModeled {
 /// This operation's error channel, as the generated `impl Operation` names it
 /// (`crate::ops::remove_tags::RemoveTagsError`). Wrapping the modeled enum is what
 /// lets a scaffolded operation answer 501 for one whose model declares no errors at all.
+///
+/// This operation is implemented, so it never answers the 501; what it does need from
+/// the wrapper is [`crate::scaffolded::Scaffolded::ModeledWithStatus`], the channel for
+/// a modelled error CloudTrail answers with a status its `@httpError` does not declare
+/// (see [`not_found`] and [`crate::state::TAGGING_REFUSAL_STATUS`]).
 pub type RemoveTagsError = crate::scaffolded::Scaffolded<RemoveTagsErrorModeled>;
 
 /// Lets `?` and `.into()` lift a modeled failure into the error channel, so an
@@ -158,6 +164,65 @@ pub type RemoveTagsError = crate::scaffolded::Scaffolded<RemoveTagsErrorModeled>
 impl From<RemoveTagsErrorModeled> for RemoveTagsError {
     fn from(modeled: RemoveTagsErrorModeled) -> Self {
         crate::scaffolded::Scaffolded::Modeled(modeled)
+    }
+}
+
+/// The modelled error a malformed `ResourceId` is refused with: the kind-specific
+/// invalid-ARN shape where the model declares one, and
+/// `ResourceTypeNotSupportedException` for a CloudTrail ARN naming a resource type
+/// that carries no tags. Every one of them is a modelled 400, so none needs a status
+/// of its own.
+fn arn_rejection(rejection: TaggableArnRejection) -> RemoveTagsErrorModeled {
+    let message = Some(rejection.message());
+    match rejection {
+        TaggableArnRejection::ChannelArn(_) => {
+            RemoveTagsErrorModeled::ChannelARNInvalidException(ChannelARNInvalidException {
+                message,
+            })
+        }
+        TaggableArnRejection::EventDataStoreArn(_) => {
+            RemoveTagsErrorModeled::EventDataStoreARNInvalidException(
+                EventDataStoreARNInvalidException { message },
+            )
+        }
+        TaggableArnRejection::CloudTrailArn(_) => {
+            RemoveTagsErrorModeled::CloudTrailARNInvalidException(CloudTrailARNInvalidException {
+                message,
+            })
+        }
+        TaggableArnRejection::UnsupportedResourceType { .. } => {
+            RemoveTagsErrorModeled::ResourceTypeNotSupportedException(
+                ResourceTypeNotSupportedException { message },
+            )
+        }
+    }
+}
+
+/// The refusal for an ARN that names no stored resource: the kind-specific not-found
+/// shape where the model declares one, and `ResourceNotFoundException` for the kinds
+/// it does not.
+///
+/// The two kind-specific shapes are the ones the model marks `@httpError(404)` and
+/// CloudTrail answers with [`crate::state::TAGGING_REFUSAL_STATUS`], so they travel
+/// through the wrapper's status override; `ResourceNotFoundException` is a modelled
+/// 400 already.
+fn not_found(arn: &TaggableArn, resource_id: &str) -> RemoveTagsError {
+    let message = Some(arn.not_found_message(resource_id));
+    match arn {
+        TaggableArn::Channel { .. } => crate::scaffolded::Scaffolded::modeled_with_status(
+            RemoveTagsErrorModeled::ChannelNotFoundException(ChannelNotFoundException { message }),
+            crate::state::TAGGING_REFUSAL_STATUS,
+        ),
+        TaggableArn::EventDataStore { .. } => crate::scaffolded::Scaffolded::modeled_with_status(
+            RemoveTagsErrorModeled::EventDataStoreNotFoundException(
+                EventDataStoreNotFoundException { message },
+            ),
+            crate::state::TAGGING_REFUSAL_STATUS,
+        ),
+        TaggableArn::Trail { .. } | TaggableArn::Dashboard { .. } => {
+            RemoveTagsErrorModeled::ResourceNotFoundException(ResourceNotFoundException { message })
+                .into()
+        }
     }
 }
 
@@ -197,18 +262,52 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RemoveTags` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RemoveTagsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RemoveTags"))
+        // `ResourceId` is an ARN, which carries the resource's Region itself, so
+        // nothing about this call depends on how the request was signed.
+        let _ = ctx;
+
+        // The ARN's form is checked before any lookup: a value that can name no
+        // taggable resource is refused as the kind of ARN it was written as.
+        let arn = crate::state::parse_taggable_arn(&input.resource_id)
+            .map_err(|rejection| RemoveTagsError::from(arn_rejection(rejection)))?;
+
+        // `InvalidTagParameterException` "can also occur if there are duplicate
+        // tags": a tag key is unique for the resource it applies to, so naming one
+        // twice is a malformed request rather than two removals.
+        if let Some(duplicate) = crate::state::first_duplicate_tag_key(&input.tags_list) {
+            return Err(RemoveTagsErrorModeled::InvalidTagParameterException(
+                InvalidTagParameterException {
+                    message: Some(format!(
+                        "TagsList carries the tag key '{duplicate}' more than once"
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            RemoveTagsErrorModeled::UnsupportedOperationException(UnsupportedOperationException {
+                message: Some(
+                    "RemoveTags needs the CloudTrail resource registry, which this engine \
+                     does not carry"
+                        .to_string(),
+                ),
+            })
+        })?;
+        let mut store = state.lock();
+
+        let Some(tags) = store.resource_tags_mut(&arn) else {
+            return Err(not_found(&arn, &input.resource_id));
+        };
+
+        // A tag key identifies the tag on its resource ("The key must be unique for
+        // the resource to which it applies"), so each named KEY is dropped whatever
+        // value the request paired it with, and a key the resource does not carry
+        // leaves the set alone — which is what makes the operation `@idempotent`.
+        let removed: ::std::collections::BTreeSet<&str> =
+            input.tags_list.iter().map(|tag| tag.key.as_str()).collect();
+        tags.retain(|tag| !removed.contains(tag.key.as_str()));
+
+        Ok(RemoveTagsOutput {})
     }
 }
