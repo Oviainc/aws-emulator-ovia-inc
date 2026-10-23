@@ -84,6 +84,10 @@ mod cache_parameter_group_delete;
 #[path = "all/describe_cache_parameters.rs"]
 mod describe_cache_parameters;
 
+// Appended for the same reason: the `DeleteServerlessCache` suite.
+#[path = "all/serverless_cache_delete.rs"]
+mod serverless_cache_delete;
+
 // Appended for the same reason: the maintenance-window, cluster-state-gate,
 // cache-security-group-closure and cluster-message suite.
 #[path = "all/cache_cluster_gates_and_messages.rs"]

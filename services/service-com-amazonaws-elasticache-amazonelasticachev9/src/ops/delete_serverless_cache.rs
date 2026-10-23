@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteServerlessCache
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteServerlessCache`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteServerlessCache::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Deletes a serverless cache: the cache this call names answers `DELETING`, and
+//! the clock owes its removal from the store
+//! ([`crate::state::ServerlessCacheRecord::pending_deletion`]), after which a
+//! read of it answers `ServerlessCacheNotFoundFault`.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +155,100 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteServerlessCache` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteServerlessCacheErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteServerlessCache"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+
+        // Same identity rule as `CreateServerlessCache`: `ServerlessCacheName`
+        // "is stored as a lowercase string", so the cache this request resolves
+        // is the one stored under the lowercased name.
+        let name = input.serverless_cache_name.to_ascii_lowercase();
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // A cache whose removal the clock has already carried through is gone,
+        // and one that has become `AVAILABLE` since it was created is available
+        // now: the record read below is the one this instant owes.
+        let Some(cache) = store.settled_serverless_cache_mut(&name, now) else {
+            // The fault names the cache the request asked for, which is all the
+            // service knows about one that does not exist.
+            return Err(
+                DeleteServerlessCacheErrorModeled::ServerlessCacheNotFoundFault(
+                    ServerlessCacheNotFoundFault {
+                        message: Some(format!(
+                            "Serverless cache with name {} not found.",
+                            input.serverless_cache_name
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // A cache is deletable only from its settled, usable status: one still
+        // `CREATING`, or already `DELETING` from an earlier call, is refused with
+        // the modelled state fault rather than deleted twice.
+        if cache.status != crate::state::SERVERLESS_STATUS_AVAILABLE {
+            return Err(
+                DeleteServerlessCacheErrorModeled::InvalidServerlessCacheStateFault(
+                    InvalidServerlessCacheStateFault {
+                        message: Some(format!(
+                            "Serverless cache {name} is in {} state, not {}.",
+                            cache.status,
+                            crate::state::SERVERLESS_STATUS_AVAILABLE
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // `FinalSnapshotName` asks for a snapshot to be TAKEN before the cache
+        // goes, and this slice can take none: the serverless-snapshot operations
+        // (`CreateServerlessCacheSnapshot`, `DescribeServerlessCacheSnapshots`,
+        // …) are scaffolded 501s that own that gap, so the store holds no
+        // serverless cache snapshot for one to appear in. Refusing the member is
+        // the honest answer — a 200 would claim a final snapshot that was never
+        // taken and that no read can find.
+        if let Some(final_snapshot_name) = input.final_snapshot_name.as_deref() {
+            return Err(invalid_value(format!(
+                "Invalid value {final_snapshot_name} for FinalSnapshotName: this emulator takes \
+                 no serverless cache snapshots."
+            )));
+        }
+
+        // The cache is leaving: it answers `DELETING` now, and the clock owes its
+        // removal, so a caller reading it straight after this call still sees it
+        // going away and a later one sees it gone.
+        cache.begin_deletion(now);
+        let serverless_cache = cache.to_modeled();
+        // Deleting a serverless cache is one of the events this service records;
+        // see `crate::state::EventRecord`. The log outlives the record, so the
+        // events of a deleted cache are still reported.
+        store.record_event(
+            crate::state::SOURCE_TYPE_SERVERLESS_CACHE,
+            &name,
+            "Serverless cache deleted",
+            now,
+        );
+
+        Ok(DeleteServerlessCacheOutput {
+            serverless_cache: Some(serverless_cache),
+        })
     }
+}
+
+/// The modelled refusal for a parameter value this operation cannot accept:
+/// `InvalidParameterValueException` ("The value for a parameter is invalid"),
+/// HTTP 400.
+fn invalid_value(message: impl Into<String>) -> DeleteServerlessCacheError {
+    DeleteServerlessCacheErrorModeled::InvalidParameterValueException(
+        InvalidParameterValueException {
+            message: Some(message.into()),
+        },
+    )
+    .into()
 }
