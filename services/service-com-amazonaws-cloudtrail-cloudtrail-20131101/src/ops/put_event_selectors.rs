@@ -468,6 +468,10 @@ fn normalize_event_selectors(selectors: Vec<EventSelector>) -> Result<Vec<EventS
 
 /// Check an advanced selector set against the documented limits.
 ///
+/// `pub(crate)` because `CreateEventDataStore` holds the selector list it stores on an
+/// event data store to the very same rules: the selector structure is one shape, so it
+/// is read in ONE place rather than once per operation.
+///
 /// Each field selector states a field and at least one condition on it, and a trail
 /// carries "up to a maximum of 500 values for all conditions and selectors".
 ///
@@ -478,7 +482,9 @@ fn normalize_event_selectors(selectors: Vec<EventSelector>) -> Result<Vec<EventS
 /// prose in the user guide the model does not carry. Refusing against a catalog this
 /// emulator invented would reject requests the service accepts, so a well-formed field
 /// is stored as given.
-fn validate_advanced_event_selectors(selectors: &[AdvancedEventSelector]) -> Result<(), String> {
+pub(crate) fn validate_advanced_event_selectors(
+    selectors: &[AdvancedEventSelector],
+) -> Result<(), String> {
     let mut values = 0usize;
     for selector in selectors {
         for field_selector in &selector.field_selectors {

@@ -195,6 +195,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
         let mut store = state.lock();
+        store.settle_event_data_stores(now);
 
         // `EventDataStore` is either a store ARN or the id suffix of one; a value
         // that can be read as neither names no store in any account. The identifier
@@ -227,7 +228,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // this call does, so it is materialised before the status below is read: a
         // store that has finished stopping must read `STOPPED_INGESTION` — which is
         // the status this call needs — and one that has finished starting `ENABLED`.
-        record.settle_ingestion(now);
+        // The whole registry is settled rather than this one record, so a store whose
+        // provisioning span or seven-day deletion wait has elapsed is seen here exactly
+        // as every other event-data-store operation sees it.
 
         // Which events a store collects is a property of its configuration, so a
         // store of a category whose ingestion cannot be controlled at all is refused

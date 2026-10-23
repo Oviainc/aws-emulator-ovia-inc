@@ -91,15 +91,22 @@ const VALIDATION_EXCEPTION: &str = "ValidationException";
 
 /// Render one violation the way CloudTrail states it.
 ///
-/// A violated `@pattern` names the member path and the pattern it failed — the pattern
-/// as the MODEL writes it, anchors included — and NOTHING of the value that was
-/// rejected. The recorded answer to a `ResourceArn` outside its pattern, quoted in this
-/// fix's issue report and replayed by its corpus unit, is `1 validation error detected:
-/// Value at 'resourceArn' failed to satisfy constraint: Member must satisfy regular
-/// expression pattern: ^[a-zA-Z0-9._/\-:]+$`. Every other class keeps the framework's
-/// own sentence ([`Violation::message`], value and all): the pattern class is the one
-/// this service has recorded wording for, and a class with no recorded wording is
-/// better left as the framework states it than reworded on a guess.
+/// A clause of a class this service has a RECORDED answer for names the member path and
+/// the requirement it failed, and NOTHING of the value that was rejected:
+///
+/// * a violated `@pattern` states the pattern as the MODEL writes it, anchors included —
+///   the recorded answer to a `ResourceArn` outside its pattern is `1 validation error
+///   detected: Value at 'resourceArn' failed to satisfy constraint: Member must satisfy
+///   regular expression pattern: ^[a-zA-Z0-9._/\-:]+$`;
+/// * a violated `@range` states the bound it broke — the recorded answer to an
+///   `UpdateEventDataStore` `RetentionPeriod` above the modelled maximum is `1
+///   validation error detected: Value at 'retentionPeriod' failed to satisfy constraint:
+///   Member must have value less than or equal to 3653`.
+///
+/// Every other class keeps the framework's own sentence ([`Violation::message`], value
+/// and all): these two are the classes this service has recorded wording for, and a
+/// class with no recorded wording is better left as the framework states it than
+/// reworded on a guess.
 ///
 /// Why neither shared seam serves this service, which is what the duplication below
 /// costs and what would retire it:
@@ -132,24 +139,39 @@ fn clause(violation: &Violation) -> String {
              expression pattern: {pattern}",
             violation.path
         ),
+        ViolationKind::MinValue(min) => format!(
+            "Value at '{}' failed to satisfy constraint: Member must have value greater \
+             than or equal to {min}",
+            violation.path
+        ),
+        ViolationKind::MaxValue(max) => format!(
+            "Value at '{}' failed to satisfy constraint: Member must have value less than \
+             or equal to {max}",
+            violation.path
+        ),
         _ => violation.message(),
     }
 }
 
-/// Whether `violation` is the class this service rewords: a violated `@pattern`.
-fn is_pattern(violation: &Violation) -> bool {
-    matches!(violation.kind, ViolationKind::Pattern(_))
+/// Whether `violation` is a class this service rewords value-free: a violated `@pattern`
+/// or a violated `@range` bound (see [`clause`] for the recorded answer behind each).
+fn is_value_free(violation: &Violation) -> bool {
+    matches!(
+        violation.kind,
+        ViolationKind::Pattern(_) | ViolationKind::MinValue(_) | ViolationKind::MaxValue(_)
+    )
 }
 
 /// The `ValidationException` message for a refused request: the AWS validation envelope
 /// (`N validation error(s) detected: `) over one clause per violation.
 ///
-/// `None` declines the refusal, leaving the framework's wording, for a request with no
-/// pattern violation at all — there is nothing to reword there. A request that mixes a
-/// pattern violation with another class IS reworded, so the pattern clause drops its
-/// value while every other clause reads exactly as the framework would have stated it.
-fn pattern_envelope(violations: &[Violation]) -> Option<String> {
-    if !violations.iter().any(is_pattern) {
+/// `None` declines the refusal, leaving the framework's wording, for a request that
+/// broke no class this service rewords ([`is_value_free`]) — there is nothing to reword
+/// there. A request that mixes one of those classes with another IS reworded, so the
+/// reworded clause drops its value while every other clause reads exactly as the
+/// framework would have stated it.
+fn value_free_envelope(violations: &[Violation]) -> Option<String> {
+    if !violations.iter().any(is_value_free) {
         return None;
     }
     let clauses: Vec<String> = violations.iter().map(clause).collect();
@@ -521,10 +543,11 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // * a value inside `EventSelectors` / `AdvancedEventSelectors` outside its
         //   modelled constraint is `InvalidEventSelectorsException`, the error the
         //   model declares for exactly that case ([`invalid_event_selectors`]);
-        // * a violated `@pattern` is a `ValidationException` whose clause names the
-        //   member and the pattern WITHOUT the value that broke it
-        //   ([`pattern_envelope`]). The code stays the one the framework would have
-        //   answered — a client branches on the code, so only the wording changes.
+        // * a violated `@pattern`, and a value outside a modelled `@range` bound, are a
+        //   `ValidationException` whose clause names the member and the requirement
+        //   WITHOUT the value that broke it ([`value_free_envelope`]). The code stays the
+        //   one the framework would have answered — a client branches on the code, so
+        //   only the wording changes.
         //
         // Every other refusal, authentication included, keeps the framework's wording
         // because every reader declines it.
@@ -539,7 +562,7 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         }
         Some(Refused {
             code: VALIDATION_EXCEPTION.to_string(),
-            message: pattern_envelope(violations)?,
+            message: value_free_envelope(violations)?,
         })
     }
 

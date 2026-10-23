@@ -130,6 +130,12 @@ pub const DATA_RESOURCES_PER_TRAIL_LIMIT: usize = 250;
 /// values for all conditions and selectors on a trail."
 pub const ADVANCED_SELECTOR_VALUES_PER_TRAIL_LIMIT: usize = 500;
 
+/// How many advanced event selectors ONE event data store may carry, from the model
+/// doc for `CreateEventDataStoreRequest$AdvancedEventSelectors` (and, in the same
+/// words, `UpdateEventDataStoreRequest$AdvancedEventSelectors`): "You can configure up
+/// to five advanced event selectors for each event data store."
+pub const ADVANCED_SELECTORS_PER_EVENT_DATA_STORE_LIMIT: usize = 5;
+
 /// How many trails one `ListTrails` page carries. `ListTrails` models no
 /// `MaxResults`, so the page size is the service's to choose; the remainder is
 /// reached through `NextToken`.
@@ -661,6 +667,55 @@ pub fn iso8601(at: SystemTime) -> Option<String> {
         .ok()
 }
 
+// ---------------------------------------------------------------------------
+// Event data store lifecycle (CloudTrail Lake)
+// ---------------------------------------------------------------------------
+
+/// The shortest retention period an event data store may carry, from the model's
+/// `@range` on `com.amazonaws.cloudtrail#RetentionPeriod` (7..3653).
+pub const RETENTION_PERIOD_MIN_DAYS: i32 = 7;
+
+/// The default and maximum retention period of `billing_mode`, in days.
+///
+/// From the model doc for `CreateEventDataStoreRequest$BillingMode`:
+/// "`EXTENDABLE_RETENTION_PRICING` - ... a flexible retention period of up to 3653
+/// days (about 10 years). The default retention period for this billing mode is 366
+/// days." / "`FIXED_RETENTION_PRICING` - ... need a retention period of up to 2557
+/// days (about 7 years). The default retention period for this billing mode is 2557
+/// days."
+pub fn retention_bounds(billing_mode: EventDataStoreBillingMode) -> (i32, i32) {
+    match billing_mode {
+        EventDataStoreBillingMode::ExtendableRetentionPricing => (366, 3653),
+        EventDataStoreBillingMode::FixedRetentionPricing => (2557, 2557),
+    }
+}
+
+/// How long a newly created event data store stays in `CREATED` before the clock owes
+/// it the status it was created for.
+///
+/// AWS publishes no span for it, so this is the emulator's own: short enough that a
+/// workflow is not slowed, long enough that a caller reading the store straight back
+/// still sees the transient `CREATED` the real service reports.
+pub const EVENT_DATA_STORE_PROVISIONING: Duration = Duration::from_millis(500);
+
+/// How long a store stays in `PENDING_DELETION` before it is really gone, from the
+/// model doc for `DeleteEventDataStore`: "the event data store enters a
+/// PENDING_DELETION state, and is automatically deleted after a wait period of seven
+/// days."
+pub const EVENT_DATA_STORE_DELETION_WAIT: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+/// How many event data stores the registry holds before `CreateEventDataStore`
+/// refuses with the modelled `EventDataStoreMaxLimitExceededException`.
+///
+/// CloudTrail publishes an adjustable per-Region quota, and this emulator models
+/// neither Service Quotas nor an account's adjustments — so this is the emulator's
+/// OWN bound on the store rather than a claim about any account's limit. It bounds
+/// the WHOLE registry, because the Region a store is created in comes from the
+/// request: a per-Region bound would still let a caller grow the store without end
+/// by varying the Region it signs for. It sits far above any workflow an emulator
+/// serves.
+pub const EVENT_DATA_STORE_QUOTA: usize = 1_000;
+
 /// The `ImportStatus` values the model's enum declares
 /// (`smithy_query(query="shape",shape="ImportStatus")`): `INITIALIZING | IN_PROGRESS |
 /// FAILED | STOPPED | COMPLETED`.
@@ -900,6 +955,16 @@ impl EventDataStoreBillingMode {
             Self::FixedRetentionPricing => "FIXED_RETENTION_PRICING",
         }
     }
+
+    /// Read a billing mode a request supplied, or `None` for a value the model's
+    /// `BillingMode` enum does not carry.
+    pub fn from_wire(value: &str) -> Option<Self> {
+        match value {
+            "EXTENDABLE_RETENTION_PRICING" => Some(Self::ExtendableRetentionPricing),
+            "FIXED_RETENTION_PRICING" => Some(Self::FixedRetentionPricing),
+            _ => None,
+        }
+    }
 }
 
 /// The Lake query federation state of an event data store: one variant per value
@@ -1011,6 +1076,10 @@ pub struct EventDataStoreRecord {
     /// The Region the store lives in; it is reachable only from there.
     pub region: String,
     pub status: EventDataStoreState,
+    /// The status the CLOCK owes this store, and the instant it comes due: a store
+    /// AWS reports in a non-terminal status reaches its next one with no further
+    /// call. Materialised by [`EventDataStoreRecord::settle`].
+    pub pending_status: Option<(SystemTime, EventDataStoreState)>,
     /// When an in-flight ingestion `status` (`STARTING_INGESTION` /
     /// `STOPPING_INGESTION`) is due to settle into the status it is heading for;
     /// `None` once it has, and for a store whose ingestion is not moving.
@@ -1057,6 +1126,9 @@ pub struct EventDataStoreRecord {
     /// The store's tag set, as `CreateEventDataStore` seeds it, `AddTags` merges into
     /// it, `RemoveTags` drops keys from it and `ListTags` reports it.
     pub tags: Vec<Tag>,
+    /// When the `PENDING_DELETION` wait period elapses and the store is gone, set
+    /// by `DeleteEventDataStore`.
+    pub deleted_at: Option<SystemTime>,
     /// The Insights selectors `PutInsightSelectors` configured on this store and
     /// `GetInsightSelectors` reports. EMPTY means Insights event logging is off,
     /// on the same terms as [`TrailRecord::insight_selectors`].
@@ -1080,6 +1152,22 @@ impl EventDataStoreRecord {
     /// This store's ARN, derived from the Region it lives in and its id.
     pub fn arn(&self) -> String {
         event_data_store_arn(&self.region, &self.id)
+    }
+
+    /// Take the status the clock already owes this store, if its instant has passed.
+    pub fn settle(&mut self, now: SystemTime) {
+        if let Some((due, next)) = self.pending_status {
+            if now >= due {
+                self.status = next;
+                self.pending_status = None;
+            }
+        }
+    }
+
+    /// Whether this store's seven-day `PENDING_DELETION` wait has elapsed, so a
+    /// caller would no longer find it at all.
+    pub fn deletion_due(&self, now: SystemTime) -> bool {
+        self.deleted_at.is_some_and(|at| now >= at)
     }
 
     /// Whether this store collects events of `category`: one of its advanced event
@@ -1655,6 +1743,42 @@ impl ComAmazonawsCloudtrailCloudtrail20131101State {
         }
     }
 
+    /// Materialise every change the CLOCK already owes the event-data-store
+    /// registry: a store whose provisioning span has elapsed takes the status it was
+    /// created for, one whose seven-day `PENDING_DELETION` wait has elapsed is gone,
+    /// and the Lake queries that ran on a store THIS pass removed go with it — a
+    /// query is reachable only through the store it ran on, so nothing can address
+    /// those records again. Every event-data-store lifecycle operation calls this
+    /// before it reads, so what it reports is what a caller would see even if nobody
+    /// had called.
+    pub fn settle_event_data_stores(&mut self, now: SystemTime) {
+        // The stores this pass removes, and with them the queries that ran on them:
+        // only those, so a query whose store the registry never held (a seeded one,
+        // say) is left alone — the clock owes nothing about it.
+        let removed: ::std::collections::HashSet<String> = self
+            .event_data_stores
+            .iter()
+            .filter(|(_, record)| record.deletion_due(now))
+            .map(|(id, _)| id.clone())
+            .collect();
+        self.event_data_stores
+            .retain(|id, _| !removed.contains(id));
+        for record in self.event_data_stores.values_mut() {
+            record.settle(now);
+            // Every transition the clock owes a store is materialised in ONE place,
+            // so a precondition cannot read a stale federation or ingestion status.
+            record.settle_federation(now);
+            record.settle_ingestion(now);
+        }
+        // This is also the ONLY eviction path the query registry has: no operation
+        // inserts into it yet (`StartQuery` is still a scaffold stub, with its own
+        // filed issue), so a per-registry bound belongs with the handler that will.
+        if !removed.is_empty() {
+            self.queries
+                .retain(|_, query| !removed.contains(&query.event_data_store_id));
+        }
+    }
+
     /// The import `import_id` names in `region`, for an operation that only reports
     /// it.
     pub fn import(&self, import_id: &str, region: &str) -> Option<&ImportRecord> {
@@ -1685,6 +1809,15 @@ impl ComAmazonawsCloudtrailCloudtrail20131101State {
         self.event_data_stores
             .values()
             .any(|record| record.region == region && record.owner() == account_id)
+    }
+
+    /// Whether this Region already holds a store of this name. An event data store
+    /// name is unique per Region, which is what
+    /// `EventDataStoreAlreadyExistsException` reports.
+    pub fn event_data_store_named(&self, name: &str, region: &str) -> bool {
+        self.event_data_stores
+            .values()
+            .any(|record| record.name == name && record.region == region)
     }
 
     /// Resolve a caller-supplied event data store identifier (an ARN or the bare
