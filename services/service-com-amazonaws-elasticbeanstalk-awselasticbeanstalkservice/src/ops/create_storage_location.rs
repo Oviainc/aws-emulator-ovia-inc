@@ -21,6 +21,10 @@
 //! The engine is held on `self` (constructor-injected), NOT passed per request.
 //! Reach the store through [`crate::state::service_state`]: the bucket this call
 //! creates is recorded there, so a second call reports the one that already exists.
+//! The bucket itself is stood up where this emulator serves the Amazon S3 object
+//! protocol — object storage, over the in-process callback — because the name this
+//! call reports is the one a client then uploads its source bundle into; see
+//! [`crate::state::create_storage_bucket`].
 //!
 //! ---
 //!
@@ -68,10 +72,13 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-elasticbeanstalk-awsela
 // `super::types::*` above, so the generated ops module re-exports each of them from
 // exactly one place.
 
-// The operation's MODELED errors. Only the bucket quota is reachable here: this
-// emulator owns the account's storage location, so there is no missing privilege
-// and no absent S3 subscription — and a bucket that already exists is reported
-// rather than refused.
+// The operation's MODELED errors. The bucket quota is reachable from both sides —
+// this service's own storage-location quota and the Amazon S3 bucket limit object
+// storage answers the create with — and `InsufficientPrivilegesException` is what a
+// create object storage refuses as not permitted reports ("the specified account does
+// not have sufficient privileges for one or more Amazon Web Services services"). Only
+// `S3SubscriptionRequiredException` is unreachable: every account in this emulator has
+// object storage. A bucket that already exists is reported rather than refused.
 #[smithy_macros::operation_error("com.amazonaws.elasticbeanstalk#CreateStorageLocation")]
 #[derive(Debug)]
 pub enum CreateStorageLocationErrorModeled {
@@ -138,20 +145,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "the Elastic Beanstalk store is unavailable",
             )
         })?;
-        let mut store = state.lock();
 
         // "If the storage location already exists, CreateStorageLocation still
         // returns the bucket name but does not create a new bucket": the create is
         // idempotent, so the store holds the bucket at most once however many
         // times this is called.
         let bucket = crate::state::storage_bucket_name(&region);
-        if !store.storage_buckets.contains(&bucket) {
+        let recorded = {
+            let store = state.lock();
+            let recorded = store.storage_buckets.contains(&bucket);
             // "TooManyBucketsException: The specified account has reached its
             // limit of Amazon S3 buckets." Enforcing the quota is also what
             // bounds this store: the bucket's name is built from the region the
             // request was signed for, so the number of names a caller can mint
             // is capped rather than unbounded.
-            if store.storage_buckets.len() >= crate::state::MAX_STORAGE_LOCATIONS {
+            if !recorded && store.storage_buckets.len() >= crate::state::MAX_STORAGE_LOCATIONS {
                 return Err(CreateStorageLocationErrorModeled::TooManyBucketsException(
                     TooManyBucketsException {
                         message: Some(format!(
@@ -163,9 +171,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             }
-            store.storage_buckets.insert(bucket.clone());
+            recorded
+        };
+
+        // The bucket this call reports is the one a client then uploads its source
+        // bundle into, so it is CREATED where this emulator serves the Amazon S3
+        // object protocol — in object storage — and not merely named here. The guard
+        // above is dropped first: this reaches another service in process and holds no
+        // store lock while it does.
+        //
+        // It runs whether or not this store already records the storage location,
+        // because what makes the reported bucket usable is object storage holding it:
+        // a bucket deleted there since is created again, as "creates a bucket in
+        // Amazon S3 … if it does not already exist" says, and one still there is left
+        // alone.
+        if let Err(refusal) = crate::state::create_storage_bucket(ctx, &region, &bucket).await {
+            return Err(match refusal {
+                // "InsufficientPrivilegesException: The specified account does not
+                // have sufficient privileges for one or more Amazon Web Services
+                // services" — here, Amazon S3, which refused the create.
+                crate::state::StorageBucketRefusal::NotPermitted => {
+                    CreateStorageLocationErrorModeled::InsufficientPrivilegesException(
+                        InsufficientPrivilegesException {
+                            message: Some(format!(
+                                "The account does not have sufficient privileges to create the \
+                                 Amazon S3 bucket {bucket}."
+                            )),
+                        },
+                    )
+                }
+                crate::state::StorageBucketRefusal::TooManyBuckets => {
+                    CreateStorageLocationErrorModeled::TooManyBucketsException(
+                        TooManyBucketsException {
+                            message: Some(
+                                "The number of Amazon S3 buckets in this account has reached its \
+                                 limit."
+                                    .to_string(),
+                            ),
+                        },
+                    )
+                }
+            }
+            .into());
         }
 
+        // Recorded only once object storage holds the bucket, so a refused create
+        // leaves no storage location a later call would report without creating.
+        if !recorded {
+            state.lock().storage_buckets.insert(bucket.clone());
+        }
 
         Ok(CreateStorageLocationOutput {
             s3_bucket: Some(bucket),
