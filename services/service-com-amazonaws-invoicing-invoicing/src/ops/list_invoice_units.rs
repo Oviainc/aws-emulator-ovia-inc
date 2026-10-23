@@ -6,6 +6,11 @@
 //! one page of at most `MaxResults` at a time, with an opaque `NextToken` that resumes
 //! the walk where the page stopped.
 //!
+//! `AsOf` makes this a point-in-time read: the answer is the state at that instant, so a
+//! unit reports the configuration that was in effect then, a unit created later is not
+//! in it, and a unit that has since been DELETED still is. With no `AsOf` the answer is
+//! the state now, which holds only the units that still exist.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -305,7 +310,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         for unit in page.map(|(_, unit)| unit) {
             // A unit that did not exist at `AsOf` is not part of the answer for that
-            // instant.
+            // instant: one created after it, and one deleted at or before it. A listing
+            // with no `AsOf` is a listing of NOW, which the units a delete has retired
+            // are not part of — while a listing at an instant between a unit's creation
+            // and its deletion still reports it, with the configuration from then.
             let Some(version) = unit.version_as_of(input.as_of.as_ref()) else {
                 continue;
             };

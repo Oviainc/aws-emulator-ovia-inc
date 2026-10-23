@@ -172,12 +172,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &input.invoice_unit_arn,
             ))
         };
+        // The whole registry, history included: a unit a delete has retired is still
+        // part of the answer for an instant it existed at.
         let unit = store
             .invoice_units
             .get(&input.invoice_unit_arn)
             .ok_or_else(not_found)?;
         // `AsOf` reads the configuration that was in effect then; a unit created after
-        // `AsOf` did not exist at that instant.
+        // `AsOf`, or deleted at or before it, did not exist at that instant. A read with
+        // no `AsOf` is a read of NOW, which a retired unit is not part of.
         let version = unit
             .version_as_of(input.as_of.as_ref())
             .ok_or_else(not_found)?;

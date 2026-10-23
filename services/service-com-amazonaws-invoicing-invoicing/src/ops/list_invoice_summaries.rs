@@ -252,7 +252,7 @@ struct SummaryFilter<'f> {
     /// `StartDate` INCLUSIVE and `EndDate` EXCLUSIVE, as both members document
     /// (`smithy_query(query="doc", shape="DateInterval", member="StartDate")`:
     /// "the start date is inclusive"; `member="EndDate"`: "up to, but not including").
-    time_interval: Option<((i64, u32), (i64, u32))>,
+    time_interval: Option<(i64, i64)>,
     /// `BillingPeriod`, as the `(Month, Year)` an invoice's own billing period must be.
     billing_period: Option<(i32, i32)>,
     /// `InvoicingEntity`, which an invoice's `Entity.InvoicingEntity` must equal.

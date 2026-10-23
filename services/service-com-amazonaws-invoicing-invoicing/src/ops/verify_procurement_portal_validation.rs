@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op VerifyProcurementPortalValidation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `VerifyProcurementPortalValidation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`VerifyProcurementPortalValidation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Completes the validation of a procurement portal preference: resolves the
+//! `ProcurementPortalPreferenceArn` against the preference registry in
+//! [`crate::state`] and checks the submitted `Code` against the one
+//! `SendProcurementPortalValidation` issued for that preference. An ARN that names no
+//! stored preference is the modelled `ResourceNotFoundException` (HTTP 404) — nothing
+//! is validated and no validation state is fabricated for it — and a `Code` that is not
+//! the outstanding one is the modelled `ValidationException` (HTTP 400).
 //!
 //! ## Shape of an operation
 //!
@@ -125,6 +124,13 @@ impl From<VerifyProcurementPortalValidationErrorModeled> for VerifyProcurementPo
     }
 }
 
+/// The sentence a submitted `Code` is refused with: a CONSTANT, the same whatever was
+/// submitted. It states that the code is not the outstanding one WITHOUT reproducing
+/// what the caller sent or revealing what the issued code is — the same rule
+/// `crate::service::validation` states for every refusal of this service.
+const INVALID_CODE_MESSAGE: &str =
+    "The validation code is not valid for this procurement portal preference.";
+
 /// The `VerifyProcurementPortalValidation` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -161,18 +167,99 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `VerifyProcurementPortalValidation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(VerifyProcurementPortalValidationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("VerifyProcurementPortalValidation"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            VerifyProcurementPortalValidationErrorModeled::InternalServerException(
+                crate::state::state_unavailable(),
+            )
+        })?;
+        let mut store = state.lock();
+        let client_token = input.client_token.as_deref();
+
+        // The ARN has to name a preference this emulator holds: there is no validation
+        // to complete for one that does not exist, and the model declares
+        // `ResourceNotFoundException` (HTTP 404) for exactly that. Checked BEFORE the
+        // idempotency replay, so a replay against a preference that is gone reports it
+        // gone rather than answering for it.
+        if !store
+            .procurement_portal_preferences
+            .contains_key(&input.procurement_portal_preference_arn)
+        {
+            return Err(
+                VerifyProcurementPortalValidationErrorModeled::ResourceNotFoundException(
+                    crate::state::no_such_resource(&input.procurement_portal_preference_arn),
+                )
+                .into(),
+            );
+        }
+
+        // `@idempotent`: a replay (the same `ClientToken` against the same preference)
+        // answers with the ARN the first call returned; the code was already consumed.
+        if let Some(arn) = store.replayed_result(
+            Self::NAME,
+            &input.procurement_portal_preference_arn,
+            client_token,
+        ) {
+            return Ok(VerifyProcurementPortalValidationOutput {
+                procurement_portal_preference_arn: arn,
+            });
+        }
+
+        // The code check and the write it authorises are one scope, so the borrow of the
+        // preference ends before the replay record is written.
+        {
+            let stored = store
+                .procurement_portal_preferences
+                .get_mut(&input.procurement_portal_preference_arn)
+                .ok_or_else(|| {
+                    VerifyProcurementPortalValidationErrorModeled::ResourceNotFoundException(
+                        crate::state::no_such_resource(&input.procurement_portal_preference_arn),
+                    )
+                })?;
+
+            // A code is accepted only when it is the one this service issued for THIS
+            // preference and is still outstanding. Anything else — no send has been
+            // made, or a code that does not match the issued one — is refused with the
+            // modelled 400, because completing the validation would otherwise assert a
+            // connectivity check that never happened.
+            let outstanding = stored
+                .validation
+                .as_ref()
+                .filter(|validation| validation.verified_at.is_none())
+                .map(|validation| validation.code.as_str());
+            if outstanding != Some(input.code.as_str()) {
+                return Err(
+                    VerifyProcurementPortalValidationErrorModeled::ValidationException(
+                        ValidationException {
+                            message: Some(INVALID_CODE_MESSAGE.to_string()),
+                            // `invalidInput` is one of the model's
+                            // `ValidationExceptionReason` values
+                            // (`crate::ops::types::VALIDATION_EXCEPTION_REASON_VALUES`).
+                            reason: Some("invalidInput".to_string()),
+                            ..Default::default()
+                        },
+                    )
+                    .into(),
+                );
+            }
+            // Submitting the issued code is what completes the validation, so this call
+            // writes: the instant it was completed at is recorded against the
+            // preference, which also retires the code — a second submit of the same
+            // code is no longer outstanding.
+            let verified_at = crate::state::now();
+            if let Some(validation) = stored.validation.as_mut() {
+                validation.verified_at = Some(verified_at);
+            }
+        }
+
+        store.record_result(
+            Self::NAME,
+            &input.procurement_portal_preference_arn,
+            client_token,
+            &input.procurement_portal_preference_arn,
+        );
+        Ok(VerifyProcurementPortalValidationOutput {
+            procurement_portal_preference_arn: input.procurement_portal_preference_arn,
+        })
     }
 }

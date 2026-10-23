@@ -14,6 +14,16 @@
 //! create the invoices" — so a read at an instant must answer with the configuration
 //! that was in effect then, not with the latest one.
 //!
+//! For the same reason a DELETE RETIRES an invoice unit rather than erasing it: the
+//! model documents `AsOf` as "the state of an invoice unit at a specified time. You can
+//! see legacy invoice units that are currently deleted if the `AsOf` time is set to
+//! before it was deleted", so the instant a unit was deleted at is part of its history
+//! and a read at an earlier instant still has to answer with it. A retired unit carries
+//! a [`StoredInvoiceUnit::deleted_at`] tombstone, is reported by a point-in-time read
+//! whose instant falls between its creation and its deletion, and is absent from every
+//! read of the state NOW — so the live surface (a create of the same `Name`, a tag
+//! write, an update, a second delete) sees it as gone.
+//!
 //! Beside the invoice units sits the INVOICE registry [`ComAmazonawsInvoicingInvoicingState::invoices`],
 //! the one copy of the invoices this emulator holds, which `ListInvoiceSummaries`
 //! reports. An invoice is ISSUED by AWS out of a billing period's activity: no
@@ -31,15 +41,23 @@ use ::aws_smithy_types::DateTime;
 
 use crate::ops::types::{
     AccessDeniedException, InternalServerException, InvoiceProfile, InvoiceSummary, InvoiceUnit,
-    InvoiceUnitRule, ResourceNotFoundException, ResourceTag,
+    InvoiceUnitRule, ProcurementPortalPreference, ResourceNotFoundException, ResourceTag,
 };
 
 /// Per-service state for com-amazonaws-invoicing-invoicing. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsInvoicingInvoicingState {
-    /// Every invoice unit that currently exists, keyed by its `InvoiceUnitArn`. A
-    /// `BTreeMap` so `ListInvoiceUnits` walks a stable, deterministic order and a
-    /// pagination token (a position in that order) stays meaningful across calls.
+    /// Every invoice unit this emulator holds, LIVE AND RETIRED, keyed by its
+    /// `InvoiceUnitArn`. A `BTreeMap` so `ListInvoiceUnits` walks a stable,
+    /// deterministic order and a pagination token (a position in that order) stays
+    /// meaningful across calls.
+    ///
+    /// A retired unit (one [`StoredInvoiceUnit::deleted_at`] is set on) is history, not
+    /// a resource: reach the live surface through [`Self::live_invoice_unit`],
+    /// [`Self::live_invoice_unit_mut`] and [`Self::live_invoice_units`] rather than
+    /// indexing this map, and read history through
+    /// [`StoredInvoiceUnit::version_as_of`], which answers `None` for an instant the
+    /// unit did not exist at — before it was created or at or after it was deleted.
     pub invoice_units: BTreeMap<String, StoredInvoiceUnit>,
     /// Every invoice this emulator holds, keyed by its `InvoiceId`, as the modelled
     /// `InvoiceSummary` a reader reports it with — one copy, so two readers of one
@@ -62,8 +80,25 @@ pub struct ComAmazonawsInvoicingInvoicingState {
     /// The keys of [`Self::idempotent_results`] in the order they were recorded, so the
     /// oldest record is the one evicted when the bound is reached.
     idempotent_record_order: VecDeque<IdempotencyKey>,
+    /// Every procurement portal preference this emulator holds, keyed by its
+    /// `ProcurementPortalPreferenceArn` — the one copy of a preference, so the
+    /// operations of the portal-validation flow cannot disagree about whether one
+    /// exists. A `BTreeMap` so a listing walks a stable, deterministic order.
+    ///
+    /// Empty until a create puts a preference here:
+    /// `CreateProcurementPortalPreference` and `PutProcurementPortalPreference` are the
+    /// operations that do so and are still scaffolded (their own stub issues own them),
+    /// so for now every ARN naming a preference resolves to nothing — which is exactly
+    /// what `SendProcurementPortalValidation` and `VerifyProcurementPortalValidation`
+    /// report as the modelled `ResourceNotFoundException`, rather than claiming a
+    /// validation state for a preference that does not exist.
+    pub procurement_portal_preferences: BTreeMap<String, StoredProcurementPortalPreference>,
     /// Source of invoice-unit ids for ARN minting.
     next_invoice_unit_id: u64,
+    /// Source of procurement-portal-preference ids for ARN minting.
+    next_procurement_portal_preference_id: u64,
+    /// Source of the validation codes `SendProcurementPortalValidation` issues.
+    next_portal_validation_code: u64,
 }
 
 /// What an `@idempotent` replay record is keyed by: the operation, the request's target
@@ -72,16 +107,37 @@ type IdempotencyKey = (String, String, String);
 
 /// How many invoice units this emulator holds. The model's `ValidationExceptionReason`
 /// declares `maxInvoiceUnitsExceeded`, so the real service refuses a create once its own
-/// (account-adjustable) maximum is reached; this constant is the emulator's maximum, and
-/// it also bounds the registry and the per-request walks over it.
+/// (account-adjustable) maximum is reached; this constant is the emulator's maximum. It
+/// bounds the units that EXIST (the registry also holds the tombstones a delete leaves,
+/// bounded by [`MAX_RETIRED_INVOICE_UNITS`]) and the per-request walks over them.
 pub const MAX_INVOICE_UNITS: usize = 1000;
 
-/// How many tags one resource holds. `ResourceTagList` is modelled `length 0..200`
-/// both as `TagResource`'s input and as `ListTagsForResource`'s output
-/// (`smithy_query(query="operation", operation="TagResource,ListTagsForResource")`),
-/// so a resource cannot hold more tags than that and still be reportable; a write
-/// past it is the modelled `ServiceQuotaExceededException` (HTTP 402).
-pub const MAX_RESOURCE_TAGS: usize = 200;
+/// How many tags ONE RESOURCE holds — a quota on the resource, independent of how many
+/// tags one call may carry.
+///
+/// `ResourceTagList` is modelled `length 0..200` as `TagResource`'s input
+/// (`smithy_query(query="operation", operation="TagResource,ListTagsForResource")`), but
+/// that is the bound on ONE CALL's array: a per-resource quota equal to it could never
+/// be reached by any legal sequence of calls, because no single call may carry more than
+/// the quota either. The per-resource quota is therefore the AWS-wide tagging quota —
+/// "Maximum number of tags per resource – 50" (AWS General Reference, "Tagging your
+/// resources") — strictly below the per-call maximum, so a caller tagging in batches
+/// reaches it. A write that would push a resource past it is refused ATOMICALLY with the
+/// modelled `ServiceQuotaExceededException` (HTTP 402); nothing of the refused batch
+/// persists.
+pub const MAX_RESOURCE_TAGS: usize = 50;
+
+/// The sentence the per-resource tag quota is refused with: a CONSTANT, the service's
+/// own canned wording as the recorded 402 of this service states it — it names no ARN
+/// and no count, so a client matching it matches every one of these refusals.
+pub const TAG_QUOTA_EXCEEDED_MESSAGE: &str =
+    "The request exceeds the maximum number of tags allowed per resource.";
+
+/// How many RETIRED invoice units this emulator keeps for point-in-time reads. Deletes
+/// are caller-driven, so the tombstones are bounded the same way the configuration
+/// history is: past this many the unit deleted longest ago is dropped, and an `AsOf`
+/// read can no longer answer with it.
+const MAX_RETIRED_INVOICE_UNITS: usize = 1000;
 
 /// How many `@idempotent` replay records this service keeps, across every operation and
 /// `ClientToken`. The key is caller-supplied, so without a bound a long-lived emulator
@@ -105,6 +161,108 @@ impl ComAmazonawsInvoicingInvoicingState {
         self.next_invoice_unit_id = self.next_invoice_unit_id.wrapping_add(1);
         let id = self.next_invoice_unit_id;
         ::engine::emulator_arn("invoicing", "", &format!("invoice-unit/{id:012x}"))
+    }
+
+    /// The invoice unit `arn` names RIGHT NOW: the stored unit, unless it has been
+    /// retired, in which case there is no such resource any more and a reader of the
+    /// current state answers `ResourceNotFoundException`.
+    ///
+    /// Every operation that acts on the live resource \u2014 a read with no `AsOf`, an
+    /// update, a tag write, a second delete \u2014 resolves the ARN through here, so one
+    /// retired unit cannot look present to one operation and absent to another.
+    pub fn live_invoice_unit(&self, arn: &str) -> Option<&StoredInvoiceUnit> {
+        self.invoice_units.get(arn).filter(|unit| unit.is_live())
+    }
+
+    /// [`Self::live_invoice_unit`], for a caller that goes on to change the unit.
+    pub fn live_invoice_unit_mut(&mut self, arn: &str) -> Option<&mut StoredInvoiceUnit> {
+        self.invoice_units
+            .get_mut(arn)
+            .filter(|unit| unit.is_live())
+    }
+
+    /// Every invoice unit that exists right now, in `InvoiceUnitArn` order. The retired
+    /// ones are history and are reached only through a point-in-time read.
+    pub fn live_invoice_units(&self) -> impl Iterator<Item = &StoredInvoiceUnit> {
+        self.invoice_units.values().filter(|unit| unit.is_live())
+    }
+
+    /// How many invoice units exist right now \u2014 what [`MAX_INVOICE_UNITS`] bounds. The
+    /// tombstones a delete leaves behind are history and do not consume the account's
+    /// invoice-unit allowance.
+    pub fn live_invoice_unit_count(&self) -> usize {
+        self.live_invoice_units().count()
+    }
+
+    /// Retire the invoice unit `arn` names at `at`, keeping it as history: it stops
+    /// being a resource (every live read now reports it missing) while a point-in-time
+    /// read before `at` still answers with the configuration that was in effect then.
+    ///
+    /// `false` when `arn` names no LIVE invoice unit, which a delete reports as
+    /// `ResourceNotFoundException` \u2014 an already-retired unit included, because the
+    /// resource is already gone.
+    pub fn retire_invoice_unit(&mut self, arn: &str, at: DateTime) -> bool {
+        match self.live_invoice_unit_mut(arn) {
+            Some(unit) => unit.deleted_at = Some(at),
+            None => return false,
+        }
+        // Bounded history: deletes are caller-driven, so keep only the most recently
+        // retired units rather than growing this map without limit.
+        while self.retired_invoice_unit_count() > MAX_RETIRED_INVOICE_UNITS {
+            let oldest = self
+                .invoice_units
+                .values()
+                .filter_map(|unit| {
+                    unit.deleted_at
+                        .map(|deleted| (instant_key(&deleted), unit.arn.clone()))
+                })
+                .min();
+            match oldest {
+                Some((_, arn)) => self.invoice_units.remove(&arn),
+                None => break,
+            };
+        }
+        true
+    }
+
+    /// How many retired invoice units this emulator is holding as history.
+    fn retired_invoice_unit_count(&self) -> usize {
+        self.invoice_units
+            .values()
+            .filter(|unit| !unit.is_live())
+            .count()
+    }
+
+    /// Mint the ARN of a new procurement portal preference:
+    /// `arn:aws:invoicing::<account>:procurement-portal-preference/<id>`, the form
+    /// `ProcurementPortalPreferenceArnString`'s `@pattern` spells
+    /// (`smithy_query(query=\"shape\", shape=\"ProcurementPortalPreference\")`).
+    pub fn mint_procurement_portal_preference_arn(&mut self) -> String {
+        self.next_procurement_portal_preference_id =
+            self.next_procurement_portal_preference_id.wrapping_add(1);
+        let id = self.next_procurement_portal_preference_id;
+        ::engine::emulator_arn(
+            "invoicing",
+            "",
+            &format!("procurement-portal-preference/{id:012x}"),
+        )
+    }
+
+    /// The validation code the next `SendProcurementPortalValidation` issues: six
+    /// decimal digits, the form the portal-validation flow's `Code` is quoted in.
+    ///
+    /// Minted from a monotonic counter mixed with the nanosecond clock, so two
+    /// validations issued in one run do not share a code. It is NOT a credential and is
+    /// never returned on the wire: the real service delivers it out of band through the
+    /// configured portal, and this emulator has no out-of-band channel, so the code it
+    /// issued is kept here (see [`IssuedPortalValidation`]) for
+    /// `VerifyProcurementPortalValidation` to check a submitted code against.
+    pub fn issue_portal_validation_code(&mut self) -> String {
+        self.next_portal_validation_code = self.next_portal_validation_code.wrapping_add(1);
+        let mixed = u64::from(now().subsec_nanos())
+            .wrapping_mul(1_000_003)
+            .wrapping_add(self.next_portal_validation_code);
+        format!("{:06}", mixed % 1_000_000)
     }
 
     /// The ARN an earlier call of `operation` already returned for this `target` and
@@ -187,7 +345,7 @@ impl ComAmazonawsInvoicingInvoicingState {
     pub fn organization_accounts(&self) -> BTreeSet<String> {
         let mut accounts = BTreeSet::new();
         accounts.insert(::engine::emulator_account_id().to_string());
-        for unit in self.invoice_units.values() {
+        for unit in self.live_invoice_units() {
             accounts.insert(unit.invoice_receiver.clone());
             for version in std::iter::once(&unit.current).chain(unit.superseded.iter()) {
                 if let Some(linked) = version.rule.linked_accounts.as_ref() {
@@ -197,6 +355,34 @@ impl ComAmazonawsInvoicingInvoicingState {
         }
         accounts
     }
+}
+
+/// One procurement portal preference as it is stored: the modelled structure a reader
+/// reports, plus the portal-validation state the validation flow keeps about it.
+#[derive(Debug, Clone)]
+pub struct StoredProcurementPortalPreference {
+    /// The preference itself, as the modelled `ProcurementPortalPreference` a reader
+    /// reports it with — one copy, so two readers of one preference cannot disagree.
+    pub preference: ProcurementPortalPreference,
+    /// The validation `SendProcurementPortalValidation` last issued for this
+    /// preference, if any. `None` means no validation has been requested, so there is
+    /// no code a `VerifyProcurementPortalValidation` could match.
+    pub validation: Option<IssuedPortalValidation>,
+}
+
+/// One issued procurement-portal validation: the code the service issued, when it
+/// issued it, and when (if ever) a caller submitted that same code back.
+#[derive(Debug, Clone)]
+pub struct IssuedPortalValidation {
+    /// The code `SendProcurementPortalValidation` issued. Kept in state and never put
+    /// on the wire: the modelled response carries only the preference's ARN, because
+    /// the real service delivers the code out of band through the portal.
+    pub code: String,
+    /// When the code was issued.
+    pub issued_at: DateTime,
+    /// When a `VerifyProcurementPortalValidation` submitted this code back, which is
+    /// what completes the validation. `None` while it is still outstanding.
+    pub verified_at: Option<DateTime>,
 }
 
 /// One invoice unit as it is stored: the members that can never change, plus the
@@ -217,21 +403,47 @@ pub struct StoredInvoiceUnit {
     /// Configurations an update replaced, oldest first, at most
     /// [`MAX_RETAINED_VERSIONS`] of them.
     pub superseded: Vec<InvoiceUnitVersion>,
+    /// When the unit was DELETED, for a unit a delete has retired. The unit is no
+    /// longer a resource from this instant on, while a point-in-time read before it
+    /// still answers with the configuration that was in effect then — the model
+    /// documents `AsOf` as showing "legacy invoice units that are currently deleted if
+    /// the AsOf time is set to before it was deleted". `None` for a unit that still
+    /// exists.
+    pub deleted_at: Option<DateTime>,
 }
 
 impl StoredInvoiceUnit {
+    /// Whether this unit still exists: a delete retires a unit rather than erasing it,
+    /// and a retired one is history rather than a resource.
+    pub fn is_live(&self) -> bool {
+        self.deleted_at.is_none()
+    }
+
     /// The configuration that was in effect at `as_of`, or the current one when the
-    /// caller asked for no particular instant. `None` when the unit did not yet exist
-    /// at `as_of`, which a reader reports as `ResourceNotFoundException`.
+    /// caller asked for no particular instant. `None` when the unit did not exist at
+    /// `as_of`, which a reader reports as `ResourceNotFoundException`.
+    ///
+    /// "Did not exist" is both ends of the unit's life: an instant before it was
+    /// created, and an instant at or after it was deleted. An instant in between
+    /// answers with the configuration from then even for a unit that has since been
+    /// deleted, and a caller that asked for no instant at all is asking about NOW, so a
+    /// deleted unit is not part of that answer.
     ///
     /// A unit that existed at `as_of` but whose configuration from then has been evicted
     /// by [`MAX_RETAINED_VERSIONS`] reads the oldest configuration still retained.
     pub fn version_as_of(&self, as_of: Option<&DateTime>) -> Option<&InvoiceUnitVersion> {
         let Some(as_of) = as_of else {
-            return Some(&self.current);
+            return self.is_live().then_some(&self.current);
         };
         let wanted = instant_key(as_of);
         if wanted < instant_key(&self.created_at) {
+            return None;
+        }
+        if self
+            .deleted_at
+            .as_ref()
+            .is_some_and(|deleted| instant_key(deleted) <= wanted)
+        {
             return None;
         }
         std::iter::once(&self.current)
@@ -279,21 +491,47 @@ pub struct InvoiceUnitVersion {
 /// A total order on timestamps, so a stored instant can be compared with a requested
 /// one — a `LastModified` against an `AsOf`, an `IssuedDate` against a `DateInterval`'s
 /// bounds — without assuming `DateTime` is itself `Ord`.
-pub fn instant_key(at: &DateTime) -> (i64, u32) {
-    (at.secs(), at.subsec_nanos())
+///
+/// The order is at MILLISECOND granularity, rounded to the nearest millisecond, because
+/// that is the precision this service's instants survive a round trip through the wire
+/// at: a timestamp travels on the awsJson protocols as epoch seconds in a JSON NUMBER,
+/// which a client (and this emulator's own deserializer) reads as a double, and a double
+/// cannot hold a nanosecond-precise instant of the current epoch — the value comes back
+/// a few hundred nanoseconds off, in either direction. Comparing at a finer granularity
+/// than the wire carries would make a read at an instant the SERVICE ITSELF reported —
+/// `AsOf` set to a unit's own `LastModified`, which is how a caller asks for "the state
+/// as of that write" — miss the very state it reported, which is not a difference any
+/// caller can account for. Milliseconds is also the granularity [`now`] stamps with, so
+/// a stored instant is exactly on a boundary and the rounding only absorbs the wire's
+/// error.
+///
+/// The arithmetic is SATURATING because the instant can come straight off the wire: a
+/// timestamp arrives as a JSON number and is built with `DateTime::from_secs_f64`, whose
+/// cast saturates, so a caller can name a second count whose millisecond count no `i64`
+/// holds. Saturating keeps the key total and order-preserving at those extremes — an
+/// absurdly large instant is "at or after everything stored", an absurdly small one is
+/// "before everything" — instead of panicking under overflow checks or wrapping to a
+/// negative key and mis-ordering the comparison.
+pub fn instant_key(at: &DateTime) -> i64 {
+    const NANOS_PER_MILLI: i64 = 1_000_000;
+    at.secs()
+        .saturating_mul(1_000)
+        .saturating_add((i64::from(at.subsec_nanos()) + NANOS_PER_MILLI / 2) / NANOS_PER_MILLI)
 }
 
 /// Now, as the timestamp an invoice unit records in `LastModified`.
 ///
-/// Built from whole seconds and nanoseconds rather than through an `f64`, so
-/// [`instant_key`] orders two writes a few microseconds apart exactly.
+/// Built from whole seconds and MILLISECONDS rather than through an `f64`, so two writes
+/// a few milliseconds apart are ordered exactly by [`instant_key`] and a stamp this
+/// service hands out survives the round trip back through an `AsOf` — see
+/// [`instant_key`] for why a finer stamp would not.
 pub fn now() -> DateTime {
     let since_epoch = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
     DateTime::from_secs_and_nanos(
         i64::try_from(since_epoch.as_secs()).unwrap_or(i64::MAX),
-        since_epoch.subsec_nanos(),
+        since_epoch.subsec_millis() * 1_000_000,
     )
 }
 
