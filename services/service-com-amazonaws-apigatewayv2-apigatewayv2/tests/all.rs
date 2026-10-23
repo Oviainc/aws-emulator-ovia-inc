@@ -17,6 +17,8 @@ mod api_lifecycle;
 mod deployment_lifecycle;
 #[path = "all/integration_lifecycle.rs"]
 mod integration_lifecycle;
+#[path = "all/model_lifecycle.rs"]
+mod model_lifecycle;
 #[path = "all/route_request_parameter.rs"]
 mod route_request_parameter;
 #[path = "all/service_claim.rs"]

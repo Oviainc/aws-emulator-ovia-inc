@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateModel
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateModel`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateModel::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: validates the request's `Name` and `Schema`, mints a `ModelId` and
+//! persists a [`crate::state::Model`] record under its parent api. This is the ONLY
+//! file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +152,103 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateModel` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateModelErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateModel"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in the assembled emulator — see the note in `create_api`.
+            return Err(crate::scaffolded::Scaffolded::not_implemented("CreateModel"));
+        };
+        let mut store = state.lock();
+
+        let Some(api) = store.apis.get_mut(&input.api_id) else {
+            return Err(CreateModelErrorModeled::NotFoundException(NotFoundException {
+                message: Some(format!(
+                    "Invalid API identifier specified {}:{}",
+                    ::engine::emulator_account_id(),
+                    input.api_id
+                )),
+                resource_type: ::std::option::Option::None,
+            })
+            .into());
+        };
+
+        // "The name of the model. Must be alphanumeric" (`CreateModel$Name`).
+        if !crate::state::model_name_is_alphanumeric(&input.name) {
+            return Err(bad_request(&format!(
+                "Model name must be alphanumeric: {}",
+                input.name
+            )));
+        }
+
+        // A model's schema is a document in the model's content type, and this service
+        // reads the one content type whose schema language it knows: JSON Schema.
+        if let Err(message) =
+            crate::state::validate_model_schema(input.content_type.as_deref(), &input.schema)
+        {
+            return Err(bad_request(&message));
+        }
+
+        // A model is referred to by NAME from a route's `RequestModels`/`ResponseModels`
+        // and from a mapping template, so one api cannot carry two models of one name.
+        if api.models.values().any(|model| model.name == input.name) {
+            return Err(CreateModelErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "Model with name {} already exists for this API.",
+                    input.name
+                )),
+            })
+            .into());
+        }
+
+        // Bound the growth a caller drives, the way CreateRoute and CreateIntegration
+        // bound theirs: `TooManyRequestsException` is the modelled error for "a limit
+        // has been exceeded" (it carries the limit's name in `LimitType`).
+        if api.models.len() >= crate::state::MAX_MODELS_PER_API {
+            return Err(CreateModelErrorModeled::TooManyRequestsException(
+                TooManyRequestsException {
+                    limit_type: Some("Model".to_string()),
+                    message: Some(format!(
+                        "The maximum number of models ({}) for this API has been reached.",
+                        crate::state::MAX_MODELS_PER_API
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let model_id = api.mint_model_id();
+        let record = crate::state::Model {
+            model_id: model_id.clone(),
+            name: input.name,
+            content_type: input.content_type,
+            description: input.description,
+            // The schema SOURCE, verbatim: every reader of the model reports the
+            // document the caller supplied, not a reserialization of it.
+            schema: input.schema,
+        };
+
+        // Persist, then read the response back out of the STORE, so what the caller
+        // gets is what a later GetModel will report rather than an echo of the request.
+        // `insert` is what this does: the record the api holds under this id is the one
+        // just minted, whatever was there before.
+        api.models.insert(model_id.clone(), record);
+        let stored = api.models[&model_id].to_wire();
+        Ok(CreateModelOutput {
+            content_type: stored.content_type,
+            description: stored.description,
+            model_id: stored.model_id,
+            name: Some(stored.name),
+            schema: stored.schema,
+        })
     }
+}
+
+/// This operation's refusal of a request it models no more specific error for: the
+/// modelled `BadRequestException` ("The request is not valid, for example, the input is
+/// incomplete or incorrect"), whose message names the member and the constraint. Takes
+/// the same `&str` the sibling helper in `create_integration` does.
+fn bad_request(message: &str) -> CreateModelError {
+    CreateModelErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message.to_string()),
+    })
+    .into()
 }
