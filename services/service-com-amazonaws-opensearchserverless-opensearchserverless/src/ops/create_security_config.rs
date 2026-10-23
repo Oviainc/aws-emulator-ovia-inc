@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateSecurityConfig
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateSecurityConfig`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateSecurityConfig::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: stores a `SecurityConfigRecord` in [`crate::state`] under the
+//! `<type>/<account-id>/<name>` id this API addresses a configuration by, applying the
+//! documented defaults of the identity-provider options, and answers that stored record —
+//! refusing a name already taken under the type, a type whose own options are missing, and
+//! a create past the type's quota.
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +158,209 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateSecurityConfig` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateSecurityConfigErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateSecurityConfig"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateSecurityConfigErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(crate::state::STORE_UNREACHABLE.to_string()),
+                },
+            )
+            .into());
+        };
+
+        // A 400 `ValidationException` for anything the model constrains but the boundary
+        // validator does not narrow — an enum's value list, and which options member the
+        // requested type requires.
+        let refuse = |message: String| -> CreateSecurityConfigError {
+            CreateSecurityConfigErrorModeled::ValidationException(ValidationException {
+                message: Some(message),
+            })
+            .into()
+        };
+
+        // `SecurityConfigType` is an enum the boundary validator does not narrow, so the
+        // handler refuses a value outside the model's own value list.
+        if !SECURITY_CONFIG_TYPE_VALUES.contains(&input.r#type.as_str()) {
+            return Err(refuse(format!(
+                "type must be one of [{}], got {:?}",
+                SECURITY_CONFIG_TYPE_VALUES.join(", "),
+                input.r#type
+            )));
+        }
+
+        // Each options member is documented as "required if you specify <type> for the type
+        // parameter", so a configuration carries exactly the options of its own type: the
+        // one the type names is required, and the options of another type describe an
+        // identity provider this configuration does not have.
+        let options_for_type: [(&str, &str, bool); 3] = [
+            ("saml", "samlOptions", input.saml_options.is_some()),
+            (
+                "iamidentitycenter",
+                "iamIdentityCenterOptions",
+                input.iam_identity_center_options.is_some(),
+            ),
+            (
+                "iamfederation",
+                "iamFederationOptions",
+                input.iam_federation_options.is_some(),
+            ),
+        ];
+        for (kind, member, present) in options_for_type {
+            if kind == input.r#type && !present {
+                return Err(refuse(format!(
+                    "{member} is required when type is {kind}"
+                )));
+            }
+            if kind != input.r#type && present {
+                return Err(refuse(format!(
+                    "{member} may only be given when type is {kind}, got type {:?}",
+                    input.r#type
+                )));
+            }
+        }
+
+        // `IamIdentityCenterUserAttribute` and `IamIdentityCenterGroupAttribute` are enums
+        // the boundary validator does not narrow either.
+        if let Some(options) = input.iam_identity_center_options.as_ref() {
+            for (member, value, allowed) in [
+                (
+                    "userAttribute",
+                    options.user_attribute.as_deref(),
+                    IAM_IDENTITY_CENTER_USER_ATTRIBUTE_VALUES,
+                ),
+                (
+                    "groupAttribute",
+                    options.group_attribute.as_deref(),
+                    IAM_IDENTITY_CENTER_GROUP_ATTRIBUTE_VALUES,
+                ),
+            ] {
+                if let Some(value) = value {
+                    if !allowed.contains(&value) {
+                        return Err(refuse(format!(
+                            "iamIdentityCenterOptions.{member} must be one of [{}], got {value:?}",
+                            allowed.join(", ")
+                        )));
+                    }
+                }
+            }
+        }
+
+        let mut store = state.lock();
+
+        // A replayed `clientToken` is a retry of the call that created the configuration,
+        // so it answers that configuration instead of creating or conflicting with a
+        // second one.
+        if let Some(token) = input.client_token.as_deref() {
+            if let Some(record) = store.replayed_security_config(Self::NAME, token) {
+                return Ok(CreateSecurityConfigOutput {
+                    security_config_detail: Some(record.detail()),
+                });
+            }
+        }
+
+        let id = crate::state::security_config_id(&input.r#type, &input.name);
+        if store.security_configs.contains_key(&id) {
+            return Err(CreateSecurityConfigErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(format!(
+                        "Security config with name {} and type {} already exists",
+                        input.name, input.r#type
+                    )),
+                },
+            )
+            .into());
+        }
+
+        if store.security_config_count(&input.r#type)
+            >= crate::state::MAX_SECURITY_CONFIGS_PER_TYPE
+        {
+            return Err(
+                CreateSecurityConfigErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        // The message the real service builds for this refusal, from the
+                        // requested type and the quota that bounds it.
+                        message: format!(
+                            "Your request exceeds the limit for {} policies in this AWS \
+                             account. The limit is {}.",
+                            input.r#type,
+                            crate::state::MAX_SECURITY_CONFIGS_PER_TYPE
+                        ),
+                        resource_id: Some(input.name.clone()),
+                        resource_type: Some("security-config".to_string()),
+                        service_code: crate::state::ARN_NAMESPACE.to_string(),
+                        quota_code: None,
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The documented defaults are applied ONCE, here, so every later read reports the
+        // session timeout and the attributes the configuration really has rather than
+        // recomputing them.
+        let saml_options = input.saml_options.map(|options| SamlConfigOptions {
+            session_timeout: Some(
+                options
+                    .session_timeout
+                    .unwrap_or(crate::state::DEFAULT_SAML_SESSION_TIMEOUT),
+            ),
+            ..options
+        });
+        let iam_identity_center_options =
+            input
+                .iam_identity_center_options
+                .map(|options| IamIdentityCenterConfigOptions {
+                    instance_arn: Some(options.instance_arn),
+                    // `applicationArn`, `applicationName` and `applicationDescription`
+                    // describe the IAM Identity Center application the real service
+                    // creates for the configuration. This emulator stands none up, so it
+                    // reports none: a value here would name an application that does not
+                    // exist.
+                    application_arn: None,
+                    application_name: None,
+                    application_description: None,
+                    user_attribute: Some(options.user_attribute.unwrap_or_else(|| {
+                        crate::state::DEFAULT_IDENTITY_CENTER_USER_ATTRIBUTE.to_string()
+                    })),
+                    group_attribute: Some(options.group_attribute.unwrap_or_else(|| {
+                        crate::state::DEFAULT_IDENTITY_CENTER_GROUP_ATTRIBUTE.to_string()
+                    })),
+                });
+
+        let created_date = crate::state::now_epoch_millis();
+        let config_version = store.next_policy_version(created_date);
+        let record = crate::state::SecurityConfigRecord {
+            id: id.clone(),
+            name: input.name.clone(),
+            kind: input.r#type.clone(),
+            config_version,
+            description: input.description,
+            saml_options,
+            iam_identity_center_options,
+            iam_federation_options: input.iam_federation_options,
+            created_date,
+            // A just-created configuration has only ever been written once, so it was last
+            // modified when it was created.
+            last_modified_date: created_date,
+        };
+        store.security_configs.insert(id.clone(), record);
+        if let Some(token) = input.client_token.as_deref() {
+            store.remember_token(Self::NAME, token, &id);
+        }
+
+        // Answered from the STORED record, so the create cannot report anything a later
+        // `GetSecurityConfig` or `ListSecurityConfigs` would not.
+        let stored = store.security_configs.get(&id).ok_or_else(|| {
+            CreateSecurityConfigError::from(
+                CreateSecurityConfigErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(crate::state::STORE_UNREACHABLE.to_string()),
+                    },
+                ),
+            )
+        })?;
+        Ok(CreateSecurityConfigOutput {
+            security_config_detail: Some(stored.detail()),
+        })
     }
 }
