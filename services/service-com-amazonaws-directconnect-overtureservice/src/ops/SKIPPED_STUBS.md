@@ -19,5 +19,10 @@ union can be declared as `{Op}Output`. A `@required` union member and a
 handler returns an error, so it never has to construct a value.
 
 // SKIPPED: DescribeCustomerMetadata — unsupported shape construct: operation 'DescribeCustomerMetadata' has a Unit/absent input, which the generator does not emit yet
-// SKIPPED: DescribeLocations — unsupported shape construct: operation 'DescribeLocations' has a Unit/absent input, which the generator does not emit yet
 // SKIPPED: DescribeVirtualGateways — unsupported shape construct: operation 'DescribeVirtualGateways' has a Unit/absent input, which the generator does not emit yet
+
+`DescribeLocations` was declined for the same reason and has since been
+hand-authored in `src/ops/describe_locations.rs` (with its shapes in
+`src/ops/types/describe_locations_types.rs`), which puts it in the service's
+`operations(...)` allow-list — `build.rs` derives that list from each ops file's
+`//! @op <Name>` header.

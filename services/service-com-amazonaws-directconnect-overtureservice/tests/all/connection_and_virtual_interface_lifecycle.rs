@@ -33,6 +33,7 @@ const SETTLE: Duration = Duration::from_millis(900);
 pub(crate) struct Emulator {
     router: MultiServiceRouter,
     region: String,
+    engine: Arc<engine::InMemoryEngine>,
 }
 
 impl Emulator {
@@ -45,12 +46,22 @@ impl Emulator {
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
         router.register_service(
-            service_com_amazonaws_directconnect_overtureservice::EmulatedService::new(engine),
+            service_com_amazonaws_directconnect_overtureservice::EmulatedService::new(
+                Arc::clone(&engine),
+            ),
         );
         Self {
             router,
             region: region.to_string(),
+            engine,
         }
+    }
+
+    /// The shared engine this emulator's handlers read and write — the one a
+    /// sibling suite needs to set up state no operation creates (the Direct
+    /// Connect location catalog, which is seeded with the store).
+    pub(crate) fn engine(&self) -> &Arc<engine::InMemoryEngine> {
+        &self.engine
     }
 
     /// `POST /` with the operation's `X-Amz-Target`, returning the status and the

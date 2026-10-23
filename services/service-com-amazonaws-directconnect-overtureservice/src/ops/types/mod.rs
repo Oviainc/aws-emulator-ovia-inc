@@ -62,6 +62,7 @@ pub mod describe_interconnect_loa_types;
 pub mod describe_interconnects_types;
 pub mod describe_lags_types;
 pub mod describe_loa_types;
+pub mod describe_locations_types;
 pub mod describe_router_configuration_types;
 pub mod describe_tags_types;
 pub mod describe_virtual_interfaces_types;
@@ -182,6 +183,8 @@ pub use describe_interconnects_types::*;
 pub use describe_lags_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use describe_loa_types::*;
+#[allow(ambiguous_glob_reexports, unused_imports)]
+pub use describe_locations_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use describe_router_configuration_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
