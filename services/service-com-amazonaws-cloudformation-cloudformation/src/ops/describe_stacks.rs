@@ -6,7 +6,9 @@
 //! every live stack in creation order. A name no live stack carries is refused with
 //! `ValidationError`. A stack whose template declares outputs carries one `Output` per
 //! declared output whose `Condition` holds, each with its `OutputValue` as
-//! `CreateStack`/`UpdateStack` evaluated it when the template was deployed.
+//! `CreateStack`/`UpdateStack` evaluated it when the template was deployed; a stack whose
+//! create FAILED (a resource the owning service refused) carries none, since nothing
+//! finished deploying.
 //!
 //! ## Shape of an operation
 //!
@@ -96,6 +98,10 @@ use crate::state::StoredStack;
 ///
 /// * `ParentId`, `RootId` — nested stacks are not implemented, so no stack here has any.
 /// * `DetailedStatus` — nothing in this slice produces one.
+///
+/// `Outputs` is the stack's evaluated outputs: one entry per output the template declares,
+/// as of the create or update that COMPLETED (see `crate::state::StoredStack`) — so a
+/// stack whose create failed reports none.
 ///
 /// `DriftInformation` is the result of the last drift detection that COMPLETED against the
 /// stack, with the instant the most recent detection was initiated on it: `NOT_CHECKED`

@@ -67,10 +67,12 @@ use crate::state::{DeployedResource, StoredStack};
 /// One deployed resource as the modelled `StackResourceDetail` shape.
 ///
 /// Every member is read back from what the stack operation that deployed it persisted:
-/// the logical id and type the template declared, the physical id CloudFormation's
-/// documented naming rules gave it, the `Metadata` resource attribute the declaration
-/// carried, and the resource-level status that operation left the resource in with the
-/// instant it reached that status (`LastUpdatedTimestamp`: "Time the status was
+/// the logical id and type the template declared, the physical id the resource carries —
+/// the one the service that owns it minted, or the one CloudFormation's documented naming
+/// rules gave it, read through the same `crate::state::physical_resource_id` the sibling
+/// reader uses so the two cannot report it differently — the `Metadata` resource attribute
+/// the declaration carried, and the resource-level status that operation left the resource
+/// in with the instant it reached that status (`LastUpdatedTimestamp`: "Time the status was
 /// updated").
 ///
 /// `StackResourceDetail` is `StackResource` plus `Metadata` — the same resource, read
@@ -84,7 +86,7 @@ fn stack_resource_detail(stack: &StoredStack, deployed: &DeployedResource) -> St
         stack_name: Some(stack.stack_name.clone()),
         stack_id: Some(stack.stack_id.clone()),
         logical_resource_id: deployed.resource.logical_id.clone(),
-        physical_resource_id: Some(deployed.resource.physical_resource_id.clone()),
+        physical_resource_id: crate::state::physical_resource_id(&deployed.resource),
         resource_type: deployed.resource.resource_type.clone(),
         last_updated_timestamp: crate::state::timestamp(deployed.status_timestamp),
         resource_status: deployed.status.clone(),

@@ -102,7 +102,9 @@ const NO_SELECTOR: &str = "Either StackName or PhysicalResourceId must be specif
 /// The members this emulator has nothing to report for are absent rather than invented:
 ///
 /// * `ResourceStatusReason` — "Success/failure message associated with the resource":
-///   no deployment here fails part-way, so no resource carries one.
+///   the reason a resource was not created is reported on the STACK (its
+///   `StackStatusReason` and its events), which is where this service records what the
+///   owning service refused.
 /// * `Description` — "User defined description associated with the resource": a resource
 ///   description is not one of the resource attributes CloudFormation names (the model's
 ///   `ResourceAttribute` enum lists `CreationPolicy`, `DeletionPolicy`, `Metadata`,
@@ -119,7 +121,7 @@ fn stack_resource_view(stack: &StoredStack, deployed: &DeployedResource) -> Stac
         stack_name: Some(stack.stack_name.clone()),
         stack_id: Some(stack.stack_id.clone()),
         logical_resource_id: deployed.resource.logical_id.clone(),
-        physical_resource_id: Some(deployed.resource.physical_resource_id.clone()),
+        physical_resource_id: crate::state::physical_resource_id(&deployed.resource),
         resource_type: deployed.resource.resource_type.clone(),
         timestamp: crate::state::timestamp(deployed.status_timestamp),
         resource_status: deployed.status.clone(),
