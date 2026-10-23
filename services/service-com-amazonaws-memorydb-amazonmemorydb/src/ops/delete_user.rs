@@ -6,8 +6,8 @@
 //! `UserNames` of every ACL that listed it, and the response reports that user as the
 //! caller last had it, in the terminal `deleting` status. The deletion is recorded as a
 //! `user` event, and the membership change it makes to each ACL that listed the user as
-//! an `acl` event, which `DescribeEvents` reports. This is the ONLY file to touch for
-//! this operation.
+//! an `acl` event naming that user and that ACL, which `DescribeEvents` reports. This is
+//! the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -229,7 +229,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The resources this call changed, each with its own event, recorded in the
         // order the change reached them: the user is gone, and every ACL it was taken
         // out of holds a different `UserNames` than before — membership is stored on
-        // the ACL, so that is a change to the ACL's own state.
+        // the ACL, so that is a change to the ACL's own state, recorded like any other
+        // membership change: one event per member removed, naming the user and the ACL.
         state.record_event(
             crate::state::event_source_type::USER,
             &user_name,
@@ -239,7 +240,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             state.record_event(
                 crate::state::event_source_type::ACL,
                 acl_name,
-                crate::state::EventKind::Modified,
+                crate::state::EventKind::UserRemoved {
+                    user_name: &user_name,
+                },
             );
         }
         Ok(DeleteUserOutput {

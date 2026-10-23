@@ -2,8 +2,11 @@
 
 //! @op DescribeEvents
 //! IMPLEMENTED: reports the events [`crate::state`] RECORDED — one per resource a call
-//! created, modified or deleted ([`crate::state::ComAmazonawsMemorydbAmazonmemorydbState::record_event`]) —
-//! narrowed to the requested `SourceName`/`SourceType` and to the time window the
+//! created, modified or deleted, and one per ACL member a membership change added or
+//! removed ([`crate::state::ComAmazonawsMemorydbAmazonmemorydbState::record_event`]) —
+//! narrowed to the requested `SourceName`/`SourceType` — each matched EXACTLY against
+//! what the event recorded, so a `SourceName` spelled differently from the recorded
+//! identifier selects nothing — and to the time window the
 //! request bounds (the last hour by default, `Duration` minutes back, or an explicit
 //! `StartTime`/`EndTime`), NEWEST FIRST, paged with `MaxResults`/`NextToken`.
 //!
@@ -251,9 +254,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let region = crate::state::request_region(ctx);
-        // A resource name is a case-insensitive identifier and the log holds the folded
-        // spelling, so the name this request filters by is folded the same way.
-        let source_name = input.source_name.as_deref().map(crate::state::fold_name);
+        // `SourceName` filters the LOG by the identifier each event recorded, and it is
+        // matched EXACTLY — this is not a resource lookup, which folds the name it was
+        // given (`crate::state::fold_name`) because a MemoryDB resource name is a
+        // case-insensitive identifier. `Event$SourceName` is "The identifier for the
+        // source of the event" as the log holds it (the folded name the create stored),
+        // so a spelling that differs from the recorded one — in letter case or
+        // otherwise — names no recorded event and selects nothing, rather than being
+        // folded into a match.
+        let source_name = input.source_name.as_deref();
         let mut state = state.lock();
         // The one write a read may make, which this caller did not ask for: the
         // transition the clock already owed at this instant, exactly as every other
@@ -273,7 +282,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .rev()
             .filter(|event| event.date >= start && event.date <= end)
             .filter(|event| {
-                source_name.as_deref().is_none_or(|name| event.source_name == name)
+                source_name.is_none_or(|name| event.source_name == name)
             })
             .filter(|event| {
                 input

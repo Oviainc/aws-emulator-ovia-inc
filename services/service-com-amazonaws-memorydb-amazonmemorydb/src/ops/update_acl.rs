@@ -7,8 +7,9 @@
 //! requires, which is DERIVED and so follows every change made here, and the
 //! `PendingChanges` the accepted change is still applying, which the clock clears when
 //! the ACL settles back to `active`. The ACLs an account already had are refused: a
-//! built-in ACL is not the caller's to change. The change is also recorded as an `acl`
-//! event, which `DescribeEvents` reports.
+//! built-in ACL is not the caller's to change. The change is also recorded as `acl`
+//! events — ONE PER MEMBER added or removed, each naming the user and the ACL — which
+//! `DescribeEvents` reports.
 //!
 //! ## Shape of an operation
 //!
@@ -347,12 +348,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let response = acl.to_api(clusters, minimum_engine_version);
         // The change this call made, recorded against the resource whose stored state
         // moved: an ACL's membership is held ONCE, on the ACL (`User$ACLNames` is
-        // DERIVED from it), so a membership change is a change to the ACL.
-        state.record_event(
-            crate::state::event_source_type::ACL,
-            &acl_name,
-            crate::state::EventKind::Modified,
-        );
+        // DERIVED from it), so a membership change is a change to the ACL. ONE EVENT
+        // PER MEMBER changed, each naming the user and the ACL the request named for
+        // it, so a client reconstructing membership history from the log can see WHICH
+        // member moved — information no other call reports after the fact. Recorded in
+        // a fixed order (the additions, then the removals, each in the stored name
+        // order of the folded set) so one call's events are always logged the same way.
+        for user_name in &to_add {
+            state.record_event(
+                crate::state::event_source_type::ACL,
+                &acl_name,
+                crate::state::EventKind::UserAdded { user_name },
+            );
+        }
+        for user_name in &to_remove {
+            state.record_event(
+                crate::state::event_source_type::ACL,
+                &acl_name,
+                crate::state::EventKind::UserRemoved { user_name },
+            );
+        }
         Ok(UpdateACLOutput {
             acl: Some(response),
         })
