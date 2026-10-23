@@ -182,7 +182,13 @@ fn assert_expense_invariants(case: &str, body: &Value) {
                 expected_index,
             );
         }
-        for (group_position, group) in list_of(document, "LineItemGroups").iter().enumerate() {
+        let groups = list_of(document, "LineItemGroups");
+        assert!(
+            !groups.is_empty(),
+            "case {case:?}: an expense document must carry at least the first line item \
+             group, got {document}"
+        );
+        for (group_position, group) in groups.iter().enumerate() {
             assert_eq!(
                 group.get("LineItemGroupIndex").and_then(Value::as_u64),
                 Some(group_position as u64 + 1),
@@ -191,8 +197,17 @@ fn assert_expense_invariants(case: &str, body: &Value) {
             );
             let items = list_of(group, "LineItems");
             assert!(
-                !items.is_empty(),
-                "case {case:?}: a line item group must hold at least one line item, got {group}"
+                group.get("LineItems").is_some(),
+                "case {case:?}: a line item group must carry its LineItems list even when the \
+                 document holds no line items, got {group}"
+            );
+            // Only the always-present first group may be empty, and only when it is the
+            // one group there is: a group that came from a table on the page must hold
+            // the rows of that table.
+            assert!(
+                !items.is_empty() || groups.len() == 1,
+                "case {case:?}: group {group_position} came from a table, so it must hold at \
+                 least one line item, got {group}"
             );
             for (row, item) in items.iter().enumerate() {
                 let fields = list_of(item, "LineItemExpenseFields");
@@ -343,18 +358,19 @@ async fn analyze_expense_reports_a_summary_field_for_every_labelled_line() {
 async fn analyze_expense_reports_one_expense_document_per_page() {
     let router = harness();
 
-    // (case, text, expected (ExpenseIndex, summary field count, line item group count))
+    // (case, text, expected (ExpenseIndex, summary field count, line item group count)).
+    // A page with no table still carries the first line item group, with no line items.
     let cases: Vec<PageCase> = vec![
-        ("one page", "Total: 1.00", vec![(1, 1, 0)]),
+        ("one page", "Total: 1.00", vec![(1, 1, 1)]),
         (
             "two pages, a form feed apart",
             "Vendor: Acme\n\u{c}Vendor: Globex\nTotal: 9.00",
-            vec![(1, 1, 0), (2, 2, 0)],
+            vec![(1, 1, 1), (2, 2, 1)],
         ),
         (
             "three pages, the middle one a table",
             "Total: 1.00\n\u{c}Item\tQty\nWidget\t2\n\u{c}Thank you",
-            vec![(1, 1, 0), (2, 0, 1), (3, 0, 0)],
+            vec![(1, 1, 1), (2, 0, 1), (3, 0, 1)],
         ),
     ];
 
@@ -468,8 +484,9 @@ async fn analyze_expense_reports_a_line_item_for_every_table_row() {
         LineItemCase {
             name: "no table at all",
             text: "Total: 10.00",
-            expected: vec![],
-            expected_rows: vec![],
+            // The first line item group is always reported, with no line items in it.
+            expected: vec![vec![]],
+            expected_rows: vec![vec![]],
         },
     ];
 
@@ -500,6 +517,19 @@ async fn analyze_expense_reports_a_line_item_for_every_table_row() {
         );
         for (group_index, group) in groups.iter().enumerate() {
             let rows = list_of(group, "LineItems");
+            // The always-present first group is EMPTY only for a page that carries no
+            // table at all; a group that came from a table holds that table's rows.
+            // Asserted against the INPUT of every row of this table, so the rule is
+            // pinned over documents with none, one and several tables rather than over
+            // the one recorded shape.
+            let page_has_table = case.text.contains('\t');
+            assert_eq!(
+                rows.is_empty(),
+                !page_has_table,
+                "case {:?}: group {group_index} must be empty exactly when the page \
+                 carries no table (page_has_table={page_has_table}), got {rows:?}",
+                case.name
+            );
             assert_eq!(
                 rows.len(),
                 case.expected[group_index].len(),
@@ -645,7 +675,7 @@ async fn analyze_expense_blocks_are_the_same_text_detect_document_text_reports()
             blocks_of(&detected),
             "case {text:?}: an expense document's Blocks must be the blocks DetectDocumentText reports for that page"
         );
-        assert_block_graph(text, &expense, &joined);
+        assert_block_graph(text, &expense, &joined, Some(state::EXTRACTED_TEXT_CONFIDENCE));
     }
 }
 
@@ -653,22 +683,27 @@ async fn analyze_expense_blocks_are_the_same_text_detect_document_text_reports()
 async fn analyze_expense_refuses_a_document_it_cannot_read() {
     let router = harness();
 
-    // A PNG signature followed by bytes that are not text: a real raster, which this
-    // emulator runs no OCR engine for.
-    let png = [
+    // A PNG signature followed by bytes that are not a PNG body: a document in a format
+    // Textract accepts, which cannot be decoded.
+    let truncated_png = [
         0x89u8, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x01, 0x02, 0xFF,
     ];
     let too_many_bytes = vec![b'a'; state::MAX_INLINE_DOCUMENT_BYTES + 1];
 
     let cases: Vec<(&str, Value, &str)> = vec![
         (
-            "a raster this emulator cannot OCR",
-            json!({ "Bytes": aws_smithy_types::base64::encode(png) }),
-            "UnsupportedDocumentException",
+            "a truncated PNG, which is a supported format this service cannot decode",
+            json!({ "Bytes": aws_smithy_types::base64::encode(truncated_png) }),
+            "BadDocumentException",
         ),
         (
             "bytes that hold no text at all",
             json!({ "Bytes": aws_smithy_types::base64::encode(b"  \n\t\n") }),
+            "UnsupportedDocumentException",
+        ),
+        (
+            "bytes in no format this service reads",
+            json!({ "Bytes": aws_smithy_types::base64::encode([0x00u8, 0x01, 0x02, 0xFF]) }),
             "UnsupportedDocumentException",
         ),
         (

@@ -20,10 +20,20 @@
 //! * inline `Bytes` that decode as text — their real lines and words are extracted
 //!   verbatim (form feed, `U+000C`, is the page break), and FORMS/TABLES analysis reads
 //!   that same real text;
-//! * inline `Bytes` that are not text (a PNG, JPEG or TIFF raster) — no OCR engine runs
-//!   in this emulator, so there is no text to report: refused as
+//! * inline `Bytes` that are a raster in a format Textract accepts (PNG, JPEG or TIFF) —
+//!   the pixels are decoded and the text recognised off them by [`ocr`], which reports
+//!   the characters it measured and the confidence it measured them with, and reports
+//!   nothing for ink it could not match to a glyph. A page with no ink is a page with no
+//!   words, answered as such rather than refused;
+//! * inline `Bytes` in one of those formats that the decoder cannot read (a truncated or
+//!   corrupt file) — refused as [`Unreadable::Corrupt`], which the handlers answer with
+//!   the modelled `BadDocumentException`;
+//! * inline `Bytes` in no format this service reads — refused as
 //!   [`Unreadable::UnsupportedFormat`], which the handlers answer with the modelled
-//!   `UnsupportedDocumentException`;
+//!   `UnsupportedDocumentException`. A PDF is answered there too, with a reason that says
+//!   so: Textract accepts PDF, but this emulator has no page rasteriser and parses no PDF
+//!   content stream, so it reads nothing out of one and says which part it cannot read
+//!   rather than claiming the bytes are not a document;
 //! * an S3 object — this emulator's Amazon S3 cannot serve object bytes yet, so Textract
 //!   genuinely cannot access it: refused as [`Unreadable::S3Unreadable`], which the
 //!   handlers answer with the modelled `InvalidS3ObjectException` (synchronously) or a
@@ -31,6 +41,8 @@
 //!
 //! Nothing here is derived from a digest, echoed from the request, or randomised: a
 //! block only ever describes text that was actually read out of the document.
+
+pub mod ocr;
 
 use std::collections::{BTreeSet, HashMap};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -141,12 +153,14 @@ pub const ADAPTER_RESOURCE_TYPE: &str = "adapters";
 /// would leave it holding more pairs than a `TagMap` can express is refused.
 pub const MAX_TAGS_PER_RESOURCE: usize = 200;
 
-/// The `Confidence` every block reports.
+/// The `Confidence` a block of a document whose text was read VERBATIM reports.
 ///
-/// This emulator READS a document's text rather than recognising it, so there is no
-/// recogniser confidence to measure. One documented constant says exactly that; a
-/// per-block spread would look like a measurement nothing made. Inside `Percent`'s
-/// `0..=100` range.
+/// A text document's characters are not recognised, they are read, so there is no
+/// recogniser confidence to measure for them and one documented constant says exactly
+/// that; a per-block spread would look like a measurement nothing made. A raster
+/// document reports instead the confidence its recogniser really measured (see
+/// [`ocr::Recognised`] and [`DocumentContent::confidence`]). Inside `Percent`'s `0..=100`
+/// range.
 pub const EXTRACTED_TEXT_CONFIDENCE: f32 = 99.0;
 
 /// Characters in a pagination token issued by [`encode_page_token`].
@@ -919,13 +933,26 @@ pub fn adapter_auto_update(value: Option<&str>) -> Result<String, String> {
 // Reading a document
 // ---------------------------------------------------------------------------
 
-/// A document's text, one entry per page.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// A document's text, one entry per page, and the confidence it was read with.
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct DocumentContent {
     pub pages: Vec<String>,
+    /// The `Confidence` every block derived from this text reports: the one documented
+    /// [`EXTRACTED_TEXT_CONFIDENCE`] for text read verbatim, and the mean score the
+    /// recogniser measured for a raster whose text it recognised.
+    pub confidence: f32,
 }
 
 impl DocumentContent {
+    /// Text read verbatim out of a document, so reported with the one documented
+    /// confidence.
+    pub fn read_verbatim(pages: Vec<String>) -> Self {
+        Self {
+            pages,
+            confidence: EXTRACTED_TEXT_CONFIDENCE,
+        }
+    }
+
     /// The page count `DocumentMetadata.Pages` reports.
     pub fn page_count(&self) -> i32 {
         i32::try_from(self.pages.len()).unwrap_or(i32::MAX)
@@ -945,6 +972,10 @@ pub enum Unreadable {
     /// The bytes are not a document this emulator can extract text from.
     /// Answered with `UnsupportedDocumentException`.
     UnsupportedFormat(String),
+    /// The bytes ARE a format this emulator reads, but the document itself cannot be
+    /// decoded (truncated, or otherwise corrupt).
+    /// Answered with `BadDocumentException`.
+    Corrupt(String),
     /// The document is an S3 object whose bytes this emulator cannot obtain.
     /// Answered with `InvalidS3ObjectException`.
     S3Unreadable(String),
@@ -958,8 +989,46 @@ impl Unreadable {
     pub fn message(&self) -> &str {
         match self {
             Self::UnsupportedFormat(message)
+            | Self::Corrupt(message)
             | Self::S3Unreadable(message)
             | Self::TooLarge(message) => message,
+        }
+    }
+}
+
+/// Why a document's text could not be read, including the case where the read itself did
+/// not run to completion.
+#[derive(Debug)]
+pub enum ReadFailure {
+    /// The document: answer with the modelled error [`Unreadable`] names.
+    Unreadable(Unreadable),
+    /// The read did not complete — a panic or a cancellation on the blocking pool. This
+    /// says nothing about the document, so it is answered as the server fault it is.
+    DidNotComplete,
+}
+
+/// Read the text of the document `reference` names, OFF the async worker.
+///
+/// Reading a raster is bounded (see [`ocr`]) but CPU-bound: the decode, the binarisation
+/// and the recognition walk every pixel of a page the caller chose the size of. So the
+/// read runs on the BLOCKING pool, where it occupies no async worker that serves health
+/// checks and other requests, and the `spawn_blocking(..).await` is a real await point a
+/// timeout, a cancellation or a shutdown can land on.
+///
+/// This is how a request path reads a document; [`read_content`] itself is the
+/// synchronous core, for a caller that is already off the async worker.
+pub async fn read_document(
+    reference: DocumentRef,
+    inline: Option<Vec<u8>>,
+) -> Result<DocumentContent, ReadFailure> {
+    let read =
+        ::tokio::task::spawn_blocking(move || read_content(&reference, inline.as_deref())).await;
+    match read {
+        Ok(Ok(content)) => Ok(content),
+        Ok(Err(reason)) => Err(ReadFailure::Unreadable(reason)),
+        Err(error) => {
+            ::tracing::error!(error = %error, "reading the document did not complete");
+            Err(ReadFailure::DidNotComplete)
         }
     }
 }
@@ -967,8 +1036,10 @@ impl Unreadable {
 /// Read the text of the document `reference` names.
 ///
 /// The ONLY source of a document's text. It extracts what is really there or refuses;
-/// it never derives, guesses or fabricates content. See the module docs for the three
-/// cases.
+/// it never derives, guesses or fabricates content. See the module docs for the cases.
+///
+/// CPU-bound for a raster: a request path reaches it through [`read_document`], which
+/// runs it on the blocking pool.
 pub fn read_content(
     reference: &DocumentRef,
     inline: Option<&[u8]>,
@@ -988,24 +1059,55 @@ pub fn read_content(
             bytes.len()
         )));
     }
-    let Some(text) = decode_text(bytes) else {
+    // The format comes from the bytes' own magic numbers, so a raster is recognised as
+    // one before the text heuristic ever sees it. A page the recogniser finds no text on
+    // is a page with no words, not a document in an unsupported format.
+    if let Some(format) = ocr::raster_format(bytes) {
+        let page = ocr::read_raster(bytes, format)?;
+        return Ok(DocumentContent {
+            pages: bounded(vec![page.text])?,
+            confidence: page.confidence,
+        });
+    }
+    // A PDF is a document format Textract itself accepts, and this emulator reads none:
+    // rendering a PDF page needs a page rasteriser it does not have, and the text a PDF
+    // carries sits in content streams nothing here parses. So the refusal names PDF as
+    // the part that is unsupported, rather than implying the bytes are not a document at
+    // all — and it is decided on the PDF header, BEFORE the text heuristic, so a PDF
+    // whose bytes happen to be printable is not read as if it were a text document.
+    if bytes.starts_with(PDF_MAGIC) {
         return Err(Unreadable::UnsupportedFormat(
-            "the document's bytes are not text, and this emulator runs no OCR engine, so no \
-             text can be detected in it"
+            "the document is a PDF: this emulator reads PNG, JPEG and TIFF documents and \
+             does not render or extract text from PDF pages"
                 .to_string(),
         ));
-    };
-    // `U+000C` FORM FEED is the page break in a text document.
-    let pages: Vec<String> = text
-        .split('\u{c}')
-        .filter(|page| !page.trim().is_empty())
-        .map(ToString::to_string)
-        .collect();
-    if pages.is_empty() {
-        return Err(Unreadable::UnsupportedFormat(
-            "the document holds no text".to_string(),
-        ));
     }
+    if let Some(text) = decode_text(bytes) {
+        // `U+000C` FORM FEED is the page break in a text document.
+        let pages: Vec<String> = text
+            .split('\u{c}')
+            .filter(|page| !page.trim().is_empty())
+            .map(ToString::to_string)
+            .collect();
+        if pages.is_empty() {
+            return Err(Unreadable::UnsupportedFormat(
+                "the document holds no text".to_string(),
+            ));
+        }
+        return Ok(DocumentContent::read_verbatim(bounded(pages)?));
+    }
+    Err(Unreadable::UnsupportedFormat(
+        "the document's bytes are not text and not a PNG, JPEG or TIFF raster, so this \
+         emulator cannot read a document out of them"
+            .to_string(),
+    ))
+}
+
+/// The bytes every PDF document starts with ("%PDF-", per the PDF file header).
+const PDF_MAGIC: &[u8] = b"%PDF-";
+
+/// `pages` unchanged, or the reason they are over a documented or emulator-side limit.
+fn bounded(pages: Vec<String>) -> Result<Vec<String>, Unreadable> {
     if pages.len() > MAX_DOCUMENT_PAGES {
         return Err(Unreadable::TooLarge(format!(
             "the document has {} pages; the maximum is {MAX_DOCUMENT_PAGES}",
@@ -1019,7 +1121,7 @@ pub fn read_content(
              most {MAX_BLOCKS_PER_DOCUMENT} blocks for one document"
         )));
     }
-    Ok(DocumentContent { pages })
+    Ok(pages)
 }
 
 /// An upper bound on the number of `Block` values these pages expand into, over EVERY
@@ -1085,6 +1187,15 @@ struct LineLayout {
     index: usize,
     text: String,
     words: Vec<WordLayout>,
+    /// The `Confidence` every block derived from this line reports.
+    ///
+    /// ONE value per document, not a per-line measurement: for a raster it is the mean
+    /// score the recogniser matched the whole page's characters with (see
+    /// [`ocr::Recognised::confidence`]), and for text read verbatim it is the one
+    /// documented [`EXTRACTED_TEXT_CONFIDENCE`]. It is carried on the line so every block
+    /// derived from the line reports the document's own measured value rather than a
+    /// per-block spread nothing measured.
+    confidence: f32,
     /// Word counts per tab-separated cell, when the line is a table row.
     cells: Vec<usize>,
     /// Character column of the `:` that separates a label from its value.
@@ -1210,7 +1321,12 @@ fn words_of(line: &str) -> Vec<(usize, String)> {
 }
 
 /// Lay out one page's lines, numbering their words so every read path agrees on ids.
-fn layout_page(key: &str, page_index: usize, page_text: &str) -> Vec<LineLayout> {
+fn layout_page(
+    key: &str,
+    page_index: usize,
+    page_text: &str,
+    confidence: f32,
+) -> Vec<LineLayout> {
     page_text
         .lines()
         .map(str::trim_end)
@@ -1250,6 +1366,7 @@ fn layout_page(key: &str, page_index: usize, page_text: &str) -> Vec<LineLayout>
                 index,
                 text: line.to_string(),
                 words,
+                confidence,
                 cells,
                 colon,
             }
@@ -1271,13 +1388,13 @@ pub fn blocks(key: &str, content: &DocumentContent, features: FeatureSet) -> Vec
     let mut out: Vec<Block> = Vec::new();
     for (page_index, page_text) in content.pages.iter().enumerate() {
         let page_number = i32::try_from(page_index + 1).unwrap_or(i32::MAX);
-        let lines = layout_page(key, page_index, page_text);
+        let lines = layout_page(key, page_index, page_text, content.confidence);
 
         let mut text_blocks: Vec<Block> = Vec::new();
         for line in &lines {
             let mut line_block = new_block("LINE", line.id.clone(), page_number);
             line_block.text = Some(line.text.trim().to_string());
-            line_block.confidence = Some(EXTRACTED_TEXT_CONFIDENCE);
+            line_block.confidence = Some(line.confidence);
             line_block.geometry = Some(geometry(bounding_box(
                 line.index,
                 line.words.first().map_or(0, |w| w.column),
@@ -1293,13 +1410,22 @@ pub fn blocks(key: &str, content: &DocumentContent, features: FeatureSet) -> Vec
             for word in &line.words {
                 let mut word_block = new_block("WORD", word.id.clone(), page_number);
                 word_block.text = Some(word.text.clone());
-                word_block.confidence = Some(EXTRACTED_TEXT_CONFIDENCE);
+                word_block.confidence = Some(line.confidence);
                 word_block.text_type = Some("PRINTED".to_string());
-                word_block.geometry = Some(geometry(bounding_box(
+                let mut word_geometry = geometry(bounding_box(
                     line.index,
                     word.column,
                     word.text.chars().count(),
-                )));
+                ));
+                // `Geometry$RotationAngle` is "a numerical value corresponding to the
+                // rotation of the WORD block. Possible values are 0, 90, 180, and 270",
+                // so it is reported for WORD blocks only. Every word this service reads
+                // is read along the page's own axes — a line is a run of inked ROWS and
+                // a word a run of inked COLUMNS within it — so the angle it was read at
+                // is 0. It never reports 90, 180 or 270, because it never reads a word
+                // at one of those angles.
+                word_geometry.rotation_angle = Some(0.0);
+                word_block.geometry = Some(word_geometry);
                 text_blocks.push(word_block);
             }
         }
@@ -1357,7 +1483,7 @@ fn form_blocks(
 
         let mut key_block = new_block("KEY_VALUE_SET", key_id.clone(), page_number);
         key_block.entity_types = Some(vec!["KEY".to_string()]);
-        key_block.confidence = Some(EXTRACTED_TEXT_CONFIDENCE);
+        key_block.confidence = Some(line.confidence);
         key_block.geometry = Some(geometry(union(&word_boxes(line, &key_words))));
         key_block.relationships = Some(vec![
             relationship("VALUE", vec![value_id.clone()]),
@@ -1366,7 +1492,7 @@ fn form_blocks(
 
         let mut value_block = new_block("KEY_VALUE_SET", value_id.clone(), page_number);
         value_block.entity_types = Some(vec!["VALUE".to_string()]);
-        value_block.confidence = Some(EXTRACTED_TEXT_CONFIDENCE);
+        value_block.confidence = Some(line.confidence);
         value_block.geometry = Some(geometry(union(&word_boxes(line, &value_words))));
         value_block.relationships = Some(vec![relationship(
             "CHILD",
@@ -1455,6 +1581,13 @@ fn table_blocks(
     let mut out = Vec::new();
     let mut ids = Vec::new();
     for (table_index, run) in table_runs(lines).into_iter().enumerate() {
+        // A run is a CONTIGUOUS set of tab-separated lines, so `table_runs` never yields
+        // an empty one. Binding the first row here makes that invariant explicit: a
+        // `TABLE` block is only ever emitted for a run that has rows, and it reports the
+        // `Confidence` of the rows it was read from rather than none at all.
+        let Some(first_row) = run.first() else {
+            continue;
+        };
         let table_id = block_id(key, "TABLE", &[page_index, table_index]);
         let mut cell_blocks = Vec::new();
         let mut cell_ids = Vec::new();
@@ -1467,7 +1600,7 @@ fn table_blocks(
                 cell.column_index = Some(i32::try_from(column + 1).unwrap_or(i32::MAX));
                 cell.row_span = Some(1);
                 cell.column_span = Some(1);
-                cell.confidence = Some(EXTRACTED_TEXT_CONFIDENCE);
+                cell.confidence = Some(line.confidence);
                 let boxes = word_boxes(line, &cell_words);
                 cell.geometry = Some(geometry(if boxes.is_empty() {
                     bounding_box(line.index, column, 1)
@@ -1489,7 +1622,7 @@ fn table_blocks(
             .map(|line| bounding_box(line.index, 0, line.text.chars().count()))
             .collect();
         let mut table = new_block("TABLE", table_id.clone(), page_number);
-        table.confidence = Some(EXTRACTED_TEXT_CONFIDENCE);
+        table.confidence = Some(first_row.confidence);
         table.geometry = Some(geometry(union(&row_boxes)));
         table.relationships = Some(vec![relationship("CHILD", cell_ids)]);
 
@@ -1690,12 +1823,13 @@ pub fn detect_currency(text: &str) -> Option<&'static str> {
         .map(|(_, code)| *code)
 }
 
-/// An `ExpenseDetection` for text that was really read at `bbox`.
-fn detection(text: &str, bbox: BoundingBox) -> ExpenseDetection {
+/// An `ExpenseDetection` for text that was really read at `bbox`, with the confidence
+/// it was read with.
+fn detection(text: &str, bbox: BoundingBox, confidence: f32) -> ExpenseDetection {
     ExpenseDetection {
         text: Some(text.to_string()),
         geometry: Some(geometry(bbox)),
-        confidence: Some(EXTRACTED_TEXT_CONFIDENCE),
+        confidence: Some(confidence),
     }
 }
 
@@ -1705,6 +1839,7 @@ fn expense_field(
     label: Option<ExpenseDetection>,
     value: ExpenseDetection,
     page_number: i32,
+    confidence: f32,
 ) -> ExpenseField {
     let currency = value
         .text
@@ -1712,12 +1847,12 @@ fn expense_field(
         .and_then(detect_currency)
         .map(|code| ExpenseCurrency {
             code: Some(code.to_string()),
-            confidence: Some(EXTRACTED_TEXT_CONFIDENCE),
+            confidence: Some(confidence),
         });
     ExpenseField {
         r#type: Some(ExpenseType {
             text: Some(kind.to_string()),
-            confidence: Some(EXTRACTED_TEXT_CONFIDENCE),
+            confidence: Some(confidence),
         }),
         label_detection: label,
         value_detection: Some(value),
@@ -1763,9 +1898,14 @@ fn summary_fields(lines: &[LineLayout], page_number: i32) -> Vec<ExpenseField> {
         let value = char_span(&line.text, colon + 1, chars).trim().to_string();
         out.push(expense_field(
             summary_field_type(&label),
-            Some(detection(&label, words_box(line, &label_words))),
-            detection(&value, words_box(line, &value_words)),
+            Some(detection(
+                &label,
+                words_box(line, &label_words),
+                line.confidence,
+            )),
+            detection(&value, words_box(line, &value_words), line.confidence),
             page_number,
+            line.confidence,
         ));
     }
     out
@@ -1793,8 +1933,9 @@ fn line_item(line: &LineLayout, header: Option<&LineLayout>, page_number: i32) -
     let mut fields = vec![expense_field(
         EXPENSE_ROW_FIELD_TYPE,
         None,
-        detection(&row_text, words_box(line, &row_words)),
+        detection(&row_text, words_box(line, &row_words), line.confidence),
         page_number,
+        line.confidence,
     )];
     let header_texts = header.map(cell_texts).unwrap_or_default();
     for (column, text) in texts.iter().enumerate() {
@@ -1811,14 +1952,20 @@ fn line_item(line: &LineLayout, header: Option<&LineLayout>, page_number: i32) -
             (Some(header), Some(header_text)) => Some(detection(
                 header_text,
                 words_box(header, &cell_words(header, column)),
+                header.confidence,
             )),
             _ => None,
         };
         fields.push(expense_field(
             kind,
             label,
-            detection(text, words_box(line, &cell_words(line, column))),
+            detection(
+                text,
+                words_box(line, &cell_words(line, column)),
+                line.confidence,
+            ),
             page_number,
+            line.confidence,
         ));
     }
     LineItemFields {
@@ -1828,8 +1975,18 @@ fn line_item(line: &LineLayout, header: Option<&LineLayout>, page_number: i32) -
 
 /// The line-item groups of one page: one group per table, as [`table_runs`] finds them,
 /// indexed from 1 in page order.
+///
+/// Always at least one group: an `ExpenseDocument` AWS returns carries a
+/// `LineItemGroups` entry with `LineItemGroupIndex` 1 even for a document on which it
+/// detects no line items (its `LineItems` is then empty), so a caller can always read
+/// the first group.
+///
+/// That is what the recorded `AnalyzeExpense` response this service is measured against
+/// carries for a page with no line-item table: `LineItemGroups` is
+/// `[{LineItemGroupIndex: 1, LineItems: []}]` alongside an empty `SummaryFields` — the
+/// group is present and empty, not absent.
 fn line_item_groups(lines: &[LineLayout], page_number: i32) -> Vec<LineItemGroup> {
-    table_runs(lines)
+    let mut groups: Vec<LineItemGroup> = table_runs(lines)
         .into_iter()
         .enumerate()
         .map(|(table_index, run)| {
@@ -1853,7 +2010,14 @@ fn line_item_groups(lines: &[LineLayout], page_number: i32) -> Vec<LineItemGroup
                 line_items: Some(line_items),
             }
         })
-        .collect()
+        .collect();
+    if groups.is_empty() {
+        groups.push(LineItemGroup {
+            line_item_group_index: Some(1),
+            line_items: Some(Vec::new()),
+        });
+    }
+    groups
 }
 
 /// Every `ExpenseDocument` for a document's stored text.
@@ -1883,7 +2047,7 @@ pub fn expense_documents(key: &str, content: &DocumentContent) -> Vec<ExpenseDoc
         .enumerate()
         .map(|(page_index, page_text)| {
             let page_number = i32::try_from(page_index + 1).unwrap_or(i32::MAX);
-            let lines = layout_page(key, page_index, page_text);
+            let lines = layout_page(key, page_index, page_text, content.confidence);
             ExpenseDocument {
                 expense_index: Some(page_number),
                 summary_fields: Some(summary_fields(&lines, page_number)),

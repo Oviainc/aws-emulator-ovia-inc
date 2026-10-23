@@ -177,7 +177,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
     async fn handle(
         &self,
-        input: Self::Input,
+        mut input: Self::Input,
         _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let Some(state) = crate::state::service_state(&*self.engine) else {
@@ -204,15 +204,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // A document is read once and stored, so this answer and every other read path's
-        // answer for the same document describe the same text.
+        // answer for the same document describe the same text. The read happens OUTSIDE
+        // the state lock, and on the blocking pool: reading a raster is bounded but
+        // CPU-bound, so it occupies no async worker.
         let key = reference.identity_key();
         let stored = state.lock().stored_content(&key);
         let content = match stored {
             Some(content) => content,
-            None => match crate::state::read_content(&reference, input.document.bytes.as_deref()) {
-                Ok(content) => state.lock().register_document(reference, content),
-                Err(reason) => return Err(unreadable_error(&reason)),
-            },
+            None => {
+                let inline = input.document.bytes.take();
+                match crate::state::read_document(reference.clone(), inline).await {
+                    Ok(content) => state.lock().register_document(reference, content),
+                    Err(crate::state::ReadFailure::Unreadable(reason)) => {
+                        return Err(unreadable_error(&reason))
+                    }
+                    Err(crate::state::ReadFailure::DidNotComplete) => {
+                        return Err(AnalyzeExpenseErrorModeled::InternalServerError(
+                            InternalServerError {
+                                message: Some("reading the document did not complete".to_string()),
+                                code: None,
+                            },
+                        )
+                        .into())
+                    }
+                }
+            }
         };
 
         Ok(AnalyzeExpenseOutput {
@@ -233,6 +249,12 @@ fn unreadable_error(reason: &crate::state::Unreadable) -> AnalyzeExpenseError {
                     code: None,
                 },
             )
+        }
+        crate::state::Unreadable::Corrupt(_) => {
+            AnalyzeExpenseErrorModeled::BadDocumentException(BadDocumentException {
+                message,
+                code: None,
+            })
         }
         crate::state::Unreadable::S3Unreadable(_) => {
             AnalyzeExpenseErrorModeled::InvalidS3ObjectException(InvalidS3ObjectException {
