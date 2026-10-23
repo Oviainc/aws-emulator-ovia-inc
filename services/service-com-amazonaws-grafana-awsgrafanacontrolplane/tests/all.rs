@@ -20,6 +20,9 @@ mod list_workspace_service_accounts;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 
+#[path = "all/service_account_tokens.rs"]
+mod service_account_tokens;
+
 #[path = "all/service_accounts.rs"]
 mod service_accounts;
 

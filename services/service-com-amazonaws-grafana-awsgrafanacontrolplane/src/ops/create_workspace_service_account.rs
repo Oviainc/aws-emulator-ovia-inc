@@ -205,24 +205,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !workspace.supports_service_accounts() {
             return Err(
                 CreateWorkspaceServiceAccountErrorModeled::ValidationException(
-                    ValidationException {
-                        message: format!(
-                            "workspace {} runs Grafana version {}; service accounts require \
-                             version {} and above",
-                            workspace.id,
-                            workspace.grafana_version,
-                            crate::state::SERVICE_ACCOUNT_MIN_GRAFANA_MAJOR
-                        ),
-                        reason: "FIELD_VALIDATION_FAILED".to_string(),
-                        field_list: Some(vec![ValidationExceptionField {
-                            name: "workspaceId".to_string(),
-                            message: format!(
-                                "names a workspace on Grafana version {}, which does not \
-                                 support service accounts",
-                                workspace.grafana_version
-                            ),
-                        }]),
-                    },
+                    crate::state::service_accounts_unsupported(
+                        &workspace.id,
+                        &workspace.grafana_version,
+                    ),
                 )
                 .into(),
             );
@@ -273,6 +259,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // An account is enabled from the moment it is created; disabling happens in
             // the console, which this emulator does not model.
             disabled: false,
+            // A new account holds no token yet: `CreateWorkspaceServiceAccountToken`
+            // mints them onto this record.
+            tokens: Vec::new(),
+            token_id_seq: 0,
             created: now,
         };
 

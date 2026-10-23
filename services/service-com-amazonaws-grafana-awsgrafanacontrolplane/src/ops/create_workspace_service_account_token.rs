@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateWorkspaceServiceAccountToken
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateWorkspaceServiceAccountToken`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateWorkspaceServiceAccountToken::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a token on a workspace service account and reports the record it stored,
+//! including the key, which is handed to the caller once and never reported again.
 //!
 //! ## Shape of an operation
 //!
@@ -136,6 +129,20 @@ impl From<CreateWorkspaceServiceAccountTokenErrorModeled> for CreateWorkspaceSer
     }
 }
 
+/// The modelled server fault for a request this emulator could not serve from its own
+/// state: the service's store was not mounted, or the credential store minted no secret
+/// to answer with. Neither is something the caller can fix, and neither leaves this
+/// operation free to invent a key.
+fn server_unavailable() -> CreateWorkspaceServiceAccountTokenError {
+    CreateWorkspaceServiceAccountTokenErrorModeled::InternalServerException(
+        InternalServerException {
+            message: "the grafana workspace store is unavailable".to_string(),
+            retry_after_seconds: None,
+        },
+    )
+    .into()
+}
+
 /// The `CreateWorkspaceServiceAccountToken` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -172,18 +179,125 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateWorkspaceServiceAccountToken` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateWorkspaceServiceAccountTokenErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateWorkspaceServiceAccountToken"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(server_unavailable());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        // `secondsToLive` "[s]ets how long the token will be valid, in seconds"; the
+        // model bounds it `@range(min: 1, max: 2592000)` (30 days), so the boundary
+        // validator has already refused anything outside that range.
+        let seconds_to_live =
+            ::std::time::Duration::from_secs(u64::from(input.seconds_to_live.unsigned_abs()));
+
+        let mut store = state.lock();
+
+        // A token hangs off a service account, which hangs off a workspace, so an id
+        // naming no workspace is a request against a resource that does not exist.
+        let Some(workspace) = store.settled_mut(&input.workspace_id, now) else {
+            return Err(
+                CreateWorkspaceServiceAccountTokenErrorModeled::ResourceNotFoundException(
+                    crate::state::workspace_not_found(&input.workspace_id),
+                )
+                .into(),
+            );
+        };
+        let workspace_id = workspace.id.clone();
+
+        // "Service accounts are only available for workspaces that are compatible with
+        // Grafana version 9 and above" — the same rule `CreateWorkspaceServiceAccount`
+        // enforces, reported through the one shared payload.
+        if !workspace.supports_service_accounts() {
+            return Err(
+                CreateWorkspaceServiceAccountTokenErrorModeled::ValidationException(
+                    crate::state::service_accounts_unsupported(
+                        &workspace_id,
+                        &workspace.grafana_version,
+                    ),
+                )
+                .into(),
+            );
+        }
+
+        // The account must be one this workspace holds: an id naming none has nothing
+        // to mint a token for.
+        if workspace.service_account(&input.service_account_id).is_none() {
+            return Err(
+                CreateWorkspaceServiceAccountTokenErrorModeled::ResourceNotFoundException(
+                    crate::state::service_account_not_found(
+                        &workspace_id,
+                        &input.service_account_id,
+                    ),
+                )
+                .into(),
+            );
+        }
+
+        // The per-account token list is bounded; past the bound a create is refused
+        // rather than adding another record.
+        let held = workspace
+            .service_account(&input.service_account_id)
+            .map(|account| account.tokens.len())
+            .unwrap_or_default();
+        if held >= crate::state::SERVICE_ACCOUNT_TOKEN_QUOTA {
+            return Err(
+                CreateWorkspaceServiceAccountTokenErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: format!(
+                            "service account {} of workspace {workspace_id} already holds the \
+                             maximum of {} tokens",
+                            input.service_account_id,
+                            crate::state::SERVICE_ACCOUNT_TOKEN_QUOTA
+                        ),
+                        // The quota is per service account, so the account is the
+                        // resource that reached it.
+                        resource_id: input.service_account_id.clone(),
+                        resource_type: crate::state::SERVICE_ACCOUNT_RESOURCE_TYPE.to_string(),
+                        service_code: "grafana".to_string(),
+                        // Named for what it bounds: a Service Quotas code is an
+                        // identifier AWS issues, which this emulator does not model and
+                        // so must not invent one of.
+                        quota_code: "TokensPerServiceAccount".to_string(),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The key is a secret handed to the caller once ("Do not lose this key, as it
+        // will not be retrievable again"): it is minted by the emulator's credential
+        // store, never constructed here, and nothing persists it.
+        let Some(key) = crate::state::mint_grafana_bearer_token(ctx.credential_store()) else {
+            return Err(server_unavailable());
+        };
+
+        // Re-reached mutably now that every refusal is behind us, so no refused request
+        // has touched the store.
+        let Some(account) = workspace.service_account_mut(&input.service_account_id) else {
+            return Err(server_unavailable());
+        };
+        let token = crate::state::ServiceAccountToken {
+            id: account.mint_token_id(),
+            name: input.name,
+            created: now,
+            expires: now + seconds_to_live,
+            // Nothing has authorized with the key yet.
+            last_used: None,
+        };
+
+        // The response reports the record that was stored, read off it; only the key is
+        // not stored, because no later call reports it.
+        let output = CreateWorkspaceServiceAccountTokenOutput {
+            service_account_token: ServiceAccountTokenSummaryWithKey {
+                id: token.id.clone(),
+                name: token.name.clone(),
+                key,
+            },
+            service_account_id: account.id.clone(),
+            workspace_id,
+        };
+        account.tokens.push(token);
+
+        Ok(output)
     }
 }

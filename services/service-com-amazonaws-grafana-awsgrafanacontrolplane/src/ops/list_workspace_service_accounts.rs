@@ -198,7 +198,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let resume_at = match input.next_token.as_deref() {
             None => None,
             Some(token) => {
-                let Some(order) = crate::state::service_account_order(token) else {
+                let Some(order) = crate::state::decimal_id_order(token) else {
                     return Err(
                         ListWorkspaceServiceAccountsErrorModeled::ValidationException(
                             ValidationException {
@@ -248,7 +248,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Resume at the first account at or after the token, so a page is still
             // served when the account the token named was deleted meanwhile.
             let before_token = resume_at.is_some_and(|start| {
-                crate::state::service_account_order(&account.id)
+                crate::state::decimal_id_order(&account.id)
                     .is_some_and(|order| order < start)
             });
             if before_token {

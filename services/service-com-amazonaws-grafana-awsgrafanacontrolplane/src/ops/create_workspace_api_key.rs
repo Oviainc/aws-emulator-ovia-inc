@@ -249,7 +249,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The token is a secret handed to the caller: it is minted by the emulator's
         // credential store, never constructed here. Nothing persists it — no operation
         // reports a key's token again.
-        let Some(key) = crate::state::mint_api_key_token(ctx.credential_store()) else {
+        let Some(key) = crate::state::mint_grafana_bearer_token(ctx.credential_store()) else {
             return Err(server_unavailable());
         };
 

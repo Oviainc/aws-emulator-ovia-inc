@@ -15,8 +15,8 @@ use std::time::{Duration, SystemTime};
 use crate::ops::types::{
     AuthenticationDescription, AuthenticationSummary, AwsSsoAuthentication, ConflictException,
     NetworkAccessConfiguration, ResourceNotFoundException, SamlAuthentication, SamlConfiguration,
-    ServiceAccountSummary, ValidationException, ValidationExceptionField, VpcConfiguration,
-    WorkspaceDescription, WorkspaceSummary,
+    ServiceAccountSummary, ServiceAccountTokenSummary, ValidationException,
+    ValidationExceptionField, VpcConfiguration, WorkspaceDescription, WorkspaceSummary,
 };
 
 /// The Grafana versions this emulator supports, OLDEST FIRST.
@@ -97,6 +97,26 @@ pub const API_KEY_QUOTA: usize = 100;
 
 /// The `resourceType` an error reports for a service account of a workspace.
 pub const SERVICE_ACCOUNT_RESOURCE_TYPE: &str = "ServiceAccount";
+
+/// The `resourceType` an error reports for a token of a service account.
+pub const SERVICE_ACCOUNT_TOKEN_RESOURCE_TYPE: &str = "ServiceAccountToken";
+
+/// How many tokens one service account holds before
+/// `CreateWorkspaceServiceAccountToken` refuses with the modelled
+/// `ServiceQuotaExceededException`.
+///
+/// Like [`SERVICE_ACCOUNT_QUOTA`], this is the emulator's OWN bound on the store
+/// rather than a claim about any account's Service Quotas value: it is what stops
+/// the per-account token list growing without end. Every record it bounds is
+/// released by `DeleteWorkspaceServiceAccountToken`, or with the service account
+/// and the workspace that own it.
+pub const SERVICE_ACCOUNT_TOKEN_QUOTA: usize = 100;
+
+/// The largest page `ListWorkspaceServiceAccountTokens` serves, and the page size
+/// it uses when the request names no `maxResults`:
+/// `ListWorkspaceServiceAccountTokensRequest$maxResults` is modelled
+/// `@range(min: 1, max: 100)`.
+pub const SERVICE_ACCOUNT_TOKEN_PAGE_LIMIT: i32 = 100;
 
 /// The lowest Grafana major version a workspace must run for it to hold service
 /// accounts.
@@ -304,6 +324,23 @@ impl Workspace {
             .find(|account| account.name == name)
     }
 
+    /// This workspace's service account `id` names, if it holds one.
+    ///
+    /// The token operations take a `serviceAccountId` naming "the service
+    /// account for which to create a token" / whose tokens to report, so this is
+    /// what they resolve before reading or writing that account's tokens.
+    pub fn service_account(&self, id: &str) -> Option<&ServiceAccount> {
+        self.service_accounts.iter().find(|account| account.id == id)
+    }
+
+    /// This workspace's service account `id` names, for a caller about to change
+    /// it. See [`Workspace::service_account`].
+    pub fn service_account_mut(&mut self, id: &str) -> Option<&mut ServiceAccount> {
+        self.service_accounts
+            .iter_mut()
+            .find(|account| account.id == id)
+    }
+
     /// Mint an id no service account of this workspace holds.
     ///
     /// Grafana identifies a service account by a positive integer, rendered as a
@@ -468,10 +505,40 @@ pub struct ServiceAccount {
     /// Grafana console", which this emulator does not model, so an account is
     /// enabled from the moment it is created.
     pub disabled: bool,
+    /// Every token of this service account, in the order
+    /// `CreateWorkspaceServiceAccountToken` minted them — the stable total order
+    /// `ListWorkspaceServiceAccountTokens` pages through. They live on the
+    /// account record because they belong to it: deleting the account, or the
+    /// workspace that holds it, releases them with it.
+    pub tokens: Vec<ServiceAccountToken>,
+    /// The counter this account's token ids are minted from.
+    pub token_id_seq: u64,
     pub created: SystemTime,
 }
 
 impl ServiceAccount {
+    /// This account's token `id` names, if it holds one.
+    pub fn token(&self, id: &str) -> Option<&ServiceAccountToken> {
+        self.tokens.iter().find(|token| token.id == id)
+    }
+
+    /// Mint an id no token of this service account holds.
+    ///
+    /// Grafana identifies a service account token by a positive integer,
+    /// rendered as a string on the wire (`ServiceAccountTokenSummary$id` is a
+    /// plain `String`), so the id is the decimal counter value — the same form
+    /// [`Workspace::mint_service_account_id`] mints and [`decimal_id_order`]
+    /// orders. The loop skips an id already taken, which is what makes the wrap
+    /// safe.
+    pub fn mint_token_id(&mut self) -> String {
+        loop {
+            self.token_id_seq = self.token_id_seq.wrapping_add(1);
+            let id = self.token_id_seq.to_string();
+            if !self.tokens.iter().any(|token| token.id == id) {
+                return id;
+            }
+        }
+    }
     /// The `ServiceAccountSummary` projection `ListWorkspaceServiceAccounts`
     /// returns.
     ///
@@ -483,6 +550,48 @@ impl ServiceAccount {
             name: self.name.clone(),
             is_disabled: self.disabled.to_string(),
             grafana_role: self.grafana_role.clone(),
+        }
+    }
+}
+
+/// One token of a service account, as this emulator persists it.
+///
+/// The token KEY is not here: it is a secret handed to the caller once, by
+/// `CreateWorkspaceServiceAccountToken` ("Do not lose this key, as it will not be
+/// retrievable again"), and no operation reports it again — so nothing in the
+/// store needs to hold it.
+///
+/// An expired token stays on the record: `ServiceAccountTokenSummary$expiresAt`
+/// is what a report says about it ("When the service account token will expire"),
+/// so expiry stops the key authenticating rather than removing the token, which
+/// is what `DeleteWorkspaceServiceAccountToken` does.
+#[derive(Debug, Clone)]
+pub struct ServiceAccountToken {
+    /// The id minted by [`ServiceAccount::mint_token_id`].
+    pub id: String,
+    /// The name the create named.
+    pub name: String,
+    pub created: SystemTime,
+    /// `created` plus the request's `secondsToLive` ("Sets how long the token
+    /// will be valid, in seconds"). Past this instant the key no longer
+    /// authenticates to the workspace's Grafana HTTP API.
+    pub expires: SystemTime,
+    /// "The last time the token was used to authorize a Grafana HTTP API" —
+    /// unset until something authorizes with it, which only the workspace's own
+    /// data plane can do.
+    pub last_used: Option<SystemTime>,
+}
+
+impl ServiceAccountToken {
+    /// The `ServiceAccountTokenSummary` projection
+    /// `ListWorkspaceServiceAccountTokens` returns.
+    pub fn to_summary(&self) -> ServiceAccountTokenSummary {
+        ServiceAccountTokenSummary {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            created_at: ::aws_smithy_types::DateTime::from(self.created),
+            expires_at: ::aws_smithy_types::DateTime::from(self.expires),
+            last_used_at: self.last_used.map(::aws_smithy_types::DateTime::from),
         }
     }
 }
@@ -551,15 +660,17 @@ pub fn is_workspace_id(value: &str) -> bool {
     hex.len() == 10 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
-/// The total order of a service-account id: the decimal counter value
-/// [`Workspace::mint_service_account_id`] renders.
+/// The total order of a decimal id: the counter value
+/// [`Workspace::mint_service_account_id`] and [`ServiceAccount::mint_token_id`]
+/// render.
 ///
-/// `ServiceAccountSummary$id` is a plain string holding a decimal number, so the
-/// ids must be ordered as NUMBERS — byte order puts "10" before "2", which would
-/// resume a page before the account its token named. `None` for a value that is
-/// not such an id, which is what lets a paginated read refuse a `nextToken` this
-/// service never issued instead of silently serving the first page again.
-pub fn service_account_order(id: &str) -> Option<u64> {
+/// `ServiceAccountSummary$id` and `ServiceAccountTokenSummary$id` are plain
+/// strings holding a decimal number, so the ids must be ordered as NUMBERS —
+/// byte order puts "10" before "2", which would resume a page before the record
+/// its token named. `None` for a value that is not such an id, which is what lets
+/// a paginated read refuse a `nextToken` this service never issued instead of
+/// silently serving the first page again.
+pub fn decimal_id_order(id: &str) -> Option<u64> {
     if id.is_empty() || !id.bytes().all(|byte| byte.is_ascii_digit()) {
         return None;
     }
@@ -667,6 +778,45 @@ pub fn workspace_not_found(id: &str) -> ResourceNotFoundException {
     }
 }
 
+/// The `ResourceNotFoundException` payload for an id that names no service
+/// account of `workspace_id` — one never created, or already deleted.
+pub fn service_account_not_found(workspace_id: &str, account_id: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: format!(
+            "Service account {account_id} not found in workspace {workspace_id}"
+        ),
+        resource_id: account_id.to_string(),
+        resource_type: SERVICE_ACCOUNT_RESOURCE_TYPE.to_string(),
+    }
+}
+
+/// The `ValidationException` payload for a workspace whose Grafana version is
+/// below the service-account floor.
+///
+/// Shared by every operation that reaches a service account, so the one
+/// documented rule ("Service accounts are only available for workspaces that are
+/// compatible with Grafana version 9 and above") cannot be reported two
+/// different ways.
+pub fn service_accounts_unsupported(
+    workspace_id: &str,
+    grafana_version: &str,
+) -> ValidationException {
+    ValidationException {
+        message: format!(
+            "workspace {workspace_id} runs Grafana version {grafana_version}; service \
+             accounts require version {SERVICE_ACCOUNT_MIN_GRAFANA_MAJOR} and above"
+        ),
+        reason: "FIELD_VALIDATION_FAILED".to_string(),
+        field_list: Some(vec![ValidationExceptionField {
+            name: "workspaceId".to_string(),
+            message: format!(
+                "names a workspace on Grafana version {grafana_version}, which does not \
+                 support service accounts"
+            ),
+        }]),
+    }
+}
+
 /// The `ResourceNotFoundException` payload for a key name that names no API key
 /// of `workspace_id` — one never created, already deleted, or expired.
 pub fn api_key_not_found(workspace_id: &str, key_name: &str) -> ResourceNotFoundException {
@@ -687,7 +837,9 @@ pub fn api_key_name_taken(workspace_id: &str, key_name: &str) -> ConflictExcepti
     }
 }
 
-/// A fresh Grafana API key token, for `CreateWorkspaceApiKey`.
+/// A fresh bearer token for a workspace's own Grafana HTTP API: the `key`
+/// `CreateWorkspaceApiKey` and `CreateWorkspaceServiceAccountToken` hand their
+/// caller.
 ///
 /// The token authenticates to the workspace's own Grafana HTTP API, NOT to this
 /// emulator, so it must never be accepted as a SigV4 credential — but it is still
@@ -699,7 +851,7 @@ pub fn api_key_name_taken(workspace_id: &str, key_name: &str) -> ConflictExcepti
 ///
 /// `None` when the store minted no session-token secret, which leaves the
 /// operation to refuse rather than report a token it made up.
-pub fn mint_api_key_token(store: &::emulator_server::CredentialStore) -> Option<String> {
+pub fn mint_grafana_bearer_token(store: &::emulator_server::CredentialStore) -> Option<String> {
     let minted = store.create(&::emulator_server::aws_credentials::AWS_SESSION);
     let token = minted
         .secret(::emulator_server::aws_credentials::SESSION_TOKEN)
