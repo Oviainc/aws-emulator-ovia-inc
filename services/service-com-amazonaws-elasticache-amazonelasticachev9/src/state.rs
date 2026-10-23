@@ -193,8 +193,9 @@ pub const DEFAULT_SNAPSHOT_RETENTION_LIMIT: i32 = 0;
 pub const DEFAULT_MAINTENANCE_WINDOW: &str = "sun:23:00-mon:01:30";
 
 /// How long a cluster stays in the status the call that started the work
-/// returned (`creating` after a create, `modifying` after an immediate modify)
-/// before the clock owes it `available`.
+/// returned (`creating` after a create, `modifying` after an immediate modify,
+/// `rebooting cluster nodes` after a reboot) before the clock owes it
+/// `available`.
 ///
 /// ElastiCache takes minutes; the emulator chooses a span, and it is
 /// deliberately NOT zero, so a caller acting straight after the call still
@@ -338,6 +339,16 @@ pub const STATUS_AVAILABLE: &str = "available";
 pub const STATUS_MODIFYING: &str = "modifying";
 /// See [`STATUS_CREATING`].
 pub const STATUS_DELETING: &str = "deleting";
+/// The `CacheClusterStatus` of a cluster whose nodes `RebootCacheCluster` is
+/// rebooting: "during the reboot, the cluster status is set to REBOOTING", and
+/// `CacheCluster$CacheClusterStatus`'s own value list spells that status
+/// `rebooting cluster nodes`. See [`STATUS_CREATING`].
+pub const STATUS_REBOOTING_NODES: &str = "rebooting cluster nodes";
+/// The `CacheNode$CacheNodeStatus` of a node being rebooted, from that member's
+/// value list ("available, creating, rebooting, or deleting"). Only the nodes
+/// `RebootCacheCluster$CacheNodeIdsToReboot` named carry it; the rest keep
+/// running.
+pub const NODE_STATUS_REBOOTING: &str = "rebooting";
 /// See [`STATUS_CREATING`]: the status a cluster carries while a snapshot of it
 /// is being taken.
 pub const STATUS_SNAPSHOTTING: &str = "snapshotting";

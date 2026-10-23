@@ -2686,6 +2686,257 @@ async fn arns_and_endpoints_name_the_region_the_request_was_signed_for() {
     }
 }
 
+/// One reboot row: the cluster to create, the nodes the reboot names, and the
+/// `CacheNodeStatus` every node of the cluster must then report, in node-id
+/// order.
+#[derive(Debug, Clone)]
+struct RebootCase {
+    id: &'static str,
+    /// The form pairs sent beside `CacheClusterId` on the create.
+    extra: &'static [(&'static str, &'static str)],
+    /// `CacheNodeIdsToReboot`.
+    ids_to_reboot: &'static [&'static str],
+    /// What each node reports while the reboot is in flight.
+    node_statuses: &'static [&'static str],
+}
+
+/// Reboot `ids` of the cluster `id`. An empty `ids` sends no
+/// `CacheNodeIdsToReboot` member at all.
+async fn reboot_cluster(emulator: &Emulator, id: &str, ids: &[&str]) -> Reply {
+    let mut pairs = params(&[("CacheClusterId", id)]);
+    for (index, node) in ids.iter().enumerate() {
+        pairs.push((
+            // `CacheNodeIdsList`'s member carries `xmlName: CacheNodeId`
+            // (`smithy_query(query="shape", shape="CacheNodeIdsList")`), which is
+            // the name an awsQuery client flattens the list under.
+            format!("CacheNodeIdsToReboot.CacheNodeId.{}", index + 1),
+            (*node).to_string(),
+        ));
+    }
+    emulator.call("RebootCacheCluster", &pairs).await
+}
+
+#[tokio::test]
+async fn a_reboot_moves_only_the_named_nodes_and_settles_back() {
+    // The axis: the engine, the number of nodes the cluster has, and how many
+    // of them the request names — one, some, or all ("to reboot an entire
+    // cluster, specify all of the cache node IDs"). The recorded single-node
+    // Valkey / Redis OSS cluster is one row.
+    let cases = [
+        RebootCase {
+            id: "reboot-redis",
+            extra: &[("Engine", "redis")],
+            ids_to_reboot: &["0001"],
+            node_statuses: &["rebooting"],
+        },
+        RebootCase {
+            id: "reboot-valkey",
+            extra: &[("Engine", "valkey")],
+            ids_to_reboot: &["0001"],
+            node_statuses: &["rebooting"],
+        },
+        RebootCase {
+            id: "reboot-one-of-three",
+            extra: &[("Engine", "memcached"), ("NumCacheNodes", "3")],
+            ids_to_reboot: &["0002"],
+            node_statuses: &["available", "rebooting", "available"],
+        },
+        RebootCase {
+            id: "reboot-two-of-four",
+            extra: &[("Engine", "memcached"), ("NumCacheNodes", "4")],
+            ids_to_reboot: &["0001", "0004"],
+            node_statuses: &["rebooting", "available", "available", "rebooting"],
+        },
+        RebootCase {
+            id: "reboot-all-of-three",
+            extra: &[("Engine", "memcached"), ("NumCacheNodes", "3")],
+            ids_to_reboot: &["0001", "0002", "0003"],
+            node_statuses: &["rebooting", "rebooting", "rebooting"],
+        },
+    ];
+
+    let emulator = Emulator::new();
+    for case in cases {
+        create_available_cluster(&emulator, case.id, case.extra).await;
+        let node_count = case.node_statuses.len();
+
+        let rebooted = reboot_cluster(&emulator, case.id, case.ids_to_reboot).await;
+        assert_eq!(
+            rebooted.status, 200,
+            "case {case:?}: the reboot must succeed, got {} {}",
+            rebooted.status, rebooted.body
+        );
+        // "During the reboot, the cluster status is set to REBOOTING", which
+        // `CacheClusterStatus`'s value list spells `rebooting cluster nodes`.
+        assert_eq!(
+            rebooted.text("CacheCluster/CacheClusterStatus"),
+            Some("rebooting cluster nodes"),
+            "case {case:?}: expected the cluster rebooting, got {:?}",
+            rebooted.text("CacheCluster/CacheClusterStatus")
+        );
+        assert_eq!(
+            rebooted.all("CacheNodes/CacheNode/CacheNodeStatus"),
+            case.node_statuses,
+            "case {case:?}: expected only the named nodes rebooting, got {:?}",
+            rebooted.all("CacheNodes/CacheNode/CacheNodeStatus")
+        );
+
+        // Persisted, not merely reported: a describe inside the span reads the
+        // same thing back, node for node, and the reboot changed nothing else
+        // about the cluster.
+        let immediate = describe_cluster(&emulator, case.id).await;
+        assert_eq!(
+            immediate.text("CacheCluster/CacheClusterStatus"),
+            Some("rebooting cluster nodes"),
+            "case {case:?}: a describe inside the span still reports the reboot, got {:?}",
+            immediate.text("CacheCluster/CacheClusterStatus")
+        );
+        assert_eq!(
+            immediate.all("CacheNodes/CacheNode/CacheNodeStatus"),
+            case.node_statuses,
+            "case {case:?}: the stored node statuses must be the reported ones, got {:?}",
+            immediate.all("CacheNodes/CacheNode/CacheNodeStatus")
+        );
+        let reported_ids = immediate.all("CacheNodes/CacheNode/CacheNodeId");
+        let expected_ids = (1..=node_count)
+            .map(|ordinal| format!("{ordinal:04}"))
+            .collect::<Vec<String>>();
+        assert_eq!(
+            reported_ids, expected_ids,
+            "case {case:?}: a reboot removes no node, got {reported_ids:?}"
+        );
+        assert_eq!(
+            immediate.text("CacheCluster/NumCacheNodes"),
+            Some(node_count.to_string().as_str()),
+            "case {case:?}: a reboot changes no node count, got {:?}",
+            immediate.text("CacheCluster/NumCacheNodes")
+        );
+
+        // Past the span the clock owes the cluster `available` again, and every
+        // rebooted node with it.
+        std::thread::sleep(PAST_TRANSITION);
+        let settled = describe_cluster(&emulator, case.id).await;
+        assert_eq!(
+            settled.text("CacheCluster/CacheClusterStatus"),
+            Some("available"),
+            "case {case:?}: past the span the reboot is over, got {:?}",
+            settled.text("CacheCluster/CacheClusterStatus")
+        );
+        let settled_statuses = settled.all("CacheNodes/CacheNode/CacheNodeStatus");
+        assert_eq!(
+            settled_statuses,
+            vec!["available"; node_count],
+            "case {case:?}: every node settles with the cluster, got {settled_statuses:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_reboot_that_cannot_be_performed_is_refused() {
+    let emulator = Emulator::new();
+    create_available_cluster(
+        &emulator,
+        "reboot-refusals",
+        &[("Engine", "memcached"), ("NumCacheNodes", "2")],
+    )
+    .await;
+    // Created last and not waited out, so it is still `creating`: the span is
+    // never zero.
+    create_cluster(&emulator, "reboot-fresh", &[]).await;
+
+    // `(case, cluster id, CacheNodeIdsToReboot, HTTP status, awsQuery code)`.
+    let cases: [(&str, &str, &[&str], u16, &str); 5] = [
+        (
+            "unknown cluster",
+            "nope",
+            &["0001"],
+            404,
+            "CacheClusterNotFound",
+        ),
+        (
+            "cluster still creating",
+            "reboot-fresh",
+            &["0001"],
+            400,
+            "InvalidCacheClusterState",
+        ),
+        (
+            "a node the cluster does not hold",
+            "reboot-refusals",
+            &["0009"],
+            400,
+            "ValidationException",
+        ),
+        (
+            "an empty node id",
+            "reboot-refusals",
+            &[""],
+            400,
+            "ValidationException",
+        ),
+        (
+            // `CacheNodeIdsToReboot` is `@required`, so the boundary validator
+            // refuses an absent one before the handler runs.
+            "absent CacheNodeIdsToReboot",
+            "reboot-refusals",
+            &[],
+            400,
+            "MalformedInput",
+        ),
+    ];
+
+    for (case, id, ids, status, code) in cases {
+        let reply = reboot_cluster(&emulator, id, ids).await;
+        assert_eq!(
+            reply.status, status,
+            "case {case}: expected HTTP {status}, got {} {}",
+            reply.status, reply.body
+        );
+        assert_eq!(
+            reply.error_code(),
+            code,
+            "case {case}: expected error code {code:?}, got {}",
+            reply.body
+        );
+    }
+
+    // A refused reboot rebooted nothing: the cluster it named is still settled.
+    let untouched = describe_cluster(&emulator, "reboot-refusals").await;
+    assert_eq!(
+        untouched.text("CacheCluster/CacheClusterStatus"),
+        Some("available"),
+        "a refused reboot leaves the cluster available, got {:?}",
+        untouched.text("CacheCluster/CacheClusterStatus")
+    );
+    assert_eq!(
+        untouched.all("CacheNodes/CacheNode/CacheNodeStatus"),
+        vec!["available", "available"],
+        "a refused reboot leaves every node available, got {:?}",
+        untouched.all("CacheNodes/CacheNode/CacheNodeStatus")
+    );
+
+    // A cluster already rebooting "is not in the available state", so a second
+    // reboot inside the span is refused rather than restarting the first.
+    let first = reboot_cluster(&emulator, "reboot-refusals", &["0001"]).await;
+    assert_eq!(
+        first.status, 200,
+        "the first reboot must succeed, got {} {}",
+        first.status, first.body
+    );
+    let second = reboot_cluster(&emulator, "reboot-refusals", &["0002"]).await;
+    assert_eq!(
+        second.status, 400,
+        "a reboot of a rebooting cluster is refused, got {} {}",
+        second.status, second.body
+    );
+    assert_eq!(
+        second.error_code(),
+        "InvalidCacheClusterState",
+        "a reboot of a rebooting cluster is refused with the modelled state fault, got {}",
+        second.body
+    );
+}
+
 #[tokio::test]
 async fn the_transition_span_is_the_one_the_state_module_publishes() {
     // The handlers store a due instant rather than sleeping, so the span is a
