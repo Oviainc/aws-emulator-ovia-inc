@@ -25,6 +25,8 @@ mod job_definition_registry;
 mod job_lifecycle;
 #[path = "all/job_queue_updates.rs"]
 mod job_queue_updates;
+#[path = "all/scheduling_policies.rs"]
+mod scheduling_policies;
 #[path = "all/service_environment.rs"]
 mod service_environment;
 #[path = "all/service_job_termination.rs"]

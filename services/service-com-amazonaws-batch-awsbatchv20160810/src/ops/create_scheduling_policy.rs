@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateSchedulingPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateSchedulingPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Creates a scheduling policy and persists it in [`crate::state`]. The `name` is the
+//! policy's identity: the ARN is minted once from it
+//! ([`crate::state::scheduling_policy_arn`]) and re-creating a name that already exists is
+//! refused with the modelled `ClientException` instead of overwriting the stored policy. A
+//! request may carry a `fairsharePolicy` OR a `quotaSharePolicy`, never both, and each is
+//! accepted only inside the bounds its own members document
+//! ([`crate::state::validate_policy_kinds`]). Nothing about a scheduling policy is owed by
+//! the clock — AWS Batch returns it ready and models no status for it — so the policy
+//! `DescribeSchedulingPolicies` reads back is exactly what this call stored.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateSchedulingPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +157,75 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateSchedulingPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateSchedulingPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateSchedulingPolicy"))
+        use crate::state as batch;
+
+        let Some(state) = batch::service_state(&*self.engine) else {
+            return Err(CreateSchedulingPolicyErrorModeled::ServerException(
+                batch::unreachable_state(),
+            )
+            .into());
+        };
+        let region = batch::request_region(ctx);
+        let now = batch::now_millis();
+
+        // `name` is a plain `String` in the model, so the framework admits anything: the
+        // charset and length the member documents are applied here.
+        if !batch::is_valid_scheduling_policy_name(&input.name) {
+            return Err(CreateSchedulingPolicyErrorModeled::ClientException(
+                batch::client_exception(format!(
+                    "name must be 1 to {} letters, numbers, hyphens (-) or underscores (_)",
+                    batch::MAX_SCHEDULING_POLICY_NAME_LEN
+                )),
+            )
+            .into());
+        }
+        // One policy kind, each inside the bounds its own members document.
+        batch::validate_policy_kinds(
+            input.fairshare_policy.as_ref(),
+            input.quota_share_policy.as_ref(),
+        )
+        .map_err(|detail| {
+            CreateSchedulingPolicyError::from(CreateSchedulingPolicyErrorModeled::ClientException(
+                batch::client_exception(detail),
+            ))
+        })?;
+
+        let mut state = state.lock();
+        state.materialize_due(now);
+
+        if state.scheduling_policies.contains_key(&input.name) {
+            return Err(CreateSchedulingPolicyErrorModeled::ClientException(
+                batch::client_exception(format!(
+                    "Object already exists: scheduling policy {}",
+                    input.name
+                )),
+            )
+            .into());
+        }
+        if state.scheduling_policies.len() >= batch::limits::MAX_SCHEDULING_POLICIES {
+            return Err(CreateSchedulingPolicyErrorModeled::ClientException(
+                batch::client_exception(batch::quota_message(
+                    "scheduling policies",
+                    batch::limits::MAX_SCHEDULING_POLICIES,
+                )),
+            )
+            .into());
+        }
+
+        let name = input.name.clone();
+        let arn = batch::scheduling_policy_arn(&region, &name);
+        let policy = batch::SchedulingPolicy {
+            name: name.clone(),
+            arn: arn.clone(),
+            fairshare_policy: input.fairshare_policy,
+            quota_share_policy: input.quota_share_policy,
+            tags: input.tags,
+        };
+        state
+            .scheduling_policies_by_arn
+            .insert(arn.clone(), name.clone());
+        state.scheduling_policies.insert(name.clone(), policy);
+
+        Ok(CreateSchedulingPolicyOutput { name, arn })
     }
 }

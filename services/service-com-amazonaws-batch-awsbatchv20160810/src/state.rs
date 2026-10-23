@@ -39,10 +39,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::ops::types::{
     CapacityLimit, ClientException, ComputeEnvironmentOrder, ComputeResource,
     ConsumableResourceProperties, ContainerDetail, ContainerOverrides, ContainerProperties,
-    EcsProperties, EcsSettings, EksConfiguration, JobDefinition, JobDependency,
-    JobStateTimeLimitAction, JobTimeout, KeyValuePair, NodeProperties, ResourceRequirement,
-    RetryStrategy, ServerException, ServiceEnvironmentOrder, ServiceJobPreemptionConfiguration,
-    ServiceJobRetryStrategy, ServiceJobTimeout,
+    EcsProperties, EcsSettings, EksConfiguration, FairsharePolicy, JobDefinition, JobDependency,
+    JobStateTimeLimitAction, JobTimeout, KeyValuePair, NodeProperties, QuotaSharePolicy,
+    ResourceRequirement, RetryStrategy, ServerException, ServiceEnvironmentOrder,
+    ServiceJobPreemptionConfiguration, ServiceJobRetryStrategy, ServiceJobTimeout, ShareAttributes,
 };
 
 /// This service's ARN namespace and sigv4 signing name (`OPERATIONS.md`).
@@ -103,6 +103,12 @@ pub mod limits {
     /// same eviction-before-refusal rule
     /// ([`super::ComAmazonawsBatchAwsbatchv20160810State::insert_service_job`]).
     pub const MAX_SERVICE_JOBS: usize = 500;
+
+    /// Scheduling policies kept at once. An EMULATOR bound (AWS publishes no quota for
+    /// this resource): `CreateSchedulingPolicy` fills the store and anyone can repeat it,
+    /// so a create past this answers the modelled `ClientException`. Sized like the other
+    /// per-Region, name-keyed Batch resources above.
+    pub const MAX_SCHEDULING_POLICIES: usize = 50;
 }
 
 /// The `ClientException` message a request past one of [`limits`] answers with.
@@ -179,6 +185,49 @@ pub const MAX_JOB_DEFINITION_NAME_LEN: usize = 128;
 /// letters, numbers, hyphens (-), and underscores (_)." The model types the member as a
 /// plain `String`, so the framework cannot refuse a bad one.
 pub const MAX_SERVICE_ENVIRONMENT_NAME_LEN: usize = 128;
+
+/// The longest scheduling policy `name` the service accepts, from the member's doc: "The
+/// name of the fair-share scheduling policy. It can be up to 128 letters long. It can
+/// contain uppercase and lowercase letters, numbers, hyphens (-), and underscores (_)."
+/// The model types the member as a plain `String`, so the framework cannot refuse a bad
+/// one.
+pub const MAX_SCHEDULING_POLICY_NAME_LEN: usize = 128;
+
+/// The bounds of `FairsharePolicy$shareDecaySeconds`, from the member's own doc: "A value
+/// of zero (0) indicates the default minimum time window (600 seconds). The maximum
+/// supported value is 604800 (1 week)." The model types the member as a plain `Integer`,
+/// so the rule is applied by every operation that accepts the policy
+/// ([`validate_fairshare_policy`]).
+pub const MIN_SHARE_DECAY_SECONDS: i32 = 0;
+/// See [`MIN_SHARE_DECAY_SECONDS`].
+pub const MAX_SHARE_DECAY_SECONDS: i32 = 604_800;
+
+/// The bounds of `FairsharePolicy$computeReservation`, from the member's own doc: "The
+/// minimum value is 0 and the maximum value is 99."
+pub const MIN_COMPUTE_RESERVATION: i32 = 0;
+/// See [`MIN_COMPUTE_RESERVATION`].
+pub const MAX_COMPUTE_RESERVATION: i32 = 99;
+
+/// The bounds of `ShareAttributes$weightFactor`, from the member's own doc: "The smallest
+/// supported value is 0.0001, and the largest supported value is 999.9999."
+pub const MIN_WEIGHT_FACTOR: f32 = 0.0001;
+/// See [`MIN_WEIGHT_FACTOR`].
+pub const MAX_WEIGHT_FACTOR: f32 = 999.9999;
+
+/// The longest `ShareAttributes$shareIdentifier` the service accepts, from the member's
+/// own doc: "The string is limited to 255 alphanumeric characters, and can be followed by
+/// an asterisk (*)."
+pub const MAX_SHARE_IDENTIFIER_LEN: usize = 255;
+
+/// The most share identifiers one fair-share policy may carry, from the
+/// `ShareAttributes$shareIdentifier` doc ("There can be no more than 500 share identifiers
+/// active in a job queue"), which `CreateJobQueue$schedulingPolicyArn` repeats ("Jobs
+/// queues with a fair-share scheduling policy can have a maximum of 500 active share
+/// identifiers"). The model constrains the list's length nowhere, so a longer
+/// `shareDistribution` is refused here — before anything walks it
+/// ([`validate_fairshare_policy`]), which is also what bounds the payload one stored
+/// policy retains.
+pub const MAX_SHARE_DISTRIBUTION_ENTRIES: usize = 500;
 
 /// The lowest `schedulingPriority` the service accepts, from the member's doc: "The
 /// minimum supported value is 0 and the maximum supported value is 9999."
@@ -353,6 +402,13 @@ pub fn service_environment_arn(region: &str, name: &str) -> String {
     )
 }
 
+/// `arn:aws:batch:<region>:<account>:scheduling-policy/<name>` — the format
+/// `CreateSchedulingPolicy$arn` documents ("The format is
+/// aws:Partition:batch:Region:Account:scheduling-policy/Name").
+pub fn scheduling_policy_arn(region: &str, name: &str) -> String {
+    ::engine::emulator_arn(ARN_SERVICE, region, &format!("scheduling-policy/{name}"))
+}
+
 /// `arn:aws:batch:<region>:<account>:service-job/<job id>` — the ARN a service job
 /// carries, the resource kind AWS Batch names a service job with.
 pub fn service_job_arn(region: &str, job_id: &str) -> String {
@@ -417,6 +473,25 @@ pub struct ServiceEnvironment {
     /// Set while the `CREATING` -> `VALID` move is still owed by the clock.
     pub status_due_at: Option<i64>,
     pub capacity_limits: Vec<CapacityLimit>,
+    pub tags: Option<HashMap<String, String>>,
+}
+
+/// A scheduling policy, exactly as `CreateSchedulingPolicy` stored it.
+///
+/// The name is the policy's identity and the ARN is minted once beside it
+/// ([`scheduling_policy_arn`]), so every later operation reports the same one. AWS Batch
+/// returns a scheduling policy ready — it carries no status member at all — so nothing
+/// about it is owed by the clock.
+///
+/// A policy carries a fair-share policy OR a quota-share policy, never both: "Only one of
+/// fairsharePolicy or quotaSharePolicy can be set. Once set, this policy type cannot be
+/// removed or changed" (`CreateSchedulingPolicy$fairsharePolicy`).
+#[derive(Debug, Clone)]
+pub struct SchedulingPolicy {
+    pub name: String,
+    pub arn: String,
+    pub fairshare_policy: Option<FairsharePolicy>,
+    pub quota_share_policy: Option<QuotaSharePolicy>,
     pub tags: Option<HashMap<String, String>>,
 }
 
@@ -729,6 +804,13 @@ pub struct ComAmazonawsBatchAwsbatchv20160810State {
     pub service_environments: HashMap<String, ServiceEnvironment>,
     /// Service environment ARN -> name, so `name or ARN` members resolve both ways.
     pub service_environments_by_arn: HashMap<String, String>,
+    /// Scheduling policies by name — the name `CreateSchedulingPolicy` keys them by.
+    /// Bounded by [`limits::MAX_SCHEDULING_POLICIES`].
+    pub scheduling_policies: HashMap<String, SchedulingPolicy>,
+    /// Scheduling policy ARN -> name, so a policy named by ARN (the only form
+    /// `DescribeSchedulingPolicies`, `UpdateSchedulingPolicy` and `DeleteSchedulingPolicy`
+    /// document) resolves to its record.
+    pub scheduling_policies_by_arn: HashMap<String, String>,
     /// Registered job-definition revisions, keyed by `(jobDefinitionName, revision)` —
     /// the describe and pagination order. Bounded by [`MAX_JOB_DEFINITIONS`].
     pub job_definitions: BTreeMap<(String, i32), JobDefinition>,
@@ -840,6 +922,27 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
         }
         let id = arn_resource_id(name_or_arn, "service-environment")?;
         self.service_environments
+            .contains_key(id)
+            .then(|| id.to_string())
+    }
+
+    /// The scheduling policy `name_or_arn` names, resolved by ARN (the form every
+    /// scheduling-policy member documents) or by plain name.
+    pub fn scheduling_policy(&self, name_or_arn: &str) -> Option<&SchedulingPolicy> {
+        let name = self.scheduling_policy_name(name_or_arn)?;
+        self.scheduling_policies.get(&name)
+    }
+
+    /// The NAME of the scheduling policy `name_or_arn` names.
+    pub fn scheduling_policy_name(&self, name_or_arn: &str) -> Option<String> {
+        if let Some(name) = self.scheduling_policies_by_arn.get(name_or_arn) {
+            return Some(name.clone());
+        }
+        if self.scheduling_policies.contains_key(name_or_arn) {
+            return Some(name_or_arn.to_string());
+        }
+        let id = arn_resource_id(name_or_arn, "scheduling-policy")?;
+        self.scheduling_policies
             .contains_key(id)
             .then(|| id.to_string())
     }
@@ -1451,6 +1554,171 @@ pub fn validate_job_state_time_limit_actions(
         }
     }
     Ok(())
+}
+
+/// Whether `value` is a scheduling policy `name` the service accepts: up to
+/// [`MAX_SCHEDULING_POLICY_NAME_LEN`] letters, numbers, hyphens and underscores
+/// (the member's own doc). See [`is_valid_resource_name`].
+pub fn is_valid_scheduling_policy_name(value: &str) -> bool {
+    is_valid_resource_name(value, MAX_SCHEDULING_POLICY_NAME_LEN)
+}
+
+/// Every `QuotaShareIdleResourceAssignmentStrategy` the model declares
+/// (`smithy_query(query="shape", shape="QuotaShareIdleResourceAssignmentStrategy")`).
+/// The generated input types carry the member as a plain `String`, so the value is
+/// checked here by every operation that accepts a quota-share policy.
+pub const QUOTA_SHARE_IDLE_RESOURCE_ASSIGNMENT_STRATEGIES: [&str; 1] = ["FIFO"];
+
+/// The refusal detail when a request carries a policy of neither kind or of both.
+///
+/// "Only one of fairsharePolicy or quotaSharePolicy can be set" — the doc of
+/// `CreateSchedulingPolicy$fairsharePolicy` and `$quotaSharePolicy`. Shared by every
+/// operation that accepts the pair (`CreateSchedulingPolicy`, `UpdateSchedulingPolicy`).
+pub fn validate_policy_kinds(
+    fairshare: Option<&FairsharePolicy>,
+    quota_share: Option<&QuotaSharePolicy>,
+) -> Result<(), String> {
+    if fairshare.is_some() && quota_share.is_some() {
+        return Err(
+            "Only one of fairsharePolicy or quotaSharePolicy can be set on a scheduling policy"
+                .to_string(),
+        );
+    }
+    if let Some(quota_share) = quota_share {
+        validate_quota_share_policy(quota_share)?;
+    }
+    if let Some(fairshare) = fairshare {
+        validate_fairshare_policy(fairshare)?;
+    }
+    Ok(())
+}
+
+/// Refuse a `quotaSharePolicy` whose `idleResourceAssignmentStrategy` is not one the
+/// model declares ([`QUOTA_SHARE_IDLE_RESOURCE_ASSIGNMENT_STRATEGIES`]).
+pub fn validate_quota_share_policy(policy: &QuotaSharePolicy) -> Result<(), String> {
+    if !QUOTA_SHARE_IDLE_RESOURCE_ASSIGNMENT_STRATEGIES
+        .contains(&policy.idle_resource_assignment_strategy.as_str())
+    {
+        return Err(format!(
+            "idleResourceAssignmentStrategy {} is not one of {}",
+            policy.idle_resource_assignment_strategy,
+            QUOTA_SHARE_IDLE_RESOURCE_ASSIGNMENT_STRATEGIES.join(", ")
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse a `fairsharePolicy` outside the bounds its members document:
+/// `shareDecaySeconds` ([`MAX_SHARE_DECAY_SECONDS`]), `computeReservation`
+/// ([`MAX_COMPUTE_RESERVATION`]), each `shareIdentifier`'s charset and length
+/// ([`MAX_SHARE_IDENTIFIER_LEN`]), each `weightFactor` ([`MIN_WEIGHT_FACTOR`]), and the
+/// no-overlap rule between share identifiers.
+///
+/// The model types every one of these members as a plain `Integer`/`Float`/`String`, so
+/// the framework admits anything and the rule is applied by every operation that accepts
+/// the policy (`CreateSchedulingPolicy`, `UpdateSchedulingPolicy`).
+pub fn validate_fairshare_policy(policy: &FairsharePolicy) -> Result<(), String> {
+    if let Some(decay) = policy.share_decay_seconds {
+        if !(MIN_SHARE_DECAY_SECONDS..=MAX_SHARE_DECAY_SECONDS).contains(&decay) {
+            return Err(format!(
+                "fairsharePolicy shareDecaySeconds must be between {MIN_SHARE_DECAY_SECONDS} and {MAX_SHARE_DECAY_SECONDS}, got {decay}"
+            ));
+        }
+    }
+    if let Some(reservation) = policy.compute_reservation {
+        if !(MIN_COMPUTE_RESERVATION..=MAX_COMPUTE_RESERVATION).contains(&reservation) {
+            return Err(format!(
+                "fairsharePolicy computeReservation must be between {MIN_COMPUTE_RESERVATION} and {MAX_COMPUTE_RESERVATION}, got {reservation}"
+            ));
+        }
+    }
+    let distribution = policy.share_distribution.as_deref().unwrap_or_default();
+    // The ENTRY COUNT is bounded before any work proportional to it: the list comes
+    // straight from the request, so a longer one is refused rather than walked.
+    if distribution.len() > MAX_SHARE_DISTRIBUTION_ENTRIES {
+        return Err(format!(
+            "fairsharePolicy shareDistribution accepts at most {MAX_SHARE_DISTRIBUTION_ENTRIES} share identifiers, not {}",
+            distribution.len()
+        ));
+    }
+    for share in distribution {
+        if !is_valid_share_identifier(&share.share_identifier) {
+            return Err(format!(
+                "shareIdentifier {} must be 1 to {MAX_SHARE_IDENTIFIER_LEN} alphanumeric characters, optionally followed by an asterisk (*)",
+                share.share_identifier
+            ));
+        }
+        if let Some(weight) = share.weight_factor {
+            if !(MIN_WEIGHT_FACTOR..=MAX_WEIGHT_FACTOR).contains(&weight) {
+                return Err(format!(
+                    "weightFactor of shareIdentifier {} must be between {MIN_WEIGHT_FACTOR} and {MAX_WEIGHT_FACTOR}, got {weight}",
+                    share.share_identifier
+                ));
+            }
+        }
+    }
+    if let Some((left, right)) = overlapping_share_identifiers(distribution) {
+        return Err(format!(
+            "The list of share identifiers in a fair-share policy can't overlap: {left} and {right}"
+        ));
+    }
+    Ok(())
+}
+
+/// Whether `value` is a `shareIdentifier` the service accepts: at most
+/// [`MAX_SHARE_IDENTIFIER_LEN`] alphanumeric characters, optionally followed by a single
+/// asterisk which makes the entry a PREFIX (the member's own doc).
+pub fn is_valid_share_identifier(value: &str) -> bool {
+    let prefix = value.strip_suffix('*').unwrap_or(value);
+    !prefix.is_empty()
+        && prefix.chars().count() <= MAX_SHARE_IDENTIFIER_LEN
+        && prefix.chars().all(|c| c.is_ascii_alphanumeric())
+}
+
+/// A pair of overlapping share identifiers in `distribution`, or `None`.
+///
+/// Two entries overlap when one selects everything the other does: the same identifier
+/// twice, or a prefix entry (`<prefix>*`) and any entry that starts with that prefix —
+/// the example the `shareIdentifier` doc gives ("you can't have one that specifies a
+/// shareIdentifier of UserA* and another that specifies a shareIdentifier of UserA1").
+///
+/// SORTED rather than pairwise, so the cost is `n log n` comparisons and not `n²`: in
+/// identifier order every entry that starts with a given prefix follows it contiguously,
+/// so an overlapping pair always leaves an ADJACENT overlapping pair behind — if `a` is a
+/// prefix of `c` then every `b` between them has `a` as a prefix too, and an overlap
+/// between two different identifiers is only ever an earlier PREFIX entry against a later
+/// one. Checking neighbours therefore finds an overlap exactly when one exists.
+fn overlapping_share_identifiers(distribution: &[ShareAttributes]) -> Option<(String, String)> {
+    // The identifier an entry selects on: the string without the `*` that makes it a
+    // prefix. The full string breaks ties so the answer does not depend on input order.
+    let sort_key = |value: &str| {
+        (
+            value.strip_suffix('*').unwrap_or(value).to_string(),
+            value.to_string(),
+        )
+    };
+    let mut sorted: Vec<&str> = distribution
+        .iter()
+        .map(|share| share.share_identifier.as_str())
+        .collect();
+    sorted.sort_unstable_by_key(|value| sort_key(value));
+    sorted.windows(2).find_map(|pair| {
+        share_identifiers_overlap(pair[0], pair[1])
+            .then(|| (pair[0].to_string(), pair[1].to_string()))
+    })
+}
+
+/// Whether two `shareIdentifier` entries select a common share identifier.
+fn share_identifiers_overlap(left: &str, right: &str) -> bool {
+    match (left.strip_suffix('*'), right.strip_suffix('*')) {
+        // Two prefixes overlap when either contains the other.
+        (Some(left), Some(right)) => left.starts_with(right) || right.starts_with(left),
+        // A prefix and an exact identifier overlap when the identifier matches it.
+        (Some(prefix), None) => right.starts_with(prefix),
+        (None, Some(prefix)) => left.starts_with(prefix),
+        // Two exact identifiers overlap only when they are the same.
+        (None, None) => left == right,
+    }
 }
 
 /// The two forms a job-definition reference takes, parsed once: the NAME it carries

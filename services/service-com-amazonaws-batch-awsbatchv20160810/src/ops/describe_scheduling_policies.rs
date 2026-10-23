@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeSchedulingPolicies
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeSchedulingPolicies`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the scheduling policies `CreateSchedulingPolicy` stored, one
+//! `SchedulingPolicyDetail` per entry of `arns` that resolves to a policy this service
+//! holds. An entry naming nothing is simply not reported — the way every other `Describe*`
+//! reader of this service answers an unknown reference — and the same policy named twice
+//! is reported once. This is a REPORTING operation: it writes nothing, so two reads at the
+//! same instant answer identically.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeSchedulingPolicies::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -140,18 +139,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeSchedulingPolicies` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeSchedulingPoliciesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeSchedulingPolicies"))
+        use crate::state as batch;
+
+        let _ = ctx;
+        let Some(state) = batch::service_state(&*self.engine) else {
+            return Err(DescribeSchedulingPoliciesErrorModeled::ServerException(
+                batch::unreachable_state(),
+            )
+            .into());
+        };
+
+        // "A list of up to 100 scheduling policy Amazon Resource Name (ARN) entries"
+        // (`arns`). The model types the list without a length constraint, so the bound is
+        // applied here.
+        if input.arns.len() > batch::MAX_DESCRIBE_FILTER_ENTRIES {
+            return Err(DescribeSchedulingPoliciesErrorModeled::ClientException(
+                batch::client_exception(format!(
+                    "arns accepts at most {} entries, not {}",
+                    batch::MAX_DESCRIBE_FILTER_ENTRIES,
+                    input.arns.len()
+                )),
+            )
+            .into());
+        }
+
+        let state = state.lock();
+        let mut seen = ::std::collections::HashSet::new();
+        let details: Vec<SchedulingPolicyDetail> = input
+            .arns
+            .iter()
+            .filter_map(|reference| state.scheduling_policy(reference))
+            .filter(|policy| seen.insert(policy.arn.clone()))
+            .map(|policy| SchedulingPolicyDetail {
+                name: policy.name.clone(),
+                arn: policy.arn.clone(),
+                fairshare_policy: policy.fairshare_policy.clone(),
+                quota_share_policy: policy.quota_share_policy.clone(),
+                tags: policy.tags.clone(),
+            })
+            .collect();
+
+        Ok(DescribeSchedulingPoliciesOutput {
+            scheduling_policies: Some(details),
+        })
     }
 }
