@@ -315,7 +315,7 @@ fn delete_channel(
             id,
             &channel.arn,
             failure_code::CONFLICT,
-            crate::state::not_idle_message("Channel", id, &channel.state),
+            crate::state::CHANNEL_NOT_STOPPED_MESSAGE.to_string(),
         ));
     }
     crate::state::begin_delete(channel, now);
@@ -351,7 +351,7 @@ fn delete_input(
             id,
             &arn,
             failure_code::CONFLICT,
-            crate::state::attached_input_message(id, &attached),
+            crate::state::busy_input_message(id),
         ));
     }
 
