@@ -28,6 +28,11 @@
 //! ([`LogGroupRecord::data_protection_policy`]), because `PutDataProtectionPolicy`
 //! "applies to only the specified log group": one group holds at most one, and deleting
 //! the group takes its policy with it.
+//!
+//! The account's deliveries — each "a connection between a logical delivery source and a
+//! logical delivery destination", which `CreateDelivery` creates and `DescribeDeliveries`
+//! reports — live in [`ComAmazonawsCloudwatchlogsLogs20140328State::deliveries`], each one
+//! a [`DeliveryRecord`].
 
 use std::collections::BTreeMap;
 
@@ -353,6 +358,15 @@ pub struct ComAmazonawsCloudwatchlogsLogs20140328State {
     /// `DescribeImportTasks` enumerates in import-id order without re-sorting, which is
     /// also what makes its pagination cursor stable.
     pub import_tasks: BTreeMap<String, ImportTaskRecord>,
+    /// Every delivery of this account — the resource `CreateDelivery` creates and
+    /// `DescribeDeliveries` reports — keyed by `Delivery$id`. A `BTreeMap` so
+    /// `DescribeDeliveries` enumerates in delivery-id order without re-sorting, which is
+    /// also what makes its pagination cursor stable.
+    ///
+    /// A delivery is an account-level resource rather than a log group's: its source and
+    /// its destination are both named by their own resources, so it lives here and not on
+    /// [`LogGroupRecord`].
+    pub deliveries: BTreeMap<String, DeliveryRecord>,
 }
 
 impl ComAmazonawsCloudwatchlogsLogs20140328State {
@@ -576,6 +590,132 @@ impl ImportTaskRecord {
             self.completion_due_ms = None;
         }
     }
+}
+
+/// One delivery — "a connection between a logical delivery source and a logical delivery
+/// destination" — as it is stored. Every member of the model's `Delivery` shape is
+/// reported from this record, so `DescribeDeliveries` answers from state alone.
+#[derive(Debug, Clone)]
+pub struct DeliveryRecord {
+    /// `Delivery$id` — "The unique ID that identifies this delivery in your account."
+    /// Also the key the store enumerates by.
+    pub id: String,
+    /// `Delivery$arn` — "The Amazon Resource Name (ARN) that uniquely identifies this
+    /// delivery", as [`delivery_arn`] builds it.
+    pub arn: String,
+    /// `Delivery$deliverySourceName` — "The name of the delivery source that is associated
+    /// with this delivery."
+    pub delivery_source_name: String,
+    /// `Delivery$deliveryDestinationArn` — "The ARN of the delivery destination that is
+    /// associated with this delivery."
+    pub delivery_destination_arn: String,
+    /// `Delivery$deliveryDestinationType` — the vendor the destination resource belongs to
+    /// ([`delivery_destination_type_for_arn`]); `None` for a destination ARN naming none of
+    /// the four the model's `DeliveryDestinationType` enumerates.
+    pub delivery_destination_type: Option<String>,
+    /// `Delivery$recordFields` — "The record fields used in this delivery". `None` when the
+    /// create named no list at all, which is not the same as the empty list it may name
+    /// (`RecordFields` is `@length(min: 0)`).
+    pub record_fields: Option<Vec<String>>,
+    /// `Delivery$fieldDelimiter` — "The field delimiter that is used between record fields
+    /// when the final output format of a delivery is in Plain, W3C, or Raw format."
+    pub field_delimiter: Option<String>,
+    /// `Delivery$s3DeliveryConfiguration` — the configuration that applies "only when the
+    /// delivery destination resource is an S3 bucket".
+    pub s3_delivery_configuration: Option<crate::ops::types::S3DeliveryConfiguration>,
+    /// `Delivery$tags` — "The tags that have been assigned to this delivery." A `BTreeMap`
+    /// so the stored order is stable; `Tags` is `@length(min: 1)`, so a delivery carrying
+    /// none reports no member at all.
+    pub tags: BTreeMap<String, String>,
+}
+
+impl DeliveryRecord {
+    /// A brand-new delivery between one delivery source and one delivery destination, with
+    /// the ARN and the destination type DERIVED rather than taken from the caller: both are
+    /// facts about the resources being connected. This is what `CreateDelivery` stores once
+    /// it is implemented (it is still a scaffold stub), which is also the only caller this
+    /// constructor is waiting for.
+    ///
+    /// The optional members a create may name — `recordFields`, `fieldDelimiter`,
+    /// `s3DeliveryConfiguration`, `tags` — are left at their "the request named none" value
+    /// and set on the returned record by the caller that has them.
+    pub fn new(
+        id: &str,
+        region: &str,
+        delivery_source_name: &str,
+        delivery_destination_arn: &str,
+    ) -> Self {
+        Self {
+            id: id.to_string(),
+            arn: delivery_arn(region, id),
+            delivery_source_name: delivery_source_name.to_string(),
+            delivery_destination_arn: delivery_destination_arn.to_string(),
+            delivery_destination_type: delivery_destination_type_for_arn(delivery_destination_arn)
+                .map(ToString::to_string),
+            record_fields: None,
+            field_delimiter: None,
+            s3_delivery_configuration: None,
+            tags: BTreeMap::new(),
+        }
+    }
+
+    /// This delivery as the model's `Delivery` structure, which is what `CreateDelivery`,
+    /// `GetDelivery` and `DescribeDeliveries` all report, so one record renders the same way
+    /// through any of them.
+    pub fn reported(&self) -> crate::ops::types::Delivery {
+        crate::ops::types::Delivery {
+            id: Some(self.id.clone()),
+            arn: Some(self.arn.clone()),
+            delivery_source_name: Some(self.delivery_source_name.clone()),
+            delivery_destination_arn: Some(self.delivery_destination_arn.clone()),
+            delivery_destination_type: self.delivery_destination_type.clone(),
+            record_fields: self.record_fields.clone(),
+            field_delimiter: self.field_delimiter.clone(),
+            s3_delivery_configuration: self.s3_delivery_configuration.clone(),
+            tags: (!self.tags.is_empty()).then(|| {
+                self.tags
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect()
+            }),
+        }
+    }
+}
+
+/// A delivery's ARN, the form `Delivery$arn` ("The Amazon Resource Name (ARN) that uniquely
+/// identifies this delivery") carries: a `delivery` resource of this service, identified by
+/// the delivery's own id.
+pub fn delivery_arn(region: &str, id: &str) -> String {
+    ::engine::emulator_arn("logs", region, &format!("delivery:{id}"))
+}
+
+/// The ARN service namespace of each vendor a delivery destination can be, paired with the
+/// `DeliveryDestinationType` the model spells it as.
+///
+/// The four vendors are the ones `DescribeDeliveries` documents — "The destination can be
+/// CloudWatch Logs, Amazon S3, Firehose or X-Ray" — and each spelling is a value of the
+/// model's `DeliveryDestinationType` enum
+/// ([`crate::ops::types::DELIVERY_DESTINATION_TYPE_VALUES`]), never a string typed here.
+pub const DELIVERY_DESTINATION_VENDOR_TYPES: [(&str, &str); 4] = [
+    ("logs", "CWL"),
+    ("firehose", "FH"),
+    ("s3", "S3"),
+    ("xray", "XRAY"),
+];
+
+/// The `DeliveryDestinationType` of the resource an ARN names, or `None` for an ARN naming
+/// none of the four vendors a delivery destination can be.
+///
+/// The type is a property of the destination RESOURCE, not of the request:
+/// `Delivery$deliveryDestinationType` "Displays whether the delivery destination associated
+/// with this delivery is CloudWatch Logs, Amazon S3, Firehose, or X-Ray", so it is read off
+/// the destination's ARN ([`DELIVERY_DESTINATION_VENDOR_TYPES`]).
+pub fn delivery_destination_type_for_arn(arn: &str) -> Option<&'static str> {
+    let (vendor, _resource) = arn_service_and_resource(arn)?;
+    DELIVERY_DESTINATION_VENDOR_TYPES
+        .iter()
+        .find(|(namespace, _)| vendor == *namespace)
+        .map(|(_, destination_type)| *destination_type)
 }
 
 /// How many account-level policies of `policy_type` the account may hold IN TOTAL once a

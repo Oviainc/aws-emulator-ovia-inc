@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetSdkType
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetSdkType`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetSdkType::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the one SDK type an `id` names, out of the service's published
+//! catalog ([`crate::state::sdk_type`]) — the same records `GetSdkTypes` lists. An id
+//! the catalog does not hold is a `NotFoundException`. Reads only.
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +142,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetSdkType` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetSdkTypeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetSdkType"))
+        let _ = ctx;
+        // The `SdkType` collection is the service's own published catalog, not an
+        // account's records, so there is nothing of a caller's to look up here and
+        // nothing for this read to write. The store is still resolved, so a call served
+        // by an engine that cannot reach this service's state is refused exactly as it
+        // is on every sibling operation rather than answered.
+        crate::state::service_state(&*self.engine).ok_or_else(crate::state::state_unavailable)?;
+
+        // The id is a free `String` path label, so nothing before this handler has
+        // refused an id the catalog does not name: an unresolvable identifier is this
+        // operation's modelled 404.
+        crate::state::sdk_type(&input.id).ok_or_else(|| {
+            GetSdkTypeError::from(GetSdkTypeErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(crate::state::no_such_sdk_type(&input.id)),
+                },
+            ))
+        })
     }
 }
