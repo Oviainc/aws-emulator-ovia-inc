@@ -1,10 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeReservedCacheNodes
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeReservedCacheNodes`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
 //! broken". Replace the `Err(..)` in [`DescribeReservedCacheNodes::handle`] with real behaviour and
 //! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
@@ -137,6 +133,17 @@ impl From<DescribeReservedCacheNodesErrorModeled> for DescribeReservedCacheNodes
     }
 }
 
+/// `message` as this operation's modelled `InvalidParameterValueException`:
+/// "the value for a parameter is invalid" (HTTP 400).
+fn invalid_parameter_value(message: String) -> DescribeReservedCacheNodesError {
+    DescribeReservedCacheNodesErrorModeled::InvalidParameterValueException(
+        InvalidParameterValueException {
+            message: Some(message),
+        },
+    )
+    .into()
+}
+
 /// The `DescribeReservedCacheNodes` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -173,18 +180,133 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeReservedCacheNodes` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeReservedCacheNodesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeReservedCacheNodes"))
+        // "Returns information about reserved cache nodes for this account, or
+        // about a specified reserved cache node": a reporting operation over
+        // the reservations `PurchaseReservedCacheNodesOffering` bought. The one
+        // write it makes is materialising the state change the clock already
+        // owed each reservation — owed at this instant whether or not anybody
+        // called — through `settle_all`.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+
+        // `MaxRecords`: "the maximum number of records to include in the
+        // response … Default: 100. Constraints: minimum 20; maximum 100."
+        let page_size = match crate::state::page_size(input.max_records) {
+            Ok(size) => size,
+            Err(message) => return Err(invalid_parameter_value(message)),
+        };
+        // A `Marker` only ever travels back unchanged, so one this service did
+        // not mint is a bad parameter value rather than an empty page.
+        let resume_from = match input.marker.as_deref() {
+            Some(marker) => match crate::state::decode_marker(marker) {
+                Some(key) => Some(key),
+                None => {
+                    return Err(invalid_parameter_value(format!(
+                        "Invalid value {marker} for Marker."
+                    )))
+                }
+            },
+            None => None,
+        };
+        // `Duration` is "specified in years or seconds" with its own valid
+        // values, and `OfferingType` has its own documented value set; neither
+        // carries a modelled constraint, so a value outside the set is refused
+        // here rather than quietly matching nothing.
+        let duration_seconds = match input.duration.as_deref() {
+            Some(value) => match crate::state::parse_offering_duration(value) {
+                Ok(seconds) => Some(seconds),
+                Err(message) => return Err(invalid_parameter_value(message)),
+            },
+            None => None,
+        };
+        let offering_type = match input.offering_type.as_deref() {
+            Some(value) => match crate::state::canonical_offering_type(value) {
+                Ok(canonical) => Some(canonical),
+                Err(message) => return Err(invalid_parameter_value(message)),
+            },
+            None => None,
+        };
+
+        // The five members this operation narrows the reservations with are the
+        // five `DescribeReservedCacheNodesOfferings` narrows the catalog with,
+        // so they are the same filter: a reservation carries its offering's
+        // attributes, and one comparison serves both describes.
+        let filter = crate::state::OfferingFilter {
+            offering_id: input.reserved_cache_nodes_offering_id.clone(),
+            cache_node_type: input.cache_node_type.clone(),
+            duration_seconds,
+            product_description: input.product_description.clone(),
+            offering_type,
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.settle_all(now);
+
+        // `ReservedCacheNodeId` is "the reserved cache node identifier filter
+        // value … show only the reservation that matches the specified
+        // reservation ID", and it names a single reservation, so an id this
+        // account holds none under is the modelled "requested reserved cache
+        // node was not found" rather than an empty page. It is a
+        // customer-specified identifier held exactly as it was given, so the
+        // lookup is exact. Every OTHER filter narrows a set, and narrowing it
+        // to nothing — including an offering id no reservation was bought from,
+        // for which this operation models no not-found — is an empty page.
+        let id_filter = match input.reserved_cache_node_id.as_deref() {
+            Some(id) => {
+                if !store.reserved_cache_nodes.contains_key(id) {
+                    return Err(
+                        DescribeReservedCacheNodesErrorModeled::ReservedCacheNodeNotFoundFault(
+                            ReservedCacheNodeNotFoundFault {
+                                // The message names the shape of the resource
+                                // that was not found and the identifier the
+                                // request asked for, which is how this service
+                                // words a not-found: it is built from the
+                                // request rather than fitting any one instance.
+                                message: Some(format!("ReservedCacheNode {id} not found.")),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+                Some(id)
+            }
+            None => None,
+        };
+
+        let mut page: Vec<ReservedCacheNode> = Vec::new();
+        let mut marker = None;
+        // `range` resumes at the marker's key in the store's own order, so a
+        // later page costs no scan of the pages before it, and the bound
+        // borrows the decoded key rather than copying it
+        // (`String: Borrow<str>`).
+        let resumed = store.reserved_cache_nodes.range::<str, _>((
+            resume_from
+                .as_deref()
+                .map_or(::std::ops::Bound::Unbounded, ::std::ops::Bound::Included),
+            ::std::ops::Bound::Unbounded,
+        ));
+        for (key, reservation) in resumed
+            .filter(|(key, _)| id_filter.is_none_or(|id| key.as_str() == id))
+            .filter(|(_, reservation)| filter.matches_reservation(reservation))
+        {
+            if page.len() == page_size {
+                // More records exist than `MaxRecords`, so the response carries
+                // the marker the next call resumes from — the key of the first
+                // record this page did not return.
+                marker = Some(crate::state::encode_marker(key));
+                break;
+            }
+            page.push(reservation.to_modeled());
+        }
+
+        Ok(DescribeReservedCacheNodesOutput {
+            marker,
+            reserved_cache_nodes: Some(page),
+        })
     }
 }

@@ -24,6 +24,11 @@
 //! so `CreateCacheCluster`'s defaults are read off it rather than from a second
 //! list.
 //!
+//! The reserved-cache-node offerings are a further such catalog, and the
+//! reservations bought from one ([`ReservedCacheNodeRecord`]) ARE an account
+//! resource: `PurchaseReservedCacheNodesOffering` mints one and
+//! `DescribeReservedCacheNodes` reports it.
+//!
 //! Beside the cache resources sits the RBAC user: `CreateUser` mints one and
 //! `DescribeUsers` reports it, over the one [`UserRecord`] map below, which also
 //! holds the built-in `default` user every account already has.
@@ -48,8 +53,9 @@ use crate::ops::types::{
     CacheNode, CacheParameterGroup, CacheParameterGroupStatus, CacheSubnetGroup, CacheUsageLimits,
     CreateUserOutput, DestinationDetails, Endpoint, LogDeliveryConfiguration,
     LogDeliveryConfigurationRequest, NodeGroupConfiguration, NodeSnapshot,
-    NotificationConfiguration, PendingModifiedValues, RecurringCharge, ReservedCacheNodesOffering,
-    ScaleConfig, SecurityGroupMembership, ServerlessCache, ServiceUpdate, Snapshot, Subnet, Tag,
+    NotificationConfiguration, PendingModifiedValues, RecurringCharge, ReservedCacheNode,
+    ReservedCacheNodesOffering, ScaleConfig, SecurityGroupMembership, ServerlessCache,
+    ServiceUpdate, Snapshot, Subnet, Tag,
 };
 
 /// The region a request is treated as having been made in when its SigV4
@@ -659,8 +665,8 @@ pub fn validate_num_cache_nodes(engine: &str, num: i32) -> Result<(), String> {
 // service publishes, which every account sees the same and which no operation
 // creates. The catalog below is therefore built once, stocked into the store by
 // [`ComAmazonawsElasticacheAmazonelasticachev9State::default`], and read from
-// there by `DescribeReservedCacheNodesOfferings` — and, when they land, by
-// `DescribeReservedCacheNodes` and `PurchaseReservedCacheNodesOffering`, which
+// there by `DescribeReservedCacheNodesOfferings` — and by
+// `PurchaseReservedCacheNodesOffering` and `DescribeReservedCacheNodes`, which
 // filter on the same five members and price a reservation from the same entry.
 // ---------------------------------------------------------------------------
 
@@ -988,7 +994,8 @@ pub struct OfferingFilter {
 }
 
 impl OfferingFilter {
-    /// True when `offering` satisfies every member this filter sets.
+    /// True when a record carrying these five attributes satisfies every member
+    /// this filter sets.
     ///
     /// The offering id is compared EXACTLY — it is an opaque identifier, so one
     /// that differs anywhere, case included, names a different offering, which
@@ -997,31 +1004,290 @@ impl OfferingFilter {
     /// ignoring ASCII case: a node type and an engine name are both stored
     /// lowercase, and an offering type is a documented display spelling, so case
     /// is part of none of their identities.
-    pub fn matches(&self, offering: &ReservedCacheNodesOffering) -> bool {
-        let same = |filter: Option<&String>, value: Option<&String>| {
+    ///
+    /// Taking the attributes rather than a shape is what lets a published
+    /// offering and a reservation bought from one be narrowed by ONE
+    /// implementation of the five comparisons, so the two describes cannot
+    /// disagree about what a filter value selects.
+    fn matches_attributes(
+        &self,
+        offering_id: Option<&str>,
+        cache_node_type: Option<&str>,
+        duration_seconds: Option<i32>,
+        product_description: Option<&str>,
+        offering_type: Option<&str>,
+    ) -> bool {
+        let same = |filter: Option<&str>, value: Option<&str>| {
             filter.is_none_or(|wanted| {
                 value.is_some_and(|actual| actual.eq_ignore_ascii_case(wanted))
             })
         };
-        self.offering_id.as_deref().is_none_or(|wanted| {
-            offering
-                .reserved_cache_nodes_offering_id
-                .as_deref()
-                .is_some_and(|actual| actual == wanted)
-        }) && same(self.cache_node_type.as_ref(), offering.cache_node_type.as_ref())
-            && same(
-                self.product_description.as_ref(),
-                offering.product_description.as_ref(),
-            )
+        self.offering_id
+            .as_deref()
+            .is_none_or(|wanted| offering_id.is_some_and(|actual| actual == wanted))
+            && same(self.cache_node_type.as_deref(), cache_node_type)
+            && same(self.product_description.as_deref(), product_description)
             && self
                 .duration_seconds
-                .is_none_or(|wanted| offering.duration == Some(wanted))
-            && self.offering_type.is_none_or(|wanted| {
-                offering
-                    .offering_type
-                    .as_deref()
-                    .is_some_and(|actual| actual.eq_ignore_ascii_case(wanted))
-            })
+                .is_none_or(|wanted| duration_seconds == Some(wanted))
+            && same(self.offering_type, offering_type)
+    }
+
+    /// True when `offering` satisfies every member this filter sets.
+    pub fn matches(&self, offering: &ReservedCacheNodesOffering) -> bool {
+        self.matches_attributes(
+            offering.reserved_cache_nodes_offering_id.as_deref(),
+            offering.cache_node_type.as_deref(),
+            offering.duration,
+            offering.product_description.as_deref(),
+            offering.offering_type.as_deref(),
+        )
+    }
+
+    /// True when `reservation` satisfies every member this filter sets.
+    ///
+    /// `DescribeReservedCacheNodes` documents the same filter members over the
+    /// reservations bought from the catalog as
+    /// `DescribeReservedCacheNodesOfferings` documents over the catalog itself,
+    /// so the comparison is the same one, made against the reservation's own
+    /// copy of the offering's attributes.
+    pub fn matches_reservation(&self, reservation: &ReservedCacheNodeRecord) -> bool {
+        self.matches_attributes(
+            Some(&reservation.reserved_cache_nodes_offering_id),
+            reservation.cache_node_type.as_deref(),
+            reservation.duration_seconds,
+            reservation.product_description.as_deref(),
+            reservation.offering_type.as_deref(),
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Reserved cache nodes
+//
+// A reserved cache node — a reservation — IS an account resource, unlike the
+// offering it is bought from: `PurchaseReservedCacheNodesOffering` mints one
+// from a catalog entry above and `DescribeReservedCacheNodes` reports it. The
+// record below is the one copy both read, so the two cannot disagree about
+// what was bought.
+// ---------------------------------------------------------------------------
+
+/// The number of nodes a purchase reserves when the request names none, as
+/// `PurchaseReservedCacheNodesOffering$CacheNodeCount` documents it: "The
+/// number of cache node instances to reserve. Default: 1".
+pub const DEFAULT_CACHE_NODE_COUNT: i32 = 1;
+
+/// The states a reservation is reported in.
+///
+/// `ReservedCacheNode$State` is documented only as "the state of the reserved
+/// cache node" and the model declares no enum for it, so these are the states
+/// ElastiCache reports a reservation in: a purchase is `payment-pending` until
+/// its payment is taken, `active` for the term it was bought for, and `retired`
+/// once that term has elapsed.
+pub const RESERVATION_STATE_PAYMENT_PENDING: &str = "payment-pending";
+/// See [`RESERVATION_STATE_PAYMENT_PENDING`].
+pub const RESERVATION_STATE_ACTIVE: &str = "active";
+/// See [`RESERVATION_STATE_PAYMENT_PENDING`].
+pub const RESERVATION_STATE_RETIRED: &str = "retired";
+
+/// How long a reservation stays `payment-pending` before the clock owes it
+/// `active`.
+///
+/// The same reasoning as [`CLUSTER_TRANSITION`]: AWS takes as long as the
+/// payment takes, the emulator chooses a span, and it is deliberately NOT zero
+/// so a caller describing straight after the purchase still observes the
+/// transient state. The due instant is stored on the record and materialised by
+/// whichever later call reads it — nothing sleeps.
+pub const RESERVATION_TRANSITION: Duration = Duration::from_millis(500);
+
+/// How many reserved cache nodes the store holds before a purchase is refused
+/// with the modelled `ReservedCacheNodeQuotaExceededFault` — "the request
+/// cannot be processed because it would exceed the user's cache node quota".
+///
+/// See [`CLUSTER_QUOTA`]: the emulator's OWN bound on the store rather than a
+/// claim about any account's limit, set at the same count as the cluster quota
+/// because both bound cache nodes.
+pub const RESERVED_CACHE_NODE_QUOTA: i32 = 300;
+
+/// The ARN of a reserved cache node, in the form
+/// `ReservedCacheNode$ReservationARN`'s own example gives
+/// (`arn:aws:elasticache:us-east-1:123456789012:reserved-instance:ri-2017-03-27-08-33-25-582`).
+pub fn reservation_arn(region: &str, reserved_cache_node_id: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_NAMESPACE,
+        region,
+        &format!("reserved-instance:{reserved_cache_node_id}"),
+    )
+}
+
+/// The identifier a reservation the request named none carries:
+/// `PurchaseReservedCacheNodesOffering$ReservedCacheNodeId` documents "if this
+/// parameter is not specified, ElastiCache automatically generates an
+/// identifier for the reservation".
+///
+/// The generated form is the one `ReservationARN`'s example carries — `ri-`
+/// followed by the purchase instant with every field hyphen-separated
+/// (`ri-2017-03-27-08-33-25-582`) — built from the RFC-3339 rendering of the
+/// instant, so the service's one timestamp implementation is also what names a
+/// reservation.
+pub fn generated_reservation_id(at: SystemTime) -> String {
+    let rendered = ::aws_smithy_types::DateTime::from(at)
+        .fmt(::aws_smithy_types::date_time::Format::DateTime)
+        .unwrap_or_default();
+    let stamp: String = rendered
+        .trim_end_matches('Z')
+        .chars()
+        .map(|c| if c.is_ascii_digit() { c } else { '-' })
+        .collect();
+    format!("ri-{stamp}")
+}
+
+/// The values a new reservation carries that do not come from the offering it
+/// is bought from — one argument so
+/// [`ReservedCacheNodeRecord::from_offering`] does not take a row of positional
+/// values.
+#[derive(Debug, Clone)]
+pub struct NewReservation {
+    /// The reservation's identity: the `ReservedCacheNodeId` the request named,
+    /// or the one [`generated_reservation_id`] minted for it.
+    pub reserved_cache_node_id: String,
+    /// `CacheNodeCount` — "the number of cache node instances to reserve".
+    pub cache_node_count: i32,
+    /// The Region of the request that bought it, which its ARN names.
+    pub region: String,
+    /// The tags the purchase was given. `AddTagsToResource` /
+    /// `ListTagsForResource` are scaffolded 501s and own their issues; the tags
+    /// are persisted here so implementing them does not have to move them.
+    pub tags: Vec<(String, String)>,
+    pub now: SystemTime,
+}
+
+/// One reserved cache node, as this emulator persists it.
+///
+/// Every priced member is COPIED out of the catalog entry the reservation was
+/// bought from, which is what makes a reservation a record of what was bought
+/// rather than a second view of the live catalog.
+#[derive(Debug, Clone)]
+pub struct ReservedCacheNodeRecord {
+    /// "The unique identifier for the reservation", which is this record's
+    /// identity in the store.
+    pub reserved_cache_node_id: String,
+    /// The offering it was bought from.
+    pub reserved_cache_nodes_offering_id: String,
+    pub cache_node_type: Option<String>,
+    /// "The time the reservation started" — the instant of the purchase.
+    pub start_time: SystemTime,
+    /// "The duration of the reservation in seconds", from the offering's term.
+    pub duration_seconds: Option<i32>,
+    pub fixed_price: Option<f64>,
+    pub usage_price: Option<f64>,
+    /// "The number of cache nodes that have been reserved."
+    pub cache_node_count: i32,
+    pub product_description: Option<String>,
+    pub offering_type: Option<String>,
+    /// One of [`RESERVATION_STATE_PAYMENT_PENDING`],
+    /// [`RESERVATION_STATE_ACTIVE`] or [`RESERVATION_STATE_RETIRED`].
+    pub state: String,
+    /// The state change the clock owes this reservation, if any.
+    pub pending_state: Option<PendingTransition>,
+    /// "The recurring price charged to run this reserved cache node", from the
+    /// offering.
+    pub recurring_charges: Vec<RecurringCharge>,
+    pub arn: String,
+    /// See [`NewReservation::tags`].
+    pub tags: Vec<(String, String)>,
+}
+
+impl ReservedCacheNodeRecord {
+    /// The reservation `new` buys from `offering`.
+    pub fn from_offering(offering: &ReservedCacheNodesOffering, new: NewReservation) -> Self {
+        Self {
+            arn: reservation_arn(&new.region, &new.reserved_cache_node_id),
+            reserved_cache_node_id: new.reserved_cache_node_id,
+            reserved_cache_nodes_offering_id: offering
+                .reserved_cache_nodes_offering_id
+                .clone()
+                .unwrap_or_default(),
+            cache_node_type: offering.cache_node_type.clone(),
+            start_time: new.now,
+            duration_seconds: offering.duration,
+            // The offering's prices are per reserved cache node — "the fixed
+            // price charged for this offering" and "the hourly price charged
+            // for this offering" — so a multi-node reservation reports the same
+            // per-node prices beside its `CacheNodeCount` rather than a total
+            // no member of this shape documents.
+            fixed_price: offering.fixed_price,
+            usage_price: offering.usage_price,
+            cache_node_count: new.cache_node_count,
+            product_description: offering.product_description.clone(),
+            offering_type: offering.offering_type.clone(),
+            state: RESERVATION_STATE_PAYMENT_PENDING.to_string(),
+            pending_state: Some(PendingTransition {
+                due: new.now + RESERVATION_TRANSITION,
+                status: RESERVATION_STATE_ACTIVE.to_string(),
+            }),
+            recurring_charges: offering.recurring_charges.clone().unwrap_or_default(),
+            tags: new.tags,
+        }
+    }
+
+    /// Materialise every state change the clock owes this reservation. The one
+    /// write a reporting operation may make; see [`SnapshotRecord::settle`].
+    pub fn settle(&mut self, now: SystemTime) {
+        self.settle_payment(now);
+        self.settle_term(now);
+    }
+
+    /// `payment-pending` becomes `active` once the payment's due instant has
+    /// passed.
+    fn settle_payment(&mut self, now: SystemTime) {
+        let Some(pending) = self.pending_state.as_ref() else {
+            return;
+        };
+        if now < pending.due {
+            return;
+        }
+        self.state = pending.status.clone();
+        self.pending_state = None;
+    }
+
+    /// An `active` reservation becomes `retired` once the term it was bought
+    /// for has elapsed: the reservation runs for its offering's `Duration`
+    /// ("the duration of the reservation in seconds") from its `StartTime`, and
+    /// that span is the offering's own rather than one the emulator chose.
+    fn settle_term(&mut self, now: SystemTime) {
+        if self.state != RESERVATION_STATE_ACTIVE {
+            return;
+        }
+        let Some(seconds) = self
+            .duration_seconds
+            .and_then(|seconds| u64::try_from(seconds).ok())
+        else {
+            return;
+        };
+        if now < self.start_time + Duration::from_secs(seconds) {
+            return;
+        }
+        self.state = RESERVATION_STATE_RETIRED.to_string();
+    }
+
+    /// This record as the modelled `ReservedCacheNode`.
+    pub fn to_modeled(&self) -> ReservedCacheNode {
+        ReservedCacheNode {
+            reserved_cache_node_id: Some(self.reserved_cache_node_id.clone()),
+            reserved_cache_nodes_offering_id: Some(self.reserved_cache_nodes_offering_id.clone()),
+            cache_node_type: self.cache_node_type.clone(),
+            start_time: Some(::aws_smithy_types::DateTime::from(self.start_time)),
+            duration: self.duration_seconds,
+            fixed_price: self.fixed_price,
+            usage_price: self.usage_price,
+            cache_node_count: Some(self.cache_node_count),
+            product_description: self.product_description.clone(),
+            offering_type: self.offering_type.clone(),
+            state: Some(self.state.clone()),
+            recurring_charges: Some(self.recurring_charges.clone()),
+            reservation_arn: Some(self.arn.clone()),
+        }
     }
 }
 
@@ -1346,6 +1612,13 @@ impl CacheClusterRecord {
             self.nodes
                 .retain(|node| !ids_to_remove.contains(&node.cache_node_id));
         }
+        // The growth loop below allocates one record per node, so the node
+        // count is bounded HERE — where both the create and the modify path go
+        // through it — rather than left to each caller's own validation. No
+        // engine permits more than [`MEMCACHED_MAX_NODES`] nodes, and no
+        // cluster has fewer than one (see [`validate_num_cache_nodes`]), so a
+        // count outside that range cannot be a cluster this service serves and
+        // is clamped instead of allocated.
         let target = target.clamp(1, MEMCACHED_MAX_NODES);
         let target_len = usize::try_from(target).unwrap_or(1);
         while self.nodes.len() > target_len {
@@ -3189,6 +3462,12 @@ pub struct ComAmazonawsElasticacheAmazonelasticachev9State {
     /// is created, because the catalog is the service's own and no operation
     /// creates or removes an entry: a describe only reports it.
     pub reserved_cache_nodes_offerings: BTreeMap<String, ReservedCacheNodesOffering>,
+    /// Every reservation this account bought, keyed by its
+    /// `ReservedCacheNodeId` — "the unique identifier for the reservation",
+    /// which is "a customer-specified identifier" and so is held exactly as it
+    /// was given. A `BTreeMap` is what gives `DescribeReservedCacheNodes` the
+    /// stable total order its `Marker` indexes into.
+    pub reserved_cache_nodes: BTreeMap<String, ReservedCacheNodeRecord>,
 }
 
 impl Default for ComAmazonawsElasticacheAmazonelasticachev9State {
@@ -3216,6 +3495,7 @@ impl Default for ComAmazonawsElasticacheAmazonelasticachev9State {
             vpc_seq: 0,
             subnet_seq: 0,
             reserved_cache_nodes_offerings: offering_catalog(),
+            reserved_cache_nodes: BTreeMap::new(),
         }
     }
 }
@@ -3373,6 +3653,63 @@ impl ComAmazonawsElasticacheAmazonelasticachev9State {
         }
     }
 
+    /// The offering `id` names, or `None` when the published catalog holds no
+    /// such entry — the one lookup every handler that resolves a
+    /// `ReservedCacheNodesOfferingId` goes through, so they cannot disagree
+    /// about which offerings exist. The id is opaque, so it is matched exactly.
+    pub fn offering(&self, id: &str) -> Option<&ReservedCacheNodesOffering> {
+        self.reserved_cache_nodes_offerings
+            .values()
+            .find(|offering| offering.reserved_cache_nodes_offering_id.as_deref() == Some(id))
+    }
+
+    /// How many cache nodes this account's reservations already hold, which is
+    /// what [`RESERVED_CACHE_NODE_QUOTA`] bounds.
+    pub fn reserved_node_count(&self) -> i64 {
+        self.reserved_cache_nodes
+            .values()
+            .map(|reservation| i64::from(reservation.cache_node_count))
+            .sum()
+    }
+
+    /// Mint the identifier of a reservation whose purchase named none.
+    ///
+    /// [`generated_reservation_id`] names it after the purchase instant; two
+    /// purchases inside the same rendered instant would otherwise collide, so
+    /// the first free sequence is appended to keep a generated id unique.
+    pub fn mint_reservation_id(&self, at: SystemTime) -> String {
+        let base = generated_reservation_id(at);
+        if !self.reserved_cache_nodes.contains_key(&base) {
+            return base;
+        }
+        (1..=RESERVED_CACHE_NODE_QUOTA)
+            .map(|seq| format!("{base}-{seq}"))
+            .find(|candidate| !self.reserved_cache_nodes.contains_key(candidate))
+            // Unreachable: the store holds at most
+            // [`RESERVED_CACHE_NODE_QUOTA`] reservations, so one of the
+            // candidates above is always free.
+            .unwrap_or(base)
+    }
+
+    /// Store `record` and hand back what was stored, so a purchase's response
+    /// is built from the persisted reservation rather than from a copy beside
+    /// it.
+    pub fn insert_reservation(
+        &mut self,
+        record: ReservedCacheNodeRecord,
+    ) -> &ReservedCacheNodeRecord {
+        match self
+            .reserved_cache_nodes
+            .entry(record.reserved_cache_node_id.clone())
+        {
+            Entry::Vacant(slot) => slot.insert(record),
+            Entry::Occupied(mut slot) => {
+                slot.insert(record);
+                slot.into_mut()
+            }
+        }
+    }
+
     /// Store `record` and hand back what was stored, so a create's response is
     /// built from the persisted record rather than from a copy beside it.
     pub fn insert_snapshot(&mut self, record: SnapshotRecord) -> &SnapshotRecord {
@@ -3408,6 +3745,9 @@ impl ComAmazonawsElasticacheAmazonelasticachev9State {
         }
         for snapshot in self.snapshots.values_mut() {
             snapshot.settle(now);
+        }
+        for reservation in self.reserved_cache_nodes.values_mut() {
+            reservation.settle(now);
         }
     }
 }
