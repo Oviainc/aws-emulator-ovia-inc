@@ -21,6 +21,8 @@ mod authorization;
 mod cw_log_delivery;
 #[path = "all/list_tags_for_resource.rs"]
 mod list_tags_for_resource;
+#[path = "all/metric_destination_summary_members.rs"]
+mod metric_destination_summary_members;
 #[path = "all/metrics_destination_removal.rs"]
 mod metrics_destination_removal;
 #[path = "all/metrics_destinations.rs"]

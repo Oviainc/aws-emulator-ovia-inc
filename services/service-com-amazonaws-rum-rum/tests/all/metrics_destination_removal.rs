@@ -80,9 +80,15 @@ impl Destination {
         body
     }
 
-    /// The `MetricDestinationSummary` `ListRumMetricsDestinations` must report for it.
+    /// The `MetricDestinationSummary` `ListRumMetricsDestinations` must report for it:
+    /// all three modelled members, with an ARN this destination kind does not carry
+    /// reported as the empty string rather than omitted.
     fn summary(&self) -> Value {
-        self.put_body()
+        json!({
+            "Destination": self.destination,
+            "DestinationArn": self.destination_arn.clone().unwrap_or_default(),
+            "IamRoleArn": self.iam_role_arn.clone().unwrap_or_default(),
+        })
     }
 
     /// How this case names the destination, for an assertion message.
