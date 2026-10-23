@@ -151,9 +151,19 @@ async fn every_response_announces_one_media_type() {
             409,
         ),
         (
-            "GetDefaultScraperConfiguration, a scaffolded operation",
+            "GetDefaultScraperConfiguration, the default configuration document",
             "GET",
             "/scraperconfiguration".to_string(),
+            String::new(),
+            200,
+        ),
+        (
+            // Still a scaffold, so the 501 media type stays covered by a row the census
+            // can confirm: `src/ops/describe_scraper.rs` carries the
+            // `//! SCAFFOLDED, NOT IMPLEMENTED:` marker.
+            "DescribeScraper, a scaffolded operation",
+            "GET",
+            "/scrapers/s-00000000-0000-0000-0000-000000000000".to_string(),
             String::new(),
             501,
         ),
