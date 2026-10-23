@@ -21,6 +21,8 @@ mod approval_rule_template_description;
 mod approval_rule_templates;
 #[path = "all/approval_rules_and_commits.rs"]
 mod approval_rules_and_commits;
+#[path = "all/aws_error_message_text.rs"]
+mod aws_error_message_text;
 #[path = "all/batch_associate_approval_rule_template.rs"]
 mod batch_associate_approval_rule_template;
 #[path = "all/batch_get_repositories.rs"]
@@ -45,6 +47,8 @@ mod comment_content_deletion;
 mod comment_deleted_refusals;
 #[path = "all/comment_lifecycle.rs"]
 mod comment_lifecycle;
+#[path = "all/comment_thread_traversal.rs"]
+mod comment_thread_traversal;
 #[path = "all/commit_reads.rs"]
 mod commit_reads;
 #[path = "all/compared_commit_comments.rs"]
@@ -65,6 +69,8 @@ mod git_transport;
 mod harness;
 #[path = "all/object_store_bounds.rs"]
 mod object_store_bounds;
+#[path = "all/path_depth_bound.rs"]
+mod path_depth_bound;
 #[path = "all/repositories_for_approval_rule_template.rs"]
 mod repositories_for_approval_rule_template;
 #[path = "all/repository_description.rs"]

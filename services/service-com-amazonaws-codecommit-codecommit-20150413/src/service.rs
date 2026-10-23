@@ -107,9 +107,13 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
 /// framework's wording in place.
 ///
 /// Each code is an error shape this service's model declares, and each message is
-/// that shape's own documented sentence (the `//! ## Errors` list in
-/// `src/ops/<operation>.rs`), followed by the member at fault so the caller can
-/// fix the request from the message alone.
+/// the text the SERVICE answers that code with: that shape's own documented
+/// sentence (the `//! ## Errors` list in `src/ops/<operation>.rs`), or, where this
+/// crate words the code in one place for every operation that raises it, that
+/// wording from `crate::state`. Nothing is appended: a message naming the member at
+/// fault, or the validator that rejected it, would mark the refusal as the
+/// emulator's rather than the service's, and no AWS client-error message takes that
+/// shape.
 fn refusal_for(violation: &Violation) -> Option<Refused> {
     // A nested path names its top-level member first (`tags.aws:x.member`), and a
     // member of a nested shape is its LAST segment
@@ -141,6 +145,13 @@ fn refusal_for(violation: &Violation) -> Option<Refused> {
         ("branchName" | "defaultBranchName", _) if missing => (
             "BranchNameRequiredException",
             "A branch name is required, but was not specified.",
+        ),
+        // A `branchName` that is PRESENT but empty is refused by `BranchName`'s
+        // `@length min 1`, and CodeCommit words that case with its own sentence
+        // rather than the generic not-a-valid-reference-name text.
+        ("branchName" | "defaultBranchName", ViolationKind::MinLength(_)) => (
+            "InvalidBranchNameException",
+            crate::state::EMPTY_BRANCH_NAME_MESSAGE,
         ),
         ("branchName" | "defaultBranchName", _) => (
             "InvalidBranchNameException",
@@ -175,11 +186,12 @@ fn refusal_for(violation: &Violation) -> Option<Refused> {
         ),
         ("commitId" | "afterCommitId" | "beforeCommitId", _) if missing => (
             "CommitIdRequiredException",
-            "A commit ID was not specified.",
+            crate::state::COMMIT_ID_REQUIRED_MESSAGE,
         ),
-        ("commitId" | "afterCommitId" | "beforeCommitId", _) => {
-            ("InvalidCommitIdException", "The specified commit ID is not valid.")
-        }
+        ("commitId" | "afterCommitId" | "beforeCommitId", _) => (
+            "InvalidCommitIdException",
+            crate::state::INVALID_COMMIT_ID_MESSAGE,
+        ),
         ("commentId", _) if missing => (
             "CommentIdRequiredException",
             "The comment ID is missing or null. A comment ID is required.",
@@ -211,7 +223,7 @@ fn refusal_for(violation: &Violation) -> Option<Refused> {
         ),
         ("content", _) if missing => (
             "CommentContentRequiredException",
-            "The comment is empty. You must provide some content for a comment.",
+            crate::state::COMMENT_CONTENT_REQUIRED_MESSAGE,
         ),
         ("content", ViolationKind::MaxLength(_)) => (
             "CommentContentSizeLimitExceededException",
@@ -276,7 +288,7 @@ fn refusal_for(violation: &Violation) -> Option<Refused> {
         ),
         ("approvalRuleTemplateContent", _) => (
             "InvalidApprovalRuleTemplateContentException",
-            "The content of the approval rule template is not valid.",
+            crate::state::INVALID_APPROVAL_RULE_CONTENT_MESSAGE,
         ),
         ("approvalRuleTemplateDescription", _) => (
             "InvalidApprovalRuleTemplateDescriptionException",
@@ -305,14 +317,14 @@ fn refusal_for(violation: &Violation) -> Option<Refused> {
         ),
         ("resourceArn", _) => (
             "InvalidResourceArnException",
-            "The value for the resource ARN is not valid.",
+            crate::state::INVALID_RESOURCE_ARN_MESSAGE,
         ),
         // Everything else keeps the framework's own wording.
         _ => return None,
     };
     Some(Refused {
         code: code.to_string(),
-        message: format!("{requirement} (member: {})", violation.path),
+        message: requirement.to_string(),
     })
 }
 

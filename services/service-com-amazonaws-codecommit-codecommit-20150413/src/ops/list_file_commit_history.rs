@@ -224,12 +224,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(max_results) if max_results > 0 => usize::try_from(max_results)
                 .unwrap_or(MAX_RESULTS_PER_PAGE)
                 .min(MAX_RESULTS_PER_PAGE),
-            Some(max_results) => {
+            Some(_) => {
                 return Err(ListFileCommitHistoryErrorModeled::InvalidMaxResultsException(
                     InvalidMaxResultsException {
-                        message: Some(format!(
-                            "the maxResults value {max_results} is not valid: a non-zero, non-negative integer is required"
-                        )),
+                        // The one place this crate words this code for an operation
+                        // that publishes no maximum: every positive value is served
+                        // (shrunk to the page this service builds).
+                        message: Some(
+                            crate::state::NON_POSITIVE_MAX_RESULTS_MESSAGE.to_string(),
+                        ),
                     },
                 )
                 .into());
@@ -314,7 +317,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .ok_or_else(|| {
                     ListFileCommitHistoryErrorModeled::InvalidContinuationTokenException(
                         InvalidContinuationTokenException {
-                            message: Some(format!("the continuation token {token} is not valid")),
+                            message: Some(crate::state::invalid_continuation_token_message(
+                                token,
+                            )),
                         },
                     )
                 })?,

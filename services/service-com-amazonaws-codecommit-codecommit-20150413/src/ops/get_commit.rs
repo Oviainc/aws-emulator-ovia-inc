@@ -170,7 +170,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if input.commit_id.is_empty() {
             return Err(GetCommitErrorModeled::CommitIdRequiredException(
                 CommitIdRequiredException {
-                    message: Some("a commit ID was not specified".to_string()),
+                    message: Some(crate::state::COMMIT_ID_REQUIRED_MESSAGE.to_string()),
                 },
             )
             .into());
@@ -178,10 +178,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !crate::state::is_object_id(&input.commit_id) {
             return Err(GetCommitErrorModeled::InvalidCommitIdException(
                 InvalidCommitIdException {
-                    message: Some(format!(
-                        "the commit ID {} is not valid; a commit ID is the full SHA ID of a commit",
-                        input.commit_id
-                    )),
+                    message: Some(crate::state::INVALID_COMMIT_ID_MESSAGE.to_string()),
                 },
             )
             .into());

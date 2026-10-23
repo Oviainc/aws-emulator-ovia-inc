@@ -257,9 +257,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if max_results <= 0 {
                 return Err(GetDifferencesErrorModeled::InvalidMaxResultsException(
                     InvalidMaxResultsException {
-                        message: Some(format!(
-                            "the maximum number of results {max_results} is not valid: expected a non-zero, non-negative integer"
-                        )),
+                        // The one place this crate words this code for an operation
+                        // that publishes no maximum: every positive value is served.
+                        message: Some(
+                            crate::state::NON_POSITIVE_MAX_RESULTS_MESSAGE.to_string(),
+                        ),
                     },
                 )
                 .into());
@@ -417,7 +419,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .ok_or_else(|| {
                     GetDifferencesErrorModeled::InvalidContinuationTokenException(
                         InvalidContinuationTokenException {
-                            message: Some(format!("the continuation token {token} is not valid")),
+                            message: Some(crate::state::invalid_continuation_token_message(
+                                token,
+                            )),
                         },
                     )
                 })?,

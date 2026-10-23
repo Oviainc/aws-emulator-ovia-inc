@@ -6,9 +6,10 @@
 //!
 //! The rule under test: a modelled exception carries the message the service is
 //! recorded to produce for the operation that raised it — so
-//! `CommentDeletedException` carries the fixed sentence "The specified comment has
-//! already been marked as deleted. Verify that you specified a valid comment ID,
-//! and then try again.", led by a clause naming the refused action only for the
+//! `CommentDeletedException` carries the fixed sentence pair "The specified comment
+//! has already been marked as deleted." and "Verify that you specified a valid
+//! comment ID, and then try again.", separated by the TWO spaces the recording
+//! carries, led by a clause naming the refused action only for the
 //! repeated `DeleteCommentContent` the corpus records that way, and never carrying
 //! a value taken from the request. The deleted record is what decides this, so the
 //! refusal does not depend on which comment it is, who is asking, or whether the
@@ -31,16 +32,21 @@ use crate::wire::{ok_as, refusal_as, DEFAULT_ACCESS_KEY_ID};
 const REACTOR_ACCESS_KEY_ID: &str = "AKIDREACTINGUSER";
 
 /// The message `CommentDeletedException` carries, by the OPERATION that refused
-/// the call. The sentence alone is the recorded answer to a `GetComment` of a
+/// the call. The sentence pair alone is the recorded answer to a `GetComment` of a
 /// comment whose content has been deleted; the recorded answer to a repeated
 /// `DeleteCommentContent` leads it with the action it refused. No recording gives
 /// `UpdateComment` or `PutCommentReaction` a lead clause, so they carry the
-/// sentence the exception is recorded with.
+/// sentence the exception is recorded with. The sentences are separated by TWO
+/// spaces, which is part of the recorded constant — hence the explicit `concat!`,
+/// whose line continuation cannot swallow them.
 pub(crate) fn comment_deleted_message(operation: &str) -> String {
-    let already_deleted = "The specified comment has already been marked as deleted. Verify that \
-                           you specified a valid comment ID, and then try again.";
+    let already_deleted = concat!(
+        "The specified comment has already been marked as deleted.",
+        "  ",
+        "Verify that you specified a valid comment ID, and then try again.",
+    );
     match operation {
-        "DeleteCommentContent" => format!("You cannot delete this comment. {already_deleted}"),
+        "DeleteCommentContent" => format!("You cannot delete this comment.  {already_deleted}"),
         _ => already_deleted.to_string(),
     }
 }

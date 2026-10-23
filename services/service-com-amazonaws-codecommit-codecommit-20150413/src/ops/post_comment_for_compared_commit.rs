@@ -184,14 +184,16 @@ impl From<PostCommentForComparedCommitErrorModeled> for PostCommentForComparedCo
 
 /// A commit id named in the request: absent (empty) is `CommitIdRequiredException`,
 /// and anything that is not a git object name is `InvalidCommitIdException`.
-fn checked_commit_id(
-    member: &str,
-    commit_id: &str,
-) -> Result<(), PostCommentForComparedCommitError> {
+///
+/// Each message comes from the one place this crate words that code
+/// (`crate::state`), which `crate::service` uses for the same code when the request
+/// boundary refuses the member: one code, one message, and nothing naming the
+/// emulator's own validator.
+fn checked_commit_id(commit_id: &str) -> Result<(), PostCommentForComparedCommitError> {
     if commit_id.is_empty() {
         return Err(PostCommentForComparedCommitErrorModeled::CommitIdRequiredException(
             CommitIdRequiredException {
-                message: Some(format!("a commit id is required (member: {member})")),
+                message: Some(crate::state::COMMIT_ID_REQUIRED_MESSAGE.to_string()),
             },
         )
         .into());
@@ -199,9 +201,7 @@ fn checked_commit_id(
     if !crate::state::is_object_id(commit_id) {
         return Err(PostCommentForComparedCommitErrorModeled::InvalidCommitIdException(
             InvalidCommitIdException {
-                message: Some(format!(
-                    "the commit id {commit_id} is not valid (member: {member})"
-                )),
+                message: Some(crate::state::INVALID_COMMIT_ID_MESSAGE.to_string()),
             },
         )
         .into());
@@ -267,7 +267,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if input.content.is_empty() {
             return Err(PostCommentForComparedCommitErrorModeled::CommentContentRequiredException(
                 CommentContentRequiredException {
-                    message: Some("the comment content is required".to_string()),
+                    message: Some(crate::state::COMMENT_CONTENT_REQUIRED_MESSAGE.to_string()),
                 },
             )
             .into());
@@ -286,7 +286,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        checked_commit_id("afterCommitId", &input.after_commit_id)?;
+        checked_commit_id(&input.after_commit_id)?;
         // A blank `beforeCommitId` names no before commit, the same as leaving the
         // optional member out: a comment on an initial commit has no before side.
         let before_commit_id = input
@@ -294,7 +294,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .as_deref()
             .filter(|commit_id| !commit_id.is_empty());
         if let Some(before_commit_id) = before_commit_id {
-            checked_commit_id("beforeCommitId", before_commit_id)?;
+            checked_commit_id(before_commit_id)?;
             if before_commit_id == input.after_commit_id {
                 return Err(
                     PostCommentForComparedCommitErrorModeled::BeforeCommitIdAndAfterCommitIdAreSameException(

@@ -208,8 +208,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::canonical_reaction(&input.reaction_value).ok_or_else(|| {
                     PutCommentReactionErrorModeled::InvalidReactionValueException(
                         InvalidReactionValueException {
+                            // The template for this class: the literal prefix and
+                            // then the value the request sent, as it sent it.
                             message: Some(format!(
-                                "the reaction value {} is not valid",
+                                "Unrecognized Reaction Value: {}",
                                 input.reaction_value
                             )),
                         },
