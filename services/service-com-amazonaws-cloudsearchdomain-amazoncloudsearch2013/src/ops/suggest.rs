@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op Suggest
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `Suggest`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`Suggest::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Answers autocomplete suggestions from the addressed domain's index: it
+//! prefix-matches the query string against the values of the suggester's source
+//! field over the uploaded documents, as the operation documents ("Amazon
+//! CloudSearch finds all of the documents whose values in the suggester field
+//! start with the specified query string"). A suggester the domain does not have
+//! earns the modelled `SearchException`.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +151,148 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `Suggest` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SuggestErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let started = std::time::Instant::now();
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| search_error("The search index is unavailable for this endpoint."))?;
+        let domain = crate::state::domain_key(ctx.parts());
+
+        // The query is caller-controlled text, so its length is bounded before it
+        // is matched against every stored value.
+        crate::state::query::guard_query_size("q", &input.query).map_err(search_error)?;
+
+        let size = match input.size {
+            // As with Search, the modelled default of 0 cannot be told apart from
+            // an absent parameter, and the API documents a default of 10.
+            0 => crate::state::DEFAULT_PAGE_SIZE,
+            size if size > 0 => usize::try_from(size).unwrap_or(usize::MAX),
+            size => {
+                return Err(search_error(format!(
+                    "Invalid size value {size}; size must be a non-negative integer."
+                )))
+            }
+        };
+        // The page of suggestions this call BUILDS is bounded by the same
+        // documented paging depth `Search` applies, so the two paging surfaces
+        // state one rule.
+        if size > crate::state::query::MAX_PAGE_DEPTH {
+            return Err(search_error(format!(
+                "Invalid size value {size}; a page holds at most {} suggestions.",
+                crate::state::query::MAX_PAGE_DEPTH
+            )));
+        }
+
+        // The index is read ONCE, under the lock, and everything this call
+        // computes — which suggesters the domain exposes included — is derived
+        // from that one snapshot outside it, so a scan never holds the store.
+        let documents = state.lock().snapshot(&domain);
+        let Some(field) = crate::state::suggester_field(&documents, &input.suggester) else {
+            return Err(search_error(format!(
+                "The suggester '{}' does not exist in this domain.",
+                input.suggester
+            )));
+        };
+
+        // "The beginning of the field must match the query string to be
+        // considered a match", case-insensitively, as CloudSearch's suggester
+        // analysis is. The scan reads the same stored values Search reads, so it
+        // is charged to the same budget and yields on the same interval; the
+        // comparison lower-cases character by character instead of allocating a
+        // copy of every value.
+        let needle = input.query.trim().to_lowercase();
+        // An empty query names no prefix, and every stored value begins with the
+        // empty prefix, so serving it would answer "every document" to a request
+        // that asked for nothing. `Search` refuses an empty `q` with the same
+        // modelled error, and the two surfaces state one rule.
+        if needle.is_empty() {
+            return Err(search_error(
+                "The q parameter must specify at least one character to suggest from.",
+            ));
+        }
+        let mut budget = crate::state::query::Budget::new();
+        let mut matches: Vec<(String, String)> = Vec::new();
+        for (scanned, document) in documents.iter().enumerate() {
+            if scanned % crate::state::query::SCAN_YIELD_INTERVAL == 0 {
+                tokio::task::yield_now().await;
+            }
+            let values = document.values(&field);
+            budget.charge_scan(values).map_err(search_error)?;
+            for value in values {
+                if starts_with_ignoring_case(value, &needle) {
+                    matches.push((value.clone(), document.id.clone()));
+                    break;
+                }
+            }
+        }
+
+        // The relevance score of a suggestion is how many documents of this
+        // domain suggest that same value, so a more common suggestion ranks
+        // higher; equal scores are ordered by suggestion and then by document id,
+        // so one page of suggestions is stable.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("Suggest"))
+        // LIMITATION: on AWS the score comes from the suggester's configured
+        // `sort` expression or fuzzy-match weighting, which is defined out of band
+        // by the configuration service's `DefineSuggester` and is not visible to a
+        // domain endpoint (see `crate::state::suggester_field`). This popularity count
+        // is this endpoint's own ranking, computed from the indexed documents —
+        // never CloudSearch's own number.
+        let mut popularity: std::collections::HashMap<String, i64> =
+            std::collections::HashMap::new();
+        for (suggestion, _) in &matches {
+            *popularity.entry(suggestion.clone()).or_insert(0) += 1;
+        }
+        matches.sort_by(|left, right| {
+            let left_score = popularity.get(&left.0).copied().unwrap_or_default();
+            let right_score = popularity.get(&right.0).copied().unwrap_or_default();
+            right_score
+                .cmp(&left_score)
+                .then_with(|| left.0.cmp(&right.0))
+                .then_with(|| left.1.cmp(&right.1))
+        });
+
+        let found = i64::try_from(matches.len()).unwrap_or(i64::MAX);
+        let suggestions: Vec<SuggestionMatch> = matches
+            .iter()
+            .take(size)
+            .map(|(suggestion, id)| SuggestionMatch {
+                score: popularity.get(suggestion).copied().unwrap_or_default(),
+                suggestion: Some(suggestion.clone()),
+                id: Some(id.clone()),
+            })
+            .collect();
+
+        Ok(SuggestOutput {
+            status: Some(SuggestStatus {
+                timems: crate::state::elapsed_ms(started),
+                rid: Some(crate::state::new_rid()),
+            }),
+            suggest: Some(SuggestModel {
+                query: Some(input.query),
+                found,
+                suggestions: Some(suggestions),
+            }),
+        })
     }
+}
+
+/// Whether `value` begins with `needle`, which must already be lower-cased.
+///
+/// Lower-cases `value` one character at a time rather than allocating a copy of
+/// it, and stops as soon as the prefix decides.
+fn starts_with_ignoring_case(value: &str, needle: &str) -> bool {
+    let mut lowered = value.chars().flat_map(char::to_lowercase);
+    for expected in needle.chars() {
+        match lowered.next() {
+            Some(actual) if actual == expected => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// The modelled refusal (HTTP 400) for a suggest request this endpoint rejects.
+fn search_error(message: impl Into<String>) -> SuggestError {
+    SuggestErrorModeled::SearchException(SearchException {
+        message: Some(message.into()),
+    })
+    .into()
 }

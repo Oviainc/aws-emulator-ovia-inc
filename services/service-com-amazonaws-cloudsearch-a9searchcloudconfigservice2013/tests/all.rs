@@ -13,5 +13,7 @@
 // points it into `tests/all/`.
 #[path = "all/domain_lifecycle.rs"]
 mod domain_lifecycle;
+#[path = "all/endpoint_claim.rs"]
+mod endpoint_claim;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

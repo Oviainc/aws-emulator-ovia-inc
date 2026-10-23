@@ -45,6 +45,39 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+/// The first URI path segment EVERY request to this service carries: the ROOT path.
+///
+/// This model is `awsQuery`, so every operation is `POST /` with the operation named
+/// by the `Action` body field and no `smithy.api#http` binding on the wire (the
+/// crate's `OPERATIONS.md`, "Wire protocol"). `emulator_server::ROOT_PATH_SEGMENT` is
+/// the framework's sentinel for exactly that path; claiming it rather than the
+/// generated EMPTY `ROUTE_PATH_SEGMENTS` (which claims every path under the signing
+/// name) keeps this service out of the CloudSearch Domain endpoint's path space.
+const OWN_PATH_SEGMENTS: &[&str] = &[emulator_server::ROOT_PATH_SEGMENT];
+
+/// Whether the request these `parts` came from resolves to `route_key` AND addresses
+/// the one URI path this service's wire protocol publishes ([`OWN_PATH_SEGMENTS`]).
+///
+/// `emulator_server::can_handle_based_on_route_key_and_path` is the agent-immutable
+/// owner of that rule and is CALLED here rather than re-implemented: the request's
+/// route key must match the key passed AND its first URI path segment must be one of
+/// the segments passed, by exact segment equality.
+///
+/// The helper takes a whole `http::Request` while [`Service::can_handle`] is handed
+/// only the request's parts, so the two things it reads — the URI and the headers —
+/// are re-presented to it as a bodiless request. It reads neither the body nor the
+/// method, so nothing it decides on is missing.
+fn claims_own_key_and_root_path(parts: &http::request::Parts, route_key: &str) -> bool {
+    let Ok(mut request) = http::Request::builder()
+        .uri(parts.uri.clone())
+        .body(bytes::Bytes::new())
+    else {
+        return false;
+    };
+    *request.headers_mut() = parts.headers.clone();
+    emulator_server::can_handle_based_on_route_key_and_path(&request, route_key, OWN_PATH_SEGMENTS)
+}
+
 /// The `com-amazonaws-cloudsearch-a9searchcloudconfigservice2013` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -74,13 +107,30 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn can_handle(&self, parts: &http::request::Parts) -> bool {
-        // Claim a request whose resolved route key is this service's signing
-        // name. Edit this for anything the model does not express — a signing
-        // name shared by several services, or access-key-id-based routing.
-        match smithy_server_runtime::resolve_route_key(parts) {
-            Some(key) => key == self.entry.identity().signing_name(),
-            None => false,
-        }
+        // This service and the CloudSearch DOMAIN data plane share one SigV4
+        // signing name (`cloudsearch`), so the signing name alone cannot tell
+        // them apart and a router that matched on it would see two claimants and
+        // answer 500 `AmbiguousService` — a code no AWS model declares — for
+        // every request to either one. What separates them is the endpoint: this
+        // model is `awsQuery`, so every operation is `POST /` with `Action` in
+        // the body (the crate's `OPERATIONS.md`, "Wire protocol"), while the
+        // domain endpoint serves only the dated data-plane paths
+        // (`/2013-01-01/search`, `/2013-01-01/suggest`,
+        // `/2013-01-01/documents/batch`).
+        //
+        // The rule is the framework's own — `emulator_server`'s
+        // `can_handle_based_on_route_key_and_path`, the agent-immutable owner of
+        // the "route key AND modelled path space" test — so it is CALLED rather
+        // than restated here, exactly as the cloudwatchevents and IAM services
+        // call it. (`service_common::claims_request` wraps this same helper; this
+        // crate reaches the owner directly so the fix adds no dependency, and so
+        // no `Cargo.lock` edit, which the merge gate's file-level squash cannot
+        // land while mainline rewrites that file every few minutes.) The
+        // generated `ROUTE_PATH_SEGMENTS` is EMPTY for a query protocol ("no
+        // constraint", which would claim every path under the key), so the
+        // segment list passed is the framework's own sentinel for the one path
+        // this protocol publishes.
+        claims_own_key_and_root_path(parts, self.entry.identity().signing_name())
     }
 
     fn override_operation(
