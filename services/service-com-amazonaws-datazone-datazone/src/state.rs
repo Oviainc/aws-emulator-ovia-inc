@@ -106,6 +106,31 @@ pub fn is_form_type_name(name: &str) -> bool {
         && matches_form_type_name_pattern(name)
 }
 
+/// The form type NAME a `FormTypeIdentifier` resolves to.
+///
+/// A DataZone form type is addressed by its name: `FormTypeIdentifier` (len 1..385,
+/// pattern `^(?!\.)[\w\.]*\w$`) carries that name, while `FormEntryOutput`'s `typeName`
+/// is a `FormTypeName` (len 1..128, pattern
+/// `^(amazon.datazone.)?(?![0-9_])\w+$|^_\w*[a-zA-Z0-9]\w*$`) — both from
+/// `smithy_query(query="shape",shape="FormEntryInput,FormEntryOutput")`. So an
+/// identifier that is already a well-formed name (including one in the service's own
+/// `amazon.datazone.` namespace) resolves to itself, and a qualified identifier in any
+/// other namespace resolves to its unqualified last segment, which is the form type's
+/// own name.
+///
+/// Shared by every handler that has to decide whether two form type references name the
+/// same form type: `CreateAssetType` stores a form entry's resolved name, and
+/// `DeleteFormType` compares a stored reference against the form type being deleted — so
+/// the two cannot drift. Whether a form type of that name EXISTS is a separate question:
+/// the built-in `amazon.datazone.*` types are not stored at all, and an asset type or an
+/// asset may name a form type in any namespace.
+pub fn form_type_reference_name(identifier: &str) -> &str {
+    if is_form_type_name(identifier) {
+        return identifier;
+    }
+    identifier.split('.').next_back().unwrap_or(identifier)
+}
+
 /// The `GlossaryStatus` members (model enum `com.amazonaws.datazone#GlossaryStatus`:
 /// DISABLED | ENABLED).
 pub const GLOSSARY_STATUS_ENABLED: &str = "ENABLED";
@@ -240,6 +265,93 @@ impl Domain {
             .values_mut()
             .find(|listing| listing.entity_type == entity_type && listing.entity_id == entity_id)
     }
+
+    /// The object stored in this domain that binds a metadata form to the form type
+    /// `form_type_name` and so prevents its deletion, when one does.
+    ///
+    /// An asset type's forms carry the form type a form of that type must satisfy, and
+    /// an asset's forms carry the form type the form's content is an instance of. Both
+    /// name it by `FormTypeIdentifier`, so each reference is resolved to a form type
+    /// name with [`form_type_reference_name`] before it is compared. Asset types are
+    /// looked at first — in name order, then assets in id order — so the dependency
+    /// reported is the same one on every call: the asset type that links the form type
+    /// where one does, and otherwise the asset that uses it. `None` exactly when nothing
+    /// in this domain depends on that form type, which is what lets `DeleteFormType`
+    /// remove it. A linear scan over maps bounded by [`MAX_ASSET_TYPES_PER_DOMAIN`] and
+    /// [`MAX_ASSETS_PER_DOMAIN`], the same trade [`Self::listing_for_entity`] makes.
+    pub fn form_type_blocker(&self, form_type_name: &str) -> Option<DeletionBlocker> {
+        let binds_it = |reference: &str| form_type_reference_name(reference) == form_type_name;
+        let blocking_type = self
+            .asset_types
+            .values()
+            .find(|asset_type| {
+                asset_type
+                    .forms
+                    .values()
+                    .any(|form| binds_it(&form.type_name))
+            })
+            .map(|asset_type| DeletionBlocker {
+                tag: GRAPH_TAG_ASSET,
+                identifier: asset_type.name.clone(),
+            });
+        blocking_type.or_else(|| {
+            self.assets
+                .values()
+                .find(|asset| {
+                    asset
+                        .forms
+                        .iter()
+                        .any(|form| form.type_name.as_deref().is_some_and(binds_it))
+                })
+                .map(|asset| DeletionBlocker {
+                    tag: GRAPH_TAG_ASSET,
+                    identifier: asset.id.clone(),
+                })
+        })
+    }
+}
+
+/// One stored object whose dependency on another object prevents that object's deletion
+/// — what [`Domain::form_type_blocker`] reports and [`deletion_prevented_message`] names
+/// in the refusal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeletionBlocker {
+    /// The tag naming this object's kind in the dependency graph: one of the
+    /// `GRAPH_TAG_*` constants.
+    pub tag: &'static str,
+    /// The object's own identifier within its domain.
+    pub identifier: String,
+}
+
+/// The dependency-graph tag a metadata form type is named by in a deletion refusal.
+///
+/// SOURCE: the recorded `ConflictException` wording, which names the form type being
+/// deleted `type Form#<domainId>#<formTypeName>`.
+pub const GRAPH_TAG_FORM_TYPE: &str = "Form";
+
+/// The dependency-graph tag an asset-domain object — an asset type, or an asset of one —
+/// is named by in a deletion refusal.
+///
+/// SOURCE: the same recorded wording, which names the asset type that prevented a form
+/// type's deletion `type asset#<domainId>#<assetTypeName>`. The third field is the
+/// object's own identifier, which is what tells one asset-domain object from another.
+pub const GRAPH_TAG_ASSET: &str = "asset";
+
+/// One object as a deletion refusal names it: `type <tag>#<domainId>#<identifier>`.
+pub fn graph_object(tag: &str, domain_id: &str, identifier: &str) -> String {
+    format!("type {tag}#{domain_id}#{identifier}")
+}
+
+/// The `ConflictException` message DataZone answers a delete a stored dependency
+/// prevents: the object that could not be deleted, and the object that prevented it.
+///
+/// Built from the request and the store, never from a recorded value: the wording is
+/// recorded behaviour ("The following objects could not be deleted: `<object>` deletion
+/// prevented by `<blocker>`. ", ending in a period and a space), while both objects in it
+/// are named by [`graph_object`] from the domain, kind and identifier the call actually
+/// found.
+pub fn deletion_prevented_message(object: &str, blocker: &str) -> String {
+    format!("The following objects could not be deleted: {object} deletion prevented by {blocker}. ")
 }
 
 /// One stored catalog listing: an entity published in the domain's catalog.
@@ -1621,6 +1733,7 @@ pub enum ResourceKind {
     DomainUnit,
     Project,
     AssetType,
+    FormType,
     Glossary,
     Asset,
     DataProduct,
@@ -1635,6 +1748,7 @@ impl ResourceKind {
             Self::DomainUnit => "Domain unit",
             Self::Project => "Project",
             Self::AssetType => "Asset type",
+            Self::FormType => "Form type",
             Self::Glossary => "Glossary",
             Self::Asset => "Asset",
             Self::DataProduct => "Data product",
@@ -1648,9 +1762,22 @@ impl ResourceKind {
     /// not-found message in this service's handlers through this, so none of them can
     /// echo the request back.
     pub fn not_found_message(self) -> String {
-        format!("{} not found", self.as_str())
+        match self {
+            // Recorded behaviour: a metadata form type DataZone cannot find is reported
+            // with its own sentence rather than the "<Kind> not found" form. Still a
+            // fixed text naming only the kind, so it echoes nothing back either.
+            Self::FormType => FORM_TYPE_NOT_FOUND_MESSAGE.to_string(),
+            _ => format!("{} not found", self.as_str()),
+        }
     }
 }
+
+/// The `ResourceNotFoundException` message DataZone answers for a metadata form type it
+/// cannot find — [`ResourceKind::FormType`]'s not-found text, recorded from the service.
+/// Every handler that addresses a form type (`GetFormType`, `DeleteFormType`) answers
+/// the same text, so the two cannot drift.
+pub const FORM_TYPE_NOT_FOUND_MESSAGE: &str =
+    "The given FormType doesn't exist. Try creating FormType before accessing it.";
 
 impl std::fmt::Display for ResourceKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
