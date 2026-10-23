@@ -21,6 +21,8 @@ mod contact_information;
 mod pattern_validation_messages;
 #[path = "all/primary_email_update.rs"]
 mod primary_email_update;
+#[path = "all/region_opt_in.rs"]
+mod region_opt_in;
 #[path = "all/region_opt_in_listing.rs"]
 mod region_opt_in_listing;
 #[path = "all/state_roundtrip.rs"]
