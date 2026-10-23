@@ -62,14 +62,16 @@
 //!
 //! ## What is NOT held to the catalogue
 //!
-//! A template that declares a `Transform`. "CloudFormation processes the template
-//! fragments" a macro is given and validates the PROCESSED template, so the types such a
-//! template spells may be a macro's input rather than what CloudFormation ends up
-//! validating (`AWS::Serverless::*` under the `AWS::Serverless-2016-10-31` transform is the
-//! familiar case). This emulator expands no macro — [`super::template`] leaves a
-//! `Fn::Transform` unevaluated — so holding a transformed template to this catalogue would
-//! refuse types the expansion would have produced. Such a template is admitted, and its
-//! resources are recorded as declared.
+//! A template that declares a `Transform` this emulator does not process. "CloudFormation
+//! processes the template fragments" a macro is given and validates the PROCESSED template,
+//! so the types such a template spells may be a macro's input rather than what
+//! CloudFormation ends up validating. The familiar case — `AWS::Serverless::*` under the
+//! `AWS::Serverless-2016-10-31` transform — IS processed ([`super::sam`] expands it before
+//! [`super::template`] reads a resource, so what reaches this catalogue is the concrete
+//! types that expansion produced), but every other macro is still unexpanded and
+//! [`super::template`] leaves a `Fn::Transform` unevaluated, so holding a transformed
+//! template to this catalogue would refuse types the expansion would have produced. Such a
+//! template is admitted, and its resources are recorded as declared.
 
 use super::template::{DeclaredResource, Template};
 
@@ -904,7 +906,9 @@ pub fn unrecognized_message(types: &[String]) -> String {
 /// recognise — the refusal a submitted template is held to before anything is created.
 ///
 /// `Ok(())` for a template that declares a `Transform`: a macro's expansion is what
-/// CloudFormation validates, and this emulator expands none (see the module docs).
+/// CloudFormation validates, and the only macro this emulator expands is the SAM one (see
+/// the module docs), whose expansion has already happened by the time a template reaches
+/// here.
 pub fn refuse_unrecognized(template: &Template) -> Result<(), String> {
     if !template.transforms.is_empty() {
         return Ok(());

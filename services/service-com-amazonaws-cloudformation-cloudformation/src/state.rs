@@ -103,6 +103,11 @@ pub mod provisioning;
 /// declares.
 pub mod template;
 
+/// The `AWS::Serverless-2016-10-31` (AWS SAM) transform: the resources that macro's
+/// expansion puts in place of a template's `AWS::Serverless::*` declarations, applied
+/// before anything reads the template.
+pub mod sam;
+
 /// Computing a change set: comparing the stack's template and parameters with the ones a
 /// change set submits, and the resource-level change list that comparison answers.
 pub mod change_plan;

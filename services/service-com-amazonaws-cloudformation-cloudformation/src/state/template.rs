@@ -600,13 +600,36 @@ pub fn required_capabilities(template: &Template) -> RequiredCapabilities {
 
 /// Read a template body, whether it is spelled as JSON or as YAML.
 ///
+/// A body whose `Transform` section names a macro this emulator PROCESSES is processed
+/// first ([`super::sam`], for `AWS::Serverless-2016-10-31`): "CloudFormation processes the
+/// template fragments" a macro is given and then works with what came back, so every
+/// reader of a template — a change set's plan, a deployment's resources, a stack's outputs —
+/// sees the resources the macro produced rather than the ones that were its input. The
+/// documented per-template quotas below are therefore applied to the PROCESSED template,
+/// which is the one CloudFormation validates.
+///
 /// `None` for a body that is neither, for a YAML body past the nesting bounds
 /// [`guard_yaml_body`] puts on an untrusted document, and for one past a documented
 /// per-template quota — a caller may put anything in `TemplateBody`, and a body this
 /// reader will not read declares no resources and no outputs rather than a subset of them.
 pub fn parse(body: &str) -> Option<Template> {
-    let document = document(body)?;
+    let mut document = document(body)?;
+    super::sam::expand(&mut document);
     template_of(&document)
+}
+
+/// The template body as CloudFormation PROCESSED it: the expansion of the macros this
+/// emulator processes, spelled as a JSON template (one `serde_json::Value` represents
+/// either submitted spelling, so the processed form of a YAML body is its JSON
+/// equivalent).
+///
+/// `None` when the body declares no macro this emulator processes, which is the case
+/// `GetTemplate` documents as "if the template doesn't include transforms, Original and
+/// Processed return the same template": the caller answers the submitted body itself,
+/// byte for byte, rather than a re-serialisation of it.
+pub fn processed(body: &str) -> Option<String> {
+    let mut document = document(body)?;
+    super::sam::expand(&mut document).then(|| document.to_string())
 }
 
 /// The `Description` a template declares, if it declares one.
@@ -777,7 +800,7 @@ fn template_of(document: &Value) -> Option<Template> {
 /// macro entry may be the name alone or an object carrying `Name` beside the macro's
 /// `Parameters` — so the NAME is what is reported either way, and an entry that names
 /// nothing contributes nothing.
-fn declared_transforms(section: Option<&Value>) -> Vec<String> {
+pub(crate) fn declared_transforms(section: Option<&Value>) -> Vec<String> {
     fn transform_name(entry: &Value) -> Option<String> {
         match entry {
             Value::String(name) => Some(name.clone()),
@@ -2049,6 +2072,16 @@ fn derived_digits(salt: &str, name: &str, digits: usize, alphabet: Alphabet) -> 
         Alphabet::Upper => ::hex::encode_upper(finished),
     };
     digest[..digits.min(digest.len())].to_string()
+}
+
+/// `digits` lowercase hexadecimal characters derived from `content` under `salt`.
+///
+/// [`derived_digits`] is the crate's ONE digest derivation; this is the name it is reached
+/// under from outside this module, for the content hash a macro expansion puts on the
+/// logical id of a resource that cannot be updated in place (see
+/// [`super::sam`](crate::state::sam)).
+pub(crate) fn content_digest(salt: &str, content: &str, digits: usize) -> String {
+    derived_digits(salt, content, digits, Alphabet::Lower)
 }
 
 /// How many characters of the digest the unique segment of a [`generated_name`] carries.
