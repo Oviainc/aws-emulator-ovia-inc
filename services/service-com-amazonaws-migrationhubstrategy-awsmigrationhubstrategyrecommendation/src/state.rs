@@ -21,16 +21,21 @@
 //! And beside those, the account's one **portfolio preferences** record
 //! ([`PortfolioPreferences`]): what `PutPortfolioPreferences` saves and
 //! `GetPortfolioPreferences` reports, member for member.
+//!
+//! Last, the account's **recommendation report generation tasks**
+//! ([`RecommendationReport`]): what `StartRecommendationReportGeneration` mints — one at
+//! a time, a start call made while one is running coalescing onto it — and
+//! `GetRecommendationReportDetails` reports.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound;
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     ApplicationPreferences, AssessmentTarget, DataCollectionDetails, DatabasePreferences,
     GetImportFileTaskOutput, GetPortfolioPreferencesOutput, Group, ImportFileTaskInformation,
-    OSInfo, PrioritizeBusinessGoals, RecommendationSet, ResourceNotFoundException, ServerDetail,
-    ServerError, SystemInfo, ValidationException,
+    OSInfo, PrioritizeBusinessGoals, RecommendationReportDetails, RecommendationSet,
+    ResourceNotFoundException, ServerDetail, ServerError, SystemInfo, ValidationException,
 };
 
 /// `ImportFileTaskStatus`'s non-terminal import status: the status a task carries from
@@ -54,14 +59,38 @@ pub const ASSESSMENT_COMPLETE: &str = "COMPLETE";
 /// The `AssessmentStatus` `StopAssessment` moves a running assessment to.
 pub const ASSESSMENT_STOPPED: &str = "STOPPED";
 
-/// How long an import file task stays `ImportInProgress`, and an assessment
-/// `IN_PROGRESS`, before the clock owes it a terminal status.
+/// `RecommendationReportStatus`'s non-terminal value: the status a report generation
+/// task carries from the instant `StartRecommendationReportGeneration` returns until the
+/// clock owes it a terminal one.
+pub const REPORT_IN_PROGRESS: &str = "IN_PROGRESS";
+
+/// The terminal `RecommendationReportStatus` a report generation task that ran to the
+/// end reaches.
 ///
-/// Neither AWS nor the model publishes a duration for either, so the emulator chooses
-/// one span for both. It is deliberately NOT zero, so a caller acting straight after the
-/// start call still observes the non-terminal status (and `StopAssessment` still has a
-/// running assessment to stop). The due instant is stored on the record and materialised
-/// by whichever later call reads it — nothing sleeps.
+/// It is the status the service's recorded behaviour shows a started task settling on (a
+/// task is `IN_PROGRESS` and then `SUCCESS`), so a task of this emulator settles there
+/// too. What this emulator cannot do is DELIVER the artifact: a recommendation report is
+/// an Excel or JSON FILE the service uploads to the account's S3 report bucket, and there
+/// is no S3 data plane here to upload it to. That is reported rather than papered over —
+/// the task's [`RecommendationReport::status_message`] says no report file was written,
+/// and `s3Bucket`/`s3Keys` stay absent, so nothing names a file nothing wrote.
+pub const REPORT_SUCCESS: &str = "SUCCESS";
+
+/// The `OutputFormat` a report generation task takes when the request names none:
+/// `StartRecommendationReportGenerationRequest$outputFormat` is documented "The output
+/// format for the recommendation report file. The default format is Microsoft Excel",
+/// and `Excel` is that format's value in `OutputFormat`.
+pub const DEFAULT_OUTPUT_FORMAT: &str = "Excel";
+
+/// How long an import file task stays `ImportInProgress`, an assessment `IN_PROGRESS`,
+/// and a recommendation report generation task `IN_PROGRESS`, before the clock owes it a
+/// terminal status.
+///
+/// Neither AWS nor the model publishes a duration for any of them, so the emulator
+/// chooses one span for all three. It is deliberately NOT zero, so a caller acting
+/// straight after the start call still observes the non-terminal status (and
+/// `StopAssessment` still has a running assessment to stop). The due instant is stored on
+/// the record and materialised by whichever later call reads it — nothing sleeps.
 pub const COMPLETION_SPAN: Duration = Duration::from_millis(500);
 
 /// How many import file tasks the store holds before `StartImportFileTask` answers its
@@ -76,6 +105,24 @@ pub const IMPORT_TASK_QUOTA: usize = 1_000;
 /// The same bound for assessments, refused with `StartAssessment`'s own modelled
 /// `ServiceQuotaExceededException`.
 pub const ASSESSMENT_QUOTA: usize = 1_000;
+
+/// How many recommendation report generation tasks the store holds before
+/// `StartRecommendationReportGeneration` refuses to mint another.
+///
+/// The same emulator-owned bound as [`IMPORT_TASK_QUOTA`] and [`ASSESSMENT_QUOTA`], for
+/// the same reason: it is what stops the store growing without end. The operation models
+/// no quota error, so the refusal is its modelled `ThrottlingException` (HTTP 429) — the
+/// request is denied because too many have been made.
+pub const REPORT_QUOTA: usize = 1_000;
+
+/// How many `groupIdFilter` entries `StartRecommendationReportGeneration` accepts.
+///
+/// `GroupIds` declares no `@length`, so the boundary validator admits a list of any size;
+/// this is the emulator's OWN bound on the work one request can ask for, and a filter
+/// past it is refused with the service's invalid-request-body sentence rather than
+/// silently truncated — the same treatment a `maxResults` past its documented maximum
+/// gets ([`MAX_LIST_PAGE_SIZE`]).
+pub const MAX_GROUP_FILTER_ENTRIES: usize = 100;
 
 /// One import file task, as this emulator persists it.
 #[derive(Debug, Clone)]
@@ -322,6 +369,90 @@ impl Assessment {
     }
 }
 
+/// One recommendation report generation task, as this emulator persists it.
+///
+/// `StartRecommendationReportGeneration` mints it and `GetRecommendationReportDetails`
+/// reports it; every member of the `RecommendationReportDetails` the read answers with is
+/// computed from this record ([`Self::to_details`]).
+#[derive(Debug, Clone)]
+pub struct RecommendationReport {
+    /// A `RecommendationTaskId` minted by
+    /// [`ComAmazonawsMigrationhubstrategyAwsmigrationhubstrategyrecommendationState::mint_recommendation_report_id`].
+    pub id: String,
+    /// One of `RecommendationReportStatus`'s values.
+    pub status: String,
+    /// `RecommendationReportDetails$statusMessage`, set when the task reaches its
+    /// terminal status.
+    pub status_message: Option<String>,
+    /// The `OutputFormat` the report was asked for, [`DEFAULT_OUTPUT_FORMAT`] when the
+    /// request named none.
+    pub output_format: String,
+    /// How many servers of the portfolio the request's `groupIdFilter` selected when this
+    /// task started — counted from the store, never from the request.
+    ///
+    /// The filter ITSELF is not kept: no member of `RecommendationReportDetails` reports
+    /// it, so the record holds the count it produced rather than a caller-sized list for
+    /// the life of the task.
+    pub servers_covered: i32,
+    pub start_time: SystemTime,
+    pub completion_time: Option<SystemTime>,
+    /// The instant the clock owes this task its terminal status, while it has one. It is
+    /// also what makes the task "in progress": a start call made while one is owed
+    /// coalesces onto this task rather than minting a second one.
+    pub completion_due: Option<SystemTime>,
+}
+
+impl RecommendationReport {
+    /// Materialise the terminal status the clock owes this task, if `now` is past its due
+    /// instant.
+    ///
+    /// `completion_time` is the DUE instant rather than `now`, so a task reports the same
+    /// completion time however late it is first read. The status is [`REPORT_SUCCESS`]:
+    /// see that constant for what the accompanying message reports.
+    pub fn settle(&mut self, now: SystemTime) {
+        let Some(due) = self.completion_due else {
+            return;
+        };
+        if now < due {
+            return;
+        }
+        self.status = REPORT_SUCCESS.to_string();
+        self.completion_time = Some(due);
+        self.completion_due = None;
+        self.status_message = Some(format!(
+            "{} server(s) of the portfolio were in scope. No {} recommendation report file was \
+             written: this emulator serves no Amazon S3 data plane to upload one to.",
+            self.servers_covered, self.output_format
+        ));
+    }
+
+    /// True while this task has not reached a terminal `RecommendationReportStatus`, so a
+    /// new start call coalesces onto it.
+    pub fn is_in_progress(&self) -> bool {
+        self.completion_due.is_some()
+    }
+
+    /// The `RecommendationReportDetails` `GetRecommendationReportDetails` reports: this
+    /// record's status, message and timestamps, and nothing derived from the request that
+    /// reads it.
+    ///
+    /// `s3Bucket` and `s3Keys` are left unset — they name where the report FILE is, and
+    /// no file was written (see [`REPORT_SUCCESS`]), so there is no bucket holding one and
+    /// no key naming one.
+    pub fn to_details(&self) -> RecommendationReportDetails {
+        RecommendationReportDetails {
+            status: Some(self.status.clone()),
+            status_message: self.status_message.clone(),
+            start_time: Some(::aws_smithy_types::DateTime::from(self.start_time)),
+            completion_time: self
+                .completion_time
+                .map(::aws_smithy_types::DateTime::from),
+            s3_bucket: None,
+            s3_keys: None,
+        }
+    }
+}
+
 /// The `ServerCriteria` value that names no member to filter on, so a request carrying it
 /// (or no `serverCriteria` at all) filters nothing.
 ///
@@ -534,6 +665,10 @@ pub struct ComAmazonawsMigrationhubstrategyAwsmigrationhubstrategyrecommendation
     /// `ListServers` reports. A `BTreeMap` is what gives that list a stable total order
     /// to sort and paginate over, and it is empty until an import ingests a server.
     pub servers: BTreeMap<String, ServerRecord>,
+    /// Every recommendation report generation task, keyed by its id: what
+    /// `StartRecommendationReportGeneration` mints and `GetRecommendationReportDetails`
+    /// reports.
+    pub recommendation_reports: BTreeMap<String, RecommendationReport>,
     /// The id of the most recently started assessment, which is what
     /// `GetLatestAssessmentId` answers. `None` until one is started.
     pub latest_assessment_id: Option<String>,
@@ -578,6 +713,17 @@ impl ComAmazonawsMigrationhubstrategyAwsmigrationhubstrategyrecommendationState 
         }
     }
 
+    /// Mint an unused recommendation report task id matching `RecommendationTaskId`'s
+    /// `[0-9a-z-:]+`, within its 52-character bound (this one is 34 characters).
+    pub fn mint_recommendation_report_id(&mut self) -> String {
+        loop {
+            let id = format!("recommendation-report-{:012x}", self.next_sequence());
+            if !self.recommendation_reports.contains_key(&id) {
+                return id;
+            }
+        }
+    }
+
     /// The import file task `id` names, with any completion the clock owes it already
     /// materialised.
     pub fn settled_import_task_mut(
@@ -598,6 +744,63 @@ impl ComAmazonawsMigrationhubstrategyAwsmigrationhubstrategyrecommendationState 
         Some(assessment)
     }
 
+    /// The recommendation report task `id` names, with any terminal status the clock owes
+    /// it already materialised.
+    pub fn settled_report_mut(
+        &mut self,
+        id: &str,
+        now: SystemTime,
+    ) -> Option<&mut RecommendationReport> {
+        let report = self.recommendation_reports.get_mut(id)?;
+        report.settle(now);
+        Some(report)
+    }
+
+    /// The id of the report generation task still running at `now`, if there is one.
+    ///
+    /// Every stored task gets the terminal status the clock already owed it first, so a
+    /// task whose span has passed is not reported as running. At most one task is ever in
+    /// progress, because a start call made while this answers `Some` coalesces onto that
+    /// task instead of minting another.
+    pub fn in_progress_report_id(&mut self, now: SystemTime) -> Option<String> {
+        for report in self.recommendation_reports.values_mut() {
+            report.settle(now);
+        }
+        self.recommendation_reports
+            .values()
+            .find(|report| report.is_in_progress())
+            .map(|report| report.id.clone())
+    }
+
+    /// How many servers of this account's portfolio a report scoped by `groups` covers.
+    ///
+    /// An EMPTY filter names no group, so it scopes nothing and the whole inventory is in
+    /// scope; otherwise a server is in scope when it came in with one of the groups named
+    /// — both halves of a `Group` agreeing, as [`ServerRecord::in_any_group`] decides it.
+    ///
+    /// The groups are collected into a set first, so the count costs one pass over the
+    /// inventory and one over the filter rather than the product of the two.
+    pub fn servers_in_groups(&self, groups: &[Group]) -> i32 {
+        if groups.is_empty() {
+            return i32::try_from(self.servers.len()).unwrap_or(i32::MAX);
+        }
+        let wanted: BTreeSet<(Option<&str>, Option<&str>)> = groups
+            .iter()
+            .map(|group| (group.name.as_deref(), group.value.as_deref()))
+            .collect();
+        let covered = self
+            .servers
+            .values()
+            .filter(|server| {
+                server
+                    .group_id
+                    .iter()
+                    .any(|held| wanted.contains(&(held.name.as_deref(), held.value.as_deref())))
+            })
+            .count();
+        i32::try_from(covered).unwrap_or(i32::MAX)
+    }
+
     /// Materialise every completion the clock owes, for a caller about to read across
     /// all of the records.
     pub fn settle_all(&mut self, now: SystemTime) {
@@ -606,6 +809,9 @@ impl ComAmazonawsMigrationhubstrategyAwsmigrationhubstrategyrecommendationState 
         }
         for assessment in self.assessments.values_mut() {
             assessment.settle(now);
+        }
+        for report in self.recommendation_reports.values_mut() {
+            report.settle(now);
         }
     }
 
@@ -827,6 +1033,19 @@ pub fn assessment_id_not_accepted() -> ValidationException {
 /// service's `ResourceNotFoundException` (HTTP 404, "The specified ID in the request is
 /// not found."), worded with [`INVALID_RESOURCE_ID`].
 pub fn assessment_not_found() -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(INVALID_RESOURCE_ID.to_string()),
+    }
+}
+
+/// `GetRecommendationReportDetails`'s refusal of an `id` that names no report generation
+/// task of this account: the not-found its own error list carries
+/// (`ResourceNotFoundException`, HTTP 404, "The specified ID in the request is not
+/// found."), worded with the service's [`INVALID_RESOURCE_ID`] sentence.
+///
+/// Like every other refusal of this service it interpolates nothing from the request —
+/// the caller already holds the id it sent.
+pub fn recommendation_report_not_found() -> ResourceNotFoundException {
     ResourceNotFoundException {
         message: Some(INVALID_RESOURCE_ID.to_string()),
     }

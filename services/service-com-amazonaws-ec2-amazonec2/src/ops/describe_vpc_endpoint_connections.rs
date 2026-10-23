@@ -238,12 +238,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let service_region = request_region(ctx.parts());
 
         let state = require_service_state(&*self.engine)?;
-        let store = state.lock();
+        let mut store = state.lock();
 
-        // A pure read: a connection stays `PendingAcceptance` until the service owner
-        // accepts or rejects it, which is an action and not an instant, so there is no
-        // clock-owed transition to materialise here and nothing this call writes.
-        //
+        // The one write a read may make: a connection `AcceptVpcEndpointConnections` left
+        // `Pending` is `Available` once its due instant has passed, whether or not anybody
+        // called, so applying it here changes nothing a later caller would not have seen
+        // anyway. Until the owner accepts or rejects it, a connection stays
+        // `PendingAcceptance` — that is an action and not an instant, so nothing is owed on
+        // a connection nobody has acted on.
+        store.materialize_due_transitions();
+
         // Every comparison is charged to ONE budget, so the PRODUCT of stored connections,
         // filters, values, held values and value length is bounded however the caller
         // combines them — which is also what bounds how long this holds the state lock.
