@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AddNotificationChannels
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AddNotificationChannels`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AddNotificationChannels::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Appends anomaly-notification channels to the named profiling group's stored
+//! configuration and reports the configuration that results. Each added channel keeps
+//! the request's `id` or gets a fresh random UUID, and a group holds at most two
+//! channels — what the model's `Channels` list allows.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +150,177 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AddNotificationChannels` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AddNotificationChannelsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AddNotificationChannels"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            AddNotificationChannelsErrorModeled::InternalServerException(InternalServerException {
+                message: "the profiling-group store is unavailable".to_string(),
+            })
+        })?;
+
+        let mut guard = state.lock();
+        // The group is looked up FIRST, so a request naming a group the store does not
+        // hold answers the same 404 the other two notification operations answer,
+        // whatever else the request carries.
+        if !guard.groups.contains_key(&input.profiling_group_name) {
+            return Err(
+                AddNotificationChannelsErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        // The ONE sentence every group-scoped refusal of this service
+                        // uses, so this operation cannot word it a second way.
+                        message: crate::state::group_not_found_message(
+                            &input.profiling_group_name,
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Resolve every requested channel BEFORE writing any of them, so a request this
+        // operation refuses leaves the stored configuration exactly as it was.
+        let mut requested: Vec<crate::state::NotificationChannel> =
+            Vec::with_capacity(input.channels.len());
+        for (index, channel) in input.channels.iter().enumerate() {
+            // `ChannelUri` is an `@arnReference` whose doc says "Currently we only
+            // support SNS channels and thus required to be an ARN" — a constraint the
+            // model cannot express, so it is refused here rather than stored as a uri
+            // no notification could ever be published to.
+            if !crate::state::is_sns_topic_arn(&channel.uri) {
+                return Err(AddNotificationChannelsErrorModeled::ValidationException(
+                    ValidationException {
+                        message: format!(
+                            "channels[{index}].uri must be an Amazon SNS topic ARN \
+                             (arn:<partition>:sns:<region>:<account>:<topic>), got {}",
+                            channel.uri
+                        ),
+                    },
+                )
+                .into());
+            }
+            // `eventPublishers` targets the closed `EventPublisher` enum, so the
+            // boundary validator already refuses anything outside it; this keeps a
+            // stored channel inside the catalogue even if that trait stops being
+            // enforced.
+            if let Some(unknown) = channel
+                .event_publishers
+                .iter()
+                .find(|publisher| !EVENT_PUBLISHER_VALUES.contains(&publisher.as_str()))
+            {
+                return Err(AddNotificationChannelsErrorModeled::ValidationException(
+                    ValidationException {
+                        message: format!(
+                            "channels[{index}].eventPublishers must each be one of {}, got {unknown}",
+                            EVENT_PUBLISHER_VALUES.join(", ")
+                        ),
+                    },
+                )
+                .into());
+            }
+
+            let id = match channel.id.clone() {
+                Some(named) => named,
+                // `Channel$id`: "A random UUID for channelId is used when adding a
+                // channel to the notification configuration if not specified in the
+                // request." Minted by the STORE, the way every UUID-shaped id this
+                // crate hands out is minted (`state::mint_channel_id`), so no second
+                // way of making one is introduced here.
+                None => guard.mint_channel_id(&input.profiling_group_name),
+            };
+            if requested.iter().any(|earlier| earlier.id == id) {
+                return Err(AddNotificationChannelsErrorModeled::ConflictException(
+                    ConflictException {
+                        message: format!(
+                            "channels[{index}] repeats channel id {id}; one request cannot add \
+                             the same channel twice"
+                        ),
+                    },
+                )
+                .into());
+            }
+            requested.push(crate::state::NotificationChannel {
+                id,
+                uri: channel.uri.clone(),
+                event_publishers: channel.event_publishers.clone(),
+            });
+        }
+
+        // The group the existence check above found, now borrowed for the write: the
+        // store lock was never released, so this is the same record and the
+        // `ok_or_else` is that same 404 rather than a second refusal.
+        let group = guard
+            .groups
+            .get_mut(&input.profiling_group_name)
+            .ok_or_else(|| {
+                AddNotificationChannelsErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: crate::state::group_not_found_message(
+                            &input.profiling_group_name,
+                        ),
+                    },
+                )
+            })?;
+
+        // A channel id already in the configuration names a channel that exists: adding
+        // it again would conflict with the stored state rather than add anything.
+        if let Some(duplicate) = requested
+            .iter()
+            .find(|channel| group.has_notification_channel(&channel.id))
+        {
+            return Err(AddNotificationChannelsErrorModeled::ConflictException(
+                ConflictException {
+                    message: format!(
+                        "profiling group {} already has a notification channel {}",
+                        input.profiling_group_name, duplicate.id
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // "Add up to 2 anomaly notifications channels for a profiling group": the
+        // stored configuration cannot hold more than the model's `Channels` list
+        // allows, and the operation's own ServiceQuotaExceededException is that answer.
+        if group.notification_channels.len() + requested.len()
+            > crate::state::MAX_NOTIFICATION_CHANNELS_PER_GROUP
+        {
+            return Err(
+                AddNotificationChannelsErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: format!(
+                            "profiling group {} already has {} of {} notification channels; \
+                             remove one before adding {}",
+                            input.profiling_group_name,
+                            group.notification_channels.len(),
+                            crate::state::MAX_NOTIFICATION_CHANNELS_PER_GROUP,
+                            requested.len()
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The whole batch is stored in one step, so a refusal is never a partial write.
+        // `false` is unreachable while the two checks above hold — they are exactly the
+        // setter's own two refusals (a repeated id, the channel bound) — and answering
+        // the modelled server error for it keeps a dropped write from ever being
+        // reported as a stored one.
+        if !group.add_notification_channels(requested) {
+            return Err(
+                AddNotificationChannelsErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: format!(
+                            "the notification channels of profiling group {} could not be stored",
+                            input.profiling_group_name
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        Ok(AddNotificationChannelsOutput {
+            notification_configuration: Some(group.notification_configuration()),
+        })
     }
 }
