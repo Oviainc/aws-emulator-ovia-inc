@@ -15,7 +15,7 @@ use sha2::{Digest, Sha256};
 use smithy_server_runtime::{Violation, ViolationKind};
 
 use crate::ops::types::{
-    AdConfiguration, Channel, ChannelNotBroadcasting, InternalServerException,
+    AdConfiguration, Channel, ChannelNotBroadcasting, ConflictException, InternalServerException,
     MultitrackInputConfiguration, PlaybackKeyPair, RecordingConfiguration, RenditionConfiguration,
     ResourceNotFoundException, ServiceQuotaExceededException, Stream, StreamKey,
     ThumbnailConfiguration, ValidationException,
@@ -119,6 +119,38 @@ impl ComAmazonawsIvsAmazoninteractivevideoserviceState {
                 record.configuration.state = RECORDING_CONFIGURATION_ACTIVE.to_string();
             }
         }
+    }
+
+    /// The ARN of a channel that still POINTS AT `arn`, if any holds it.
+    ///
+    /// A channel is the only resource in this service that references another: it
+    /// names a recording configuration, a playback restriction policy and an ad
+    /// configuration, each by ARN. Those three ARN namespaces are disjoint (the
+    /// modelled patterns pin the resource segment of each), so one lookup over all
+    /// three members answers "is this resource still in use?" for every kind of
+    /// resource a channel can reference, without the caller saying which kind it
+    /// asked about.
+    ///
+    /// The scan runs in the store's one stable order (see [`Self::channels`]), so
+    /// the same store always names the same channel. A member left as the empty
+    /// string references nothing and is simply never equal to a well-formed ARN.
+    pub fn channel_referencing(&self, arn: &str) -> Option<&str> {
+        self.channels.values().find_map(|channel| {
+            let references = [
+                channel.recording_configuration_arn.as_deref(),
+                channel.playback_restriction_policy_arn.as_deref(),
+                channel.ad_configuration_arn.as_deref(),
+            ];
+            if references
+                .into_iter()
+                .flatten()
+                .any(|reference| reference == arn)
+            {
+                Some(channel.arn.as_deref().unwrap_or_default())
+            } else {
+                None
+            }
+        })
     }
 }
 
@@ -715,6 +747,18 @@ pub fn channel_offline_message(channel_arn: &str) -> String {
     format!("Channel: {channel_arn} is not currently online")
 }
 
+/// How IVS states a delete refused because another resource still POINTS AT the one
+/// being deleted (`ConflictException`, HTTP 409): it names the resource the request
+/// asked to delete and one resource that still references it.
+///
+/// AWS documents the status and the code for this refusal ("If you try to delete a
+/// recording configuration that is associated with a channel, you will get an error
+/// (409 ConflictException)") but no message text, so the text is built from the
+/// request the same way every other message above is.
+pub fn resource_referenced_message(arn: &str, referenced_by: &str) -> String {
+    format!("Resource: {arn} is still referenced by: {referenced_by}")
+}
+
 /// How IVS states a quota refusal (`ServiceQuotaExceededException`, HTTP 402): it names
 /// the resource the quota is on and the limit that was reached, not the operation.
 pub fn quota_exceeded_message(resource: &str, limit: usize) -> String {
@@ -826,6 +870,24 @@ pub fn quota_exceeded<E>(
     let message = quota_exceeded_message(resource, limit);
     Scaffolded::stated(
         variant(ServiceQuotaExceededException {
+            exception_message: Some(message.clone()),
+            ..Default::default()
+        }),
+        message,
+    )
+}
+
+/// The `ConflictException` (HTTP 409) this service answers when a delete would leave
+/// another resource pointing at something that no longer exists. See
+/// [`resource_referenced_message`].
+pub fn resource_referenced<E>(
+    variant: fn(ConflictException) -> E,
+    arn: &str,
+    referenced_by: &str,
+) -> Scaffolded<E> {
+    let message = resource_referenced_message(arn, referenced_by);
+    Scaffolded::stated(
+        variant(ConflictException {
             exception_message: Some(message.clone()),
             ..Default::default()
         }),
