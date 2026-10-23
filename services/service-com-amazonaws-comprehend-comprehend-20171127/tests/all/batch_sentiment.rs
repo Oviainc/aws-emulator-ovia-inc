@@ -4,12 +4,14 @@
 //!
 //! The rule under test is the one the modelled output documents: the operation
 //! answers one entry per submitted document, carrying that document's zero-based
-//! position in `TextList` as `Index` — a `ResultList` entry for a document it scored
-//! and an `ErrorList` entry for one it could not — so both lists are aligned with the
-//! input list and sorted ascending by `Index`. Batching changes how many documents one
+//! position in `TextList` as `Index`, so `ResultList` is aligned with the input list
+//! and sorted ascending by `Index`. Batching changes how many documents one
 //! request carries, never how a document is scored, so every suite below asserts over
 //! a SET of batches that differ in size, in content, in document size and in the ORDER
 //! the same documents are submitted in — the recorded request is one row of that table.
+//!
+//! The two documented batch quotas refuse the REQUEST rather than one item of it;
+//! `sync_inference_refusals.rs` holds that rule for the whole batch family.
 
 use serde_json::{json, Value};
 use service_com_amazonaws_comprehend_comprehend_20171127::ops::types::{
@@ -30,10 +32,6 @@ const MAX_BATCH_DOCUMENTS: usize = 25;
 /// (`crate::state::REALTIME_TEXT_QUOTA_BYTES`): a count of UTF-8 bytes, which the
 /// member prose rounds to "5 KB".
 const MAX_DOCUMENT_BYTES: usize = 5_000;
-
-/// The `BatchItemError$ErrorCode` the handler reports a document past
-/// [`MAX_DOCUMENT_BYTES`] under.
-const TEXT_SIZE_LIMIT_ERROR_CODE: &str = "TEXT_SIZE_LIMIT_EXCEEDED";
 
 /// The batch built by taking `size` documents from [`SENTIMENTS`], cycling when the
 /// batch is longer than the table: `(expected sentiment, text)` per position.
@@ -264,90 +262,96 @@ async fn a_batch_at_the_documented_size_limit_is_accepted_and_one_past_it_is_not
 }
 
 #[tokio::test]
-async fn a_document_past_the_documented_byte_ceiling_is_reported_at_its_index() {
+async fn a_batch_whose_documents_all_fit_the_byte_ceiling_is_scored_whole() {
     let comprehend = Comprehend::new();
     let scored = SENTIMENTS[0].2;
     let at_ceiling = "a".repeat(MAX_DOCUMENT_BYTES);
     let past_ceiling = "a".repeat(MAX_DOCUMENT_BYTES + 1);
 
-    // Rows differ in where the oversized documents sit and how many there are:
-    // (case, documents, the indices expected in ErrorList). The ceiling is per
-    // document, not per batch, so a document exactly at it is still scored.
-    let cases: Vec<(&str, Vec<&str>, Vec<i64>)> = vec![
+    // The ceiling is measured per document and enforced over the REQUEST: a batch
+    // whose documents all fit is scored in full with an empty `ErrorList`, and a
+    // batch carrying one past it is refused whole rather than answered with a
+    // per-index error. Rows differ in document size, in batch size and in where the
+    // oversized document sits. `sync_inference_refusals.rs` asserts the refusal's
+    // code and message for the whole batch family.
+    let cases: Vec<(&str, Vec<&str>, bool)> = vec![
         (
             "a document exactly at the ceiling",
             vec![&at_ceiling],
-            vec![],
+            true,
         ),
-        ("one document, one byte past it", vec![&past_ceiling], vec![0]),
+        (
+            "two documents at the ceiling",
+            vec![&at_ceiling, &at_ceiling],
+            true,
+        ),
+        (
+            "a document at the ceiling beside a short one",
+            vec![scored, &at_ceiling],
+            true,
+        ),
+        ("one document, one byte past it", vec![&past_ceiling], false),
         (
             "an oversized document first",
             vec![&past_ceiling, scored, &at_ceiling],
-            vec![0],
+            false,
         ),
         (
             "an oversized document in the middle",
             vec![scored, &past_ceiling, scored],
-            vec![1],
-        ),
-        (
-            "two oversized documents apart",
-            vec![&past_ceiling, scored, &past_ceiling],
-            vec![0, 2],
+            false,
         ),
         (
             "every document oversized",
             vec![&past_ceiling, &past_ceiling],
-            vec![0, 1],
+            false,
         ),
     ];
 
-    for (case, text_list, expected_errors) in cases {
-        let output = comprehend
-            .ok(
+    for (case, text_list, accepted) in cases {
+        let (status, body) = comprehend
+            .call(
                 "BatchDetectSentiment",
                 &json!({ "TextList": text_list, "LanguageCode": "en" }),
             )
             .await;
 
-        let errors = output["ErrorList"]
-            .as_array()
-            .unwrap_or_else(|| panic!("case {case:?}: expected an ErrorList, got {output}"));
-        let error_indices: Vec<i64> = errors
-            .iter()
-            .map(|entry| entry["Index"].as_i64().unwrap_or(-1))
-            .collect();
-        assert_eq!(
-            error_indices, expected_errors,
-            "case {case:?}: expected ErrorList at indices {expected_errors:?} in \
-             ascending order, got {output}"
-        );
-        for entry in errors {
+        if !accepted {
             assert_eq!(
-                entry["ErrorCode"].as_str().unwrap_or_default(),
-                TEXT_SIZE_LIMIT_ERROR_CODE,
-                "case {case:?}: expected the text-size error code on {entry}"
+                status, 400,
+                "case {case:?}: a batch carrying an oversized document is refused \
+                 whole, got {status}: {body}"
             );
-            assert!(
-                !entry["ErrorMessage"].as_str().unwrap_or_default().is_empty(),
-                "case {case:?}: expected a non-empty ErrorMessage on {entry}"
+            assert_eq!(
+                error_code(&body),
+                "TextSizeLimitExceededException",
+                "case {case:?}: expected TextSizeLimitExceededException, got {body}"
             );
+            continue;
         }
 
-        // Every document NOT in ErrorList is in ResultList, still at its own index.
-        let result_indices: Vec<i64> = output["ResultList"]
+        assert_eq!(
+            status, 200,
+            "case {case:?}: every document fits the ceiling, expected 200, got \
+             {status}: {body}"
+        );
+        assert_eq!(
+            body["ErrorList"].as_array().map(Vec::len),
+            Some(0),
+            "case {case:?}: an accepted batch leaves no document unanalysed, so \
+             ErrorList is empty, got {body}"
+        );
+        let result_indices: Vec<i64> = body["ResultList"]
             .as_array()
-            .unwrap_or_else(|| panic!("case {case:?}: expected a ResultList, got {output}"))
+            .unwrap_or_else(|| panic!("case {case:?}: expected a ResultList, got {body}"))
             .iter()
             .map(|entry| entry["Index"].as_i64().unwrap_or(-1))
             .collect();
-        let expected_results: Vec<i64> = (0..text_list.len() as i64)
-            .filter(|index| !expected_errors.contains(index))
-            .collect();
+        let expected_results: Vec<i64> = (0..text_list.len() as i64).collect();
         assert_eq!(
             result_indices, expected_results,
             "case {case:?}: expected ResultList at indices {expected_results:?} in \
-             ascending order, got {output}"
+             ascending order, got {body}"
         );
     }
 }
