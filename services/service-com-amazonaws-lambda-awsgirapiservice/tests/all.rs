@@ -19,6 +19,8 @@ mod function_configuration;
 mod function_lifecycle;
 #[path = "all/function_url_config.rs"]
 mod function_url_config;
+#[path = "all/layer_versions.rs"]
+mod layer_versions;
 #[path = "all/resource_policy.rs"]
 mod resource_policy;
 #[path = "all/signing_name_routing.rs"]
