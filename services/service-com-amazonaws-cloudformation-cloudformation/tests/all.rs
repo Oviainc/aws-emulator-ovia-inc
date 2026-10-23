@@ -17,6 +17,8 @@ mod agentcore_stack_outputs;
 mod callback_signature;
 #[path = "all/change_set_lifecycle.rs"]
 mod change_set_lifecycle;
+#[path = "all/ecs_elbv2_stack_identifiers.rs"]
+mod ecs_elbv2_stack_identifiers;
 // An EMPTY, moved-out suite: its rows now live in `all/nested_resource_outputs.rs` and
 // `all/provisioned_resources.rs`. Declared because the layout check refuses an undeclared
 // file under `tests/all/`, and this fixer's tool set can write a file but not remove one;

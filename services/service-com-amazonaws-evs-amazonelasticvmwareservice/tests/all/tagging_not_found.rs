@@ -32,12 +32,20 @@ const ACCOUNT: &str = "000000000000";
 /// the `resourceArn` member instead, never in this string.
 const NOT_FOUND_MESSAGE: &str = "Resource cannot be found.";
 
+/// The VPC and the subnet inside it that the creates below name. `CreateEnvironment`
+/// checks the network a request names against the account's own Amazon EC2 store, so
+/// [`emulator`] registers these there.
+const VPC_ID: &str = "vpc-0123456789abcdef0";
+/// See [`VPC_ID`].
+const SUBNET_ID: &str = "subnet-0123456789abcdef0";
+
 /// The emulator a test drives: one shared engine, this service mounted on it.
 fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // The tests exercise behaviour, not signing: the credentials below are unsigned.
     router.set_request_authentication(false);
+    crate::environment_lifecycle::register_network(&engine, VPC_ID, SUBNET_ID);
     router.register_service(
         service_com_amazonaws_evs_amazonelasticvmwareservice::EmulatedService::new(engine),
     );
@@ -99,8 +107,8 @@ fn vlans() -> Value {
 async fn create_tagged(router: &MultiServiceRouter, name: &str, tags: Value) -> String {
     let request = json!({
         "environmentName": name,
-        "vpcId": "vpc-0123456789abcdef0",
-        "serviceAccessSubnetId": "subnet-0123456789abcdef0",
+        "vpcId": VPC_ID,
+        "serviceAccessSubnetId": SUBNET_ID,
         "vcfVersion": "VCF-5.2.1",
         "termsAccepted": true,
         "initialVlans": vlans(),

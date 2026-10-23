@@ -120,6 +120,26 @@ pub const MIN_PAGE_SIZE: i32 = 1;
 /// resource was minted with records the region of the call that created it.
 pub const RESOURCE_QUOTA: usize = 100;
 
+/// The most tags one resource's stored tag set may hold.
+///
+/// The `Tags` map is modelled `length 0..200`, so 200 entries is the largest
+/// tag set the real service accepts for a resource, and a request that would
+/// leave more than that is refused. The model bounds ONE request's map, which
+/// the framework enforces before a handler runs; this bounds the set a
+/// REPEATED `TagResource` accumulates, which is the one caller-driven
+/// dimension of this store that would otherwise grow without limit.
+pub const MAX_TAGS_PER_RESOURCE: usize = 200;
+
+/// Why a tag write was refused, with nothing written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TagWriteRefusal {
+    /// This emulator holds no resource of that ARN.
+    NoSuchResource,
+    /// The write would leave the resource holding more than
+    /// [`MAX_TAGS_PER_RESOURCE`] tags; `would_hold` is how many.
+    CapExceeded { would_hold: usize },
+}
+
 /// What the clock still owes a resource, and when.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PendingChange {
@@ -525,6 +545,74 @@ impl ComAmazonawsKafkaconnectKafkaconnectState {
                     .get(arn)
                     .map(|worker| &worker.tags)
             })
+    }
+
+    /// The tags stored on the resource `arn` names, for a caller that is about
+    /// to change them, or `None` when this emulator holds no resource of that
+    /// ARN.
+    ///
+    /// The mutable twin of [`Self::tags_of`]. PRIVATE on purpose: every tag
+    /// write goes through [`Self::attach_tags`] or [`Self::remove_tags`], so the
+    /// cap on a resource's stored tag count cannot be bypassed by a handler
+    /// holding the map directly.
+    fn tags_of_mut(&mut self, arn: &str) -> Option<&mut HashMap<String, String>> {
+        if let Some(plugin) = self.custom_plugins.get_mut(arn) {
+            return Some(&mut plugin.tags);
+        }
+        if let Some(connector) = self.connectors.get_mut(arn) {
+            return Some(&mut connector.tags);
+        }
+        self.worker_configurations
+            .get_mut(arn)
+            .map(|worker| &mut worker.tags)
+    }
+
+    /// Attach `incoming` to the resource `arn` names, per key: a key the
+    /// resource already carries takes the new value, a key `incoming` does not
+    /// name keeps the value it had.
+    ///
+    /// Refused, with nothing written, when the ARN names no resource this
+    /// emulator holds, or when the merged set would hold more than
+    /// [`MAX_TAGS_PER_RESOURCE`] keys — the one caller-driven dimension of this
+    /// store that a repeated call could otherwise grow without bound.
+    pub fn attach_tags(
+        &mut self,
+        arn: &str,
+        incoming: HashMap<String, String>,
+    ) -> Result<(), TagWriteRefusal> {
+        let tags = self
+            .tags_of_mut(arn)
+            .ok_or(TagWriteRefusal::NoSuchResource)?;
+        // The size the merge would leave: the keys already stored that the
+        // request does not name, plus the request's own keys.
+        let would_hold = tags
+            .keys()
+            .filter(|key| !incoming.contains_key(*key))
+            .count()
+            + incoming.len();
+        if would_hold > MAX_TAGS_PER_RESOURCE {
+            return Err(TagWriteRefusal::CapExceeded { would_hold });
+        }
+        for (key, value) in incoming {
+            tags.insert(key, value);
+        }
+        Ok(())
+    }
+
+    /// Remove the named keys from the resource `arn` names, per key: a key the
+    /// request does not name keeps its value, and a key the resource does not
+    /// carry is a no-op (so the call is safe to retry).
+    ///
+    /// Refused only when the ARN names no resource this emulator holds — a
+    /// removal can never grow the stored set.
+    pub fn remove_tags(&mut self, arn: &str, keys: &[String]) -> Result<(), TagWriteRefusal> {
+        let tags = self
+            .tags_of_mut(arn)
+            .ok_or(TagWriteRefusal::NoSuchResource)?;
+        for key in keys {
+            tags.remove(key);
+        }
+        Ok(())
     }
 
     /// The stored worker configuration of this name, if any. A name identifies
