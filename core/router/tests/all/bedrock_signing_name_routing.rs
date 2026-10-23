@@ -42,6 +42,12 @@
 //! models' path spaces overlap ONLY where that rule declares a split, and that a request
 //! to each member reaches that member's own service through the whole router — never the
 //! router's `AmbiguousService` (500, several claimants) or `UnknownService` (404, none).
+//!
+//! One test takes the awsJson1_1 member one level further: EVERY operation it binds,
+//! dispatched with the family mounted, answering that service's own modelled status and
+//! error code. Dispatch is per request rather than per operation, so one unreachable
+//! operation would mean all six were — which is exactly the state this suite exists to
+//! keep out.
 
 use std::sync::Arc;
 
@@ -978,6 +984,130 @@ async fn a_guardrail_created_through_the_router_reads_back_through_it() {
             Some(identifier.as_str()),
             "case {case:?}: the read-back guardrail is the created one, got {}",
             read.raw_body
+        );
+    }
+}
+
+/// A legal `dataAutomationProfileArn` (`smithy_query` shape `DataAutomationProfileArn`,
+/// whose account segment accepts the literal `aws`).
+const PROFILE_ARN: &str =
+    "arn:aws:bedrock:us-east-1:aws:data-automation-profile/us.data-automation-v1";
+
+/// A legal `dataAutomationConfiguration.dataAutomationProjectArn` (`smithy_query` shape
+/// `DataAutomationArn`).
+const PROJECT_ARN: &str =
+    "arn:aws:bedrock:us-east-1:000000000000:data-automation-project/invoices";
+
+/// A well-formed `InvocationArn` / `TaggableResourceArn` that names nothing this emulator
+/// minted.
+const ABSENT_INVOCATION_ARN: &str =
+    "arn:aws:bedrock:us-east-1:000000000000:data-automation-invocation/absent";
+
+/// EVERY operation of the awsJson1_1 member answers its own modelled contract with the
+/// whole family mounted — not only the one operation the row above dispatches.
+///
+/// The rows differ along the operation and, within an operation, along what the answer
+/// depends on (an accepted submission, a submission naming nothing to extract, an ARN
+/// that names nothing), so a row passes only if the request reached THAT service's
+/// handlers and they computed the answer. Before the claim was narrowed, every one of
+/// these was `500 AmbiguousService`, produced before any handler ran.
+#[tokio::test]
+async fn every_operation_of_the_awsjson_member_answers_its_own_contract() {
+    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    let router = build_router(&engine);
+
+    let submission = format!(
+        r#"{{"inputConfiguration":{{"s3Uri":"s3://in-bucket/assets/doc.pdf"}},
+             "outputConfiguration":{{"s3Uri":"s3://out-bucket/routing/"}},
+             "dataAutomationProfileArn":"{PROFILE_ARN}",
+             "dataAutomationConfiguration":{{"dataAutomationProjectArn":"{PROJECT_ARN}"}}}}"#
+    );
+    let no_extraction_target = format!(
+        r#"{{"inputConfiguration":{{"s3Uri":"s3://in-bucket/assets/doc.pdf"}},
+             "outputConfiguration":{{"s3Uri":"s3://out-bucket/routing/"}},
+             "dataAutomationProfileArn":"{PROFILE_ARN}"}}"#
+    );
+
+    // (case, operation, body, expected status, expected error code)
+    let rows: [(&str, &str, String, u16, Option<&str>); 7] = [
+        (
+            "an accepted asynchronous submission",
+            "InvokeDataAutomationAsync",
+            submission,
+            200,
+            None,
+        ),
+        (
+            "an asynchronous submission naming nothing to extract",
+            "InvokeDataAutomationAsync",
+            no_extraction_target.clone(),
+            400,
+            Some("ValidationException"),
+        ),
+        (
+            "a synchronous submission naming nothing to extract",
+            "InvokeDataAutomation",
+            no_extraction_target,
+            400,
+            Some("ValidationException"),
+        ),
+        (
+            "a status read of an invocation that does not exist",
+            "GetDataAutomationStatus",
+            format!(r#"{{"invocationArn":"{ABSENT_INVOCATION_ARN}"}}"#),
+            400,
+            Some("ResourceNotFoundException"),
+        ),
+        (
+            "a tag edit on an invocation that does not exist",
+            "TagResource",
+            format!(
+                r#"{{"resourceARN":"{ABSENT_INVOCATION_ARN}",
+                     "tags":[{{"key":"env","value":"dev"}}]}}"#
+            ),
+            400,
+            Some("ResourceNotFoundException"),
+        ),
+        (
+            "a tag read of an invocation that does not exist",
+            "ListTagsForResource",
+            format!(r#"{{"resourceARN":"{ABSENT_INVOCATION_ARN}"}}"#),
+            400,
+            Some("ResourceNotFoundException"),
+        ),
+        (
+            "a tag removal on an invocation that does not exist",
+            "UntagResource",
+            format!(r#"{{"resourceARN":"{ABSENT_INVOCATION_ARN}","tagKeys":["env"]}}"#),
+            400,
+            Some("ResourceNotFoundException"),
+        ),
+    ];
+
+    for (case, operation, body, expected_status, expected_code) in &rows {
+        let target = format!("AmazonBedrockKeystoneRuntimeService.{operation}");
+        let answer = dispatch(
+            &router,
+            "POST",
+            "/",
+            &[("x-amz-target", target.as_str())],
+            body.as_str(),
+        )
+        .await;
+        assert!(
+            !ROUTER_REFUSALS.contains(&answer.error_code.as_str()),
+            "case {case:?} ({target}): routing failed with {}, got {} with {}",
+            answer.error_code,
+            answer.status,
+            answer.raw_body
+        );
+        assert_eq!(
+            (answer.status, answer.error_code.as_str()),
+            (*expected_status, expected_code.unwrap_or_default()),
+            "case {case:?} ({target}): expected HTTP {expected_status} {expected_code:?}, \
+             got {} with {}",
+            answer.status,
+            answer.raw_body
         );
     }
 }

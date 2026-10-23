@@ -41,9 +41,59 @@
 //! do not write it; editing the entry would let this file drift from the model.
 
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, ErasedOperation, Refusal, Refused, Service, Violation, ViolationKind,
 };
 use std::sync::Arc;
+
+/// The error code this service names for a request its own rules refused — the one its
+/// model declares for invalid input, and the code the handlers return for the rules the
+/// framework's walk cannot express.
+const VALIDATION_EXCEPTION: &str = "ValidationException";
+
+/// One violation, worded the way this service words it.
+///
+/// Two differences from the framework's conventional wording, both shown by the recorded
+/// wire for three separate operations (`inputConfiguration.s3Uri`, `invocationArn`,
+/// `resourceARN`): the offending value is NOT echoed, and a `@pattern` is printed
+/// without its anchors. Both live in `crate::state`'s wording helpers, which a handler
+/// enforcing a rule the walk cannot express reaches too, so one logical failure cannot
+/// read two ways.
+///
+/// The requirement half of each clause is the AWS envelope's own phrasing, restated here
+/// for every violation kind so that a request with TWO violations cannot answer with two
+/// different styles in one message. A kind this service does not restate (the enum is
+/// `#[non_exhaustive]`), and an absent member — which has no value to omit, and which AWS
+/// states as `Value null at '…'` — keep the framework's wording.
+///
+/// Restating each kind is what `services/common/src/validation.rs` stages a shared,
+/// framework-derived requirement half to replace, so a restatement cannot drift from the
+/// framework's wording. See the PENDING MIGRATION note on
+/// `crate::state::pattern_requirement`: this change does not own that migration.
+fn clause_for_violation(violation: &Violation) -> String {
+    let requirement = match &violation.kind {
+        ViolationKind::MinLength(min) => {
+            format!("Member must have length greater than or equal to {min}")
+        }
+        ViolationKind::MaxLength(max) => {
+            format!("Member must have length less than or equal to {max}")
+        }
+        ViolationKind::MinValue(min) => {
+            format!("Member must have value greater than or equal to {min}")
+        }
+        ViolationKind::MaxValue(max) => {
+            format!("Member must have value less than or equal to {max}")
+        }
+        ViolationKind::Pattern(pattern) => crate::state::pattern_requirement(pattern),
+        ViolationKind::EnumValue(allowed) => {
+            format!("Member must satisfy enum value set: [{}]", allowed.join(", "))
+        }
+        ViolationKind::UniqueItems => "Member must have unique values".to_string(),
+        // `MissingRequiredMember` and any kind added later: nothing to omit, so the
+        // framework's own clause already reads the way this service states it.
+        _ => return violation.message(),
+    };
+    crate::state::violation_clause(&violation.path, &requirement)
+}
 
 /// The `com-amazonaws-bedrockdataautomationruntime-amazonbedrockkeystoneruntimeservice` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -111,17 +161,25 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
-        // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // The framework refused the request before any handler ran. This service states
+        // such a refusal as its model's own `ValidationException`, in the AWS
+        // constraint-violation envelope (`N validation error(s) detected: <clause>; …`)
+        // with THIS service's clause wording — see `clause_for_violation`. The code is
+        // replaced along with the message, because a client branches on the code.
+        //
+        // Only `Refusal::Invalid` is reworded: an authentication refusal is the
+        // framework's to word, and is not a `ValidationException`.
+        let Refusal::Invalid(violations) = refusal else {
+            return None;
+        };
+        let clauses: Vec<String> = violations.iter().map(clause_for_violation).collect();
+        if clauses.is_empty() {
+            return None;
+        }
+        Some(Refused {
+            code: VALIDATION_EXCEPTION.to_string(),
+            message: crate::state::validation_envelope(&clauses),
+        })
     }
 
     fn override_routing_error(

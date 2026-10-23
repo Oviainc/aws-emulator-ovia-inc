@@ -168,15 +168,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let store = state.lock();
         let Some(invocation) = store.invocation(&input.resource_arn) else {
-            return Err(ListTagsForResourceErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!(
-                        "No data automation invocation found for {}",
-                        input.resource_arn
-                    )),
-                },
-            )
-            .into());
+            // 400, not the 404 the shape's advisory `@httpError` declares: see
+            // `crate::scaffolded::Scaffolded::ClientError`.
+            return Err(crate::scaffolded::Scaffolded::client_error(
+                ListTagsForResourceErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::INVOCATION_NOT_FOUND_MESSAGE.to_string()),
+                    },
+                ),
+            ));
         };
 
         Ok(ListTagsForResourceOutput {
