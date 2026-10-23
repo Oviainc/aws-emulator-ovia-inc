@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: merges the request's tags into the tag map of the NON-certificate ACM
+//! resource the ARN names, so `ListTagsForResource` reports them back.
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +157,80 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(validation_exception(
+                "the acm resource store is unavailable".to_string(),
+            ));
+        };
+
+        // "Use this action for all ACM resource types EXCEPT the certificate resource
+        // type. For certificate resources, use AddTagsToCertificate instead" — so a
+        // certificate ARN is input this operation's own constraints do not admit, and
+        // it is refused before the store is touched rather than tagging the
+        // certificate through a path AWS does not serve.
+        if crate::state::certificate_id_from_arn(&input.resource_arn).is_some() {
+            return Err(validation_exception(
+                crate::state::certificate_resource_message(
+                    &input.resource_arn,
+                    "AddTagsToCertificate",
+                ),
+            ));
+        }
+
+        // The reserved-prefix rule, decided where every tagging path decides it. This
+        // operation models no `InvalidTagException`, so a reserved pair is refused as
+        // the `ValidationException` it does model.
+        let added = crate::state::tag_map(&input.tags).map_err(validation_exception)?;
+
+        let mut store = state.lock();
+        // Every handler materialises what the clock already owes first, so tagging a
+        // resource cannot hold back a transition that was already due.
+        store.materialize_due(::std::time::SystemTime::now());
+        let Some(stored) = store.resource_tags_mut(&input.resource_arn) else {
+            return Err(TagResourceErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::resource_not_found_message(
+                        &input.resource_arn,
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // Merged by key: a key the resource already carries takes the new value, so
+        // tagging is an update of the stored map rather than a replacement of it.
+        let mut merged = stored.clone();
+        merged.extend(added);
+
+        // The per-resource tag quota, which `ServiceQuotaExceededException` is this
+        // operation's modelled answer for. Refused BEFORE the record is written, so a
+        // rejected request leaves the resource's tags exactly as they were.
+        if merged.len() > crate::state::TAG_LIMIT {
+            let over = merged.len();
+            return Err(
+                TagResourceErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(format!(
+                            "a resource may carry at most {} tags; this request would leave {over}",
+                            crate::state::TAG_LIMIT
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        *stored = merged;
+
+        Ok(TagResourceOutput)
     }
+}
+
+/// A refusal of the request as invalid, as this operation's own modelled
+/// `ValidationException` ("the supplied input failed to satisfy constraints").
+fn validation_exception(message: String) -> TagResourceError {
+    TagResourceErrorModeled::ValidationException(ValidationException {
+        message: Some(message),
+    })
+    .into()
 }
