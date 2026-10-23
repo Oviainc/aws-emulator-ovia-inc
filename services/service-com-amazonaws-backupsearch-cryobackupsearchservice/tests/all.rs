@@ -15,6 +15,8 @@
 mod export_jobs;
 #[path = "all/export_listing.rs"]
 mod export_listing;
+#[path = "all/search_job_outcome_and_paging.rs"]
+mod search_job_outcome_and_paging;
 #[path = "all/search_jobs.rs"]
 mod search_jobs;
 #[path = "all/state_roundtrip.rs"]

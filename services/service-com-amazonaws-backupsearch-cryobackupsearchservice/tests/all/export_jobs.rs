@@ -28,7 +28,8 @@ use service_com_amazonaws_backupsearch_cryobackupsearchservice::ops::types;
 use service_com_amazonaws_backupsearch_cryobackupsearchservice::state;
 
 use crate::search_jobs::{
-    call, emulator, emulator_with_engine, Answer, PAST_THE_DUE_INSTANT, WITHIN_THE_DUE_INSTANT,
+    call, emulator_with_engine, recovery_point, seed_recovery_points, Answer,
+    PAST_THE_DUE_INSTANT, WITHIN_THE_DUE_INSTANT,
 };
 
 /// A `RoleArn` the service can be passed: a role in the account this emulator attributes
@@ -131,12 +132,26 @@ fn export_body(case: &ExportCase, search_job_identifier: &str) -> Value {
 /// Start a search job and bring it to the status `settled` names, the way a client does:
 /// let the clock finish the scan, or cancel it and let the clock finish the stop. Answers
 /// the job's identifier and ARN.
+///
+/// A scan only runs to `COMPLETED` if its scope resolved to something, so the store is
+/// seeded with one recovery point the scope below selects — the Backup data plane is what
+/// would hold it, and nothing in this service creates one.
 async fn settled_search_job(
     emulator: &MultiServiceRouter,
+    engine: &engine::InMemoryEngine,
     region: &str,
     case: &str,
     settled: Settled,
 ) -> (String, String) {
+    seed_recovery_points(
+        engine,
+        vec![recovery_point(
+            "S3",
+            "arn:aws:backup:us-west-2:000000000000:recovery-point:rp-export",
+            "arn:aws:s3:::to-export",
+            std::time::SystemTime::now(),
+        )],
+    );
     let started = call(
         emulator,
         region,
@@ -218,7 +233,7 @@ async fn a_started_export_job_is_persisted_and_every_member_is_read_back_out_of_
     let mut identifiers: BTreeSet<String> = BTreeSet::new();
     // One emulator for every row, so the identifiers the rows are answered with come out
     // of the SAME store and uniqueness is a claim about that store.
-    let emulator = emulator();
+    let (emulator, engine) = emulator_with_engine();
     for case in export_cases() {
         let ExportCase {
             case: name,
@@ -227,7 +242,7 @@ async fn a_started_export_job_is_persisted_and_every_member_is_read_back_out_of_
             ..
         } = case;
         let (search_job_identifier, search_job_arn) =
-            settled_search_job(&emulator, region, name, settled).await;
+            settled_search_job(&emulator, &engine, region, name, settled).await;
         let body = export_body(&case, &search_job_identifier);
 
         let started = call(&emulator, region, "PUT", "/export-search-jobs", Some(body.clone())).await;
@@ -342,11 +357,11 @@ async fn a_started_export_job_is_persisted_and_every_member_is_read_back_out_of_
 
 #[tokio::test]
 async fn an_export_job_identifier_no_export_job_exists_for_is_not_found() {
-    let (emulator, _engine) = emulator_with_engine();
+    let (emulator, engine) = emulator_with_engine();
     // One real export job exists, so a miss is a miss on the lookup and not an empty
     // store answering 404 for everything.
     let (search_job_identifier, _) =
-        settled_search_job(&emulator, "us-west-2", "seed", Settled::Completed).await;
+        settled_search_job(&emulator, &engine, "us-west-2", "seed", Settled::Completed).await;
     let started = call(
         &emulator,
         "us-west-2",
@@ -466,6 +481,17 @@ async fn an_export_is_refused_while_the_search_job_has_not_settled() {
     ];
     for (case, expected_status, cancel) in cases {
         let (emulator, engine) = emulator_with_engine();
+        // One recovery point in scope, so the scan has something to get through and
+        // settles to a status an export may be started from.
+        seed_recovery_points(
+            &engine,
+            vec![recovery_point(
+                "S3",
+                "arn:aws:backup:us-west-2:000000000000:recovery-point:rp-unsettled",
+                "arn:aws:s3:::unsettled",
+                std::time::SystemTime::now(),
+            )],
+        );
         let started = call(
             &emulator,
             "us-west-2",
@@ -555,9 +581,9 @@ async fn an_export_is_refused_while_the_search_job_has_not_settled() {
 async fn a_client_token_is_idempotent_for_the_same_body_and_conflicts_for_a_different_one() {
     let (emulator, engine) = emulator_with_engine();
     let (first_job, _) =
-        settled_search_job(&emulator, "us-west-2", "token", Settled::Completed).await;
+        settled_search_job(&emulator, &engine, "us-west-2", "token", Settled::Completed).await;
     let (second_job, _) =
-        settled_search_job(&emulator, "us-west-2", "token", Settled::Stopped).await;
+        settled_search_job(&emulator, &engine, "us-west-2", "token", Settled::Stopped).await;
 
     let token = "11111111-2222-3333-4444-555555555555";
     let body = json!({
@@ -663,7 +689,8 @@ async fn a_client_token_is_idempotent_for_the_same_body_and_conflicts_for_a_diff
 async fn an_export_that_would_have_to_transmit_items_ends_in_the_modelled_failed_status() {
     let (emulator, engine) = emulator_with_engine();
     let (search_job_identifier, _) =
-        settled_search_job(&emulator, "us-west-2", "with results", Settled::Completed).await;
+        settled_search_job(&emulator, &engine, "us-west-2", "with results", Settled::Completed)
+            .await;
 
     // Give the settled search job a result set, which nothing in this emulator can scan
     // its way to: an export of it would have to transmit objects into the destination
@@ -773,7 +800,7 @@ async fn the_statuses_this_slice_uses_are_the_ones_its_model_declares() {
 async fn starting_an_export_past_the_store_cap_is_refused_with_the_quota_error() {
     let (emulator, engine) = emulator_with_engine();
     let (search_job_identifier, search_job_arn) =
-        settled_search_job(&emulator, "us-west-2", "cap", Settled::Completed).await;
+        settled_search_job(&emulator, &engine, "us-west-2", "cap", Settled::Completed).await;
 
     // Seed the store to ONE short of the cap, so the next two calls walk the boundary.
     // Driving `MAX_EXPORT_JOBS` requests would only be a slower way to reach this state.

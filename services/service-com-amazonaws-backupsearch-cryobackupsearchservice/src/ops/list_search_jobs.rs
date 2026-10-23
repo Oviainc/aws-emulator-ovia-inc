@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListSearchJobs
-//! Pages over the search jobs this account holds, in creation order: one
+//! Pages over the search jobs this account holds, NEWEST-CREATED FIRST: one
 //! `SearchJobSummary` per persisted job, read from [`crate::state`]. `Status` (the
 //! `ByStatus` query parameter) keeps only jobs in that status, and `MaxResults`/
 //! `NextToken` page the result, the token resuming exactly where the previous page
-//! ended.
+//! ended and being issued whenever the page just served was full.
 //!
 //! ## Shape of an operation
 //!
@@ -160,7 +160,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         state.settle(SystemTime::now());
 
         let summaries: Vec<SearchJobSummary> = state
-            .jobs_in_order()
+            .jobs_newest_first()
             .filter(|job| {
                 input
                     .by_status
