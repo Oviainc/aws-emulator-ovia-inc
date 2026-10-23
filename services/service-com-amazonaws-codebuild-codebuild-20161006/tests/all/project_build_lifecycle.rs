@@ -78,7 +78,7 @@ pub(crate) async fn call(router: &MultiServiceRouter, operation: &str, body: Val
 }
 
 /// A minimal valid `CreateProject` request for `name`, with `extra`'s members merged in.
-fn create_project_body(name: &str, extra: Value) -> Value {
+pub(crate) fn create_project_body(name: &str, extra: Value) -> Value {
     let mut body = json!({
         "name": name,
         "source": {"type": "NO_SOURCE", "buildspec": "version: 0.2"},

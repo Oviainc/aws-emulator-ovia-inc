@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateIPSet
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateIPSet`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: mints an IPSet (trusted IP list) under the request's detector and
+//! persists it in [`crate::state`], so `GetIPSet` reports what this call stored. A
+//! replayed `ClientToken` returns the IPSet the first call minted.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateIPSet::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +154,93 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateIPSet` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateIPSetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateIPSet"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateIPSetErrorModeled::InternalServerErrorException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+
+        let region = crate::state::request_region(ctx);
+        let mut state = state.lock();
+        let now = state.tick_millis();
+
+        // Resolve the detector this IPSet hangs off, and — under the same borrow —
+        // the IPSet a replayed `ClientToken` already minted. `ClientToken` is
+        // `@idempotencyToken` (`smithy_query(operation="CreateIPSet")`), so a
+        // replayed create returns the first call's IPSet instead of minting a
+        // second one.
+        let token = input
+            .client_token
+            .as_deref()
+            .filter(|token| !token.is_empty())
+            .map(str::to_string);
+        let already_minted = {
+            let Some(detector) = state.detector_in(&region, &input.detector_id) else {
+                // Classified from the REQUEST, the way every reporting operation
+                // here classifies a `DetectorId` it cannot resolve.
+                return Err(detector_rejection(&input.detector_id));
+            };
+            let replayed = token
+                .as_deref()
+                .and_then(|token| detector.ip_set_for_token(token))
+                .map(|ip_set| ip_set.id.clone());
+            // Nothing is minted past the per-detector maximum: this is the branch
+            // that BOUNDS `Detector::ip_sets`, so the store a caller can make this
+            // service retain is at most `IP_SETS_PER_DETECTOR` records per
+            // detector, released with the detector by `DeleteDetector`. Checked
+            // after the idempotency lookup, because a replay mints nothing.
+            if replayed.is_none() && detector.ip_sets.len() >= crate::state::IP_SETS_PER_DETECTOR {
+                return Err(crate::scaffolded::Scaffolded::invalid_input(
+                    crate::state::ip_set_limit_message(),
+                ));
+            }
+            replayed
+        };
+        if let Some(ip_set_id) = already_minted {
+            return Ok(CreateIPSetOutput { ip_set_id });
+        }
+
+        let id = state.mint_id();
+        let record = crate::state::IpSetRecord::created(
+            id.clone(),
+            input.name.clone(),
+            input.format.clone(),
+            input.location.clone(),
+            input.expected_bucket_owner.clone(),
+            input
+                .tags
+                .as_ref()
+                .map(|tags| {
+                    tags.iter()
+                        .map(|(key, value)| (key.clone(), value.clone()))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            input.activate,
+            token,
+            now,
+        );
+        let Some(detector) = state.detector_in_mut(&region, &input.detector_id) else {
+            return Err(detector_rejection(&input.detector_id));
+        };
+        detector.ip_sets.insert(id.clone(), record);
+        // The detector itself changed: it holds one more sub-resource than before.
+        detector.updated_at_millis = now;
+
+        Ok(CreateIPSetOutput { ip_set_id: id })
     }
+}
+
+/// Refuse a `DetectorId` the store does not resolve: HTTP 400 under the
+/// `InvalidInputException` class, classified from the REQUEST — a value that cannot
+/// be a detector id at all is a parameter failure, a well-formed one this
+/// account/Region does not hold an ownership failure.
+///
+/// Not `AccessDeniedException`: this operation's 403 is the IAM denial ("only users
+/// from the administrator account can use this operation" —
+/// `smithy_query(query="doc",shape="CreateIPSet")`), which is decided from the
+/// caller's permissions and not from whether the store holds the detector.
+fn detector_rejection(detector_id: &str) -> CreateIPSetError {
+    crate::scaffolded::Scaffolded::invalid_input(crate::state::detector_id_rejection(detector_id))
 }

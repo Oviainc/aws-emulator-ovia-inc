@@ -334,6 +334,39 @@ const URL_SUFFIX: &str = "amazonaws.com";
 /// `WorkflowId` is `^w-([a-z0-9]{17})$`, both `length 19..19`.
 const TRANSFER_ID_HEX_DIGITS: usize = 17;
 
+/// How many characters an Amazon Bedrock AgentCore identifier carries after its label.
+///
+/// The AgentCore control-plane model fixes it: every one of its identifiers ends in a
+/// `-` plus exactly ten characters — `MemoryId` is
+/// `^[a-zA-Z][a-zA-Z0-9-_]{0,99}-[a-zA-Z0-9]{10}$`, `AgentRuntimeId` is
+/// `^[a-zA-Z][a-zA-Z0-9_]{0,99}-[a-zA-Z0-9]{10}$` and `GatewayId` is
+/// `^([0-9a-z][-]?){1,100}-[0-9a-z]{10}$`. Those alphabets are wider than hexadecimal
+/// (which is why this is not named after hex, as `TRANSFER_ID_HEX_DIGITS` is): the
+/// suffix [`generated_service_id`] mixes is hexadecimal, and hexadecimal satisfies every
+/// one of them.
+const AGENTCORE_ID_SUFFIX_CHARS: usize = 10;
+
+/// The longest LABEL an AgentCore identifier carries before that suffix.
+///
+/// 48, the tightest of the bounds the model publishes: `AgentRuntimeArn` admits
+/// `[a-zA-Z][a-zA-Z0-9_]{0,47}` and `GatewayArn` `([0-9a-z][-]?){1,48}` before the
+/// suffix, so a label cut to 48 characters satisfies both the identifier's pattern and
+/// the ARN's.
+const AGENTCORE_LABEL_CHARS: usize = 48;
+
+/// The ARN namespace (and SigV4 signing name) AgentCore resources carry:
+/// `arn:aws:bedrock-agentcore:<region>:<account>:<resource>`, as every `arnReference`
+/// in the AgentCore control-plane model spells it (`MemoryArn`, `GatewayArn`,
+/// `AgentRuntimeArn`).
+const AGENTCORE_ARN_SERVICE: &str = "bedrock-agentcore";
+
+/// The version an AgentCore Runtime carries when it is first created.
+///
+/// `CreateAgentRuntime` answers an `agentRuntimeVersion` (`^([1-9][0-9]{0,4})$`,
+/// `length 1..5`) for the version it published, and a resource CloudFormation has just
+/// declared has exactly one.
+const FIRST_AGENTCORE_RUNTIME_VERSION: u32 = 1;
+
 /// One resource a template declares, as the template spells it.
 #[derive(Debug, Clone)]
 pub struct DeclaredResource {
@@ -1098,6 +1131,69 @@ fn generated_service_id(prefix: &str, name: &str, digits: usize) -> String {
     format!("{prefix}-{}", &digest[..digits])
 }
 
+/// The LABEL an AgentCore identifier derived from `name` carries: `name` reduced to the
+/// characters that identifier's documented pattern admits, cut to
+/// [`AGENTCORE_LABEL_CHARS`], and made to start with a letter.
+///
+/// The three AgentCore identifier patterns admit three different label alphabets
+/// (`[a-zA-Z0-9-_]` for a memory, `[a-zA-Z0-9_]` for a runtime, lower-case
+/// `[0-9a-z]` with single `-` separators for a gateway), so `admits` is the pattern's
+/// alphabet and `lowercase` says whether the pattern admits upper case at all. A
+/// CloudFormation physical name (`<stack>-<logical id>-<unique id>`) is not inside any of
+/// them, which is why it is reduced here rather than used as it is: an identifier this
+/// emulator reports must be of the form the owning service's model publishes.
+///
+/// `fallback` is the single letter the label starts with when `name` begins with
+/// something the pattern cannot (a digit, or a character that was dropped) — every one of
+/// the patterns requires a leading letter except the gateway's, and a leading letter
+/// satisfies that one too.
+fn agentcore_label(name: &str, admits: fn(char) -> bool, lowercase: bool, fallback: char) -> String {
+    let source = if lowercase {
+        name.to_ascii_lowercase()
+    } else {
+        name.to_string()
+    };
+    let kept: String = source.chars().filter(|c| admits(*c)).collect();
+    // A `-` may not repeat in a gateway label (`([0-9a-z][-]?){1,48}` allows at most one
+    // after each character) and may not end it, since the suffix adds its own.
+    let mut label = String::with_capacity(kept.len() + 1);
+    if !kept.starts_with(|c: char| c.is_ascii_alphabetic()) {
+        label.push(fallback);
+    }
+    for c in kept.chars() {
+        if c == '-' && (label.is_empty() || label.ends_with('-')) {
+            continue;
+        }
+        label.push(c);
+    }
+    label.truncate(AGENTCORE_LABEL_CHARS);
+    while label.ends_with('-') {
+        label.pop();
+    }
+    if label.is_empty() {
+        label.push(fallback);
+    }
+    label
+}
+
+/// Whether `c` is admitted by a memory identifier's label alphabet
+/// (`MemoryId`: `[a-zA-Z][a-zA-Z0-9-_]{0,99}`).
+fn memory_label_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '-' || c == '_'
+}
+
+/// Whether `c` is admitted by an agent-runtime identifier's label alphabet
+/// (`AgentRuntimeId`: `[a-zA-Z][a-zA-Z0-9_]{0,99}`, which has no `-`).
+fn runtime_label_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_'
+}
+
+/// Whether `c` is admitted by a gateway identifier's label alphabet
+/// (`GatewayId`: `([0-9a-z][-]?){1,100}`, which is lower case only).
+fn gateway_label_char(c: char) -> bool {
+    c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'
+}
+
 /// The resource types this emulator IMPLEMENTS: the ones [`return_values`] below carries
 /// the documented `Ref` and `Fn::GetAtt` return values of, so a stack that declares one
 /// gets the physical id and the attributes the type's "Return values" section publishes
@@ -1109,6 +1205,10 @@ fn generated_service_id(prefix: &str, name: &str, digits: usize) -> String {
 /// resource type this emulator provisions, and nothing for a name it knows nothing about.
 /// Keep it in step with the `match` in [`return_values`] — one entry per arm.
 pub const IMPLEMENTED_RESOURCE_TYPES: &[&str] = &[
+    "AWS::BedrockAgentCore::Gateway",
+    "AWS::BedrockAgentCore::Memory",
+    "AWS::BedrockAgentCore::Runtime",
+    "AWS::BedrockAgentCore::WorkloadIdentity",
     "AWS::DynamoDB::Table",
     "AWS::IAM::Role",
     "AWS::Lambda::Function",
@@ -1235,6 +1335,90 @@ fn return_values(
                 "Arn".to_string(),
                 ::emulator_server::emulator_arn("iam", "", &format!("role/{name}")),
             );
+            (name.to_string(), attributes)
+        }
+        // The four Amazon Bedrock AgentCore types. Source for each one's identifiers: the
+        // AgentCore control-plane model, whose `arnReference` traits name these very
+        // resource types — `MemoryArn` references `AWS::BedrockAgentCore::Memory`,
+        // `GatewayArn` `AWS::BedrockAgentCore::Gateway`, `AgentRuntimeArn`
+        // `AWS::BedrockAgentCore::Runtime` and `WorkloadIdentityArnType`
+        // `AWS::BedrockAgentCore::WorkloadIdentity` — and whose create responses publish
+        // the members a CloudFormation resource of that type returns. `Ref` returns the
+        // resource's own identifier (the type's primary identifier) and `Fn::GetAtt` reads
+        // the identifier and the ARN, each in the form the model's pattern fixes; the
+        // members those responses carry that describe a resource's RUNNING state (a
+        // status, a timestamp, a failure reason, a gateway's URL) are not carried, because
+        // nothing here provisioned a resource to be in a state.
+        //
+        // "Ref returns the memory id"; Fn::GetAtt: MemoryId, MemoryArn.
+        "AWS::BedrockAgentCore::Memory" => {
+            let id = generated_service_id(
+                &agentcore_label(name, memory_label_char, false, 'm'),
+                name,
+                AGENTCORE_ID_SUFFIX_CHARS,
+            );
+            let arn = ::emulator_server::emulator_arn(
+                AGENTCORE_ARN_SERVICE,
+                region,
+                &format!("memory/{id}"),
+            );
+            attributes.insert("MemoryId".to_string(), id.clone());
+            attributes.insert("MemoryArn".to_string(), arn);
+            (id, attributes)
+        }
+        // "Ref returns the agent runtime id"; Fn::GetAtt: AgentRuntimeId,
+        // AgentRuntimeArn, AgentRuntimeVersion. A create answers version `1`
+        // (`AgentRuntimeVersion` is `^([1-9][0-9]{0,4})$`, and the first version of a
+        // runtime is its first), which is a value of the declared resource rather than of
+        // its running state.
+        "AWS::BedrockAgentCore::Runtime" => {
+            let id = generated_service_id(
+                &agentcore_label(name, runtime_label_char, false, 'r'),
+                name,
+                AGENTCORE_ID_SUFFIX_CHARS,
+            );
+            let arn = ::emulator_server::emulator_arn(
+                AGENTCORE_ARN_SERVICE,
+                region,
+                &format!("runtime/{id}"),
+            );
+            attributes.insert("AgentRuntimeId".to_string(), id.clone());
+            attributes.insert("AgentRuntimeArn".to_string(), arn);
+            attributes.insert(
+                "AgentRuntimeVersion".to_string(),
+                FIRST_AGENTCORE_RUNTIME_VERSION.to_string(),
+            );
+            (id, attributes)
+        }
+        // "Ref returns the gateway id"; Fn::GetAtt: GatewayId, GatewayArn. A gateway
+        // identifier is lower case only (`GatewayId`: `^([0-9a-z][-]?){1,100}-[0-9a-z]{10}$`).
+        "AWS::BedrockAgentCore::Gateway" => {
+            let id = generated_service_id(
+                &agentcore_label(name, gateway_label_char, true, 'g'),
+                name,
+                AGENTCORE_ID_SUFFIX_CHARS,
+            );
+            let arn = ::emulator_server::emulator_arn(
+                AGENTCORE_ARN_SERVICE,
+                region,
+                &format!("gateway/{id}"),
+            );
+            attributes.insert("GatewayId".to_string(), id.clone());
+            attributes.insert("GatewayArn".to_string(), arn);
+            (id, attributes)
+        }
+        // "Ref returns the name"; Fn::GetAtt: Name, WorkloadIdentityArn. A workload
+        // identity is named, not id'd: `CreateWorkloadIdentity` takes a `name`
+        // (`^[A-Za-z0-9_.-]+$`) and answers that name plus the ARN, whose shape the model
+        // leaves unpatterned, so it is built in this service's own ARN form.
+        "AWS::BedrockAgentCore::WorkloadIdentity" => {
+            let arn = ::emulator_server::emulator_arn(
+                AGENTCORE_ARN_SERVICE,
+                region,
+                &format!("workload-identity-directory/default/workload-identity/{name}"),
+            );
+            attributes.insert("Name".to_string(), name.to_string());
+            attributes.insert("WorkloadIdentityArn".to_string(), arn);
             (name.to_string(), attributes)
         }
         // "Ref returns the app monitor name"; Fn::GetAtt: Id ("The unique ID of the new
