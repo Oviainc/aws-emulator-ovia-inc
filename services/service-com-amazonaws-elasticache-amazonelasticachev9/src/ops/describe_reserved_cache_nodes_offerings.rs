@@ -255,7 +255,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(
                     DescribeReservedCacheNodesOfferingsErrorModeled::ReservedCacheNodesOfferingNotFoundFault(
                         ReservedCacheNodesOfferingNotFoundFault {
-                            message: Some(format!("Offering with ID {id} not found.")),
+                            // The template `PurchaseReservedCacheNodesOffering`
+                            // already answers this same condition with: the
+                            // member, the id the request gave, and that no
+                            // offering carries it. One condition, one wording.
+                            message: Some(format!(
+                                "ReservedCacheNodesOfferingId {id} not found."
+                            )),
                         },
                     )
                     .into(),

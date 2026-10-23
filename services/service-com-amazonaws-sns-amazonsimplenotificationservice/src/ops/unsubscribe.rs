@@ -68,36 +68,6 @@
 use super::types::*;
 use crate::state;
 
-/// The fields a SUBSCRIPTION's ARN holds: an ARN whose resource is a topic name
-/// followed by the subscription's own id segment
-/// (`arn:aws:sns:<region>:<account>:<topic>:<id>`, as `Subscribe` mints it).
-const SUBSCRIPTION_ARN_FIELDS: usize = state::ARN_ELEMENTS + 1;
-
-/// Why `arn` is not a subscription ARN, or `None` when it is one.
-///
-/// The reason names the member's constraint and is built from the request, the way
-/// SNS's own argument validation reports one ("An ARN must have at least 6 elements,
-/// not 1"); nothing of the recorded wire text is required beyond that. The generic
-/// ARN shape comes from [`state::arn_shape_reason`], the one place this crate judges
-/// it, so every ARN-typed member of this service states that part alike; what is
-/// added here is what makes an ARN a SUBSCRIPTION's.
-fn malformed_subscription_arn(arn: &str) -> Option<String> {
-    if let Some(reason) = state::arn_shape_reason(arn) {
-        return Some(reason);
-    }
-    let fields: Vec<&str> = arn.split(':').collect();
-    let well_formed = fields.len() == SUBSCRIPTION_ARN_FIELDS
-        && fields[2] == "sns"
-        && fields[1..].iter().all(|field| !field.is_empty())
-        && state::topic_name_is_valid(fields[5]);
-    (!well_formed).then(|| {
-        format!(
-            "A subscription ARN names a topic and the subscription's id, so it has \
-             {SUBSCRIPTION_ARN_FIELDS} elements: {arn}"
-        )
-    })
-}
-
 /// The refusal of a subscription that is still awaiting confirmation. The HTTP 400 and
 /// the `InvalidParameter` code are the requirement; the sentence is SNS's own wording
 /// for this reason.
@@ -224,7 +194,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A `SubscriptionArn` that is not a subscription ARN fails argument validation
         // BEFORE any lookup, so garbage is refused as bad input rather than reported as
         // a subscription that is merely absent.
-        if let Some(reason) = malformed_subscription_arn(&input.subscription_arn) {
+        if let Some(reason) = state::malformed_subscription_arn(&input.subscription_arn) {
             return Err(UnsubscribeErrorModeled::InvalidParameterException(
                 InvalidParameterException {
                     message: Some(format!(

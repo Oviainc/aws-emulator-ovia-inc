@@ -15,6 +15,8 @@
 mod execution_progression;
 #[path = "all/plan_lifecycle.rs"]
 mod plan_lifecycle;
+#[path = "all/plan_update.rs"]
+mod plan_update;
 #[path = "all/route53_health_checks.rs"]
 mod route53_health_checks;
 #[path = "all/state_roundtrip.rs"]

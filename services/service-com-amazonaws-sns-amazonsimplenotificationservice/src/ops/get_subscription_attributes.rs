@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetSubscriptionAttributes
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetSubscriptionAttributes`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetSubscriptionAttributes::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -79,6 +70,8 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state;
+use std::collections::BTreeMap;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -149,20 +142,125 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetSubscriptionAttributes` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetSubscriptionAttributesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetSubscriptionAttributes"))
+        // Argument validation, BEFORE the store is consulted: a `SubscriptionArn` that
+        // is not a subscription ARN at all — including the `pending confirmation`
+        // sentinel a `Subscribe` response carries in place of one — is bad input, not a
+        // subscription that does not exist.
+        if let Some(reason) = state::malformed_subscription_arn(&input.subscription_arn) {
+            return Err(
+                GetSubscriptionAttributesErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(format!(
+                            "Invalid parameter: SubscriptionArn Reason: {reason}"
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let Some(store) = state::service_state(&*self.engine) else {
+            return Err(GetSubscriptionAttributesErrorModeled::InternalErrorException(
+                InternalErrorException {
+                    message: Some("the SNS store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let store = store.lock();
+
+        let Some(subscription) = store.subscriptions.get(&input.subscription_arn) else {
+            return Err(GetSubscriptionAttributesErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(state::SUBSCRIPTION_DOES_NOT_EXIST.to_string()),
+                },
+            )
+            .into());
+        };
+
+        // Every property SNS reports for a subscription: the ones it COMPUTES from the
+        // record — the subscription's own ARN, the topic it belongs to, how and where it
+        // delivers, the account that owns it and its confirmation state — beside the
+        // ones its owner set.
+        let mut attributes: BTreeMap<String, String> = BTreeMap::new();
+        attributes.insert(
+            state::SUBSCRIPTION_ARN_ATTRIBUTE.to_string(),
+            subscription.arn.clone(),
+        );
+        attributes.insert(
+            state::TOPIC_ARN_ATTRIBUTE.to_string(),
+            subscription.topic_arn.clone(),
+        );
+        attributes.insert(
+            state::PROTOCOL_ATTRIBUTE.to_string(),
+            subscription.protocol.clone(),
+        );
+        // The endpoint is the address the subscription was created for, reported
+        // verbatim however the resource it names has fared since: a subscription
+        // outlives the function or the queue at its endpoint.
+        if let Some(endpoint) = &subscription.endpoint {
+            attributes.insert(state::ENDPOINT_ATTRIBUTE.to_string(), endpoint.clone());
+        }
+        attributes.insert(
+            state::OWNER_ATTRIBUTE.to_string(),
+            subscription.owner.clone(),
+        );
+        // A subscription awaiting its subscriber's confirmation is pending, and nothing
+        // has confirmed it yet; one SNS confirmed itself was confirmed by the
+        // authenticated API call that created it.
+        attributes.insert(
+            state::PENDING_CONFIRMATION_ATTRIBUTE.to_string(),
+            state::attribute_flag(subscription.pending_confirmation),
+        );
+        attributes.insert(
+            state::CONFIRMATION_WAS_AUTHENTICATED_ATTRIBUTE.to_string(),
+            state::attribute_flag(!subscription.pending_confirmation),
+        );
+        // Raw message delivery is reported whether or not it was set: a subscription
+        // whose owner has set none delivers SNS's JSON envelope, which is the
+        // documented default.
+        attributes.insert(
+            state::RAW_MESSAGE_DELIVERY_ATTRIBUTE.to_string(),
+            subscription
+                .attributes
+                .get(state::RAW_MESSAGE_DELIVERY_ATTRIBUTE)
+                .cloned()
+                .unwrap_or_else(|| state::RAW_MESSAGE_DELIVERY_DISABLED.to_string()),
+        );
+        // A filter policy is applied under a scope, so a subscription that holds a
+        // policy and no explicit scope reports the documented default scope with it.
+        if subscription
+            .attributes
+            .contains_key(state::FILTER_POLICY_ATTRIBUTE)
+        {
+            attributes.insert(
+                state::FILTER_POLICY_SCOPE_ATTRIBUTE.to_string(),
+                state::DEFAULT_FILTER_POLICY_SCOPE.to_string(),
+            );
+        }
+        // The retry policy a delivery to this subscription is actually run under: the
+        // system defaults, with the topic's delivery policy and then the subscription's
+        // own laid over them. Only a protocol a delivery policy governs has one.
+        if state::protocol_has_delivery_policy(&subscription.protocol) {
+            attributes.insert(
+                state::EFFECTIVE_DELIVERY_POLICY_ATTRIBUTE.to_string(),
+                state::effective_subscription_delivery_policy(
+                    store.topics.get(&subscription.topic_arn),
+                    subscription,
+                ),
+            );
+        }
+        // Every attribute the subscription holds — a filter policy and its scope, a
+        // delivery or redrive or replay policy, a Firehose role ARN — reported because
+        // its owner set it, and with the value its owner set.
+        for (name, value) in &subscription.attributes {
+            attributes.insert(name.clone(), value.clone());
+        }
+
+        Ok(GetSubscriptionAttributesOutput {
+            attributes: Some(attributes),
+        })
     }
 }

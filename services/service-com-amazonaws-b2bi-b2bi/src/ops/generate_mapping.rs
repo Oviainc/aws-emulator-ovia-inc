@@ -1367,8 +1367,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // The template is computed from the request's own two documents: this operation
-        // owns no resource, so it reads and writes no state and the engine goes unused.
-        let _ = &self.engine;
+        // owns no resource, so it reads and writes no state and the engine is reached only
+        // to authorize the request.
+        if let Err(denied) =
+            crate::state::authorize(&*self.engine, ctx, Self::NAME, crate::state::ANY_RESOURCE)
+        {
+            return Err(GenerateMappingErrorModeled::AccessDeniedException(denied).into());
+        }
 
         // An access record for the call. The method and URI are values `http` already
         // parsed, and the sizes are numbers — the caller's `mappingType` string and the

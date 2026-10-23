@@ -31,11 +31,15 @@ pub(crate) const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
 /// `p-<17 hex>` ids in this service's own Smithy model examples.
 pub(crate) const ID_HEX_DIGITS: usize = 17;
 
-/// A router with the b2bi service and the CloudWatch Logs service on one shared
-/// engine — what `build_router` assembles, narrowed to the services under test.
+/// A router with the b2bi service, the CloudWatch Logs service and the Amazon S3 service
+/// on one shared engine — what `build_router` assembles, narrowed to the services under
+/// test.
 ///
 /// CloudWatch Logs is mounted because `CreateProfile` provisions a logging-ENABLED
-/// profile's log group by calling it in process, exactly as the assembled emulator does.
+/// profile's log group by calling it in process; S3 is mounted because `TestParsing`,
+/// `CreateStarterMappingTemplate` and `StartTransformerJob` read their EDI objects from it
+/// (and a transformer job writes its output file back) — exactly as the assembled emulator
+/// does.
 pub(crate) fn b2bi_router() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
@@ -43,9 +47,44 @@ pub(crate) fn b2bi_router() -> MultiServiceRouter {
         &engine,
     )));
     router.register_service(
-        service_com_amazonaws_cloudwatchlogs_logs_20140328::EmulatedService::new(engine),
+        service_com_amazonaws_cloudwatchlogs_logs_20140328::EmulatedService::new(Arc::clone(
+            &engine,
+        )),
     );
+    router.register_service(service_com_amazonaws_s3_amazons3::EmulatedService::new(
+        engine,
+    ));
     router
+}
+
+/// Send one path-style request to the emulator's S3 front door, returning the HTTP status.
+///
+/// S3 is a REST service: the bucket and key live in the URI and the body is the object's
+/// own bytes, so this is a raw request rather than an `x-amz-target` call. The credential
+/// scope names `s3`, which is what the router claims on.
+pub(crate) async fn s3(
+    router: &MultiServiceRouter,
+    method: &str,
+    path: &str,
+    body: &[u8],
+) -> (u16, Vec<u8>) {
+    let request = http::Request::builder()
+        .method(method)
+        .uri(path)
+        .header(
+            "authorization",
+            format!(
+                "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20240101/{SIGNING_REGION}/s3/\
+                 aws4_request, SignedHeaders=host, Signature=deadbeef"
+            ),
+        )
+        .body(bytes::Bytes::copy_from_slice(body))
+        .expect("a well-formed request");
+    let response = router.dispatch(request).await;
+    (
+        response.status().as_u16(),
+        response.body().as_ref().to_vec(),
+    )
 }
 
 /// Invoke one operation and return `(status, body)`.
@@ -63,6 +102,41 @@ pub(crate) async fn call_signed_for(
             format!(
                 "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20240101/{region}/b2bi/aws4_request, \
                  SignedHeaders=host, Signature=deadbeef"
+            ),
+        )
+        .header("x-amz-target", format!("B2BI.{operation}"))
+        .header("content-type", "application/x-amz-json-1.0")
+        .body(bytes::Bytes::from(
+            serde_json::to_vec(&body).expect("the request body serializes"),
+        ))
+        .expect("a well-formed request");
+
+    let response = router.dispatch(request).await;
+    let status = response.status().as_u16();
+    let parsed = if response.body().is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(response.body()).unwrap_or(Value::Null)
+    };
+    (status, parsed)
+}
+
+/// Invoke one operation signed for [`SIGNING_REGION`] with the access key id
+/// `access_key_id`, so a test can speak for the principal that key names.
+pub(crate) async fn call_as(
+    router: &MultiServiceRouter,
+    access_key_id: &str,
+    operation: &str,
+    body: Value,
+) -> (u16, Value) {
+    let request = http::Request::builder()
+        .method("POST")
+        .uri("/")
+        .header(
+            "authorization",
+            format!(
+                "AWS4-HMAC-SHA256 Credential={access_key_id}/20240101/{SIGNING_REGION}/b2bi/\
+                 aws4_request, SignedHeaders=host, Signature=deadbeef"
             ),
         )
         .header("x-amz-target", format!("B2BI.{operation}"))
@@ -973,10 +1047,14 @@ async fn deleting_a_resource_a_partnership_still_uses_is_a_conflict() {
 }
 
 /// RULE: a create repeated with the same `@idempotencyToken` answers with the resource
-/// the first call created, rather than minting a second one; a different token mints a
-/// new resource. Rows span all three creates.
+/// the first call created, rather than minting a second one, ONCE that first create has
+/// settled; a repeat sent while it is still in flight is the racer AWS refuses with
+/// `ConflictException` (409). A different token mints a new resource. Rows span all three
+/// creates.
 #[tokio::test]
 async fn repeating_a_create_with_the_same_client_token_returns_the_same_resource() {
+    use service_com_amazonaws_b2bi_b2bi::state::IDEMPOTENT_CREATE_IN_FLIGHT;
+
     let router = b2bi_router();
     let profile_id = given_profile(&router, "acme").await;
     let capability_id = given_capability(&router, "edi-850").await;
@@ -1044,6 +1122,22 @@ async fn repeating_a_create_with_the_same_client_token_returns_the_same_resource
 
         let (status, first) = call(&router, operation, request("token-alpha")).await;
         assert_eq!(status, 201, "case {case:?}: first create failed: {status} {first}");
+
+        // While that create is still in flight, a duplicate is the racer that lost it.
+        let (status, raced) = call(&router, operation, request("token-alpha")).await;
+        assert_eq!(
+            status, 409,
+            "case {case:?}: a duplicate sent while the create is in flight must be \
+             refused with ConflictException, got {status} {raced}"
+        );
+        assert_eq!(
+            error_code(&raced),
+            "ConflictException",
+            "case {case:?}: expected ConflictException, got {raced}"
+        );
+
+        // Once it has settled, the same token answers with the resource it minted.
+        tokio::time::sleep(IDEMPOTENT_CREATE_IN_FLIGHT).await;
         let (status, replay) = call(&router, operation, request("token-alpha")).await;
         assert_eq!(status, 201, "case {case:?}: replay failed: {status} {replay}");
         assert_eq!(
@@ -1063,13 +1157,190 @@ async fn repeating_a_create_with_the_same_client_token_returns_the_same_resource
             "case {case:?}: a different clientToken must mint a different resource"
         );
 
+        // One token names ONE request: the SAME token carrying a DIFFERENT request can
+        // neither replay the resource it minted nor mint a second one, so it is the
+        // modelled conflict.
+        let mut different = request("token-alpha");
+        different["name"] = json!("a different request under a used token");
+        let (status, refused) = call(&router, operation, different).await;
+        assert_eq!(
+            status, 409,
+            "case {case:?}: a different request under a used clientToken must be refused, \
+             got {status} {refused}"
+        );
+        assert_eq!(
+            error_code(&refused),
+            "ConflictException",
+            "case {case:?}: expected ConflictException, got {refused}"
+        );
+
         let (_, after) = call(&router, list_op, json!({})).await;
         let count_after = after[*items].as_array().map(Vec::len).unwrap_or_default();
         assert_eq!(
             count_after,
             count_before + 2,
-            "case {case:?}: two distinct tokens must add exactly two resources"
+            "case {case:?}: two distinct tokens must add exactly two resources, and a \
+             refused request none"
         );
+    }
+}
+
+/// One row of an update table: the case, the update to send, and the (member, value)
+/// pairs the stored record must report afterwards.
+type UpdateCase<'a> = (&'a str, Value, Vec<(&'a str, Value)>);
+
+/// RULE: `UpdateProfile` applies ONLY the members a request names — every other member
+/// keeps the value the store holds — reports the stored record (so a later `GetProfile`
+/// agrees with it), and refuses a `profileId` that does not resolve with
+/// `ResourceNotFoundException` (404), which is the same verdict `GetProfile` gives for it.
+///
+/// The rows differ along which members the update names: one, several, and none at all.
+#[tokio::test]
+async fn updating_a_profile_applies_only_the_members_it_names() {
+    let router = b2bi_router();
+
+    let (status, created) = call(
+        &router,
+        "CreateProfile",
+        json!({
+            "name": "original",
+            "phone": "555-555-0100",
+            "businessName": "Original Corp",
+            "email": "original@example.com",
+            "logging": "ENABLED"
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "the profile must be created, got {status} {created}");
+    let profile_id = text(&created, "profileId");
+
+    // Each row: the case, the update to send, and the (member, value) pairs the stored
+    // record must report afterwards — including the ones the update did NOT name.
+    let cases: Vec<UpdateCase<'_>> = vec![
+        (
+            "the name alone",
+            json!({ "name": "renamed" }),
+            vec![
+                ("name", json!("renamed")),
+                ("phone", json!("555-555-0100")),
+                ("businessName", json!("Original Corp")),
+                ("email", json!("original@example.com")),
+            ],
+        ),
+        (
+            "the phone and the business name",
+            json!({ "phone": "555-555-0199", "businessName": "Renamed Corp" }),
+            vec![
+                ("name", json!("renamed")),
+                ("phone", json!("555-555-0199")),
+                ("businessName", json!("Renamed Corp")),
+                ("email", json!("original@example.com")),
+            ],
+        ),
+        (
+            "the email alone",
+            json!({ "email": "new@example.com" }),
+            vec![
+                ("name", json!("renamed")),
+                ("phone", json!("555-555-0199")),
+                ("email", json!("new@example.com")),
+            ],
+        ),
+        (
+            "nothing at all",
+            json!({}),
+            vec![
+                ("name", json!("renamed")),
+                ("phone", json!("555-555-0199")),
+                ("businessName", json!("Renamed Corp")),
+                ("email", json!("new@example.com")),
+            ],
+        ),
+    ];
+
+    for (case, update, expected) in cases {
+        let mut body = json!({ "profileId": profile_id.clone() });
+        for (member, value) in update.as_object().expect("an object of members") {
+            body[member] = value.clone();
+        }
+        let (status, updated) = call(&router, "UpdateProfile", body).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: the update must succeed, got {status} {updated}"
+        );
+        assert!(
+            updated["modifiedAt"].is_number(),
+            "case {case:?}: an update must report when it happened, got {updated}"
+        );
+        assert_eq!(
+            updated["createdAt"], created["createdAt"],
+            "case {case:?}: an update must not change when the profile was created"
+        );
+        assert_eq!(
+            updated["logGroupName"], created["logGroupName"],
+            "case {case:?}: an update names no logging member, so the profile keeps its \
+             log group, got {updated}"
+        );
+
+        let (status, read_back) = call(
+            &router,
+            "GetProfile",
+            json!({ "profileId": profile_id.clone() }),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: the read-back must succeed, got {status} {read_back}"
+        );
+        for (member, value) in expected {
+            assert_eq!(
+                updated[member], value,
+                "case {case:?}: the update must report {member} as {value}, got {updated}"
+            );
+            assert_eq!(
+                read_back[member], value,
+                "case {case:?}: the stored profile must report {member} as {value}, got \
+                 {read_back}"
+            );
+        }
+    }
+
+    // A mutation on an id this service does not hold — never held, or deleted — is
+    // refused as not-found, exactly as a read of it is.
+    let (status, _) = call(
+        &router,
+        "DeleteProfile",
+        json!({ "profileId": profile_id.clone() }),
+    )
+    .await;
+    assert_eq!(status, 200, "the profile must be deletable, got {status}");
+
+    for (case, id) in [
+        ("a deleted profile", profile_id.as_str()),
+        ("an id this service never held", "p-00000000000000000"),
+    ] {
+        for operation in ["UpdateProfile", "GetProfile"] {
+            let mut body = json!({ "profileId": id });
+            if operation == "UpdateProfile" {
+                body["name"] = json!("renamed");
+            }
+            let (status, response) = call(&router, operation, body).await;
+            assert_eq!(
+                status, 404,
+                "case {case:?}: {operation} must answer 404, got {status} {response}"
+            );
+            assert_eq!(
+                error_code(&response),
+                "ResourceNotFoundException",
+                "case {case:?}: {operation} must answer ResourceNotFoundException, got \
+                 {response}"
+            );
+            let message = response["message"].as_str().unwrap_or_default();
+            assert!(
+                message.contains(id),
+                "case {case:?}: {operation}'s refusal must name the id, got {message:?}"
+            );
+        }
     }
 }
 

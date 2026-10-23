@@ -362,14 +362,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // member carries no modelled `@pattern`, so the documented name rule is
         // enforced here.
         let replication_group_id = input.replication_group_id.to_ascii_lowercase();
-        if !crate::state::is_valid_replication_group_id(&replication_group_id) {
-            return Err(invalid_value(format!(
-                "Invalid value {} for ReplicationGroupId: a name must contain from 1 to {} \
-                 alphanumeric characters or hyphens, must begin with a letter, and must not end \
-                 with a hyphen or contain two consecutive hyphens.",
-                input.replication_group_id,
-                crate::state::REPLICATION_GROUP_ID_MAX_LEN
-            )));
+        // The identifier rule, worded by the one helper every identifier
+        // refusal of this service goes through
+        // (`crate::state::identifier_refusal`), against the bound THIS member
+        // documents — a create mints the member cluster ids from the group id,
+        // so its bound is the stricter one.
+        if let Some(message) = crate::state::identifier_refusal(
+            "Replication Group ID",
+            "ReplicationGroupIdentifier",
+            &replication_group_id,
+            crate::state::REPLICATION_GROUP_ID_MAX_LEN,
+        ) {
+            return Err(invalid_value(message));
         }
 
         // The engine the request named, refused here when it is not one a

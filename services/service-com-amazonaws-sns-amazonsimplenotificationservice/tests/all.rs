@@ -20,6 +20,9 @@ mod resource_tags;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 
+#[path = "all/subscription_attributes.rs"]
+mod subscription_attributes;
+
 #[path = "all/subscription_pending_confirmation.rs"]
 mod subscription_pending_confirmation;
 

@@ -552,6 +552,12 @@ pub fn timestamp(at: SystemTime) -> ::aws_smithy_types::DateTime {
 // [`validate_members`]; its violations become the modelled error through
 // [`constraint_validation_exception`].
 //
+// The ARN-typed members are the one class whose REPORTING is this service's own
+// rather than the framework's: a request's ARNs are parsed by the service's own
+// ARN validators, which state their own field name and message. The acceptance
+// test is still the modelled `@pattern`, run by the same walk; only the refusal
+// is worded by this service. See [`arn_validation_exception`].
+//
 // ONE member is deliberately NOT covered: the paginated operations' `MaxResults`
 // and its `@range(1..100)`. The recorded AWS answer for an out-of-range page size
 // is the request-validation layer's own envelope — a 400 whose body carries a
@@ -1239,20 +1245,139 @@ pub fn constrained_network_configuration(
     })
 }
 
+// ---------------------------------------------------------------------------
+// The service's own ARN validation
+// ---------------------------------------------------------------------------
+//
+// An ARN-typed input member is not reported as a member-constraint failure.
+// This service parses the ARNs a request carries with its OWN validators,
+// before any member constraint is rendered, and each validator reports its own
+// result:
+//
+// * a resource ARN of this service (a member targeting `WorkflowArn` or
+//   `TaggableResourceArn`) is reported under the generic field name `Arn` with
+//   the validator's short message, and the top-level `Message` is composed as
+//   the service-level prefix plus that field message — so a client attributes
+//   an ARN failure to one field name whichever operation refused it;
+// * the IAM role ARN (a member targeting `RoleARN`) is reported under the name
+//   the model gives the member, with a message built from the request: the
+//   fixed prefix plus the rejected value as supplied, which is also the
+//   top-level `Message`.
+//
+// Neither carries the modelled `@pattern` source, which is internal.
+
+/// `FieldList$Name` for a resource ARN this service refused: the generic field
+/// name its ARN validator reports, not the member the value arrived in.
+const ARN_FIELD_NAME: &str = "Arn";
+
+/// The field message a malformed resource ARN carries.
+const INVALID_ARN_MESSAGE: &str = "Invalid arn";
+
+/// How a service-level validation failure composes its top-level `Message`:
+/// this fixed prefix followed by the offending field's own message.
+const VALIDATION_FAILED_PREFIX: &str = "Validation failed. ";
+
+/// The fixed prefix of the role-ARN validator's message, followed by the
+/// rejected value as supplied.
+const INVALID_ROLE_ARN_PREFIX: &str = "Invalid Role ARN: ";
+
+/// Which of this service's ARN validators owns an input member.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArnValidator {
+    /// A member naming a resource OF THIS SERVICE (`WorkflowArn`,
+    /// `TaggableResourceArn`).
+    Resource,
+    /// A member naming an IAM role (`RoleARN`).
+    Role,
+}
+
+/// Every ARN-typed input member of this service, with the validator that owns
+/// it — keyed by the member SCHEMA the walk reads, so this list cannot drift
+/// from the member names the violation paths carry.
+static ARN_MEMBERS: &[(&Schema, ArnValidator)] = &[
+    (&M_WORKFLOW_ARN, ArnValidator::Resource),
+    (&M_RESOURCE_ARN, ArnValidator::Resource),
+    (&M_ROLE_ARN, ArnValidator::Role),
+];
+
+/// The ARN validator that owns the member a violation `path` names, or `None`
+/// when the path is not one of this service's ARN members. A path is compared
+/// against the framework's own lowerCamel member spelling, the exact form it
+/// builds a path segment with.
+fn arn_validator_for(path: &str) -> Option<ArnValidator> {
+    ARN_MEMBERS.iter().find_map(|(schema, validator)| {
+        let member = schema.member_name()?;
+        (path == ::aws_smithy_schema_server::constraints::path::member(member))
+            .then_some(*validator)
+    })
+}
+
+/// The ARN validator's own `ValidationException` when a request carried a
+/// malformed ARN, or `None` when no ARN member was at fault.
+///
+/// The validators run before member-constraint rendering, so an ARN failure is
+/// answered on its own: the `FieldList` carries the ARN field alone, and the
+/// `Message` is the one that validator states. A resource ARN names the
+/// resource a call targets, so it is parsed before the role ARN a create or
+/// update also carries.
+fn arn_validation_exception(violations: &[Violation]) -> Option<ValidationException> {
+    for owner in [ArnValidator::Resource, ArnValidator::Role] {
+        for violation in violations {
+            // An ABSENT member is not a malformed ARN: there is no value to
+            // parse, so it keeps the missing-member refusal the walk states.
+            let Some(value) = violation.value.as_deref() else {
+                continue;
+            };
+            if arn_validator_for(&violation.path) != Some(owner) {
+                continue;
+            }
+            let field = match owner {
+                ArnValidator::Resource => ValidationExceptionField {
+                    name: ARN_FIELD_NAME.to_string(),
+                    message: INVALID_ARN_MESSAGE.to_string(),
+                },
+                ArnValidator::Role => ValidationExceptionField {
+                    name: model_member_name(&violation.path),
+                    message: format!("{INVALID_ROLE_ARN_PREFIX}{value}"),
+                },
+            };
+            let message = match owner {
+                // The service-level field validation prefixes its field
+                // message; the role-ARN check states its message directly.
+                ArnValidator::Resource => format!("{VALIDATION_FAILED_PREFIX}{}", field.message),
+                ArnValidator::Role => field.message.clone(),
+            };
+            return Some(ValidationException {
+                message,
+                reason: REASON_FIELD_VALIDATION_FAILED.to_string(),
+                field_list: Some(vec![field]),
+            });
+        }
+    }
+    None
+}
+
 /// This service's modelled `ValidationException` for the violations the walk
 /// reported.
 ///
-/// The `Message` is the framework's own envelope, so a refusal made here reads
-/// exactly like one the boundary made; `Reason` is the `@required`
+/// An ARN member at fault is answered by [`arn_validation_exception`] — this
+/// service validates the ARNs a request carries itself, and its validators'
+/// results are not the generic constraint rendering.
+///
+/// Otherwise the `Message` is the framework's own envelope, so a refusal made
+/// here reads exactly like one the boundary made; `Reason` is the `@required`
 /// `fieldValidationFailed` the boundary cannot carry; and `FieldList` names
 /// every member that failed.
 ///
-/// A violation `path` is the walk's lowerCamel rendering (`roleArn`,
+/// A violation `path` is the walk's lowerCamel rendering (`name`,
 /// `subnetIds.0.member`), which is the form AWS validation messages use, so it
 /// is kept verbatim in the clause. `FieldList$Name` is documented as "the name
 /// of the field that failed validation", so its FIRST segment is restored to the
 /// spelling the model gives that member by [`model_member_name`].
 pub fn constraint_validation_exception(violations: &[Violation]) -> ValidationException {
+    if let Some(exception) = arn_validation_exception(violations) {
+        return exception;
+    }
     ValidationException {
         message: ::aws_smithy_schema_server::envelope(violations)
             .unwrap_or_else(|| "invalid request".to_string()),

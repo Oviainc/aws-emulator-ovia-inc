@@ -206,7 +206,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             widgets,
             created_at: now,
             updated_at: now,
-            // Persisted at create time so the tagging operations have state to read.
+            // Persisted at create time, as the tag list every tagging operation
+            // reads and writes.
             resource_tags: input.resource_tags.unwrap_or_default(),
             // A new dashboard carries no resource-based policy: `CreateDashboard`
             // models no member that attaches one, so `GetResourcePolicy` reads back

@@ -202,6 +202,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // modelled not-found; pagination does not apply to a single-resource
         // lookup. "This parameter is not case sensitive."
         if let Some(id) = input.replication_group_id.as_deref() {
+            // The FORM of the identifier first: a value no replication group
+            // could ever carry is a bad parameter value, not a group that does
+            // not exist, and a client told "not found" would go on creating
+            // against an id that can never be accepted.
+            if let Some(message) = crate::state::identifier_refusal(
+                "Replication Group ID",
+                "ReplicationGroupIdentifier",
+                id,
+                crate::state::LOOKUP_IDENTIFIER_MAX_LEN,
+            ) {
+                return Err(
+                    DescribeReplicationGroupsErrorModeled::InvalidParameterValueException(
+                        InvalidParameterValueException {
+                            message: Some(message),
+                        },
+                    )
+                    .into(),
+                );
+            }
             let key = id.to_ascii_lowercase();
             let Some(group) = store.modeled_replication_group(&key) else {
                 return Err(

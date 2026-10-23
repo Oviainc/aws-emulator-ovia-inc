@@ -491,6 +491,13 @@ pub struct RuleGroupsNamespace {
     /// The `clientToken` of the call that created this namespace, which is what makes
     /// `CreateRuleGroupsNamespace` idempotent per its `@idempotencyToken`.
     pub create_token: Option<String>,
+    /// The `clientToken` of the `PutRuleGroupsNamespace` update still in flight, which
+    /// is what makes that `@idempotent` operation idempotent per its
+    /// `@idempotencyToken`: replaying it answers with the update it already started
+    /// instead of starting a second one. Forgotten the moment the update settles (see
+    /// [`materialize_namespaces_due`]), so a later call reusing the token is a new
+    /// request.
+    pub update_token: Option<String>,
 }
 
 /// One entry of a configuration's `limitsPerLabelSet`: a label set and the active time
@@ -904,6 +911,9 @@ fn materialize_namespaces_due(
                 false
             } else {
                 namespace.status_code = NAMESPACE_STATUS_ACTIVE.to_string();
+                // The token identified the update that just settled, so it stops
+                // standing for one: a later call carrying it is a new request.
+                namespace.update_token = None;
                 true
             }
         }

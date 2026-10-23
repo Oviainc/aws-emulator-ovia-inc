@@ -21,6 +21,8 @@ mod environment_update;
 mod extensions;
 #[path = "all/list_configuration_profiles.rs"]
 mod list_configuration_profiles;
+#[path = "all/list_environments.rs"]
+mod list_environments;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/state_roundtrip.rs"]

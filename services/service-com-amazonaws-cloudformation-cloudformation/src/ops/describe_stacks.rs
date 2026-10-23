@@ -73,7 +73,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
-use crate::state::{StoredStack, DRIFT_STATUS_NOT_CHECKED};
+use crate::state::StoredStack;
 
 /// One stored stack as the modelled `Stack` shape.
 ///
@@ -97,9 +97,9 @@ use crate::state::{StoredStack, DRIFT_STATUS_NOT_CHECKED};
 /// * `ParentId`, `RootId` — nested stacks are not implemented, so no stack here has any.
 /// * `DetailedStatus` — nothing in this slice produces one.
 ///
-/// `DriftInformation` is `NOT_CHECKED`: drift detection compares a stack's resources
-/// against its template, and `DetectStackDrift` answers 501 here rather than reporting a
-/// check nothing ran, so no stack of this emulator has ever been checked.
+/// `DriftInformation` is the result of the last drift detection that COMPLETED against the
+/// stack, with the instant the most recent detection was initiated on it: `NOT_CHECKED`
+/// with no timestamp until `DetectStackDrift` has run one.
 fn stack_view(stored: &StoredStack) -> Stack {
     Stack {
         stack_id: Some(stored.stack_id.clone()),
@@ -129,10 +129,7 @@ fn stack_view(stored: &StoredStack) -> Stack {
         enable_termination_protection: Some(stored.enable_termination_protection),
         parent_id: None,
         root_id: None,
-        drift_information: Some(StackDriftInformation {
-            stack_drift_status: DRIFT_STATUS_NOT_CHECKED.to_string(),
-            last_check_timestamp: None,
-        }),
+        drift_information: crate::state::stack_drift_information(stored),
         retain_except_on_create: stored.retain_except_on_create,
         deletion_mode: stored.deletion_mode.clone(),
         detailed_status: None,

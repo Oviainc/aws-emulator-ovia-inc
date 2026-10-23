@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutRuleGroupsNamespace
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutRuleGroupsNamespace`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: replaces the rules file an EXISTING rule groups namespace holds, in the
+//! PERSISTED record, and answers from that record. The namespace moves to `UPDATING` and
+//! the clock owes its move back to `ACTIVE` ([`crate::state::TRANSITION_DELAY`]);
+//! `clientToken` makes the call idempotent while that update is in flight, a namespace
+//! the workspace does not hold is refused `ResourceNotFoundException`, and a namespace or
+//! workspace that is not `ACTIVE` is refused `ConflictException`. Tags are left exactly
+//! as they are: "You can't use this operation to add tags to an existing rule groups
+//! namespace. Instead, use TagResource."
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutRuleGroupsNamespace::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -172,18 +173,139 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutRuleGroupsNamespace` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutRuleGroupsNamespaceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutRuleGroupsNamespace"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(PutRuleGroupsNamespaceErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the workspace store is unavailable".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.materialize_due(now);
+
+        // The namespace lives "within a workspace", so without that workspace there is
+        // nothing to update: `ResourceNotFoundException` (404).
+        let Some(workspace) = store.workspaces.get_mut(&input.workspace_id) else {
+            return Err(
+                PutRuleGroupsNamespaceErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: crate::state::WORKSPACE_NOT_FOUND_MESSAGE.to_string(),
+                        resource_id: input.workspace_id.clone(),
+                        resource_type: crate::state::WORKSPACE_RESOURCE_TYPE.to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+        let workspace_id = workspace.workspace_id.clone();
+        let workspace_status = workspace.status_code.clone();
+
+        // "Use this operation only to update existing rule groups namespaces. To create a
+        // new rule groups namespace, use CreateRuleGroupsNamespace." — so a name the
+        // workspace does not hold is a missing resource (404), never a fresh namespace.
+        let Some(namespace) = workspace.rule_groups_namespaces.get_mut(&input.name) else {
+            return Err(
+                PutRuleGroupsNamespaceErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: crate::state::RULE_GROUPS_NAMESPACE_NOT_FOUND_MESSAGE
+                            .to_string(),
+                        resource_id: input.name.clone(),
+                        resource_type: crate::state::RULE_GROUPS_NAMESPACE_RESOURCE_TYPE
+                            .to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // Replaying the SAME `clientToken` that started the update STILL PENDING is not a
+        // conflict: the operation is `@idempotent` and `clientToken` carries
+        // `@idempotencyToken`, so that call answers with the update it already started
+        // rather than starting a second one. The match is deliberately narrow — only while
+        // that update is in flight, which is the window the token identifies;
+        // `materialize_due` forgets the token when the update settles, so a later call
+        // reusing it is a new request and is applied like any other.
+        let replaying_pending_update = input.client_token.is_some()
+            && namespace.status_code == crate::state::NAMESPACE_STATUS_UPDATING
+            && namespace.update_token == input.client_token;
+        if replaying_pending_update {
+            return Ok(response_for(namespace));
+        }
+
+        // Every entry of `RuleGroupsNamespaceStatusCode` documents the same rule:
+        // "Update/Deletion is disallowed until namespace is ACTIVE and workspace status is
+        // ACTIVE." A namespace still being created, still settling a previous update or
+        // being deleted — or one inside a workspace that is not usable yet — is an
+        // inconsistent state rather than a missing resource, so `ConflictException` (409).
+        if workspace_status != crate::state::STATUS_ACTIVE {
+            return Err(PutRuleGroupsNamespaceErrorModeled::ConflictException(
+                ConflictException {
+                    message: format!(
+                        "The workspace is {workspace_status}; an update is disallowed \
+                         until workspace status is {}",
+                        crate::state::STATUS_ACTIVE,
+                    ),
+                    resource_id: workspace_id,
+                    resource_type: crate::state::WORKSPACE_RESOURCE_TYPE.to_string(),
+                },
+            )
+            .into());
+        }
+        if namespace.status_code != crate::state::NAMESPACE_STATUS_ACTIVE {
+            return Err(PutRuleGroupsNamespaceErrorModeled::ConflictException(
+                ConflictException {
+                    message: format!(
+                        "The rule groups namespace is {}; an update is disallowed until \
+                         the namespace is {}",
+                        namespace.status_code,
+                        crate::state::NAMESPACE_STATUS_ACTIVE,
+                    ),
+                    resource_id: namespace.arn.clone(),
+                    resource_type: crate::state::RULE_GROUPS_NAMESPACE_RESOURCE_TYPE.to_string(),
+                },
+            )
+            .into());
+        }
+
+        // The update itself: `data` is `@required`, so the stored rules file is REPLACED
+        // by the one this request carries, byte for byte (`RuleGroupsNamespaceData` is a
+        // blob). `tags` is not an input of this operation at all — "You can't use this
+        // operation to add tags to an existing rule groups namespace" — so the stored tags
+        // are left alone, and the ARN and the creation instant still identify the same
+        // resource: only `modifiedAt` moves, because this is when the namespace was "most
+        // recently changed".
+        namespace.data = input.data;
+        namespace.modified_at = now;
+        // Accepted (202) with the namespace UPDATING, and the clock owes the move back to
+        // ACTIVE at `transition_due` — so a caller reading straight after this call still
+        // sees UPDATING and the state refusals that go with it.
+        namespace.status_code = crate::state::NAMESPACE_STATUS_UPDATING.to_string();
+        // "The reason for the failure, if any": nothing has failed.
+        namespace.status_reason = None;
+        namespace.transition_due = Some(now + crate::state::TRANSITION_DELAY);
+        namespace.update_token = input.client_token;
+
+        Ok(response_for(namespace))
+    }
+}
+
+/// The response for a stored namespace.
+///
+/// Every member is read back off the persisted record — so `tags` and `status` report
+/// what the namespace HOLDS, not what the request carried.
+fn response_for(namespace: &crate::state::RuleGroupsNamespace) -> PutRuleGroupsNamespaceOutput {
+    PutRuleGroupsNamespaceOutput {
+        name: namespace.name.clone(),
+        arn: namespace.arn.clone(),
+        status: RuleGroupsNamespaceStatus {
+            status_code: namespace.status_code.clone(),
+            status_reason: namespace.status_reason.clone(),
+        },
+        tags: crate::state::tag_map(&namespace.tags),
     }
 }

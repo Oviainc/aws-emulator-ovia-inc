@@ -310,37 +310,23 @@ fn store_full() -> CreateTransformerError {
     .into()
 }
 
-/// The modelled refusal for a repeat of a `clientToken` that asks for something else.
-///
-/// An `@idempotencyToken` makes a retry safe, so one token names ONE request: a second
-/// request under a token this store already minted a transformer for cannot be served as
-/// a replay (the parameters differ) and must not mint a second transformer either, which
-/// is what `ConflictException` (HTTP 409) is modelled for on this operation.
+/// The modelled refusal for a repeat of a `clientToken` that asks for something else — the
+/// wording every create of this service refuses it with
+/// ([`crate::state::token_already_used`]).
 fn token_already_used(existing: &crate::state::Transformer) -> CreateTransformerError {
     CreateTransformerErrorModeled::ConflictException(ConflictException {
-        message: format!(
-            "this clientToken already created transformer {} with different parameters",
-            existing.transformer_id
-        ),
+        message: crate::state::token_already_used("transformer", &existing.transformer_id),
     })
     .into()
 }
 
 /// A digest of everything this create request asks for, as the `@idempotencyToken`
-/// replay check compares it.
+/// replay check compares it ([`crate::state::request_digest`]).
 ///
 /// Derived from the typed members' own `Debug` rendering, with the tag list sorted so
 /// two requests differing only in tag ORDER are the same request. `clientToken` itself
-/// is excluded (it is the key, not part of the payload), and the digest is hashed
-/// rather than kept verbatim because `mappingTemplate` alone can be 350 000 bytes.
-///
-/// A `Debug` rendering is enough precisely because this digest is never compared with one
-/// from anywhere else: it is only ever compared with a digest THIS process computed, over
-/// records held in this process's own memory, so it needs to distinguish two requests
-/// rather than to be stable across builds.
+/// is excluded (it is the key, not part of the payload).
 fn request_digest(input: &CreateTransformerInput) -> String {
-    use sha2::Digest;
-
     // Destructured, not field-accessed, so the member set is EXHAUSTIVE at compile time:
     // a member added to `CreateTransformerInput` by a model update breaks this line
     // instead of being silently left out of the digest (which would answer a genuinely
@@ -382,9 +368,7 @@ fn request_digest(input: &CreateTransformerInput) -> String {
             &tags,
         )
     );
-    let mut digest = sha2::Sha256::new();
-    digest.update(rendered.as_bytes());
-    ::hex::encode(digest.finalize())
+    crate::state::request_digest(&rendered)
 }
 
 /// The response for a stored transformer — every member read back off the record, so a
@@ -452,6 +436,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(mixed_configuration_styles(&legacy, &current));
         }
 
+        if let Err(denied) =
+            crate::state::authorize(&*self.engine, ctx, Self::NAME, crate::state::ANY_RESOURCE)
+        {
+            return Err(CreateTransformerErrorModeled::AccessDeniedException(denied).into());
+        }
         let Some(store) = crate::state::service_state(&*self.engine) else {
             return Err(CreateTransformerErrorModeled::InternalServerException(
                 InternalServerException {
@@ -468,32 +457,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The model's prose calls the member "Reserved for future use", but the trait and
         // the recorded behaviour (trace
         // `b2bi.create-transformer-idempotent-token-concurrent-dedup`: concurrent creates
-        // sharing one token yield exactly ONE transformer, and a later replay of that token
-        // answers with the original transformerId) both say it dedupes, so the trait wins.
-        // Lookup and insert happen under one hold of the state lock, so concurrent racers
-        // sharing a token cannot each mint one.
+        // sharing one token yield exactly ONE transformer, the losing racers are refused
+        // with `ConflictException`, and a replay issued after the original request
+        // completed answers with the original transformerId) both say it dedupes, so the
+        // trait wins. Lookup and insert happen under one hold of the state lock, so
+        // concurrent racers sharing a token cannot each mint one.
         //
-        // That recording also has the LOSING racers answered with `ConflictException`.
-        // Serialised behind the state lock there are no losers to answer: a racer either
-        // mints the one transformer or replays it, which is what makes "exactly one
-        // transformer" hold. The conflict the token CAN produce is the one that is
-        // observable here: a token this store has already minted a transformer for, used
-        // again for a DIFFERENT request. The digest below is what tells the two apart.
+        // The two arms of that recording are the two states a remembered token can be in,
+        // which is what `replay` reports: the create a token started is IN FLIGHT for
+        // [`crate::state::IDEMPOTENT_CREATE_IN_FLIGHT`] — a duplicate inside that span is
+        // the racer that lost, refused with the modelled `ConflictException` (409) — and
+        // settled after it, when a duplicate answers with the transformer it minted.
+        //
+        // A SETTLED token used again for a DIFFERENT request is the other conflict a token
+        // can produce, and the digest below is what tells the two apart: the same request
+        // replays, a different one is refused.
         let digest = request_digest(&input);
         let idempotency_key = input
             .client_token
             .as_deref()
             .map(|token| crate::state::idempotency_key("transformer", token));
         if let Some(key) = idempotency_key.as_deref() {
-            if let Some(existing) = state
-                .idempotency
-                .get(key)
-                .and_then(|id| state.transformers.get(id))
-            {
-                if existing.request_digest == digest {
-                    return Ok(stored_transformer_response(existing));
+            match state.replay(key, ::std::time::Instant::now()) {
+                Some(crate::state::TokenReplay::InFlight) => {
+                    return Err(CreateTransformerErrorModeled::ConflictException(
+                        ConflictException {
+                            message: crate::state::create_in_flight(
+                                "transformer",
+                                input.client_token.as_deref().unwrap_or_default(),
+                            ),
+                        },
+                    )
+                    .into())
                 }
-                return Err(token_already_used(existing));
+                Some(crate::state::TokenReplay::Completed(minted)) => {
+                    if let Some(existing) = state.transformers.get(&minted) {
+                        if existing.request_digest == digest {
+                            return Ok(stored_transformer_response(existing));
+                        }
+                        return Err(token_already_used(existing));
+                    }
+                }
+                None => {}
             }
         }
 

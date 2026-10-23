@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/list_links.rs"]
 mod list_links;
+#[path = "all/sink_policy.rs"]
+mod sink_policy;
 #[path = "all/sinks_and_links.rs"]
 mod sinks_and_links;
 #[path = "all/state_roundtrip.rs"]

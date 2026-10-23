@@ -62,7 +62,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
-use crate::state::{DeployedResource, StoredStack, DRIFT_STATUS_NOT_CHECKED};
+use crate::state::{DeployedResource, StoredStack};
 
 /// One deployed resource as the modelled `StackResourceDetail` shape.
 ///
@@ -76,7 +76,7 @@ use crate::state::{DeployedResource, StoredStack, DRIFT_STATUS_NOT_CHECKED};
 /// `StackResourceDetail` is `StackResource` plus `Metadata` — the same resource, read
 /// through a second shape — so the members this emulator has nothing to report for
 /// (`ResourceStatusReason`, `Description`, `ModuleInfo`) are absent, and
-/// `DriftInformation` is `NOT_CHECKED`, for exactly the reasons
+/// `DriftInformation` is the resource's own drift result, for exactly the reasons
 /// `ops::describe_stack_resources`'s `stack_resource_view` states once and in full. They
 /// are stated there rather than repeated here so the two readers cannot drift apart.
 fn stack_resource_detail(stack: &StoredStack, deployed: &DeployedResource) -> StackResourceDetail {
@@ -91,10 +91,7 @@ fn stack_resource_detail(stack: &StoredStack, deployed: &DeployedResource) -> St
         resource_status_reason: None,
         description: None,
         metadata: deployed.resource.metadata.clone(),
-        drift_information: Some(StackResourceDriftInformation {
-            stack_resource_drift_status: DRIFT_STATUS_NOT_CHECKED.to_string(),
-            last_check_timestamp: None,
-        }),
+        drift_information: crate::state::resource_drift_information(deployed),
         module_info: None,
     }
 }

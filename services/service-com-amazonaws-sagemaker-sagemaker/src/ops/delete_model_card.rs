@@ -166,9 +166,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // This is also what a second delete of one card reads: the delete is
             // complete when this call answers, so no deletion is ever in flight for a
             // later call to conflict with, and `ConflictException` — the other error
-            // this operation models — has no state in this emulator that produces it
-            // (model card export jobs, what a real conflict would be about, are not
-            // modelled here).
+            // this operation models — has no state in this emulator that produces it.
+            // (The card's export jobs are modelled, in `state::model_card_export_jobs`,
+            // but nothing documents a delete refusal over them: the model says only
+            // "Deletes an Amazon SageMaker Model Card", so no conflict is invented over
+            // a job, and a job keeps replaying the card name and version it stored.)
             return Err(DeleteModelCardErrorModeled::ResourceNotFound(ResourceNotFound {
                 // The wording the model-card readers use for the same fact: the kind,
                 // then the identifier AS THE CALLER SENT IT, in single quotes.

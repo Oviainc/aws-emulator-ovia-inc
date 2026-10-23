@@ -35,7 +35,8 @@ use ring::rand::{SecureRandom, SystemRandom};
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    KeyMetadata, MultiRegionConfiguration, MultiRegionKey, CUSTOMER_MASTER_KEY_SPEC_VALUES,
+    AliasListEntry, KeyMetadata, MultiRegionConfiguration, MultiRegionKey,
+    CUSTOMER_MASTER_KEY_SPEC_VALUES,
 };
 
 /// `KeyState` values, from `smithy_query(shape="KeyState")`.
@@ -174,6 +175,36 @@ impl ComAmazonawsKmsTrentserviceState {
     /// different (absent) alias.
     pub fn alias(&self, region: &str, alias_name: &str) -> Option<&Alias> {
         self.aliases.get(&alias_arn(region, alias_name))
+    }
+
+    /// [`Self::alias`], for an operation that then repoints it at another key.
+    pub fn alias_mut(&mut self, region: &str, alias_name: &str) -> Option<&mut Alias> {
+        self.aliases.get_mut(&alias_arn(region, alias_name))
+    }
+
+    /// Forget the alias `region`'s endpoint serves under `alias_name`, answering the
+    /// record that was dropped (`None` when there was none).
+    ///
+    /// Removal is from the alias store ITSELF, which is the one index every `KeyId`
+    /// resolution consults ([`Self::lookup`]): an alias that is gone resolves to
+    /// nothing from the next request on, rather than lingering as the last known
+    /// mapping. The creation order is kept in step so a later reader cannot page over
+    /// an ARN the store no longer holds.
+    pub fn remove_alias(&mut self, region: &str, alias_name: &str) -> Option<Alias> {
+        let arn = alias_arn(region, alias_name);
+        let removed = self.aliases.remove(&arn)?;
+        self.alias_order.retain(|held| *held != arn);
+        Some(removed)
+    }
+
+    /// The aliases `region`'s endpoint serves, in creation order — what an alias
+    /// reader pages over, so a page boundary is stable across calls.
+    pub fn aliases_in(&self, region: &str) -> Vec<&Alias> {
+        self.alias_order
+            .iter()
+            .filter_map(|arn| self.aliases.get(arn))
+            .filter(|alias| alias.region == region)
+            .collect()
     }
 
     /// How many aliases `region`'s endpoint already holds for the key `key_id` —
@@ -387,7 +418,13 @@ pub fn key_not_found_message(region: &str, requested: &str) -> String {
     }
     match parse_key_identifier(requested) {
         Ok(KeyIdentifier::Alias { alias, scope }) => {
-            format!("Alias {} is not found.", arn_of(region, scope, requested, &alias))
+            // An identifier that already WAS an ARN is reported as given; a bare
+            // `alias/<name>` is reported as this endpoint's alias ARN, which is what
+            // `alias_not_found_message` builds.
+            match scope {
+                Some(_) => format!("Alias {requested} is not found."),
+                None => alias_not_found_message(region, &alias),
+            }
         }
         Ok(KeyIdentifier::KeyId { key_id, scope }) => {
             let resource = format!("key/{key_id}");
@@ -420,6 +457,17 @@ fn arn_of(
     } else {
         ::engine::emulator_arn(ARN_SERVICE, region, resource)
     }
+}
+
+/// How a failed ALIAS lookup is reported: by the alias ARN of the name the request
+/// named.
+///
+/// `DeleteAlias` and `UpdateAlias` take an `AliasName`, never a `KeyId`, so the thing
+/// that was not found is always an alias of THIS endpoint — and KMS names it by its
+/// ARN, exactly as [`key_not_found_message`] does for a `KeyId` that named an alias.
+/// One function for both wordings, so the two can never drift apart.
+pub fn alias_not_found_message(region: &str, alias_name: &str) -> String {
+    format!("Alias {} is not found.", alias_arn(region, alias_name))
 }
 
 /// The ARN of the alias `alias_name` (`alias/<name>`) in `region`, which is what
@@ -494,18 +542,46 @@ pub struct Alias {
     /// The key id (never an alias) this alias resolves to.
     pub target_key_id: String,
     pub creation_date: SystemTime,
+    /// "Date and time that the alias was most recently associated with a KMS key in
+    /// the account and Region"
+    /// (`smithy_query(query="doc",shape="AliasListEntry",member="LastUpdatedDate")`):
+    /// the creation instant until `UpdateAlias` associates the name with another key.
+    pub last_updated_date: SystemTime,
 }
 
 impl Alias {
     /// A freshly created alias for `target_key_id`.
     pub fn new(region: String, alias_name: String, target_key_id: String) -> Self {
         let arn = alias_arn(&region, &alias_name);
+        let now = SystemTime::now();
         Self {
             alias_name,
             arn,
             region,
             target_key_id,
-            creation_date: SystemTime::now(),
+            creation_date: now,
+            last_updated_date: now,
+        }
+    }
+
+    /// Associate this alias with another key: "To associate an existing alias with a
+    /// different KMS key, call UpdateAlias"
+    /// (`smithy_query(query="doc",shape="DeleteAlias")`). The name, the ARN and the
+    /// creation date are the alias's identity and do not move; only the target and the
+    /// instant it was last associated do.
+    pub fn repoint(&mut self, target_key_id: String) {
+        self.target_key_id = target_key_id;
+        self.last_updated_date = SystemTime::now();
+    }
+
+    /// This alias as `ListAliases` reports it.
+    pub fn list_entry(&self) -> AliasListEntry {
+        AliasListEntry {
+            alias_name: Some(self.alias_name.clone()),
+            alias_arn: Some(self.arn.clone()),
+            target_key_id: Some(self.target_key_id.clone()),
+            creation_date: Some(date_time(self.creation_date)),
+            last_updated_date: Some(date_time(self.last_updated_date)),
         }
     }
 }
@@ -783,6 +859,22 @@ impl KeySpecProfile {
         .into_iter()
         .filter(|usage| self.supports(usage))
         .collect()
+    }
+
+    /// Which of the three key TYPES a key of this spec is: "both symmetric or both
+    /// asymmetric or both HMAC"
+    /// (`smithy_query(query="doc",shape="UpdateAliasRequest",member="TargetKeyId")`)
+    /// is the partition KMS names, and it follows from the spec's material: an
+    /// AES-GCM key is a symmetric encryption key, an HMAC key is an HMAC key, and a
+    /// key pair is asymmetric.
+    ///
+    /// The prose is what a refusal names, so it reads as the documentation does.
+    pub fn family(&self) -> &'static str {
+        match self.material {
+            MaterialKind::Aes256 => "symmetric",
+            MaterialKind::Hmac(_) => "HMAC",
+            MaterialKind::KeyPair => "asymmetric",
+        }
     }
 }
 
@@ -1329,27 +1421,54 @@ fn encryption_context_aad(context: Option<&HashMap<String, String>>) -> Vec<u8> 
 }
 
 // ---------------------------------------------------------------------------
-// ListKeys pagination
+// List pagination
 // ---------------------------------------------------------------------------
 
 /// Tags a `NextMarker` as one this service minted, and for which list.
 const MARKER_PREFIX: &str = "keys/1/";
+
+/// [`MARKER_PREFIX`], for the alias list. A token is tagged per LIST so a marker
+/// from one list is not accepted by another, which would silently resume a page at
+/// an item of the wrong kind instead of answering `InvalidMarkerException`.
+const ALIAS_MARKER_PREFIX: &str = "aliases/1/";
 
 /// The `NextMarker` that resumes a list after `key_id`.
 ///
 /// Hex-encoded so the token is opaque to a caller (who must pass it back
 /// verbatim) while still satisfying `MarkerType`'s `^[\u0020-\u00FF]*$` pattern.
 pub fn encode_marker(key_id: &str) -> String {
-    hex::encode(format!("{MARKER_PREFIX}{key_id}"))
+    encode_marker_for(MARKER_PREFIX, key_id)
 }
 
 /// The key id a `Marker` resumes after, or `None` when the token is not one this
 /// service minted.
 pub fn decode_marker(marker: &str) -> Option<String> {
+    decode_marker_for(MARKER_PREFIX, marker)
+}
+
+/// [`encode_marker`], for the alias list: the token resumes after the alias whose
+/// ARN is `alias_arn`, since the ARN is what identifies an alias.
+pub fn encode_alias_marker(alias_arn: &str) -> String {
+    encode_marker_for(ALIAS_MARKER_PREFIX, alias_arn)
+}
+
+/// [`decode_marker`], for the alias list.
+pub fn decode_alias_marker(marker: &str) -> Option<String> {
+    decode_marker_for(ALIAS_MARKER_PREFIX, marker)
+}
+
+/// One encoding for every list, so no two pagers mint tokens a reader must handle
+/// differently.
+fn encode_marker_for(prefix: &str, id: &str) -> String {
+    hex::encode(format!("{prefix}{id}"))
+}
+
+/// The inverse of [`encode_marker_for`], for the list `prefix` tags.
+fn decode_marker_for(prefix: &str, marker: &str) -> Option<String> {
     let decoded = hex::decode(marker).ok()?;
     let text = String::from_utf8(decoded).ok()?;
-    let key_id = text.strip_prefix(MARKER_PREFIX)?;
-    (!key_id.is_empty()).then(|| key_id.to_string())
+    let id = text.strip_prefix(prefix)?;
+    (!id.is_empty()).then(|| id.to_string())
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

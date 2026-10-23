@@ -149,6 +149,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
         let region = crate::state::request_region(ctx.parts());
+        // Authorization first: AWS decides it at the IAM layer, BEFORE the resource the
+        // request names is evaluated, so a denied caller is told it is not authorized
+        // rather than whether the environment exists. The ARN is therefore the one the
+        // REQUEST names, built without a lookup.
+        if let Some(denied) = crate::state::authorization::denied(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            Some(&crate::state::environment_arn(&region, &input.environment_id)),
+        ) {
+            return Err(denied);
+        }
         let mut state = state.lock();
         // Reporting only: this materialises the state change the clock already owed
         // this environment, which was due whether or not anybody read it.

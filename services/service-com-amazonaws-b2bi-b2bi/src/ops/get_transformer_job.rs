@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetTransformerJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetTransformerJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the run `StartTransformerJob` performed: the status it reached, the output
+//! files it wrote and, for a run that failed, why.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetTransformerJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A reporting operation. The only thing it materialises is the transition the CLOCK
+//! already made due: a job reports the non-terminal `running` status for
+//! [`crate::state::TRANSFORMER_JOB_RUNNING_FOR`] after the call that started it and its
+//! terminal status afterwards, which is read off the stored job rather than written to it,
+//! so two reads of a settled job agree and a read never moves a job on.
 //!
 //! ## Shape of an operation
 //!
@@ -163,18 +162,51 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetTransformerJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetTransformerJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetTransformerJob"))
+        let region = crate::state::request_region(ctx.parts());
+        if let Err(denied) = crate::state::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::state::resource_arn(&region, "transformer", &input.transformer_id),
+        ) {
+            return Err(GetTransformerJobErrorModeled::AccessDeniedException(denied).into());
+        }
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(GetTransformerJobErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: crate::state::STATE_UNAVAILABLE.to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+        let state = store.lock();
+
+        // The job has to belong to the transformer the request names: both ids address it,
+        // so a job id paired with another transformer's id names no job here. A job this
+        // service no longer holds is the modelled 404, which is also the answer AWS gives
+        // for a job older than the 30 days it keeps one.
+        let Some(job) = state
+            .transformer_jobs
+            .get(&input.transformer_job_id)
+            .filter(|job| job.transformer_id == input.transformer_id)
+        else {
+            return Err(GetTransformerJobErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: crate::state::transformer_job_not_found(
+                        &input.transformer_job_id,
+                        &input.transformer_id,
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::Instant::now();
+        Ok(GetTransformerJobOutput {
+            status: job.status_at(now).to_string(),
+            output_files: job.output_files_at(now),
+            message: job.message_at(now),
+        })
     }
 }

@@ -14,6 +14,23 @@
 //! public key) is answered with the scaffold's 501: the capability is not
 //! implemented, and no response here may carry a plaintext in its place.
 //!
+//! ## `KeyOrigin`
+//!
+//! The response reports the ORIGIN of the key that opened the ciphertext, beside the
+//! key's ARN and the id of the material used: AWS answers `Decrypt` with that member
+//! (the `simparity-wire-aws-v1` recording of `kms-symmetric-encrypt-decrypt` carries
+//! `KeyOrigin: AWS_KMS` for a symmetric-default CMK), while THIS model snapshot
+//! declares it only on `DeriveSharedSecretResponse`
+//! (`smithy_query(query="doc",shape="DeriveSharedSecretResponse",member="KeyOrigin")`,
+//! whose wording it reuses). So the member is declared HERE, beside
+//! [`DecryptResponse`], rather than by editing the vendored snapshot: the generated
+//! shape writes every modelled member of `DecryptResponse` and this one is written
+//! after it. The value is read from the key record that backs `KeyMetadata.Origin`, so
+//! `Decrypt` and `DescribeKey` report one origin for one key.
+//! `tests/all/decrypt_key_origin.rs` pins both halves: the member on the wire, and the
+//! snapshot still not declaring it — if a refreshed snapshot ever does, that test
+//! fails and this local declaration should give way to the modelled member.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -160,6 +177,9 @@
 //!   the key material used to decrypt the ciphertext. This field is present only when the
 //!   operation uses a symmetric encryption KMS key. This field is omitted if the request
 //!   includes the Recipient parameter.
+//!
+//! Beside those, the response carries `KeyOrigin` (OriginType), which this model snapshot
+//! does not declare for `Decrypt` — see "## `KeyOrigin`" above.
 //! * `Plaintext` (PlaintextType, len 1..4096) — Decrypted plaintext data. When you use the
 //!   HTTP API or the Amazon Web Services CLI, the value is Base64-encoded. Otherwise, it is
 //!   not Base64-encoded. If the response includes the CiphertextForRecipient field, the
@@ -216,6 +236,57 @@ use super::types::*;
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
 // `DecryptError` enum is never produced.
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-kms-trentservice.json");
+
+/// The `KeyOrigin` response member: "The source of the key material for the specified
+/// KMS key. When this value is `AWS_KMS`, KMS created the key material. When this
+/// value is `EXTERNAL`, the key material was imported or the KMS key doesn't have any
+/// key material."
+/// (`smithy_query(query="doc",shape="DeriveSharedSecretResponse",member="KeyOrigin")` —
+/// the one shape this snapshot declares the member on).
+///
+/// It is declared here because the snapshot does not declare it on `DecryptResponse`
+/// while AWS answers `Decrypt` with it. The member schema carries the wire name, which
+/// is what the JSON codec emits the key from; the index follows the five modelled
+/// members of `DecryptResponse`.
+static KEY_ORIGIN_MEMBER: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+    ::aws_smithy_schema::ShapeId::from_static(
+        "com.amazonaws.kms#DecryptResponse$KeyOrigin",
+        "com.amazonaws.kms",
+        "KeyOrigin",
+    ),
+    ::aws_smithy_schema::ShapeType::String,
+    "KeyOrigin",
+    5,
+);
+
+/// What `Decrypt` answers: every modelled member of `DecryptResponse`, plus
+/// `KeyOrigin`.
+///
+/// The modelled half IS the generated shape, serialized by its own generated
+/// implementation against the generated schema, so no modelled member is re-described
+/// here; this type only adds the one member the snapshot lacks.
+pub struct DecryptResponse {
+    modelled: DecryptOutput,
+    /// The `OriginType` of the key that opened the ciphertext — the same value
+    /// `DescribeKey` reports as `KeyMetadata.Origin`.
+    key_origin: Option<String>,
+}
+
+impl ::aws_smithy_schema::serde::SerializableStruct for DecryptResponse {
+    fn serialize_members(
+        &self,
+        serializer: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        ::aws_smithy_schema::serde::SerializableStruct::serialize_members(
+            &self.modelled,
+            serializer,
+        )?;
+        if let Some(key_origin) = &self.key_origin {
+            serializer.write_string(&KEY_ORIGIN_MEMBER, key_origin)?;
+        }
+        Ok(())
+    }
+}
 
 // The operation's MODELED errors. `#[operation_error]` accepts only variants the
 // model declares for this operation, so the scaffold's `NotImplemented` cannot live
@@ -276,7 +347,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     for Decrypt<Eng>
 {
     type Input = DecryptInput;
-    type Output = DecryptOutput;
+    type Output = DecryptResponse;
     type Error = DecryptError;
 
     const NAME: &'static str = "Decrypt";
@@ -428,18 +499,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(invalid_ciphertext());
         };
 
-        Ok(DecryptOutput {
-            key_id: Some(key.arn.clone()),
-            plaintext: Some(plaintext),
-            encryption_algorithm: Some(algorithm),
-            // Only a `Recipient` request has a ciphertext for one, and those are
-            // refused above.
-            ciphertext_for_recipient: None,
-            // "The identifier of the key material used to decrypt the ciphertext.
-            // This field is present only when the operation uses a symmetric
-            // encryption KMS key" (`smithy_query(shape="DecryptResponse")`), which is
-            // exactly the material that carries an id.
-            key_material_id: key.current_key_material_id.clone(),
+        Ok(DecryptResponse {
+            modelled: DecryptOutput {
+                key_id: Some(key.arn.clone()),
+                plaintext: Some(plaintext),
+                encryption_algorithm: Some(algorithm),
+                // Only a `Recipient` request has a ciphertext for one, and those are
+                // refused above.
+                ciphertext_for_recipient: None,
+                // "The identifier of the key material used to decrypt the ciphertext.
+                // This field is present only when the operation uses a symmetric
+                // encryption KMS key" (`smithy_query(shape="DecryptResponse")`), which
+                // is exactly the material that carries an id.
+                key_material_id: key.current_key_material_id.clone(),
+            },
+            // Where that key's material comes from — the same field `DescribeKey`
+            // reports as `KeyMetadata.Origin`, read from the one key record so the two
+            // answers can never disagree. A client branches on it to decide how the
+            // backing material is held (`AWS_KMS`, `EXTERNAL`, a CloudHSM or external
+            // key store), so a null here is not the same answer as a value.
+            key_origin: Some(key.origin.clone()),
         })
     }
 }

@@ -22,6 +22,11 @@
 //!   `status` are not configuration, so they stay updatable in either status, which is
 //!   what lets a caller toggle a transformer between `active` and `inactive`.
 //!
+//! Moving `status` to `active` is also the precondition `StartTransformerJob` enforces:
+//! "you can update the state of the transformer from inactive to active"
+//! (`UpdateTransformerRequest$status`), and nothing else in this service moves a
+//! transformer there.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -339,9 +344,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The ARN and the id are the create's, so this request's signing region is not
-        // read: an update never re-mints either.
-        let _ = ctx;
+        if let Err(denied) = crate::state::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::state::resource_arn(
+                &crate::state::request_region(ctx.parts()),
+                "transformer",
+                &input.transformer_id,
+            ),
+        ) {
+            return Err(UpdateTransformerErrorModeled::AccessDeniedException(denied).into());
+        }
+        // Beyond that decision the request's signing region is not read: the ARN and the
+        // id are the create's, and an update never re-mints either.
 
         let Some(store) = crate::state::service_state(&*self.engine) else {
             return Err(UpdateTransformerErrorModeled::InternalServerException(

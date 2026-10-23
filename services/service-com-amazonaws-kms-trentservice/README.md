@@ -8,6 +8,25 @@ cargo build -p service-com-amazonaws-kms-trentservice
 cargo test  -p service-com-amazonaws-kms-trentservice
 ```
 
+## A response member the model snapshot does not declare
+
+`smithy-model/com-amazonaws-kms-trentservice.json` is a snapshot of the published
+model and is kept EXACTLY as shipped — nothing in this crate edits it.
+
+One member AWS answers with is therefore not in it: `Decrypt` reports `KeyOrigin`
+(the origin of the key that opened the ciphertext, recorded in the
+`simparity-wire-aws-v1` fixture `kms-symmetric-encrypt-decrypt` as
+`KeyOrigin: AWS_KMS`), while the snapshot declares that member only on
+`DeriveSharedSecretResponse`. `src/ops/decrypt.rs` declares the member schema itself,
+beside its response type, and writes it after the generated shape's modelled members;
+the value comes from the same stored field `KeyMetadata.Origin` projects, so `Decrypt`
+and `DescribeKey` always agree.
+
+`tests/all/decrypt_key_origin.rs` pins both halves — the member on the wire, and the
+snapshot still not declaring it. If the snapshot is ever refreshed with a
+`DecryptResponse$KeyOrigin` member, that test fails and the local declaration should
+give way to the modelled one.
+
 ## Layout
 
 ```

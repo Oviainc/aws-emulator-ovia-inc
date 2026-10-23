@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListAliases
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListAliases`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: pages over the aliases this Region's endpoint holds. This is the ONLY
+//! file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListAliases::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The page is computed from the alias store, in creation order, so a `Marker` resumes
+//! after the alias the previous page ended on and a newly created alias never
+//! reshuffles an earlier page. `KeyId` narrows the list to the aliases that resolve to
+//! one key.
+//!
+//! The emulator mints no AWS managed keys, so it has no `aws/<service>` aliases and no
+//! predefined ones to report: every entry here is an alias a caller created.
 //!
 //! ## Shape of an operation
 //!
@@ -184,18 +185,126 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListAliases` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListAliasesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListAliases"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListAliasesErrorModeled::KMSInternalException(KMSInternalException {
+                message: Some("the KMS state store is unavailable".to_string()),
+            })
+            .into());
+        };
+
+        // "If you include a value, it must be between 1 and 100, inclusive"
+        // (`smithy_query(query="doc",shape="ListAliasesRequest",member="Limit")`).
+        // `LimitType`'s modelled range is 1..1000 — it is shared with the other
+        // listings — so the boundary validator passes a value this operation's own
+        // documented bound refuses; the refusal names the member and the constraint.
+        if let Some(limit) = input.limit {
+            if limit > MAX_LIMIT {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "Value '{limit}' at 'limit' failed to satisfy constraint: Member must \
+                     have value less than or equal to {MAX_LIMIT}"
+                )));
+            }
+        }
+
+        let region = crate::state::request_region(ctx);
+        let state = state.lock();
+
+        // "To get only the aliases associated with a particular KMS key, use the KeyId
+        // parameter"; "if you omit it, ListAliases returns all aliases in the account
+        // and Region." The filter is by the key the identifier RESOLVES to, so a key
+        // id, a key ARN and an alias of that key all narrow to the same list.
+        let filter = match input.key_id.as_deref() {
+            None => None,
+            Some(requested) => match state.resolve(&region, requested) {
+                crate::state::KeyRef::Found(key) => Some(key.key_id.clone()),
+                crate::state::KeyRef::MalformedArn => {
+                    return Err(ListAliasesErrorModeled::InvalidArnException(
+                        InvalidArnException {
+                            message: Some(crate::state::invalid_arn_message(requested)),
+                        },
+                    )
+                    .into());
+                }
+                crate::state::KeyRef::NotFound => {
+                    return Err(ListAliasesErrorModeled::NotFoundException(NotFoundException {
+                        message: Some(crate::state::key_not_found_message(&region, requested)),
+                    })
+                    .into());
+                }
+            },
+        };
+
+        let listed: Vec<&crate::state::Alias> = state
+            .aliases_in(&region)
+            .into_iter()
+            .filter(|alias| {
+                filter
+                    .as_ref()
+                    .is_none_or(|key_id| alias.target_key_id == *key_id)
+            })
+            .collect();
+
+        // "Set it to the value of NextMarker from the truncated response you just
+        // received" — so a marker resumes after the last alias the previous page
+        // returned. Anything else "is not valid" (`InvalidMarkerException`).
+        let start = match input.marker.as_deref() {
+            None => 0,
+            Some(marker) => {
+                let resume_after = crate::state::decode_alias_marker(marker)
+                    .and_then(|arn| listed.iter().position(|alias| alias.arn == arn));
+                match resume_after {
+                    Some(position) => position + 1,
+                    None => {
+                        return Err(ListAliasesErrorModeled::InvalidMarkerException(
+                            InvalidMarkerException {
+                                message: Some(
+                                    "The marker that specifies where pagination should next \
+                                     begin is not valid."
+                                        .to_string(),
+                                ),
+                            },
+                        )
+                        .into());
+                    }
+                }
+            }
+        };
+
+        // "If you do not include a value, it defaults to 50." A `Limit` that reached
+        // here is already within 1..=MAX_LIMIT — the modelled `LimitType` range floors
+        // it at 1 and the check above refuses anything larger — so the clamp only
+        // carries that bound into the `usize` the page size needs.
+        let limit =
+            usize::try_from(input.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT)).unwrap_or(1);
+        let page: Vec<AliasListEntry> = listed
+            .iter()
+            .skip(start)
+            .take(limit)
+            .map(|alias| alias.list_entry())
+            .collect();
+
+        let truncated = start + page.len() < listed.len();
+        let next_marker = truncated
+            .then(|| {
+                page.last()
+                    .and_then(|entry| entry.alias_arn.as_deref())
+                    .map(crate::state::encode_alias_marker)
+            })
+            .flatten();
+
+        Ok(ListAliasesOutput {
+            aliases: Some(page),
+            next_marker,
+            truncated,
+        })
     }
 }
+
+/// The page size `ListAliases` uses when the request names none: "If you do not
+/// include a value, it defaults to 50."
+/// (`smithy_query(query="doc",shape="ListAliasesRequest",member="Limit")`).
+const DEFAULT_LIMIT: i32 = 50;
+
+/// The largest page this operation accepts: "If you include a value, it must be
+/// between 1 and 100, inclusive." (same member's documentation).
+const MAX_LIMIT: i32 = 100;

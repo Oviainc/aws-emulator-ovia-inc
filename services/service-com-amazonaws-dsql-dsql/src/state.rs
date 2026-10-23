@@ -857,6 +857,43 @@ fn kms_key_arn(region: &str, kms_encryption_key: &str) -> String {
     }
 }
 
+/// The length `ClusterId`'s and `StreamId`'s `^[a-z0-9]{26}$` fixes
+/// (`smithy_query(query="shape", shape="ClusterId,StreamId")`).
+pub const RESOURCE_ID_LEN: usize = 26;
+
+/// Whether `value` is a value `ClusterId`'s and `StreamId`'s shared
+/// `^[a-z0-9]{26}$` accepts.
+pub fn is_resource_identifier(value: &str) -> bool {
+    value.len() == RESOURCE_ID_LEN
+        && value
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+}
+
+/// Encode a list operation's pagination cursor: the identifier of the last entry
+/// the page returned, hex-encoded so the `nextToken` a client round-trips is an
+/// opaque token rather than a resource name.
+///
+/// Shared by every paginated reader of this service (`ListClusters` pages over
+/// `ClusterId` order, `ListStreams` over a cluster's `StreamId` order), so a
+/// cursor is spelled one way.
+pub fn encode_pagination_cursor(last_identifier: &str) -> String {
+    ::hex::encode(last_identifier.as_bytes())
+}
+
+/// Decode a cursor produced by [`encode_pagination_cursor`]: a hex-encoded
+/// 26-character resource identifier.
+///
+/// `None` for anything this service did not issue — not only a token that is not
+/// hex, but also one that decodes to anything other than a value
+/// [`is_resource_identifier`] accepts, so a fabricated cursor is refused rather
+/// than served as a page starting after some arbitrary key.
+pub fn decode_pagination_cursor(token: &str) -> Option<String> {
+    let decoded = ::hex::decode(token).ok()?;
+    let cursor = String::from_utf8(decoded).ok()?;
+    is_resource_identifier(&cursor).then_some(cursor)
+}
+
 /// A fresh cluster or stream identifier: a ULID, lowercased.
 ///
 /// A ULID is a 48-bit millisecond timestamp followed by 80 bits of entropy,

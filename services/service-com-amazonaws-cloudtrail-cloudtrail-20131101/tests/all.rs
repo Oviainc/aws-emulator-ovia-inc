@@ -29,6 +29,8 @@ mod disable_federation;
 mod emulator;
 #[path = "all/event_configuration.rs"]
 mod event_configuration;
+#[path = "all/event_data_store_ingestion.rs"]
+mod event_data_store_ingestion;
 #[path = "all/event_data_store_reads.rs"]
 mod event_data_store_reads;
 #[path = "all/event_selectors.rs"]

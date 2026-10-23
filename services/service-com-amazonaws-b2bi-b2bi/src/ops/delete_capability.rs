@@ -171,7 +171,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        if let Err(denied) = crate::state::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::state::resource_arn(
+                &crate::state::request_region(ctx.parts()),
+                "capability",
+                &input.capability_id,
+            ),
+        ) {
+            return Err(DeleteCapabilityErrorModeled::AccessDeniedException(denied).into());
+        }
         let Some(store) = crate::state::service_state(&*self.engine) else {
             return Err(DeleteCapabilityErrorModeled::InternalServerException(
                 InternalServerException {

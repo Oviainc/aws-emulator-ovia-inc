@@ -1,15 +1,30 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateListingChangeSet
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateListingChangeSet`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateListingChangeSet::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Applies one change set to the catalog record — the LISTING — of a PERSISTED entity
+//! in a persisted, available domain, and stores it there, so `GetListing` answers from
+//! the stored listing and the listing disappears with its domain.
+//!
+//! A listing is "a record of an asset at a given time", so the two change sets the
+//! model declares (`ChangeAction`: PUBLISH | UNPUBLISH) are:
+//!
+//! * PUBLISH records a REVISION of the entity's listing — a snapshot of the entity as
+//!   it is at this instant — minting the listing at [`crate::state::FIRST_REVISION`]
+//!   the first time the entity is published and recording the next revision every
+//!   later time. The listing is `CREATING` until the clock makes its publish due, and
+//!   `ACTIVE` afterwards
+//!   ([`crate::state::ComAmazonawsDatazoneDatazoneState::settle_clock`]).
+//! * UNPUBLISH takes the record out of the catalog: the listing becomes `INACTIVE` and
+//!   keeps the revisions it has, because nothing about the entity was recorded. An
+//!   entity with no listing has nothing to unpublish, which is a 404.
+//!
+//! `entityRevision` is resolved against the STORED entity: a request that pins none
+//! records the revision the entity is at, and one that pins a revision the entity does
+//! not have names no stored resource (the rule `GetAsset` applies to its `revision`).
+//! Only an ASSET can be resolved today — a data product is a resource no store holds
+//! (`CreateDataProduct` is a scaffold) — so `entityType=DATA_PRODUCT` answers with the
+//! operation's own `ResourceNotFoundException` rather than inventing an entity.
 //!
 //! ## Shape of an operation
 //!
@@ -166,18 +181,293 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateListingChangeSet` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateListingChangeSetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateListingChangeSet"))
+        use crate::state::{
+            caller_principal, listing_forms, listing_name, now_ms, Listing, ListingRevision,
+            ResourceKind, CHANGE_ACTION_PUBLISH, CHANGE_ACTION_UNPUBLISH, DOMAIN_STATUS_AVAILABLE,
+            ENTITY_TYPE_ASSET, ENTITY_TYPE_DATA_PRODUCT, LIFECYCLE_SETTLE_MS,
+            LISTING_STATUS_CREATING, LISTING_STATUS_INACTIVE, MAX_LISTINGS_PER_DOMAIN,
+            MAX_LISTING_REVISIONS,
+        };
+
+        // Both enums are modelled, so the boundary validator has already refused
+        // anything outside them; a value that reached here nonetheless describes a
+        // change set this service does not define, which is a bad request and not a
+        // missing implementation.
+        let action = input.action.as_str();
+        if action != CHANGE_ACTION_PUBLISH && action != CHANGE_ACTION_UNPUBLISH {
+            return Err(CreateListingChangeSetErrorModeled::ValidationException(
+                ValidationException {
+                    message: format!(
+                        "action must be one of {CHANGE_ACTION_PUBLISH}, {CHANGE_ACTION_UNPUBLISH}"
+                    ),
+                },
+            )
+            .into());
+        }
+        let entity_type = input.entity_type.as_str();
+        if entity_type != ENTITY_TYPE_ASSET && entity_type != ENTITY_TYPE_DATA_PRODUCT {
+            return Err(CreateListingChangeSetErrorModeled::ValidationException(
+                ValidationException {
+                    message: format!(
+                        "entityType must be one of {ENTITY_TYPE_ASSET}, {ENTITY_TYPE_DATA_PRODUCT}"
+                    ),
+                },
+            )
+            .into());
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateListingChangeSetErrorModeled::InternalServerException(InternalServerException {
+                message: "the DataZone store is unavailable".to_string(),
+            })
+        })?;
+        let mut store = state.lock();
+        let now = now_ms();
+        store.settle_clock(now);
+
+        let domain = store.domains.get(&input.domain_identifier).ok_or_else(|| {
+            CreateListingChangeSetErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: ResourceKind::Domain.not_found_message(),
+                },
+            )
+        })?;
+        // A domain still being created, or already being deleted, cannot take a change
+        // set: the request conflicts with the domain's current state (the rule
+        // `CreateAsset` applies to a create in that domain).
+        if domain.status != DOMAIN_STATUS_AVAILABLE {
+            return Err(CreateListingChangeSetErrorModeled::ConflictException(
+                ConflictException {
+                    message: format!(
+                        "Domain {} is {}, so it cannot accept a listing change set",
+                        input.domain_identifier, domain.status
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // The entity the change set is about. Only an ASSET has a stored record: a data
+        // product is created by `CreateDataProduct`, still a scaffold, so no data
+        // product is in the store and none can be found.
+        let entity = match entity_type {
+            ENTITY_TYPE_ASSET => domain.assets.get(&input.entity_identifier),
+            _ => None,
+        };
+        let entity = entity.ok_or_else(|| {
+            CreateListingChangeSetErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: if entity_type == ENTITY_TYPE_ASSET {
+                        ResourceKind::Asset.not_found_message()
+                    } else {
+                        ResourceKind::DataProduct.not_found_message()
+                    },
+                },
+            )
+        })?;
+        // A revision the entity does not have names no stored resource, so there is
+        // nothing to record and nothing to take out of the catalog.
+        if let Some(pinned) = input.entity_revision.as_deref() {
+            if pinned != entity.revision {
+                return Err(CreateListingChangeSetErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: ResourceKind::Asset.not_found_message(),
+                    },
+                )
+                .into());
+            }
+        }
+        // The snapshot this change set would record, read off the stored entity before
+        // the store is borrowed mutably to mint into.
+        let snapshot = ListingRevision {
+            // Replaced below with the number the listing actually gets.
+            revision: 0,
+            entity_revision: entity.revision.clone(),
+            name: listing_name(&entity.name),
+            description: entity.description.clone(),
+            entity_type_name: entity.type_identifier.clone(),
+            owning_project_id: entity.owning_project_id.clone(),
+            entity_created_at_ms: entity.created_at_ms,
+            forms: listing_forms(&entity.forms),
+            created_by: caller_principal(ctx),
+            created_at_ms: now,
+            client_token: input.client_token.clone(),
+        };
+
+        let existing = domain.listing_for_entity(entity_type, &input.entity_identifier);
+        // `clientToken` is an `@idempotencyToken`: a replay of the change set that
+        // recorded a revision answers with that revision rather than recording a second
+        // one. It is a replay only when the rest of the request describes the same
+        // change set — the same entity and the same action — so a token reused for a
+        // different change set still applies it (the rule `AddPolicyGrant` applies).
+        if let (Some(token), Some(listing)) = (input.client_token.as_deref(), existing) {
+            let replayed = match action {
+                CHANGE_ACTION_PUBLISH => listing
+                    .revision_with_token(token)
+                    .map(|revision| revision.revision.to_string()),
+                _ => (listing.unpublish_client_token.as_deref() == Some(token))
+                    .then(|| listing_revision_string(listing)),
+            };
+            if let Some(listing_revision) = replayed {
+                return Ok(CreateListingChangeSetOutput {
+                    listing_id: listing.id.clone(),
+                    listing_revision,
+                    status: listing.status.clone(),
+                });
+            }
+        }
+
+        if action == CHANGE_ACTION_UNPUBLISH {
+            // Only a published entity has a record in the catalog to remove.
+            let listing = existing.ok_or_else(|| {
+                CreateListingChangeSetErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: ResourceKind::Listing.not_found_message(),
+                    },
+                )
+            })?;
+            // Already out of the catalog: the change set has nothing left to apply, so
+            // the stored listing is reported as it stands rather than touched again.
+            if listing.status == LISTING_STATUS_INACTIVE {
+                return Ok(CreateListingChangeSetOutput {
+                    listing_id: listing.id.clone(),
+                    listing_revision: listing_revision_string(listing),
+                    status: listing.status.clone(),
+                });
+            }
+            let listing_id = listing.id.clone();
+            let Some(listing) = store
+                .domains
+                .get_mut(&input.domain_identifier)
+                .and_then(|domain| domain.listings.get_mut(&listing_id))
+            else {
+                return Err(CreateListingChangeSetErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the listing is no longer in the DataZone store".to_string(),
+                    },
+                )
+                .into());
+            };
+            // An unpublish takes effect at once: the listing leaves the catalog, and
+            // `INACTIVE` is a settled status, so it owes the clock nothing.
+            listing.status = LISTING_STATUS_INACTIVE.to_string();
+            listing.status_due_ms = None;
+            listing.updated_at_ms = now;
+            listing.updated_by = snapshot.created_by;
+            listing.unpublish_client_token = input.client_token;
+            // Built from the record that was actually stored, so the answer can never
+            // report a change this call did not persist.
+            return Ok(CreateListingChangeSetOutput {
+                listing_id: listing.id.clone(),
+                listing_revision: listing_revision_string(listing),
+                status: listing.status.clone(),
+            });
+        }
+
+        // A PUBLISH: the listing's next revision records the snapshot taken above.
+        let listing_id = match existing {
+            Some(listing) => {
+                // The store is bounded, so a publish loop cannot grow the emulator's
+                // heap without limit; the refusal is the error the operation models.
+                if listing.revisions.len() >= MAX_LISTING_REVISIONS {
+                    return Err(
+                        CreateListingChangeSetErrorModeled::ServiceQuotaExceededException(
+                            ServiceQuotaExceededException {
+                                message: format!(
+                                    "this emulator records at most {MAX_LISTING_REVISIONS} revisions of one listing"
+                                ),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+                listing.id.clone()
+            }
+            None => {
+                if domain.listings.len() >= MAX_LISTINGS_PER_DOMAIN {
+                    return Err(
+                        CreateListingChangeSetErrorModeled::ServiceQuotaExceededException(
+                            ServiceQuotaExceededException {
+                                message: format!(
+                                    "this emulator stores at most {MAX_LISTINGS_PER_DOMAIN} listings in one domain"
+                                ),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+                store.mint_id(now)
+            }
+        };
+
+        // The domain was proved present above, but the lookup is answered rather than
+        // assumed: the response is built from the record that was actually stored, so
+        // the answer can never report a listing this call did not persist.
+        let Some(domain) = store.domains.get_mut(&input.domain_identifier) else {
+            return Err(CreateListingChangeSetErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the domain is no longer in the DataZone store".to_string(),
+                },
+            )
+            .into());
+        };
+        let changed_by = snapshot.created_by.clone();
+        let listing = domain.listings.entry(listing_id.clone()).or_insert(Listing {
+            id: listing_id.clone(),
+            domain_id: input.domain_identifier.clone(),
+            entity_type: input.entity_type.clone(),
+            entity_id: input.entity_identifier.clone(),
+            status: LISTING_STATUS_CREATING.to_string(),
+            status_due_ms: None,
+            created_by: changed_by.clone(),
+            created_at_ms: now,
+            updated_by: changed_by.clone(),
+            updated_at_ms: now,
+            revisions: std::collections::BTreeMap::new(),
+            unpublish_client_token: None,
+        });
+        let revision = listing.next_revision_number();
+        listing.revisions.insert(
+            revision,
+            ListingRevision {
+                revision,
+                ..snapshot
+            },
+        );
+        // Publishing is the step AWS reports as in-progress, so the listing is
+        // `CREATING` until the clock makes it due — a caller polling straight after
+        // this call still sees that status — and a re-publish of an entity that was
+        // taken out of the catalog puts it back through the same step.
+        listing.status = LISTING_STATUS_CREATING.to_string();
+        listing.status_due_ms = Some(now + LIFECYCLE_SETTLE_MS);
+        listing.updated_at_ms = now;
+        listing.updated_by = changed_by;
+        // A listing that is published again is in the catalog on its own terms, so the
+        // token of the unpublish that took it out no longer answers anything.
+        listing.unpublish_client_token = None;
+        // Built from the record that was actually stored, so the answer can never report
+        // a listing revision this call did not persist.
+        let listing_revision = listing_revision_string(listing);
+        Ok(CreateListingChangeSetOutput {
+            listing_id: listing.id.clone(),
+            listing_revision,
+            status: listing.status.clone(),
+        })
     }
+}
+
+/// The `listingRevision` a change set reports for `listing`: the latest revision
+/// recorded for it.
+///
+/// An unpublish records no revision — it takes the listing out of the catalog without
+/// recording anything about the entity — so it reports the revision the listing already
+/// has. A listing always has at least the revision its first publish recorded; the
+/// fallback is [`crate::state::FIRST_REVISION`], which is what that publish returned.
+fn listing_revision_string(listing: &crate::state::Listing) -> String {
+    listing
+        .latest_revision()
+        .map_or_else(
+            || crate::state::FIRST_REVISION.to_string(),
+            |revision| revision.revision.to_string(),
+        )
 }

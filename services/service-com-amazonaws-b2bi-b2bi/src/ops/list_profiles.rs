@@ -149,7 +149,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // A reporting operation: nothing about the store changes here.
-        let _ = ctx;
+        if let Err(denied) =
+            crate::state::authorize(&*self.engine, ctx, Self::NAME, crate::state::ANY_RESOURCE)
+        {
+            return Err(ListProfilesErrorModeled::AccessDeniedException(denied).into());
+        }
         let Some(store) = crate::state::service_state(&*self.engine) else {
             return Err(ListProfilesErrorModeled::InternalServerException(
                 InternalServerException {

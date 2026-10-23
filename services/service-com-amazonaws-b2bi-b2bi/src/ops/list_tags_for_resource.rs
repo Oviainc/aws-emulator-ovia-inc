@@ -149,6 +149,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // A reporting operation: nothing about the store changes here.
+        //
+        // No authorization check: this operation's model declares NO
+        // `AccessDeniedException`, so a refusal has no modelled error to travel in
+        // (`smithy_query(query="operation",operation="ListTagsForResource")`), and the
+        // emulator does not invent one. Every b2bi operation that DOES model it is
+        // authorized against the caller's IAM identity policies (`crate::state::authorize`).
         let _ = ctx;
         let Some(store) = crate::state::service_state(&*self.engine) else {
             return Err(ListTagsForResourceErrorModeled::InternalServerException(

@@ -17,6 +17,8 @@ mod api_key_collection_members;
 mod api_key_lifecycle;
 #[path = "all/delete_lifecycle.rs"]
 mod delete_lifecycle;
+#[path = "all/delete_method_response.rs"]
+mod delete_method_response;
 #[path = "all/epoch_second_timestamps.rs"]
 mod epoch_second_timestamps;
 #[path = "all/method_integration.rs"]

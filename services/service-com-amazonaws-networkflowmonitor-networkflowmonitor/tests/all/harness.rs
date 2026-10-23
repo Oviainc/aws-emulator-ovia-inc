@@ -126,6 +126,12 @@ impl Emulator {
             .await
     }
 
+    /// `ListScopes`: `GET /scopes`, with `query` carrying the `@httpQuery` members
+    /// (`?maxResults=..&nextToken=..`) or empty for none.
+    pub async fn list_scopes(&self, query: &str) -> Answer {
+        self.call("GET", &format!("/scopes{query}"), None).await
+    }
+
     pub async fn create_monitor(&self, body: Value) -> Answer {
         self.call("POST", "/monitors", Some(body)).await
     }

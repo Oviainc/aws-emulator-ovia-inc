@@ -12,10 +12,10 @@
 //! about it exactly, or a client that places a DAX subnet group and an FSx file system in
 //! "the same" subnet is talking to two different accounts.
 //!
-//! The agreement, which `fsx`'s and `dax`'s `state.rs` both implement today
-//! (`region_subnets` / `resolve_subnet` / `default_vpc_id` in each, constant for
+//! The agreement, which `fsx`'s, `dax`'s and `elasticache`'s `state.rs` each implement
+//! today (`region_subnets` / `resolve_subnet` / `default_vpc_id` in each, constant for
 //! constant), and which is where the derivation itself belongs once one change may carry
-//! both service crates' manifests:
+//! every such service crate's manifest:
 //!
 //! * AWS gives an account a default VPC in every Region, "with a size /16 IPv4 CIDR block
 //!   and a default subnet in each Availability Zone" (EC2's `CreateDefaultVpc` /

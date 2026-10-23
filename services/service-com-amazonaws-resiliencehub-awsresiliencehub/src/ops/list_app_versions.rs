@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListAppVersions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListAppVersions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListAppVersions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: projects the addressed application's app versions — its DRAFT
+//! version, which exists for every stored application, and every version
+//! `PublishAppVersion` froze from it — into `AppVersionSummary` values, honouring
+//! the `startTime`/`endTime` bounds on a version's creation time and `maxResults`
+//! as a real page bound with a resumable `nextToken`. A pure read.
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +157,226 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListAppVersions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListAppVersionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListAppVersions"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_failure());
+        };
+
+        let resume_from = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(PageKey::decode(token).ok_or_else(|| {
+                invalid("nextToken: not a token this operation issued".to_string())
+            })?),
+        };
+        // `maxResults` is modeled `@range(min: 1, max: 100)`, which the boundary
+        // validator already enforces; absent means "as many as a page allows". A
+        // value that reaches here outside the range is refused rather than clamped,
+        // so a validator regression cannot be masked by silently narrowing a page.
+        let page_size = match input.max_results {
+            None => MAX_PAGE_SIZE,
+            Some(requested) if (1..=MAX_PAGE_SIZE).contains(&requested) => requested,
+            Some(requested) => {
+                return Err(invalid(format!(
+                    "maxResults: {requested} is outside the modeled range of 1 to {MAX_PAGE_SIZE}"
+                )))
+            }
+        } as usize;
+
+        let store = state.lock();
+
+        // The versions listed are versions OF an application, so an `appArn` that
+        // names none is a miss rather than an empty list: an empty list would say
+        // "this application has no versions", which is never true of one that
+        // exists, since every stored application has a draft version.
+        let Some(app) = store.apps.get(&input.app_arn) else {
+            return Err(app_not_found(&input.app_arn));
+        };
+
+        let mut matching = summarise_versions(&store, app);
+        matching.retain(|summary| within_requested_range(summary, &input));
+
+        // A total order over the page, so a `nextToken` resumes at exactly the
+        // element after the last one returned: oldest first, which puts the draft —
+        // which came into being with the application — ahead of everything published
+        // from it.
+        matching.sort_by(|left, right| PageKey::of(left).cmp(&PageKey::of(right)));
+
+        // Resume past the token's element, and past anything removed since, by
+        // taking the first element strictly beyond it.
+        let start = match resume_from {
+            None => 0,
+            Some(token) => matching
+                .iter()
+                .position(|summary| PageKey::of(summary) > token)
+                .unwrap_or(matching.len()),
+        };
+        let page = &matching[start..];
+        let returned = &page[..page_size.min(page.len())];
+
+        let next_token = (page.len() > returned.len())
+            .then(|| returned.last().map(|summary| PageKey::of(summary).encode()))
+            .flatten();
+
+        Ok(ListAppVersionsOutput {
+            app_versions: returned.to_vec(),
+            next_token,
+        })
     }
+}
+
+/// The largest page `maxResults` allows. Source: the `maxResults` member's
+/// `@range(min: 1, max: 100)` (smithy_query query="operation"
+/// operation="ListAppVersions").
+const MAX_PAGE_SIZE: i32 = 100;
+
+/// Every app version `app` has, as this list reports them: its DRAFT version, and
+/// each version frozen from the draft by `PublishAppVersion`.
+///
+/// The draft is reported for every stored application whether or not anything has
+/// been written into it — it is created with the application and cannot be removed,
+/// the same rule
+/// [`crate::state::ComAmazonawsResiliencehubAwsresiliencehubState::app_version_exists`]
+/// answers with — and it carries the application's own `creationTime`, because the
+/// draft comes into being with the application. Only a PUBLISHED version has an
+/// `identifier` (its publish sequence number), a `versionName` and a creation
+/// instant of its own.
+fn summarise_versions(
+    store: &crate::state::ComAmazonawsResiliencehubAwsresiliencehubState,
+    app: &App,
+) -> Vec<AppVersionSummary> {
+    let mut summaries = vec![AppVersionSummary {
+        app_version: crate::state::DRAFT_APP_VERSION.to_string(),
+        identifier: None,
+        creation_time: Some(app.creation_time),
+        version_name: None,
+    }];
+    if let Some(versions) = store.app_versions.get(&app.app_arn) {
+        summaries.extend(
+            versions
+                .iter()
+                .filter(|(app_version, _)| {
+                    app_version.as_str() != crate::state::DRAFT_APP_VERSION
+                })
+                .map(|(app_version, contents)| AppVersionSummary {
+                    app_version: app_version.clone(),
+                    identifier: contents.identifier,
+                    creation_time: contents.creation_time,
+                    version_name: contents.version_name.clone(),
+                }),
+        );
+    }
+    summaries
+}
+
+/// Whether `summary` falls inside the time range the request asked for, both bounds
+/// inclusive. An absent bound admits everything on that side.
+///
+/// `startTime`/`endTime` bound the application VERSION's creation time, so a version
+/// whose creation instant is unknown is outside any such range — the same reading
+/// `ListApps` gives an application that has never been assessed.
+fn within_requested_range(summary: &AppVersionSummary, input: &ListAppVersionsInput) -> bool {
+    if input.start_time.is_none() && input.end_time.is_none() {
+        return true;
+    }
+    let Some(created) = summary.creation_time else {
+        return false;
+    };
+    if input
+        .start_time
+        .is_some_and(|from| as_nanos(created) < as_nanos(from))
+    {
+        return false;
+    }
+    input
+        .end_time
+        .is_none_or(|to| as_nanos(created) <= as_nanos(to))
+}
+
+/// A timestamp as a single comparable quantity.
+fn as_nanos(at: ::aws_smithy_types::DateTime) -> i128 {
+    i128::from(at.secs()) * 1_000_000_000 + i128::from(at.subsec_nanos())
+}
+
+/// The total order `ListAppVersions` pages over: oldest first, the `appVersion`
+/// string breaking a tie between two versions recorded in the same instant.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct PageKey {
+    seconds: i64,
+    subsec_nanos: u32,
+    app_version: String,
+}
+
+impl PageKey {
+    /// This version's position in the order. A version with no creation instant
+    /// sorts at the epoch, so the order stays total whatever is stored.
+    fn of(summary: &AppVersionSummary) -> Self {
+        Self {
+            seconds: summary.creation_time.map(|at| at.secs()).unwrap_or_default(),
+            subsec_nanos: summary
+                .creation_time
+                .map(|at| at.subsec_nanos())
+                .unwrap_or_default(),
+            app_version: summary.app_version.clone(),
+        }
+    }
+
+    /// The `nextToken` form: the page key, hex-encoded with the workspace `hex`
+    /// crate — the same codec `ListApps` uses for its tokens. Hex is an ENCODING,
+    /// not a secret, so the safety comes from `decode` doing bounded work: a token
+    /// it cannot read is refused with a 400, and one it reads that no longer matches
+    /// a stored version simply resumes past everything, yielding an empty page. The
+    /// result carries no whitespace, so it satisfies `NextToken`'s `^\S{1,2000}$`.
+    fn encode(&self) -> String {
+        ::hex::encode(format!(
+            "{}.{:09}:{}",
+            self.seconds, self.subsec_nanos, self.app_version
+        ))
+    }
+
+    /// Parse a token this operation issued; `None` for anything else. Bounded work:
+    /// one hex decode, two `split_once`s and two integer parses.
+    fn decode(token: &str) -> Option<Self> {
+        let plain = String::from_utf8(::hex::decode(token).ok()?).ok()?;
+        let (instant, app_version) = plain.split_once(':')?;
+        let (seconds, subsec_nanos) = instant.split_once('.')?;
+        if app_version.is_empty() {
+            return None;
+        }
+        Some(Self {
+            seconds: seconds.parse().ok()?,
+            subsec_nanos: subsec_nanos.parse().ok()?,
+            app_version: app_version.to_string(),
+        })
+    }
+}
+
+/// A 400 `ValidationException` carrying `message`.
+///
+/// The MODELED error, not `crate::scaffolded::Scaffolded::validation`: this
+/// operation declares `ValidationException`, so the modeled shape is what a client
+/// deserializes (see the note in `crate::scaffolded`).
+fn invalid(message: impl Into<String>) -> ListAppVersionsError {
+    ListAppVersionsErrorModeled::ValidationException(ValidationException {
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// A 404 `ResourceNotFoundException` for an `appArn` that was never created, or was
+/// deleted.
+fn app_not_found(app_arn: &str) -> ListAppVersionsError {
+    ListAppVersionsErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("application {app_arn} does not exist")),
+        resource_id: Some(app_arn.to_string()),
+        resource_type: Some("App".to_string()),
+    })
+    .into()
+}
+
+/// The 500 for a service mounted on an engine that holds no state for it.
+fn internal_failure() -> ListAppVersionsError {
+    ListAppVersionsErrorModeled::InternalServerException(InternalServerException {
+        message: Some("resiliencehub state is unavailable on this engine".to_string()),
+    })
+    .into()
 }
