@@ -177,6 +177,72 @@ impl SerializableStruct for ValidationException {
     }
 }
 
+/// The wire error code this service answers an INVALID CROSS-ACCOUNT AUTHORIZATION
+/// with.
+///
+/// The model declares `ValidationException` (400) on `CreateCrossAccountAuthorization`,
+/// but the service's recorded refusal of a malformed authorization value carries the
+/// code `Validation` — a shape no model declares, which is exactly what this wrapper
+/// exists for. The code is what a client branches on, so the recorded code is what this
+/// emulator sends; the status is the modelled 400 either way.
+pub const VALIDATION_ERROR_NAME: &str = "Validation";
+
+/// The `message` member of the synthetic `Validation` error shape.
+static VALIDATION_ERROR_MESSAGE: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "smithy.framework#Validation$message",
+        "smithy.framework",
+        "message",
+    ),
+    ShapeType::String,
+    "message",
+    0,
+)
+.with_xml_name("Message");
+
+/// Schema for the synthetic `Validation` error shape, in the `smithy.framework`
+/// namespace for the same reason as the others here: the shape is in no service's model,
+/// so it must not collide with a modelled one.
+pub static VALIDATION_ERROR_SCHEMA: Schema = Schema::new_struct(
+    ShapeId::from_static(
+        "smithy.framework#Validation",
+        "smithy.framework",
+        "Validation",
+    ),
+    ShapeType::Structure,
+    &[&VALIDATION_ERROR_MESSAGE],
+);
+
+/// The payload of a `Validation` failure: why the submitted value was refused.
+#[derive(Debug, Clone)]
+pub struct ValidationError {
+    pub message: String,
+}
+
+impl ValidationError {
+    /// A `Validation` failure carrying `message`.
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for ValidationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{VALIDATION_ERROR_NAME}: {}", self.message)
+    }
+}
+
+impl std::error::Error for ValidationError {}
+
+impl SerializableStruct for ValidationError {
+    fn serialize_members(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
+        s.write_string(&VALIDATION_ERROR_MESSAGE, self.message.as_str())?;
+        Ok(())
+    }
+}
+
 /// The wire error code of the not-found answer this service's TAGGING operations give.
 ///
 /// The model declares `ResourceNotFoundException` on `ListTagsForResources`,
@@ -267,6 +333,11 @@ pub enum Scaffolded<E> {
     /// [`NOT_FOUND_EXCEPTION_NAME`] — the code this service's tagging operations
     /// answer, which its model does not declare.
     NotFoundException(NotFoundException),
+    /// A submitted value was refused by a rule the service enforces but does not model.
+    /// Renders as HTTP 400 with the error code [`VALIDATION_ERROR_NAME`] — the code the
+    /// cross-account authorization grant's refusal is recorded with, which this
+    /// service's model does not declare.
+    ValidationError(ValidationError),
 }
 
 impl<E> Scaffolded<E> {
@@ -302,6 +373,13 @@ impl<E> Scaffolded<E> {
     pub fn not_found(message: impl Into<String>) -> Self {
         Self::NotFoundException(NotFoundException::new(message))
     }
+
+    /// Refuse the request with HTTP 400 and the error code [`VALIDATION_ERROR_NAME`],
+    /// for the operations whose recorded refusal code is not the `ValidationException`
+    /// their model names.
+    pub fn validation_error(message: impl Into<String>) -> Self {
+        Self::ValidationError(ValidationError::new(message))
+    }
 }
 
 impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
@@ -311,6 +389,7 @@ impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
             Self::Modeled(e) => write!(f, "{e}"),
             Self::ValidationException(e) => write!(f, "{e}"),
             Self::NotFoundException(e) => write!(f, "{e}"),
+            Self::ValidationError(e) => write!(f, "{e}"),
         }
     }
 }
@@ -324,6 +403,7 @@ impl<E: std::error::Error + 'static> std::error::Error for Scaffolded<E> {
             Self::Modeled(e) => e.source(),
             Self::ValidationException(e) => e.source(),
             Self::NotFoundException(e) => e.source(),
+            Self::ValidationError(e) => e.source(),
         }
     }
 }
@@ -339,6 +419,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::Modeled(e) => e.as_serializable(),
             Self::ValidationException(e) => e,
             Self::NotFoundException(e) => e,
+            Self::ValidationError(e) => e,
         }
     }
 
@@ -348,6 +429,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::Modeled(e) => e.variant_schema(),
             Self::ValidationException(_) => &VALIDATION_EXCEPTION_SCHEMA,
             Self::NotFoundException(_) => &NOT_FOUND_EXCEPTION_SCHEMA,
+            Self::ValidationError(_) => &VALIDATION_ERROR_SCHEMA,
         }
     }
 
@@ -363,6 +445,9 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             // The code this service's tagging operations answer, which its model does
             // not declare. Keep the literal: a client branches on it.
             Self::NotFoundException(_) => NOT_FOUND_EXCEPTION_NAME,
+            // The code the cross-account authorization refusal is recorded with. Keep
+            // the literal: a client branches on it.
+            Self::ValidationError(_) => VALIDATION_ERROR_NAME,
         }
     }
 
@@ -376,6 +461,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::Modeled(e) => e.http_status(),
             Self::ValidationException(_) => 400,
             Self::NotFoundException(_) => 404,
+            Self::ValidationError(_) => 400,
         }
     }
 
@@ -389,6 +475,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             // Same reason: the synthetic shape carries no `awsQueryError` trait.
             Self::ValidationException(_) => None,
             Self::NotFoundException(_) => None,
+            Self::ValidationError(_) => None,
         }
     }
 }
