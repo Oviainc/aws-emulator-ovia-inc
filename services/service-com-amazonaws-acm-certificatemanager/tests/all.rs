@@ -21,6 +21,8 @@ mod acme_account_listing;
 mod acme_directory_endpoint;
 #[path = "all/acme_endpoint_lifecycle.rs"]
 mod acme_endpoint_lifecycle;
+#[path = "all/acme_endpoint_list.rs"]
+mod acme_endpoint_list;
 #[path = "all/acme_endpoint_update.rs"]
 mod acme_endpoint_update;
 #[path = "all/certificate_detail_projection.rs"]

@@ -50,6 +50,8 @@ mod ec2_query;
 mod elastic_ip_addresses;
 #[path = "all/fast_launch_images.rs"]
 mod fast_launch_images;
+#[path = "all/fpga_image_tasks_and_volume_io.rs"]
+mod fpga_image_tasks_and_volume_io;
 #[path = "all/get_password_data.rs"]
 mod get_password_data;
 #[path = "all/images.rs"]

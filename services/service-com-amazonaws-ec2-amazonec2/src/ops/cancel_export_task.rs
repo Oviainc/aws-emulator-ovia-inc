@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CancelExportTask
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CancelExportTask`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: cancels the instance export task the request names in [`crate::state`]. This
+//! is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CancelExportTask::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "Cancels an ACTIVE export task" and "if the export task is complete or is in the process
+//! of transferring the final disk image, the command fails and returns an error"
+//! (`CancelExportTask`): a task that is not active is refused with `IncorrectState`, the code
+//! EC2 answers when the resource exists but is not in a state that admits the request. A
+//! cancel that is admitted puts the task into the non-terminal `cancelling` state and the
+//! clock owes it `cancelled` ([`crate::state::ExportTaskRecord`]).
+//!
+//! `ExportVmTaskId` carries no modelled pattern and EC2 publishes no `.Malformed` code for
+//! one, so an id the account holds no export task for is answered the one way there is:
+//! `InvalidExportTaskID.NotFound`. `CreateInstanceExportTask`, which is what starts a task,
+//! is still a scaffold, so a fresh account holds none — and that is the answer every id gets
+//! until one is started.
+//!
+//! This operation models no `DryRun` member, so there is no permission probe to answer.
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +156,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CancelExportTask` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CancelExportTaskErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CancelExportTask"))
+        use crate::state::{
+            EXPORT_TASK_STATE_ACTIVE, TRANSITION_DELAY, incorrect_state,
+            invalid_export_task_id_not_found, require_service_state,
+        };
+
+        // An export task carries no Region member of its own, so nothing here depends on the
+        // Region the request was signed for.
+        let _ = ctx;
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+        let now = ::std::time::Instant::now();
+
+        let Some(record) = store.export_tasks.get_mut(&input.export_task_id) else {
+            return Err(invalid_export_task_id_not_found(&input.export_task_id));
+        };
+        // Only an active task can be cancelled: one already cancelling, cancelled or
+        // complete is refused with the state it is in.
+        let current = record.state_at(now);
+        if current != EXPORT_TASK_STATE_ACTIVE {
+            return Err(incorrect_state(format!(
+                "Export task '{}' is in the '{current}' state, which is not a state it can be \
+                 cancelled from",
+                input.export_task_id
+            )));
+        }
+        // The cancellation is started now and falls due on the clock, the same span a
+        // volume's `creating` -> `available` move takes in this crate.
+        record.cancelled_at = Some(now + TRANSITION_DELAY);
+        Ok(CancelExportTaskOutput)
     }
 }

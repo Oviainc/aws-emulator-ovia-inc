@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateRestoreImageTask
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateRestoreImageTask`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: refuses the restore, because the Amazon S3 object it must read does not
+//! exist here. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateRestoreImageTask::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "Starts a task that restores an AMI from an Amazon S3 object that was PREVIOUSLY CREATED
+//! by using CreateStoreImageTask" (`CreateRestoreImageTask`): the object is the input of the
+//! restore, not something this call creates. This emulator stores no Amazon S3 objects —
+//! `CreateStoreImageTask`, which is what would write one, is still a scaffold — so the
+//! object a request names can only be one that cannot be read, and the task is refused at
+//! the start call with `InaccessibleStorageLocation` naming it. No AMI is minted: an AMI
+//! restored from an object nothing read would be an image this emulator invented.
+//!
+//! The same storage-location rule the FPGA-image create keeps applies first: a bucket name
+//! outside Amazon S3's published naming rules names no bucket at all
+//! ([`crate::state::s3_bucket_name_is_well_formed`]), which is the same refusal. `DryRun`
+//! sits between the two, because it asks whether the CALLER MAY make the request rather than
+//! whether the object is there.
 //!
 //! ## Shape of an operation
 //!
@@ -146,18 +153,73 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateRestoreImageTask` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateRestoreImageTaskErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateRestoreImageTask"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            IMAGE_TAGGABLE_RESOURCES, MAX_S3_BUCKET_NAME_CHARS, MIN_S3_BUCKET_NAME_CHARS,
+            dry_run_operation, inaccessible_storage_location, s3_bucket_name_is_well_formed,
+            validate_tag_size,
+        };
+
+        // The restore is refused below for a reason that does not depend on the Region the
+        // request was signed for, and nothing is stored, so the engine is not reached.
+        let _ = (ctx, &self.engine);
+
+        // "The name of the Amazon S3 bucket that contains the stored AMI object"
+        // (`CreateRestoreImageTaskRequest$Bucket`): a value outside Amazon S3's bucket
+        // naming rules names no bucket at all, so it is refused before anything else.
+        if !s3_bucket_name_is_well_formed(&input.bucket) {
+            return Err(inaccessible_storage_location(format!(
+                "The S3 bucket '{}' is not an accessible storage location: an S3 bucket name \
+                 holds {MIN_S3_BUCKET_NAME_CHARS} to {MAX_S3_BUCKET_NAME_CHARS} lowercase \
+                 letters, digits, dots and hyphens, begins and ends with a letter or a digit, \
+                 and is not formatted as an IP address",
+                input.bucket
+            )));
+        }
+        // "The name of the stored AMI object in the bucket" (`ObjectKey`): an empty key names
+        // no object.
+        if input.object_key.is_empty() {
+            return Err(Scaffolded::missing_parameter(
+                "objectKey must name the stored AMI object in the bucket",
+            ));
+        }
+
+        // "You can tag the AMI, the snapshots, or both. To tag the AMI, the value for
+        // ResourceType must be image. To tag the snapshots, the value for ResourceType must
+        // be snapshot" (`TagSpecifications`): a specification naming any other resource type
+        // is refused rather than accepted and discarded.
+        for specification in input.tag_specifications.iter().flatten() {
+            match specification.resource_type.as_deref() {
+                Some(resource_type) if !IMAGE_TAGGABLE_RESOURCES.contains(&resource_type) => {
+                    return Err(Scaffolded::invalid_parameter_value(format!(
+                        "Invalid value '{resource_type}' for resourceType. \
+                         CreateRestoreImageTask tags the '{}' it restores",
+                        IMAGE_TAGGABLE_RESOURCES.join("' and the '")
+                    )));
+                }
+                _ => {}
+            }
+            for tag in specification.tags.iter().flatten() {
+                validate_tag_size(
+                    tag.key.as_deref().unwrap_or_default(),
+                    tag.value.as_deref().unwrap_or_default(),
+                )?;
+            }
+        }
+
+        // The permission question, answered before the object is looked for: the flag asks
+        // whether the caller MAY start this task, which is a question about the caller.
+        if input.dry_run == Some(true) {
+            return Err(dry_run_operation());
+        }
+
+        // The object the restore reads is one `CreateStoreImageTask` wrote, and this
+        // emulator stores no Amazon S3 objects at all, so there is nothing to restore from
+        // and no AMI is minted (see the module docs).
+        Err(inaccessible_storage_location(format!(
+            "The stored AMI object 's3://{}/{}' could not be read: this emulator stores no \
+             Amazon S3 objects, so there is no stored AMI to restore",
+            input.bucket, input.object_key
+        )))
     }
 }

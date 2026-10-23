@@ -1,15 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AttachImageWatermark
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AttachImageWatermark`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: attaches a watermark to one of the account's own non-public AMIs in
+//! [`crate::state`] and answers the `WatermarkKey` it was given. This is the ONLY file to
+//! touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AttachImageWatermark::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The watermark is stored ON the image, in the modelled `Image$ImageWatermarks` list
+//! `DescribeImages` reports, so the attach and every report of that image cannot disagree
+//! about which watermarks it carries. The key is DERIVED, never taken from the request:
+//! "the watermark identifier, in `accountId:watermarkName` format"
+//! ([`crate::state::image_watermark_key`]), so attaching the same name twice names the same
+//! watermark and adds no second row.
+//!
+//! The refusals: something that is not an AMI id is `InvalidAMIID.Malformed`; a watermark
+//! name carrying a character the member's own constraints exclude is
+//! `InvalidParameterValue`; a `DryRun` request is `DryRunOperation`; an id the account can
+//! see no image for is `InvalidAMIID.NotFound`; and "only the AMI owner can attach
+//! watermarks. Watermarks cannot be added to public AMIs" — both of which are
+//! `OperationNotPermitted`, the code EC2 answers when the request is well formed and the
+//! resource exists but a property of it forbids the action.
 //!
 //! ## Shape of an operation
 //!
@@ -142,18 +151,155 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AttachImageWatermark` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AttachImageWatermarkErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AttachImageWatermark"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            MAX_STORED_BYTES, MAX_WATERMARKS_PER_IMAGE, WATERMARK_NAME_PUNCTUATION,
+            dry_run_operation, image_id_is_well_formed, image_is_visible, image_watermark_key,
+            invalid_ami_id_malformed, invalid_ami_id_not_found, request_region,
+            require_service_state, resource_limit_exceeded, system_time_to_date_time,
+            watermark_name_is_well_formed,
+        };
+
+        // "The Region where the watermark was originally attached"
+        // (`ImageWatermark$SourceImageRegion`) is the Region this call was made in, which is
+        // the Region its SigV4 credential scope names.
+        let region = request_region(ctx.parts());
+
+        if !image_id_is_well_formed(&input.image_id) {
+            return Err(invalid_ami_id_malformed(&input.image_id));
+        }
+        // The LENGTH of a watermark name is modelled and already refused; its character set
+        // is documented on the member but not modelled, so this is the only place it can be
+        // enforced.
+        if !watermark_name_is_well_formed(&input.watermark_name) {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "Invalid value '{}' for watermarkName. A watermark name carries alphanumeric \
+                 characters and the punctuation '{WATERMARK_NAME_PUNCTUATION}'",
+                input.watermark_name
+            )));
+        }
+
+        // The permission question, answered before the resource one and before the write.
+        if input.dry_run == Some(true) {
+            return Err(dry_run_operation());
+        }
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+        let account = ::engine::emulator_account_id().to_string();
+
+        let watermark_key = image_watermark_key(&account, &input.watermark_name);
+        let (source_image_creation_time, attached_watermarks, already_attached) = {
+            let image = store
+                .images
+                .get(&input.image_id)
+                .filter(|image| image_is_visible(image, &account))
+                .ok_or_else(|| invalid_ami_id_not_found(&input.image_id))?;
+            // "Only the AMI owner can attach watermarks. Watermarks cannot be added to
+            // public AMIs" (`AttachImageWatermark`).
+            if image.owner_id.as_deref() != Some(account.as_str()) {
+                return Err(Scaffolded::operation_not_permitted(format!(
+                    "Only the owner of AMI '{}' can attach a watermark to it",
+                    input.image_id
+                )));
+            }
+            if image.public == Some(true) {
+                return Err(Scaffolded::operation_not_permitted(format!(
+                    "A watermark cannot be attached to the public AMI '{}'",
+                    input.image_id
+                )));
+            }
+            let watermarks = image.image_watermarks.as_deref().unwrap_or_default();
+            (
+                image_creation_time(image.creation_date.as_deref()),
+                watermarks.len(),
+                watermarks
+                    .iter()
+                    .any(|watermark| watermark.watermark_key.as_deref() == Some(&watermark_key)),
+            )
+        };
+
+        // The key is the account and the name, so a second attach of the same name names
+        // the watermark the image already carries: it is reported, and nothing is stored
+        // twice.
+        if !already_attached {
+            if attached_watermarks >= MAX_WATERMARKS_PER_IMAGE {
+                return Err(resource_limit_exceeded(format!(
+                    "AMI '{}' carries {attached_watermarks} watermarks, which is as many as \
+                     this emulator stores for one image",
+                    input.image_id
+                )));
+            }
+            if store.would_exceed_stored_bytes(watermark_key.len()) {
+                return Err(resource_limit_exceeded(format!(
+                    "This emulator holds {} of at most {MAX_STORED_BYTES} bytes of \
+                     caller-supplied data, so it cannot store {} more",
+                    store.stored_bytes(),
+                    watermark_key.len()
+                )));
+            }
+            let watermark = ImageWatermark {
+                watermark_key: Some(watermark_key.clone()),
+                // "The ID of the AMI to which the watermark was originally attached" and the
+                // Region it was attached in: this call's own image and Region, which is what
+                // makes the watermark propagate unchanged to a derivative image.
+                source_image_id: Some(input.image_id.clone()),
+                source_image_region: Some(region),
+                source_image_creation_time,
+                // "The date and time the watermark was attached to the AMI"
+                // (`ImageWatermark$WatermarkCreationTime`).
+                watermark_creation_time: Some(system_time_to_date_time(
+                    ::std::time::SystemTime::now(),
+                )),
+            };
+            let charge = watermark_key.len();
+            let Some(image) = store.images.get_mut(&input.image_id) else {
+                return Err(invalid_ami_id_not_found(&input.image_id));
+            };
+            image
+                .image_watermarks
+                .get_or_insert_with(Vec::new)
+                .push(watermark);
+            // The bytes the stored watermark retains are charged only once it IS stored, so
+            // a path that does not store it cannot leave the budget charged for it.
+            store.add_stored_bytes(charge);
+        }
+
+        // Read the answer back OUT of the store, so the caller is told the key a later
+        // `DescribeImages` will report rather than one held only in this stack frame.
+        store
+            .images
+            .get(&input.image_id)
+            .and_then(|image| {
+                image
+                    .image_watermarks
+                    .iter()
+                    .flatten()
+                    .find(|watermark| watermark.watermark_key.as_deref() == Some(&watermark_key))
+            })
+            .map(|watermark| AttachImageWatermarkOutput {
+                watermark_key: watermark.watermark_key.clone(),
+            })
+            .ok_or_else(|| {
+                Scaffolded::internal_error(format!(
+                    "the watermark '{watermark_key}' attached to AMI '{}' could not be read \
+                     back",
+                    input.image_id
+                ))
+            })
     }
+}
+
+/// The `Image$CreationDate` of a stored image as a timestamp, or `None` for an image that
+/// carries none.
+///
+/// The member is an ISO 8601 UTC string on the `Image` shape and a timestamp on
+/// `ImageWatermark$SourceImageCreationTime` ("the creation date of the source AMI, in the
+/// following format: YYYY-MM-DDTHH:MM:SS.ssssss+HH:MM"), so the stored rendering is read
+/// back into the modelled type rather than re-derived from the clock.
+fn image_creation_time(creation_date: Option<&str>) -> Option<::aws_smithy_types::DateTime> {
+    creation_date.and_then(|text| {
+        ::aws_smithy_types::DateTime::from_str(text, ::aws_smithy_types::date_time::Format::DateTime)
+            .ok()
+    })
 }
