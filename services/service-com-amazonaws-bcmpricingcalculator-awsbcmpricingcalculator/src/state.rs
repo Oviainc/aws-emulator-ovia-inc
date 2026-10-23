@@ -19,13 +19,23 @@ use std::collections::{BTreeMap, HashMap};
 use ::aws_smithy_types::DateTime;
 
 use crate::ops::types::{
-    BillInterval, Expression, HistoricalUsageEntity, UsageAmount, UsageQuantity,
-    ValidationException, WorkloadEstimateUsageQuantity,
+    BillInterval, Expression, HistoricalUsageEntity, ResourceNotFoundException, UsageAmount,
+    UsageQuantity, ValidationException, WorkloadEstimateUsageQuantity,
 };
 
-/// The region an ARN carries when the request's SigV4 credential scope names none.
-/// `engine::emulator_arn`'s contract: "emulators default to us-east-1".
-pub const DEFAULT_REGION: &str = "us-east-1";
+/// The region segment every ARN this service mints carries: NONE.
+///
+/// `AWSBCMPricingCalculator` is a PARTITIONAL service — its model carries
+/// `aws.endpoints#standardPartitionalEndpoints`, so a resource of it belongs to the
+/// account inside a partition rather than to a region — and its `Arn` shape's pattern
+/// leaves the region field possibly empty (smithy_query `shape="Arn"`:
+/// `^arn:aws[-a-z0-9]*:bcm-pricing-calculator:[-a-z0-9]*:[0-9]{12}:[-a-z0-9/:_]+$`).
+/// That is the form the service's own ARNs carry, and the form a client holding one
+/// sends back: `arn:aws:bcm-pricing-calculator::<account>:workload-estimate/<id>`.
+///
+/// Because the region segment does not select among this service's resources, it is
+/// also not part of the identity [`parse_resource_arn`] resolves an ARN by.
+pub const ARN_REGION: &str = "";
 
 /// This service's ARN namespace, as the Smithy model's `aws.api#service` declares it
 /// (`arnNamespace: bcm-pricing-calculator`).
@@ -135,12 +145,12 @@ pub const COST_STATUS_VALID: &str = "VALID";
 pub const BILL_SCENARIO_RESOURCE_TYPE: &str = "BillScenario";
 
 /// The resource-type segment a bill scenario's ARN carries, as `CreateBillScenario`
-/// mints it: `arn:aws:bcm-pricing-calculator:<region>:<account>:bill-scenario/<id>`.
+/// mints it: `arn:aws:bcm-pricing-calculator::<account>:bill-scenario/<id>`.
 pub const BILL_SCENARIO_ARN_TYPE: &str = "bill-scenario";
 
 /// The resource-type segment a workload estimate's ARN carries, as
 /// `CreateWorkloadEstimate` mints it:
-/// `arn:aws:bcm-pricing-calculator:<region>:<account>:workload-estimate/<id>`.
+/// `arn:aws:bcm-pricing-calculator::<account>:workload-estimate/<id>`.
 pub const WORKLOAD_ESTIMATE_ARN_TYPE: &str = "workload-estimate";
 
 /// Every resource kind an ARN of this service names, as `(ARN segment, Smithy shape
@@ -192,13 +202,73 @@ pub fn is_reserved_tag_key(key: &str) -> bool {
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case(RESERVED_TAG_KEY_PREFIX))
 }
 
+/// Which resource one of this service's ARNs addresses: every segment of it that
+/// SELECTS a resource.
+///
+/// The region is deliberately absent. This service is partitional (see [`ARN_REGION`]),
+/// so a resource of it is not region-scoped and the region segment names nothing to
+/// choose between: the same resource is addressed whether the caller sends the empty
+/// region its own ARNs carry or writes a region into that field, which the `Arn`
+/// pattern permits. Everything else — partition, account and the resource type and id —
+/// is part of the identity, so another partition's or another account's ARN addresses a
+/// different resource and resolves to nothing here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResourceArn<'a> {
+    pub partition: &'a str,
+    pub account_id: &'a str,
+    /// The resource-type segment (`bill-scenario`, `workload-estimate`, …).
+    pub resource_type: &'a str,
+    /// The id after the type's `/`, empty when the ARN carries no `/`.
+    pub resource_id: &'a str,
+}
+
+/// The resource one of this service's ARNs addresses, or `None` when the string is not
+/// an ARN of this service at all.
+///
+/// The form every ARN this service mints carries, and the one its `Arn` shape pins:
+/// `arn:<partition>:bcm-pricing-calculator:<region>:<account>:<type>/<id>`. The resource
+/// portion is split off with `splitn(6, ':')` rather than `split`, because the pattern
+/// admits `:` INSIDE that portion, so a resource segment carrying one must stay whole.
+pub fn parse_resource_arn(arn: &str) -> Option<ResourceArn<'_>> {
+    let mut fields = arn.splitn(6, ':');
+    if fields.next()? != "arn" {
+        return None;
+    }
+    let partition = fields.next()?;
+    if fields.next()? != ARN_NAMESPACE {
+        return None;
+    }
+    // The region field: read so the fields after it are reached, and dropped because it
+    // is not part of the identity (see [`ResourceArn`]).
+    let _region = fields.next()?;
+    let account_id = fields.next()?;
+    let resource = fields.next()?;
+    let (resource_type, resource_id) = resource.split_once('/').unwrap_or((resource, ""));
+    Some(ResourceArn {
+        partition,
+        account_id,
+        resource_type,
+        resource_id,
+    })
+}
+
+/// Whether `requested` addresses the resource whose own ARN is `minted`: the two name
+/// the same [`ResourceArn`] identity.
+///
+/// An ARN this service never mints (another partition's, another account's, another
+/// kind's, another id's) addresses something else, and a string that is not an ARN of
+/// this service addresses nothing.
+pub fn arn_addresses(minted: &str, requested: &str) -> bool {
+    match (parse_resource_arn(minted), parse_resource_arn(requested)) {
+        (Some(minted), Some(requested)) => minted == requested,
+        _ => false,
+    }
+}
+
 /// The resource-type segment `arn` names (`bill-scenario`, `workload-estimate`, …), or
 /// `None` when the string does not have the ARN form this service's `Arn` shape pins.
-///
-/// The segment is the sixth `:`-field up to its `/`, from the form every ARN this service
-/// mints carries: `arn:<partition>:bcm-pricing-calculator:<region>:<account>:<type>/<id>`.
 pub fn arn_resource_type(arn: &str) -> Option<&str> {
-    arn.split(':').nth(5)?.split('/').next()
+    parse_resource_arn(arn).map(|parsed| parsed.resource_type)
 }
 
 /// What a modelled error's `resourceType` names the resource `arn` addresses as: the
@@ -413,9 +483,9 @@ impl WorkloadEstimateUsage {
 pub struct WorkloadEstimate {
     /// The server-assigned `ResourceId` (a lowercase-hex v4 UUID).
     pub id: String,
-    /// `arn:aws:bcm-pricing-calculator:<region>:<account>:workload-estimate/<id>`,
-    /// built through `engine::emulator_arn` so the account segment is the canonical
-    /// one.
+    /// `arn:aws:bcm-pricing-calculator::<account>:workload-estimate/<id>`, built through
+    /// `engine::emulator_arn` so the account segment is the canonical one and the region
+    /// segment is empty ([`ARN_REGION`]).
     ///
     /// This is what the operations that address an estimate by ARN (`TagResource`,
     /// `UntagResource`, `ListTagsForResource`) resolve against, through
@@ -500,8 +570,9 @@ impl WorkloadEstimate {
 pub struct BillScenario {
     /// The server-assigned `ResourceId` (a lowercase-hex v4 UUID).
     pub id: String,
-    /// `arn:aws:bcm-pricing-calculator:<region>:<account>:bill-scenario/<id>`, built
-    /// through `engine::emulator_arn` so the account segment is the canonical one.
+    /// `arn:aws:bcm-pricing-calculator::<account>:bill-scenario/<id>`, built through
+    /// `engine::emulator_arn` so the account segment is the canonical one and the region
+    /// segment is empty ([`ARN_REGION`]).
     ///
     /// This is what the operations that address a scenario by ARN (`TagResource`,
     /// `UntagResource`, `ListTagsForResource`) resolve against, through
@@ -803,31 +874,42 @@ impl ComAmazonawsBcmpricingcalculatorAwsbcmpricingcalculatorState {
     /// The tags of the resource `arn` addresses, or `None` when this store holds no
     /// resource with that ARN.
     ///
-    /// The ARN is matched against the one the resource was minted with, so an ARN is
-    /// resolved to the resource whose ARN it IS — every segment of it, partition, region
-    /// and account included. A well-formed ARN naming a resource this store does not hold
-    /// (one that was deleted, one that expired, or one of a kind this service cannot yet
-    /// create) resolves to nothing, which every tagging operation answers with the
-    /// modelled `ResourceNotFoundException`.
+    /// The ARN is matched by the identity it names ([`parse_resource_arn`]): partition,
+    /// account, resource type and resource id, which is everything that selects a
+    /// resource of this partitional service. So another account's or another kind's ARN
+    /// resolves to nothing, while the region field — which names nothing to choose
+    /// between here — does not keep an ARN from resolving. A well-formed ARN naming a
+    /// resource this store does not hold (one that was deleted, one that expired, or one
+    /// of a kind this service cannot yet create) resolves to nothing, which every tagging
+    /// operation answers with the modelled not-found payload under HTTP 400
+    /// ([`unresolvable_arn_refusal`]).
     pub fn resource_tags(&self, arn: &str) -> Option<&BTreeMap<String, String>> {
-        if let Some(scenario) = self.bill_scenarios.iter().find(|s| s.arn == arn) {
+        if let Some(scenario) = self
+            .bill_scenarios
+            .iter()
+            .find(|s| arn_addresses(&s.arn, arn))
+        {
             return Some(&scenario.tags);
         }
         self.workload_estimates
             .iter()
-            .find(|e| e.arn == arn)
+            .find(|e| arn_addresses(&e.arn, arn))
             .map(|estimate| &estimate.tags)
     }
 
     /// The tags of the resource `arn` addresses, to be changed in place. `None` for an
     /// ARN this store holds no resource for; see [`Self::resource_tags`].
     pub fn resource_tags_mut(&mut self, arn: &str) -> Option<&mut BTreeMap<String, String>> {
-        if let Some(scenario) = self.bill_scenarios.iter_mut().find(|s| s.arn == arn) {
+        if let Some(scenario) = self
+            .bill_scenarios
+            .iter_mut()
+            .find(|s| arn_addresses(&s.arn, arn))
+        {
             return Some(&mut scenario.tags);
         }
         self.workload_estimates
             .iter_mut()
-            .find(|e| e.arn == arn)
+            .find(|e| arn_addresses(&e.arn, arn))
             .map(|estimate| &mut estimate.tags)
     }
 
@@ -1238,22 +1320,70 @@ pub fn month_bounds(secs: i64) -> (i64, i64) {
     bounds().unwrap_or((secs, secs))
 }
 
-/// The region this request was signed for, defaulting to [`DEFAULT_REGION`].
+/// The `ResourceNotFoundException` this service answers a request that names a resource
+/// of `resource_type` it does not hold with.
 ///
-/// The value comes from the caller's SigV4 credential scope, so it is only accepted
-/// when it has the shape of a region (lowercase alphanumerics and hyphens, 1..32
-/// characters); anything else falls back to the default rather than being interpolated
-/// into an ARN the real service could never emit.
-pub fn request_region(headers: &::http::HeaderMap) -> String {
-    ::emulator_server::sigv4_credential_scope(headers)
-        .map(|scope| scope.region)
-        .filter(|region| {
-            (1..=32).contains(&region.len())
-                && region
-                    .bytes()
-                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-        })
-        .unwrap_or_else(|| DEFAULT_REGION.to_string())
+/// THE MESSAGE IS FIXED PER RESOURCE TYPE and never carries the requested identifier.
+/// The recorded service answers the same string for two different operations reading the
+/// same kind of resource (`GetWorkloadEstimate` and `ListWorkloadEstimateUsage`), which
+/// is what makes it identifier- and operation-independent: it reports the service's
+/// condition ("there is no resource of this kind by that id") rather than reflecting the
+/// request back. The requested identifier is still reported, in the member modelled for
+/// it (`resourceId`), beside the kind in `resourceType`.
+///
+/// `resource_type` is the resource's Smithy shape name, as that member reports it
+/// ([`WORKLOAD_ESTIMATE_RESOURCE_TYPE`], [`BILL_SCENARIO_RESOURCE_TYPE`], …).
+pub fn resource_not_found(resource_type: &str, resource_id: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: format!(
+            "The requested {resource_type} was not found. Check the {resource_type} ID \
+             and try again."
+        ),
+        resource_id: resource_id.to_string(),
+        resource_type: resource_type.to_string(),
+    }
+}
+
+/// [`resource_not_found`] for a workload estimate `identifier` names no live estimate.
+pub fn workload_estimate_not_found(identifier: &str) -> ResourceNotFoundException {
+    resource_not_found(WORKLOAD_ESTIMATE_RESOURCE_TYPE, identifier)
+}
+
+/// [`resource_not_found`] for a bill scenario `identifier` names no live scenario.
+pub fn bill_scenario_not_found(identifier: &str) -> ResourceNotFoundException {
+    resource_not_found(BILL_SCENARIO_RESOURCE_TYPE, identifier)
+}
+
+/// The message the tagging surface refuses an unresolvable `arn` with — fixed, and the
+/// same for all three tagging operations, as the recorded service answers it.
+pub const UNRESOLVABLE_ARN_MESSAGE: &str = "Resource not found";
+
+/// The HTTP status the tagging surface answers an unresolvable `arn` under.
+///
+/// It is NOT the 404 the `ResourceNotFoundException` shape's `@httpError` states: the
+/// recorded service answers that shape's payload under a 400 on this surface, where the
+/// resource is named by a caller-built ARN and an ARN that resolves to nothing is bad
+/// INPUT — a non-retryable error the caller must fix — rather than the 404 that tells a
+/// client to create the resource and retry. The status and the error code are
+/// independent facts of the wire, so the pair is answered as recorded
+/// ([`crate::scaffolded::Scaffolded::ModeledWithStatus`]).
+pub const UNRESOLVABLE_ARN_STATUS: u16 = 400;
+
+/// The refusal `ListTagsForResource`, `TagResource` and `UntagResource` answer an `arn`
+/// that addresses no resource this account holds with: the modelled
+/// `ResourceNotFoundException` payload, under [`UNRESOLVABLE_ARN_STATUS`], carrying
+/// [`UNRESOLVABLE_ARN_MESSAGE`].
+///
+/// The message is FIXED and never echoes the ARN, for the same reason
+/// [`resource_not_found`]'s is: it reports the service's condition rather than
+/// reflecting the request. The requested ARN is still reported in the member modelled
+/// for it (`resourceId`), with the kind that ARN names beside it in `resourceType`.
+pub fn unresolvable_arn_refusal(arn: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: UNRESOLVABLE_ARN_MESSAGE.to_string(),
+        resource_id: arn.to_string(),
+        resource_type: arn_resource_label(arn),
+    }
 }
 
 /// Whether `candidate` satisfies a filter's `values` under its `matchOption`.

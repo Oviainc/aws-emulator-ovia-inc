@@ -193,10 +193,12 @@ async fn an_unknown_application_is_named_after_the_delimiter() {
                 "ListDeploymentGroups",
                 json!({"applicationName": ghost}),
             ),
-            (
-                "DeleteDeploymentGroup",
-                json!({"applicationName": ghost, "deploymentGroupName": "any-group"}),
-            ),
+            // `DeleteDeploymentGroup` is NOT in this table: its model declares no
+            // `ApplicationDoesNotExistException` (OPERATIONS.md lists its five
+            // errors: the two name-required and two invalid-name refusals, and
+            // `InvalidRoleException`), because deleting a group nothing holds is a
+            // success rather than a refusal. The suite
+            // `tests/all/delete_deployment_group.rs` pins that instead.
             (
                 "BatchGetDeploymentGroups",
                 json!({"applicationName": ghost, "deploymentGroupNames": ["any-group"]}),

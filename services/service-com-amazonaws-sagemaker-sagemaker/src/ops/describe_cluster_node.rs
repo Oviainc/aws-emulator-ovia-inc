@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeClusterNode
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeClusterNode`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeClusterNode::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: replays one node of the cluster `ClusterName` names (by name or ARN),
+//! picked by `NodeId` or `NodeLogicalId`, materialising the `Pending` -> `Running`
+//! transition the clock already owes it, and refuses an absent cluster or node with the
+//! modelled `ResourceNotFound`. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -146,18 +141,100 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeClusterNode` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeClusterNodeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeClusterNode"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        // Documented on `NodeLogicalId`: "You can specify either NodeLogicalId or
+        // InstanceId, but not both." A request naming neither picks no node at all.
+        match (&input.node_id, &input.node_logical_id) {
+            (None, None) => {
+                return Err(crate::scaffolded::Scaffolded::validation(
+                    "Specify either NodeId or NodeLogicalId.",
+                ));
+            }
+            (Some(_), Some(_)) => {
+                return Err(crate::scaffolded::Scaffolded::validation(
+                    "Specify either NodeId or NodeLogicalId, not both.",
+                ));
+            }
+            _ => {}
+        }
+
+        let mut store = state.lock();
+        let Some(cluster) = store.cluster_by_name_or_arn_mut(&input.cluster_name) else {
+            return Err(DescribeClusterNodeErrorModeled::ResourceNotFound(ResourceNotFound {
+                message: Some(format!("Cluster {} does not exist.", input.cluster_name)),
+            })
+            .into());
+        };
+        let cluster_arn = cluster.arn.clone();
+        let node = match (&input.node_id, &input.node_logical_id) {
+            (Some(node_id), _) => cluster.node_by_instance_id_mut(node_id),
+            (_, Some(logical_id)) => cluster.nodes.get_mut(logical_id),
+            _ => None,
+        };
+        let Some(node) = node else {
+            return Err(DescribeClusterNodeErrorModeled::ResourceNotFound(ResourceNotFound {
+                message: Some(format!(
+                    "Cluster {cluster_arn} has no node {}.",
+                    input
+                        .node_id
+                        .or(input.node_logical_id)
+                        .unwrap_or_default()
+                )),
+            })
+            .into());
+        };
+        // The one write a reporting operation may make: both transitions were due
+        // whether or not anybody described the node.
+        let now = ::std::time::SystemTime::now();
+        let settled = node.settle_status(now);
+        node.settle_attachments(now);
+
+        let answer = DescribeClusterNodeOutput {
+            node_details: ClusterNodeDetails {
+                instance_group_name: Some(node.instance_group_name.clone()),
+                // Absent until the node reaches `Running`, which is when it gets one.
+                instance_id: node.instance_id.clone(),
+                node_logical_id: Some(node.logical_id.clone()),
+                instance_status: Some(ClusterInstanceStatusDetails {
+                    status: node.status.clone(),
+                    message: None,
+                }),
+                instance_type: node.instance_type.clone(),
+                launch_time: Some(crate::state::timestamp(node.launch_time)),
+                // No software update has been applied to a node this emulator added.
+                last_software_update_time: None,
+                life_cycle_config: None,
+                override_vpc_config: None,
+                threads_per_core: node.threads_per_core,
+                instance_storage_configs: None,
+                private_primary_ip: None,
+                private_primary_ipv6: None,
+                private_dns_hostname: None,
+                placement: node
+                    .availability_zone
+                    .clone()
+                    .map(|zone| ClusterInstancePlacement {
+                        availability_zone: Some(zone),
+                        availability_zone_id: None,
+                    }),
+                current_image_id: None,
+                desired_image_id: None,
+                current_image_release_version: None,
+                desired_image_release_version: None,
+                image_version_status: None,
+                ultra_server_info: None,
+                kubernetes_config: None,
+                capacity_type: None,
+                network_interface: None,
+            },
+        };
+        drop(store);
+
+        if settled {
+            crate::state::record_state_change(Self::NAME, &cluster_arn, ctx);
+        }
+        Ok(answer)
     }
 }

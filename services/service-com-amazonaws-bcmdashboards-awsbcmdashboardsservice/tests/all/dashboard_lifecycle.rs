@@ -875,13 +875,18 @@ async fn delete_dashboard_removes_the_record() {
 
     let (status, body) = call(&router, "GetDashboard", &json!({"arn": doomed})).await;
     assert_eq!(
-        status, 404,
+        status, 400,
         "a deleted dashboard must not resolve, got {status}: {body}"
     );
     assert!(
         error_code(&body).contains("ResourceNotFoundException"),
         "expected ResourceNotFoundException, got {}",
         error_code(&body)
+    );
+    assert_eq!(
+        body["resourceId"].as_str(),
+        Some(doomed.as_str()),
+        "the not-found answer must echo the requested arn in resourceId: {body}"
     );
 
     let listed = ok_call(&router, "ListDashboards", &json!({})).await;
@@ -918,7 +923,7 @@ async fn delete_dashboard_removes_the_record() {
     )
     .await;
     assert_eq!(
-        status, 404,
+        status, 400,
         "updating an absent dashboard is a not-found, got {status}: {body}"
     );
     assert!(
@@ -929,7 +934,9 @@ async fn delete_dashboard_removes_the_record() {
 }
 
 /// An ARN that names no dashboard is a not-found; an ARN that is not a `DashboardArn`
-/// at all is a validation failure.
+/// at all is a validation failure. Both answer HTTP 400 (see
+/// `tests/all/resource_not_found.rs` for why a not-found is 400 here), so the two are
+/// told apart by the wire error code, which is what a client branches on.
 #[tokio::test]
 async fn unknown_and_malformed_arns_are_told_apart() {
     let router = router();
@@ -938,8 +945,8 @@ async fn unknown_and_malformed_arns_are_told_apart() {
     let never_created = "arn:aws:bcm-dashboards::000000000000:dashboard/does-not-exist";
     let (status, body) = call(&router, "GetDashboard", &json!({"arn": never_created})).await;
     assert_eq!(
-        status, 404,
-        "case well-formed but unknown: expected 404, got {status}: {body}"
+        status, 400,
+        "case well-formed but unknown: expected 400, got {status}: {body}"
     );
     assert!(
         error_code(&body).contains("ResourceNotFoundException"),

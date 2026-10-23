@@ -3601,6 +3601,19 @@ pub const MAX_ACTIONS_PER_PIPELINE: usize = 100;
 /// only by the request body.
 pub const MAX_CONFIGURATION_ENTRIES_PER_ACTION: usize = 100;
 
+/// The most `inputArtifacts` — or `outputArtifacts` — entries one action may declare.
+///
+/// `InputArtifactList` and `OutputArtifactList` carry no `@length` of their own, so
+/// without this bound the artifact lists the validation walks and the handler stores
+/// would be sized only by the request body. The figure is the largest artifact count
+/// an action type can even declare for itself: `MaximumActionTypeArtifactCount` is
+/// `@range(min: 0, max: 10)` (`MaximumArtifactCount`, the custom-action form, stops at
+/// 5), so no declaration an action type could accept is refused by it. Enforced BEFORE
+/// the artifact walk, so the work one request drives is capped by a stated figure:
+/// together with [`MAX_ACTIONS_PER_PIPELINE`] it bounds a declaration's artifacts in
+/// total.
+pub const MAX_ARTIFACTS_PER_ACTION: usize = 10;
+
 /// The `ActionCategory` of an action that brings a revision INTO the pipeline.
 pub const CATEGORY_SOURCE: &str = "Source";
 
@@ -3722,6 +3735,31 @@ pub fn validate_declaration(
         )));
     }
 
+    if let Some((stage, action, member, count)) = declaration.stages.iter().find_map(|stage| {
+        stage.actions.iter().find_map(|action| {
+            [
+                (
+                    "inputArtifacts",
+                    action.input_artifacts.as_ref().map_or(0, Vec::len),
+                ),
+                (
+                    "outputArtifacts",
+                    action.output_artifacts.as_ref().map_or(0, Vec::len),
+                ),
+            ]
+            .into_iter()
+            .find_map(|(member, count)| {
+                (count > MAX_ARTIFACTS_PER_ACTION).then_some((stage, action, member, count))
+            })
+        })
+    }) {
+        return Err(DeclarationProblem::Limit(format!(
+            "action {} in stage {} declares {count} {member} entries, past the limit of \
+             {MAX_ARTIFACTS_PER_ACTION} artifacts for an action",
+            action.name, stage.name
+        )));
+    }
+
     if let Some(stage) = declaration
         .stages
         .iter()
@@ -3788,7 +3826,11 @@ pub fn validate_declaration(
                 .push(action);
         }
         for group in groups.values() {
-            let mut outputs: Vec<&str> = Vec::new();
+            // A SET, not a list: the membership test below is what decides a duplicate,
+            // so a list would rescan every name already collected for the group and
+            // make this walk quadratic in a request-controlled count (`OutputArtifactList`
+            // carries no modelled `@length`).
+            let mut outputs: BTreeSet<&str> = BTreeSet::new();
             for action in group {
                 for input in action.input_artifacts.iter().flatten() {
                     if !produced.contains(input.name.as_str()) {
@@ -3801,7 +3843,7 @@ pub fn validate_declaration(
                 }
                 for output in action.output_artifacts.iter().flatten() {
                     if produced.contains(output.name.as_str())
-                        || outputs.contains(&output.name.as_str())
+                        || !outputs.insert(output.name.as_str())
                     {
                         return Err(DeclarationProblem::Structure(format!(
                             "the output artifact {} is declared by more than one action; \
@@ -3809,7 +3851,6 @@ pub fn validate_declaration(
                             output.name
                         )));
                     }
-                    outputs.push(output.name.as_str());
                 }
             }
             produced.extend(outputs);

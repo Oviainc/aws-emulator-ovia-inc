@@ -460,7 +460,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             architectures: input.architectures.clone().unwrap_or_else(|| {
                 vec![crate::state::DEFAULT_ARCHITECTURE.to_string()]
             }),
-            environment: environment_variables(&input)?,
+            environment: crate::state::environment_variables(input.environment.as_ref())
+                .map_err(invalid_parameter)?,
             layers,
             ephemeral_storage_mb: input
                 .ephemeral_storage
@@ -478,6 +479,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             code_sha256,
             last_modified: crate::state::iso8601(now),
             revision_id: crate::state::mint_revision_id(),
+            vpc_config: input.vpc_config.clone(),
+            dead_letter_config: input.dead_letter_config.clone(),
+            file_system_configs: input.file_system_configs.clone().unwrap_or_default(),
+            image_config: input.image_config.clone(),
+            snap_start_apply_on: input
+                .snap_start
+                .as_ref()
+                .and_then(|snap_start| snap_start.apply_on.clone()),
+            logging_config: input.logging_config.clone(),
+            capacity_provider_config: input.capacity_provider_config.clone(),
+            durable_config: input.durable_config.clone(),
+            tenancy_config: input.tenancy_config.clone(),
         };
 
         let mut record = crate::state::FunctionRecord {
@@ -493,6 +506,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             state_reason: Some(crate::state::STATE_REASON_CREATING.to_string()),
             state_reason_code: Some(crate::state::STATE_REASON_CODE_CREATING.to_string()),
             last_update_status: None,
+            // Nothing is being updated on a function that is still being created.
+            last_update_due: None,
             active_due: now + crate::state::ACTIVATION_DELAY,
             tags: input
                 .tags
@@ -658,30 +673,3 @@ fn package_code(
 /// package (.zip file archive) size: 50 MB (zipped, for direct upload)".
 const MAX_INLINE_ZIP_BYTES: usize = 50 * 1024 * 1024;
 
-/// AWS's published Lambda quota for environment variables: 4 KB for all of a
-/// function's environment variables combined.
-const MAX_ENVIRONMENT_BYTES: usize = 4 * 1024;
-
-/// The environment variables of the function being created, refused when the set is
-/// larger than the documented quota.
-fn environment_variables(
-    input: &CreateFunctionInput,
-) -> Result<::std::collections::BTreeMap<String, String>, CreateFunctionError> {
-    let variables: ::std::collections::BTreeMap<String, String> = input
-        .environment
-        .as_ref()
-        .and_then(|environment| environment.variables.clone())
-        .map(|variables| variables.into_iter().collect())
-        .unwrap_or_default();
-    let size: usize = variables
-        .iter()
-        .map(|(name, value)| name.len() + value.len())
-        .sum();
-    if size > MAX_ENVIRONMENT_BYTES {
-        return Err(invalid_parameter(format!(
-            "Environment.Variables must be smaller than {MAX_ENVIRONMENT_BYTES} bytes for all \
-             environment variables combined, and this request's are {size} bytes"
-        )));
-    }
-    Ok(variables)
-}

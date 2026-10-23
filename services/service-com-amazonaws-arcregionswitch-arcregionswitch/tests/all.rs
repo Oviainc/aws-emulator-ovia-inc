@@ -15,6 +15,8 @@
 mod approve_plan_execution_step;
 #[path = "all/execution_progression.rs"]
 mod execution_progression;
+#[path = "all/plan_execution_listing.rs"]
+mod plan_execution_listing;
 #[path = "all/plan_lifecycle.rs"]
 mod plan_lifecycle;
 #[path = "all/plan_update.rs"]

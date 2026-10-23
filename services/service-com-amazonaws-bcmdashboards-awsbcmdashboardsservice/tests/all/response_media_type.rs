@@ -171,10 +171,10 @@ async fn every_routed_response_announces_the_services_media_type() {
             status: 200,
         },
         Case {
-            label: "a modelled exception: ResourceNotFoundException",
+            label: "a handler's not-found answer: ResourceNotFoundException",
             operation: "GetDashboard",
             body: json!({"arn": unknown_arn}),
-            status: 404,
+            status: 400,
         },
         Case {
             label: "a handler refusal: a pagination token this service never minted",

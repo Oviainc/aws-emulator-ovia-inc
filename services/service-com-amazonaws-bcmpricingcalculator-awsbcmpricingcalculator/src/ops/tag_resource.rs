@@ -22,11 +22,15 @@
 //! being sent to look for a resource that would not have accepted the key anyway. A test
 //! row pins that order.
 //!
-//! WHICH RESOURCE AN ARN ADDRESSES: the ARN is matched in FULL against the one the
-//! resource was minted with (partition, region and the single account this emulator
-//! presents included), so an ARN naming another account's or another region's resource
-//! resolves to nothing and is answered with the modelled `ResourceNotFoundException` —
-//! this surface never reads or writes a resource the ARN does not name. Caller-identity
+//! WHICH RESOURCE AN ARN ADDRESSES: the ARN is resolved by the identity it names
+//! ([`crate::state::parse_resource_arn`]) — partition, account, resource type and
+//! resource id, which is everything that selects a resource of this partitional service
+//! — so another account's or another kind's ARN addresses nothing here and is refused
+//! with the modelled not-found payload under HTTP 400
+//! ([`crate::state::unresolvable_arn_refusal`]), while the region field, which names
+//! nothing to choose between for a service whose own ARNs leave it empty, does not keep
+//! an ARN from resolving. This surface never writes to a resource the ARN does not name.
+//! Caller-identity
 //! authorization beyond that (IAM policy evaluation, `AccessDeniedException`) is not
 //! modelled by this emulator at all, here or in any other operation of this service.
 //!
@@ -79,9 +83,15 @@
 //!
 //! ## Errors
 //!
-//! * `ResourceNotFoundException` (HTTP 404) — The specified resource was not found.
+//! * `ResourceNotFoundException` (HTTP 404) — The specified resource was not found. On
+//!   this surface it is what an `arn` resolving to no resource of this account earns, and
+//!   the recorded service answers it under HTTP 400 rather than its modelled 404: see
+//!   [`crate::state::unresolvable_arn_refusal`].
 //! * `ServiceQuotaExceededException` (HTTP 402) — The request would cause you to exceed your
 //!   service quota.
+//! * `ValidationException` (HTTP 400) — The input provided fails to satisfy the
+//!   constraints specified by an Amazon Web Services service. This is what a reserved tag
+//!   key earns.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -203,14 +213,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let resource_type = crate::state::arn_resource_label(&input.arn);
 
         let Some(tags) = state.resource_tags_mut(&input.arn) else {
-            return Err(TagResourceErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: format!("No resource found with ARN {}", input.arn),
-                    resource_id: input.arn.clone(),
-                    resource_type,
-                },
-            )
-            .into());
+            // An ARN that addresses nothing is bad INPUT on this surface: the modelled
+            // not-found payload under a 400, as `crate::state::unresolvable_arn_refusal`
+            // explains.
+            return Err(crate::scaffolded::Scaffolded::modeled_with_status(
+                TagResourceErrorModeled::ResourceNotFoundException(
+                    crate::state::unresolvable_arn_refusal(&input.arn),
+                ),
+                crate::state::UNRESOLVABLE_ARN_STATUS,
+            ));
         };
 
         // What the merge would leave: the keys the resource already carries that this

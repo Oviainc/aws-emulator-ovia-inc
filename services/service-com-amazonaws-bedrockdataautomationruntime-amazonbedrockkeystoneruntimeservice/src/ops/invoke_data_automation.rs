@@ -11,6 +11,16 @@
 //! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
 //! so leaving it on an implemented operation under-reports progress.
 //!
+//! The marker STAYS here, and deliberately: this operation's success response is the
+//! extraction itself (`semanticModality` and the `outputSegments` read out of the
+//! submitted asset), which is model inference the emulator cannot perform and must not
+//! synthesise. What IS enforced is the one thing that does not need inference — the
+//! cross-member request rule this service shares with `InvokeDataAutomationAsync`: a
+//! submission must name EXACTLY one of a data-automation project or an inline blueprint,
+//! and one naming neither or both is refused with the modelled `ValidationException`
+//! (HTTP 400) rather than the 501, because a malformed request is a client error, not
+//! unwritten code.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -160,17 +170,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `InvokeDataAutomation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(InvokeDataAutomationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
+        // request metadata. Neither is needed to refuse a malformed submission.
+        let _ = (ctx, &self.engine);
+
+        // A submission has to say WHAT to extract, in exactly one of two members: a
+        // data-automation project or an inline `blueprints` list. The model marks both
+        // optional and expresses no "exactly one of", so the rule is enforced here with
+        // this operation's own modelled `ValidationException` (HTTP 400). A bad request
+        // is NOT a 501: that answer would say "nobody has written this yet" about a
+        // request no implementation could ever accept. See
+        // `crate::state::extraction_target_refusal`, which the asynchronous
+        // `InvokeDataAutomationAsync` calls too.
+        if let Some(message) = crate::state::extraction_target_refusal(
+            input.data_automation_configuration.as_ref(),
+            input.blueprints.as_deref(),
+        ) {
+            return Err(InvokeDataAutomationErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(message.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // A well-formed SYNCHRONOUS invocation is still a 501, which is why the
+        // SCAFFOLDED marker at the top of this file stays. Its response is the
+        // extraction itself — `semanticModality` plus the `outputSegments` read out of
+        // the submitted asset — which is model inference this emulator cannot perform
+        // and must not synthesise: a fabricated modality or segment list would be
+        // indistinguishable from a real answer. The asynchronous
+        // `InvokeDataAutomationAsync` is implemented because its response is the job
+        // record, which is control-plane state this crate does own.
         Err(crate::scaffolded::Scaffolded::not_implemented("InvokeDataAutomation"))
     }
 }

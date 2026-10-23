@@ -28,9 +28,11 @@
 //!   the segment after the LAST dot of the target rather than after the first.
 //! - `override_refusal` — how this service words a request the framework refused
 //!   before any handler ran. The default returns `None`, keeping the framework's
-//!   wording. THIS service rewords ONE class: a tag key or value outside its modelled
-//!   length, which CloudTrail answers as `InvalidTagParameterException` rather than as
-//!   a generic `ValidationException`. See the inline note on that method.
+//!   wording. THIS service rewords three classes: a tag key or value outside its
+//!   modelled length, which CloudTrail answers as `InvalidTagParameterException`; a
+//!   value inside an event selector outside its modelled constraint, which the model
+//!   declares `InvalidEventSelectorsException` for; and a violated `@pattern`, whose
+//!   recorded clause carries no value. See the inline notes on that method.
 //! - `override_routing_error` — how this service words a request that reached it
 //!   but named no modeled operation. The default returns `None`, so the entry
 //!   renders the protocol-correct default (query -> 400 InvalidAction, awsJson ->
@@ -184,6 +186,61 @@ fn invalid_tag_parameter(violations: &[Violation]) -> Option<Refused> {
     })
 }
 
+/// Which event-selector member a constraint-violation path walks into, or `None` for a
+/// path that walks into neither.
+///
+/// The validating walk spells a path in lowerCamel, with a `<1-based-index>.member`
+/// step from a list into one of its elements, so an out-of-set `ReadWriteType` on the
+/// first basic selector of a `PutEventSelectors` request is
+/// `eventSelectors.1.member.readWriteType`. `EventSelectors` and
+/// `AdvancedEventSelectors` are the two members that carry a trail's event selectors,
+/// and every operation the model binds them on declares
+/// `InvalidEventSelectorsException`.
+fn event_selector_member(path: &str) -> Option<&'static str> {
+    match path.split('.').next()? {
+        "eventSelectors" => Some("EventSelectors"),
+        "advancedEventSelectors" => Some("AdvancedEventSelectors"),
+        _ => None,
+    }
+}
+
+/// The refusal a value inside an event selector that is outside its modelled
+/// constraint is answered with, if `violations` carries one.
+///
+/// CloudTrail does not answer such a value with the framework's generic
+/// `ValidationException`: the model's own `InvalidEventSelectorsException` doc names
+/// this case as one of its own — "Specify a valid value for a parameter. For example,
+/// specifying the `ReadWriteType` parameter with a value of `read-only` is not valid."
+/// — and `ValidationException` is not an error any operation carrying those members
+/// declares, so a client catching the modelled error would miss this refusal
+/// altogether. The rule holds for every value inside either selector member, not only
+/// `ReadWriteType`, and for every operation that carries them (`PutEventSelectors`,
+/// `UpdateTrail`, `CreateEventDataStore`, `UpdateEventDataStore`), each of which
+/// declares that error.
+///
+/// The message is built from the request: it names the member path the value sat at
+/// and the constraint it broke, which for an enumerated member is the value set the
+/// model declares.
+fn invalid_event_selectors(violations: &[Violation]) -> Option<Refused> {
+    violations.iter().find_map(|violation| {
+        let member = event_selector_member(&violation.path)?;
+        let message = match &violation.kind {
+            ViolationKind::EnumValue(allowed) => format!(
+                "Specify a valid value for {member} at '{}': the valid values are {}.",
+                violation.path,
+                allowed.join(", ")
+            ),
+            // Every other class keeps the framework's own sentence, which already
+            // names the member and the bound it broke; only the error code changes.
+            _ => clause(violation),
+        };
+        Some(Refused {
+            code: "InvalidEventSelectorsException".to_string(),
+            message,
+        })
+    })
+}
+
 /// The `com-amazonaws-cloudtrail-cloudtrail-20131101` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -267,23 +324,29 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
         // required member, or a value outside a declared bound) to let this service
-        // reword it. Two classes are reworded, each from a recorded answer, and in
-        // this order because a request can break both:
+        // reword it. Three classes are reworded, each from the model or a recorded
+        // answer, and in this order because a request can break several:
         //
         // * a tag key or value outside its modelled length is
         //   `InvalidTagParameterException`, not a `ValidationException`
         //   ([`invalid_tag_parameter`]);
+        // * a value inside `EventSelectors` / `AdvancedEventSelectors` outside its
+        //   modelled constraint is `InvalidEventSelectorsException`, the error the
+        //   model declares for exactly that case ([`invalid_event_selectors`]);
         // * a violated `@pattern` is a `ValidationException` whose clause names the
         //   member and the pattern WITHOUT the value that broke it
         //   ([`pattern_envelope`]). The code stays the one the framework would have
         //   answered — a client branches on the code, so only the wording changes.
         //
         // Every other refusal, authentication included, keeps the framework's wording
-        // because both readers decline it.
+        // because every reader declines it.
         let Refusal::Invalid(violations) = refusal else {
             return None;
         };
         if let Some(refused) = invalid_tag_parameter(violations) {
+            return Some(refused);
+        }
+        if let Some(refused) = invalid_event_selectors(violations) {
             return Some(refused);
         }
         Some(Refused {

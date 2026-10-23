@@ -451,10 +451,10 @@ pub fn unknown_trail_message(identifier: &str) -> String {
 /// Check a bare trail name against the rules the model documents for
 /// `CreateTrailRequest$Name`:
 ///
-/// * only ASCII letters, digits, periods, underscores or dashes,
-/// * starts and ends with a letter or digit,
 /// * between [`TRAIL_NAME_MIN_LEN`] and [`TRAIL_NAME_MAX_LEN`] characters,
+/// * starts and ends with a letter or digit,
 /// * no two adjacent periods, underscores or dashes,
+/// * only ASCII letters, digits, periods, underscores or dashes,
 /// * not in IP-address format.
 ///
 /// A refusal names the ONE rule the name broke — and, where that rule is a length
@@ -462,6 +462,15 @@ pub fn unknown_trail_message(identifier: &str) -> String {
 /// the caller can fix the name from the refusal alone. The rules are checked in the
 /// order they are listed above, so a name that breaks several is refused for the
 /// first.
+///
+/// That order is the order the real service applies them in, not an arbitrary one:
+/// a name whose last character is neither a letter nor a digit is refused for the
+/// terminal-character rule even when that character is also outside the charset
+/// (recorded: `bad name!` answers "Trail name must end with a letter or number.",
+/// not the charset sentence), and a name shorter than the minimum is refused for
+/// its length whatever else it breaks. So the charset rule — which every
+/// ill-formed name also breaks — is checked LAST of the character rules, and only
+/// a name that satisfies the edge and adjacency rules can be refused for it.
 pub fn validate_trail_name(name: &str) -> Result<(), IdentifierRejection> {
     let reject = |message: String| Err(IdentifierRejection::InvalidName(message));
 
@@ -477,16 +486,6 @@ pub fn validate_trail_name(name: &str) -> Result<(), IdentifierRejection> {
             "Trail name too long. Maximum allowed length: {TRAIL_NAME_MAX_LEN} characters. \
              Specified name length: {length} characters."
         ));
-    }
-    if !name
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || TRAIL_NAME_PUNCTUATION.contains(&c))
-    {
-        return reject(
-            "Trail name or ARN can only contain ASCII letters (a-z, A-Z), numbers (0-9), \
-             periods (.), underscores (_), or dashes (-)."
-                .to_string(),
-        );
     }
     // The two edges are separate rules, so a refusal names the edge that broke.
     if name
@@ -512,6 +511,16 @@ pub fn validate_trail_name(name: &str) -> Result<(), IdentifierRejection> {
         return reject(
             "Trail name or ARN cannot have adjacent periods (.), hyphens (-), or \
              underscores (_)."
+                .to_string(),
+        );
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || TRAIL_NAME_PUNCTUATION.contains(&c))
+    {
+        return reject(
+            "Trail name or ARN can only contain ASCII letters (a-z, A-Z), numbers (0-9), \
+             periods (.), underscores (_), or dashes (-)."
                 .to_string(),
         );
     }
@@ -583,14 +592,57 @@ fn parse_trail_arn(value: &str) -> Result<TrailIdentifier, IdentifierRejection> 
 /// `ops::describe_query`.
 pub const TRAIL_NOT_FOUND_STATUS: u16 = 400;
 
-/// The refusal text that names the trail by its ARN — what `GetTrailStatus`,
-/// `DeleteTrail`, `StartLogging`, `StopLogging` and `UpdateTrail` answer with, each
-/// of which addresses exactly one Region's trail, so a caller who passed a bare name
-/// is told which Region's trail was looked for. `GetTrail`'s recorded refusal carries
-/// the identifier as the request sent it instead ([`unknown_trail_message`]).
+/// The refusal text that names the trail by the ARN the identifier RESOLVED to —
+/// the subject every trail operation's `TrailNotFoundException` carries unless its
+/// own recorded refusal echoes the caller's identifier instead.
+///
+/// A caller who passed a bare name is told which Region's trail was looked for,
+/// which is what the recorded refusals of `GetTrailStatus`, `DeleteTrail`,
+/// `StartLogging`, `StopLogging`, `UpdateTrail` and `PutEventSelectors` carry. The
+/// three exceptions, each pinned by its own recording, echo the identifier as the
+/// request sent it ([`unknown_trail_message`]): `GetTrail`, `GetInsightSelectors`
+/// and the tag writes.
 pub fn trail_not_found_arn_message(region: &str, name: &str) -> String {
     unknown_trail_message(&trail_arn(region, name))
 }
+
+/// The refusal text for `TrailAlreadyExistsException`: `CreateTrail`'s duplicate-name
+/// refusal, which names the trail the request asked for and the account that already
+/// holds one of that name.
+///
+/// Request-derived (the `Name` the caller sent) plus the caller's account, the way
+/// the recorded response words it — the Region is NOT in it, even though a trail name
+/// is scoped to one Region, because "for customer: <account>" is the subject the
+/// service states.
+pub fn trail_already_exists_message(name: &str) -> String {
+    format!(
+        "Trail {name} already exists for customer: {}",
+        ::engine::emulator_account_id()
+    )
+}
+
+/// The refusal text for `InsightNotEnabledException`, shared by every operation that
+/// reports or reads Insights events on a resource that has none enabled
+/// (`GetInsightSelectors` and the Insights data operations).
+///
+/// Request-derived (the ARN of the resource the call addressed) plus the fixed tail
+/// the recorded response carries, which tells the caller what to change. `kind` is the
+/// noun the subject opens with: `Trail` for a trail, which is the form the recorded
+/// refusal carries, and [`EVENT_DATA_STORE_SUBJECT`] for an event data store, whose
+/// own wording no recording pins — so it states the same rule about the resource it
+/// was actually given.
+pub fn insight_not_enabled_message(kind: &str, resource_arn: &str) -> String {
+    format!(
+        "{kind} {resource_arn} does not have Insights enabled. Edit the trail settings to \
+         enable Insights, and then try the operation again."
+    )
+}
+
+/// The subject noun of a refusal about a trail: `Trail <arn>`.
+pub const TRAIL_SUBJECT: &str = "Trail";
+
+/// The subject noun of a refusal about an event data store.
+pub const EVENT_DATA_STORE_SUBJECT: &str = "Event data store";
 
 /// Render an instant the way the modelled string timestamp members carry it
 /// (ISO 8601, e.g. `2026-10-21T21:38:12Z`).
@@ -1467,6 +1519,28 @@ pub struct ComAmazonawsCloudtrailCloudtrail20131101State {
     pub resource_policies: BTreeMap<String, String>,
 }
 
+/// What a reporting operation found for the identifier it was given: the registry
+/// key the identifier addressed, and the trail stored under it, if any.
+#[derive(Debug)]
+pub struct AddressedTrail<'a> {
+    /// The name and Region the identifier addressed — the ARN's own Region for a
+    /// trail ARN, the request's Region for a bare name.
+    pub key: TrailKey,
+    /// The trail stored under [`Self::key`]; `None` is a well-formed identifier
+    /// naming no trail, which is `TrailNotFoundException`.
+    pub record: Option<&'a TrailRecord>,
+}
+
+impl AddressedTrail<'_> {
+    /// The refusal text for an identifier that names no trail: the ARN the
+    /// identifier resolved to, plus the account the lookup ran in
+    /// ([`trail_not_found_arn_message`]).
+    pub fn not_found_message(&self) -> String {
+        let (name, region) = &self.key;
+        trail_not_found_arn_message(region, name)
+    }
+}
+
 /// What a mutating operation found for the identifier it was given.
 ///
 /// The three failing variants are what keeps `TrailNotFoundException` (no such
@@ -1516,6 +1590,23 @@ impl ComAmazonawsCloudtrailCloudtrail20131101State {
     ) -> Result<Option<&TrailRecord>, IdentifierRejection> {
         let key = self.addressed_key(identifier, request_region)?;
         Ok(self.trails.get(&key))
+    }
+
+    /// Resolve a caller-supplied identifier the way [`Self::resolve`] does, keeping
+    /// the key it ADDRESSED beside the trail stored under it.
+    ///
+    /// A reporting operation whose not-found refusal names the trail by its resolved
+    /// ARN needs both: the record when there is one, and the ARN the identifier
+    /// resolved to when there is not
+    /// ([`AddressedTrail::not_found_message`]).
+    pub fn resolve_addressed(
+        &self,
+        identifier: &str,
+        request_region: &str,
+    ) -> Result<AddressedTrail<'_>, IdentifierRejection> {
+        let key = self.addressed_key(identifier, request_region)?;
+        let record = self.trails.get(&key);
+        Ok(AddressedTrail { key, record })
     }
 
     /// Every Region holding a trail of this name, in Region order.

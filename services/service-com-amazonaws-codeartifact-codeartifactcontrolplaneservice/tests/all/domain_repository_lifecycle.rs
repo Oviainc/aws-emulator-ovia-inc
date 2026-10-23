@@ -14,9 +14,11 @@
 //!    the upstream order and `createdTime`.
 //! 2. A resource identifier is unique within its container: a second create of a name
 //!    already held is `ConflictException` (409), and addressing a name not held is
-//!    `ResourceNotFoundException` (404).
-//! 3. A delete removes the resource, answers with it as it was just before removal, and
-//!    is observable to the very next call.
+//!    `ResourceNotFoundException` (404) — except on a DELETE, whose goal is that the name
+//!    not be held: that answers 200 and reports no removed resource.
+//! 3. A delete removes the resource, answers with the record it removed (the domain's
+//!    carrying the terminal `Deleted` status it reached by the call), and is observable to
+//!    the very next call.
 //! 4. A `@paginated` list returns every matching resource exactly once in key order,
 //!    across any page size, and omits `nextToken` on the last page.
 //! 5. A domain's `repositoryCount` is the number of repositories it holds, at every point
@@ -485,9 +487,13 @@ async fn create_read_and_delete_round_trip_through_stored_state() {
             "case {label:?}: expected DeleteDomain 200, got {removed:?}"
         );
         assert_eq!(
-            removed.body["domain"]["name"].as_str(),
-            Some(domain),
-            "case {label:?}: DeleteDomain must answer with the removed domain, got {:?}",
+            (
+                removed.body["domain"]["name"].as_str(),
+                removed.body["domain"]["status"].as_str()
+            ),
+            (Some(domain), Some("Deleted")),
+            "case {label:?}: DeleteDomain must answer with the removed domain at the terminal \
+             status, got {:?}",
             removed.body
         );
         let gone = describe_domain(&router, domain).await;
@@ -552,10 +558,6 @@ async fn duplicate_names_conflict_and_unknown_names_are_not_found() {
             describe_domain(&router, "no-such-domain").await,
         ),
         (
-            "DeleteDomain for an unknown domain",
-            delete_domain(&router, "no-such-domain").await,
-        ),
-        (
             "CreateRepository in an unknown domain",
             create_repository(&router, "no-such-domain", "r1", None, &[]).await,
         ),
@@ -566,10 +568,6 @@ async fn duplicate_names_conflict_and_unknown_names_are_not_found() {
         (
             "DescribeRepository for an unknown repository",
             describe_repository(&router, "held", "no-such-repo").await,
-        ),
-        (
-            "DeleteRepository for an unknown repository",
-            delete_repository(&router, "held", "no-such-repo").await,
         ),
         (
             "DeleteRepository in an unknown domain",
@@ -599,6 +597,31 @@ async fn duplicate_names_conflict_and_unknown_names_are_not_found() {
             (answer.status, answer.code()),
             (404, "ResourceNotFoundException".to_string()),
             "case {label:?}: expected 404 ResourceNotFoundException, got {answer:?}"
+        );
+    }
+
+    // A DELETE is the exception: the absence of the resource it names is what it is for, so
+    // addressing one that is not held succeeds and reports no removed resource. The
+    // enclosing domain is still a scope that has to resolve, which is the
+    // "DeleteRepository in an unknown domain" row above.
+    let idempotent = vec![
+        (
+            "DeleteDomain for an unknown domain",
+            "domain",
+            delete_domain(&router, "no-such-domain").await,
+        ),
+        (
+            "DeleteRepository for an unknown repository",
+            "repository",
+            delete_repository(&router, "held", "no-such-repo").await,
+        ),
+    ];
+    for (label, member, answer) in idempotent {
+        assert_eq!(
+            (answer.status, answer.body.clone()),
+            (200, json!({})),
+            "case {label:?}: deleting what is not held must succeed with no {member:?}, got \
+             {answer:?}"
         );
     }
 

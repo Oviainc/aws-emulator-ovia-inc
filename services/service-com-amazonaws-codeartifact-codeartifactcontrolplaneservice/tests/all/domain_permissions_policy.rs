@@ -27,7 +27,8 @@
 //!    with `ValidationException` (400) and nothing is stored.
 //! 5. Deleting the policy answers with it as it was immediately before removal, is
 //!    observable to the very next call, and is locked by `policyRevision` the same way a
-//!    write is.
+//!    write is. A domain that holds NO policy has the delete's goal already met: that
+//!    answers 200 with the bare `ResourcePolicy` envelope naming the domain.
 
 use serde_json::json;
 use smithy_server_runtime::MultiServiceRouter;
@@ -497,7 +498,7 @@ async fn a_document_that_is_not_a_json_object_is_refused() {
 }
 
 /// RULE 5: the delete is locked by `policyRevision` exactly as a write is, and a domain
-/// that holds no policy has nothing to delete.
+/// that holds no policy has the delete's goal already met.
 #[tokio::test]
 async fn deleting_the_policy_is_locked_by_its_revision() {
     let (router, engine) = emulator_with_engine();
@@ -510,22 +511,27 @@ async fn deleting_the_policy_is_locked_by_its_revision() {
             created.status, 200,
             "case {domain:?}: expected CreateDomain 200, got {created:?}"
         );
+        let arn = format!("arn:aws:codeartifact:{REGION}:{ACCOUNT}:domain/{domain}");
 
-        // Nothing attached: there is no policy resource to delete, with or without a
-        // revision.
-        for revision in [None, Some("1")] {
-            let nothing = delete_domain_policy(&router, domain, None, revision).await;
-            assert_eq!(
-                (nothing.status, nothing.code(), nothing.body["message"].as_str()),
-                (
-                    404,
-                    "ResourceNotFoundException".to_string(),
-                    Some(format!("No policy found for (domain): ({domain})").as_str())
-                ),
-                "case {domain:?}/{revision:?}: deleting an unset policy must be not found, got \
-                 {nothing:?}"
-            );
-        }
+        // Nothing attached, and the caller locks nothing: the delete has nothing to remove,
+        // which is success carrying only the envelope that names the domain it targeted.
+        let nothing = delete_domain_policy(&router, domain, None, None).await;
+        assert_eq!(
+            (nothing.status, nothing.body.clone()),
+            (200, json!({ "policy": { "resourceArn": arn } })),
+            "case {domain:?}: deleting an unset policy must answer the bare envelope, got \
+             {nothing:?}"
+        );
+
+        // ...but a caller that NAMES a revision is locking against the policy it read, and
+        // a domain holding none carries no revision for it to match.
+        let locked = delete_domain_policy(&router, domain, None, Some("1")).await;
+        assert_eq!(
+            (locked.status, locked.code()),
+            (409, "ConflictException".to_string()),
+            "case {domain:?}: a revision named with no policy attached must conflict, got \
+             {locked:?}"
+        );
 
         let written = put_domain_policy(&router, domain, None, document, None).await;
         let revision = revision_of(&written).expect("the write mints a revision");
@@ -563,12 +569,13 @@ async fn deleting_the_policy_is_locked_by_its_revision() {
             stored_policy(&engine, domain)
         );
 
-        // ...and deleting again finds nothing, so the delete is not reported twice.
+        // ...and deleting again removes nothing, so the removed policy is not reported
+        // twice: the second delete answers the bare envelope.
         let again = delete_domain_policy(&router, domain, None, None).await;
         assert_eq!(
-            (again.status, again.code()),
-            (404, "ResourceNotFoundException".to_string()),
-            "case {domain:?}: a second delete must find nothing, got {again:?}"
+            (again.status, again.body.clone()),
+            (200, nothing.body.clone()),
+            "case {domain:?}: a second delete must answer the bare envelope, got {again:?}"
         );
     }
 

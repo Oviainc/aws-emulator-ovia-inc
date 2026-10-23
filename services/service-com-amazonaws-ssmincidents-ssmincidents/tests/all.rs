@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/incident_lifecycle.rs"]
 mod incident_lifecycle;
+#[path = "all/replication_set.rs"]
+mod replication_set;
 #[path = "all/replication_set_lifecycle.rs"]
 mod replication_set_lifecycle;
 #[path = "all/replication_set_listing.rs"]

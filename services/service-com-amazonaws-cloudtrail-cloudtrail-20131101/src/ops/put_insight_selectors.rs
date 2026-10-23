@@ -515,14 +515,15 @@ fn configure_trail(
             )
             .into())
         }
-        crate::state::TrailForMutation::Absent { .. } => {
+        crate::state::TrailForMutation::Absent { name } => {
             // The model says 404 for a not-found trail; CloudTrail answers 400
-            // (`crate::state::TRAIL_NOT_FOUND_STATUS`). No recording pins this
-            // operation's wording, so it carries the shared text: the identifier as
-            // the request sent it, plus the account the lookup ran in.
+            // (`crate::state::TRAIL_NOT_FOUND_STATUS`). The refusal names the trail by
+            // the ARN the identifier resolved to, the subject every trail operation's
+            // not-found refusal carries except the three whose own recordings echo the
+            // caller's identifier (`crate::state::trail_not_found_arn_message`).
             return Err(crate::scaffolded::Scaffolded::modeled_with_status(
                 PutInsightSelectorsErrorModeled::TrailNotFoundException(TrailNotFoundException {
-                    message: Some(crate::state::unknown_trail_message(identifier)),
+                    message: Some(crate::state::trail_not_found_arn_message(region, &name)),
                 }),
                 crate::state::TRAIL_NOT_FOUND_STATUS,
             ))

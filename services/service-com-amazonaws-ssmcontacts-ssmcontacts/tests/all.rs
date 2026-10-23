@@ -15,10 +15,16 @@
 mod contact_lifecycle;
 #[path = "all/contact_updates.rs"]
 mod contact_updates;
+#[path = "all/cross_service_onboarding.rs"]
+mod cross_service_onboarding;
 #[path = "all/data_plane_precondition.rs"]
 mod data_plane_precondition;
 #[path = "all/engagement_lifecycle.rs"]
 mod engagement_lifecycle;
+#[path = "all/onboarding.rs"]
+mod onboarding;
+#[path = "all/replication_set_precondition.rs"]
+mod replication_set_precondition;
 #[path = "all/rotation_reads.rs"]
 mod rotation_reads;
 #[path = "all/start_engagement.rs"]

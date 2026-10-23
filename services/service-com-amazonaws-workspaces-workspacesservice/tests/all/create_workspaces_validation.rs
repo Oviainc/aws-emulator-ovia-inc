@@ -26,15 +26,22 @@
 //! so no echo can carry it. `WorkspaceProperties` carries `RunningMode`,
 //! `RunningModeAutoStopTimeoutInMinutes`, `RootVolumeSizeGib`, `UserVolumeSizeGib`,
 //! `ComputeTypeName`, `Protocols`, `OperatingSystemName`, `GlobalAccelerator` and
-//! `NestedVirtualizationEnabled` — and the cases below stay inside that set. The one
-//! member not echoed exactly as submitted is `Tags`: a recorded AWS echo carries the list
-//! even for a request that sent none, so an absent `Tags` comes back as `[]`.
+//! `NestedVirtualizationEnabled` — and the cases below stay inside that set. Two members
+//! are not echoed exactly as submitted:
+//!
+//! * `Tags`: a recorded AWS echo carries the list even for a request that sent none, so
+//!   an absent `Tags` comes back as `[]`;
+//! * `WorkspaceProperties`: the echo carries the EFFECTIVE property set, so a property
+//!   the service resolved for the caller (an omitted `RunningMode`) is echoed with the
+//!   value the WorkSpace would have been created with. That rule is asserted over its own
+//!   table in `create_workspaces_effective_properties`; here it only shapes what the echo
+//!   of each case must be.
 
 use std::sync::Arc;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_workspaces_workspacesservice::state::{
-    service_state, DirectoryRegistrationState,
+    service_state, DirectoryRegistrationState, DEFAULT_RUNNING_MODE,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -56,7 +63,9 @@ enum Expected {
 /// The bundles a create may name are the ones the STORE holds, so the cases take their
 /// bundle ids from the operation a client would list them with rather than from a
 /// hand-written list.
-async fn amazon_bundle_ids(router: &MultiServiceRouter) -> Vec<String> {
+/// `pub(crate)` because `tests/all.rs` compiles every suite into ONE test crate, so the
+/// suites beside this one list the catalog through it rather than copying the call.
+pub(crate) async fn amazon_bundle_ids(router: &MultiServiceRouter) -> Vec<String> {
     let filters = json!({ "Owner": "AMAZON" });
     let (status, body) = call(router, "DescribeWorkspaceBundles", &filters).await;
     assert_eq!(
@@ -86,6 +95,16 @@ fn expected_echo(submitted: &Value) -> Value {
     if echo.get("Tags").is_none() {
         echo["Tags"] = json!([]);
     }
+    // The effective property set: the submitted properties with the service's default
+    // `RunningMode` filled in. See `create_workspaces_effective_properties`.
+    let mut properties = echo
+        .get("WorkspaceProperties")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    if properties.get("RunningMode").is_none() {
+        properties["RunningMode"] = json!(DEFAULT_RUNNING_MODE);
+    }
+    echo["WorkspaceProperties"] = properties;
     echo
 }
 
@@ -180,7 +199,9 @@ async fn every_batch_element_is_judged_on_its_own_against_persisted_state() {
     // rows differ along what the rule generalises over: which resource is unresolvable
     // (directory, bundle, both), the id form, the optional members carried (tags,
     // `WorkspaceProperties`, `WorkspaceName`), and the per-element refusals that need no
-    // resource lookup at all.
+    // resource lookup at all. (The effective-property rule the echoed
+    // `WorkspaceProperties` follows has its own suite:
+    // `create_workspaces_effective_properties`.)
     let cases: Vec<(Value, Expected)> = vec![
         (
             json!({
@@ -223,8 +244,9 @@ async fn every_batch_element_is_judged_on_its_own_against_persisted_state() {
             Expected::Refused("ResourceNotFound.Bundle"),
         ),
         (
-            // Neither resolves: the directory is the resource reported, because it is
-            // the one a WorkSpace lives in.
+            // Neither resolves: the entry has two failures to report and one
+            // `ErrorCode`, so it reports the first of them in the model's own member
+            // order (`WorkspaceRequest` declares `DirectoryId` before `BundleId`).
             json!({
                 "DirectoryId": "wsd-unregistered1",
                 "UserName": "dan",

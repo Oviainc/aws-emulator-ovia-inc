@@ -35,5 +35,7 @@ mod resource_tags;
 mod signing_name_routing;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/update_function_configuration.rs"]
+mod update_function_configuration;
 #[path = "all/version_publishing.rs"]
 mod version_publishing;

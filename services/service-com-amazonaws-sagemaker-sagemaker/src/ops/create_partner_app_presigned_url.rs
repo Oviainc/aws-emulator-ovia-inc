@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreatePartnerAppPresignedUrl
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreatePartnerAppPresignedUrl`'s real behaviour. Implement it here — this is
+//! IMPLEMENTED: resolves the partner app the `Arn` names in `crate::state`, refuses an
+//! app that does not exist with the modelled `ResourceNotFound`, records the grant the
+//! URL carries on that app, and answers the app's own base URL with that grant. This is
 //! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreatePartnerAppPresignedUrl::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -142,18 +137,74 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreatePartnerAppPresignedUrl` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreatePartnerAppPresignedUrlErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreatePartnerAppPresignedUrl"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        // The spans a request that names neither carries, which live beside the
+        // `PartnerApp` record they govern in `crate::state`.
+        let expires_in = input
+            .expires_in_seconds
+            .unwrap_or(crate::state::DEFAULT_PRESIGNED_URL_EXPIRES_IN_SECONDS);
+        let session_duration = input
+            .session_expiration_duration_in_seconds
+            .unwrap_or(crate::state::DEFAULT_PRESIGNED_URL_SESSION_SECONDS);
+        let now = ::std::time::SystemTime::now();
+
+        let mut store = state.lock();
+        let Some(app) = store.partner_app_by_arn_mut(&input.arn) else {
+            // The app is this call's subject, so an ARN this account holds no app for is
+            // the modelled `ResourceNotFound`, and no URL is minted.
+            return Err(CreatePartnerAppPresignedUrlErrorModeled::ResourceNotFound(
+                ResourceNotFound {
+                    message: Some(format!("Partner app {} does not exist.", input.arn)),
+                },
+            )
+            .into());
+        };
+        // An app that is still being created, or has failed, serves nothing: a URL to it
+        // would be a link to nowhere. The `Creating` -> `Available` transition the clock
+        // already owes is materialised first, since it was due at this instant whether or
+        // not anybody called. The model gives this operation no error for an app that is
+        // not reachable, so it is a 400 `ValidationException`.
+        app.settle_status(now);
+        if app.status != crate::state::PARTNER_APP_STATUS_AVAILABLE {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "Partner app {} is {} and cannot be accessed; it must be {}.",
+                app.arn,
+                app.status,
+                crate::state::PARTNER_APP_STATUS_AVAILABLE
+            )));
+        }
+
+        let grant = crate::state::PresignedUrlGrant {
+            token: crate::state::mint_grant_token(),
+            issued_at: now,
+            expires_at: now
+                + ::std::time::Duration::from_secs(u64::try_from(expires_in).unwrap_or_default()),
+            session_expires_at: now
+                + ::std::time::Duration::from_secs(
+                    u64::try_from(session_duration).unwrap_or_default(),
+                ),
+        };
+        // An expiry the clock already made due releases its grant: the record is gone
+        // once the session it opened could no longer be in use.
+        app.grants
+            .retain(|held| held.session_expires_at > now);
+        app.grants.push(grant.clone());
+        if app.grants.len() > crate::state::GRANT_HISTORY_CAP {
+            let overflow = app.grants.len() - crate::state::GRANT_HISTORY_CAP;
+            app.grants.drain(..overflow);
+        }
+
+        let url = format!(
+            "{}/auth?authToken={}&expiresInSeconds={expires_in}",
+            app.base_url.trim_end_matches('/'),
+            grant.token
+        );
+        let arn = app.arn.clone();
+        drop(store);
+
+        crate::state::record_state_change(Self::NAME, &arn, ctx);
+        Ok(CreatePartnerAppPresignedUrlOutput { url: Some(url) })
     }
 }

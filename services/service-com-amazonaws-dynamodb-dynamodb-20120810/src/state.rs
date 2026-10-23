@@ -2089,6 +2089,29 @@ impl ComAmazonawsDynamodbDynamodb20120810State {
             .ok_or_else(|| not_found(name))
     }
 
+    /// The table an ARN-ADDRESSED operation names.
+    ///
+    /// The same lookup as [`Self::table`] with a different REFUSAL: the caller
+    /// addressed this resource by its `ResourceArn`, so a miss is reported against
+    /// that member and echoes the value sent ([`resource_arn_not_found`]) rather than
+    /// a table name derived from it, which no member of the request carries.
+    pub fn table_by_arn(&self, resource: &TaggedResource) -> Result<&Table, RequestError> {
+        self.tables_in(&resource.region)
+            .and_then(|tables| tables.get(&resource.table))
+            .ok_or_else(|| resource_arn_not_found(&resource.arn))
+    }
+
+    /// The same, mutably, for the ARN-addressed operations that change a table.
+    pub fn table_by_arn_mut(
+        &mut self,
+        resource: &TaggedResource,
+    ) -> Result<&mut Table, RequestError> {
+        self.regions
+            .get_mut(&resource.region)
+            .and_then(|tables| tables.get_mut(&resource.table))
+            .ok_or_else(|| resource_arn_not_found(&resource.arn))
+    }
+
     /// The table by that name in that region, which must be `ACTIVE`.
     ///
     /// An item operation on a table that is still `CREATING`, or already `DELETING`,
@@ -2220,6 +2243,45 @@ fn not_found(name: &str) -> RequestError {
     RequestError::NotFound(format!("Requested resource not found: Table: {name} not found"))
 }
 
+/// The `ResourceNotFoundException` message an ARN-ADDRESSED operation answers with.
+///
+/// The tagging surface and the resource-policy surface carry no `TableName`: the
+/// caller's whole selector is the `ResourceArn` member, so the refusal names THAT
+/// member and echoes the value the request carried — the same construction the
+/// name-addressed [`not_found`] above makes for `Table`, over the identifier that was
+/// actually sent. Nothing derived from the ARN (the table name inside it) appears,
+/// because no member of the request holds it.
+pub fn resource_arn_not_found(resource_arn: &str) -> RequestError {
+    RequestError::NotFound(format!(
+        "Requested resource not found: ResourceArn: {resource_arn} not found"
+    ))
+}
+
+/// The `ValidationException` message an ARN-ADDRESSED operation answers a
+/// `ResourceArn` it cannot address with: the fixed prefix DynamoDB's own ARN
+/// validator states, followed by the value the request carried.
+///
+/// This is an INPUT refusal, not a lookup miss: a value that is not an ARN this
+/// service can address names no resource whose existence could be checked.
+pub fn invalid_resource_arn(resource_arn: &str) -> RequestError {
+    RequestError::Validation(format!(
+        "Invalid TableArn: Invalid ResourceArn provided as input {resource_arn}"
+    ))
+}
+
+/// The `ValidationException` message for a request whose tag list repeats a key.
+///
+/// Built from the request: the fixed prefix, then the key found twice. A tag key
+/// identifies at most one tag on a resource ("Each DynamoDB table can only have up to
+/// one tag with the same key" — the `Tag$Key` doc), so a list that names one key twice
+/// asks for two tags that cannot both exist and is refused rather than silently
+/// resolved to one of its values.
+pub fn duplicate_tag_key(key: &str) -> RequestError {
+    RequestError::Validation(format!(
+        "Duplicate Tag Keys provided as input: Duplicate Tag Key found {key}"
+    ))
+}
+
 /// The `ResourceNotFoundException` message the DATA plane answers with.
 ///
 /// An item operation (`GetItem`, `PutItem`, `DeleteItem`, `Query`, …) against a
@@ -2344,33 +2406,46 @@ pub fn resolve_table_name(table_name: &str) -> Result<String, RequestError> {
     Ok(name.to_string())
 }
 
-/// The DynamoDB resource a tagging operation's `ResourceArn` names: the region it
-/// lives in and the table it is.
+/// The DynamoDB resource an ARN-addressed operation's `ResourceArn` names: the region
+/// it lives in, the table it is, and the ARN as the request spelled it.
 ///
-/// A tagging call carries no `TableName`, so the ARN is the caller's whole selector
-/// and it names the region too — which is the scope a table name resolves in.
+/// Such a call carries no `TableName`, so the ARN is the caller's whole selector — and
+/// it is also the only identifier the request holds, which is why it is kept here: a
+/// refusal about this resource echoes `arn`, never the `table` derived from it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaggedResource {
     pub region: String,
     pub table: String,
+    pub arn: String,
 }
 
-/// Resolve a tagging operation's `ResourceArn` to the table it names.
+/// Resolve an ARN-addressed operation's `ResourceArn` to the table it names, in the
+/// scope the request itself is made in.
 ///
-/// The one place an ARN is classified for the tagging surface, so `TagResource`,
-/// `UntagResource` and `ListTagsOfResource` share a single rule: the value must be an
-/// ARN of THIS service (`arn:<partition>:dynamodb:<region>:<account>:table/<name>`)
-/// naming a table and nothing deeper — a sub-resource ARN (`.../index/<i>`,
-/// `.../stream/<label>`) is not a resource this emulator keeps a tag set for, so it
-/// is refused rather than silently tagged as its table. A value that is not such an
-/// ARN is a bad request, not a missing resource.
-pub fn resolve_resource_arn(resource_arn: &str) -> Result<TaggedResource, RequestError> {
-    let invalid = || {
-        RequestError::Validation(format!(
-            "Invalid ResourceArn: {resource_arn} is not a DynamoDB table ARN of the form \
-             arn:<partition>:dynamodb:<region>:<account>:table/<name>"
-        ))
-    };
+/// The one place an ARN is classified for the tagging and resource-policy surfaces, so
+/// `TagResource`, `UntagResource`, `ListTagsOfResource` and the three `*ResourcePolicy`
+/// operations share a single rule, in two parts:
+///
+/// * SHAPE — the value must be an ARN of THIS service
+///   (`arn:<partition>:dynamodb:<region>:<account>:table/<name>`) naming a table and
+///   nothing deeper: a sub-resource ARN (`.../index/<i>`, `.../stream/<label>`) is not
+///   a resource this emulator keeps a tag set or a policy for, so it is refused rather
+///   than silently taken for its table;
+/// * SCOPE — the ARN must address a resource of the endpoint the request reached: the
+///   same partition, account and REGION this request is signed for, which is the one
+///   this service answers for. [`table_arn`] mints exactly that form for a table of
+///   this region, so the comparison against it is the whole scope check.
+///
+/// Either way the value names no resource whose existence could be looked up, so it is
+/// an INPUT failure ([`invalid_resource_arn`], 400 `ValidationException`) and not a
+/// missing resource — an out-of-scope ARN is not "absent here", it is unaddressable
+/// from here. Only a well-formed, in-scope ARN reaches the lookup, where a table that
+/// is not there is [`resource_arn_not_found`].
+pub fn resolve_resource_arn(
+    resource_arn: &str,
+    request_region: &str,
+) -> Result<TaggedResource, RequestError> {
+    let invalid = || invalid_resource_arn(resource_arn);
     // `arn`, partition, service, region, account, resource — the resource field is
     // the last one and may itself carry `/`, so the split stops at six.
     let fields: Vec<&str> = resource_arn.splitn(6, ':').collect();
@@ -2387,19 +2462,35 @@ pub fn resolve_resource_arn(resource_arn: &str) -> Result<TaggedResource, Reques
     if path.contains('/') {
         return Err(invalid());
     }
+    let table = resolve_table_name(path).map_err(|_| invalid())?;
+    // The scope half of the rule: anything but this endpoint's own ARN form for that
+    // table — another partition, another account, another region — is unaddressable
+    // here, whatever this store happens to hold.
+    if resource_arn != table_arn(request_region, &table) {
+        return Err(invalid());
+    }
     Ok(TaggedResource {
-        region: region.to_string(),
-        table: resolve_table_name(path).map_err(|_| invalid())?,
+        region: request_region.to_string(),
+        table,
+        arn: resource_arn.to_string(),
     })
 }
 
-/// Fold a request's `TagList` into the stored [`TagSet`].
+/// Fold a request's `TagList` into the stored [`TagSet`], refusing a list AWS does not
+/// accept.
 ///
-/// A key repeated inside one request keeps its LAST value, by the same rule that
-/// makes a second `TagResource` overwrite the first: "If you try to add an existing
-/// tag (same key), the existing tag value will be updated to the new value"
-/// (`Tag$Key`). A key in the reserved `aws:` namespace is refused — the user "cannot
-/// assign" it — so no stored key is ever one AWS alone mints.
+/// The one place a request's tag list becomes a set, so every operation that takes one
+/// (`CreateTable$Tags`, `TagResource$Tags`) enforces the same two rules:
+///
+/// * a tag KEY may appear at most once in one request — "Each DynamoDB table can only
+///   have up to one tag with the same key" (`Tag$Key`), so a list repeating a key asks
+///   for two tags that cannot both exist, and is refused ([`duplicate_tag_key`])
+///   instead of collapsing to whichever value happens to win;
+/// * a key in the reserved `aws:` namespace is refused — the user "cannot assign" it —
+///   so no stored key is ever one AWS alone mints.
+///
+/// Keys are compared as sent: tag keys are case sensitive, so `Env` and `env` are two
+/// keys rather than one repeated.
 pub fn tag_set_from_request(tags: &[Tag]) -> Result<TagSet, RequestError> {
     let mut set = TagSet::new();
     for tag in tags {
@@ -2414,7 +2505,9 @@ pub fn tag_set_from_request(tags: &[Tag]) -> Result<TagSet, RequestError> {
                 tag.key
             )));
         }
-        set.insert(tag.key.clone(), tag.value.clone());
+        if set.insert(tag.key.clone(), tag.value.clone()).is_some() {
+            return Err(duplicate_tag_key(&tag.key));
+        }
     }
     Ok(set)
 }

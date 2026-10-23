@@ -69,6 +69,18 @@ pub fn is_terminal_status(status: &str) -> bool {
 /// past it is refused with the caller's modelled quota error rather than growing the
 /// store without bound.
 pub const MAX_PENDING_EXECUTIONS_PER_THING: usize = 1_000;
+/// How many COMMAND executions one device may have outstanding (non-terminal) at
+/// once: AWS IoT Device Management publishes a non-adjustable command-execution
+/// concurrency limit of 100 concurrent command executions per target device, so a
+/// start request for a device that already holds that many is REFUSED with the
+/// starting operation's modelled admission error instead of being enqueued.
+///
+/// It is the service's own published quota and is deliberately independent of
+/// [`MAX_PENDING_EXECUTIONS_PER_THING`], which is this emulator's memory bound on
+/// the job executions a thing holds whatever created them: a job execution is not a
+/// command execution and consumes none of the device's command-execution
+/// concurrency.
+pub const MAX_CONCURRENT_COMMAND_EXECUTIONS_PER_THING: usize = 100;
 /// How many FINISHED executions one thing keeps: the newest ones stay resolvable
 /// (so a reader can still tell "finished" from "never existed"), older ones are
 /// evicted as new executions are enqueued, so completed work does not accumulate for
@@ -173,6 +185,16 @@ pub struct JobExecutionRecord {
     /// names an S3 object), which this emulator does not fetch and therefore does
     /// not report.
     pub job_document: Option<String>,
+    /// The ARN of the COMMAND this execution runs, for an execution a command start
+    /// created (`iot-jobs-data`: `StartCommandExecution`); `None` for one a JOB
+    /// created (`iot`: `CreateJob`).
+    ///
+    /// It is what makes an execution countable against the target device's
+    /// published command-execution concurrency limit
+    /// ([`MAX_CONCURRENT_COMMAND_EXECUTIONS_PER_THING`], counted by
+    /// [`JobExecutionStore::concurrent_command_executions`]), which a job execution
+    /// does not consume.
+    pub command_arn: Option<String>,
 }
 
 impl JobExecutionRecord {
@@ -200,7 +222,15 @@ impl JobExecutionRecord {
             execution_timeout_expires_at: None,
             in_progress_timeout_minutes: None,
             job_document,
+            command_arn: None,
         }
+    }
+
+    /// True when this execution runs a COMMAND, i.e. it was created by a command
+    /// start and therefore occupies one of its device's command-execution
+    /// concurrency slots while it is pending.
+    pub fn is_command_execution(&self) -> bool {
+        self.command_arn.is_some()
     }
 
     /// True when the execution has reached a status it never leaves.
@@ -377,6 +407,11 @@ pub struct StartedCommand {
 /// [`MAX_STATUS_DETAIL_PAIRS`] / [`MAX_STATUS_DETAIL_NAME_LEN`] /
 /// [`MAX_STATUS_DETAIL_VALUE_LEN`]; and the client-token index holds at most
 /// [`MAX_REMEMBERED_CLIENT_TOKENS`] entries (oldest evicted first).
+///
+/// Separately from those memory bounds, the store reports the SERVICE's published
+/// per-device command-execution concurrency limit
+/// ([`Self::try_admit_command_execution`]), which a command start enforces before it
+/// mints anything.
 #[derive(Debug, Default)]
 pub struct JobExecutionStore {
     /// thing name -> that thing's job executions, in the order they were enqueued.
@@ -685,6 +720,46 @@ impl JobExecutionStore {
             .count()
     }
 
+    /// How many COMMAND executions `thing_name` currently holds in a non-terminal
+    /// status — the device's command-execution concurrency, as the published
+    /// per-device limit counts it ([`MAX_CONCURRENT_COMMAND_EXECUTIONS_PER_THING`]).
+    ///
+    /// Only command executions count: an execution a JOB created is not a command
+    /// execution. Only non-terminal ones count: an execution that has finished,
+    /// failed, been rejected or timed out has released its slot.
+    pub fn concurrent_command_executions(&self, thing_name: &str) -> usize {
+        self.executions_for(thing_name)
+            .iter()
+            .filter(|held| held.is_command_execution() && held.is_pending())
+            .count()
+    }
+
+    /// The admission decision for ONE more command execution on `thing_name`:
+    /// `Ok(())` while the device is under the published per-device concurrency
+    /// limit, and `Err` naming the limit it is already at, for the caller to report
+    /// as ITS modelled admission error. Nothing is enqueued either way — this is the
+    /// check a start makes BEFORE it mints a record.
+    ///
+    /// Timers that have already come due are materialised first
+    /// ([`Self::time_out_due_executions`]): an execution whose timeout has passed is
+    /// `TIMED_OUT`, hence terminal, hence no longer holding a slot — the move was
+    /// owed at its own deadline whether or not anybody called, so the device's
+    /// concurrency is read at the current instant rather than at the last call's.
+    pub fn try_admit_command_execution(
+        &mut self,
+        thing_name: &str,
+        now: i64,
+    ) -> Result<(), String> {
+        self.time_out_due_executions(thing_name, now);
+        let outstanding = self.concurrent_command_executions(thing_name);
+        if outstanding >= MAX_CONCURRENT_COMMAND_EXECUTIONS_PER_THING {
+            return Err(format!(
+                "the device already has {outstanding} command executions that have not reached a terminal status, the maximum of {MAX_CONCURRENT_COMMAND_EXECUTIONS_PER_THING} concurrent command executions per device"
+            ));
+        }
+        Ok(())
+    }
+
     /// Materialise the `TIMED_OUT` transition every one of `thing_name`'s executions
     /// has already come due for, and answer how many moved. See
     /// [`JobExecutionRecord::time_out_if_due`] for why a reporting handler may write
@@ -958,6 +1033,107 @@ mod tests {
                 .sum::<usize>(),
             "case past the bound: the byte count must follow the store, got {}",
             store.stored_document_bytes
+        );
+    }
+
+    /// Enqueue one COMMAND execution for `thing`, the way a command start does:
+    /// admitted against the device's concurrency limit, then stored carrying the
+    /// `commandArn` that makes it a command execution.
+    fn enqueue_command(store: &mut JobExecutionStore, thing: &str, id: &str, now: i64) {
+        store
+            .try_admit_command_execution(thing, now)
+            .unwrap_or_else(|limit| panic!("admitting {id}: {limit}"));
+        let mut record = JobExecutionRecord::queued(
+            id.to_string(),
+            thing.to_string(),
+            Some("{}".to_string()),
+            now,
+        );
+        record.command_arn = Some("arn:aws:iot:us-east-1:111122223333:command/reboot".to_string());
+        store
+            .try_insert_execution(record)
+            .expect("the store accepts an execution below every quota");
+    }
+
+    /// A device's command-execution concurrency counts exactly its NON-TERMINAL
+    /// COMMAND executions: a job execution occupies no slot, the device is admitted
+    /// up to [`MAX_CONCURRENT_COMMAND_EXECUTIONS_PER_THING`] and refused past it,
+    /// another device is unaffected, and a slot is released both by a finished
+    /// execution and by one the clock has timed out.
+    #[test]
+    fn a_device_admits_command_executions_up_to_the_published_concurrency_limit() {
+        const NOW: i64 = 1_700_000_000;
+        let mut store = JobExecutionStore::default();
+
+        // A JOB execution is not a command execution.
+        enqueue(&mut store, "thing", "job-1", NOW);
+        assert_eq!(
+            store.concurrent_command_executions("thing"),
+            0,
+            "case \"a job execution\": expected no command-execution slot consumed, got {}",
+            store.concurrent_command_executions("thing")
+        );
+
+        for index in 0..MAX_CONCURRENT_COMMAND_EXECUTIONS_PER_THING {
+            enqueue_command(&mut store, "thing", &format!("cmd-{index}"), NOW);
+        }
+        assert_eq!(
+            store.concurrent_command_executions("thing"),
+            MAX_CONCURRENT_COMMAND_EXECUTIONS_PER_THING,
+            "case \"at the limit\": expected {MAX_CONCURRENT_COMMAND_EXECUTIONS_PER_THING} outstanding, got {}",
+            store.concurrent_command_executions("thing")
+        );
+        assert!(
+            store.try_admit_command_execution("thing", NOW).is_err(),
+            "case \"past the limit\": expected the device refused, got admitted"
+        );
+        assert!(
+            store.try_admit_command_execution("other-thing", NOW).is_ok(),
+            "case \"another device\": expected its own empty concurrency, got refused"
+        );
+
+        // A finished execution releases its slot.
+        let at = store
+            .execution_index("thing", "cmd-0", None)
+            .expect("the first command execution");
+        store
+            .record_mut("thing", at)
+            .expect("the index came from this store")
+            .status = "SUCCEEDED".to_string();
+        assert_eq!(
+            store.concurrent_command_executions("thing"),
+            MAX_CONCURRENT_COMMAND_EXECUTIONS_PER_THING - 1,
+            "case \"one finished\": expected one slot released, got {}",
+            store.concurrent_command_executions("thing")
+        );
+
+        // Refill the released slot with an execution carrying its own timeout: the
+        // device is at the limit again at that instant...
+        enqueue_command(&mut store, "thing", "cmd-timing-out", NOW);
+        let at = store
+            .execution_index("thing", "cmd-timing-out", None)
+            .expect("the execution just enqueued");
+        store
+            .record_mut("thing", at)
+            .expect("the index came from this store")
+            .execution_timeout_expires_at = Some(NOW + 60);
+        assert!(
+            store.try_admit_command_execution("thing", NOW).is_err(),
+            "case \"at the limit again\": expected the device refused, got admitted"
+        );
+        // ...and under it once that execution's own deadline has passed, which the
+        // clock owed whether or not anybody called.
+        assert!(
+            store.try_admit_command_execution("thing", NOW + 61).is_ok(),
+            "case \"a timed-out execution\": expected its slot released, got refused"
+        );
+        assert_eq!(
+            store
+                .resolve_record("thing", "cmd-timing-out", None)
+                .map(|record| record.status.clone()),
+            Some(STATUS_TIMED_OUT.to_string()),
+            "case \"a timed-out execution\": expected it moved to TIMED_OUT, got {:?}",
+            store.resolve_record("thing", "cmd-timing-out", None)
         );
     }
 

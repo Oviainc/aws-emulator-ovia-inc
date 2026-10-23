@@ -5,7 +5,11 @@
 //! IMPLEMENTED: reports the resource-based policy document persisted on the dashboard
 //! its `resourceArn` names. A dashboard with no policy attached resolves to the empty
 //! document (the modelled `policyDocument` starts at 0 characters), and an ARN this
-//! service holds no dashboard under answers the modelled `ResourceNotFoundException`.
+//! service holds no dashboard under answers the service's not-found refusal — HTTP 400
+//! with the error code `ResourceNotFoundException` and a `resourceId` member carrying the
+//! requested ARN, as `crate::scaffolded::Scaffolded::resource_not_found` renders it (the
+//! model's `@httpError` for that shape is 404, which is not what the recorded service
+//! answers).
 //! `@readonly`: this handler writes nothing.
 //!
 //! ## Shape of an operation
@@ -165,10 +169,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let policy_document = state
             .dashboard_resource_policy(&input.resource_arn)
             .ok_or_else(|| {
-                GetResourcePolicyErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: format!("No dashboard found for arn {}", input.resource_arn),
-                    },
+                // No recording covers this operation's not-found wording, so its own text
+                // stands; the status, the code and the echoed `resourceId` are the
+                // service-wide rule.
+                crate::scaffolded::Scaffolded::resource_not_found(
+                    &input.resource_arn,
+                    format!("No dashboard found for arn {}", input.resource_arn),
                 )
             })?
             .to_string();
