@@ -8,8 +8,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    Connection, Host, RepositoryLinkInfo, SyncBlocker, SyncBlockerContext, SyncConfiguration, Tag,
-    VpcConfiguration,
+    Connection, Host, RepositoryLinkInfo, SyncBlocker, SyncBlockerContext, SyncBlockerSummary,
+    SyncConfiguration, Tag, VpcConfiguration,
 };
 
 /// The region an ARN carries when the request is unsigned, so no SigV4 credential
@@ -361,6 +361,50 @@ impl ComAmazonawsCodeconnectionsCodeconnections20231201State {
         self.connections
             .values()
             .any(|connection| connection.connection_name == name)
+    }
+
+    /// The blocker summary this service reports for `resource_name` under `sync_type`.
+    ///
+    /// The ONE projection from the blocker store onto the modeled `SyncBlockerSummary`,
+    /// so every reader of a resource's blockers reports them the same way.
+    /// `GetSyncBlockerSummary` "Returns a list of the most recent sync blockers" and the
+    /// `LatestBlockers` member is "The latest events for a sync blocker summary", so the
+    /// pair's blockers are reported MOST RECENT FIRST — by `CreatedAt`, with the blocker
+    /// id breaking a tie, which makes the order total and stable instead of dependent on
+    /// how the rows sit in the store. The list is always rendered, empty when the pair
+    /// holds no blocker: this reports blocker EVENTS, not whether the resource exists,
+    /// so "no blockers" is an answer rather than a missing member or a refusal.
+    /// `ParentResourceName` comes from the most recently raised of those blockers, the
+    /// rows that carry it; a pair with no blocker reports none.
+    pub fn blocker_summary(&self, sync_type: &str, resource_name: &str) -> SyncBlockerSummary {
+        let mut latest: Vec<&StoredSyncBlocker> = self
+            .sync_blockers
+            .values()
+            .filter(|blocker| {
+                blocker.sync_type == sync_type && blocker.resource_name == resource_name
+            })
+            .collect();
+        // `DateTime` carries no total order of its own, so recency is compared on the
+        // seconds-and-nanoseconds pair it exposes.
+        let raised_at =
+            |blocker: &StoredSyncBlocker| (blocker.created_at.secs(), blocker.created_at.subsec_nanos());
+        latest.sort_by(|left, right| {
+            raised_at(right)
+                .cmp(&raised_at(left))
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        SyncBlockerSummary {
+            resource_name: resource_name.to_string(),
+            parent_resource_name: latest
+                .first()
+                .and_then(|blocker| blocker.parent_resource_name.clone()),
+            latest_blockers: Some(
+                latest
+                    .into_iter()
+                    .map(StoredSyncBlocker::to_modeled)
+                    .collect(),
+            ),
+        }
     }
 
     /// The tags stored against the resource this ARN names, or `None` when the

@@ -1,10 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeUsers
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeUsers`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
 //! broken". Replace the `Err(..)` in [`DescribeUsers::handle`] with real behaviour and
 //! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
@@ -153,18 +149,115 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeUsers` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeUsersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeUsers"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+
+        // A pure read: a user has no lifecycle the clock drives — `CreateUser`
+        // answers with it already active, and the built-in `default` user is in
+        // the store from the moment it is built — so this handler writes nothing
+        // at all.
+        let _ = ctx;
+
+        // This operation models no `InvalidParameterValueException`, so a
+        // `MaxRecords` that cannot be a page size and a `Marker` this service did
+        // not mint are refused through the synthetic `ValidationException` — the
+        // channel for a rule the service enforces but the model gives it no error
+        // for. `MaxRecords` here documents no bounds (unlike the cluster and
+        // subnet-group describes), so any positive count is a page it serves.
+        let page_size = match crate::state::unbounded_page_size(input.max_records) {
+            Ok(size) => size,
+            Err(message) => return Err(crate::scaffolded::Scaffolded::validation(message)),
+        };
+        let resume_from = match input.marker.as_deref() {
+            Some(marker) => match crate::state::decode_marker(marker) {
+                Some(key) => Some(key),
+                None => {
+                    return Err(crate::scaffolded::Scaffolded::validation(format!(
+                        "Invalid value {marker} for Marker."
+                    )))
+                }
+            },
+            None => None,
+        };
+        // "The property being filtered. For example, UserId": a filter names a
+        // property of the resource being reported, so one that names something
+        // else is refused instead of quietly matching nothing.
+        let filters = input.filters.unwrap_or_default();
+        if let Some(unknown) = filters
+            .iter()
+            .find(|filter| !crate::state::USER_FILTER_NAMES.contains(&filter.name.as_str()))
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "Invalid value {} for Filters.Name: must be one of {}.",
+                unknown.name,
+                crate::state::USER_FILTER_NAMES.join(" | ")
+            )));
+        }
+        // The engine is stored lowercased, so the filter compares lowercased too.
+        let engine = input.engine.map(|engine| engine.to_ascii_lowercase());
+        // Every predicate the request asked for, over one stored user.
+        let matches = |user: &crate::state::UserRecord| {
+            engine
+                .as_deref()
+                .is_none_or(|wanted| user.engine == wanted)
+                && filters.iter().all(|filter| {
+                    user.property(&filter.name)
+                        .is_some_and(|value| filter.values.iter().any(|want| want == value))
+                })
+        };
+
+        let store = state.lock();
+
+        // With `UserId` the answer is that one user, or the modelled not-found;
+        // pagination does not apply to a single-resource lookup.
+        if let Some(user_id) = input.user_id.as_deref() {
+            let key = user_id.to_ascii_lowercase();
+            let Some(user) = store.users.get(&key) else {
+                return Err(DescribeUsersErrorModeled::UserNotFoundFault(
+                    UserNotFoundFault {
+                        message: Some(format!("User {user_id} not found.")),
+                    },
+                )
+                .into());
+            };
+            // The user exists; the other predicates still apply, so a request
+            // that also asked for an engine or a property the user does not have
+            // is answered with no users rather than with one it excluded.
+            let users = if matches(user) {
+                vec![user.to_modeled()]
+            } else {
+                Vec::new()
+            };
+            return Ok(DescribeUsersOutput {
+                marker: None,
+                users: Some(users),
+            });
+        }
+
+        let mut page: Vec<CreateUserOutput> = Vec::new();
+        let mut marker = None;
+        for (key, user) in store
+            .users
+            .iter()
+            .filter(|(key, user)| {
+                resume_from.as_ref().is_none_or(|from| *key >= from) && matches(user)
+            })
+        {
+            if page.len() == page_size {
+                // More records exist than `MaxRecords`, so the response carries
+                // the marker the next call resumes from.
+                marker = Some(crate::state::encode_marker(key));
+                break;
+            }
+            page.push(user.to_modeled());
+        }
+
+        Ok(DescribeUsersOutput {
+            marker,
+            users: Some(page),
+        })
     }
 }

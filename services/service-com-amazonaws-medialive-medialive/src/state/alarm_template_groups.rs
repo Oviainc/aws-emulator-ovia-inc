@@ -61,7 +61,9 @@ pub enum AlarmTemplateGroupRefusal {
 ///
 /// `TemplateCount` is NOT stored: `CloudWatchAlarmTemplateGroupSummary` documents
 /// it as "The number of templates in a group", so it is derived from the
-/// templates that exist, never carried on the group.
+/// templates that exist
+/// ([`ComAmazonawsMedialiveMedialiveState::alarm_template_ids_in_group`]), never
+/// carried on the group.
 #[derive(Debug, Clone)]
 pub struct CloudWatchAlarmTemplateGroupRecord {
     pub id: String,
@@ -159,12 +161,10 @@ impl ComAmazonawsMedialiveMedialiveState {
     /// `DeleteCloudWatchAlarmTemplateGroup` is documented "Deletes a cloudwatch
     /// alarm template group. You must detach this group from all signal maps and
     /// ensure its existing templates are moved to another group or deleted", so a
-    /// group a signal map still names is refused and nothing is removed. The
-    /// group's own cloudwatch alarm TEMPLATES have no store to check yet —
-    /// `CreateCloudWatchAlarmTemplate` is still a scaffold, so no group this store
-    /// holds can hold one — and that half of the precondition belongs to the
-    /// create's own issue. Once removed the group is GONE from the store, so every
-    /// later read of either of its identifiers misses and its name is free again.
+    /// group a signal map still names is refused and nothing is removed, and so is
+    /// a group that still holds cloudwatch alarm TEMPLATES of its own. Once
+    /// removed the group is GONE from the store, so every later read of either of
+    /// its identifiers misses and its name is free again.
     ///
     /// The resolution, the precondition and the removal live together here, so a
     /// handler cannot check one of them and write past another; the handler's job
@@ -182,12 +182,11 @@ impl ComAmazonawsMedialiveMedialiveState {
             .clone();
 
         let signal_map_ids = self.signal_maps_using_alarm_template_group(&id);
-        if !signal_map_ids.is_empty() {
+        let template_ids = self.alarm_template_ids_in_group(&id);
+        if !signal_map_ids.is_empty() || !template_ids.is_empty() {
             return Err(TemplateGroupDeleteRefusal::StillHeld {
                 signal_map_ids,
-                // The group's own cloudwatch alarm TEMPLATES have no store to
-                // read: see this method's documentation.
-                template_ids: Vec::new(),
+                template_ids,
             });
         }
 

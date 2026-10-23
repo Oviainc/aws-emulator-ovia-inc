@@ -11,11 +11,20 @@
 use std::collections::BTreeMap;
 use std::time::SystemTime;
 
-use crate::ops::types::{DashboardReference, ResourceTag, Widget};
+use crate::ops::types::{
+    DashboardReference, DateTimeRange, HealthStatus, ResourceTag, ScheduleConfig, ScheduledReport,
+    Widget,
+};
 
 /// The only `DashboardType` the model declares (`DASHBOARD_TYPE_VALUES`), and the
 /// type every dashboard a client creates through this API carries.
 pub const DASHBOARD_TYPE_CUSTOM: &str = "CUSTOM";
+
+/// The `ScheduleState` (`SCHEDULE_STATE_VALUES`) a schedule carries when the request
+/// left `scheduleConfig.state` unset: a report whose state nobody chose runs on its
+/// schedule, which is what the recorded unit
+/// `bcm-dashboards.scheduled-report-default-schedule-state-enabled` reads back.
+pub const SCHEDULE_STATE_ENABLED: &str = "ENABLED";
 
 /// The prefix a `ListDashboards` pagination cursor carries, so a token this
 /// service did not mint is rejected instead of being read as a resume point.
@@ -66,6 +75,65 @@ impl Dashboard {
     }
 }
 
+/// The most scheduled reports this emulator stores for the account before
+/// `CreateScheduledReport` answers its modelled `ServiceQuotaExceededException`.
+///
+/// The real service's scheduled-report quota is not stated in the model, so this
+/// bound is CHOSEN, not cited: it is set far above any plausible client's report
+/// count, so normal use never meets it, while the store a caller can grow stays
+/// bounded.
+pub const MAX_SCHEDULED_REPORTS: usize = 1_000;
+
+/// One stored scheduled report.
+///
+/// Holds the modelled members verbatim — including the `scheduleConfig` with its
+/// `state` resolved — so every reader projects the stored record rather than
+/// re-deriving anything from a request. `last_execution_at` and `health_status` stay
+/// unset until an execution of this report sets them: nothing has run at create time.
+#[derive(Debug, Clone)]
+pub struct ScheduledReportRecord {
+    pub arn: String,
+    pub name: String,
+    pub dashboard_arn: String,
+    pub execution_role_arn: String,
+    pub schedule_config: ScheduleConfig,
+    pub description: Option<String>,
+    /// `None` when the request named no widget, `Some(list)` otherwise — the two are
+    /// distinct on the wire, and `UpdateScheduledReport` has to be able to reset the
+    /// member to an empty list.
+    pub widget_ids: Option<Vec<String>>,
+    pub widget_date_range_override: Option<DateTimeRange>,
+    pub created_at: SystemTime,
+    pub updated_at: SystemTime,
+    pub last_execution_at: Option<SystemTime>,
+    pub health_status: Option<HealthStatus>,
+    /// The tags supplied at create time, persisted so the tagging operations have
+    /// state to read once they are implemented.
+    pub resource_tags: Vec<ResourceTag>,
+}
+
+impl ScheduledReportRecord {
+    /// This record projected onto the modelled `ScheduledReport` shape that
+    /// `GetScheduledReport` (and the other readers) return: the stored record's own
+    /// fields, never request input.
+    pub fn report(&self) -> ScheduledReport {
+        ScheduledReport {
+            arn: Some(self.arn.clone()),
+            name: self.name.clone(),
+            dashboard_arn: self.dashboard_arn.clone(),
+            scheduled_report_execution_role_arn: self.execution_role_arn.clone(),
+            schedule_config: self.schedule_config.clone(),
+            description: self.description.clone(),
+            widget_ids: self.widget_ids.clone(),
+            widget_date_range_override: self.widget_date_range_override.clone(),
+            created_at: Some(::aws_smithy_types::DateTime::from(self.created_at)),
+            updated_at: Some(::aws_smithy_types::DateTime::from(self.updated_at)),
+            last_execution_at: self.last_execution_at.map(::aws_smithy_types::DateTime::from),
+            health_status: self.health_status.clone(),
+        }
+    }
+}
+
 /// Per-service state for com-amazonaws-bcmdashboards-awsbcmdashboardsservice. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsBcmdashboardsAwsbcmdashboardsserviceState {
@@ -78,6 +146,17 @@ pub struct ComAmazonawsBcmdashboardsAwsbcmdashboardsserviceState {
     pub next_dashboard_seq: u64,
     /// Monotonic counter behind every minted widget id.
     pub next_widget_seq: u64,
+    /// Every stored scheduled report, keyed by its ARN. A `BTreeMap` for the same
+    /// reason the dashboards are in one: `ListScheduledReports` needs one stable
+    /// order to page over.
+    pub scheduled_reports: BTreeMap<String, ScheduledReportRecord>,
+    /// Monotonic counter behind every minted scheduled-report resource id.
+    pub next_scheduled_report_seq: u64,
+    /// The `clientToken` of every `CreateScheduledReport` that has created a report,
+    /// mapped to the ARN it minted. A token is an at-most-once create key: the first
+    /// caller presenting it wins and every later one is refused with the modelled
+    /// `ConflictException`, so a retried token can never mint a second report.
+    pub scheduled_report_client_tokens: BTreeMap<String, String>,
 }
 
 impl ComAmazonawsBcmdashboardsAwsbcmdashboardsserviceState {
@@ -99,6 +178,20 @@ impl ComAmazonawsBcmdashboardsAwsbcmdashboardsserviceState {
     pub fn mint_widget_id(&mut self) -> String {
         self.next_widget_seq = self.next_widget_seq.wrapping_add(1);
         format!("{:032x}", self.next_widget_seq)
+    }
+
+    /// Mint a fresh, unique scheduled-report ARN, the same way dashboard ARNs are
+    /// minted: 32 lowercase hex characters for the resource id (which satisfies
+    /// `ScheduledReportArn`'s `[-a-z0-9]+` resource segment), the emulator's
+    /// canonical account id, and the empty region the model's pattern requires.
+    pub fn mint_scheduled_report_arn(&mut self) -> String {
+        self.next_scheduled_report_seq = self.next_scheduled_report_seq.wrapping_add(1);
+        let resource_id = format!("{:032x}", self.next_scheduled_report_seq);
+        ::engine::emulator_arn(
+            "bcm-dashboards",
+            "",
+            &format!("scheduled-report/{resource_id}"),
+        )
     }
 
     /// The widgets to store for a create or update: the supplied widgets with an
@@ -158,6 +251,17 @@ pub fn record_state_change(
         outcome,
         "state-changing bcm-dashboards operation"
     );
+}
+
+/// The `scheduleConfig` to store for a create or an update: the supplied config with
+/// `state` resolved to [`SCHEDULE_STATE_ENABLED`] when the request left it unset, so
+/// every reader sees a schedule whose state is decided once, at write time, rather
+/// than each reader guessing.
+pub fn resolve_schedule_config(mut config: ScheduleConfig) -> ScheduleConfig {
+    if config.state.as_deref().is_none_or(str::is_empty) {
+        config.state = Some(SCHEDULE_STATE_ENABLED.to_string());
+    }
+    config
 }
 
 /// Encode the ARN a `ListDashboards` page resumes at as an opaque `nextToken`.

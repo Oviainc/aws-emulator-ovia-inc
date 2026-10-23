@@ -68,7 +68,7 @@ impl Emulator {
     }
 
     /// This service's store, as the handlers reach it.
-    fn store(&self) -> engine::ServiceState<cleanrooms_state::CleanRoomsState> {
+    pub(crate) fn store(&self) -> engine::ServiceState<cleanrooms_state::CleanRoomsState> {
         cleanrooms_state::service_state(&*self.engine).expect("the cleanrooms store")
     }
 

@@ -18,10 +18,11 @@
 //!    omitting the member.
 //!
 //! The rows differ along what the rules generalise over: the resource (cloudwatch
-//! alarm template group, eventbridge rule template group, eventbridge rule template,
-//! signal map), the operation reporting it (a create, the read that follows it, and a
-//! list, which reports a summary shape of its own), which timestamp members the shape
-//! carries, and whether the request supplied tags at all and how many.
+//! alarm template group, cloudwatch alarm template, eventbridge rule template group,
+//! eventbridge rule template, signal map), the operation reporting it (a create, the
+//! read that follows it, and a list, which reports a summary shape of its own), which
+//! timestamp members the shape carries, and whether the request supplied tags at all
+//! and how many.
 
 use std::time::SystemTime;
 
@@ -32,12 +33,13 @@ use crate::channel_lifecycle::wait_for_the_clock;
 use crate::support::{entry_point, epoch_seconds, member, reported_tags, timestamp, unix_seconds};
 use crate::wire::{call, medialive, ACCOUNT, DEFAULT_REGION};
 
-/// The collection URIs of the four taggable, timestamped resources this service
+/// The collection URIs of the five taggable, timestamped resources this service
 /// implements (`smithy_query(query="operation", operation="…")` for each one's
 /// create: POST /prod/cloudwatch-alarm-template-groups,
-/// /prod/eventbridge-rule-template-groups, /prod/eventbridge-rule-templates and
-/// /prod/signal-maps).
+/// /prod/cloudwatch-alarm-templates, /prod/eventbridge-rule-template-groups,
+/// /prod/eventbridge-rule-templates and /prod/signal-maps).
 const ALARM_GROUPS: &str = "/prod/cloudwatch-alarm-template-groups";
+const ALARM_TEMPLATES: &str = "/prod/cloudwatch-alarm-templates";
 const RULE_GROUPS: &str = "/prod/eventbridge-rule-template-groups";
 const RULE_TEMPLATES: &str = "/prod/eventbridge-rule-templates";
 const SIGNAL_MAPS: &str = "/prod/signal-maps";
@@ -81,6 +83,16 @@ async fn rule_group(router: &MultiServiceRouter, name: &str) -> String {
     created["id"].as_str().unwrap_or_default().to_string()
 }
 
+/// A template group to create cloudwatch alarm templates in, answering its id.
+async fn alarm_group(router: &MultiServiceRouter, name: &str) -> String {
+    let (status, created) = call(router, "POST", ALARM_GROUPS, Some(json!({ "name": name }))).await;
+    assert_eq!(
+        status, 201,
+        "setup: expected CreateCloudWatchAlarmTemplateGroup to answer 201, got {status}: {created}"
+    );
+    created["id"].as_str().unwrap_or_default().to_string()
+}
+
 /// Rule: every response member modelled as a `date-time` timestamp is reported as an
 /// RFC 3339 string naming the instant of the call, by the create that stamps it and
 /// by the read that reports it afterwards; and `Tags` is always reported as a map.
@@ -89,6 +101,7 @@ async fn created_and_read_resources_report_date_time_strings_and_a_tag_map() {
     let router = medialive();
     let entry = entry_point(&router, "timestamp-entry").await;
     let group = rule_group(&router, "timestamp-group").await;
+    let alarms = alarm_group(&router, "timestamp-alarm-group").await;
 
     // Every `EventBridgeRuleTemplateTarget$Arn` must be an SNS topic or a CloudWatch
     // log group (`smithy_query(query="shape", shape="EventBridgeRuleTemplateTarget")`).
@@ -109,6 +122,45 @@ async fn created_and_read_resources_report_date_time_strings_and_a_tag_map() {
                 "name": "alarm-group-tagged",
                 "description": "stamped on create",
                 "tags": { "owner": "video", "env": "test", "cost-centre": "1234" },
+            }),
+            created_status: 201,
+            stamps: &["createdAt", "modifiedAt"],
+        },
+        Row {
+            case: "alarm template, untagged",
+            collection: ALARM_TEMPLATES,
+            body: json!({
+                "name": "alarm-template-untagged",
+                "groupIdentifier": alarms.clone(),
+                "comparisonOperator": "GreaterThanThreshold",
+                "evaluationPeriods": 1,
+                "metricName": "InputVideoFrameRate",
+                "period": 60,
+                "statistic": "Average",
+                "targetResourceType": "MEDIALIVE_CHANNEL",
+                "threshold": 29.97,
+                "treatMissingData": "notBreaching",
+            }),
+            created_status: 201,
+            stamps: &["createdAt", "modifiedAt"],
+        },
+        Row {
+            case: "alarm template, tagged and fully specified",
+            collection: ALARM_TEMPLATES,
+            body: json!({
+                "name": "alarm-template-tagged",
+                "groupIdentifier": alarms.clone(),
+                "description": "stamped on create",
+                "comparisonOperator": "LessThanThreshold",
+                "datapointsToAlarm": 2,
+                "evaluationPeriods": 3,
+                "metricName": "ActiveAlerts",
+                "period": 300,
+                "statistic": "Maximum",
+                "targetResourceType": "MEDIAPACKAGE_CHANNEL",
+                "threshold": 1.0,
+                "treatMissingData": "breaching",
+                "tags": { "owner": "video", "env": "test" },
             }),
             created_status: 201,
             stamps: &["createdAt", "modifiedAt"],
