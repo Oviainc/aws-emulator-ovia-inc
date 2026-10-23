@@ -4,7 +4,8 @@
 //! Submits a job and persists it in [`crate::state`].
 //!
 //! `jobQueue` resolves by name or ARN and `jobDefinition` by name, `name:revision` or
-//! ARN, both against persisted state: an unknown queue, an unknown definition or an
+//! ARN, both against persisted state: an unknown queue, a queue whose `JQState` is
+//! `DISABLED` ("new jobs can't be added to the queue"), an unknown definition or an
 //! unknown `dependsOn` job id is a `ClientException`, never a 200 carrying an id nothing
 //! stored. The job id is a fresh UUID, and the record keeps the queue ARN, the resolved
 //! revision's ARN, `createdAt` in epoch milliseconds, the parameters (the definition's
@@ -272,6 +273,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         let queue_arn = queue.arn.clone();
+        // `JQState`: "If the job queue state is DISABLED, new jobs can't be added to the
+        // queue, but jobs already in the queue can finish." So a submit to a disabled
+        // queue is refused, and the jobs already stored for it keep advancing.
+        if queue.state == batch::STATE_DISABLED {
+            return Err(SubmitJobErrorModeled::ClientException(batch::client_exception(
+                format!("Job queue {queue_arn} is DISABLED and can't accept new jobs"),
+            ))
+            .into());
+        }
 
         let Some(definition) = state.job_definition(&input.job_definition) else {
             return Err(SubmitJobErrorModeled::ClientException(batch::client_exception(

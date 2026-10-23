@@ -53,7 +53,8 @@ pub const ARN_SERVICE: &str = "batch";
 pub const DEFAULT_REGION: &str = "us-east-1";
 
 /// How long one clock-owed transition takes: a compute environment or job queue
-/// leaving `CREATING`, and each move a submitted job makes.
+/// leaving `CREATING`, a job queue leaving `UPDATING`, and each move a submitted
+/// job makes.
 ///
 /// A span chosen by this emulator (AWS documents no duration for it), inside the
 /// 250–750 ms band the project fixes for a transition the clock owes. It is never
@@ -133,10 +134,16 @@ pub const UNREACHABLE_STATE: &str = "the Batch emulator could not reach its serv
 // (`C_E_STATUS_VALUES`, `J_Q_STATUS_VALUES`, `JOB_STATUS_VALUES`, `CEState`/`JQState`).
 /// `CEStatus`/`JQStatus` value a resource carries while its creation is pending.
 pub const STATUS_CREATING: &str = "CREATING";
+/// `JQStatus` value a job queue carries while an update to it is pending.
+pub const STATUS_UPDATING: &str = "UPDATING";
 /// `CEStatus`/`JQStatus` value of a created resource.
 pub const STATUS_VALID: &str = "VALID";
 /// `CEState`/`JQState` default: a resource is created enabled unless asked otherwise.
 pub const STATE_ENABLED: &str = "ENABLED";
+/// `CEState`/`JQState` of a resource that accepts no new work. `JQState`'s own doc:
+/// "If the job queue state is `DISABLED`, new jobs can't be added to the queue, but jobs
+/// already in the queue can finish."
+pub const STATE_DISABLED: &str = "DISABLED";
 /// `JobDefinition$status` of a revision `RegisterJobDefinition` created and nothing has
 /// deregistered.
 pub const STATUS_ACTIVE: &str = "ACTIVE";
@@ -182,6 +189,15 @@ pub const MAX_SCHEDULING_PRIORITY: i32 = 9999;
 /// The shortest job timeout the service accepts, in seconds, from the `timeout` member's
 /// doc: "The minimum value for the timeout is 60 seconds."
 pub const MIN_ATTEMPT_DURATION_SECONDS: i32 = 60;
+
+/// The bounds of `JobStateTimeLimitAction$maxTimeSeconds`, from the member's own doc:
+/// "The minimum value is 600 (10 minutes) and the maximum value is 86,400 (24 hours)."
+/// The model types the member as a plain `Integer`, so the framework admits anything and
+/// the rule is applied by every operation that accepts the list
+/// ([`validate_job_state_time_limit_actions`]).
+pub const MIN_JOB_STATE_TIME_LIMIT_SECONDS: i32 = 600;
+/// See [`MIN_JOB_STATE_TIME_LIMIT_SECONDS`].
+pub const MAX_JOB_STATE_TIME_LIMIT_SECONDS: i32 = 86_400;
 
 /// The most job definitions `DescribeJobDefinitions` accepts in one request, from the
 /// `jobDefinitions` member's doc: "A list of up to 100 job definitions."
@@ -415,7 +431,8 @@ pub struct JobQueue {
     pub state: String,
     pub status: String,
     pub status_reason: Option<String>,
-    /// Set while the `CREATING` -> `VALID` move is still owed by the clock.
+    /// Set while the `CREATING` -> `VALID` or `UPDATING` -> `VALID` move is still owed by
+    /// the clock.
     pub status_due_at: Option<i64>,
     pub priority: i32,
     pub scheduling_policy_arn: Option<String>,
@@ -827,6 +844,62 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
             .then(|| id.to_string())
     }
 
+    /// `entries` with every `computeEnvironment` resolved against the stored compute
+    /// environments and rewritten as that environment's ARN; the refusal detail of the
+    /// first entry that resolves to nothing otherwise.
+    ///
+    /// The normalisation rule is shared by every operation that accepts the list
+    /// (`CreateJobQueue`, `UpdateJobQueue`), so a queue reports the ARN whichever form
+    /// named the environment.
+    pub fn resolve_compute_environment_order(
+        &self,
+        entries: &[ComputeEnvironmentOrder],
+    ) -> Result<Vec<ComputeEnvironmentOrder>, String> {
+        entries
+            .iter()
+            .map(|entry| {
+                let environment = self.compute_environment(&entry.compute_environment).ok_or_else(
+                    || {
+                        format!(
+                            "Compute environment {} does not exist",
+                            entry.compute_environment
+                        )
+                    },
+                )?;
+                Ok(ComputeEnvironmentOrder {
+                    order: entry.order,
+                    compute_environment: environment.arn.clone(),
+                })
+            })
+            .collect()
+    }
+
+    /// `entries` with every `serviceEnvironment` resolved against the stored service
+    /// environments and rewritten as that environment's ARN; see
+    /// [`Self::resolve_compute_environment_order`].
+    pub fn resolve_service_environment_order(
+        &self,
+        entries: &[ServiceEnvironmentOrder],
+    ) -> Result<Vec<ServiceEnvironmentOrder>, String> {
+        entries
+            .iter()
+            .map(|entry| {
+                let environment = self
+                    .service_environment(&entry.service_environment)
+                    .ok_or_else(|| {
+                        format!(
+                            "Service environment {} does not exist",
+                            entry.service_environment
+                        )
+                    })?;
+                Ok(ServiceEnvironmentOrder {
+                    order: entry.order,
+                    service_environment: environment.arn.clone(),
+                })
+            })
+            .collect()
+    }
+
     /// The revision `RegisterJobDefinition` gives the next registration of `name`: one
     /// past the highest revision stored for it, and 1 for a name nothing is stored for. A
     /// revision is never reused, so deregistering the highest one does not hand its
@@ -917,6 +990,8 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
                 environment.status_due_at = None;
             }
         }
+        // A queue leaves its transient status (`CREATING` after a create, `UPDATING`
+        // after an update) for `VALID` once the span the clock owes has elapsed.
         for queue in self.job_queues.values_mut() {
             if queue.status_due_at.is_some_and(|due| due <= now) {
                 queue.status = STATUS_VALID.to_string();
@@ -1355,6 +1430,27 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
 pub fn job_definition_reference_name(reference: &str) -> &str {
     let short = arn_resource_id(reference, "job-definition").unwrap_or(reference);
     short.rsplit_once(':').map_or(short, |(name, _)| name)
+}
+
+/// Refuse a `jobStateTimeLimitActions` list that names a `maxTimeSeconds` outside the
+/// documented bounds; answers the refusal detail of the first offending entry.
+///
+/// Shared by every operation that accepts the list (`CreateJobQueue`, `UpdateJobQueue`),
+/// so one rule covers all of them.
+pub fn validate_job_state_time_limit_actions(
+    actions: &[JobStateTimeLimitAction],
+) -> Result<(), String> {
+    for action in actions {
+        if !(MIN_JOB_STATE_TIME_LIMIT_SECONDS..=MAX_JOB_STATE_TIME_LIMIT_SECONDS)
+            .contains(&action.max_time_seconds)
+        {
+            return Err(format!(
+                "jobStateTimeLimitActions maxTimeSeconds must be between {MIN_JOB_STATE_TIME_LIMIT_SECONDS} and {MAX_JOB_STATE_TIME_LIMIT_SECONDS}, got {}",
+                action.max_time_seconds
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The two forms a job-definition reference takes, parsed once: the NAME it carries
