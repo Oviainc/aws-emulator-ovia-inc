@@ -242,12 +242,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A retry with the same `ClientToken` answers with what the first call
         // created, performing no further action. The token is scoped to the region
         // that minted the record, as the record itself is.
-        let replayed = input
-            .client_token
-            .as_deref()
-            .and_then(|token| {
-                store.replayed_resource_id(crate::state::MANAGED_THING_RESOURCE_TYPE, token)
-            });
+        let replayed = input.client_token.as_deref().and_then(|token| {
+            store.replayed_resource_id(crate::state::MANAGED_THING_RESOURCE_TYPE, token)
+        });
         if let Some(created) = replayed.and_then(|id| store.managed_thing_in(&region, &id)) {
             return Ok(CreateManagedThingOutput {
                 id: Some(created.id.clone()),

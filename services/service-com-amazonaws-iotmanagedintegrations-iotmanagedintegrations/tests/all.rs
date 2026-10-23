@@ -15,6 +15,8 @@
 mod default_encryption_configuration;
 #[path = "all/enum_value_set_rendering.rs"]
 mod enum_value_set_rendering;
+#[path = "all/event_log_configuration_lifecycle.rs"]
+mod event_log_configuration_lifecycle;
 #[path = "all/hub_configuration.rs"]
 mod hub_configuration;
 #[path = "all/managed_thing_lifecycle.rs"]
