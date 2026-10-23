@@ -185,6 +185,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // was written.
             return Err(crate::scaffolded::Scaffolded::not_implemented("DeleteStack"));
         };
+        // The deletion runs as the `RoleARN` it names, so a role CloudFormation cannot
+        // assume is refused before the stack is touched — the same check `CreateStack`
+        // makes.
+        crate::state::refuse_unassumable_role(&*self.engine, input.role_arn.as_deref())?;
         let now = ::std::time::SystemTime::now();
         // The store lock is taken for the write and RELEASED at the end of this block: the
         // calls that delete the stack's resources run after it, and each of those reaches

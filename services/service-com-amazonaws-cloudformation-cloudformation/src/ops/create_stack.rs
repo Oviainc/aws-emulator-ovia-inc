@@ -9,7 +9,9 @@
 //! CloudFormation's documented naming rules give it, and each declared output is
 //! evaluated against those resources and the stack's parameters, which is what
 //! `DescribeStacks` reports once the create completes. A request naming a live stack's
-//! name is refused with the modelled `AlreadyExistsException`.
+//! name is refused with the modelled `AlreadyExistsException`, and one naming a `RoleARN`
+//! the account's IAM records show CloudFormation cannot assume is refused with the
+//! service's `ValidationError` (see `crate::state::role_trust_refusal`).
 //!
 //! It then CREATES those resources in the services that own them, through this
 //! emulator's own in-process callback: see [`crate::state::provisioning`] for which
@@ -334,6 +336,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // 501 is the only honest answer.
             return Err(crate::scaffolded::Scaffolded::not_implemented("CreateStack"));
         };
+        // "CloudFormation uses the role's credentials to make calls on your behalf": a
+        // role whose trust policy does not let cloudformation.amazonaws.com assume it is
+        // one the stack could never deploy under, so the request is refused before
+        // anything is written.
+        crate::state::refuse_unassumable_role(&*self.engine, input.role_arn.as_deref())?;
         let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx.parts());
 
@@ -405,8 +412,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
             // "The quota for the resource has already been reached": the store holds at
             // most `MAX_STACKS` live stacks, which is what bounds its growth. Nothing
-            // above this point touched the store, so a refused request leaves it exactly
-            // as it was.
+            // above this point WROTE a stack, so a refused request adds none — the one
+            // change it can leave behind is `settle`'s, which only materialises the
+            // transitions the clock already owed and would have happened on any other
+            // request at this instant.
             if store.live_stacks().count() >= crate::state::MAX_STACKS {
                 return Err(CreateStackErrorModeled::LimitExceededException(
                     LimitExceededException {

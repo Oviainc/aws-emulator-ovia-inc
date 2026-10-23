@@ -337,6 +337,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // was written.
             return Err(crate::scaffolded::Scaffolded::not_implemented("UpdateStack"));
         };
+        // The update runs as the `RoleARN` it names, so a role CloudFormation cannot
+        // assume is refused before the stack is touched — the same check `CreateStack`
+        // makes. A request that names none keeps the role already on the stack, which was
+        // checked when the request that set it named it.
+        crate::state::refuse_unassumable_role(&*self.engine, input.role_arn.as_deref())?;
         let now = ::std::time::SystemTime::now();
         // The store is read under the lock and the lock is RELEASED with this block: what
         // the update computes from the request and the stack's previous values needs no

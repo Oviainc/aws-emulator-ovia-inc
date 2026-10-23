@@ -349,6 +349,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "CreateChangeSet",
             ));
         };
+        // The change set carries the `RoleARN` its execution would run as, so a role
+        // CloudFormation cannot assume is refused before the plan is written — the same
+        // check `CreateStack` makes.
+        crate::state::refuse_unassumable_role(&*self.engine, input.role_arn.as_deref())?;
         let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();

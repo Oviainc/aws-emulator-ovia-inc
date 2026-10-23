@@ -47,6 +47,8 @@ mod stack_reported_members;
 mod stack_resource_detail;
 #[path = "all/stack_resources.rs"]
 mod stack_resources;
+#[path = "all/stack_role_trust.rs"]
+mod stack_role_trust;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/template_outputs.rs"]

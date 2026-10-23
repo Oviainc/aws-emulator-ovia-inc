@@ -95,7 +95,7 @@ pub(crate) fn expected_status(
 ///
 /// Everything outside the unreserved set an AWS SDK leaves alone is escaped, which is
 /// what the form body an SDK sends looks like.
-fn form_encode(value: &str) -> String {
+pub(crate) fn form_encode(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for byte in value.as_bytes() {
         match byte {

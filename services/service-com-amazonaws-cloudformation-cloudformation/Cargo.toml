@@ -48,6 +48,12 @@ sha2 = { workspace = true }
 # YAML 1.2 implementation whose event stream reports those tags, which a loaded tree
 # drops.
 yaml-rust2 = { version = "0.10", default-features = false }
+# `iam_trust_policy`: the one reading of an IAM trust policy, shared with every other
+# service that resolves a caller-supplied service role before it writes.
+service-common = { path = "../common" }
+# The IAM store a stack operation resolves its `RoleARN` against, to check the role's
+# trust policy lets cloudformation.amazonaws.com assume it before the stack is written.
+service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
