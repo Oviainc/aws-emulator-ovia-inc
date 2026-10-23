@@ -22,7 +22,9 @@
 
 use serde_json::{json, Value};
 
-use crate::certificate_lifecycle::{call, describe, error_code, list_all_arns, router};
+use crate::certificate_lifecycle::{
+    call, describe, error_code, hold_pending_validations, list_all_arns, router_with_engine,
+};
 
 /// One row: what it exercises, the certificate's `DomainName`, the entry's
 /// `DomainName`, the entry's `ValidationDomain`, and whether ACM accepts it.
@@ -151,7 +153,7 @@ const CASES: &[SuperdomainCase<'_>] = &[
 async fn validation_domain_must_be_the_domain_or_a_superdomain() {
     for (case, domain_name, option_domain, validation_domain, accepted) in CASES {
         // A router per row, so the store a refusal must leave empty is this row's own.
-        let router = router();
+        let (router, engine) = router_with_engine();
         let body = json!({
             "DomainName": domain_name,
             "ValidationMethod": "EMAIL",
@@ -176,6 +178,9 @@ async fn validation_domain_must_be_the_domain_or_a_superdomain() {
             let expected_suffix = validation_domain
                 .strip_prefix("*.")
                 .unwrap_or(validation_domain);
+            // The row is about the record the request created, so the transitions the
+            // clock owes it — including the initial validation mail — are held out.
+            hold_pending_validations(&engine);
             let detail = describe(&router, arn).await;
             let validation = &detail["DomainValidationOptions"][0];
             assert!(
@@ -186,13 +191,12 @@ async fn validation_domain_must_be_the_domain_or_a_superdomain() {
                  {expected_suffix}, got {validation}"
             );
             // The mailbox list of an email-validated name holds the messages ACM has
-            // SENT; nothing here sends mail, so it is the empty list rather than a set
-            // of invented addresses. (The recorded DescribeCertificate response of an
-            // email-validated certificate carries no mailbox entries either.)
+            // SENT. The initial dispatch is still held out, so it is the empty list
+            // rather than a set of addresses no message went to.
             assert_eq!(
                 validation["ValidationEmails"],
                 json!([]),
-                "case {case:?}: no validation email has been sent, got {validation}"
+                "case {case:?}: no validation email has been sent yet, got {validation}"
             );
         } else {
             assert_eq!(
@@ -302,7 +306,7 @@ async fn every_entry_in_the_list_is_checked() {
     ];
 
     for (case, body, expected_error) in cases {
-        let router = router();
+        let (router, _engine) = router_with_engine();
         let (status, response) = call(&router, "RequestCertificate", body).await;
         match expected_error {
             None => {

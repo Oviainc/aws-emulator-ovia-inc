@@ -8,12 +8,14 @@
 //! documented 72-hour resend window.
 //!
 //! The request's own values are checked first (`ValidationDomain` must be `Domain` or a
-//! superdomain of it, `Domain` must be a name the certificate covers): either is
-//! `InvalidDomainValidationOptionsException`, whatever state the certificate is in.
+//! superdomain of it): that is
+//! `InvalidDomainValidationOptionsException`, whatever state the certificate is in. A
+//! `Domain` the certificate holds no validation record for is
+//! `ResourceNotFoundException`, as the unknown certificate itself is.
 //! Only then does the certificate's state decide: there is mail to resend only while
 //! the certificate is still `PENDING_VALIDATION`, that domain is still awaiting proof
-//! by EMAIL, and the 72-hour window has not elapsed — otherwise
-//! `InvalidStateException`.
+//! by EMAIL, ACM has already dispatched the initial validation mail the request owes,
+//! and the 72-hour window has not elapsed — otherwise `InvalidStateException`.
 //!
 //! ## Shape of an operation
 //!
@@ -252,17 +254,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `Domain` is "the fully qualified domain name (FQDN) of the certificate that
         // needs to be validated" (`ResendValidationEmailRequest$Domain` doc), so it
-        // must be a name this certificate covers: a name it does not cover has no
-        // validation to re-send, whatever the certificate's status.
+        // names one of the certificate's own domain validations. A name this
+        // certificate does not cover has no validation record to resend for, and a
+        // resource the account does not hold is what `ResourceNotFoundException`
+        // reports, whatever the certificate's status.
         let Some(index) = certificate
             .domain_validations
             .iter()
             .position(|validation| crate::state::same_domain(&validation.domain_name, &input.domain))
         else {
-            return Err(invalid_domain_validation_options(format!(
-                "The domain {} is not a domain name in the certificate {}.",
-                input.domain, input.certificate_arn
-            )));
+            return Err(
+                ResendValidationEmailErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "The domain {} is not a domain name in the certificate {}.",
+                            input.domain, input.certificate_arn
+                        )),
+                    },
+                )
+                .into(),
+            );
         };
 
         // Beyond here the request is well formed and the only question is whether this
@@ -288,6 +299,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(invalid_state(format!(
                 "The domain {} of certificate {} has validation status {status}, so it is not awaiting an approval mail.",
                 input.domain, input.certificate_arn
+            )));
+        }
+
+        // ACM sends the FIRST validation mail itself, a bounded span after it accepts
+        // the request: while that dispatch is still owed the request is still being
+        // processed and there is no message to RE-send yet.
+        if certificate.pending_validation_email.is_some() {
+            return Err(invalid_state(format!(
+                "The request for certificate {} is still in progress: its initial domain \
+                 validation email has not been sent yet. Try again later.",
+                input.certificate_arn
             )));
         }
 
