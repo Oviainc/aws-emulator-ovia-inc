@@ -21,6 +21,8 @@ mod authorizer_lifecycle;
 mod cors_configuration;
 #[path = "all/deployment_lifecycle.rs"]
 mod deployment_lifecycle;
+#[path = "all/deployment_stage_release.rs"]
+mod deployment_stage_release;
 #[path = "all/integration_lifecycle.rs"]
 mod integration_lifecycle;
 #[path = "all/integration_pagination.rs"]
