@@ -29,6 +29,8 @@ mod function_url_config;
 mod layer_versions;
 #[path = "all/resource_policy.rs"]
 mod resource_policy;
+#[path = "all/resource_tags.rs"]
+mod resource_tags;
 #[path = "all/signing_name_routing.rs"]
 mod signing_name_routing;
 #[path = "all/state_roundtrip.rs"]
