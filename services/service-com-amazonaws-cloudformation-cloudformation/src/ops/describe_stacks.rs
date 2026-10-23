@@ -5,8 +5,8 @@
 //! exactly that stack (a stack id resolves a deleted stack too); with none it answers
 //! every live stack in creation order. A name no live stack carries is refused with
 //! `ValidationError`. A stack whose template declares outputs carries one `Output` per
-//! declared output, evaluated by `CreateStack`/`UpdateStack` when the template was
-//! deployed.
+//! declared output whose `Condition` holds, each with its `OutputValue` as
+//! `CreateStack`/`UpdateStack` evaluated it when the template was deployed.
 //!
 //! ## Shape of an operation
 //!

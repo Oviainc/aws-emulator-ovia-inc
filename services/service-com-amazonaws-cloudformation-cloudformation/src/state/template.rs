@@ -19,6 +19,20 @@
 //!    parameters, its resources and the pseudo parameters, which is what
 //!    `DescribeStacks` reports as `Stack$Outputs`.
 //!
+//! A `Conditions` section decides what the stack HAS: a resource or an output the
+//! template declares under a condition that evaluates false is not part of it ("you can
+//! … create resources conditionally"), while a condition this module cannot evaluate
+//! leaves both in place rather than dropping them.
+//!
+//! A stack that finished deploying reports a VALUE for every output its template
+//! declares, because that is the only way a client learns what CloudFormation created:
+//! `Ref` answers a declared resource's physical id, `Fn::GetAtt` the named attribute of
+//! one — from that type's published "Return values" where [`return_values`] carries it,
+//! from the resource's own declared property where the attribute IS that property, and
+//! from CloudFormation's uniform `Arn`/`Id`/`Name` naming otherwise (see
+//! [`conventional_attributes`]) — and the intrinsic functions an output composes them
+//! with are evaluated rather than dropped.
+//!
 //! ## What this does NOT do
 //!
 //! Creating the resource in the service that owns it (an `AWS::SNS::Topic` in Amazon
@@ -27,11 +41,16 @@
 //! CloudFormation's documented naming rules give them, and nothing here reports a status,
 //! an error or a value for an upstream call that never ran.
 //!
-//! An expression this module cannot evaluate (an intrinsic function it does not
-//! implement, a `Ref` to a name the template never declares) yields NO value rather than
-//! a guessed one: the output is reported with its key and description and without an
-//! `OutputValue`, because `Output$OutputValue` is optional and a made-up ARN is worse
-//! than an absent one.
+//! An expression this module cannot evaluate yields NO value rather than a guessed one:
+//! the output is reported with its key and description and without an `OutputValue`,
+//! because `Output$OutputValue` is optional and a made-up ARN is worse than an absent
+//! one. What is left unevaluated is an expression whose INPUT this emulator does not
+//! hold — a `Ref` to a name the template never declares, a `Fn::ImportValue` of an
+//! export no stack of this account published (the account-wide export registry is
+//! `ListExports`'s, and it is still scaffolded), a `Fn::Transform` macro, or a
+//! `Fn::GetAtt` for an attribute that is neither published for the type, declared as a
+//! property of the resource, nor one of the conventional names — never a function whose
+//! value follows from the template and the stack.
 //!
 //! ## Bounds
 //!
@@ -91,6 +110,24 @@ pub const MAX_RESOURCES_PER_TEMPLATE: usize = 500;
 /// The documented CloudFormation quota ("Outputs — maximum number of outputs that you can
 /// declare in a template: 200").
 pub const MAX_OUTPUTS_PER_TEMPLATE: usize = 200;
+
+/// The most attributes one provisioned resource records for `Fn::GetAtt` to read.
+///
+/// A resource's attributes are its type's published return values, the conventional
+/// names and the properties the template declared for it — all three bounded by the
+/// template body, which is itself bounded; this is the explicit ceiling on the
+/// per-resource map so one caller's template cannot grow it further. Chosen: far past
+/// the properties any resource declaration carries.
+pub const MAX_ATTRIBUTES_PER_RESOURCE: usize = 128;
+
+/// How many Availability Zones a Region has, for `Fn::GetAZs`.
+///
+/// The account's network is modelled Region by Region rather than stored (see
+/// `services/common/src/network.rs`): a Region has three Availability Zones, named
+/// `<region>a`, `<region>b`, `<region>c`, which is exactly what EC2's own
+/// `availability_zones_in_region` reports — so a template reading the zones here reads
+/// the zones `DescribeAvailabilityZones` lists.
+pub const AVAILABILITY_ZONES_PER_REGION: usize = 3;
 
 /// The most parameters one template declares. The documented CloudFormation quota
 /// ("Parameters — maximum number of parameters that you can declare in a template: 200").
@@ -305,6 +342,11 @@ pub struct DeclaredResource {
     pub resource_type: String,
     /// `Properties`, with intrinsic functions still unevaluated.
     pub properties: Value,
+    /// `Condition`: the name of the condition that governs whether this resource is
+    /// created at all ("the optional `Conditions` section … controls whether certain
+    /// resources are created"). `None` for a resource the template declares
+    /// unconditionally.
+    pub condition: Option<String>,
     /// The WHOLE resource object the template declares, `Type` and every other
     /// `ResourceAttribute` (`Metadata`, `DeletionPolicy`, `UpdatePolicy`, …) included.
     ///
@@ -322,6 +364,9 @@ pub struct DeclaredOutput {
     pub description: Option<String>,
     /// `Export.Name`, with intrinsic functions still unevaluated.
     pub export_name: Option<Value>,
+    /// `Condition`: the name of the condition that governs whether this output is
+    /// reported at all ("Condition: … output values that are conditionally created").
+    pub condition: Option<String>,
 }
 
 /// A template body, as this service reads it.
@@ -333,8 +378,15 @@ pub struct Template {
     /// `Parameters`, with each declared parameter's `Default` where it has a string one:
     /// the value a `Ref` to that parameter resolves to when the request supplied none.
     pub parameter_defaults: BTreeMap<String, String>,
+    /// Each declared parameter's `Type`, which is what decides whether a `Ref` to it
+    /// resolves to one value or to a LIST of them: "CommaDelimitedList: An array of
+    /// literal strings that are separated by commas", and likewise every `List<…>` type.
+    pub parameter_types: BTreeMap<String, String>,
     /// The `Mappings` section, which `Fn::FindInMap` reads.
     pub mappings: Value,
+    /// The `Conditions` section, which `Fn::If` and a resource's or output's own
+    /// `Condition` are evaluated against.
+    pub conditions: Value,
     pub resources: Vec<DeclaredResource>,
     pub outputs: Vec<DeclaredOutput>,
 }
@@ -378,6 +430,14 @@ fn template_of(document: &Value) -> Option<Template> {
             .filter(|mappings| mappings.is_object())
             .cloned()
             .unwrap_or(Value::Null),
+        // "Conditions: Conditions that control whether certain resources are created or
+        // whether certain resource properties are assigned a value" — a section, like
+        // `Mappings`, that the evaluator reads rather than a declaration list.
+        conditions: document
+            .get("Conditions")
+            .filter(|conditions| conditions.is_object())
+            .cloned()
+            .unwrap_or(Value::Null),
         ..Template::default()
     };
     template.description = document
@@ -394,6 +454,13 @@ fn template_of(document: &Value) -> Option<Template> {
             // the parameter's type; a `List<Number>` default is left to the request.
             if let Some(default) = declaration.get("Default").and_then(scalar_text) {
                 template.parameter_defaults.insert(name.clone(), default);
+            }
+            // "Type (required): The data type for the parameter" — kept because a
+            // list-typed parameter's value is an ARRAY to every function that reads it.
+            if let Some(declared_type) = declaration.get("Type").and_then(Value::as_str) {
+                template
+                    .parameter_types
+                    .insert(name.clone(), declared_type.to_string());
             }
         }
     }
@@ -415,6 +482,10 @@ fn template_of(document: &Value) -> Option<Template> {
                     .get("Properties")
                     .cloned()
                     .unwrap_or(Value::Null),
+                condition: declaration
+                    .get("Condition")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string),
                 declaration: declaration.clone(),
             });
         }
@@ -441,6 +512,10 @@ fn template_of(document: &Value) -> Option<Template> {
                     .get("Export")
                     .and_then(|export| export.get("Name"))
                     .cloned(),
+                condition: declaration
+                    .get("Condition")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string),
             });
         }
     }
@@ -734,34 +809,226 @@ pub struct StackScope<'a> {
 /// `TopicName: !Ref TopicName` case), against the stack's parameters and pseudo
 /// parameters: the resources are what this function is producing, so a name that refers
 /// to ANOTHER resource is not resolvable here and that resource takes the generated name.
+///
+/// A resource the template declares under a `Condition` is materialised only where that
+/// condition HOLDS ("you can … create resources conditionally"); a condition this module
+/// cannot evaluate leaves the resource in place rather than silently dropping it.
+///
+/// `scope` is the deployment's scope with NO resources resolved yet — which is what this
+/// function produces. The attributes each resource answers are filled in in a second
+/// pass, once every resource's identity is known, so an attribute that is the resource's
+/// own declared property resolves even where that property refers to another resource of
+/// the same template (`VpcId: !Ref Vpc`).
 pub fn provision(
     template: &Template,
-    parameters: &BTreeMap<String, String>,
-    scope: StackScope<'_>,
+    scope: &Scope<'_>,
     budget: &mut Budget,
 ) -> Vec<StoredResource> {
-    let no_resources = BTreeMap::new();
-    let naming = Scope {
-        stack: scope,
-        parameters,
-        resources: &no_resources,
-        mappings: &template.mappings,
-    };
-    template
-        .resources
+    let mut names: Vec<(&DeclaredResource, String)> = Vec::new();
+    let mut provisioned: Vec<StoredResource> = Vec::new();
+    for declared in &template.resources {
+        if !is_created(declared, scope, budget) {
+            continue;
+        }
+        let name = physical_name(declared, scope, budget);
+        let (physical_resource_id, attributes) =
+            return_values(&declared.resource_type, &name, scope.stack);
+        provisioned.push(StoredResource {
+            logical_id: declared.logical_id.clone(),
+            resource_type: declared.resource_type.clone(),
+            physical_resource_id,
+            attributes,
+        });
+        names.push((declared, name));
+    }
+
+    let by_logical_id: BTreeMap<String, StoredResource> = provisioned
         .iter()
-        .map(|declared| {
-            let name = physical_name(declared, &naming, budget);
-            let (physical_resource_id, attributes) =
-                return_values(&declared.resource_type, &name, scope);
-            StoredResource {
-                logical_id: declared.logical_id.clone(),
-                resource_type: declared.resource_type.clone(),
-                physical_resource_id,
-                attributes,
-            }
-        })
-        .collect()
+        .map(|resource| (resource.logical_id.clone(), resource.clone()))
+        .collect();
+    let resolved = Scope {
+        resources: &by_logical_id,
+        ..*scope
+    };
+    for (resource, (declared, name)) in provisioned.iter_mut().zip(names) {
+        attach_attributes(resource, declared, &name, &resolved, budget);
+    }
+    provisioned
+}
+
+/// Whether a declared resource is one this deployment creates.
+///
+/// Unconditional unless the declaration names a `Condition`, and then exactly when that
+/// condition evaluates TRUE. A condition this module cannot evaluate is not an answer of
+/// `false`: the resource is created, because dropping a resource the template declares
+/// would be a worse answer than materialising one a false condition would have excluded.
+fn is_created(declared: &DeclaredResource, scope: &Scope<'_>, budget: &mut Budget) -> bool {
+    declared.condition.as_deref().is_none_or(|condition| {
+        condition_holds(condition, scope, 0, budget).unwrap_or(true)
+    })
+}
+
+/// Fill in the attributes a provisioned resource answers `Fn::GetAtt` with, beyond the
+/// ones its type's published return values already gave it:
+///
+/// 1. the conventional `Arn`/`Id`/`Name` names every type answers
+///    ([`conventional_attributes`]);
+/// 2. each property the template DECLARED for the resource, under the property's own
+///    name — CloudFormation publishes a great many attributes that are exactly the
+///    property the template set (`AWS::EC2::Subnet`'s `AvailabilityZone`, `CidrBlock`
+///    and `VpcId` among them), and the declared value is the one the resource has.
+///
+/// Neither ever overwrites an attribute already present: the type's published return
+/// value wins over the convention, and the convention over the raw property.
+fn attach_attributes(
+    resource: &mut StoredResource,
+    declared: &DeclaredResource,
+    name: &str,
+    scope: &Scope<'_>,
+    budget: &mut Budget,
+) {
+    for (attribute, value) in
+        conventional_attributes(&declared.resource_type, name, resource, scope.stack)
+    {
+        if resource.attributes.len() >= MAX_ATTRIBUTES_PER_RESOURCE {
+            return;
+        }
+        resource.attributes.entry(attribute).or_insert(value);
+    }
+    let Some(properties) = declared.properties.as_object() else {
+        return;
+    };
+    for (property, declaration) in properties {
+        if resource.attributes.len() >= MAX_ATTRIBUTES_PER_RESOURCE {
+            return;
+        }
+        if resource.attributes.contains_key(property) {
+            continue;
+        }
+        // Only a property that resolves to ONE value is an attribute: a list- or
+        // object-valued property is not something `Fn::GetAtt` reports as a string.
+        if let Some(value) = text(declaration, scope, 0, budget) {
+            resource.attributes.insert(property.clone(), value);
+        }
+    }
+}
+
+/// The attributes CloudFormation's UNIFORM return-value naming gives a resource of ANY
+/// type.
+///
+/// Every resource type publishes its own "Return values" section, and [`return_values`]
+/// carries the ones whose values do not follow from the resource's identity. Across those
+/// sections the NAMES are uniform, though: a type's `Arn`/`<Type>Arn` attribute is the
+/// resource's ARN, its `Id`/`<Type>Id` the physical id `Ref` returns, and its
+/// `Name`/`<Type>Name` the resource's name. A resource of a type this service carries no
+/// catalogue entry for therefore still answers those, so an output over it resolves
+/// instead of being reported with a key and no value.
+///
+/// The ARN is the resource's OWN: the one its type's published return values already gave
+/// it, where they gave it one (an `…Arn` attribute, or a physical id that is itself an
+/// ARN), and otherwise the type's SERVICE segment as the ARN namespace
+/// (`AWS::EC2::Subnet` -> `ec2`) with its TYPE segment, hyphenated, as the resource path
+/// (`arn:aws:ec2:<region>:<account>:subnet/<name>`) — the form the majority of AWS ARNs
+/// take.
+///
+/// That minted form is the same kind of approximation as the physical id it is built
+/// from, and it diverges the same way: a type whose published ARN carries a
+/// multi-segment resource path (`AWS::Scheduler::Schedule` is `schedule/<group>/<name>`,
+/// `AWS::AutoScaling::AutoScalingGroup` is
+/// `autoScalingGroup:<id>:autoScalingGroupName/<name>`) gets an ARN of this emulator's
+/// uniform shape rather than of that type's. Narrowing it is the business of the open
+/// fidelity issue on the identifiers a stack's outputs carry
+/// (`20261022T154846Z-…-stack-outputs-return-synthesized-logical-names-instead`): the
+/// answer is a catalogue entry in [`return_values`], which wins here, for each type whose
+/// real identifiers this emulator can produce — not an absent value, which is what a
+/// client cannot use at all.
+///
+/// The names are offered for every type, so `Fn::GetAtt` answers one real CloudFormation
+/// would reject at validation time for a type that publishes no such attribute. This
+/// service does not validate a template against the resource-type registry at all (it has
+/// none), so refusing those names would not make it stricter — it would only make the
+/// attributes a type DOES publish depend on whether the catalogue happens to carry it.
+fn conventional_attributes(
+    resource_type: &str,
+    name: &str,
+    resource: &StoredResource,
+    stack: StackScope<'_>,
+) -> Vec<(String, String)> {
+    // A resource type is `AWS::<Service>::<Type>`: the service segment is the ARN
+    // namespace and the last segment is the resource's own type. Anything else (a
+    // malformed `Type`) carries no convention at all.
+    let segments: Vec<&str> = resource_type.split("::").collect();
+    let (Some(service), Some(segment)) = (segments.get(1), segments.last()) else {
+        return Vec::new();
+    };
+    if segments.len() < 3 || service.is_empty() || segment.is_empty() {
+        return Vec::new();
+    }
+    let physical_resource_id = resource.physical_resource_id.clone();
+    let arn = known_arn(resource).unwrap_or_else(|| {
+        ::emulator_server::emulator_arn(
+            &service.to_lowercase(),
+            stack.region,
+            &format!("{}/{name}", hyphenated(segment)),
+        )
+    });
+    vec![
+        ("Arn".to_string(), arn.clone()),
+        (format!("{segment}Arn"), arn),
+        ("Id".to_string(), physical_resource_id.clone()),
+        (format!("{segment}Id"), physical_resource_id),
+        ("Name".to_string(), name.to_string()),
+        (format!("{segment}Name"), name.to_string()),
+    ]
+}
+
+/// The ARN a resource ALREADY carries: its physical resource id where that is an ARN
+/// ("Ref returns the Amazon Resource Name (ARN)", for the types documented that way), or
+/// the value of the one `…Arn` attribute its type's published return values gave it.
+///
+/// This is what keeps the conventional `Arn` of a type [`return_values`] carries from
+/// disagreeing with the ARN that type really publishes (`AWS::SNS::Topic`'s `TopicArn`,
+/// `AWS::SQS::Queue`'s `Arn`).
+fn known_arn(resource: &StoredResource) -> Option<String> {
+    if resource.physical_resource_id.starts_with("arn:") {
+        return Some(resource.physical_resource_id.clone());
+    }
+    let mut published = resource
+        .attributes
+        .iter()
+        .filter(|(attribute, value)| attribute.ends_with("Arn") && value.starts_with("arn:"));
+    let (_, only) = published.next()?;
+    // Two published ARNs and no rule for which is "the" ARN: the convention mints the
+    // resource's own rather than choosing one of them.
+    if published.next().is_some() {
+        return None;
+    }
+    Some(only.clone())
+}
+
+/// A resource type's segment as an ARN resource path spells it: `AutoScalingGroup` ->
+/// `auto-scaling-group`, `LaunchTemplate` -> `launch-template`, `VPC` -> `vpc`.
+///
+/// A hyphen goes before an upper-case character that starts a word — one following a
+/// lower-case character or digit, or one followed by a lower-case character — so an
+/// initialism stays one word.
+fn hyphenated(segment: &str) -> String {
+    let characters: Vec<char> = segment.chars().collect();
+    let mut out = String::with_capacity(segment.len() + 4);
+    for (index, character) in characters.iter().enumerate() {
+        let starts_word = index > 0
+            && character.is_ascii_uppercase()
+            && (characters[index - 1].is_ascii_lowercase()
+                || characters[index - 1].is_ascii_digit()
+                || characters
+                    .get(index + 1)
+                    .is_some_and(char::is_ascii_lowercase));
+        if starts_word {
+            out.push('-');
+        }
+        out.push(character.to_ascii_lowercase());
+    }
+    out
 }
 
 /// The name a declared resource carries.
@@ -961,29 +1228,42 @@ pub struct Scope<'a> {
     pub stack: StackScope<'a>,
     /// The parameter values in force on the stack, keyed by `ParameterKey`.
     pub parameters: &'a BTreeMap<String, String>,
+    /// The TYPE each parameter was declared with, which decides whether a `Ref` to it
+    /// resolves to one value or to a list of them.
+    pub parameter_types: &'a BTreeMap<String, String>,
     /// The stack's resources, keyed by logical id.
     pub resources: &'a BTreeMap<String, StoredResource>,
     /// The template's `Mappings` section.
     pub mappings: &'a Value,
+    /// The template's `Conditions` section.
+    pub conditions: &'a Value,
 }
 
 /// Evaluate every output a template declares, in `OutputKey` order (the protocol fixes no
 /// order for `Stack$Outputs`).
 ///
-/// One entry per DECLARED output, whether or not its value could be evaluated: the output
-/// exists because the template declares it, and [`StoredOutput::value`] is `None` where
-/// this module cannot compute the value rather than carrying an invented one. The
-/// `budget` is the deployment's — shared with [`provision`] — so the work of a whole
-/// request is bounded, not just each output's.
+/// One entry per output the stack HAS — an output the template declares under a
+/// `Condition` that evaluates false is not one of them ("output values that are
+/// conditionally created"), and a condition this module cannot evaluate leaves the output
+/// reported rather than dropping it. Whether or not its value could be evaluated does not
+/// change that: the output exists because the template declares it, and
+/// [`StoredOutput::value`] is `None` where this module cannot compute the value rather
+/// than carrying an invented one. The `budget` is the deployment's — shared with
+/// [`provision`] — so the work of a whole request is bounded, not just each output's.
 pub fn evaluate_outputs(
     template: &Template,
     scope: &Scope<'_>,
     budget: &mut Budget,
 ) -> Vec<StoredOutput> {
-    template
-        .outputs
-        .iter()
-        .map(|declared| StoredOutput {
+    let mut outputs = Vec::with_capacity(template.outputs.len());
+    for declared in &template.outputs {
+        let reported = declared.condition.as_deref().is_none_or(|condition| {
+            condition_holds(condition, scope, 0, budget).unwrap_or(true)
+        });
+        if !reported {
+            continue;
+        }
+        outputs.push(StoredOutput {
             key: declared.key.clone(),
             value: text(&declared.value, scope, 0, budget),
             description: declared.description.clone(),
@@ -991,8 +1271,9 @@ pub fn evaluate_outputs(
                 .export_name
                 .as_ref()
                 .and_then(|name| text(name, scope, 0, budget)),
-        })
-        .collect()
+        });
+    }
+    outputs
 }
 
 /// An evaluated expression: CloudFormation's intrinsic functions produce either a string
@@ -1075,11 +1356,13 @@ fn bounded(resolved: Resolved, budget: &mut Budget) -> Option<Resolved> {
 
 /// Evaluate one intrinsic function.
 ///
-/// The functions this module does not implement — `Fn::ImportValue` (a cross-stack export
-/// registry this emulator does not keep), `Fn::GetAZs` (the Availability Zones of an
-/// account in a Region), `Fn::Base64`, `Fn::Cidr`, `Fn::ToJsonString`, `Fn::Length` and
-/// the condition functions — yield no value, so an output that uses one is reported
-/// without an `OutputValue`.
+/// The functions this module does not implement yield no value, so an output that uses
+/// one is reported without an `OutputValue`: `Fn::ImportValue` (the account-wide registry
+/// of exported output values is `ListExports`'s, and that operation is still scaffolded)
+/// and `Fn::Transform` (a macro this emulator runs nothing for). The CONDITION functions
+/// (`Fn::Equals`, `Fn::And`, `Fn::Or`, `Fn::Not`, `Condition`) are not values either:
+/// they are evaluated where CloudFormation allows them — the `Conditions` section and
+/// `Fn::If` — by [`boolean`].
 fn intrinsic(
     name: &str,
     argument: &Value,
@@ -1090,7 +1373,7 @@ fn intrinsic(
     match name {
         // "The intrinsic function Ref returns the value of the specified parameter or
         // resource."
-        "Ref" => reference(argument.as_str()?, scope).map(Resolved::Text),
+        "Ref" => reference(argument.as_str()?, scope),
         // "The Fn::GetAtt intrinsic function returns the value of an attribute from a
         // resource in the template": [logicalNameOfResource, attributeName], or the
         // short form's dotted string.
@@ -1147,8 +1430,299 @@ fn intrinsic(
                 .and_then(scalar_text)?;
             Some(Resolved::Text(found))
         }
+        // "The intrinsic function Fn::GetAZs returns an array that lists Availability
+        // Zones for a specified Region … you can specify "" (empty string) … to get all
+        // Availability Zones for the Region the stack is created in."
+        "Fn::GetAZs" => {
+            let requested = if argument.is_null() {
+                String::new()
+            } else {
+                text(argument, scope, depth + 1, budget)?
+            };
+            let region = if requested.is_empty() {
+                scope.stack.region
+            } else {
+                requested.as_str()
+            };
+            Some(Resolved::List(availability_zones(region)))
+        }
+        // "The intrinsic function Fn::Base64 returns the Base64 representation of the
+        // input string." The codec is `aws_smithy_types::base64`, the standard-alphabet
+        // encoder the wire serializer already uses for every Smithy blob.
+        "Fn::Base64" => {
+            let source = text(argument, scope, depth + 1, budget)?;
+            Some(Resolved::Text(::aws_smithy_types::base64::encode(source)))
+        }
+        // "The intrinsic function Fn::Cidr returns an array of CIDR address blocks."
+        "Fn::Cidr" => cidr(argument, scope, depth, budget),
+        // "Fn::If returns one value if the specified condition evaluates to true and
+        // another value if the specified condition evaluates to false":
+        // [condition_name, value_if_true, value_if_false].
+        "Fn::If" => {
+            let branches = argument.as_array()?;
+            if branches.len() != 3 {
+                return None;
+            }
+            let holds = condition_holds(branches[0].as_str()?, scope, depth + 1, budget)?;
+            let chosen = if holds { &branches[1] } else { &branches[2] };
+            evaluate(chosen, scope, depth + 1, budget)
+        }
+        // "Fn::Length returns the number of elements within an array or an intrinsic
+        // function that returns an array." (A `AWS::LanguageExtensions` function; this
+        // service runs no transform, and the count is what it is either way.)
+        "Fn::Length" => {
+            let items = list(argument, scope, depth + 1, budget)?;
+            Some(Resolved::Text(items.len().to_string()))
+        }
+        // "Fn::ToJsonString … converts an object or array to its corresponding JSON
+        // string." (An `AWS::LanguageExtensions` function, as above.)
+        "Fn::ToJsonString" => json_text(argument, scope, depth, budget).map(Resolved::Text),
         _ => None,
     }
+}
+
+/// The Availability Zones Region `region` has, in zone-name order, as `Fn::GetAZs` lists
+/// them.
+///
+/// Derived from the Region name rather than stored: the zones of a Region are a fact of
+/// the account's network, named `<region>` + a letter running from `a`
+/// ([`AVAILABILITY_ZONES_PER_REGION`] of them) — the model of the account's network every
+/// service of this emulator shares (stated in `services/common/src/network.rs`, and
+/// implemented for EC2 by that crate's own `availability_zones_in_region`), so the zones a
+/// template reads here are the zones `DescribeAvailabilityZones` reports.
+fn availability_zones(region: &str) -> Vec<String> {
+    (0..AVAILABILITY_ZONES_PER_REGION)
+        .map(|index| {
+            let letter = char::from(b'a' + u8::try_from(index).unwrap_or(0));
+            format!("{region}{letter}")
+        })
+        .collect()
+}
+
+/// `{"Fn::Cidr": [ipBlock, count, cidrBits]}`: "the specified number of CIDRs"
+/// (`count`) carved out of `ipBlock` in order, each with `cidrBits` subnet bits —
+/// "specifying a value of 8 for this parameter will create a CIDR with a mask of /24"
+/// for an IPv4 block, which is the block's address size (32 bits, or 128 for IPv6) less
+/// those subnet bits.
+///
+/// No value for a request the arithmetic cannot satisfy: a block that is not a CIDR, a
+/// subnet size larger than the block, or more subnets than the block holds.
+fn cidr(
+    argument: &Value,
+    scope: &Scope<'_>,
+    depth: usize,
+    budget: &mut Budget,
+) -> Option<Resolved> {
+    use ::std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    let arguments = argument.as_array()?;
+    if arguments.len() < 3 {
+        return None;
+    }
+    let block = text(&arguments[0], scope, depth + 1, budget)?;
+    let count: usize = text(&arguments[1], scope, depth + 1, budget)?.parse().ok()?;
+    let subnet_bits: u32 = text(&arguments[2], scope, depth + 1, budget)?.parse().ok()?;
+    if count == 0 || count > MAX_RESOLVED_LIST_LEN {
+        return None;
+    }
+    let (address, prefix) = block.split_once('/')?;
+    let prefix: u32 = prefix.parse().ok()?;
+    let (base, total_bits, is_ipv6) = match address.parse::<IpAddr>().ok()? {
+        IpAddr::V4(address) => (u128::from(u32::from(address)), 32u32, false),
+        IpAddr::V6(address) => (u128::from(address), 128u32, true),
+    };
+    if prefix > total_bits || subnet_bits > total_bits {
+        return None;
+    }
+    let subnet_prefix = total_bits - subnet_bits;
+    if subnet_prefix < prefix {
+        return None;
+    }
+    // The block holds 2^(subnet prefix - block prefix) subnets of that size.
+    let available = 1u128.checked_shl(subnet_prefix - prefix)?;
+    if u128::try_from(count).ok()? > available {
+        return None;
+    }
+    // The distance from one subnet's network to the next. A subnet that IS the whole
+    // address space (`::/0` with 128 subnet bits) has no next one — the bound above has
+    // already held `count` to the single subnet the block holds — so the step is never
+    // added to anything there.
+    let step = 1u128.checked_shl(subnet_bits).unwrap_or(0);
+    let network = base & (ones(total_bits) ^ ones(total_bits - prefix));
+    let mut blocks = Vec::with_capacity(count);
+    for index in 0..count {
+        let address = network.checked_add(u128::try_from(index).ok()?.checked_mul(step)?)?;
+        let rendered = if is_ipv6 {
+            Ipv6Addr::from(address).to_string()
+        } else {
+            Ipv4Addr::from(u32::try_from(address).ok()?).to_string()
+        };
+        blocks.push(format!("{rendered}/{subnet_prefix}"));
+    }
+    bounded(Resolved::List(blocks), budget)
+}
+
+/// The low `bits` bits set.
+fn ones(bits: u32) -> u128 {
+    if bits >= 128 {
+        u128::MAX
+    } else {
+        (1u128 << bits) - 1
+    }
+}
+
+/// Whether the condition `name` the template declares evaluates TRUE, or `None` when
+/// this module cannot evaluate it — including when the template declares no condition by
+/// that name.
+fn condition_holds(
+    name: &str,
+    scope: &Scope<'_>,
+    depth: usize,
+    budget: &mut Budget,
+) -> Option<bool> {
+    if depth > MAX_INTRINSIC_DEPTH {
+        return None;
+    }
+    budget.spend(1)?;
+    let declaration = scope.conditions.get(name)?;
+    boolean(declaration, scope, depth + 1, budget)
+}
+
+/// Evaluate a CONDITION: "the condition functions … Fn::And, Fn::Equals, Fn::If,
+/// Fn::Not, Fn::Or", plus a `Condition` naming another declared condition.
+///
+/// Separate from [`evaluate`] because a condition is not a value: CloudFormation allows
+/// these functions in the `Conditions` section and in `Fn::If`, and nowhere a value is
+/// expected.
+fn boolean(
+    value: &Value,
+    scope: &Scope<'_>,
+    depth: usize,
+    budget: &mut Budget,
+) -> Option<bool> {
+    if depth > MAX_INTRINSIC_DEPTH {
+        return None;
+    }
+    budget.spend(1)?;
+    if let Some(flag) = value.as_bool() {
+        return Some(flag);
+    }
+    let members = value.as_object()?;
+    let mut entries = members.iter();
+    let (name, argument) = entries.next()?;
+    if entries.next().is_some() {
+        return None;
+    }
+    match name.as_str() {
+        // "Fn::Equals compares if two values are equal. Returns true if the two values
+        // are equal or false if they aren't."
+        "Fn::Equals" => {
+            let [left, right] = pair(argument)?;
+            let left = evaluate(left, scope, depth + 1, budget)?;
+            let right = evaluate(right, scope, depth + 1, budget)?;
+            Some(left == right)
+        }
+        // "Fn::Not returns true for a condition that evaluates to false or returns false
+        // for a condition that evaluates to true": a one-element list.
+        "Fn::Not" => {
+            let conditions = argument.as_array()?;
+            if conditions.len() != 1 {
+                return None;
+            }
+            Some(!boolean(&conditions[0], scope, depth + 1, budget)?)
+        }
+        // "Fn::And returns true if all the specified conditions evaluate to true"; and
+        // "Fn::Or returns true if any one of the specified conditions evaluate to true".
+        "Fn::And" | "Fn::Or" => {
+            let conditions = argument.as_array()?;
+            if conditions.is_empty() || conditions.len() > MAX_RESOLVED_LIST_LEN {
+                return None;
+            }
+            let all = name == "Fn::And";
+            let mut holds = all;
+            for condition in conditions {
+                let evaluated = boolean(condition, scope, depth + 1, budget)?;
+                holds = if all {
+                    holds && evaluated
+                } else {
+                    holds || evaluated
+                };
+            }
+            Some(holds)
+        }
+        // "Condition: … the name of a condition that evaluates to true or false."
+        "Condition" => condition_holds(argument.as_str()?, scope, depth + 1, budget),
+        _ => None,
+    }
+}
+
+/// `{"Fn::ToJsonString": <value>}`: the value with every intrinsic function inside it
+/// resolved, serialized as JSON.
+fn json_text(
+    argument: &Value,
+    scope: &Scope<'_>,
+    depth: usize,
+    budget: &mut Budget,
+) -> Option<String> {
+    let resolved = json_value(argument, scope, depth + 1, budget)?;
+    let rendered = ::serde_json::to_string(&resolved).ok()?;
+    budget.spend_text(rendered.len())?;
+    (rendered.len() <= MAX_RESOLVED_TEXT_BYTES).then_some(rendered)
+}
+
+/// One node of a `Fn::ToJsonString` argument with the intrinsic functions inside it
+/// resolved: an intrinsic becomes the string (or the array of strings) it evaluates to,
+/// and every other node keeps its shape.
+fn json_value(
+    value: &Value,
+    scope: &Scope<'_>,
+    depth: usize,
+    budget: &mut Budget,
+) -> Option<Value> {
+    if depth > MAX_INTRINSIC_DEPTH {
+        return None;
+    }
+    budget.spend(1)?;
+    match value {
+        Value::Object(members) if is_intrinsic(members) => {
+            match evaluate(value, scope, depth + 1, budget)? {
+                Resolved::Text(text) => Some(Value::String(text)),
+                Resolved::List(items) => {
+                    Some(Value::Array(items.into_iter().map(Value::String).collect()))
+                }
+            }
+        }
+        Value::Object(members) => {
+            if members.len() > MAX_RESOLVED_LIST_LEN {
+                return None;
+            }
+            let mut resolved = Map::new();
+            for (key, member) in members {
+                resolved.insert(key.clone(), json_value(member, scope, depth + 1, budget)?);
+            }
+            Some(Value::Object(resolved))
+        }
+        Value::Array(items) => {
+            if items.len() > MAX_RESOLVED_LIST_LEN {
+                return None;
+            }
+            let mut resolved = Vec::with_capacity(items.len());
+            for item in items {
+                resolved.push(json_value(item, scope, depth + 1, budget)?);
+            }
+            Some(Value::Array(resolved))
+        }
+        scalar => Some(scalar.clone()),
+    }
+}
+
+/// Whether an object is an intrinsic function: one member, named `Ref` or `Fn::<Name>`.
+fn is_intrinsic(members: &Map<String, Value>) -> bool {
+    members.len() == 1
+        && members
+            .keys()
+            .next()
+            .is_some_and(|name| name == "Ref" || name.starts_with("Fn::"))
 }
 
 /// The two arguments a binary intrinsic function takes.
@@ -1169,40 +1743,64 @@ fn list(
 ) -> Option<Vec<String>> {
     match evaluate(value, scope, depth, budget)? {
         Resolved::List(items) => Some(items),
-        // A function that produced one string where a list was expected (a `Ref` to a
-        // `CommaDelimitedList` parameter, say) is not a list: CloudFormation's own typed
-        // parameters are not modelled here, so this yields no value rather than
-        // splitting a string nobody asked to split.
+        // A function that produced one string where a list was expected is not a list:
+        // the list-valued expressions are the list-typed parameters (see
+        // [`is_list_type`]) and the functions documented to return an array, and this
+        // yields no value rather than splitting a string nobody asked to split.
         Resolved::Text(_) => None,
     }
 }
 
 /// `{"Ref": "<name>"}`: a pseudo parameter, a template parameter, or a resource's
 /// physical id.
-fn reference(name: &str, scope: &Scope<'_>) -> Option<String> {
+///
+/// A parameter declared with a LIST type resolves to a list, not to one string:
+/// "CommaDelimitedList: An array of literal strings that are separated by commas", and
+/// likewise every `List<…>` type — which is what lets `Fn::Select`, `Fn::Join` and
+/// `Fn::Length` read a `Ref` to one.
+fn reference(name: &str, scope: &Scope<'_>) -> Option<Resolved> {
     // "CloudFormation provides pseudo parameters … use them the same way as you would a
     // parameter, as the argument for the Ref function."
     match name {
-        "AWS::Region" => return Some(scope.stack.region.to_string()),
-        "AWS::AccountId" => return Some(::emulator_server::emulator_account_id().to_string()),
-        "AWS::StackName" => return Some(scope.stack.stack_name.to_string()),
-        "AWS::StackId" => return Some(scope.stack.stack_id.to_string()),
-        "AWS::Partition" => return Some(PARTITION.to_string()),
-        "AWS::URLSuffix" => return Some(URL_SUFFIX.to_string()),
+        "AWS::Region" => return Some(Resolved::Text(scope.stack.region.to_string())),
+        "AWS::AccountId" => {
+            return Some(Resolved::Text(
+                ::emulator_server::emulator_account_id().to_string(),
+            ))
+        }
+        "AWS::StackName" => return Some(Resolved::Text(scope.stack.stack_name.to_string())),
+        "AWS::StackId" => return Some(Resolved::Text(scope.stack.stack_id.to_string())),
+        "AWS::Partition" => return Some(Resolved::Text(PARTITION.to_string())),
+        "AWS::URLSuffix" => return Some(Resolved::Text(URL_SUFFIX.to_string())),
         // "AWS::NoValue … removes the corresponding resource property" — there is no
         // value to substitute.
         "AWS::NoValue" => return None,
         _ => {}
     }
     if let Some(value) = scope.parameters.get(name) {
-        return Some(value.clone());
+        if is_list_type(scope.parameter_types.get(name).map(String::as_str)) {
+            let items: Vec<String> = value
+                .split(',')
+                .map(|item| item.trim().to_string())
+                .collect();
+            return (items.len() <= MAX_RESOLVED_LIST_LEN).then_some(Resolved::List(items));
+        }
+        return Some(Resolved::Text(value.clone()));
     }
     // "Ref returns the physical ID of the resource" for a logical id the template
     // declares.
     scope
         .resources
         .get(name)
-        .map(|resource| resource.physical_resource_id.clone())
+        .map(|resource| Resolved::Text(resource.physical_resource_id.clone()))
+}
+
+/// Whether a declared parameter type carries a LIST of values: `CommaDelimitedList`, or
+/// any of the `List<…>` types ("List<Number>", "List<AWS::EC2::Subnet::Id>", …).
+fn is_list_type(declared_type: Option<&str>) -> bool {
+    declared_type.is_some_and(|declared| {
+        declared == "CommaDelimitedList" || declared.starts_with("List<")
+    })
 }
 
 /// `{"Fn::GetAtt": ["<logical id>", "<attribute>"]}`, or the short form's
@@ -1297,7 +1895,11 @@ fn substitute(
                 budget,
             )?);
         } else {
-            out.push_str(&reference(name, scope)?);
+            match reference(name, scope)? {
+                Resolved::Text(value) => out.push_str(&value),
+                // A list is not a value a substitution can put into a string.
+                Resolved::List(_) => return None,
+            }
         }
         budget.spend(1)?;
         if out.len() > MAX_RESOLVED_TEXT_BYTES {

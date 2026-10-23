@@ -568,7 +568,18 @@ impl StoredStack {
         // ONE budget for the whole deployment: the resource names and every output are
         // evaluated out of it, so the total work one request can ask for is bounded.
         let mut budget = template::Budget::new();
-        let resources = template::provision(&declared, &parameters, stack, &mut budget);
+        let no_resources = BTreeMap::new();
+        // The deployment's scope with no resource resolved yet, which is what
+        // `provision` turns into the stack's resources.
+        let scope = template::Scope {
+            stack,
+            parameters: &parameters,
+            parameter_types: &declared.parameter_types,
+            resources: &no_resources,
+            mappings: &declared.mappings,
+            conditions: &declared.conditions,
+        };
+        let resources = template::provision(&declared, &scope, &mut budget);
         let by_logical_id: BTreeMap<String, StoredResource> = resources
             .iter()
             .map(|resource| (resource.logical_id.clone(), resource.clone()))
@@ -576,10 +587,8 @@ impl StoredStack {
         let outputs = template::evaluate_outputs(
             &declared,
             &template::Scope {
-                stack,
-                parameters: &parameters,
                 resources: &by_logical_id,
-                mappings: &declared.mappings,
+                ..scope
             },
             &mut budget,
         );
