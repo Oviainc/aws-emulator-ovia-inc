@@ -47,6 +47,9 @@ mod input_push_endpoints;
 #[path = "all/input_security_group.rs"]
 mod input_security_group;
 
+#[path = "all/input_security_group_listing.rs"]
+mod input_security_group_listing;
+
 #[path = "all/input_update.rs"]
 mod input_update;
 
