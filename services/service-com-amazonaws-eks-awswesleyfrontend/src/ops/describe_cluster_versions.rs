@@ -23,8 +23,13 @@
 //! * `defaultOnly` — keeps only the default version, the one `CreateCluster`
 //!   creates when the caller names no `version`.
 //! * `status` / `versionStatus` — the same lifecycle state in the deprecated and
-//!   the current spelling (`status` "is deprecated. Use `versionStatus` instead"),
-//!   each matched against the row's derived status; giving both applies both.
+//!   the current spelling (`status` "is deprecated. Use `versionStatus` instead,
+//!   as that field matches for input and output of this action"), each matched
+//!   against the row's derived status; giving both applies both. Only
+//!   `versionStatus` matches in BOTH directions: this FILTER takes the deprecated
+//!   member in the `ClusterVersionStatus` spelling (`standard-support`), while the
+//!   reported `ClusterVersionInformation$status` carries the `VersionStatus`
+//!   spelling its replacement does (see `crate::state`).
 //! * `includeAll` — "Include all available versions in the response". It only ever
 //!   WIDENS a listing, and this calendar already publishes every version it knows
 //!   (narrowed only by whether the clock has reached a row's release date), so no
