@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AddFlowSources
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AddFlowSources`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AddFlowSources::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Adds sources to the flow a request names, each materialised into a record the flow
+//! keeps and reported back out of the stored flow.
 //!
 //! ## Shape of an operation
 //!
@@ -81,6 +74,38 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use crate::state::StoredSource;
+
+/// Refuse the request with the service's own client-input error, `BadRequestException`
+/// (HTTP 400): "thrown if the request contains a semantic error". `detail` states what was
+/// unacceptable; the message carries it inside this service's refusal envelope
+/// ([`crate::state::validation_failed_message`]).
+fn bad_request(detail: impl Into<String>) -> AddFlowSourcesError {
+    AddFlowSourcesErrorModeled::BadRequestException(BadRequestException {
+        message: crate::state::validation_failed_message(&detail.into()),
+    })
+    .into()
+}
+
+/// Refuse the request with `NotFoundException` (HTTP 404): "one or more of the resources
+/// in the request does not exist in the system" — the flow `identifier` addressed, in this
+/// service's not-found envelope ([`crate::state::not_found_message`]).
+fn not_found(identifier: &str) -> AddFlowSourcesError {
+    AddFlowSourcesErrorModeled::NotFoundException(NotFoundException {
+        message: crate::state::not_found_message(identifier),
+    })
+    .into()
+}
+
+/// The server-side refusal this operation answers when the store cannot be reached or a
+/// flow it just read cannot be read back (HTTP 500).
+fn internal_error(message: &str) -> AddFlowSourcesError {
+    AddFlowSourcesErrorModeled::InternalServerErrorException(InternalServerErrorException {
+        message: message.to_string(),
+    })
+    .into()
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -155,18 +180,87 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AddFlowSources` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AddFlowSourcesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AddFlowSources"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_error(
+                "the mediaconnect flow store is unavailable",
+            ));
+        };
+
+        // "A list of sources that you want to add to the flow": a request that adds no
+        // source has nothing to do, which is a semantic error rather than a no-op.
+        if input.sources.is_empty() {
+            return Err(bad_request(
+                "An add flow sources request must include at least one source.",
+            ));
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // The status change the clock already owes this flow is materialised before the
+        // flow is read, exactly as the reporting operations do it.
+        store.settle_due_transitions(now);
+
+        // This operation adds sources to "a flow", addressed by the flow's own ARN.
+        let Some(flow) = store.flows.get(&input.flow_arn) else {
+            return Err(not_found(&input.flow_arn));
+        };
+
+        // The bound is on the STORED flow, so it counts the sources already stored plus
+        // the ones this request would add (see `crate::state::MAX_FLOW_SOURCES`).
+        let held = flow.sources.len();
+        if held + input.sources.len() > crate::state::MAX_FLOW_SOURCES {
+            return Err(bad_request(format!(
+                "A flow can hold at most {} sources; flow {} already has {held} and this \
+                 request adds {}.",
+                crate::state::MAX_FLOW_SOURCES,
+                input.flow_arn,
+                input.sources.len()
+            )));
+        }
+
+        // `Source.Name` is required while `SetSourceRequest.Name` is optional, so a
+        // source whose request named none is named by the service — against the flow's
+        // existing source names AND the names resolved for earlier sources of this same
+        // request, through the one function CreateFlow names a source with.
+        let flow_name = flow.name.clone();
+        let mut taken = flow.source_names();
+        let mut names = Vec::with_capacity(input.sources.len());
+        for (offset, request) in input.sources.iter().enumerate() {
+            let name = crate::state::resolve_source_name(
+                request.name.as_deref(),
+                &flow_name,
+                held + offset,
+                &taken,
+            );
+            taken.insert(name.clone());
+            names.push(name);
+        }
+
+        // Nothing above wrote anything, so a refused request leaves the flow exactly as
+        // it was. From here the whole batch is stored.
+        let mut added = Vec::with_capacity(input.sources.len());
+        for (request, name) in input.sources.iter().zip(names) {
+            let suffix = store.next_suffix();
+            added.push(StoredSource::from_set_request(request, name, &region, suffix));
+        }
+        let Some(flow) = store.flows.get_mut(&input.flow_arn) else {
+            return Err(internal_error(
+                "the flow could not be read back while adding its sources",
+            ));
+        };
+        let first_added = flow.sources.len();
+        flow.sources.extend(added);
+
+        // "The details of the newly added sources" — read back out of the STORED flow,
+        // not from the request, and only the sources this call appended.
+        let sources: Vec<Source> = flow.sources[first_added..]
+            .iter()
+            .map(StoredSource::to_source)
+            .collect();
+        Ok(AddFlowSourcesOutput {
+            flow_arn: Some(flow.flow_arn.clone()),
+            sources: Some(sources),
+        })
     }
 }
