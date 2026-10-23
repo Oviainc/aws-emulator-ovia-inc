@@ -2,29 +2,83 @@
 
 //! `GetResourceMetrics`, end to end over the wire.
 //!
-//! The rules under test are the ones the model and the member documentation
-//! state: `AlignedStartTime` sits on a period boundary at or before the
-//! requested `StartTime` and `AlignedEndTime` on one at or after the requested
-//! `EndTime`; the period is one of the documented granularities, chosen from the
-//! window when the caller names none; the series a metric key carries is one
-//! data point per period across the aligned window, and `PeriodAlignment`
-//! decides whether a point is stamped with its period's start or its end
-//! (`END_TIME` by default); one `MetricList` entry per `MetricQueries` element;
-//! and a repeated call answers identically because nothing is stored.
+//! The rules under test are the ones the model, the member documentation and the
+//! service's recorded behaviour state: `AlignedStartTime` sits on a period
+//! boundary at or before the requested `StartTime`, while `AlignedEndTime` is
+//! the latest period boundary the service HOLDS metrics through — its own clock
+//! floored to the period, never a boundary computed from the requested
+//! `EndTime` (the bound's own suite is `aligned_window_bounds.rs`); the period is
+//! one of the documented granularities, chosen from the window when the caller
+//! names none; the series a metric key carries is one data point per period from
+//! `AlignedStartTime` across the requested window, never past the latest
+//! boundary the service holds, and `PeriodAlignment` decides whether a point is
+//! stamped with its period's start or its end (`END_TIME` by default); one
+//! `MetricList` entry per `MetricQueries` element; and a repeated call answers
+//! the same series because nothing is stored.
 
 use serde_json::{json, Value};
 
 use crate::pi_harness::{call, emulator, is_modelled_next_token};
 
-/// 2026-01-01T00:00:00Z. Windows below are stated relative to it, including ones
-/// that start and end off a period boundary.
-const T0: i64 = 1_767_225_600;
-
 /// The granularities `PeriodInSeconds` documents: 1 (one second), 60 (one
 /// minute), 300 (five minutes), 3600 (one hour), 86400 (twenty-four hours).
 const DOCUMENTED_PERIODS: &[i64] = &[1, 60, 300, 3600, 86400];
 
+/// One day in seconds — a multiple of every documented period, which is what
+/// makes a day boundary a boundary of all of them.
+const ONE_DAY: i64 = 86_400;
+
+/// How far clear of the service's clock [`past_start`] keeps a window's end.
+///
+/// Two whole days, which is more than the coarsest documented period: a window
+/// that ends this far back is one the service holds metrics through from end to
+/// end, so its series covers the whole requested window at every granularity.
+const PAST_MARGIN: i64 = 2 * ONE_DAY;
+
 const IDENTIFIER: &str = "db-ABCDEFG1234567";
+
+/// Epoch seconds, as the service reads its own clock.
+fn unix_now() -> i64 {
+    i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("the clock is at or after the Unix epoch")
+            .as_secs(),
+    )
+    .expect("the current time fits in an i64")
+}
+
+/// `seconds` floored to a `period` boundary measured from the Unix epoch — the
+/// alignment both of the service's reported bounds use.
+fn floor_to(seconds: i64, period: i64) -> i64 {
+    seconds - seconds.rem_euclid(period)
+}
+
+/// `seconds` raised to a `period` boundary measured from the Unix epoch.
+fn ceil_to(seconds: i64, period: i64) -> i64 {
+    let remainder = seconds.rem_euclid(period);
+    if remainder == 0 {
+        seconds
+    } else {
+        seconds - remainder + period
+    }
+}
+
+/// A window start that leaves a `span`-second window entirely in the PAST, clear
+/// of the service's clock by [`PAST_MARGIN`], and on a boundary of every
+/// documented period.
+fn past_start(span: i64) -> i64 {
+    floor_to(unix_now() - span - PAST_MARGIN, ONE_DAY)
+}
+
+/// The `AlignedEndTime` values a call made between `before` and `after` may
+/// report at `period`: the service's clock floored to the period, which is the
+/// one driver of that bound.
+fn aligned_end_candidates(before: i64, after: i64, period: i64) -> Vec<i64> {
+    let mut candidates = vec![floor_to(before, period), floor_to(after, period)];
+    candidates.dedup();
+    candidates
+}
 
 fn metrics_input(
     identifier: &str,
@@ -64,11 +118,12 @@ fn data_points(answer: &Value, index: usize) -> Vec<Value> {
         .unwrap_or_default()
 }
 
-/// RULE: the returned window is the requested one widened to the effective
-/// period's NEAREST boundaries, and the series for the requested metric carries
-/// no invented magnitudes.
+/// RULE: `AlignedStartTime` is the requested `StartTime` floored to the
+/// effective period, `AlignedEndTime` is the service's own clock floored to the
+/// same period, and the series for the requested metric spans the requested
+/// window at that granularity with no invented magnitudes.
 #[tokio::test]
-async fn the_window_is_widened_to_the_nearest_period_boundaries() {
+async fn the_window_is_reported_from_the_request_start_and_the_services_clock() {
     let emulator = emulator();
 
     // The rows differ along what the rule generalises over: the period (every
@@ -76,6 +131,7 @@ async fn the_window_is_widened_to_the_nearest_period_boundaries() {
     // start and end already sit on a boundary, and the alignment.
     let mut cases: Vec<(i64, i64, i64, Option<&str>)> = Vec::new();
     for &period in DOCUMENTED_PERIODS {
+        let t0 = past_start(period * 4);
         for (start_offset, end_offset) in [
             (0, period),              // both ends already aligned
             (1, period + 1),          // both ends inside a period
@@ -83,13 +139,14 @@ async fn the_window_is_widened_to_the_nearest_period_boundaries() {
             (0, period * 3 + 7),      // an end that needs widening
         ] {
             for alignment in [None, Some("START_TIME"), Some("END_TIME")] {
-                cases.push((T0 + start_offset, T0 + end_offset, period, alignment));
+                cases.push((t0 + start_offset, t0 + end_offset, period, alignment));
             }
         }
     }
 
     for (start, end, period, alignment) in cases {
         let label = format!("start={start} end={end} period={period} alignment={alignment:?}");
+        let before = unix_now();
         let answer = call(
             &emulator,
             "GetResourceMetrics",
@@ -103,6 +160,7 @@ async fn the_window_is_widened_to_the_nearest_period_boundaries() {
             ),
         )
         .await;
+        let after = unix_now();
         assert_eq!(
             answer.status, 200,
             "case {label}: expected 200, got {} {:?}",
@@ -126,50 +184,41 @@ async fn the_window_is_widened_to_the_nearest_period_boundaries() {
             .unwrap_or_else(|| panic!("case {label}: no AlignedEndTime in {:?}", answer.body));
 
         assert_eq!(
-            aligned_start % period,
-            0,
-            "case {label}: expected AlignedStartTime on a {period}s boundary, got {aligned_start}"
+            aligned_start,
+            floor_to(start, period),
+            "case {label}: expected AlignedStartTime at the {period}s boundary at or before \
+             StartTime, got {aligned_start}"
         );
-        assert_eq!(
-            aligned_end % period,
-            0,
-            "case {label}: expected AlignedEndTime on a {period}s boundary, got {aligned_end}"
-        );
+        // The end bound is the latest boundary the service holds, i.e. its clock
+        // floored to the period — NOT the requested end rounded in either
+        // direction.
+        let candidates = aligned_end_candidates(before, after, period);
         assert!(
-            aligned_start <= start,
-            "case {label}: expected AlignedStartTime <= StartTime, got {aligned_start}"
-        );
-        assert!(
-            aligned_end >= end,
-            "case {label}: expected AlignedEndTime >= EndTime, got {aligned_end}"
-        );
-        // Widened by less than one period at each end, i.e. the NEAREST
-        // boundary, not an arbitrary earlier or later one.
-        assert!(
-            start - aligned_start < period && aligned_end - end < period,
-            "case {label}: expected the nearest boundaries, got {aligned_start}..{aligned_end}"
+            candidates.contains(&aligned_end),
+            "case {label}: expected AlignedEndTime to be the current time floored to the \
+             {period}s boundary ({candidates:?}), got {aligned_end}"
         );
 
-        // The series spans the window the answer itself reports: one point per
-        // period of [AlignedStartTime, AlignedEndTime).
+        // The series spans the requested window at the effective period, and
+        // stops at the latest boundary the service holds.
         let points = data_points(&answer.body, 0);
-        let expected = (aligned_end - aligned_start) / period;
+        let expected = (ceil_to(end, period).min(aligned_end) - aligned_start) / period;
         assert_eq!(
             points.len() as i64,
             expected,
-            "case {label}: expected {expected} data points across the reported window, got {}",
+            "case {label}: expected {expected} data points across the requested window, got {}",
             points.len()
         );
     }
 }
 
-/// RULE: the series a metric key carries is the GRID the aligned window holds:
-/// one data point per `PeriodInSeconds` period across
-/// `[AlignedStartTime, AlignedEndTime)`, in time order, each stamped at that
+/// RULE: the series a metric key carries is the GRID the requested window holds:
+/// one data point per `PeriodInSeconds` period from `AlignedStartTime` to the
+/// requested window's own aligned end, in time order, each stamped at that
 /// period's start or end as `PeriodAlignment` asks and each carrying the
 /// `@required` `Value` the model declares.
 #[tokio::test]
-async fn the_series_is_the_grid_the_aligned_window_holds() {
+async fn the_series_is_the_grid_the_requested_window_holds() {
     let emulator = emulator();
 
     // The rows differ along what the rule generalises over: the period (every
@@ -178,9 +227,10 @@ async fn the_series_is_the_grid_the_aligned_window_holds() {
     // whether the requested window already sits on period boundaries.
     let mut cases: Vec<(i64, i64, i64, Option<&str>)> = Vec::new();
     for &period in DOCUMENTED_PERIODS {
+        let t0 = past_start(period * 3);
         for (start_offset, end_offset) in [(0, period * 3), (1, period * 2 + 1)] {
             for alignment in [None, Some("START_TIME"), Some("END_TIME")] {
-                cases.push((T0 + start_offset, T0 + end_offset, period, alignment));
+                cases.push((t0 + start_offset, t0 + end_offset, period, alignment));
             }
         }
     }
@@ -207,15 +257,17 @@ async fn the_series_is_the_grid_the_aligned_window_holds() {
         );
 
         let aligned_start = answer.member("AlignedStartTime").as_i64().unwrap_or(-1);
-        let aligned_end = answer.member("AlignedEndTime").as_i64().unwrap_or(-1);
         let points = data_points(&answer.body, 0);
 
-        // One point per period of the window the answer itself reports.
-        let expected = (aligned_end - aligned_start) / period;
+        // The window is wholly in the past, so the series covers it completely:
+        // one point per period from the aligned start to the aligned end of the
+        // REQUESTED window.
+        let series_end = ceil_to(end, period);
+        let expected = (series_end - aligned_start) / period;
         assert_eq!(
             points.len() as i64,
             expected,
-            "case {label}: expected {expected} points across {aligned_start}..{aligned_end}, \
+            "case {label}: expected {expected} points across {aligned_start}..{series_end}, \
              got {}",
             points.len()
         );
@@ -242,25 +294,25 @@ async fn the_series_is_the_grid_the_aligned_window_holds() {
             );
         }
 
-        // The first and last stamps are the window's own ends, so a client
-        // charting the series has the x-axis the window describes: inclusive of
-        // the start under START_TIME, inclusive of the end under END_TIME.
+        // The first and last stamps are the series' own ends, so a client
+        // charting it has the x-axis the requested window describes: inclusive
+        // of the start under START_TIME, inclusive of the end under END_TIME.
         if let (Some(first), Some(last)) = (points.first(), points.last()) {
             let first_stamp = first.get("Timestamp").and_then(Value::as_i64);
             let last_stamp = last.get("Timestamp").and_then(Value::as_i64);
             if stamps_the_period_start {
                 assert_eq!(
                     (first_stamp, last_stamp),
-                    (Some(aligned_start), Some(aligned_end - period)),
+                    (Some(aligned_start), Some(series_end - period)),
                     "case {label}: expected the period-start grid {aligned_start}..\
                      {}, got {first_stamp:?}..{last_stamp:?}",
-                    aligned_end - period
+                    series_end - period
                 );
             } else {
                 assert_eq!(
                     (first_stamp, last_stamp),
-                    (Some(aligned_start + period), Some(aligned_end)),
-                    "case {label}: expected the period-end grid {}..{aligned_end}, got \
+                    (Some(aligned_start + period), Some(series_end)),
+                    "case {label}: expected the period-end grid {}..{series_end}, got \
                      {first_stamp:?}..{last_stamp:?}",
                     aligned_start + period
                 );
@@ -280,7 +332,7 @@ async fn every_metric_key_carries_the_same_grid() {
     let answer = call(
         &emulator,
         "GetResourceMetrics",
-        metrics_input(IDENTIFIER, &metrics, T0, T0 + 1_800, Some(60), None),
+        metrics_input(IDENTIFIER, &metrics, past_start(1_800), past_start(1_800) + 1_800, Some(60), None),
     )
     .await;
     assert_eq!(
@@ -319,7 +371,8 @@ async fn a_cursor_whose_offset_is_past_the_query_list_is_refused() {
     // A legitimately paged request, to obtain a cursor whose scope IS this
     // request's. The cursor is `hex("<offset>|<scope>")`, so the rows below
     // rewrite only the offset and keep the scope the service accepted.
-    let mut paged = metrics_input(IDENTIFIER, &metrics, T0, T0 + 3_600, Some(60), None);
+    let t0 = past_start(3_600);
+    let mut paged = metrics_input(IDENTIFIER, &metrics, t0, t0 + 3_600, Some(60), None);
     paged["MaxResults"] = json!(1);
     let issued = call(&emulator, "GetResourceMetrics", paged.clone())
         .await
@@ -393,14 +446,17 @@ async fn a_response_past_the_emulators_data_point_budget_is_refused() {
     // about the POINT COUNT rather than about one granularity.
     let budget = service_com_amazonaws_pi_performanceinsightsv20180227::state::MAX_DATA_POINTS_PER_RESPONSE;
     for &period in &[1_i64, 60] {
+        // The whole window sits in the past, so the budget is measured against a
+        // grid the service holds every period of.
+        let t0 = past_start((budget + 1) * period);
         let at_bound = call(
             &emulator,
             "GetResourceMetrics",
             metrics_input(
                 IDENTIFIER,
                 &["db.load.avg"],
-                T0,
-                T0 + budget * period,
+                t0,
+                t0 + budget * period,
                 Some(period),
                 None,
             ),
@@ -423,8 +479,8 @@ async fn a_response_past_the_emulators_data_point_budget_is_refused() {
             metrics_input(
                 IDENTIFIER,
                 &["db.load.avg"],
-                T0,
-                T0 + (budget + 1) * period,
+                t0,
+                t0 + (budget + 1) * period,
                 Some(period),
                 None,
             ),
@@ -448,13 +504,21 @@ async fn a_response_past_the_emulators_data_point_budget_is_refused() {
     // served for one metric key and refused for three, and `MaxResults` pages
     // it back inside.
     let half = budget / 2;
+    let half_window_start = past_start(half * 60);
     for (keys, expected_status) in [(1_usize, 200), (2, 200), (3, 400)] {
         let metrics: Vec<String> = (0..keys).map(|index| format!("db.sql.stat{index}.avg")).collect();
         let metrics: Vec<&str> = metrics.iter().map(String::as_str).collect();
         let answer = call(
             &emulator,
             "GetResourceMetrics",
-            metrics_input(IDENTIFIER, &metrics, T0, T0 + half * 60, Some(60), None),
+            metrics_input(
+                IDENTIFIER,
+                &metrics,
+                half_window_start,
+                half_window_start + half * 60,
+                Some(60),
+                None,
+            ),
         )
         .await;
         assert_eq!(
@@ -466,7 +530,14 @@ async fn a_response_past_the_emulators_data_point_budget_is_refused() {
 
     let metrics: Vec<String> = (0..3).map(|index| format!("db.sql.stat{index}.avg")).collect();
     let metrics: Vec<&str> = metrics.iter().map(String::as_str).collect();
-    let mut paged = metrics_input(IDENTIFIER, &metrics, T0, T0 + half * 60, Some(60), None);
+    let mut paged = metrics_input(
+        IDENTIFIER,
+        &metrics,
+        half_window_start,
+        half_window_start + half * 60,
+        Some(60),
+        None,
+    );
     paged["MaxResults"] = json!(1);
     let answer = call(&emulator, "GetResourceMetrics", paged).await;
     assert_eq!(
@@ -484,7 +555,8 @@ async fn a_response_past_the_emulators_data_point_budget_is_refused() {
 
 /// RULE: with no `PeriodInSeconds` the service picks the finest documented
 /// granularity that keeps the window inside the documented 100-200 data-point
-/// goal — observable in the boundaries the window is widened to.
+/// goal — observable in the grid the series carries and in the boundary the
+/// start bound is floored to.
 #[tokio::test]
 async fn the_period_is_chosen_from_the_window_when_the_caller_names_none() {
     let emulator = emulator();
@@ -496,9 +568,10 @@ async fn the_period_is_chosen_from_the_window_when_the_caller_names_none() {
     ];
 
     for &span in spans {
-        // T0 is a multiple of every documented period, so starting one second
-        // past it makes the widened window reveal which period was chosen.
-        let start = T0 + 1;
+        // The window starts one second past a day boundary — a multiple of every
+        // documented period — so the start bound reveals which period was
+        // chosen, and the whole window sits in the past.
+        let start = past_start(span) + 1;
         let answer = call(
             &emulator,
             "GetResourceMetrics",
@@ -512,7 +585,6 @@ async fn the_period_is_chosen_from_the_window_when_the_caller_names_none() {
         );
 
         let aligned_start = answer.member("AlignedStartTime").as_i64().unwrap_or(-1);
-        let aligned_end = answer.member("AlignedEndTime").as_i64().unwrap_or(-1);
 
         // The finest documented granularity that keeps the window inside the
         // documented budget, and the coarsest one for a window too long for any
@@ -526,25 +598,35 @@ async fn the_period_is_chosen_from_the_window_when_the_caller_names_none() {
                 periods <= 200
             })
             .unwrap_or(86_400);
-        // The window the documented alignment rule widens this request to, at
-        // the period the rule above chose.
+        // The grid the requested window holds at the period the rule above
+        // chose: the start floored to it, the end raised to it.
         let end = start + span;
-        let expected_start = start - start.rem_euclid(expected_period);
-        let covered = end - expected_start;
-        let periods_in_window =
-            covered / expected_period + i64::from(covered % expected_period != 0);
-        let expected_end = expected_start + periods_in_window * expected_period;
+        let expected_start = floor_to(start, expected_period);
+        let series_end = ceil_to(end, expected_period);
+        let periods_in_window = (series_end - expected_start) / expected_period;
 
         assert_eq!(
             aligned_start, expected_start,
-            "case span={span}: expected the window widened down to the {expected_period}s \
+            "case span={span}: expected the start floored to the {expected_period}s \
              boundary at {expected_start}, got {aligned_start}"
         );
+        let points = data_points(&answer.body, 0);
         assert_eq!(
-            aligned_end, expected_end,
-            "case span={span}: expected a window of {periods_in_window} periods of \
-             {expected_period}s ending at {expected_end}, got {aligned_start}..{aligned_end}"
+            points.len() as i64,
+            periods_in_window,
+            "case span={span}: expected {periods_in_window} periods of {expected_period}s \
+             across {expected_start}..{series_end}, got {} points",
+            points.len()
         );
+        // The spacing between points is the chosen period itself.
+        if let (Some(first), Some(second)) = (points.first(), points.get(1)) {
+            let spacing = second.get("Timestamp").and_then(Value::as_i64).unwrap_or(0)
+                - first.get("Timestamp").and_then(Value::as_i64).unwrap_or(0);
+            assert_eq!(
+                spacing, expected_period,
+                "case span={span}: expected the points {expected_period}s apart, got {spacing}"
+            );
+        }
         if expected_period != 86_400 {
             assert!(
                 periods_in_window <= 200,
@@ -564,14 +646,15 @@ async fn period_in_seconds_accepts_exactly_the_documented_granularities() {
     for &period in DOCUMENTED_PERIODS {
         // A window of one period, so even the one-second granularity stays
         // small.
+        let t0 = past_start(period);
         let answer = call(
             &emulator,
             "GetResourceMetrics",
             metrics_input(
                 IDENTIFIER,
                 &["db.load.avg"],
-                T0,
-                T0 + period,
+                t0,
+                t0 + period,
                 Some(period),
                 None,
             ),
@@ -586,6 +669,7 @@ async fn period_in_seconds_accepts_exactly_the_documented_granularities() {
 
     // Each row is one period off the documented set, including values just
     // below and just above every published one.
+    let t0 = past_start(3_600);
     for period in [0, 2, 30, 59, 61, 299, 301, 3_599, 3_601, 86_399, 86_401, 172_800] {
         let answer = call(
             &emulator,
@@ -593,8 +677,8 @@ async fn period_in_seconds_accepts_exactly_the_documented_granularities() {
             metrics_input(
                 IDENTIFIER,
                 &["db.load.avg"],
-                T0,
-                T0 + 3_600,
+                t0,
+                t0 + 3_600,
                 Some(period),
                 None,
             ),
@@ -640,14 +724,15 @@ async fn one_metric_list_entry_per_query_keyed_by_its_metric() {
     ];
 
     for metrics in cases {
+        let t0 = past_start(3_600);
         let answer = call(
             &emulator,
             "GetResourceMetrics",
             metrics_input(
                 IDENTIFIER,
                 &metrics,
-                T0,
-                T0 + 3_600,
+                t0,
+                t0 + 3_600,
                 Some(300),
                 Some("END_TIME"),
             ),
@@ -685,17 +770,21 @@ async fn one_metric_list_entry_per_query_keyed_by_its_metric() {
     }
 }
 
-/// RULE: the answer is computed from the request and nothing else, so repeating
-/// a call answers identically — and no entry carries an invented magnitude.
+/// RULE: the series is computed from the request and nothing else, so repeating
+/// a call answers the same series and the same start bound — and no entry
+/// carries an invented magnitude. The END bound is the service's clock floored
+/// to the period, so it is the one member a repeat may advance (never a value
+/// the request decided).
 #[tokio::test]
-async fn repeating_the_same_request_answers_identically() {
+async fn repeating_the_same_request_answers_the_same_series() {
     let emulator = emulator();
 
+    let t0 = past_start(3_600);
     let input = metrics_input(
         IDENTIFIER,
         &["db.load.avg", "os.cpuUtilization.total.avg"],
-        T0 + 17,
-        T0 + 3_600,
+        t0 + 17,
+        t0 + 3_600,
         Some(60),
         Some("END_TIME"),
     );
@@ -707,14 +796,27 @@ async fn repeating_the_same_request_answers_identically() {
         "case the first call: expected 200, got {} {:?}",
         first.status, first.body
     );
-    assert_eq!(
-        first.body, second.body,
-        "case repeated call: expected an identical answer, got {:?} then {:?}",
-        first.body, second.body
+    for member in ["Identifier", "AlignedStartTime", "MetricList", "NextToken"] {
+        assert_eq!(
+            first.member(member),
+            second.member(member),
+            "case repeated call: expected the same {member}, got {:?} then {:?}",
+            first.member(member),
+            second.member(member)
+        );
+    }
+    let (first_end, second_end) = (
+        first.member("AlignedEndTime").as_i64().unwrap_or(-1),
+        second.member("AlignedEndTime").as_i64().unwrap_or(-1),
+    );
+    assert!(
+        second_end >= first_end,
+        "case repeated call: expected the end bound to track the clock forward, got \
+         {first_end} then {second_end}"
     );
 
-    // The window is 60 periods of 60 seconds wide ([T0, T0 + 3600) widened to
-    // the nearest minute boundaries), and both entries carry that same grid.
+    // The window is 60 periods of 60 seconds wide ([t0 + 17, t0 + 3600) aligned
+    // to the nearest minute boundaries), and both entries carry that same grid.
     for index in 0..2 {
         let series = data_points(&first.body, index);
         assert_eq!(
@@ -740,6 +842,7 @@ async fn max_results_pages_the_metric_keys_exactly_once() {
     ];
 
     for page_size in [1, 2, 3, 5, 6, 25] {
+        let t0 = past_start(3_600);
         let mut seen: Vec<String> = Vec::new();
         let mut next_token: Option<String> = None;
         let mut pages = 0;
@@ -748,8 +851,8 @@ async fn max_results_pages_the_metric_keys_exactly_once() {
             let mut input = metrics_input(
                 IDENTIFIER,
                 &metrics,
-                T0,
-                T0 + 3_600,
+                t0,
+                t0 + 3_600,
                 Some(3_600),
                 Some("END_TIME"),
             );
@@ -813,11 +916,12 @@ async fn max_results_pages_the_metric_keys_exactly_once() {
 
     // A cursor from one window does not resume another: the result set it was
     // issued for is part of the token.
+    let t0 = past_start(90_000);
     let mut first = metrics_input(
         IDENTIFIER,
         &metrics,
-        T0,
-        T0 + 3_600,
+        t0,
+        t0 + 3_600,
         Some(3_600),
         Some("END_TIME"),
     );
@@ -832,8 +936,8 @@ async fn max_results_pages_the_metric_keys_exactly_once() {
     let mut elsewhere = metrics_input(
         IDENTIFIER,
         &metrics,
-        T0 + 86_400,
-        T0 + 90_000,
+        t0 + 86_400,
+        t0 + 90_000,
         Some(3_600),
         Some("END_TIME"),
     );
@@ -855,10 +959,11 @@ async fn max_results_pages_the_metric_keys_exactly_once() {
 async fn a_window_whose_end_does_not_follow_its_start_is_refused() {
     let emulator = emulator();
 
+    let t0 = past_start(86_400);
     for (start, end, label) in [
-        (T0, T0, "equal"),
-        (T0, T0 - 1, "one second inverted"),
-        (T0, T0 - 86_400, "a day inverted"),
+        (t0, t0, "equal"),
+        (t0, t0 - 1, "one second inverted"),
+        (t0, t0 - 86_400, "a day inverted"),
     ] {
         let answer = call(
             &emulator,
@@ -939,12 +1044,14 @@ async fn extreme_timestamps_are_refused_rather_than_overflowing() {
     ];
 
     for (label, start, end) in served {
+        let before = unix_now();
         let answer = call(
             &emulator,
             "GetResourceMetrics",
             metrics_input(IDENTIFIER, &["db.load.avg"], start, end, Some(3_600), None),
         )
         .await;
+        let after = unix_now();
         assert_eq!(
             answer.status, 200,
             "case {label}: expected 200, got {} {:?}",
@@ -958,18 +1065,45 @@ async fn extreme_timestamps_are_refused_rather_than_overflowing() {
             "case {label}: expected both ends on a 3600s boundary, got \
              {aligned_start}..{aligned_end}"
         );
-        assert!(
-            aligned_start <= start && aligned_end >= end,
-            "case {label}: expected the window to cover {start}..{end}, got \
-             {aligned_start}..{aligned_end}"
+        assert_eq!(
+            aligned_start,
+            floor_to(start, 3_600),
+            "case {label}: expected the start floored to the 3600s boundary, got {aligned_start}"
         );
+        // A window the service's clock has already passed reports the latest
+        // boundary it holds; one that has not been reached yet holds NOTHING, so
+        // its reported window is empty and carries no point.
+        let points = data_points(&answer.body, 0);
+        if aligned_start <= floor_to(before, 3_600) {
+            let candidates = aligned_end_candidates(before, after, 3_600);
+            assert!(
+                candidates.contains(&aligned_end),
+                "case {label}: expected AlignedEndTime at the current 3600s boundary \
+                 ({candidates:?}), got {aligned_end}"
+            );
+            assert_eq!(
+                points.len() as i64,
+                (ceil_to(end, 3_600).min(aligned_end) - aligned_start) / 3_600,
+                "case {label}: expected the grid of the held part of the window, got {} points",
+                points.len()
+            );
+        } else {
+            assert_eq!(
+                (aligned_end, points.len()),
+                (aligned_start, 0),
+                "case {label}: expected an empty window for one the clock has not reached, \
+                 got {aligned_start}..{aligned_end} with {} points",
+                points.len()
+            );
+        }
     }
 
     // The emulator still answers normally afterwards: nothing was wedged.
+    let t0 = past_start(3_600);
     let healthy = call(
         &emulator,
         "GetResourceMetrics",
-        metrics_input(IDENTIFIER, &["db.load.avg"], T0, T0 + 3_600, Some(60), None),
+        metrics_input(IDENTIFIER, &["db.load.avg"], t0, t0 + 3_600, Some(60), None),
     )
     .await;
     assert_eq!(
@@ -1005,6 +1139,7 @@ async fn grouped_or_filtered_queries_answer_501_rather_than_fabricating() {
         ),
     ];
 
+    let t0 = past_start(3_600);
     for (label, query) in cases {
         let answer = call(
             &emulator,
@@ -1013,8 +1148,8 @@ async fn grouped_or_filtered_queries_answer_501_rather_than_fabricating() {
                 "ServiceType": "RDS",
                 "Identifier": IDENTIFIER,
                 "MetricQueries": [query],
-                "StartTime": T0,
-                "EndTime": T0 + 3_600,
+                "StartTime": t0,
+                "EndTime": t0 + 3_600,
                 "PeriodInSeconds": 300,
             }),
         )
@@ -1040,8 +1175,8 @@ async fn grouped_or_filtered_queries_answer_501_rather_than_fabricating() {
             "ServiceType": "RDS",
             "Identifier": IDENTIFIER,
             "MetricQueries": [{"Metric": "db.load.avg", "Filter": {}}],
-            "StartTime": T0,
-            "EndTime": T0 + 3_600,
+            "StartTime": t0,
+            "EndTime": t0 + 3_600,
             "PeriodInSeconds": 300,
         }),
     )
@@ -1059,14 +1194,15 @@ async fn grouped_or_filtered_queries_answer_501_rather_than_fabricating() {
 async fn reading_metrics_does_not_touch_the_report_store() {
     let emulator = emulator();
 
+    let t0 = past_start(3_600);
     let created = call(
         &emulator,
         "CreatePerformanceAnalysisReport",
         json!({
             "ServiceType": "RDS",
             "Identifier": IDENTIFIER,
-            "StartTime": T0,
-            "EndTime": T0 + 3_600,
+            "StartTime": t0,
+            "EndTime": t0 + 3_600,
         }),
     )
     .await;
@@ -1081,7 +1217,7 @@ async fn reading_metrics_does_not_touch_the_report_store() {
         let answer = call(
             &emulator,
             "GetResourceMetrics",
-            metrics_input(IDENTIFIER, &["db.load.avg"], T0, T0 + 3_600, Some(60), None),
+            metrics_input(IDENTIFIER, &["db.load.avg"], t0, t0 + 3_600, Some(60), None),
         )
         .await;
         assert_eq!(

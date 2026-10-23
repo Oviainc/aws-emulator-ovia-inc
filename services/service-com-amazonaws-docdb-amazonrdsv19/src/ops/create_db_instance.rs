@@ -376,18 +376,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .expect("the instance was inserted on the line above");
         let dbi_resource_id = stored.dbi_resource_id.clone();
         let engine = stored.engine.clone();
+        let monitoring = ::service_common::db_data_sources::MonitoringConfiguration {
+            performance_insights_enabled: stored.performance_insights_enabled,
+            // Amazon DocumentDB's model has no `DatabaseInsightsMode` member at all, so
+            // this service records none: the mode is not a setting that exists here,
+            // which is different from one that is off.
+            database_insights_mode: None,
+        };
         let db_instance = docdb::instance_to_shape(stored, store.clusters.get(&cluster_key));
         // The `DbiResourceId` just minted is recorded in the SHARED data-source
         // directory, so a service that monitors this instance can tell that THIS
         // service owns the id — Amazon RDS mints `db-<TOKEN>` ids too, so the form
-        // cannot say it. The DocumentDB store is already locked and the directory is
-        // taken second, the order its doc fixes.
+        // cannot say it. The monitoring settings this create persisted go in beside it,
+        // because a monitoring service cannot measure whether a feature is turned on
+        // for an instance — this service is what the setting was given to. The
+        // DocumentDB store is already locked and the directory is taken second, the
+        // order its doc fixes.
         if let Some(directory) = crate::state::data_source_directory(&*self.engine) {
-            directory.lock().register(
+            let mut directory = directory.lock();
+            directory.register(
                 &dbi_resource_id,
                 ::service_common::db_data_sources::SERVICE_TYPE_DOCDB,
                 &engine,
             );
+            directory.record_monitoring(&dbi_resource_id, monitoring);
         }
         Ok(CreateDBInstanceOutput {
             db_instance: Some(db_instance),

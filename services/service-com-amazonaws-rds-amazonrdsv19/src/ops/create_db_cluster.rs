@@ -1091,6 +1091,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let db_cluster = store.cluster_to_wire(&record);
         let resource_id = record.resource_id.clone();
         let engine = record.engine.clone();
+        let monitoring = ::service_common::db_data_sources::MonitoringConfiguration {
+            performance_insights_enabled: record.performance_insights_enabled,
+            database_insights_mode: Some(record.database_insights_mode.clone()),
+        };
         let cluster_arn = record.arn();
         store.db_clusters.insert(key, record);
         // A cluster that joined a global database is a MEMBER of it from now on: the
@@ -1107,14 +1111,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The id just minted is recorded in the SHARED data-source directory, so a service
         // that monitors this cluster (Performance Insights addresses a data source by its
         // resource id) can tell that THIS service owns the id: the id's form cannot say so,
-        // because a global cluster's id has the same form. The RDS store is already locked
-        // here and the directory is taken second, the order its doc fixes.
+        // because a global cluster's id has the same form. The monitoring settings this
+        // create persisted go in beside it, because a monitoring service cannot measure
+        // whether a feature is turned on for a cluster — this service is what the setting
+        // was given to. The RDS store is already locked here and the directory is taken
+        // second, the order its doc fixes.
         if let Some(directory) = crate::state::data_source_directory(&*self.engine) {
-            directory.lock().register(
+            let mut directory = directory.lock();
+            directory.register(
                 &resource_id,
                 ::service_common::db_data_sources::SERVICE_TYPE_RDS,
                 &engine,
             );
+            directory.record_monitoring(&resource_id, monitoring);
         }
 
         Ok(CreateDBClusterOutput {

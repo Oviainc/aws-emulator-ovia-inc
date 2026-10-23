@@ -185,3 +185,5 @@ mod cloudformation_provisions_sns_topics;
 mod cloudformation_provisions_waf_regional_ip_sets;
 #[path = "all/mediapackagev2_published_data_plane_urls.rs"]
 mod mediapackagev2_published_data_plane_urls;
+#[path = "all/pi_resource_features.rs"]
+mod pi_resource_features;

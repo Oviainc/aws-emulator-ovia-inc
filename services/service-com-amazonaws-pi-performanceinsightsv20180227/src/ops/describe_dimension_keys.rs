@@ -283,9 +283,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(not_authorized());
         }
 
-        let window =
-            crate::state::aligned_window(input.start_time, input.end_time, input.period_in_seconds)
-                .map_err(invalid_argument)?;
+        let window = crate::state::aligned_window(
+            input.start_time,
+            input.end_time,
+            input.period_in_seconds,
+            crate::state::now(),
+        )
+        .map_err(invalid_argument)?;
 
         // The key list is empty for every window (there are no DB sessions to
         // group), so no page can ever be partial and this operation hands out

@@ -674,9 +674,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let db_instance = record.to_wire();
+        let dbi_resource_id = record.dbi_resource_id.clone();
+        let monitoring = ::service_common::db_data_sources::MonitoringConfiguration {
+            performance_insights_enabled: record.performance_insights_enabled,
+            database_insights_mode: Some(record.database_insights_mode.clone()),
+        };
         store
             .db_instances
             .insert((region, record.identifier.clone()), record);
+        // A modification can turn Performance Insights on or off and can change the
+        // database-insights mode, so the SHARED data-source directory is brought up to
+        // date with the settings the instance runs under NOW: a monitoring service reads
+        // the current configuration, not the one the instance was created with. The RDS
+        // store is already locked here and the directory is taken second, the order its
+        // doc fixes.
+        if let Some(directory) = crate::state::data_source_directory(&*self.engine) {
+            directory
+                .lock()
+                .record_monitoring(&dbi_resource_id, monitoring);
+        }
 
         Ok(ModifyDBInstanceOutput {
             db_instance: Some(db_instance),
