@@ -15,5 +15,7 @@
 mod domain_response_projection;
 #[path = "all/domain_subscription_lifecycle.rs"]
 mod domain_subscription_lifecycle;
+#[path = "all/error_detail_member.rs"]
+mod error_detail_member;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
