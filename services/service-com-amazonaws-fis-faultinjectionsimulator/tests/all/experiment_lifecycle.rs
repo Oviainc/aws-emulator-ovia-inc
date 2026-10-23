@@ -17,10 +17,10 @@
 //!   at ANY admissible page size enumerates the collection once;
 //! * an experiment is minted from the PERSISTED template: it carries that template's
 //!   `roleArn`, targets, actions and stop conditions, starts `initiating`, becomes
-//!   `running` once the clock says so, runs for as long as its wait actions last and then
-//!   reaches the terminal status its actions earn — `completed` for a run of waits,
-//!   `failed` for one carrying an action this emulator cannot inject — and goes
-//!   `stopping` -> `stopped` with an `endTime` when it is stopped instead;
+//!   `running` once the clock says so, RUNS for as long as the longest path through its
+//!   actions' durations takes on the emulator's run clock and then reaches the terminal
+//!   status its actions earned, and goes `stopping` -> `stopped` with an `endTime` when it
+//!   is stopped instead;
 //! * a resource id that names no record answers `ResourceNotFoundException` (HTTP 404),
 //!   and a request outside a constraint the model or the FIS documentation states answers
 //!   `ValidationException` (HTTP 400).
@@ -61,10 +61,6 @@ const PAST_TRANSITION: Duration = Duration::from_millis(900);
 /// for the `aws:fis:wait` action's `duration`, and long enough that an experiment running
 /// it is still running while a case polls it.
 pub(crate) const WAIT_DURATION: &str = "PT5M";
-
-/// How long a case waits for an experiment whose run this emulator cannot perform to reach
-/// its terminal status. That run is one transition span long, so this is generous.
-const FINAL_BUDGET: Duration = Duration::from_secs(5);
 
 /// A SigV4 credential scope naming this service, for `region`. The service field is what
 /// routes the request to fis; the region field is what a minted ARN names.
@@ -210,18 +206,6 @@ pub(crate) async fn stop_experiment(router: &MultiServiceRouter, id: &str) -> An
         FALLBACK_REGION,
     )
     .await
-}
-
-/// True when every action of a create body is the `aws:fis:wait` built-in — the one action
-/// whose whole effect is elapsed time, so the emulator can carry the experiment out and
-/// the run ends `completed`. Any other action injects a fault into another service, which
-/// the emulator does not do, so that run ends `failed`.
-fn only_waits(body: &Value) -> bool {
-    body["actions"]
-        .as_object()
-        .expect("a create body names its actions")
-        .values()
-        .all(|action| action["actionId"].as_str() == Some("aws:fis:wait"))
 }
 
 /// Poll `GetExperiment` until the experiment reaches a terminal status, or `budget` runs
@@ -913,7 +897,6 @@ async fn an_experiment_carries_the_persisted_template_and_runs_to_the_status_its
     let router = emulator();
 
     for (case, body) in template_cases() {
-        let body_for_outcome = body.clone();
         let created = create_template(&router, body).await;
         let id = template_id(case, &created);
         let template = created.member("experimentTemplate").clone();
@@ -1015,66 +998,42 @@ async fn an_experiment_carries_the_persisted_template_and_runs_to_the_status_its
 
         tokio::time::sleep(PAST_TRANSITION).await;
 
-        if only_waits(&body_for_outcome) {
-            // Every action is a wait of several minutes, so the experiment is running —
-            // and stays running — once the transition to `running` has fallen due.
-            let running = get_experiment(&router, &experiment_id).await;
+        // Every started experiment RUNS: whatever its actions are, the move to `running`
+        // has fallen due by now and the run lasts longer than this case's wait, so the
+        // experiment is running — and nothing but the status has moved.
+        let running = get_experiment(&router, &experiment_id).await;
+        assert_eq!(
+            running.member("experiment")["state"]["status"]
+                .as_str()
+                .unwrap_or_default(),
+            "running",
+            "case {case:?}: expected the experiment to be running once the transition fell \
+             due, got {:?}",
+            running.body
+        );
+        assert!(
+            running.member("experiment")["endTime"].is_null(),
+            "case {case:?}: a running experiment has not ended, got {:?}",
+            running.member("experiment")["endTime"]
+        );
+        // Everything else is the record it was: only the status moved.
+        for member in ["id", "arn", "experimentTemplateId", "roleArn", "creationTime"] {
             assert_eq!(
-                running.member("experiment")["state"]["status"]
-                    .as_str()
-                    .unwrap_or_default(),
-                "running",
-                "case {case:?}: expected the experiment to be running once the transition fell \
-                 due, got {:?}",
-                running.body
+                running.member("experiment")[member], experiment[member],
+                "case {case:?}: expected experiment.{member} to be unchanged, got {:?}",
+                running.member("experiment")[member]
             );
-            // Everything else is the record it was: only the status moved.
-            for member in ["id", "arn", "experimentTemplateId", "roleArn", "creationTime"] {
-                assert_eq!(
-                    running.member("experiment")[member], experiment[member],
-                    "case {case:?}: expected experiment.{member} to be unchanged, got {:?}",
-                    running.member("experiment")[member]
-                );
-            }
-            // This row is done with its experiment: stop it, so the suite does not hold
-            // one active-experiment slot per row and no later row can be refused for
-            // having reached the account's quota.
-            let stopped = stop_experiment(&router, &experiment_id).await;
-            assert_eq!(
-                stopped.status, 200,
-                "case {case:?}: expected the stop to be accepted, got {} with {:?}",
-                stopped.status, stopped.body
-            );
-        } else {
-            // The template carries an action that injects a fault into another service,
-            // which this emulator does not do: the run ends in the modelled `failed`
-            // state with a reason saying so, rather than reporting a success.
-            let final_state = poll_until_final(&router, &experiment_id, FINAL_BUDGET).await;
-            assert_eq!(
-                final_state["state"]["status"].as_str().unwrap_or_default(),
-                "failed",
-                "case {case:?}: expected a run this emulator cannot perform to fail, \
-                 got {final_state:?}"
-            );
-            assert!(
-                final_state["state"]["reason"]
-                    .as_str()
-                    .is_some_and(|reason| !reason.is_empty()),
-                "case {case:?}: a failed experiment says why, got {final_state:?}"
-            );
-            assert!(
-                !final_state["endTime"].is_null(),
-                "case {case:?}: an experiment that has ended carries an endTime, \
-                 got {final_state:?}"
-            );
-            for member in ["id", "arn", "experimentTemplateId", "roleArn", "creationTime"] {
-                assert_eq!(
-                    final_state[member], experiment[member],
-                    "case {case:?}: expected experiment.{member} to be unchanged, got {:?}",
-                    final_state[member]
-                );
-            }
         }
+        // This row is done with its experiment: stop it, so the suite does not hold one
+        // active-experiment slot per row and no later row can be refused for having
+        // reached the account's quota. The terminal status a run EARNS is asserted in
+        // `experiment_run.rs`, which lets a compressed run elapse.
+        let stopped = stop_experiment(&router, &experiment_id).await;
+        assert_eq!(
+            stopped.status, 200,
+            "case {case:?}: expected the stop to be accepted, got {} with {:?}",
+            stopped.status, stopped.body
+        );
     }
 }
 

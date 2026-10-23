@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateCollaborationChangeRequest
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateCollaborationChangeRequest`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateCollaborationChangeRequest::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Takes one decision on a change request `CreateCollaborationChangeRequest` persisted in
+//! [`crate::state`] and reports the stored record that decision left behind, which
+//! `GetCollaborationChangeRequest` reads back unchanged.
+//!
+//! The operation "allows approval actions for pending change requests": a party to the
+//! collaboration APPROVEs or DENYs, which records THAT account's vote, and the votes then
+//! decide the request's status ([`crate::state::change_request_status_from_approvals`]);
+//! the collaboration owner CANCELs a request outright, or COMMITs one the parties have
+//! approved — which is when the request's changes are applied to the collaboration. A
+//! request that has reached a terminal status (COMMITTED, DENIED, CANCELLED) admits no
+//! further decision, and a COMMIT before the parties have approved is refused, so nothing
+//! is applied twice and nothing is applied unapproved.
 //!
 //! ## Shape of an operation
 //!
@@ -162,20 +166,211 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateCollaborationChangeRequest` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateCollaborationChangeRequestErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateCollaborationChangeRequest"))
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(
+                UpdateCollaborationChangeRequestErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some("cleanrooms state is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let caller = st::caller_account_id();
+        let collaboration_id = input.collaboration_identifier;
+        let change_request_id = input.change_request_identifier;
+        let mut store = state.lock();
+
+        // The collaboration is resolved exactly as every other operation that takes a
+        // `collaborationIdentifier` resolves it, so an id this account is not a party to
+        // is refused the same way whether or not a collaboration is stored under it.
+        let Some(record) = store
+            .visible_collaboration(&collaboration_id, caller)
+            .cloned()
+        else {
+            return Err(
+                UpdateCollaborationChangeRequestErrorModeled::AccessDeniedException(
+                    AccessDeniedException {
+                        message: Some(st::collaboration_access_denied_message(
+                            &collaboration_id,
+                            caller,
+                        )),
+                        reason: Some(
+                            st::ACCESS_DENIED_REASON_INSUFFICIENT_PERMISSIONS.to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // A change request is addressed under its collaboration, so one stored against
+        // another collaboration is not found here — the same scoping the read uses.
+        let Some(request) = store
+            .collaboration_change_request_in_collaboration(&collaboration_id, &change_request_id)
+            .cloned()
+        else {
+            return Err(
+                UpdateCollaborationChangeRequestErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!(
+                            "change request {change_request_id} not found in collaboration \
+                             {collaboration_id}"
+                        ),
+                        // The `ResourceType` catalog names no change request, so the
+                        // required pair names the collaboration the lookup was scoped
+                        // to, as `GetCollaborationChangeRequest` does.
+                        resource_id: collaboration_id.clone(),
+                        resource_type: st::RESOURCE_TYPE_COLLABORATION.to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // Every action is a decision on a request that is still open: a COMMITTED,
+        // DENIED or CANCELLED request has already reached the end of its lifecycle.
+        if st::change_request_is_terminal(&request.status) {
+            return Err(conflict(format!(
+                "change request {change_request_id} is {} and admits no further action",
+                request.status
+            )));
+        }
+
+        let is_owner = caller == record.creator_account_id;
+        let mut approvals = request.approvals.clone().unwrap_or_default();
+        let new_status;
+        let mut commit = false;
+
+        match input.action.as_str() {
+            action @ (st::CHANGE_REQUEST_ACTION_APPROVE | st::CHANGE_REQUEST_ACTION_DENY) => {
+                // A vote is recorded while the request is still collecting them: once
+                // every party has approved, the round is closed and what remains is the
+                // owner's COMMIT or CANCEL.
+                if request.status != st::CHANGE_REQUEST_STATUS_PENDING {
+                    return Err(conflict(format!(
+                        "change request {change_request_id} is {} and is no longer collecting \
+                         approvals",
+                        request.status
+                    )));
+                }
+                // Only an account the request records an approval for has a vote to
+                // cast: the approvals are the parties to the change.
+                let Some(details) = approvals.get_mut(caller) else {
+                    return Err(
+                        UpdateCollaborationChangeRequestErrorModeled::AccessDeniedException(
+                            AccessDeniedException {
+                                message: Some(format!(
+                                    "Account {caller} is not an approver of change request \
+                                     {change_request_id}"
+                                )),
+                                reason: Some(
+                                    st::ACCESS_DENIED_REASON_INSUFFICIENT_PERMISSIONS.to_string(),
+                                ),
+                            },
+                        )
+                        .into(),
+                    );
+                };
+                details.status = if action == st::CHANGE_REQUEST_ACTION_APPROVE {
+                    st::APPROVAL_STATUS_APPROVED.to_string()
+                } else {
+                    st::APPROVAL_STATUS_DENIED.to_string()
+                };
+                new_status = st::change_request_status_from_approvals(&approvals).to_string();
+            }
+            st::CHANGE_REQUEST_ACTION_CANCEL => {
+                if !is_owner {
+                    return Err(owner_only(st::CHANGE_REQUEST_ACTION_CANCEL, caller));
+                }
+                new_status = st::CHANGE_REQUEST_STATUS_CANCELLED.to_string();
+            }
+            st::CHANGE_REQUEST_ACTION_COMMIT => {
+                if !is_owner {
+                    return Err(owner_only(st::CHANGE_REQUEST_ACTION_COMMIT, caller));
+                }
+                // COMMIT is documented as "commit after the request is approved", so a
+                // request the parties have not all approved has nothing to commit yet.
+                if request.status != st::CHANGE_REQUEST_STATUS_APPROVED {
+                    return Err(conflict(format!(
+                        "change request {change_request_id} is {} and can be committed only once \
+                         it is {}",
+                        request.status,
+                        st::CHANGE_REQUEST_STATUS_APPROVED
+                    )));
+                }
+                commit = true;
+                new_status = st::CHANGE_REQUEST_STATUS_COMMITTED.to_string();
+            }
+            // `ChangeRequestAction` is a modelled enum, so a value outside its catalog
+            // is refused before this handler runs; this arm keeps the match total.
+            other => {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "action {other} is not a ChangeRequestAction"
+                )))
+            }
+        }
+
+        let at = st::now();
+        if commit {
+            for change in &request.changes {
+                store.apply_collaboration_change(&collaboration_id, change, at);
+            }
+        }
+
+        let Some(stored) = store
+            .collaboration_change_requests
+            .get_mut(&change_request_id)
+        else {
+            return Err(
+                UpdateCollaborationChangeRequestErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(format!(
+                            "change request {change_request_id} disappeared while it was being \
+                             updated"
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+        stored.status = new_status;
+        stored.approvals = Some(approvals);
+        stored.update_time = at;
+
+        Ok(UpdateCollaborationChangeRequestOutput {
+            collaboration_change_request: stored.clone(),
+        })
     }
 }
+
+/// A `ConflictException` (HTTP 409) for a change request whose current status does not
+/// admit the action asked of it — the model's `INVALID_STATE` reason.
+fn conflict(message: String) -> UpdateCollaborationChangeRequestError {
+    UpdateCollaborationChangeRequestErrorModeled::ConflictException(ConflictException {
+        message: Some(message),
+        resource_id: None,
+        resource_type: None,
+        reason: Some(crate::state::CONFLICT_REASON_INVALID_STATE.to_string()),
+    })
+    .into()
+}
+
+/// An `AccessDeniedException` (HTTP 403) for an action only the collaboration owner may
+/// take: "The collaboration owner can manually CANCEL or COMMIT a change request."
+fn owner_only(action: &str, caller: &str) -> UpdateCollaborationChangeRequestError {
+    UpdateCollaborationChangeRequestErrorModeled::AccessDeniedException(AccessDeniedException {
+        message: Some(format!(
+            "Account {caller} is not the collaboration owner, so it cannot {action} a change \
+             request"
+        )),
+        reason: Some(crate::state::ACCESS_DENIED_REASON_INSUFFICIENT_PERMISSIONS.to_string()),
+    })
+    .into()
+}
+

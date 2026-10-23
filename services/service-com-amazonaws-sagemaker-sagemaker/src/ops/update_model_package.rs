@@ -1,15 +1,30 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateModelPackage
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateModelPackage`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: modifies the model package `crate::state` holds under the required
+//! `ModelPackageArn` — replacing the single-valued members the request carries, merging
+//! `CustomerMetadataProperties` by key and dropping the keys
+//! `CustomerMetadataPropertiesToRemove` names, appending
+//! `AdditionalInferenceSpecificationsToAdd` — leaving every member the request omits as it
+//! was, recording the modifying identity and instant, and answering the package's ARN.
+//! This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateModelPackage::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A `ClientToken` this package has already applied REPLAYS whatever body it arrives
+//! with: the token is matched on its own, not against a digest of the request it first
+//! carried, so a caller that reuses a token for a genuinely different update is answered
+//! the ARN and changes nothing rather than being told the parameters mismatch. That is
+//! deliberate — this operation's model declares no idempotency-mismatch error, and
+//! `ConflictException`, the one client error it does declare, is spent on the collision
+//! the model documents (a repeated additional-inference-specification name) — and it is
+//! the conservative half of the choice: a retry can never apply an accumulating member
+//! twice.
+//!
+//! Every refusal here comes from a rule the model states: the uniqueness of an additional
+//! inference specification's name, the documented total of 15 of them, and
+//! `CustomerMetadataMap`'s modelled length. A key named by BOTH
+//! `CustomerMetadataProperties` and `CustomerMetadataPropertiesToRemove` is not refused —
+//! removals are applied before upserts, so such a key ends up with the value the request
+//! set.
 //!
 //! ## Shape of an operation
 //!
@@ -175,18 +190,242 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateModelPackage` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateModelPackageErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        // `ModelPackageArn` is required, and the resource part of this service's
+        // model-package ARN is exactly the key `CreateModelPackage` registered the
+        // package under — the same resolution `DescribeModelPackage` performs.
+        let key = crate::state::model_package_lookup_key(&input.model_package_arn).to_string();
+        let now = ::std::time::SystemTime::now();
+
+        let mut store = state.lock();
+        let Some(package) = store.model_packages.get_mut(&key) else {
+            // The message quotes the ARN the caller passed, not one this emulator
+            // synthesized.
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "Could not find model package \"{}\".",
+                input.model_package_arn
+            )));
+        };
+
+        // `ModelApprovalStatus` "does not apply to unversioned models"
+        // (`CreateModelPackage$ModelApprovalStatus`'s model doc), and this operation
+        // "Updates a versioned model": an unversioned package has no approval status to
+        // move, so a request naming one is refused rather than answered with a 200 for a
+        // change that did not happen. The guard is exactly the member the doc names —
+        // `ApprovalDescription` carries no such statement, so it is stored like any other
+        // free-text member and replayed by `DescribeModelPackage`.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateModelPackage"))
+        // It is checked BEFORE the idempotency replay below, because it is a property of
+        // the package the request names and so is the same answer on the first call and on
+        // every retry: a request this operation refuses stays refused however often it is
+        // presented.
+        if package.version.is_none() && input.model_approval_status.is_some() {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "Model package \"{}\" is unversioned, so ModelApprovalStatus does not \
+                 apply to it: an approval status belongs to a model version inside a \
+                 model package group.",
+                input.model_package_arn
+            )));
+        }
+
+        // `ClientToken` "guarantees that the call to this API is idempotent": a retry
+        // presenting a token this package has already applied answers the same ARN and
+        // applies nothing again — which is what keeps the two members that ACCUMULATE
+        // (`AdditionalInferenceSpecificationsToAdd`, `CustomerMetadataPropertiesToRemove`)
+        // from being applied a second time by a retried call.
+        //
+        // The checks BELOW this point are about what the package would hold AFTER the
+        // request is applied (a specification name already in the list, a merged map or
+        // list past its bound), so they are reached only when the request is going to be
+        // applied: a retry must not be refused for the state its own first call created.
+        if input
+            .client_token
+            .as_deref()
+            .is_some_and(|token| package.update_token_applied(token))
+        {
+            let settled = package.settle_status(now);
+            let arn = package.arn.clone();
+            drop(store);
+            if settled {
+                crate::state::record_state_change(Self::NAME, &arn, ctx);
+            }
+            return Ok(UpdateModelPackageOutput {
+                model_package_arn: arn,
+            });
+        }
+
+        // The merged metadata map: the keys the request removes are dropped and the ones
+        // it sets are upserted, so a key the request mentions neither way survives.
+        //
+        // The two members are applied in THAT order, which gives a key named by both a
+        // defined outcome — the value the request set — rather than a refusal of a call
+        // the service accepts: a "replace this key" request naming it in both members ends
+        // up with the new value, and only a key named by the removal alone is dropped.
+        let mut metadata = package
+            .customer_metadata_properties
+            .clone()
+            .unwrap_or_default();
+        for removed in input
+            .customer_metadata_properties_to_remove
+            .iter()
+            .flatten()
+        {
+            metadata.remove(removed);
+        }
+        for (set_key, value) in input.customer_metadata_properties.iter().flatten() {
+            metadata.insert(set_key.clone(), value.clone());
+        }
+        // `CustomerMetadataMap` is modelled `length 1..50`, so the merged map a later read
+        // replays has to fit in it too — the boundary validator can only bound the map ONE
+        // request carries.
+        if metadata.len() > crate::state::CUSTOMER_METADATA_PROPERTIES_MAX {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "A model package holds at most {} customer metadata properties; this \
+                 update would leave it with {}.",
+                crate::state::CUSTOMER_METADATA_PROPERTIES_MAX,
+                metadata.len()
+            )));
+        }
+
+        // The additional inference specifications after the additions: appended in the
+        // order the request lists them, after the ones the package already holds.
+        let mut additional = package
+            .additional_inference_specifications
+            .clone()
+            .unwrap_or_default();
+        for added in input
+            .additional_inference_specifications_to_add
+            .iter()
+            .flatten()
+        {
+            // "The name must be unique within the list of your additional inference
+            // specifications for a particular model package"
+            // (`AdditionalInferenceSpecificationDefinition$Name`'s model doc) — so a name
+            // already in the list is a conflict with what the package holds, the failure
+            // `ConflictException` is this operation's modelled one for. Checked against the
+            // growing list, so a request repeating a name within itself is refused too.
+            if additional.iter().any(|held| held.name == added.name) {
+                return Err(UpdateModelPackageErrorModeled::ConflictException(ConflictException {
+                    message: Some(format!(
+                        "Additional inference specification \"{}\" already exists on model \
+                         package \"{}\": its name must be unique within the model package.",
+                        added.name, input.model_package_arn
+                    )),
+                })
+                .into());
+            }
+            additional.push(added.clone());
+        }
+        // "Total number of additional Inference Specifications can not exceed 15"
+        // (`AdditionalInferenceSpecificationsToAdd`'s model doc): the member's own modelled
+        // length bounds one request's list, the total is this operation's to enforce.
+        if additional.len() > crate::state::ADDITIONAL_INFERENCE_SPECIFICATIONS_MAX {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "A model package holds at most {} additional inference specifications; \
+                 this update would leave it with {}.",
+                crate::state::ADDITIONAL_INFERENCE_SPECIFICATIONS_MAX,
+                additional.len()
+            )));
+        }
+
+        // Whether this request actually CHANGES the package. A member it carries whose
+        // value the package already holds is not a change, so a removal naming keys the
+        // package does not hold, or a re-set of an identical value, moves neither
+        // `LastModifiedTime` nor `LastModifiedBy`: both report a modification that
+        // happened, never one that was merely asked for.
+        let stored_metadata = package
+            .customer_metadata_properties
+            .clone()
+            .unwrap_or_default();
+        let held_additional = package
+            .additional_inference_specifications
+            .as_ref()
+            .map_or(0, Vec::len);
+        // A single-valued member replaces the stored one only when it differs from it.
+        let replaces = |requested: Option<&String>, stored: Option<&String>| {
+            requested.is_some_and(|value| stored != Some(value))
+        };
+        let changed = replaces(
+            input.model_approval_status.as_ref(),
+            package.model_approval_status.as_ref(),
+        ) || replaces(
+            input.approval_description.as_ref(),
+            package.approval_description.as_ref(),
+        ) || replaces(
+            input.model_package_registration_type.as_ref(),
+            package.registration_type.as_ref(),
+        ) || replaces(input.source_uri.as_ref(), package.source_uri.as_ref())
+            // The modelled structure shapes carry no `PartialEq` (they are generated from
+            // the model), so one the request carries is taken as a replacement without
+            // comparing it against the stored value.
+            || input.inference_specification.is_some()
+            || input.model_card.is_some()
+            || input.model_life_cycle.is_some()
+            || metadata != stored_metadata
+            // The additions only ever append, so a differing count is exactly "something
+            // was added".
+            || additional.len() != held_additional;
+
+        // A request that changes nothing modifies nothing — not even
+        // `LastModifiedTime`, which would otherwise report a modification that never
+        // happened. The clock-owed registration transition is still materialised, and the
+        // token is still remembered, so "a token this package has applied" means the same
+        // thing whether the call it first arrived on turned out to change anything.
+        let settled = package.settle_status(now);
+        if !changed {
+            if let Some(token) = input.client_token {
+                package.remember_update_token(token);
+            }
+            let arn = package.arn.clone();
+            drop(store);
+            if settled {
+                crate::state::record_state_change(Self::NAME, &arn, ctx);
+            }
+            return Ok(UpdateModelPackageOutput {
+                model_package_arn: arn,
+            });
+        }
+
+        if let Some(status) = input.model_approval_status {
+            package.model_approval_status = Some(status);
+        }
+        if let Some(description) = input.approval_description {
+            package.approval_description = Some(description);
+        }
+        if let Some(registration_type) = input.model_package_registration_type {
+            package.registration_type = Some(registration_type);
+        }
+        if let Some(specification) = input.inference_specification {
+            package.inference_specification = Some(specification);
+        }
+        if let Some(source_uri) = input.source_uri {
+            package.source_uri = Some(source_uri);
+        }
+        if let Some(model_card) = input.model_card {
+            package.model_card = Some(model_card);
+        }
+        if let Some(life_cycle) = input.model_life_cycle {
+            package.model_life_cycle = Some(life_cycle);
+        }
+        // An emptied map is ABSENT rather than empty: `CustomerMetadataMap` is modelled
+        // with a minimum length of one, so a package whose last property was removed
+        // carries no map at all.
+        package.customer_metadata_properties = (!metadata.is_empty()).then_some(metadata);
+        package.additional_inference_specifications =
+            (!additional.is_empty()).then_some(additional);
+        package.last_modified_time = now;
+        package.last_modified_by = Some(crate::state::caller_user_context(ctx));
+        if let Some(token) = input.client_token {
+            package.remember_update_token(token);
+        }
+        let arn = package.arn.clone();
+        drop(store);
+
+        crate::state::record_state_change(Self::NAME, &arn, ctx);
+        Ok(UpdateModelPackageOutput {
+            model_package_arn: arn,
+        })
     }
 }

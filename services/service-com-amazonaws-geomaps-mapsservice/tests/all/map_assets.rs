@@ -29,7 +29,9 @@ use service_com_amazonaws_geomaps_mapsservice::ops::types::{
 use service_com_amazonaws_geomaps_mapsservice::state::assets;
 use service_com_amazonaws_geomaps_mapsservice::state::vector_tile::Tile;
 use service_com_amazonaws_geomaps_mapsservice::state::{
-    ColorSchemeKind, MapStyleKind, TileFormat, VariantKind,
+    route_shield_width, ColorSchemeKind, MapStyleKind, TileFormat, VariantKind, CITY_DOT_BOX,
+    CITY_DOT_LOWRANK_BOX, INCIDENT_ICON_BOX, MARKER_HEIGHT, MARKER_WIDTH, PLACE_ICON_BOX,
+    RESTRICTION_SHIELD_BOX, SHIELD_BASE_WIDTH, SHIELD_DIGIT_WIDTH,
 };
 use service_com_amazonaws_geomaps_mapsservice::{
     ComAmazonawsGeomapsMapsserviceState, EmulatedService,
@@ -82,6 +84,16 @@ fn header(response: &http::Response<Bytes>, name: &str) -> String {
         .and_then(|value| value.to_str().ok())
         .unwrap_or_default()
         .to_string()
+}
+
+/// The media type the catalog says a STORED asset (a glyph range, a sprite
+/// file) is delivered with. Read from state rather than written out here, so
+/// these cases pin "a stored asset's media type is the object's, not the
+/// payload's" rather than one spelling of it.
+fn delivered_content_type(emulator: &Emulator) -> String {
+    let catalog = emulator.catalog();
+    let content_type = catalog.lock().asset_delivery.content_type.clone();
+    content_type
 }
 
 /// The wire error code of a failed response: restJson1 carries it in
@@ -257,19 +269,20 @@ async fn a_style_descriptor_bootstraps_tiles_sprites_and_glyphs() {
                 );
             }
 
-            // The sprite sheet and its index, followed to GetSprites.
+            // The sprite sheet and its index, followed to GetSprites. Both are
+            // stored assets, so both are delivered with the object store's own
+            // media type rather than the media type of what is inside them.
             let sprite = document["sprite"]
                 .as_str()
                 .unwrap_or_else(|| panic!("case {case:?}: a style must declare a sprite URL"));
-            for (suffix, expected_type) in
-                [(".png", "image/png"), (".json", "application/json")]
-            {
+            let delivered = delivered_content_type(&emulator);
+            for suffix in [".png", ".json"] {
                 let response = emulator.get(&path_of(&format!("{sprite}{suffix}"))).await;
                 assert_ok(&format!("{case} sprite {suffix}"), &response);
                 assert_eq!(
                     header(&response, "content-type"),
-                    expected_type,
-                    "case {case:?}: sprite {suffix} must be served as {expected_type}"
+                    delivered,
+                    "case {case:?}: sprite {suffix} must be served as {delivered}"
                 );
             }
 
@@ -903,13 +916,13 @@ async fn the_sprite_index_describes_the_sheet_it_is_paired_with() {
                 assert_ok(&case, &index);
                 assert_eq!(
                     header(&sheet, "content-type"),
-                    "image/png",
-                    "case {case:?}: a .png sprite file is image/png"
+                    delivered_content_type(&emulator),
+                    "case {case:?}: a stored sprite file reports the object store's media type"
                 );
                 assert_eq!(
                     header(&index, "content-type"),
-                    "application/json",
-                    "case {case:?}: a .json sprite file is application/json"
+                    delivered_content_type(&emulator),
+                    "case {case:?}: a stored sprite file reports the object store's media type"
                 );
                 assert_eq!(
                     header(&sheet, "etag"),
@@ -1013,8 +1026,8 @@ async fn glyph_ranges_decode_for_every_stack_and_range() {
             assert_ok(&case, &response);
             assert_eq!(
                 header(&response, "content-type"),
-                "application/octet-stream",
-                "case {case:?}: a glyph range is a protobuf blob"
+                delivered_content_type(&emulator),
+                "case {case:?}: a stored glyph range reports the object store's media type"
             );
             assert_eq!(
                 header(&response, "etag"),
@@ -1579,5 +1592,379 @@ async fn two_emulators_serve_identical_assets() {
             header(&right, "etag"),
             "case {path:?}: and therefore the same ETag"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Asset delivery: the STORED assets, and the object headers they carry
+// ---------------------------------------------------------------------------
+
+/// The server-side-encryption algorithm the catalog says the asset bucket
+/// reports, read from state for the same reason as [`delivered_content_type`].
+fn delivered_encryption(emulator: &Emulator) -> String {
+    let catalog = emulator.catalog();
+    let encryption = catalog.lock().asset_delivery.server_side_encryption.clone();
+    encryption
+}
+
+/// Every address of a STORED asset: a glyph range (every font stack and range
+/// the catalog answers for) and every sprite file (every style, colour scheme,
+/// variant, file and pixel ratio).
+fn stored_asset_paths() -> Vec<String> {
+    let mut paths = vec![
+        // Rows: a published stack, a second one, a fallback LIST, a stack the
+        // catalog does not publish; the first range, a middle one and the last
+        // range of the BMP.
+        "/v2/glyphs/Amazon%20Ember%20Regular/0-255.pbf".to_string(),
+        "/v2/glyphs/Amazon%20Ember%20Bold/256-511.pbf".to_string(),
+        "/v2/glyphs/Amazon%20Ember%20Bold,Noto%20Sans%20Bold/3072-3327.pbf".to_string(),
+        "/v2/glyphs/Not%20A%20Published%20Font/65280-65535.pbf".to_string(),
+    ];
+    for style in MapStyleKind::ALL {
+        for scheme in ColorSchemeKind::ALL {
+            for file in [
+                "sprites.png",
+                "sprites@2x.png",
+                "sprites.json",
+                "sprites@2x.json",
+            ] {
+                paths.push(format!(
+                    "/v2/styles/{}/{}/{}/sprites/{file}",
+                    style.as_wire(),
+                    scheme.as_wire(),
+                    VariantKind::Default.as_wire()
+                ));
+            }
+        }
+    }
+    paths
+}
+
+/// A stored asset is served out of the object store, so every one of them —
+/// every glyph range and every sprite file — reports the object's own media type
+/// and carries the delivery headers of the object version it was read from.
+///
+/// The version id identifies the stored content: it is the same on a repeat read
+/// of one asset, the same for two assets whose bytes are the same, and different
+/// as soon as the bytes are.
+#[tokio::test]
+async fn stored_assets_carry_the_object_store_delivery_headers() {
+    let emulator = Emulator::new();
+    let delivered = delivered_content_type(&emulator);
+    let encryption = delivered_encryption(&emulator);
+    // body digest -> the version id served for it, so the one id per content
+    // rule is checked across every asset rather than per request.
+    let mut ids_by_content: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
+
+    for path in stored_asset_paths() {
+        let response = emulator.get(&path).await;
+        assert_ok(&path, &response);
+        assert_eq!(
+            header(&response, "content-type"),
+            delivered,
+            "case {path:?}: a stored asset reports the object store's media type, got {:?}",
+            header(&response, "content-type")
+        );
+        assert_eq!(
+            header(&response, "x-amz-server-side-encryption"),
+            encryption,
+            "case {path:?}: a stored asset reports how the bucket encrypts it, got {:?}",
+            header(&response, "x-amz-server-side-encryption")
+        );
+        let version_id = header(&response, "x-amz-version-id");
+        assert!(
+            !version_id.is_empty(),
+            "case {path:?}: a stored asset must report the object version it came from"
+        );
+        assert_eq!(
+            header(&response, "etag"),
+            expected_etag(response.body()),
+            "case {path:?}: the ETag must hash the body served"
+        );
+
+        // A repeat read of one asset is the same object version.
+        let repeat = emulator.get(&path).await;
+        assert_eq!(
+            header(&repeat, "x-amz-version-id"),
+            version_id,
+            "case {path:?}: a repeat read must report the same object version"
+        );
+
+        let content = expected_etag(response.body());
+        match ids_by_content.get(&content) {
+            Some(seen) => assert_eq!(
+                seen, &version_id,
+                "case {path:?}: byte-identical assets must report one version id, got {version_id:?}"
+            ),
+            None => {
+                assert!(
+                    !ids_by_content.values().any(|seen| seen == &version_id),
+                    "case {path:?}: a different asset must report a different version id, got {version_id:?}"
+                );
+                ids_by_content.insert(content, version_id);
+            }
+        }
+    }
+}
+
+/// The negative half of the same rule: a body this service COMPUTES from the
+/// request is not an object of the asset bucket, so it keeps its own media type
+/// and carries neither object header.
+#[tokio::test]
+async fn computed_bodies_carry_no_object_headers() {
+    let emulator = Emulator::new();
+    // Rows: every operation whose body is computed from the request, with the
+    // media type its own catalog record declares.
+    let computed: Vec<(String, String)> = {
+        let catalog = emulator.catalog();
+        let catalog = catalog.lock();
+        let mut rows = vec![
+            (
+                "/v2/styles/Standard/descriptor".to_string(),
+                catalog
+                    .styles
+                    .get(&(MapStyleKind::Standard, ColorSchemeKind::Light))
+                    .expect("the catalog publishes the Standard Light style")
+                    .content_type
+                    .clone(),
+            ),
+            (
+                "/v2/static/map?width=256&height=256&center=0,0&zoom=4".to_string(),
+                catalog.static_maps.content_type.clone(),
+            ),
+        ];
+        for (id, record) in &catalog.tilesets {
+            rows.push((
+                format!("/v2/tiles/{id}/4/5/6"),
+                record.content_type.clone(),
+            ));
+        }
+        rows
+    };
+
+    for (path, expected_type) in computed {
+        let response = emulator.get(&path).await;
+        assert_ok(&path, &response);
+        assert_eq!(
+            header(&response, "content-type"),
+            expected_type,
+            "case {path:?}: a computed body keeps its own media type, got {:?}",
+            header(&response, "content-type")
+        );
+        for object_header in ["x-amz-version-id", "x-amz-server-side-encryption"] {
+            assert!(
+                response.headers().get(object_header).is_none(),
+                "case {path:?}: a computed body carries no {object_header}, got {:?}",
+                header(&response, object_header)
+            );
+        }
+    }
+}
+
+/// A glyph range is derived from the request: no two (stack, range) addresses
+/// answer with the same bytes, so none of them is a constant placeholder.
+#[tokio::test]
+async fn glyph_ranges_differ_per_stack_and_range() {
+    let emulator = Emulator::new();
+    // Rows: the same range across stacks with different metrics, and the same
+    // stack across ranges.
+    let stacks = [
+        "Amazon Ember Regular",
+        "Amazon Ember Bold",
+        "Amazon Ember Condensed RC Regular",
+        "Noto Sans Regular",
+    ];
+    let ranges = ["0-255.pbf", "256-511.pbf", "3072-3327.pbf", "65280-65535.pbf"];
+    let mut seen: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+
+    for stack in stacks {
+        for range in ranges {
+            let case = format!("{stack} {range}");
+            let path = format!("/v2/glyphs/{}/{range}", stack.replace(' ', "%20"));
+            let response = emulator.get(&path).await;
+            assert_ok(&case, &response);
+            let digest = expected_etag(response.body());
+            if let Some(other) = seen.get(&digest) {
+                panic!("case {case:?}: must not serve the same glyph bytes as {other:?}");
+            }
+            seen.insert(digest, case);
+        }
+    }
+}
+
+/// The sprite index is the published iconography of the sheet it is paired
+/// with: every icon family the catalog carries is in it, under the name a style
+/// layer references, with the five members a client reads a rectangle from.
+#[tokio::test]
+async fn the_sprite_index_lists_the_published_iconography() {
+    let emulator = Emulator::new();
+    // Rows: one icon of every family the catalog holds, with the box its family
+    // occupies at pixelRatio 1 (the constants in `state.rs`).
+    let families: [(&str, u32, u32); 7] = [
+        ("accommodation", PLACE_ICON_BOX, PLACE_ICON_BOX),
+        ("truck-weigh-station", PLACE_ICON_BOX, PLACE_ICON_BOX),
+        ("road_closure", INCIDENT_ICON_BOX, INCIDENT_ICON_BOX),
+        ("citydot", CITY_DOT_BOX, CITY_DOT_BOX),
+        ("citydot_lowrank", CITY_DOT_LOWRANK_BOX, CITY_DOT_LOWRANK_BOX),
+        ("marker_transit", MARKER_WIDTH, MARKER_HEIGHT),
+        (
+            "shield-hgv-weight_restriction",
+            RESTRICTION_SHIELD_BOX,
+            RESTRICTION_SHIELD_BOX,
+        ),
+    ];
+
+    for style in MapStyleKind::ALL {
+        for scheme in ColorSchemeKind::ALL {
+            for (file, ratio) in [("sprites.json", 1_u32), ("sprites@2x.json", 2)] {
+                let case = format!("{}/{}/{file}", style.as_wire(), scheme.as_wire());
+                let response = emulator
+                    .get(&format!(
+                        "/v2/styles/{}/{}/Default/sprites/{file}",
+                        style.as_wire(),
+                        scheme.as_wire()
+                    ))
+                    .await;
+                assert_ok(&case, &response);
+                let index: serde_json::Value = serde_json::from_slice(response.body())
+                    .unwrap_or_else(|error| panic!("case {case:?}: index must be JSON: {error}"));
+                let index = index
+                    .as_object()
+                    .unwrap_or_else(|| panic!("case {case:?}: index must be a JSON object"));
+
+                for (name, width, height) in families {
+                    let entry = index.get(name).unwrap_or_else(|| {
+                        panic!("case {case:?}: the index must describe {name}")
+                    });
+                    let entry = entry.as_object().unwrap_or_else(|| {
+                        panic!("case {case:?}: {name} must be an object, got {entry}")
+                    });
+                    let members: BTreeSet<&str> =
+                        entry.keys().map(String::as_str).collect();
+                    assert_eq!(
+                        members,
+                        ["height", "pixelRatio", "width", "x", "y"]
+                            .into_iter()
+                            .collect::<BTreeSet<&str>>(),
+                        "case {case:?}: {name} must carry exactly the index members, got {members:?}"
+                    );
+                    assert_eq!(
+                        entry["width"].as_u64(),
+                        Some(u64::from(width * ratio)),
+                        "case {case:?}: {name} is {width} style pixels wide at ratio {ratio}"
+                    );
+                    assert_eq!(
+                        entry["height"].as_u64(),
+                        Some(u64::from(height * ratio)),
+                        "case {case:?}: {name} is {height} style pixels tall at ratio {ratio}"
+                    );
+                    assert_eq!(
+                        entry["pixelRatio"].as_u64(),
+                        Some(u64::from(ratio)),
+                        "case {case:?}: {name} must report the requested pixel ratio"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// A route shield is as wide as the longest route number its own name says it
+/// has to hold: a width word (`-long`, `-xlong`, `-wide`) or a trailing
+/// digit-capacity suffix, over the catalog's two-digit base.
+#[test]
+fn route_shield_boxes_follow_the_digit_capacity_in_the_name() {
+    let two = SHIELD_BASE_WIDTH;
+    let three = SHIELD_BASE_WIDTH + SHIELD_DIGIT_WIDTH;
+    let four = SHIELD_BASE_WIDTH + 2 * SHIELD_DIGIT_WIDTH;
+    // Rows: no suffix, each width word, each numeric capacity suffix — and
+    // names the catalog does not carry, because this is the rule and not a
+    // lookup of the published list.
+    let cases: [(&str, u32); 12] = [
+        ("shield-AE", two),
+        ("shield-Emirates routes", two),
+        ("shield-US-Hwy-1-2", two),
+        ("shield-US-Hwy-3", three),
+        ("shield-autostrade-2-3", three),
+        ("shield-MX-Federal-3-4", four),
+        ("shield-rectangle-white-long", three),
+        ("shield-rectangle-white-xlong", four),
+        ("shield-IN-National-wide", three),
+        // Not in the published catalog: the rule still answers.
+        ("shield-ZZ", two),
+        ("shield-ZZ-long", three),
+        ("shield-ZZ-9", four),
+    ];
+    for (name, expected) in cases {
+        let actual = route_shield_width(name);
+        assert_eq!(
+            actual, expected,
+            "case {name:?}: expected a {expected}px box, got {actual:?}"
+        );
+    }
+}
+
+/// The published catalog really is laid out by that rule: the index reports each
+/// shield at the width its name states, and every rectangle it reports lies
+/// inside the sheet it is paired with.
+#[tokio::test]
+async fn the_sheet_holds_every_icon_the_index_points_at() {
+    let emulator = Emulator::new();
+    let names: Vec<String> = {
+        let catalog = emulator.catalog();
+        let catalog = catalog.lock();
+        catalog
+            .sprites
+            .get(&(
+                MapStyleKind::Standard,
+                ColorSchemeKind::Light,
+                VariantKind::Default,
+            ))
+            .expect("the catalog publishes the Standard Light sheet")
+            .icons
+            .iter()
+            .map(|icon| icon.name.clone())
+            .collect()
+    };
+    assert!(
+        names.len() > 100,
+        "case \"catalog\": a published sheet carries the whole iconography, got {} icons",
+        names.len()
+    );
+
+    let base = "/v2/styles/Standard/Light/Default/sprites/sprites";
+    let sheet = emulator.get(&format!("{base}.png")).await;
+    let index = emulator.get(&format!("{base}.json")).await;
+    assert_ok("sheet", &sheet);
+    assert_ok("index", &index);
+    let (width, height, _) = decode_png("sheet", sheet.body());
+    let described: serde_json::Value =
+        serde_json::from_slice(index.body()).expect("the index must be JSON");
+    let described = described.as_object().expect("the index must be an object");
+
+    for name in &names {
+        let entry = described
+            .get(name)
+            .unwrap_or_else(|| panic!("case {name:?}: the index must describe it"));
+        let read = |key: &str| {
+            entry[key]
+                .as_u64()
+                .unwrap_or_else(|| panic!("case {name:?}: must report a numeric {key}")) as u32
+        };
+        let (x, y, w, h) = (read("x"), read("y"), read("width"), read("height"));
+        assert!(
+            x + w <= width && y + h <= height,
+            "case {name:?}: {x},{y} {w}x{h} falls outside the {width}x{height} sheet"
+        );
+        if let Some(rest) = name.strip_prefix("shield-") {
+            if !rest.starts_with("hgv-") {
+                assert_eq!(
+                    w,
+                    route_shield_width(name),
+                    "case {name:?}: a route shield is as wide as its name states, got {w:?}"
+                );
+            }
+        }
     }
 }

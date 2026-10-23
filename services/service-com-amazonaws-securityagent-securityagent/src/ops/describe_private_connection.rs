@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribePrivateConnection
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribePrivateConnection`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribePrivateConnection::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reads one stored private connection back: the record's own persisted values plus the
+//! status the clock owes it, never an echo of the request. A name the store does not
+//! hold is a 404 `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -168,18 +163,49 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribePrivateConnection` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribePrivateConnectionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribePrivateConnection"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribePrivateConnectionErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the private connection store is unavailable".to_string(),
+                },
+            )
+        })?;
+        let now = ::std::time::SystemTime::now();
+
+        // A read (`@readonly`): it projects the stored record and writes nothing — the
+        // `CREATE_IN_PROGRESS` -> `ACTIVE` transition is computed from the stored due
+        // instant, so a describe moves no status of its own.
+        let state = state.lock();
+        let summary = state
+            .private_connections
+            .get(&input.private_connection_name)
+            .map(|connection| connection.summary(now))
+            .ok_or_else(|| {
+                DescribePrivateConnectionErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!(
+                            "Private connection '{}' was not found. Verify that the \
+                             resource identifier is correct and that the resource \
+                             exists in the specified agent space or account.",
+                            input.private_connection_name
+                        ),
+                    },
+                )
+            })?;
+
+        Ok(DescribePrivateConnectionOutput {
+            name: summary.name,
+            r#type: summary.r#type,
+            status: summary.status,
+            resource_gateway_id: summary.resource_gateway_id,
+            host_address: summary.host_address,
+            vpc_id: summary.vpc_id,
+            resource_configuration_id: summary.resource_configuration_id,
+            certificate_expiry_time: summary.certificate_expiry_time,
+            dns_resolution: summary.dns_resolution,
+            failure_message: summary.failure_message,
+            tags: summary.tags,
+        })
     }
 }
