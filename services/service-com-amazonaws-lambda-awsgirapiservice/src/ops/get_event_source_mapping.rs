@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetEventSourceMapping
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetEventSourceMapping`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetEventSourceMapping::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the event source mapping [`crate::state`] holds under the `UUID` the request
+//! names, brought up to whatever the clock has already made due, and the modelled
+//! not-found when this account holds no mapping of that id.
 //!
 //! ## Shape of an operation
 //!
@@ -248,18 +242,86 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetEventSourceMapping` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetEventSourceMappingErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetEventSourceMapping"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetEventSourceMappingErrorModeled::ServiceException(
+                ServiceException {
+                    r#type: None,
+                    message: Some("Lambda state is not reachable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx);
+        let mut store = state.lock();
+
+        // A read reports the mapping as of now, so the record is first brought up to
+        // whatever the clock already made due — the move out of `Creating` it owed — and
+        // nothing else is changed by reading.
+        let Some(record) = store.event_source_mappings.get_mut(&input.uuid) else {
+            return Err(GetEventSourceMappingErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    r#type: None,
+                    message: Some(format!(
+                        "Event source mapping not found: {}",
+                        crate::state::event_source_mapping_arn(&region, &input.uuid)
+                    )),
+                },
+            )
+            .into());
+        };
+        record.materialize(now);
+        Ok(event_source_mapping_configuration(record.reported()))
+    }
+}
+
+/// The one `EventSourceMappingConfiguration` the model declares, in this operation's own
+/// generated shape of it.
+///
+/// [`crate::state::EventSourceMappingRecord::reported`] builds the shared one (generated
+/// as `CreateEventSourceMappingOutput`) that every operation reporting a mapping answers
+/// with; this operation's output is generated as its own struct over the same shape, so
+/// the members are carried across one for one rather than rebuilt from state a second
+/// time.
+fn event_source_mapping_configuration(
+    configuration: CreateEventSourceMappingOutput,
+) -> GetEventSourceMappingOutput {
+    GetEventSourceMappingOutput {
+        uuid: configuration.uuid,
+        starting_position: configuration.starting_position,
+        starting_position_timestamp: configuration.starting_position_timestamp,
+        batch_size: configuration.batch_size,
+        maximum_batching_window_in_seconds: configuration.maximum_batching_window_in_seconds,
+        parallelization_factor: configuration.parallelization_factor,
+        event_source_arn: configuration.event_source_arn,
+        filter_criteria: configuration.filter_criteria,
+        filter_criteria_error: configuration.filter_criteria_error,
+        kms_key_arn: configuration.kms_key_arn,
+        metrics_config: configuration.metrics_config,
+        logging_config: configuration.logging_config,
+        scaling_config: configuration.scaling_config,
+        function_arn: configuration.function_arn,
+        last_modified: configuration.last_modified,
+        last_processing_result: configuration.last_processing_result,
+        state: configuration.state,
+        state_transition_reason: configuration.state_transition_reason,
+        destination_config: configuration.destination_config,
+        topics: configuration.topics,
+        queues: configuration.queues,
+        source_access_configurations: configuration.source_access_configurations,
+        self_managed_event_source: configuration.self_managed_event_source,
+        maximum_record_age_in_seconds: configuration.maximum_record_age_in_seconds,
+        bisect_batch_on_function_error: configuration.bisect_batch_on_function_error,
+        maximum_retry_attempts: configuration.maximum_retry_attempts,
+        tumbling_window_in_seconds: configuration.tumbling_window_in_seconds,
+        function_response_types: configuration.function_response_types,
+        amazon_managed_kafka_event_source_config: configuration
+            .amazon_managed_kafka_event_source_config,
+        self_managed_kafka_event_source_config: configuration
+            .self_managed_kafka_event_source_config,
+        document_db_event_source_config: configuration.document_db_event_source_config,
+        event_source_mapping_arn: configuration.event_source_mapping_arn,
+        provisioned_poller_config: configuration.provisioned_poller_config,
     }
 }

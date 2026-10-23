@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartSyncExecution
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartSyncExecution`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: RUNS the Express state machine's Amazon States Language definition
+//! through [`crate::state::asl`] and answers the TERMINAL outcome that walk computed —
+//! this call is synchronous, so nothing about the outcome is owed to the clock — and
+//! stores the execution it ran.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartSyncExecution::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A request this operation cannot serve is refused with one of the operation's own
+//! modelled errors; it never answers 501.
 //!
 //! ## Shape of an operation
 //!
@@ -206,18 +204,282 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartSyncExecution` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartSyncExecutionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // `stateMachineArn` (1..256), `name` (1..80), `input` (0..262144),
+        // `traceHeader`'s ASCII pattern and `includedData`'s enum are modelled, so the
+        // centralized walk has already refused anything outside them. The character
+        // rule on `name` and the requirement that `input` be JSON are not modelled, so
+        // they are checked here, exactly as `StartExecution` checks them.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+
+        // The ARN is validated BEFORE the state machine is looked up: a malformed ARN
+        // and one naming another service or another region are defects in the
+        // REQUEST, which `InvalidArn` reports, not a state machine that is absent.
+        let endpoint_region = crate::state::request_region(ctx.parts());
+        let parsed =
+            match crate::state::read_state_machine_arn(&input.state_machine_arn, &endpoint_region) {
+                Ok(parsed) => parsed,
+                Err(message) => {
+                    return Err(StartSyncExecutionErrorModeled::InvalidArn(InvalidArn {
+                        message: Some(message),
+                    })
+                    .into())
+                }
+            };
+
+        // A map-run labeled ARN names a Distributed Map state inside a state machine
+        // rather than a state machine to run, which no API accepts. This operation's
+        // model declares no `ValidationException`, so the refusal goes out through the
+        // crate's one non-modelled channel — a 400 `ValidationException` carrying the
+        // same sentence every other operation states it with.
+        if parsed.label().is_some() {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::LABELED_ARN_MESSAGE,
+            ));
+        }
+
+        if let Some(name) = input.name.as_deref() {
+            if !crate::state::is_valid_name(name) {
+                return Err(StartSyncExecutionErrorModeled::InvalidName(InvalidName {
+                    message: Some(crate::state::resource_error_message(
+                        crate::state::INVALID_NAME,
+                        name,
+                    )),
+                })
+                .into());
+            }
+        }
+
+        // `input`'s own documentation: "If you don't include any JSON input data, you
+        // still must include the two braces" — an execution with no input data is the
+        // empty JSON object, which is what the interpreter receives.
+        let execution_input = input.input.clone().unwrap_or_else(|| "{}".to_string());
+        if let Err(error) = serde_json::from_str::<serde_json::Value>(&execution_input) {
+            return Err(StartSyncExecutionErrorModeled::InvalidExecutionInput(
+                InvalidExecutionInput {
+                    message: Some(crate::state::resource_error_message(
+                        crate::state::INVALID_STATE_MACHINE_EXECUTION_INPUT,
+                        &error.to_string(),
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let started = crate::state::now();
+
+        // Phase 1, under the lock: resolve the state machine and read what the run
+        // needs. The lock is released before the walk, so no other request waits on
+        // an interpretation.
+        let (machine_arn, machine_name, definition, role_arn, execution_name, execution_id) = {
+            let mut store = state.lock();
+            store.settle(started);
+            let Some(machine) = store.state_machines.get(&input.state_machine_arn) else {
+                return Err(StartSyncExecutionErrorModeled::StateMachineDoesNotExist(
+                    StateMachineDoesNotExist {
+                        message: Some(crate::state::resource_error_message(
+                            crate::state::STATE_MACHINE_DOES_NOT_EXIST,
+                            &input.state_machine_arn,
+                        )),
+                    },
+                )
+                .into());
+            };
+            if machine.is_deleting() {
+                return Err(StartSyncExecutionErrorModeled::StateMachineDeleting(
+                    StateMachineDeleting {
+                        message: Some(crate::state::resource_error_message(
+                            crate::state::STATE_MACHINE_DELETING,
+                            &input.state_machine_arn,
+                        )),
+                    },
+                )
+                .into());
+            }
+            // "Starts a Synchronous Express state machine execution.
+            // StartSyncExecution is not available for STANDARD workflows." A workflow
+            // type this operation does not serve is the modelled
+            // `StateMachineTypeNotSupported`, whatever the type is.
+            if machine.sm_type != crate::state::STATE_MACHINE_TYPE_EXPRESS {
+                return Err(
+                    StartSyncExecutionErrorModeled::StateMachineTypeNotSupported(
+                        StateMachineTypeNotSupported {
+                            message: Some(
+                                crate::state::STATE_MACHINE_TYPE_NOT_SUPPORTED.to_string(),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            let (arn, name, definition, role_arn) = (
+                machine.arn.clone(),
+                machine.name.clone(),
+                machine.definition.clone(),
+                machine.role_arn.clone(),
+            );
+            // The same minting rule as `StartExecution`: "If you don't provide a name
+            // for the execution, Step Functions automatically generates a universally
+            // unique identifier (UUID) as the execution name." The trailing id of an
+            // Express execution ARN is minted here too, so two synchronous runs that
+            // reused one name are two records and two ARNs.
+            let execution_name = match input.name.clone() {
+                Some(name) => name,
+                None => store.fresh_execution_name(),
+            };
+            let execution_id = store.fresh_execution_id();
+            (
+                arn,
+                name,
+                definition,
+                role_arn,
+                execution_name,
+                execution_id,
+            )
+        };
+
+        // The execution ARN is built in the state machine's OWN region, so the two
+        // ARNs always agree however the request was signed.
+        let region = crate::state::arn_region(&machine_arn);
+        let arn = crate::state::express_execution_arn(
+            &region,
+            &machine_name,
+            &execution_name,
+            &execution_id,
+        );
+
+        // Phase 2, OUTSIDE the lock: the definition is INTERPRETED here, on a blocking
+        // thread, exactly as `StartExecution` interprets it — same walk, same budgets,
+        // same deadline. The one difference is that this call answers the outcome
+        // itself, so it settles with NO delay: the response carries the terminal
+        // `status`, `stopDate` and payload.
+        let context = crate::state::asl::Context {
+            execution_arn: arn.clone(),
+            execution_name: execution_name.clone(),
+            state_machine_arn: machine_arn.clone(),
+            state_machine_name: machine_name.clone(),
+            role_arn: role_arn.clone(),
+        };
+        let interpreted = {
+            let definition = definition.clone();
+            let execution_input = execution_input.clone();
+            tokio::task::spawn_blocking(move || {
+                crate::state::plan_run_settling_after(
+                    &definition,
+                    &execution_input,
+                    started,
+                    &context,
+                    crate::state::EVENT_EXECUTION_STARTED,
+                    0,
+                    std::time::Duration::ZERO,
+                )
+            })
+            .await
+        };
+        let Ok((mut history, outcome)) = interpreted else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::INTERPRETER_UNAVAILABLE,
+            ));
+        };
+
+        // The execution stopped when the walk finished — and never before the offsets
+        // the definition's own `Wait` states declare, which the walk accumulates
+        // instead of sleeping for them (`outcome.due_at`).
+        let stopped = std::cmp::max(crate::state::now(), outcome.due_at);
+        history.extend(outcome.events);
+
+        let executed = crate::state::Execution {
+            arn: arn.clone(),
+            state_machine_arn: machine_arn.clone(),
+            name: execution_name,
+            // A synchronous execution is already terminal when this call answers, so
+            // its status is the one the walk computed: `SUCCEEDED`, `FAILED` or
+            // `TIMED_OUT`, the three the modelled `SyncExecutionStatus` carries.
+            status: outcome.status,
+            start_date: started,
+            stop_date: Some(stopped),
+            input: execution_input,
+            output: outcome.output,
+            error: outcome.error,
+            cause: outcome.cause,
+            trace_header: crate::state::effective_trace_header(ctx.parts(), input.trace_header),
+            redrive_count: 0,
+            redrive_date: None,
+            redrive_tokens: Vec::new(),
+            history,
+            // Nothing is owed to the clock: see above.
+            pending: None,
+            // Measured and counted by `insert_execution`.
+            retained_bytes: 0,
+        };
+
+        // `inputDetails`/`outputDetails` say whether the data itself is included: it
+        // is, because this response carries it ("Indicates whether input or output was
+        // included in the response. Always true for API calls."). `output` is reported
+        // "only if the execution succeeds. If the execution fails, this field is null",
+        // which is what the walk already left on the record, so `outputDetails` follows
+        // the output rather than being reported beside an absent one.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartSyncExecution"))
+        // `includedData` is not read here: it selects whether a state machine's
+        // KMS-ENCRYPTED DEFINITION is decrypted for the caller ("callers must have
+        // kms:Decrypt permission to decrypt the definition. Alternatively, you can
+        // call the API with includedData = METADATA_ONLY to get a successful response
+        // without the encrypted definition"), and this response declares no definition
+        // member, so both values answer the same body.
+        let included = Some(CloudWatchEventsExecutionDataDetails { included: true });
+        let response = StartSyncExecutionOutput {
+            execution_arn: executed.arn.clone(),
+            state_machine_arn: Some(executed.state_machine_arn.clone()),
+            name: Some(executed.name.clone()),
+            start_date: crate::state::to_date_time(executed.start_date),
+            stop_date: crate::state::to_date_time(stopped),
+            status: executed.status.clone(),
+            error: executed.error.clone(),
+            cause: executed.cause.clone(),
+            input: Some(executed.input.clone()),
+            input_details: included.clone(),
+            output: executed.output.clone(),
+            output_details: executed.output.as_ref().and(included),
+            trace_header: executed.trace_header.clone(),
+            // What the run cost, in the increments Express Workflows are billed in:
+            // the span this execution ran for, and the memory its own data retained.
+            billing_details: Some(BillingDetails {
+                billed_duration_in_milliseconds: crate::state::billed_duration_millis(
+                    executed.start_date,
+                    stopped,
+                ),
+                billed_memory_used_in_mb: crate::state::billed_memory_mb(executed.measure()),
+            }),
+        };
+
+        // Phase 3, under the lock again: keep the execution that ran. The response is
+        // ALREADY computed, and this operation models no limit error, so a store with
+        // no room for the record — or a state machine deleted while the walk ran, which
+        // would leave the record indexed under a resource that is gone — answers the
+        // same body rather than refusing a run that happened. An Express execution is
+        // not readable through this API either way (`DescribeExecution` and
+        // `ListExecutions` each refuse an Express execution, and `GetExecutionHistory`
+        // is still scaffolded), so the record is what this emulator retains of the run
+        // and not a resource the caller can address later.
+        let mut store = state.lock();
+        // Settled against the REAL clock, not against this run's stop instant: a
+        // definition's `Wait` states can date that instant in the future, and an
+        // outcome another execution owes is due when ITS clock says so.
+        store.settle(crate::state::now());
+        let keep = store
+            .state_machines
+            .get(&machine_arn)
+            .is_some_and(|machine| !machine.is_deleting())
+            && store
+                .execution_rejection(&machine_arn, executed.measure())
+                .is_none();
+        if keep {
+            store.insert_execution(executed);
+        }
+
+        Ok(response)
     }
 }

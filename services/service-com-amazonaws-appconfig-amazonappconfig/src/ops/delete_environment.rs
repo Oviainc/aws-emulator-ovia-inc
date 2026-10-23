@@ -184,9 +184,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // or left to the account setting. Protection refuses a delete only when the
         // environment served a configuration inside the protected interval; the call that
         // would record that (`GetLatestConfiguration`) belongs to the `appconfigdata`
-        // service, so this service observes no such activity and holds no account-level
-        // setting to apply. The check therefore has nothing to refuse on, whichever value
-        // the caller sent.
+        // service, so this service observes no such activity. The account-level setting
+        // `GetAccountSettings` reports is stored here, but with no observed activity to
+        // measure against it there is nothing to refuse on, whichever value the caller
+        // sent.
         let _requested_check = input.deletion_protection_check;
 
         // An environment only exists under an application, so the parent is resolved
@@ -195,9 +196,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(application) = store.applications.get_mut(&input.application_id) else {
             return Err(DeleteEnvironmentErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "No application with id {} exists.",
-                        input.application_id
+                    message: Some(crate::state::application_not_found(
+                        &input.application_id,
                     )),
                     resource_name: Some(input.application_id),
                 },
@@ -217,9 +217,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(DeleteEnvironmentErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "No environment with id {} exists in application {}.",
-                        input.environment_id, input.application_id
+                    message: Some(crate::state::environment_not_found(
+                        &input.application_id,
+                        &input.environment_id,
                     )),
                     resource_name: Some(input.environment_id),
                 },

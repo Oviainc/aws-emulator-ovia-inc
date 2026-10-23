@@ -15,7 +15,9 @@
 use crate::appconfig_workflow::{
     create_application, create_environment, create_profile, json_call, router, send, Answer,
 };
-use service_com_amazonaws_appconfig_amazonappconfig::state::PREDEFINED_DEPLOYMENT_STRATEGIES;
+use service_com_amazonaws_appconfig_amazonappconfig::state::{
+    ENVIRONMENT_DEPLOYING, ENVIRONMENT_READY_FOR_DEPLOYMENT, PREDEFINED_DEPLOYMENT_STRATEGIES,
+};
 
 /// One CloudWatch alarm monitor. The member names and the `AlarmRoleArn` pattern are the
 /// model's own: `smithy_query(query="shape",shape="Monitor")` gives `AlarmArn`
@@ -276,8 +278,8 @@ async fn update_environment_replaces_only_the_members_the_request_carries() {
         // so the environment is ready for one.
         assert_eq!(
             updated.string("State").as_deref(),
-            Some("READY_FOR_DEPLOYMENT"),
-            "case {case:?}: an environment with no deployment is READY_FOR_DEPLOYMENT, got {:?}",
+            Some(ENVIRONMENT_READY_FOR_DEPLOYMENT),
+            "case {case:?}: an environment with no deployment is ReadyForDeployment, got {:?}",
             updated.string("State")
         );
         assert_round_trip(&router, case, &application, &id, &after).await;
@@ -354,8 +356,8 @@ async fn update_environment_refuses_a_value_past_a_modelled_bound_without_writin
         // The boundary validator refuses a modelled constraint before the handler runs,
         // with the error code `crate::scaffolded` documents for that refusal.
         assert!(
-            refused.error_code().contains("ValidationException"),
-            "case {case:?}: expected ValidationException, got {:?}",
+            refused.error_code().contains("BadRequestException"),
+            "case {case:?}: expected the modelled BadRequestException, got {:?}",
             refused.error_code()
         );
         assert_round_trip(&router, case, &application, &id, &expected).await;
@@ -502,9 +504,9 @@ async fn the_last_update_wins_and_state_stays_the_clocks() {
     );
     assert_eq!(
         during.string("State").as_deref(),
-        Some("DEPLOYING"),
+        Some(ENVIRONMENT_DEPLOYING),
         "case \"update during a deployment\": an environment with a deployment in flight is \
-         DEPLOYING, got {:?}",
+         Deploying, got {:?}",
         during.string("State")
     );
     assert_round_trip(

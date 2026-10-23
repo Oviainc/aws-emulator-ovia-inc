@@ -173,23 +173,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // version to delete unless the request names one explicitly.
         let Some((extension, pinned_version)) = store.resolve_extension(&input.extension_identifier)
         else {
-            return Err(not_found(format!(
-                "No extension matching {} exists.",
-                input.extension_identifier
+            return Err(not_found(crate::state::extension_not_found(
+                &input.extension_identifier,
             )));
         };
         // "A specific version of an extension to delete. If omitted, the highest version
         // is deleted." An extension is reachable only through its versions, so one that
         // holds none is already gone.
         let extension_id = extension.id.clone();
-        let extension_name = extension.name.clone();
         let Some(version_number) = input
             .version_number
             .or(pinned_version)
             .or_else(|| extension.latest_version().map(|version| version.version_number))
         else {
-            return Err(not_found(format!(
-                "Extension {extension_name} holds no version."
+            return Err(not_found(crate::state::extension_not_found(
+                &input.extension_identifier,
             )));
         };
 
@@ -204,8 +202,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .remove_extension_version(&extension_id, version_number)
             .is_none()
         {
-            return Err(not_found(format!(
-                "Extension {extension_name} has no version {version_number}."
+            return Err(not_found(crate::state::extension_version_not_found(
+                &input.extension_identifier,
+                version_number,
             )));
         }
 

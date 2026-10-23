@@ -16,9 +16,9 @@
 //!
 //! [`detect_pii_spans`] is that recognizer, and it is the ONE place the entity rules
 //! live. It returns the spans (type, confidence, begin/end offset) so the
-//! `DetectPiiEntities` operation — still a scaffold, with its own issue — can project
-//! the same spans into `PiiEntity` values and agree with this operation by
-//! construction. `ContainsPiiEntities` projects them into the distinct set of types.
+//! `DetectPiiEntities` operation projects the same spans into `PiiEntity` values and
+//! agrees with this operation by construction. `ContainsPiiEntities` projects them
+//! into the distinct set of types.
 //!
 //! ## Shape of an operation
 //!
@@ -578,8 +578,8 @@ struct ByteSpan {
 /// the returned list as TRUNCATED at that budget for any one rule.
 ///
 /// This is the ONE recognizer for Comprehend's PII family: `ContainsPiiEntities`
-/// projects these spans into the distinct set of types, and `DetectPiiEntities` (its
-/// own issue) projects the same spans into `PiiEntity` values, so the two operations
+/// projects these spans into the distinct set of types, and `DetectPiiEntities`
+/// projects the same spans into `PiiEntity` values, so the two operations
 /// cannot disagree. Every REQUEST-time caller runs it through [`recognize_pii`],
 /// which keeps the scan off the async worker; this function itself stays available
 /// to a pass that already yields of its own accord.

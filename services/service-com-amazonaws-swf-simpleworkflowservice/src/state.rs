@@ -151,6 +151,19 @@ impl WorkflowTypeRecord {
         self.deprecation_date = Some(at);
     }
 
+    /// Return this type to `REGISTERED`, the move `UndeprecateWorkflowType` makes
+    /// ("Undeprecates a previously deprecated workflow type. After a workflow type has
+    /// been undeprecated, you can create new executions of that type").
+    /// `WorkflowTypeInfo.deprecationDate`'s doc scopes that stamp to a deprecated type
+    /// ("If the type is in deprecated state, then it is set to the date when the type was
+    /// deprecated"), so a record back on `REGISTERED` reports none. Nothing else the
+    /// record holds — identity, description, registration-time defaults, creation date —
+    /// is touched.
+    pub fn undeprecate(&mut self) {
+        self.status = STATUS_REGISTERED.to_string();
+        self.deprecation_date = None;
+    }
+
     /// The `WorkflowTypeInfo` every workflow-type reader returns, built from what is
     /// stored.
     pub fn info(&self) -> WorkflowTypeInfo {

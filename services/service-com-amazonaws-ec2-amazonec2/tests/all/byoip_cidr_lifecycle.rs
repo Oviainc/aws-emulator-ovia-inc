@@ -24,9 +24,10 @@
 //! from the RFC 2544 benchmarking block (`198.18.0.0/15`), so no row names an address range
 //! that belongs to anybody.
 //!
-//! The store is seeded directly, the way `describe_vpcs` and `launch_templates` seed theirs:
-//! `ProvisionByoipCidr` is still a scaffold (its own stub issue), so there is no API path
-//! that brings a range into the account yet.
+//! The store is seeded directly, the way `describe_vpcs` and `launch_templates` seed
+//! theirs: these rows need a range in a chosen `ByoipCidrState`, including states no
+//! provision can leave one in, which the API has no path to. The `ProvisionByoipCidr`
+//! path a caller takes is covered by `byoip_cidrs` instead.
 //!
 //! Each refusal's MESSAGE is checked only for the substitution the service makes — the
 //! value the request sent, named back in EC2's "the value you sent, in parentheses" form —

@@ -5,7 +5,8 @@
 //! operation and the termination-protection flag.
 //!
 //! Every case drives the real awsQuery request path (form body in, XML envelope out)
-//! through a router carrying only this service, so what it asserts is what a client sees.
+//! through the wire harness `stack_lifecycle.rs` builds, so what it asserts is what a
+//! client sees.
 //! The rules under test:
 //!
 //! * `NotificationARNs`, `Tags`, `RollbackConfiguration`, `DeploymentConfig` and

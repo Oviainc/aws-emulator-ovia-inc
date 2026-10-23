@@ -4,8 +4,8 @@
 //!
 //! The rule under test: **a stack reports a resource as created only where the service
 //! that owns it created it.** Two cases follow from that, and this suite pins both
-//! through the wire of a router carrying CloudFormation ALONE — so no owning service is
-//! reachable, which is exactly the shape of "the call did not happen":
+//! through the wire of a router that does not carry Amazon Data Firehose — which is
+//! exactly the shape of "the call did not happen" for the type it owns:
 //!
 //! 1. A resource type this emulator PROVISIONS (an `AWS::KinesisFirehose::DeliveryStream`)
 //!    whose owning service does not answer leaves the stack in `CREATE_FAILED`, naming the

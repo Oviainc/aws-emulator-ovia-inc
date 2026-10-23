@@ -216,7 +216,7 @@ fn detail_cases() -> Vec<DetailCase> {
             // Three types, declared out of logical-id order, one of them a type the
             // return-value catalogue does not carry; two carry Metadata and one does not.
             // Every type here is one this emulator does not provision in an owning
-            // service, so the stack completes with CloudFormation alone mounted.
+            // service, so nothing outside CloudFormation is called for the stack.
             case: "a yaml template declaring three resources of three types",
             stack_name: "detail-mixed",
             template: concat!(

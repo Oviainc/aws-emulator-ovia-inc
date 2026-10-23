@@ -288,8 +288,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             compute_role_arn: input.compute_role_arn,
         };
 
-        app.branches
-            .insert(branch.branch_name.clone(), branch.clone());
+        app.branches.insert(
+            branch.branch_name.clone(),
+            crate::state::AmplifyBranch::new(branch.clone()),
+        );
 
         Ok(CreateBranchOutput {
             branch: BranchProjection::written(branch),

@@ -30,6 +30,7 @@ pub mod delete_experiment_definition_types;
 pub mod delete_extension_association_types;
 pub mod delete_extension_types;
 pub mod delete_hosted_configuration_version_types;
+pub mod get_account_settings_types;
 pub mod get_application_types;
 pub mod get_configuration_profile_types;
 pub mod get_configuration_types;
@@ -103,6 +104,8 @@ pub use delete_extension_association_types::*;
 pub use delete_extension_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use delete_hosted_configuration_version_types::*;
+#[allow(ambiguous_glob_reexports, unused_imports)]
+pub use get_account_settings_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use get_application_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]

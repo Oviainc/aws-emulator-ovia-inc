@@ -47,8 +47,10 @@ vader_sentiment = "0.1"
 # that classifies a string into categories (profane, offensive, sexual, mean) each
 # at a mild/moderate/severe level.
 rustrict = "0.7"
-# Regular-expression engine behind the PII recognizer in ops::contains_pii_entities:
-# it matches each PII entity type's published form over the submitted document.
+# Regular-expression engine behind the PII recognizer in ops::contains_pii_entities,
+# which ContainsPiiEntities and DetectPiiEntities both project: it matches each PII
+# entity type's published form over the submitted document, in linear time, so no
+# document can make one request backtrack.
 regex = "1.12"
 # Amazon S3 client the asynchronous dominant-language detection job reads its input
 # documents with and writes its `output.tar.gz` back through, over the in-process
