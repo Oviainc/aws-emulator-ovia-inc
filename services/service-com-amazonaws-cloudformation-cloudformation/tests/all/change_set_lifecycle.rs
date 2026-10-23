@@ -118,7 +118,10 @@ fn assert_change_set_id_shape(case: &str, change_set_id: &str, change_set_name: 
 /// wall clock. The in-flight states are asserted where they belong — against a store held
 /// BEFORE its due instant, in
 /// [`a_change_set_cannot_be_executed_before_its_creation_completes`].
-async fn settle_the_store(router: &MultiServiceRouter, engine: &Arc<engine::InMemoryEngine>) {
+pub(crate) async fn settle_the_store(
+    router: &MultiServiceRouter,
+    engine: &Arc<engine::InMemoryEngine>,
+) {
     {
         let state = store(engine);
         let mut held = state.lock();
@@ -161,15 +164,10 @@ async fn settled_change_set(
 /// `<Scope>` block rather than off the whole document, where a change's own `<member>`
 /// wrapper would swallow them.
 fn scope_entries(xml: &str) -> Vec<String> {
-    let mut entries = Vec::new();
-    let mut rest = xml;
-    while let Some(start) = rest.find("<Scope>") {
-        let after = &rest[start + "<Scope>".len()..];
-        let Some(end) = after.find("</Scope>") else { break };
-        entries.extend(xml_texts(&after[..end], "member"));
-        rest = &after[end + "</Scope>".len()..];
-    }
-    entries
+    crate::stack_lifecycle::xml_blocks(xml, "Scope")
+        .iter()
+        .flat_map(|scope| xml_texts(scope, "member"))
+        .collect()
 }
 
 /// One row of the create-and-execute table: a template the class covers.
@@ -884,15 +882,19 @@ async fn create_change_set_refuses_what_it_cannot_plan() {
                 member("TemplateBody", template),
             ],
             status: 400,
-            error_code: "AlreadyExistsException",
+            // The REQUEST cannot be satisfied — a stack that exists cannot be created
+            // again — rather than a change-set name colliding, which is what the modelled
+            // AlreadyExistsException names.
+            error_code: "ValidationError",
         },
         RefusalCase {
-            case: "a change set name the stack already carries",
+            case: "a change set name the stack already carries, with different attributes",
             members: vec![
                 member("StackName", "dup"),
                 member("ChangeSetName", "dup-set"),
                 member("ChangeSetType", "CREATE"),
                 member("TemplateBody", template),
+                member("Description", "not the stored one"),
             ],
             status: 400,
             error_code: "AlreadyExistsException",

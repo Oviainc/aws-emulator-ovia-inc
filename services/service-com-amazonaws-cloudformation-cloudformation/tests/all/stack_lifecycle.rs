@@ -177,6 +177,27 @@ pub(crate) fn xml_text(xml: &str, tag: &str) -> Option<String> {
     xml_texts(xml, tag).into_iter().next()
 }
 
+/// The inner text of every non-nested `<tag>…</tag>` BLOCK, in document order, left exactly
+/// as the serializer wrote it.
+///
+/// [`xml_texts`] is the leaf form of this scan: it unescapes what it finds, which is right
+/// for a value and wrong for a block that carries more elements. A caller reading a nested
+/// list (the `<member>`s inside one `<Details>`) takes the block first and scans INSIDE it,
+/// so a sibling list's members cannot be swept up with it.
+pub(crate) fn xml_blocks(xml: &str, tag: &str) -> Vec<String> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let mut found = Vec::new();
+    let mut rest = xml;
+    while let Some(start) = rest.find(&open) {
+        let after = &rest[start + open.len()..];
+        let Some(end) = after.find(&close) else { break };
+        found.push(after[..end].to_string());
+        rest = &after[end + close.len()..];
+    }
+    found
+}
+
 pub(crate) async fn create_stack(
     router: &MultiServiceRouter,
     name: &str,

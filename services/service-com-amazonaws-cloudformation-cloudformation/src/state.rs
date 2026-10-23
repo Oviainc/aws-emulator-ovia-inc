@@ -103,6 +103,10 @@ pub mod provisioning;
 /// declares.
 pub mod template;
 
+/// Computing a change set: comparing the stack's template and parameters with the ones a
+/// change set submits, and the resource-level change list that comparison answers.
+pub mod change_plan;
+
 /// One entry per resource type this emulator really creates: which service owns it, and
 /// the create and delete calls that make its resources exist.
 mod provisioner;
@@ -1171,23 +1175,10 @@ fn installed_resources(
         .collect()
 }
 
-/// One resource-level change a change set would make, computed once when the change set
-/// is created by comparing the submitted template with the stack's current one.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StoredResourceChange {
-    /// The model's `ChangeAction`: `Add`, `Modify` or `Remove`.
-    pub action: String,
-    pub logical_resource_id: String,
-    pub resource_type: String,
-    /// The physical id of the resource the change acts on, for a change to one the stack
-    /// has already deployed (a `Modify` or a `Remove`). `None` for an `Add`: the resource
-    /// does not exist yet, so it has no physical id to report.
-    pub physical_resource_id: Option<String>,
-    /// For a `Modify`, the resource attributes that differ, spelled as the model's
-    /// `ResourceAttribute` enum spells them and in that enum's order. Empty for an `Add`
-    /// or a `Remove`, which change the whole resource rather than an attribute of it.
-    pub scope: Vec<String>,
-}
+/// The change set as this store carries it: the resource-level change list and the
+/// property-level detail behind each entry, which [`change_plan::computed_changes`]
+/// computes once where the change set is created.
+pub use change_plan::{StackRevision, StoredChangeDetail, StoredResourceChange};
 
 /// The change-set statuses a change set's creation is headed for, and the instant they
 /// are due.
@@ -1281,6 +1272,114 @@ impl StoredChangeSet {
         self.status == change_set_status::CREATE_COMPLETE
             && self.execution_status == execution_status::AVAILABLE
     }
+
+    /// The first attribute this stored change set states differently from a request that
+    /// re-creates its name, spelled as the REQUEST member that carries it, or `None` when
+    /// the request submits the very same change set.
+    ///
+    /// What `CreateChangeSet` answers for a name the stack already carries depends on this
+    /// comparison, not on the name alone: re-submitting the same plan under the same name is
+    /// the same change set (which is what makes a retried create idempotent), while one
+    /// whose attributes differ cannot be created, and the refusal names the attribute that
+    /// differs — "cannot be created due to a mismatch with existing attribute `<member>`".
+    ///
+    /// The attributes are the request's own, in the order this function compares them; the
+    /// change set's id, its stack, its creation time and its status are not request
+    /// attributes and are not compared.
+    pub fn mismatching_attribute(
+        &self,
+        submitted: &SubmittedChangeSet<'_>,
+    ) -> Option<&'static str> {
+        let comparisons: [(&'static str, bool); 14] = [
+            ("ChangeSetType", self.change_set_type == submitted.change_set_type),
+            (
+                "Parameters",
+                same_parameters(&self.parameters, submitted.parameters),
+            ),
+            ("TemplateBody", self.template_body == submitted.template_body),
+            ("Capabilities", self.capabilities == submitted.capabilities),
+            ("ResourceTypes", self.resource_types == submitted.resource_types),
+            ("RoleARN", self.role_arn.as_deref() == submitted.role_arn),
+            (
+                "RollbackConfiguration",
+                self.rollback_configuration.as_ref() == submitted.rollback_configuration,
+            ),
+            (
+                "NotificationARNs",
+                self.notification_arns == submitted.notification_arns,
+            ),
+            ("Tags", same_tags(&self.tags, submitted.tags)),
+            ("Description", self.description.as_deref() == submitted.description),
+            (
+                "OnStackFailure",
+                self.on_stack_failure.as_deref() == submitted.on_stack_failure,
+            ),
+            (
+                "IncludeNestedStacks",
+                self.include_nested_stacks == submitted.include_nested_stacks,
+            ),
+            (
+                "ImportExistingResources",
+                self.import_existing_resources == submitted.import_existing_resources,
+            ),
+            (
+                "DeploymentMode",
+                self.deployment_mode.as_deref() == submitted.deployment_mode,
+            ),
+        ];
+        comparisons
+            .into_iter()
+            .find_map(|(attribute, agrees)| (!agrees).then_some(attribute))
+    }
+}
+
+/// Whether two parameter sets state the same values: `Parameters` is a SET keyed by
+/// `ParameterKey`, so two requests that list the same pairs in two orders submit the same
+/// parameters.
+fn same_parameters(stored: &[StoredParameter], submitted: &[StoredParameter]) -> bool {
+    fn by_key(parameters: &[StoredParameter]) -> BTreeMap<&str, &str> {
+        parameters
+            .iter()
+            .map(|parameter| (parameter.key.as_str(), parameter.value.as_str()))
+            .collect()
+    }
+    by_key(stored) == by_key(submitted)
+}
+
+/// Whether two tag sets state the same tags, keyed by `Key` for the same reason
+/// [`same_parameters`] keys by `ParameterKey`.
+fn same_tags(stored: &[StoredTag], submitted: &[StoredTag]) -> bool {
+    fn by_key(tags: &[StoredTag]) -> BTreeMap<&str, &str> {
+        tags.iter()
+            .map(|tag| (tag.key.as_str(), tag.value.as_str()))
+            .collect()
+    }
+    by_key(stored) == by_key(submitted)
+}
+
+/// The attributes one `CreateChangeSet` request submits, resolved the way they would be
+/// STORED: what [`StoredChangeSet::mismatching_attribute`] compares a re-created name
+/// against.
+#[derive(Debug, Clone, Copy)]
+pub struct SubmittedChangeSet<'a> {
+    pub change_set_type: &'a str,
+    pub description: Option<&'a str>,
+    /// The template the change set would put on the stack, which for a request reusing the
+    /// stack's template is that template.
+    pub template_body: &'a str,
+    /// The parameter values the change set would apply, already resolved against the ones
+    /// the stack carries (`UsePreviousValue`).
+    pub parameters: &'a [StoredParameter],
+    pub capabilities: &'a [String],
+    pub resource_types: &'a [String],
+    pub role_arn: Option<&'a str>,
+    pub rollback_configuration: Option<&'a StoredRollbackConfiguration>,
+    pub notification_arns: &'a [String],
+    pub tags: &'a [StoredTag],
+    pub on_stack_failure: Option<&'a str>,
+    pub include_nested_stacks: bool,
+    pub import_existing_resources: bool,
+    pub deployment_mode: Option<&'a str>,
 }
 
 /// One drift-detection operation on one stack: what `DetectStackDrift` started and
@@ -1693,25 +1792,7 @@ pub fn output_views(outputs: &[StoredOutput]) -> Option<Vec<crate::ops::types::O
     )
 }
 
-/// The `ResourceAttribute`s one resource declaration states differently from another, in
-/// the order the model's enum lists them.
-///
-/// Only attributes the model can name are reported, which is what `ResourceChange$Scope`
-/// carries: the whole resource declaration is compared, not just its `Properties`.
-fn differing_attributes(
-    resource: &template::DeclaredResource,
-    other: &template::DeclaredResource,
-) -> Vec<String> {
-    crate::ops::types::RESOURCE_ATTRIBUTE_VALUES
-        .iter()
-        .filter(|attribute| {
-            resource.declaration.get(**attribute) != other.declaration.get(**attribute)
-        })
-        .map(|attribute| (*attribute).to_string())
-        .collect()
-}
-
-/// The resources a template body declares, by logical id, for comparing two templates.
+/// The template a body declares, ready to compare against another revision of it.
 ///
 /// Read by the SAME reader a deployment uses ([`template::parse`], which takes a JSON or a
 /// YAML body under this service's template bounds), then SORTED by logical id — and that
@@ -1723,77 +1804,17 @@ fn differing_attributes(
 ///
 /// `None` for a body this service will not read at all; `Some([])` for one that declares no
 /// resources — which `CreateChangeSet` refuses, since a change set is a plan over resources.
-pub fn template_resources(template_body: &str) -> Option<Vec<template::DeclaredResource>> {
-    let mut declared = template::parse(template_body)?.resources;
-    declared.sort_by(|left, right| left.logical_id.cmp(&right.logical_id));
+pub fn declared_template(template_body: &str) -> Option<template::Template> {
+    let mut declared = template::parse(template_body)?;
+    declared
+        .resources
+        .sort_by(|left, right| left.logical_id.cmp(&right.logical_id));
     Some(declared)
 }
 
-/// The resource-level changes that applying `next` to a stack whose template declares
-/// `previous` would make, against the resources that stack has `deployed`.
-///
-/// A resource only `next` declares is an `Add`, one only `previous` declares is a `Remove`,
-/// and one both declare differently is a `Modify` scoped to the attributes that differ —
-/// except when its `Type` itself changed, which cannot be modified into place and so is
-/// reported as the `Remove` of the old resource and the `Add` of the new one. A change to a
-/// resource the stack has already deployed carries that resource's physical id. The order is
-/// deterministic: the submitted template's resources (in the order
-/// [`template_resources`] yields them, which is by logical id), then the removals in the
-/// stack template's.
-pub fn computed_changes(
-    previous: &[template::DeclaredResource],
-    next: &[template::DeclaredResource],
-    deployed: &[DeployedResource],
-) -> Vec<StoredResourceChange> {
-    let physical_id = |logical_id: &str| {
-        deployed
-            .iter()
-            .find(|deployed| deployed.resource.logical_id == logical_id)
-            .map(|deployed| deployed.resource.physical_resource_id.clone())
-    };
-    let change =
-        |action: &str, resource: &template::DeclaredResource, scope: Vec<String>| {
-            StoredResourceChange {
-                action: action.to_string(),
-                logical_resource_id: resource.logical_id.clone(),
-                resource_type: resource.resource_type.clone(),
-                // Only a change to a resource the stack has deployed has one; an addition
-                // has nothing deployed under that logical id yet.
-                physical_resource_id: (action != change_action::ADD)
-                    .then(|| physical_id(&resource.logical_id))
-                    .flatten(),
-                scope,
-            }
-        };
-    let mut changes = Vec::new();
-    for resource in next {
-        match previous
-            .iter()
-            .find(|candidate| candidate.logical_id == resource.logical_id)
-        {
-            None => changes.push(change(change_action::ADD, resource, Vec::new())),
-            Some(before) if before.declaration == resource.declaration => {}
-            Some(before) if before.resource_type != resource.resource_type => {
-                changes.push(change(change_action::REMOVE, before, Vec::new()));
-                changes.push(change(change_action::ADD, resource, Vec::new()));
-            }
-            Some(before) => changes.push(change(
-                change_action::MODIFY,
-                resource,
-                differing_attributes(resource, before),
-            )),
-        }
-    }
-    for resource in previous {
-        let still_declared = next
-            .iter()
-            .any(|candidate| candidate.logical_id == resource.logical_id);
-        if !still_declared {
-            changes.push(change(change_action::REMOVE, resource, Vec::new()));
-        }
-    }
-    changes
-}
+/// The resource-level change list a change set carries, computed by comparing the stack's
+/// revision with the submitted one — see [`change_plan`].
+pub use change_plan::computed_changes;
 
 /// Resolve the request's `Parameters` against the values the stack already carries.
 ///

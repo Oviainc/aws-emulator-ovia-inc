@@ -1226,8 +1226,11 @@ fn creation_order(template: &Template) -> Vec<&DeclaredResource> {
 /// Only names the template declares as RESOURCES count: a `Ref` to a parameter or to a
 /// pseudo parameter is not a dependency on anything that has to be created first.
 fn dependencies_of(resource: &DeclaredResource, template: &Template) -> BTreeSet<String> {
-    let mut referenced = BTreeSet::new();
-    collect_references(&resource.declaration, 0, &mut referenced);
+    let mut referenced: BTreeSet<String> = references(&resource.declaration)
+        .names()
+        .into_iter()
+        .map(ToString::to_string)
+        .collect();
     if let Some(depends_on) = resource.declaration.get("DependsOn") {
         match depends_on {
             Value::String(name) => {
@@ -1255,8 +1258,61 @@ fn dependencies_of(resource: &DeclaredResource, template: &Template) -> BTreeSet
         .collect()
 }
 
-/// Every name the intrinsic functions inside one declaration refer to.
-fn collect_references(value: &Value, depth: usize, into: &mut BTreeSet<String>) {
+/// The names the intrinsic functions inside one template value refer to, split by HOW each
+/// is referred to.
+///
+/// The split is what `ResourceChangeDetail$ChangeSource` names: a `Ref` names a VALUE —
+/// "`ParameterReference` entities are `Ref` intrinsic functions that get template parameter
+/// values", "`ResourceReference` entities are `Ref` intrinsic functions that refer to
+/// resources in the template" — while "`ResourceAttribute` entities are `Fn::GetAtt`
+/// intrinsic functions that get resource attribute values". `Fn::Sub`'s `${Name}` and
+/// `${Name.Attribute}` variables are those same two forms spelled inside a string.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct References {
+    /// The names a `Ref` (or a bare `${Name}`) names: a parameter, a pseudo parameter or a
+    /// resource of the same template.
+    pub by_value: BTreeSet<String>,
+    /// The ATTRIBUTE PATHS an `Fn::GetAtt` (or a `${Name.Attribute}`) reads, each spelled
+    /// as that intrinsic spells it: `<logical id>.<attribute>`, which is the whole entity a
+    /// change caused by one of them names.
+    pub by_attribute: BTreeSet<String>,
+}
+
+impl References {
+    /// Every RESOURCE name referred to, however it is referred to: an attribute path names
+    /// its resource in the segment before the first dot.
+    pub fn names(&self) -> BTreeSet<&str> {
+        self.by_value
+            .iter()
+            .map(String::as_str)
+            .chain(self.by_attribute.iter().map(|path| resource_of(path)))
+            .collect()
+    }
+
+    /// Each attribute path with the resource it reads the attribute off.
+    pub fn attribute_targets(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.by_attribute
+            .iter()
+            .map(|path| (resource_of(path), path.as_str()))
+    }
+}
+
+/// The resource an `Fn::GetAtt` path names: everything before the first dot.
+pub fn resource_of(attribute_path: &str) -> &str {
+    attribute_path
+        .split('.')
+        .next()
+        .unwrap_or(attribute_path)
+}
+
+/// Every name the intrinsic functions inside one template value refer to.
+pub fn references(value: &Value) -> References {
+    let mut found = References::default();
+    collect_references(value, 0, &mut found);
+    found
+}
+
+fn collect_references(value: &Value, depth: usize, into: &mut References) {
     if depth > MAX_TEMPLATE_DEPTH {
         return;
     }
@@ -1265,17 +1321,19 @@ fn collect_references(value: &Value, depth: usize, into: &mut BTreeSet<String>) 
             for (key, member) in members {
                 match (key.as_str(), member) {
                     ("Ref", Value::String(name)) => {
-                        into.insert(name.clone());
+                        into.by_value.insert(name.clone());
                     }
                     // `Fn::GetAtt` takes `[logicalId, attribute]` or the `logicalId.attribute`
-                    // short form.
+                    // short form, and names the same entity either way.
                     ("Fn::GetAtt", Value::Array(arguments)) => {
-                        if let Some(name) = arguments.first().and_then(Value::as_str) {
-                            into.insert(name.to_string());
+                        let path: Vec<&str> =
+                            arguments.iter().filter_map(Value::as_str).collect();
+                        if !path.is_empty() {
+                            into.by_attribute.insert(path.join("."));
                         }
                     }
                     ("Fn::GetAtt", Value::String(path)) => {
-                        into.insert(path.split('.').next().unwrap_or(path).to_string());
+                        into.by_attribute.insert(path.clone());
                     }
                     // `Fn::Sub`'s `${Name}` and `${Name.Attribute}` variables name the
                     // same resources `Ref` and `Fn::GetAtt` do.
@@ -1288,8 +1346,15 @@ fn collect_references(value: &Value, depth: usize, into: &mut BTreeSet<String>) 
                             _ => None,
                         };
                         if let Some(source) = source {
-                            for name in substitution_names(source) {
-                                into.insert(name);
+                            for (name, path) in substitution_names(source) {
+                                match path {
+                                    Some(path) => {
+                                        into.by_attribute.insert(path);
+                                    }
+                                    None => {
+                                        into.by_value.insert(name);
+                                    }
+                                }
                             }
                         }
                         collect_references(member, depth + 1, into);
@@ -1308,8 +1373,9 @@ fn collect_references(value: &Value, depth: usize, into: &mut BTreeSet<String>) 
 }
 
 /// The variable names an `Fn::Sub` source string names, each `${…}` without its
-/// attribute path.
-fn substitution_names(source: &str) -> Vec<String> {
+/// attribute path, and the WHOLE `${…}` where it read an attribute path off the name (the
+/// `${Name.Attribute}` form, which is an `Fn::GetAtt` by another spelling).
+fn substitution_names(source: &str) -> Vec<(String, Option<String>)> {
     let mut names = Vec::new();
     let mut rest = source;
     while let Some(start) = rest.find("${") {
@@ -1317,13 +1383,9 @@ fn substitution_names(source: &str) -> Vec<String> {
         let Some(end) = after.find('}') else { break };
         let variable = after[..end].trim();
         if !variable.is_empty() && !variable.starts_with('!') {
-            names.push(
-                variable
-                    .split('.')
-                    .next()
-                    .unwrap_or(variable)
-                    .to_string(),
-            );
+            let name = variable.split('.').next().unwrap_or(variable);
+            let path = (name.len() < variable.len()).then(|| variable.to_string());
+            names.push((name.to_string(), path));
         }
         rest = &after[end + 1..];
     }
@@ -1630,23 +1692,8 @@ fn physical_name(
     naming: &Scope<'_>,
     budget: &mut Budget,
 ) -> String {
-    let segment = declared
-        .resource_type
-        .rsplit("::")
-        .next()
-        .unwrap_or_default();
-    // The type's OWN name property, where it is neither convention, comes first; then the
-    // two conventions, then the Amazon RDS `Identifier` spelling. The chain is consumed
-    // as it is built — the first property the template declares wins — so no candidate
-    // past it is even formatted.
-    let declared_name = declared_name_property(&declared.resource_type)
-        .map(ToString::to_string)
+    let declared_name = name_property_candidates(&declared.resource_type)
         .into_iter()
-        .chain([
-            format!("{segment}Name"),
-            "Name".to_string(),
-            format!("{segment}Identifier"),
-        ])
         .find_map(|property| {
             declared
                 .properties
@@ -1666,6 +1713,37 @@ fn physical_name(
             generated_name(&declared.logical_id, naming.stack),
         ),
     }
+}
+
+/// The properties a resource of `resource_type` can take its physical NAME from, most
+/// specific first: the type's OWN name property where it is neither convention, then the
+/// two conventions ([`physical_name`]), then the Amazon RDS `Identifier` spelling.
+///
+/// The ONE list of those candidates: [`physical_name`] reads the first of them the
+/// declaration carries, and [`name_property`] answers WHICH property that was — which is
+/// what a change set needs, since a resource's physical name is fixed when it is created
+/// (every name property's "Update requires" in the resource and property types reference is
+/// `Replacement`).
+pub fn name_property_candidates(resource_type: &str) -> Vec<String> {
+    let segment = resource_type.rsplit("::").next().unwrap_or_default();
+    declared_name_property(resource_type)
+        .map(ToString::to_string)
+        .into_iter()
+        .chain([
+            format!("{segment}Name"),
+            "Name".to_string(),
+            format!("{segment}Identifier"),
+        ])
+        .collect()
+}
+
+/// The property a declaration of `resource_type` takes its physical name from: the first
+/// of [`name_property_candidates`] the `Properties` object carries, or `None` for a
+/// declaration that names the resource nowhere (CloudFormation generates its name).
+pub fn name_property(resource_type: &str, properties: &Value) -> Option<String> {
+    name_property_candidates(resource_type)
+        .into_iter()
+        .find(|property| properties.get(property).is_some())
 }
 
 /// A GENERATED name held to the naming rules of the service that owns the resource type.
@@ -2756,6 +2834,17 @@ pub fn resolve_properties(
         resource.properties =
             resolved_value(&declared.properties, scope, 0, budget).unwrap_or(Value::Null);
     }
+}
+
+/// One template value with every intrinsic function it carries evaluated, preserving the
+/// objects and arrays around them; `None` for a value that cannot be evaluated at all.
+///
+/// The one entry point for evaluating a value OUTSIDE a deployment: comparing what two
+/// revisions of a template declare for one property has to compare the values each would
+/// really deploy, since a property that reads `!Ref Size` is a different value under a
+/// different parameter value while the template text is the same.
+pub fn resolve(value: &Value, scope: &Scope<'_>, budget: &mut Budget) -> Option<Value> {
+    resolved_value(value, scope, 0, budget)
 }
 
 /// One template value with every intrinsic function it carries evaluated, preserving the
