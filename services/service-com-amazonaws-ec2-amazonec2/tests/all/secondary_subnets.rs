@@ -218,7 +218,8 @@ fn seed(engine: &engine::InMemoryEngine) -> Seeded {
             state: fixture.state.to_string(),
             state_reason: fixture.state_reason.map(str::to_string),
             tags: fixture.tags,
-        });
+        })
+        .expect("the seeded store is far below its secondary subnet ceiling");
         let associations = guard
             .secondary_subnets
             .get(&id)
@@ -367,6 +368,7 @@ async fn every_stored_secondary_subnet_is_reported_and_a_later_write_is_visible(
             state_reason: None,
             tags: vec![tag("Name", "late")],
         })
+        .expect("the seeded store is far below its secondary subnet ceiling")
     };
 
     let after = described_ids(&router, "after a later write", &[]).await;
@@ -635,7 +637,8 @@ async fn every_modelled_subnet_state_selects_the_subnet_stored_in_it() {
                 state: (*state).to_string(),
                 state_reason: None,
                 tags: Vec::new(),
-            });
+            })
+            .expect("the seeded store is far below its secondary subnet ceiling");
             by_subnet_state.push((state, id));
         }
     }
@@ -680,7 +683,8 @@ async fn every_modelled_association_state_selects_the_subnet_whose_block_is_in_i
                 state: SECONDARY_SUBNET_STATE_CREATE_COMPLETE.to_string(),
                 state_reason: None,
                 tags: Vec::new(),
-            });
+            })
+            .expect("the seeded store is far below its secondary subnet ceiling");
             by_association_state.push((state, id));
         }
     }

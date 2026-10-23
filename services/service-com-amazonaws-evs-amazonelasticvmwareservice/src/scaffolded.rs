@@ -308,6 +308,80 @@ impl SerializableStruct for TaggingResourceNotFound {
     }
 }
 
+/// The `message` member of the synthetic `AccessDeniedException` error shape.
+static ACCESS_DENIED_MESSAGE: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "smithy.framework#AccessDeniedException$message",
+        "smithy.framework",
+        "message",
+    ),
+    ShapeType::String,
+    "message",
+    0,
+)
+.with_xml_name("Message")
+.with_json_name("message");
+
+/// Schema for the synthetic `AccessDeniedException` error shape.
+///
+/// In the `smithy.framework` namespace for the same reason as [`NOT_IMPLEMENTED_SCHEMA`]:
+/// `AccessDeniedException` is one of the AWS COMMON errors, which the authorization layer
+/// answers for every service, and this service's model declares no such shape — so it
+/// must be declared here and must not collide with a modeled one. The wire error code and
+/// the status travel beside it, from [`ACCESS_DENIED_CODE`] and [`ACCESS_DENIED_STATUS`].
+pub static ACCESS_DENIED_SCHEMA: Schema = Schema::new_struct(
+    ShapeId::from_static(
+        "smithy.framework#AccessDeniedException",
+        "smithy.framework",
+        "AccessDeniedException",
+    ),
+    ShapeType::Structure,
+    &[&ACCESS_DENIED_MESSAGE],
+);
+
+/// The wire error code of an authorization refusal: the AWS-common
+/// `AccessDeniedException`, which is what a client catches it by.
+pub const ACCESS_DENIED_CODE: &str = "AccessDeniedException";
+
+/// The HTTP status this service answers an authorization refusal with.
+///
+/// 400, for the same reason every modeled CLIENT error of this service is reported with
+/// 400 ([`wire_http_status`]): an awsJson front end reports an error's FAULT rather than
+/// a per-shape code, and the body's error code is what distinguishes one client error
+/// from another. An authorization refusal is a client fault, so it joins them.
+pub const ACCESS_DENIED_STATUS: u16 = 400;
+
+/// The payload of an `AccessDeniedException`: which principal was refused which action
+/// on which resource, and why.
+#[derive(Debug, Clone)]
+pub struct AccessDeniedException {
+    pub message: String,
+}
+
+impl AccessDeniedException {
+    /// An `AccessDeniedException` carrying `message`.
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for AccessDeniedException {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{ACCESS_DENIED_CODE}: {}", self.message)
+    }
+}
+
+impl std::error::Error for AccessDeniedException {}
+
+impl SerializableStruct for AccessDeniedException {
+    fn serialize_members(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
+        s.write_string(&ACCESS_DENIED_MESSAGE, self.message.as_str())?;
+        Ok(())
+    }
+}
+
 /// An operation's error channel: either the synthetic scaffold signal, or one of the
 /// operation's own modeled errors.
 #[derive(Debug)]
@@ -336,6 +410,14 @@ pub enum Scaffolded<E> {
     /// `MalformedQueryString` rather than `ValidationException`, so a client
     /// matching on the error code there sees two codes for one logical failure.
     ValidationException(ValidationException),
+    /// IAM refused the request before the resource it names was evaluated. Renders with
+    /// the error code `AccessDeniedException` at [`ACCESS_DENIED_STATUS`].
+    ///
+    /// It is a variant here rather than a modeled error because this service's model
+    /// declares no `AccessDeniedException`: the refusal is the AWS-common one the
+    /// authorization layer answers for every service (see
+    /// [`crate::state::authorization`]).
+    AccessDenied(AccessDeniedException),
 }
 
 impl<E> Scaffolded<E> {
@@ -375,6 +457,16 @@ impl<E> Scaffolded<E> {
     pub fn tagging_resource_not_found(resource_arn: impl Into<String>) -> Self {
         Self::TaggingResourceNotFound(TaggingResourceNotFound::new(resource_arn))
     }
+
+    /// Refuse the request because IAM does not allow it: the AWS-common
+    /// `AccessDeniedException`, with the message the authorization gate built from the
+    /// principal, the action and the resource.
+    ///
+    /// Reach for it ONLY through [`crate::state::authorization`], which owns the
+    /// decision and the wording; a handler never decides authorization itself.
+    pub fn access_denied(message: impl Into<String>) -> Self {
+        Self::AccessDenied(AccessDeniedException::new(message))
+    }
 }
 
 impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
@@ -384,6 +476,7 @@ impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
             Self::Modeled(e) => write!(f, "{e}"),
             Self::TaggingResourceNotFound(e) => write!(f, "{e}"),
             Self::ValidationException(e) => write!(f, "{e}"),
+            Self::AccessDenied(e) => write!(f, "{e}"),
         }
     }
 }
@@ -397,6 +490,7 @@ impl<E: std::error::Error + 'static> std::error::Error for Scaffolded<E> {
             Self::Modeled(e) => e.source(),
             Self::TaggingResourceNotFound(e) => e.source(),
             Self::ValidationException(e) => e.source(),
+            Self::AccessDenied(e) => e.source(),
         }
     }
 }
@@ -412,6 +506,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::Modeled(e) => e.as_serializable(),
             Self::TaggingResourceNotFound(e) => e,
             Self::ValidationException(e) => e,
+            Self::AccessDenied(e) => e,
         }
     }
 
@@ -421,6 +516,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::Modeled(e) => e.variant_schema(),
             Self::TaggingResourceNotFound(_) => &TAGGING_RESOURCE_NOT_FOUND_SCHEMA,
             Self::ValidationException(_) => &VALIDATION_EXCEPTION_SCHEMA,
+            Self::AccessDenied(_) => &ACCESS_DENIED_SCHEMA,
         }
     }
 
@@ -434,6 +530,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::Modeled(e) => e.shape_name(),
             Self::TaggingResourceNotFound(_) => TAGGING_RESOURCE_NOT_FOUND_CODE,
             Self::ValidationException(_) => "ValidationException",
+            Self::AccessDenied(_) => ACCESS_DENIED_CODE,
         }
     }
 
@@ -451,6 +548,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::Modeled(e) => wire_http_status(e.http_status()),
             Self::TaggingResourceNotFound(_) => TAGGING_RESOURCE_NOT_FOUND_STATUS,
             Self::ValidationException(_) => 400,
+            Self::AccessDenied(_) => ACCESS_DENIED_STATUS,
         }
     }
 
@@ -465,6 +563,8 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::TaggingResourceNotFound(_) => None,
             // Same reason: the synthetic shape carries no `awsQueryError` trait.
             Self::ValidationException(_) => None,
+            // Same reason: the synthetic shape carries no `awsQueryError` trait.
+            Self::AccessDenied(_) => None,
         }
     }
 }
