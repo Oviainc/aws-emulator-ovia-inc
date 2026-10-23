@@ -91,7 +91,7 @@ impl NamespaceCase {
 
 /// `IdNamespaceInputSource` entries: `inputSourceARN` (a Glue table ARN is one of the
 /// forms the modelled pattern admits) plus the optional `schemaName`.
-fn input_sources(count: usize) -> Vec<Value> {
+pub(crate) fn input_sources(count: usize) -> Vec<Value> {
     (0..count)
         .map(|index| {
             if index % 2 == 0 {
@@ -111,7 +111,11 @@ fn input_sources(count: usize) -> Vec<Value> {
 /// members of `NamespaceRuleBasedProperties` (`rules` 1..25, `ruleDefinitionTypes`,
 /// `attributeMatchingModel` one of `ONE_TO_ONE | MANY_TO_MANY`, `recordMatchingModels`
 /// one of `ONE_SOURCE_TO_ONE_TARGET | MANY_SOURCE_TO_ONE_TARGET`).
-fn rule_based_properties(rules: usize, matching_model: &str, record_model: &str) -> Value {
+pub(crate) fn rule_based_properties(
+    rules: usize,
+    matching_model: &str,
+    record_model: &str,
+) -> Value {
     let rules: Vec<Value> = (0..rules)
         .map(|index| {
             json!({
@@ -135,7 +139,7 @@ fn rule_based_properties(rules: usize, matching_model: &str, record_model: &str)
 /// `NamespaceProviderProperties$providerServiceArn` is @required. The ARN comes from
 /// the sibling suite's one `ProviderServiceArn` helper (an EMPTY account segment,
 /// `smithy_query(query="shape",shape="NamespaceProviderProperties")`).
-fn provider_properties() -> Value {
+pub(crate) fn provider_properties() -> Value {
     json!({
         "idMappingType": "PROVIDER",
         "providerProperties": {
@@ -224,7 +228,7 @@ fn namespace_cases() -> Vec<NamespaceCase> {
 }
 
 /// An optional member of a response body: `None` when the response carries none.
-fn optional_member(record: &Value, member: &str) -> Option<Value> {
+pub(crate) fn optional_member(record: &Value, member: &str) -> Option<Value> {
     record.get(member).cloned()
 }
 

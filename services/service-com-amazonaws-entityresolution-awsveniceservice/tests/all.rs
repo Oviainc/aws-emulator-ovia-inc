@@ -19,6 +19,8 @@ mod id_mapping_workflow_listing;
 mod id_mapping_workflow_update;
 #[path = "all/id_namespace_lifecycle.rs"]
 mod id_namespace_lifecycle;
+#[path = "all/id_namespace_update.rs"]
+mod id_namespace_update;
 #[path = "all/matching_job_lifecycle.rs"]
 mod matching_job_lifecycle;
 #[path = "all/matching_workflow_update.rs"]
