@@ -25,6 +25,16 @@
 //! `GetPolicy` reports the document those statements make up, so no policy text is ever
 //! echoed back out of a request body.
 //!
+//! The asynchronous-invocation slice hangs off the same record. `InvokeAsync` answers
+//! "202 Accepted ... the request is queued for invocation", so what it persists is the
+//! queued event itself — on [`FunctionRecord::async_invocations`], one
+//! [`AsyncInvocationRecord`] per accepted event, against the version it was addressed
+//! to. The event is never executed here (this emulator has no in-process runtime for a
+//! deployment package), so the entry's outcome settles into
+//! [`AsyncInvocationOutcome::Failed`] once its delivery attempt is due, carrying the
+//! reason; nothing invents a result, a log tail or a duration for a function that did
+//! not run.
+//!
 //! `GetAccountSettings` reports on the same records at the account level:
 //! "Retrieves details about your account's limits and usage in an Amazon Web Services
 //! Region", so its usage is what the store holds and its unreserved concurrency is what
@@ -32,7 +42,7 @@
 //! [`ComAmazonawsLambdaAwsgirapiserviceState::account_usage`] and
 //! [`ComAmazonawsLambdaAwsgirapiserviceState::account_limit`]).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, SystemTime};
 
 use base64::Engine as _;
@@ -604,6 +614,66 @@ impl FunctionUrlConfigRecord {
     }
 }
 
+/// What has become of one queued asynchronous invocation.
+///
+/// A queued event is NOT a run: the queue is the only thing an asynchronous
+/// invocation's accepting call ("A success response (202 Accepted) indicates that the
+/// request is queued for invocation") promises, and this emulator has no in-process
+/// runtime that can run a deployment package. So an entry starts [`Self::Queued`] and,
+/// once its first delivery attempt is due, settles into [`Self::Failed`] carrying the
+/// reason it never ran. Nothing here ever reports a result, a log tail or a duration
+/// for a function that did not execute.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AsyncInvocationOutcome {
+    /// Accepted and waiting for its delivery attempt, which is due at
+    /// [`AsyncInvocationRecord::attempt_due`].
+    Queued,
+    /// The delivery attempt came due and the event was never executed; the string is
+    /// why.
+    Failed(String),
+}
+
+/// One asynchronous invocation this emulator accepted for a function.
+///
+/// Held per function on [`FunctionRecord::async_invocations`], because Lambda queues an
+/// asynchronous event against the function version it was addressed to.
+#[derive(Debug, Clone)]
+pub struct AsyncInvocationRecord {
+    /// The version label the event was addressed to (`$LATEST` or a published version).
+    pub version: String,
+    /// The event payload, exactly as the caller supplied it.
+    pub payload: Vec<u8>,
+    /// ISO-8601 instant the event was accepted for invocation.
+    pub received: String,
+    /// When the first delivery attempt becomes due; see [`ASYNC_DELIVERY_DELAY`].
+    pub attempt_due: SystemTime,
+    /// What has become of the event.
+    pub outcome: AsyncInvocationOutcome,
+}
+
+/// How long after an asynchronous invocation is accepted its first delivery attempt
+/// becomes due.
+///
+/// An EMULATOR-CHOSEN span, like [`ACTIVATION_DELAY`]: Lambda publishes no latency for
+/// the asynchronous event queue. It is deliberately non-zero, so a caller that looks
+/// straight after the accepting call still sees the event [`AsyncInvocationOutcome::Queued`].
+pub const ASYNC_DELIVERY_DELAY: Duration = Duration::from_millis(250);
+
+/// Why a queued asynchronous invocation never ran, recorded on the entry when its
+/// delivery attempt comes due.
+pub const ASYNC_NOT_EXECUTED_REASON: &str =
+    "the event was accepted and queued, but no in-process runtime in this emulator can \
+     run the function's deployment package, so it was never executed";
+
+/// The most queued asynchronous invocations this emulator keeps for one function.
+///
+/// An EMULATOR-CHOSEN ceiling for the same reason as [`MAX_FUNCTIONS`]: the queue is in
+/// memory and every accepted event adds its payload to it, so past this point the
+/// oldest entry is dropped rather than the store growing without bound. Dropping the
+/// oldest does not change what any call answers — the accepting call reports only that
+/// the event was queued, and no operation reads the queue back out.
+pub const MAX_QUEUED_ASYNC_INVOCATIONS: usize = 100;
+
 /// The most aliases this emulator keeps for one function.
 ///
 /// An EMULATOR-CHOSEN ceiling, in the sense [`MAX_FUNCTIONS`] is: the store is in memory
@@ -746,6 +816,9 @@ pub struct FunctionRecord {
     /// them in a stable order. An alias belongs to the function, not to one of its
     /// versions, and names the version it invokes.
     pub aliases: BTreeMap<String, AliasRecord>,
+    /// The asynchronous invocations accepted for this function, oldest first, bounded
+    /// by [`MAX_QUEUED_ASYNC_INVOCATIONS`].
+    pub async_invocations: VecDeque<AsyncInvocationRecord>,
 }
 
 impl FunctionRecord {
@@ -761,6 +834,37 @@ impl FunctionRecord {
             self.state_reason = None;
             self.state_reason_code = None;
             self.last_update_status = Some(LAST_UPDATE_STATUS_SUCCESSFUL.to_string());
+        }
+        // The same rule for the asynchronous event queue: a queued event whose delivery
+        // attempt the clock has already made due has had that attempt, and this emulator
+        // runs no deployment package, so the attempt ended without the function ever
+        // executing. The outcome would have been owed at the same instant even if nobody
+        // had called.
+        for invocation in &mut self.async_invocations {
+            if invocation.outcome == AsyncInvocationOutcome::Queued && now >= invocation.attempt_due
+            {
+                invocation.outcome =
+                    AsyncInvocationOutcome::Failed(ASYNC_NOT_EXECUTED_REASON.to_string());
+            }
+        }
+    }
+
+    /// Queue one asynchronous invocation of `version` carrying `payload`, accepted at
+    /// `now`.
+    ///
+    /// The queue is bounded by [`MAX_QUEUED_ASYNC_INVOCATIONS`]: once it is full the
+    /// oldest entry makes room for the newest, so accepting an event never fails for
+    /// want of memory.
+    pub fn queue_async_invocation(&mut self, version: &str, payload: Vec<u8>, now: SystemTime) {
+        self.async_invocations.push_back(AsyncInvocationRecord {
+            version: version.to_string(),
+            payload,
+            received: iso8601(now),
+            attempt_due: now + ASYNC_DELIVERY_DELAY,
+            outcome: AsyncInvocationOutcome::Queued,
+        });
+        while self.async_invocations.len() > MAX_QUEUED_ASYNC_INVOCATIONS {
+            self.async_invocations.pop_front();
         }
     }
 

@@ -513,6 +513,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             url_configs: ::std::collections::BTreeMap::new(),
             // ... and no alias until `CreateAlias` creates one.
             aliases: ::std::collections::BTreeMap::new(),
+            // ... and nothing queued for it until an invocation is accepted.
+            async_invocations: ::std::collections::VecDeque::new(),
         };
 
         // "Use the Publish parameter to create version 1 of your function from its
