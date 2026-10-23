@@ -37,6 +37,8 @@ mod extension_registry;
 mod nested_resource_outputs;
 #[path = "all/provisioned_resources.rs"]
 mod provisioned_resources;
+#[path = "all/published_type_schema.rs"]
+mod published_type_schema;
 #[path = "all/resolved_properties.rs"]
 mod resolved_properties;
 #[path = "all/scratch.rs"]

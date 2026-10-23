@@ -615,9 +615,10 @@ async fn every_implemented_resource_type_is_an_aws_published_public_extension() 
                 present(provisioning_type::FULLY_MUTABLE),
             ),
             ("IsDefaultVersion", present("true")),
-            // Not known for a published extension, so not reported: no schema, no
-            // publisher, no private-extension members.
-            ("Schema", None),
+            // Not known for a published extension, so not reported: no publisher and no
+            // private-extension members. (`Schema` IS reported — the registry derives the
+            // type's resource schema — and `published_type_schema.rs` is the suite that
+            // pins what it carries.)
             ("DefaultVersionId", None),
             ("PublisherId", None),
             ("IsActivated", None),

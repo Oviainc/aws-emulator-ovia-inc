@@ -393,7 +393,10 @@ pub const AWS_PUBLISHED_VERSION_ID: &str = "00000001";
 /// not assigned a publisher ID" — its `SourceUrl` is the open-source repository AWS
 /// publishes that type's resource provider in ([`aws_published_source_url`]), and its
 /// registration instants are the instant this registry came into being
-/// ([`REGISTRY_GENESIS`]), which is how long it has held them. The schema, the description
+/// ([`REGISTRY_GENESIS`]), which is how long it has held them. Its `Schema` is "the schema
+/// that defines the extension": the resource schema this registry holds for the type
+/// ([`crate::state::resource_schema`]), derived from the properties the type publishes. The
+/// description
 /// and the documentation URL are NOT known here, so they stay absent rather than invented.
 pub fn aws_published(region: &str, type_kind: &str, type_name: &str) -> Option<StoredExtension> {
     if type_kind != registry_type::RESOURCE
@@ -455,7 +458,11 @@ static REGISTRY_GENESIS: ::std::sync::LazyLock<SystemTime> =
 /// (`AWS::S3::Bucket` -> `.../aws-cloudformation-resource-providers-s3`). `SourceUrl` is
 /// "the URL of the source code for the extension", and that is the URL for one of these,
 /// derived from the type name rather than held as a per-type constant.
-fn aws_published_source_url(type_name: &str) -> Option<String> {
+///
+/// It is also the `sourceUrl` of the resource schema this registry derives for the type
+/// ([`crate::state::resource_schema`]): a published resource schema names that same
+/// repository.
+pub fn aws_published_source_url(type_name: &str) -> Option<String> {
     let service = type_name.split("::").nth(1)?;
     if service.is_empty() {
         return None;
@@ -475,7 +482,10 @@ fn aws_published_record(region: &str, type_name: &str) -> StoredExtension {
         // CloudFormation reports for one — so the version carries it unsuffixed.
         arn: arn.clone(),
         description: None,
-        schema: None,
+        // "The schema that defines the extension": the resource schema this registry holds
+        // for the type, derived from the properties the type publishes rather than read
+        // out of a handler package — nobody registered this extension, so there is none.
+        schema: crate::state::resource_schema::resource_type_schema(type_name),
         provisioning_type: Some(provisioning_type::FULLY_MUTABLE.to_string()),
         deprecated_status: deprecated_status::LIVE.to_string(),
         // "CloudFormation doesn't return this information for public extensions": the

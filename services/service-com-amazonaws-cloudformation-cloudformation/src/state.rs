@@ -123,6 +123,10 @@ pub mod resource_types;
 /// Region holds, and the versions of each.
 pub mod registry;
 
+/// The resource schema the registry holds for a resource type: the document that defines
+/// which properties the type has.
+pub mod resource_schema;
+
 /// How long after the call that starts it a stack's terminal status becomes due.
 ///
 /// Chosen (CloudFormation's real stack operations take as long as the resources do, so

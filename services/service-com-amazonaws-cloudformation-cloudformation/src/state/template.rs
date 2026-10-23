@@ -2735,6 +2735,74 @@ fn return_values(
     }
 }
 
+/// The NAMES of the `Fn::GetAtt` attributes a resource of this type publishes — the other
+/// half of the catalogue [`return_values`] above keys, read without a resource.
+///
+/// Source: the very same per-type "Return values" sections. Which attributes a type
+/// publishes is a property of the TYPE, while the values [`return_values`] computes are
+/// properties of one provisioned resource, so the extension registry can report what a
+/// published resource type's schema DEFINES
+/// ([`crate::state::resource_schema`](crate::state::resource_schema)) with no stack having
+/// declared one. A type this emulator carries no return values for publishes no
+/// attributes, and gets the empty list.
+///
+/// This is the same split [`declared_name_property`] is in: an arm added to
+/// [`return_values`] has to be added here too, which
+/// `published_attribute_names_are_the_catalogued_return_values` in this module's tests
+/// enforces — it compares this list, type by type, against the attributes the arm actually
+/// inserts. The order is the sorted order a resource's own attribute map holds them in, so
+/// a document built from them is byte-for-byte the same on every read.
+pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str] {
+    match resource_type {
+        "AWS::SNS::Topic" => &["TopicArn", "TopicName"],
+        SQS_QUEUE => &["Arn", "QueueName", "QueueUrl"],
+        "AWS::S3::Bucket" => &["Arn", "DomainName"],
+        "AWS::DynamoDB::Table" => &["Arn"],
+        "AWS::Lambda::Function" => &["Arn"],
+        "AWS::Logs::LogGroup" => &["Arn"],
+        "AWS::Transfer::Server" => &["Arn", "ServerId"],
+        "AWS::Transfer::Workflow" => &["Arn", "WorkflowId"],
+        "AWS::IAM::Role" => &["Arn"],
+        ECR_PUBLIC_REPOSITORY => &["Arn"],
+        FIREHOSE_DELIVERY_STREAM => &["Arn"],
+        ECR_REPOSITORY => &["Arn", "RepositoryUri"],
+        ECS_CLUSTER => &["Arn"],
+        ECS_TASK_DEFINITION => &["TaskDefinitionArn"],
+        ELB_LOAD_BALANCER => &["DNSName", "LoadBalancerFullName", "LoadBalancerName"],
+        ELB_TARGET_GROUP => &["TargetGroupArn", "TargetGroupFullName", "TargetGroupName"],
+        "AWS::RDS::DBCluster" => &[
+            "DBClusterArn",
+            "DBClusterResourceId",
+            "Endpoint.Address",
+            "Endpoint.Port",
+            "ReadEndpoint.Address",
+        ],
+        "AWS::RDS::DBInstance" => &[
+            "DBInstanceArn",
+            "DbiResourceId",
+            "Endpoint.Address",
+            "Endpoint.Port",
+        ],
+        "AWS::SecretsManager::Secret" => &["Id"],
+        "AWS::EC2::SecurityGroup" => &["GroupId"],
+        ECS_SERVICE => &["Name"],
+        ELB_LISTENER => &["ListenerArn"],
+        ELB_LISTENER_RULE => &["IsDefault", "RuleArn"],
+        "AWS::BedrockAgentCore::Memory" => &["MemoryArn", "MemoryId"],
+        "AWS::BedrockAgentCore::Runtime" => {
+            &["AgentRuntimeArn", "AgentRuntimeId", "AgentRuntimeVersion"]
+        }
+        "AWS::BedrockAgentCore::CodeInterpreter" => &["CodeInterpreterArn", "CodeInterpreterId"],
+        "AWS::BedrockAgentCore::Browser" => &["BrowserArn", "BrowserId"],
+        "AWS::BedrockAgentCore::Gateway" => &["GatewayArn", "GatewayId"],
+        "AWS::BedrockAgentCore::WorkloadIdentity" => &["Name", "WorkloadIdentityArn"],
+        "AWS::RUM::AppMonitor" => &["Id"],
+        "AWS::CloudWatch::Alarm" => &["Arn"],
+        FIS_EXPERIMENT_TEMPLATE => &["Id"],
+        _ => &[],
+    }
+}
+
 /// Whether the PHYSICAL ID of a resource of this type is assigned by the service that owns
 /// it rather than derived from what the template declares.
 ///
@@ -3804,14 +3872,15 @@ fn substitute(
 mod tests {
     use super::*;
 
-    /// [`IMPLEMENTED_RESOURCE_TYPES`] is the catalogue of the arms of [`return_values`],
-    /// and the registry reports a published extension for exactly its entries — so an
-    /// entry that `return_values` does not actually know would make the registry report an
-    /// extension for a type this emulator provisions no better than any other. Every
-    /// catalogued type must therefore yield the attributes its "Return values" section
-    /// publishes, which a type outside the `match` has none of.
-    #[test]
-    fn every_implemented_resource_type_has_known_return_values() {
+    /// The attributes [`return_values`] computes for a resource of `resource_type`.
+    ///
+    /// `return_values` reads the whole declaration, because a few published return values
+    /// are functions of the resource's own properties: a DB type's `Endpoint.Port` needs a
+    /// declared engine, and the two NESTED Elastic Load Balancing types (a listener and a
+    /// rule, whose ARNs are built from their parent's) the parent ARN. So the declaration
+    /// here carries what a template declaring one of those types would, which is what
+    /// makes the attribute set it yields the type's WHOLE published set.
+    fn computed_attributes(resource_type: &str) -> BTreeMap<String, String> {
         let stack = StackScope {
             region: "us-east-1",
             stack_name: "a-stack",
@@ -3831,14 +3900,7 @@ mod tests {
             conditions: &conditions,
         };
         let mut budget = Budget::new();
-        // `return_values` reads the whole declaration, because a few published return
-        // values are functions of the resource's own properties: a declaration carrying
-        // only the type is what a template that sets no property spells. A DB type's
-        // `Endpoint.Port` is one of those — it needs a declared engine — so each DB row
-        // declares the engine a template would, and the two NESTED Elastic Load Balancing
-        // types (a listener and a rule, whose ARNs are built from their parent's) the
-        // parent ARN a template would.
-        let declared_as = |resource_type: &str| DeclaredResource {
+        let declared = DeclaredResource {
             logical_id: "ARes".to_string(),
             resource_type: resource_type.to_string(),
             properties: ::serde_json::json!({
@@ -3855,9 +3917,20 @@ mod tests {
             condition: None,
             declaration: Value::Null,
         };
+        let (_, attributes) = return_values(&declared, "a-name", &scope, &mut budget);
+        attributes
+    }
+
+    /// [`IMPLEMENTED_RESOURCE_TYPES`] is the catalogue of the arms of [`return_values`],
+    /// and the registry reports a published extension for exactly its entries — so an
+    /// entry that `return_values` does not actually know would make the registry report an
+    /// extension for a type this emulator provisions no better than any other. Every
+    /// catalogued type must therefore yield the attributes its "Return values" section
+    /// publishes, which a type outside the `match` has none of.
+    #[test]
+    fn every_implemented_resource_type_has_known_return_values() {
         for resource_type in IMPLEMENTED_RESOURCE_TYPES {
-            let (_, attributes) =
-                return_values(&declared_as(resource_type), "a-name", &scope, &mut budget);
+            let attributes = computed_attributes(resource_type);
             assert!(
                 !attributes.is_empty(),
                 "case {resource_type:?}: expected the type's documented Fn::GetAtt \
@@ -3866,15 +3939,36 @@ mod tests {
             );
         }
         // And a type no arm carries is NOT in the catalogue: it has no attributes at all.
-        let (_, unknown) = return_values(
-            &declared_as("AWS::NotAService::NotAType"),
-            "a-name",
-            &scope,
-            &mut budget,
-        );
+        let unknown = computed_attributes("AWS::NotAService::NotAType");
         assert!(
             unknown.is_empty(),
             "case \"a type no arm carries\": expected no attributes, got {unknown:?}"
         );
+    }
+
+    /// [`published_attribute_names`] names exactly the attributes [`return_values`]
+    /// computes, for every type either half carries: the registry's resource schema is
+    /// built from the names, so a name missing from one half or invented in the other
+    /// would make the schema a published type's registry record carries disagree with the
+    /// attributes a resource of that type actually answers.
+    #[test]
+    fn published_attribute_names_are_the_catalogued_return_values() {
+        // Every type the schema side is asked about, plus one no arm carries at all.
+        let types = IMPLEMENTED_RESOURCE_TYPES
+            .iter()
+            .copied()
+            .chain(["AWS::NotAService::NotAType"]);
+        for resource_type in types {
+            let computed: Vec<String> = computed_attributes(resource_type).into_keys().collect();
+            let named: Vec<String> = published_attribute_names(resource_type)
+                .iter()
+                .map(ToString::to_string)
+                .collect();
+            assert_eq!(
+                named, computed,
+                "case {resource_type:?}: expected the names of the attributes \
+                 return_values computes ({computed:?}), got {named:?}"
+            );
+        }
     }
 }
