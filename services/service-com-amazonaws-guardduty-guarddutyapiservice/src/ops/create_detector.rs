@@ -242,6 +242,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             updated_at_millis: now,
             findings: std::collections::BTreeMap::new(),
             filters: std::collections::BTreeMap::new(),
+            threat_intel_sets: std::collections::BTreeMap::new(),
             investigations: std::collections::BTreeMap::new(),
             ip_sets: std::collections::BTreeMap::new(),
             // Malware Protection scans every eligible resource and retains no

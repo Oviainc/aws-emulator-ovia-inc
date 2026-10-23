@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateThreatIntelSet
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateThreatIntelSet`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: mints a ThreatIntelSet on the detector named in the URI and persists
+//! every member the request carried in [`crate::state`], so `GetThreatIntelSet` reads
+//! back exactly what was stored. A replayed `ClientToken` returns the list the first
+//! call minted, and a list the request asked to activate starts in the TRANSIENT
+//! `ACTIVATING` status the clock settles into `ACTIVE`. A create past the quota of
+//! threat lists the account may hold is refused, which is also what keeps the store
+//! bounded ([`crate::state::THREAT_INTEL_SETS_PER_DETECTOR`]).
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateThreatIntelSet::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +158,119 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateThreatIntelSet` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateThreatIntelSetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateThreatIntelSet"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateThreatIntelSetErrorModeled::InternalServerErrorException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+
+        let region = crate::state::request_region(ctx);
+        let mut state = state.lock();
+
+        // A threat list hangs off a detector, so the detector has to resolve before
+        // anything is minted: `DetectorId` is "the unique ID of the detector of the
+        // GuardDuty account for which you want to create a threatIntelSet"
+        // (`smithy_query(operation="CreateThreatIntelSet")`).
+        if state.detector_in(&region, &input.detector_id).is_none() {
+            return Err(invalid_input(crate::state::detector_id_rejection(
+                &input.detector_id,
+            )));
+        }
+
+        // `ClientToken` is `@idempotencyToken`: a replayed create returns the list
+        // the first call minted rather than minting a second one. The token is
+        // scoped to the detector the list hangs off.
+        let token = input
+            .client_token
+            .as_deref()
+            .filter(|token| !token.is_empty())
+            .map(str::to_string);
+        if let Some(token) = token.as_deref() {
+            if let Some(existing) = state
+                .detector_in(&region, &input.detector_id)
+                .and_then(|detector| detector.threat_intel_set_for_token(token))
+            {
+                return Ok(CreateThreatIntelSetOutput {
+                    threat_intel_set_id: existing.id.clone(),
+                });
+            }
+        }
+
+        // AWS publishes a quota of 6 threat lists per account per Region, and a
+        // detector is the account's one resource in a Region, so the quota is the
+        // detector's. Checked after the token replay, so a replayed create consumes
+        // none of it, and before anything is minted, so a refused create writes
+        // nothing. It is also what bounds this store: a caller varying or omitting
+        // `ClientToken` would otherwise add an entry per request.
+        if state
+            .detector_in(&region, &input.detector_id)
+            .is_some_and(|detector| {
+                detector.threat_intel_sets.len() >= crate::state::THREAT_INTEL_SETS_PER_DETECTOR
+            })
+        {
+            return Err(invalid_input(crate::state::threat_intel_set_limit_message()));
+        }
+
+        let now = state.tick_millis();
+        let id = state.mint_id();
+        let record = crate::state::ThreatIntelSetRecord {
+            id: id.clone(),
+            name: input.name.clone(),
+            format: input.format.clone(),
+            location: input.location.clone(),
+            expected_bucket_owner: input.expected_bucket_owner.clone(),
+            tags: input
+                .tags
+                .as_ref()
+                .map(|tags| {
+                    tags.iter()
+                        .map(|(key, value)| (key.clone(), value.clone()))
+                        .collect::<std::collections::BTreeMap<_, _>>()
+                })
+                .unwrap_or_default(),
+            client_token: token,
+            created_at_millis: now,
+            // `Activate` says "whether GuardDuty is to start using the uploaded
+            // ThreatIntelSet": a list the create activates is not in use the instant
+            // the call returns, so it reports the transient `ACTIVATING` until the
+            // activation this call started comes due. A list nobody asked to
+            // activate is `INACTIVE` straight away, and stays there — the clock owes
+            // it nothing.
+            status: if input.activate {
+                crate::state::THREAT_INTEL_SET_ACTIVATING.to_string()
+            } else {
+                crate::state::THREAT_INTEL_SET_INACTIVE.to_string()
+            },
+            pending_status: if input.activate {
+                Some((
+                    crate::state::THREAT_INTEL_SET_ACTIVE.to_string(),
+                    now.saturating_add(crate::state::THREAT_INTEL_SET_ACTIVATION_SPAN_MILLIS),
+                ))
+            } else {
+                None
+            },
+        };
+
+        let Some(detector) = state.detector_in_mut(&region, &input.detector_id) else {
+            // The detector resolved above under the same lock, so this cannot be
+            // reached; answering the modelled server fault keeps it from panicking.
+            return Err(CreateThreatIntelSetErrorModeled::InternalServerErrorException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+        detector.threat_intel_sets.insert(id.clone(), record);
+
+        Ok(CreateThreatIntelSetOutput {
+            threat_intel_set_id: id,
+        })
     }
+}
+
+/// Refuse the request the way GuardDuty does: HTTP 400 under the
+/// `InvalidInputException` class, in both the body's `__type` and its `type`
+/// member.
+fn invalid_input(message: impl Into<String>) -> CreateThreatIntelSetError {
+    crate::scaffolded::Scaffolded::invalid_input(message)
 }
