@@ -135,6 +135,16 @@ pub mod limits {
     /// per-Region, name-keyed Batch resources above.
     pub const MAX_SCHEDULING_POLICIES: usize = 50;
 
+    /// How many tags ONE resource carries at most.
+    ///
+    /// The model's own bound: every tag map on this service — `TagResource$tags`,
+    /// `ListTagsForResource$tags`, `CreateJobQueue$tags`, … — targets
+    /// `com.amazonaws.batch#TagrisTagsMap`, declared `@length(min: 1, max: 50)`
+    /// (`smithy_query(query="shape", shape="TagrisTagsMap")`). A resource holding more
+    /// than this could not be reported through that shape at all, so a `TagResource`
+    /// whose merge would take a resource past it is refused instead.
+    pub const MAX_TAGS_PER_RESOURCE: usize = 50;
+
     /// Job ids ONE `DescribeJobs` call may name. AWS documents it on the member:
     /// `DescribeJobsRequest$jobs` is "A list of up to 100 job IDs"
     /// (`smithy_query(query="doc", shape="DescribeJobsRequest", member="jobs")`); the
@@ -159,6 +169,70 @@ pub fn describe_jobs_bound_message() -> String {
 /// The `ClientException` message a request past one of [`limits`] answers with.
 pub fn quota_message(resource: &str, maximum: usize) -> String {
     format!("Too many {resource}: this emulator stores at most {maximum}")
+}
+
+/// The `ClientException` detail for a `TagResource` whose merge would leave one resource
+/// holding more tags than [`limits::MAX_TAGS_PER_RESOURCE`].
+///
+/// Built from the request — the resource it named and how many tags it would end up
+/// holding — the way a Batch refusal states what the caller has to fix.
+pub fn tag_limit_message(arn: &str, requested: usize) -> String {
+    format!(
+        "Resource {arn} would hold {requested} tags: a resource carries at most {} tags",
+        limits::MAX_TAGS_PER_RESOURCE
+    )
+}
+
+/// The longest `TagKey` the model admits: `com.amazonaws.batch#TagKey` is
+/// `@length(min: 1, max: 128)` (`smithy_query(query="shape", shape="TagrisTagsMap")`).
+pub const MAX_TAG_KEY_LEN: usize = 128;
+
+/// The longest `TagValue` the model admits, from the same shape:
+/// `@length(min: 0, max: 256)` — so an EMPTY tag value is legal.
+pub const MAX_TAG_VALUE_LEN: usize = 256;
+
+/// Whether every entry of `tags` fits the bounds the model declares for a tag KEY and a
+/// tag VALUE; the refusal detail naming the first entry that does not otherwise.
+///
+/// The boundary walk enforces the tag MAP's own length (at most
+/// [`limits::MAX_TAGS_PER_RESOURCE`] entries in one request) but not the bounds of the
+/// key and value shapes INSIDE it, so the service enforces those rather than storing a
+/// key or value it could never report back through `TagrisTagsMap` again. The entries are
+/// examined in key order, so one request always answers with the same entry.
+pub fn validate_tags(tags: &HashMap<String, String>) -> Result<(), String> {
+    let ordered: BTreeMap<&str, &str> = tags
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect();
+    for (key, value) in ordered {
+        validate_tag_key(key)?;
+        let length = value.chars().count();
+        if length > MAX_TAG_VALUE_LEN {
+            return Err(format!(
+                "The value of tag key {key} is {length} characters: a tag value is at most \
+                 {MAX_TAG_VALUE_LEN} characters"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// [`validate_tags`] for the keys alone, which is what `UntagResource` carries; examined
+/// in the order the request listed them.
+pub fn validate_tag_keys(keys: &[String]) -> Result<(), String> {
+    keys.iter().try_for_each(|key| validate_tag_key(key))
+}
+
+/// Whether one tag key fits `TagKey`'s declared bounds.
+fn validate_tag_key(key: &str) -> Result<(), String> {
+    let length = key.chars().count();
+    if length == 0 || length > MAX_TAG_KEY_LEN {
+        return Err(format!(
+            "The tag key {key} is {length} characters: a tag key is 1 to {MAX_TAG_KEY_LEN} \
+             characters"
+        ));
+    }
+    Ok(())
 }
 
 /// What `DescribeQuotaShare` answers for a `quotaShareArn` that is not a quota-share ARN
@@ -824,6 +898,120 @@ fn arn_resource_id<'a>(value: &'a str, kind: &str) -> Option<&'a str> {
     arn_resource(value)?.strip_prefix(kind)?.strip_prefix('/')
 }
 
+/// What a Batch resource ARN names: which of this service's stores holds that
+/// resource, and the key it is held under.
+///
+/// Parsed ONCE, by [`tagged_resource`], so every tagging operation
+/// (`TagResource`, `UntagResource`, `ListTagsForResource`) covers exactly the same
+/// resource kinds — every kind whose `Create*`/`Register*`/`Submit*` accepts a `tags`
+/// map, which is every record in this store that carries one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TaggedResource {
+    ComputeEnvironment(String),
+    JobQueue(String),
+    /// Keyed by the ARN itself, the way [`ComAmazonawsBatchAwsbatchv20160810State::quota_shares`] keys a share.
+    QuotaShare(String),
+    /// The `<name>:<revision>` reference the ARN carries.
+    JobDefinition(String),
+    Job(String),
+    ServiceJob(String),
+    ConsumableResource(String),
+    SchedulingPolicy(String),
+    ServiceEnvironment(String),
+}
+
+/// The resource an ARN names, or `None` when `value` is not an ARN of a Batch resource
+/// kind this service holds.
+///
+/// Only the ARN form resolves: `resourceArn` is documented as "The Amazon Resource Name
+/// (ARN) of the resource", so a bare name names nothing here (unlike the "name or ARN"
+/// members every other operation takes).
+fn tagged_resource(value: &str) -> Option<TaggedResource> {
+    // A quota share's ARN is nested under its job queue's, so it is recognised before
+    // the `job-queue/<name>` form it starts with.
+    if parse_quota_share_arn(value).is_some() {
+        return Some(TaggedResource::QuotaShare(value.to_string()));
+    }
+    let (kind, id) = arn_resource(value)?.split_once('/')?;
+    if id.is_empty() {
+        return None;
+    }
+    let id = id.to_string();
+    match kind {
+        "compute-environment" => Some(TaggedResource::ComputeEnvironment(id)),
+        "job-queue" => Some(TaggedResource::JobQueue(id)),
+        "job-definition" => Some(TaggedResource::JobDefinition(id)),
+        "job" => Some(TaggedResource::Job(id)),
+        "service-job" => Some(TaggedResource::ServiceJob(id)),
+        "consumable-resource" => Some(TaggedResource::ConsumableResource(id)),
+        "scheduling-policy" => Some(TaggedResource::SchedulingPolicy(id)),
+        "service-environment" => Some(TaggedResource::ServiceEnvironment(id)),
+        _ => None,
+    }
+}
+
+/// The arm list both tag accessors share, written ONCE.
+///
+/// [`ComAmazonawsBatchAwsbatchv20160810State::resource_tags`] and
+/// [`ComAmazonawsBatchAwsbatchv20160810State::resource_tags_mut`] differ only in the map
+/// lookup (`get` or `get_mut`) and in how they borrow the record's `tags`, so the list of
+/// kinds lives here: a kind added to [`TaggedResource`] is added once and both accessors
+/// gain it together, which is what keeps a read and the write that follows it on the same
+/// record.
+macro_rules! resource_tags_of {
+    ($state:expr, $arn:expr, $get:ident $(, $mutability:tt)?) => {
+        match tagged_resource($arn)? {
+            TaggedResource::ComputeEnvironment(name) => $state
+                .compute_environments
+                .$get(&name)
+                .filter(|record| record.arn == $arn)
+                .map(|record| & $($mutability)? record.tags),
+            TaggedResource::JobQueue(name) => $state
+                .job_queues
+                .$get(&name)
+                .filter(|record| record.arn == $arn)
+                .map(|record| & $($mutability)? record.tags),
+            TaggedResource::QuotaShare(key) => $state
+                .quota_shares
+                .$get(&key)
+                .map(|record| & $($mutability)? record.tags),
+            TaggedResource::JobDefinition(reference) => {
+                let key = $state.job_definition_key(&reference)?;
+                $state
+                    .job_definitions
+                    .$get(&key)
+                    .filter(|record| record.job_definition_arn == $arn)
+                    .map(|record| & $($mutability)? record.tags)
+            }
+            TaggedResource::Job(id) => $state
+                .jobs
+                .$get(&id)
+                .filter(|record| record.job_arn == $arn)
+                .map(|record| & $($mutability)? record.tags),
+            TaggedResource::ServiceJob(id) => $state
+                .service_jobs
+                .$get(&id)
+                .filter(|record| record.job_arn == $arn)
+                .map(|record| & $($mutability)? record.tags),
+            TaggedResource::ConsumableResource(name) => $state
+                .consumable_resources
+                .$get(&name)
+                .filter(|record| record.arn == $arn)
+                .map(|record| & $($mutability)? record.tags),
+            TaggedResource::SchedulingPolicy(name) => $state
+                .scheduling_policies
+                .$get(&name)
+                .filter(|record| record.arn == $arn)
+                .map(|record| & $($mutability)? record.tags),
+            TaggedResource::ServiceEnvironment(name) => $state
+                .service_environments
+                .$get(&name)
+                .filter(|record| record.arn == $arn)
+                .map(|record| & $($mutability)? record.tags),
+        }
+    };
+}
+
 /// A compute environment, exactly as `CreateComputeEnvironment` stored it.
 #[derive(Debug, Clone)]
 pub struct ComputeEnvironment {
@@ -1471,6 +1659,24 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
         self.scheduling_policies
             .contains_key(id)
             .then(|| id.to_string())
+    }
+
+    /// The tag map of the resource `arn` names, or `None` when this service holds no
+    /// such resource.
+    ///
+    /// The ONE place a tagging operation resolves a `resourceArn`, so `TagResource`,
+    /// `UntagResource` and `ListTagsForResource` all cover the same resource kinds and
+    /// all read the same stored map the `Describe*` readers report. The ARN must be the
+    /// one the resource was minted with — the same region, account and id — because a
+    /// different one names a different resource.
+    pub fn resource_tags(&self, arn: &str) -> Option<&Option<HashMap<String, String>>> {
+        resource_tags_of!(self, arn, get)
+    }
+
+    /// [`Self::resource_tags`], mutably: the slot a tagging WRITE updates, resolved and
+    /// reached in one step so the write lands on the record the read reported.
+    pub fn resource_tags_mut(&mut self, arn: &str) -> Option<&mut Option<HashMap<String, String>>> {
+        resource_tags_of!(self, arn, get_mut, mut)
     }
 
     /// `entries` with every `computeEnvironment` resolved against the stored compute
