@@ -21,6 +21,13 @@
 //! instead of being silently ignored — a filter honoured for supported values and
 //! dropped for unsupported ones would hand back the whole catalog for a typo.
 //!
+//! That refusal is this OPERATION's own unknown-type check and carries the constant
+//! [`crate::state::UNKNOWN_RESOURCE_TYPE_MESSAGE`]. `ResourceType` targets a plain
+//! `__string` — the model puts no enum, pattern or value list on it — so there is no
+//! modelled constraint for a boundary validator to report, and the message neither
+//! echoes the rejected value nor enumerates the supported types: the emulator's catalog
+//! is not part of the wire contract.
+//!
 //! PROVENANCE of the catalog's text: the rule IDS in [`BUILTIN_RULES`] are the rule
 //! identifiers Route 53 Application Recovery Controller publishes for each resource
 //! type — `ApiGwV1*` for an API Gateway stage, `Asg*` for an Auto Scaling group,
@@ -892,14 +899,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A `ResourceType` filter is validated BEFORE the listing: the value must name a
         // resource type this API supports, because an unsupported one names no type the
         // service has rules for — a bad request, not a type that happens to carry none.
+        //
+        // The refusal is THIS OPERATION's own unknown-type check, carrying the constant
+        // `crate::state::UNKNOWN_RESOURCE_TYPE_MESSAGE`: `ResourceType` targets a plain
+        // `__string` with no enum, pattern or value list, so there is no modelled
+        // constraint to report and no reason to publish the emulator's catalog in an
+        // error body.
         if let Some(resource_type) = input.resource_type.as_deref() {
-            crate::state::validate_resource_type("resourceType", resource_type).map_err(
-                |message| {
-                    ListRulesErrorModeled::ValidationException(ValidationException {
-                        message: Some(message),
-                    })
-                },
-            )?;
+            crate::state::validate_resource_type(resource_type).map_err(|message| {
+                ListRulesErrorModeled::ValidationException(ValidationException {
+                    message: Some(message.to_string()),
+                })
+            })?;
         }
 
         // The page the caller asked for, over the rules the filter admits. The shared

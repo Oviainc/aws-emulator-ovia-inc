@@ -40,8 +40,9 @@ use crate::harness::{
 const MAX_TAG_KEYS: usize = 50;
 
 /// The wire error code the tag APIs answer for a `resourceArn` addressing no resource of
-/// this account, with the HTTP status it carries.
-const NOT_FOUND: (u16, &str) = (400, "NotFoundException");
+/// this account, with the HTTP status it carries: 404, because the refusal reports an
+/// ABSENT resource (`crate::scaffolded::NOT_FOUND_STATUS`).
+const NOT_FOUND: (u16, &str) = (404, "NotFoundException");
 
 /// A Secrets Manager ARN satisfying the modelled `SecretArn` pattern, distinct per index.
 fn secret_arn(index: usize) -> String {

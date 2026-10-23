@@ -2803,6 +2803,109 @@ pub fn parse_taggable_resource(value: &str) -> Option<TaggableResourceRef> {
     })
 }
 
+/// The most tags one Lambda resource may carry.
+///
+/// AWS publishes it as a tagging restriction rather than in the model: the Lambda
+/// Developer Guide's "Tag Lambda resources" states "Maximum number of tags per resource:
+/// 50". A tag write that would leave a resource holding more than this is refused whole,
+/// so the resource keeps the tag set it had.
+pub const MAX_TAGS_PER_RESOURCE: usize = 50;
+
+/// Why a `TaggableResource` — the `Resource` label of the `/2017-03-31/tags/{Resource}`
+/// operations — names no tag set.
+///
+/// The two variants are the two answers AWS gives, and every tag operation maps them to
+/// its own modelled errors the same way: [`Self::Invalid`] is the caller naming something
+/// that carries no tag set at all (an `InvalidParameterValueException`, HTTP 400) and
+/// [`Self::NotFound`] is a well-formed ARN for a resource this account does not hold (a
+/// `ResourceNotFoundException`, HTTP 404).
+#[derive(Debug, Clone)]
+pub enum TagResolveFailure {
+    /// The value is no Lambda resource ARN, or it qualifies a function with a version or
+    /// an alias, which carries no tag set of its own.
+    Invalid(String),
+    /// The ARN is well formed but names a resource this account does not hold.
+    NotFound(String),
+}
+
+/// Resolve a `TaggableResource` to the ONE tag map the store holds for the resource it
+/// names, so `ListTags`, `TagResource` and `UntagResource` all read and write the same
+/// record rather than three copies of it.
+///
+/// A function's tags live on [`FunctionRecord::tags`] (where `CreateFunction` persists
+/// the `Tags` of its request and `GetFunction` reads the `Tags` it reports), a capacity
+/// provider's on [`CapacityProviderRecord::tags`] and an event source mapping's on
+/// [`EventSourceMappingRecord::tags`]. A function ARN carrying a qualifier names no tag
+/// set — `Resource`'s own documentation says "Lambda does not support adding tags to
+/// function aliases or versions" — and a resource type this store holds no records of
+/// (a code-signing configuration, a network connector) names no resource at all until
+/// whoever implements its create carries its records through
+/// [`parse_taggable_resource`].
+///
+/// The borrow is mutable because that is what a tag write needs; a reporting caller takes
+/// it too and simply does not write. The function branch goes through
+/// [`resolve_function`], so a function is resolved exactly as every other operation on
+/// this service resolves one, and the lifecycle transition the clock already owed is
+/// materialised on the way.
+pub fn resolve_resource_tags<'a>(
+    store: &'a mut ComAmazonawsLambdaAwsgirapiserviceState,
+    resource: &str,
+    region: &str,
+    now: SystemTime,
+) -> Result<&'a mut BTreeMap<String, String>, TagResolveFailure> {
+    // The `Resource` pattern has already been enforced at the boundary, so the value here
+    // is one of the resource ARNs it admits; the parse says WHICH.
+    let named = parse_taggable_resource(resource).ok_or_else(|| {
+        TagResolveFailure::Invalid(format!(
+            "1 validation error detected: Value '{resource}' at 'resource' failed to satisfy \
+             constraint: Member must be the Amazon Resource Name of a Lambda resource"
+        ))
+    })?;
+
+    match named {
+        TaggableResourceRef::Function(name) => {
+            let (record, _version) = resolve_function(store, &name, None, region, now).map_err(
+                |failure| match failure {
+                    ResolveFailure::Malformed(message) => TagResolveFailure::Invalid(message),
+                    ResolveFailure::NotFound(message) => TagResolveFailure::NotFound(message),
+                },
+            )?;
+            Ok(&mut record.tags)
+        }
+        TaggableResourceRef::FunctionQualifier { qualifier, .. } => {
+            Err(TagResolveFailure::Invalid(format!(
+                "Tags are not supported for a function version or alias. The resource \
+                 '{resource}' qualifies the function with '{qualifier}'; specify the \
+                 unqualified function ARN instead."
+            )))
+        }
+        TaggableResourceRef::CapacityProvider(provider) => {
+            let record = store.capacity_providers.get_mut(&provider).ok_or_else(|| {
+                TagResolveFailure::NotFound(format!(
+                    "The resource you requested does not exist: no capacity provider is held \
+                     for '{resource}'"
+                ))
+            })?;
+            record.materialize(now);
+            Ok(&mut record.tags)
+        }
+        TaggableResourceRef::EventSourceMapping(uuid) => {
+            let record = store.event_source_mappings.get_mut(&uuid).ok_or_else(|| {
+                TagResolveFailure::NotFound(format!(
+                    "The resource you requested does not exist: no event source mapping is \
+                     held for '{resource}'"
+                ))
+            })?;
+            record.materialize(now);
+            Ok(&mut record.tags)
+        }
+        TaggableResourceRef::Other(resource_type) => Err(TagResolveFailure::NotFound(format!(
+            "The resource you requested does not exist: no {resource_type} is held for \
+             '{resource}'"
+        ))),
+    }
+}
+
 /// Why a `FunctionName`/`Qualifier` pair names no record.
 #[derive(Debug, Clone)]
 pub enum ResolveFailure {

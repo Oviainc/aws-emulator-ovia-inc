@@ -100,6 +100,8 @@ mod placement_groups;
 mod principal_id_format;
 #[path = "all/regions.rs"]
 mod regions;
+#[path = "all/resource_specific_error_codes.rs"]
+mod resource_specific_error_codes;
 #[path = "all/route_servers.rs"]
 mod route_servers;
 #[path = "all/secondary_networks.rs"]

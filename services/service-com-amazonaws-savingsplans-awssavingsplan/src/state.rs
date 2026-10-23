@@ -213,16 +213,52 @@ pub fn parse_amount_at_wire_scale(value: &str) -> Option<i128> {
     parse_amount_with_digits("amount", value, AMOUNT_WIRE_DIGITS).ok()
 }
 
+/// How a leading `-` is read by [`parse_decimal_amount`].
+///
+/// A member whose documented rule has a RANGE reads a negative amount as the
+/// number it is, so the clause a caller gets names the bound the value missed;
+/// a member whose rule is simply "an amount" refuses the sign as a malformed
+/// value, which is all there is to say about it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Negative {
+    /// Refused as a malformed amount.
+    Refused,
+    /// Read as the negative number it is.
+    Read,
+}
+
 /// [`parse_amount`], with the number of fractional digits the caller admits.
 fn parse_amount_with_digits(member: &str, value: &str, max_digits: usize) -> Result<i128, String> {
+    parse_decimal_amount(member, value, max_digits, Negative::Refused)
+}
+
+/// Parse a plain decimal amount into [`AMOUNT_SCALE`] units, admitting at most
+/// `max_digits` fractional digits and reading a leading `-` as `negative` says.
+fn parse_decimal_amount(
+    member: &str,
+    value: &str,
+    max_digits: usize,
+    negative: Negative,
+) -> Result<i128, String> {
     let trimmed = value.trim();
-    let invalid = || format!("{member} must be a non-negative decimal amount, got '{value}'");
-    let (whole, fraction) = match trimmed.split_once('.') {
+    let form = match negative {
+        Negative::Refused => "non-negative decimal amount",
+        Negative::Read => "decimal amount",
+    };
+    let invalid = || format!("{member} must be a {form}, got '{value}'");
+    // The sign is taken off the front before the digit rules are applied, so a
+    // negative amount is read by exactly the rules a positive one is.
+    let (sign, magnitude) = match trimmed.strip_prefix('-') {
+        Some(magnitude) if negative == Negative::Read => (-1, magnitude),
+        Some(_) => return Err(invalid()),
+        None => (1, trimmed),
+    };
+    let (whole, fraction) = match magnitude.split_once('.') {
         Some((whole, fraction)) => (whole, fraction),
-        None => (trimmed, ""),
+        None => (magnitude, ""),
     };
     let digits = |text: &str| !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit());
-    if !digits(whole) || (trimmed.contains('.') && !digits(fraction)) {
+    if !digits(whole) || (magnitude.contains('.') && !digits(fraction)) {
         return Err(invalid());
     }
     if fraction.len() > max_digits {
@@ -239,22 +275,52 @@ fn parse_amount_with_digits(member: &str, value: &str, max_digits: usize) -> Res
             .checked_add(padded.parse::<i128>().map_err(|_| invalid())?)
             .ok_or_else(invalid)?;
     }
-    Ok(units)
+    Ok(sign * units)
 }
 
 /// Parse and validate `CreateSavingsPlan`'s `commitment` against the rule the
 /// model documents for it: a value between 0.001 and 1 million, with at most
 /// five digits after the decimal point.
+///
+/// A value OUTSIDE that interval is a well-formed amount the member's range
+/// refuses, so the clause names the member and the bound it missed — the floor
+/// for anything below it, including zero and a negative amount, and the ceiling
+/// for anything above. Only a value that is not a decimal number at all, or one
+/// spelled at more digits than a request may carry, is refused on its form.
 pub fn parse_commitment(value: &str) -> Result<i128, String> {
-    let units = parse_amount("commitment", value)?;
-    if !(MIN_COMMITMENT_UNITS..=MAX_COMMITMENT_UNITS).contains(&units) {
+    let units = parse_decimal_amount("commitment", value, MAX_AMOUNT_DIGITS, Negative::Read)?;
+    if units < MIN_COMMITMENT_UNITS {
         return Err(format!(
-            "commitment must be between {} and {}, got '{value}'",
-            format_amount(MIN_COMMITMENT_UNITS),
-            format_amount(MAX_COMMITMENT_UNITS)
+            "'commitment' cannot be less than {}",
+            format_bound(MIN_COMMITMENT_UNITS)
+        ));
+    }
+    if units > MAX_COMMITMENT_UNITS {
+        return Err(format!(
+            "'commitment' cannot be greater than {}",
+            format_bound(MAX_COMMITMENT_UNITS)
         ));
     }
     Ok(units)
+}
+
+/// A BOUND as a message quotes it: the amount in its shortest exact decimal
+/// spelling — trailing fractional zeros dropped, and the decimal point with them
+/// when the amount is whole.
+///
+/// A bound is a number the service publishes rather than a value a caller sent,
+/// and the documentation writes it this way ("a value between 0.001 and 1
+/// million"), so it is quoted this way too. Every amount the service REPORTS
+/// still goes through [`format_amount`]'s one fixed scale.
+pub fn format_bound(units: i128) -> String {
+    let rendered = format_amount(units);
+    match rendered.split_once('.') {
+        Some((whole, fraction)) => match fraction.trim_end_matches('0') {
+            "" => whole.to_string(),
+            trimmed => format!("{whole}.{trimmed}"),
+        },
+        None => rendered,
+    }
 }
 
 /// Render [`AMOUNT_SCALE`] units as an `Amount`: FIXED WIDTH, always with a

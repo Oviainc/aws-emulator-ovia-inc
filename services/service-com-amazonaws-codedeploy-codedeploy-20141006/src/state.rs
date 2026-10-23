@@ -291,6 +291,30 @@ pub fn deployment_config_not_found(deployment_config_name: &str) -> String {
     format!("No Deployment Configuration found for name: {deployment_config_name}")
 }
 
+/// `InvalidOperationException` (HTTP 400): the name of the deployment
+/// configuration a request asked to delete, where that configuration is one
+/// CodeDeploy itself ships — "Predefined configurations cannot be deleted"
+/// (`smithy_query(query="doc",shape="DeleteDeploymentConfig")`).
+pub fn predefined_deployment_config_undeletable(deployment_config_name: &str) -> String {
+    format!(
+        "The deployment configuration {deployment_config_name} is a predefined deployment \
+         configuration and cannot be deleted"
+    )
+}
+
+/// `DeploymentConfigInUseException` (HTTP 400): the name of the deployment
+/// configuration something still uses — "A deployment configuration cannot be
+/// deleted if it is currently in use"
+/// (`smithy_query(query="doc",shape="DeleteDeploymentConfig")`). See
+/// [`ComAmazonawsCodedeployCodedeploy20141006State::deployment_config_is_in_use`]
+/// for what counts as using one.
+pub fn deployment_config_in_use(deployment_config_name: &str) -> String {
+    format!(
+        "The deployment configuration {deployment_config_name} is currently in use and cannot be \
+         deleted"
+    )
+}
+
 /// `ApplicationAlreadyExistsException` (HTTP 400): the conflicting name FIRST,
 /// so a client can recover it by stripping the fixed tail.
 pub fn application_already_exists(application_name: &str) -> String {
@@ -1176,7 +1200,47 @@ const BUILTIN_DEPLOYMENT_CONFIGS: &[BuiltinDeploymentConfig] = &[
     },
 ];
 
+/// Whether `name` is one of the deployment configurations CodeDeploy itself
+/// ships ([`BUILTIN_DEPLOYMENT_CONFIGS`]), as opposed to one a client created.
+///
+/// A built-in is in the same store as a created configuration — it is read,
+/// listed and named by a deployment group the same way — so what it is, rather
+/// than where it is stored, is what the operations that may not change it (a
+/// deletion) ask about. Matching is over the stored names, so a name that only
+/// LOOKS like a built-in (a different `CodeDeployDefault.*` spelling a client
+/// created) is a created configuration and is treated as one.
+pub fn is_predefined_deployment_config(name: &str) -> bool {
+    BUILTIN_DEPLOYMENT_CONFIGS
+        .iter()
+        .any(|builtin| builtin.name == name)
+}
+
 impl ComAmazonawsCodedeployCodedeploy20141006State {
+    /// Whether the deployment configuration `name` is one something still uses,
+    /// so that deleting it would leave a reference to a configuration that is
+    /// not there.
+    ///
+    /// Two things use a configuration: a deployment group, whose stored
+    /// `deploymentConfigName` is the configuration its deployments run under
+    /// until the group is updated or deleted, and a deployment that has not yet
+    /// reached a terminal status ([`deployment_is_terminal`]), which is running
+    /// under the configuration right now. A deployment that already finished
+    /// only RECORDS the configuration it ran under, as history, so it never
+    /// blocks a deletion.
+    pub fn deployment_config_is_in_use(&self, name: &str) -> bool {
+        let named_by_a_group = self.applications.values().any(|application| {
+            application
+                .deployment_groups
+                .values()
+                .any(|group| group.deployment_config_name == name)
+        });
+        named_by_a_group
+            || self.deployments.values().any(|deployment| {
+                deployment.deployment_config_name == name
+                    && !deployment_is_terminal(&deployment.status)
+            })
+    }
+
     /// Seed the built-in deployment configurations, once per store.
     fn ensure_seeded(&mut self, now_ms: i64) {
         if self.seeded {
@@ -1219,6 +1283,21 @@ impl ComAmazonawsCodedeployCodedeploy20141006State {
         if self.deployment_configs.insert(name.clone(), config).is_none() {
             self.deployment_config_order.push(name);
         }
+    }
+
+    /// Drop the deployment configuration stored under `name`, and its position in
+    /// [`Self::deployment_config_order`] with it.
+    ///
+    /// The counterpart of [`Self::insert_deployment_config`], and the one way a
+    /// configuration LEAVES the store, so the listing index and the map stay in
+    /// step: dropping the map entry alone would leave the name in the index, and
+    /// re-creating a configuration under that name would then list it twice and
+    /// grow the index on every create/delete cycle. Removing a name the store
+    /// does not carry does nothing.
+    pub fn remove_deployment_config(&mut self, name: &str) {
+        self.deployment_configs.remove(name);
+        self.deployment_config_order
+            .retain(|stored| stored != name);
     }
 
     /// The names of the stored deployment configurations, in the order they

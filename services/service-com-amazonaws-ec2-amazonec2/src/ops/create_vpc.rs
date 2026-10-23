@@ -224,12 +224,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )))
             }
             Err(state::CidrProblem::PrefixLength) => {
-                return Err(state::invalid_parameter_value(format!(
-                    "The CIDR '{requested_cidr}' is invalid. The allowed block size is \
-                     between a /{min} netmask and /{max} netmask.",
-                    min = state::MIN_VPC_IPV4_PREFIX,
-                    max = state::MAX_VPC_IPV4_PREFIX,
-                )))
+                // A block the VPC range rules do not admit is a RANGE violation, not an
+                // unreadable value: "The block range must be between a /16 netmask and /28
+                // netmask" (`InvalidVpc.Range`, EC2 API error codes).
+                return Err(state::invalid_vpc_range(requested_cidr))
             }
         };
 

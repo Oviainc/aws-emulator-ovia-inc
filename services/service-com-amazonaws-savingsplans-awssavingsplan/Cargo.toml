@@ -7,6 +7,9 @@ publish = false
 build = "build.rs"
 
 [dependencies]
+# The value a constraint-violation message echoes is the one the caller submitted,
+# including a list-valued member the framework's walk can only summarise as a count.
+service-common = { path = "../common" }
 engine = { workspace = true }
 smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }

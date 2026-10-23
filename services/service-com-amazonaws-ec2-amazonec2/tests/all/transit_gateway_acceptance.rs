@@ -672,6 +672,110 @@ async fn an_unassociated_subnet_or_attachment_is_refused() {
     );
 }
 
+/// Which of the ids a request names is reported when more than one cannot be resolved: the
+/// ATTACHMENT, the resource the acceptance acts on, before the multicast domain, the scope
+/// it acts in. A client told about the scope would be sent to fix a parameter that may well
+/// be right and never hear about the one that is wrong.
+///
+/// The rows cross the two ids: neither resolvable, only the domain unresolvable, only the
+/// attachment unresolvable (an id absent from the attachment id space altogether), an
+/// attachment that IS in that id space but holds no association in this domain, and both
+/// resolvable, which succeeds. The last two differ in which check answers, and both are the
+/// attachment's own code.
+#[tokio::test]
+async fn the_attachment_is_resolved_before_the_domain_it_is_accepted_into() {
+    let action = "AcceptTransitGatewayMulticastDomainAssociations";
+    let unknown_domain = format!(
+        "{}-00000000000000000",
+        ec2::state::TRANSIT_GATEWAY_MULTICAST_DOMAIN_ID_PREFIX
+    );
+    let unknown_attachment = format!(
+        "{}-00000000000000000",
+        ec2::state::TRANSIT_GATEWAY_ATTACHMENT_ID_PREFIX
+    );
+
+    // (case, the domain id, the attachment id, the code — or None for a call that succeeds).
+    // An empty id means "the seeded resource"; `STRANGER` means "an attachment of the id
+    // space this domain holds no association for".
+    const STRANGER: &str = "a stranger attachment";
+    let rows: Vec<(&str, &str, &str, Option<&str>)> = vec![
+        (
+            "neither id resolvable",
+            unknown_domain.as_str(),
+            unknown_attachment.as_str(),
+            Some(ec2::state::INVALID_TRANSIT_GATEWAY_ATTACHMENT_ID_NOT_FOUND),
+        ),
+        (
+            "only the domain unresolvable",
+            unknown_domain.as_str(),
+            "",
+            Some(ec2::state::INVALID_TRANSIT_GATEWAY_MULTICAST_DOMAIN_ID_NOT_FOUND),
+        ),
+        (
+            "an attachment id nothing was attached for",
+            "",
+            unknown_attachment.as_str(),
+            Some(ec2::state::INVALID_TRANSIT_GATEWAY_ATTACHMENT_ID_NOT_FOUND),
+        ),
+        (
+            "an attachment this domain holds no association for",
+            "",
+            STRANGER,
+            Some(ec2::state::INVALID_TRANSIT_GATEWAY_ATTACHMENT_ID_NOT_FOUND),
+        ),
+        ("both resolvable", "", "", None),
+    ];
+
+    for (case, domain_row, attachment_row, expected) in rows {
+        let (router, engine) = super::ec2_query::emulator();
+        let (seeded_domain, attachments) = seed_multicast_domain(&engine);
+        let domain_id = if domain_row.is_empty() {
+            seeded_domain.clone()
+        } else {
+            domain_row.to_string()
+        };
+        let attachment_id = match attachment_row {
+            "" => attachments[0].clone(),
+            STRANGER => engine
+                .state::<Ec2State>()
+                .lock()
+                .insert_transit_gateway_attachment(pending_vpc_attachment())
+                .expect("the store holds the seeded attachment"),
+            literal => literal.to_string(),
+        };
+
+        let (status, body) = invoke(
+            &router,
+            action,
+            &accept_associations_params(&domain_id, &attachment_id, &[]),
+        )
+        .await;
+        match expected {
+            Some(expected_code) => {
+                assert_eq!(
+                    status, 400,
+                    "case {case:?}: expected HTTP 400, got {status} with body {body}"
+                );
+                assert_eq!(
+                    error_code(&body),
+                    expected_code,
+                    "case {case:?}: expected {expected_code}, got {body}"
+                );
+                // Nothing moved: an association is still waiting for the domain's owner.
+                assert_eq!(
+                    association_state(&engine, &seeded_domain, "subnet-0000000000000000a"),
+                    MULTICAST_ASSOCIATION_STATE_PENDING_ACCEPTANCE,
+                    "case {case:?}: a refused acceptance must move nothing"
+                );
+            }
+            None => assert_eq!(
+                status, 200,
+                "case {case:?}: expected HTTP 200, got {status} with body {body}"
+            ),
+        }
+    }
+}
+
 /// Deleting a route table announcement is the same state machine again: it moves to
 /// `deleting` with `deleted` owed, the record is KEPT so the outcome stays readable, and a
 /// second delete is refused rather than reported as a deletion it did not perform.

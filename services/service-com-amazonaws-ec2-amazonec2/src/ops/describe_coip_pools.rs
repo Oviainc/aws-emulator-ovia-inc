@@ -232,6 +232,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 requested.len()
             )));
         }
+        // The ids' own FORM before any lookup: a value that is not a customer-owned address
+        // pool id at all names nothing that could exist, so it is refused as malformed
+        // rather than reported as a pool the account does not have — a client cannot tell a
+        // typo from a missing pool otherwise, and goes on waiting for a pool that can never
+        // appear. The form is `crate::state`'s one reader of a pool id, the same one
+        // `ModifySubnetAttribute` holds the pool a subnet keeps to.
+        if let Some(malformed) = requested
+            .iter()
+            .find(|id| !crate::state::coip_pool_id_is_well_formed(id))
+        {
+            return Err(crate::state::invalid_pool_id_malformed(malformed));
+        }
 
         let store = state.lock();
 

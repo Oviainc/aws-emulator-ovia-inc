@@ -101,7 +101,12 @@ fn operations() -> Vec<Operation> {
             member("TransitGatewayMulticastDomainId", &domain),
             member("TransitGatewayAttachmentId", &attachment),
         ],
-        unknown_code: ec2::state::INVALID_TRANSIT_GATEWAY_MULTICAST_DOMAIN_ID_NOT_FOUND,
+        // Both ids are unknown here, and the one the caller is told about is the ATTACHMENT:
+        // the acceptance acts on the attachment whose pending associations it accepts, and
+        // the multicast domain is the scope it accepts them into, so the subject is resolved
+        // first — reporting the scope would send a client to fix a parameter that may well be
+        // right and never mention the one that is wrong.
+        unknown_code: ec2::state::INVALID_TRANSIT_GATEWAY_ATTACHMENT_ID_NOT_FOUND,
         malformed: vec![
             member("TransitGatewayMulticastDomainId", "tgw-mcast-domain-xyz"),
             member("TransitGatewayAttachmentId", &attachment),
@@ -337,7 +342,9 @@ async fn a_caller_chosen_id_list_is_capped_before_any_per_item_work() {
                 member("TransitGatewayMulticastDomainId", &domain),
                 member("TransitGatewayAttachmentId", &attachment),
             ],
-            ec2::state::INVALID_TRANSIT_GATEWAY_MULTICAST_DOMAIN_ID_NOT_FOUND,
+            // The attachment is the resource the acceptance acts on, so it is the id this
+            // operation resolves first; the domain is the scope it acts in.
+            ec2::state::INVALID_TRANSIT_GATEWAY_ATTACHMENT_ID_NOT_FOUND,
         ),
     ];
 

@@ -190,11 +190,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // that do not already use it, so a syntactically valid create passes input
         // validation (above) and is then denied account-wide — before any record is
         // written, so nothing exists afterwards for a list or a get to report.
-        state.check_create_allowed().map_err(|message| {
-            CreateReadinessCheckErrorModeled::AccessDeniedException(AccessDeniedException {
-                message: Some(message.to_string()),
-            })
-        })?;
+        //
+        // Answered through `Scaffolded::access_denied`: the status is the modelled
+        // `AccessDeniedException`'s 403, and the wire error code is the `AccessDenied`
+        // THIS operation's recorded 403 carries (see
+        // `crate::scaffolded::ACCESS_DENIED_NAME`) rather than the shape's name. The
+        // other three creates' denials are recorded with the shape name itself, so they
+        // return the modelled variant: the code belongs to the operation, not to the
+        // shape or to the shared gate.
+        state
+            .check_create_allowed()
+            .map_err(crate::scaffolded::Scaffolded::access_denied)?;
 
         if state
             .readiness_checks

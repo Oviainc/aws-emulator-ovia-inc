@@ -10,8 +10,8 @@
 //!    answers the modelled `ResourceNotFoundException` (404) with this service's
 //!    CONSTANT, resource-agnostic sentence — on every call, and whatever was asked for.
 //! 3. An ARN-addressed tagging call for an ARN no stored resource carries answers this
-//!    service's `NotFoundException` (404) with its own constant sentence, and writes
-//!    nothing.
+//!    service's `NotFoundException` (400 — see `error_wire_contract.rs`) with its own
+//!    constant sentence, and writes nothing.
 //! 4. A `ListRules` `ResourceType` filter outside the resource types this API documents
 //!    is refused with `ValidationException` (400) rather than ignored.
 //! 5. A `NextToken` this service did not mint is refused with its constant
@@ -170,6 +170,16 @@ impl Kind {
         }
     }
 
+    /// The wire error code this kind's CREATE answers its 403 denial with, as recorded
+    /// per operation: `CreateReadinessCheck`'s denial carries `AccessDenied`, the other
+    /// three carry the `AccessDeniedException` shape name.
+    fn denied_error_code(self) -> &'static str {
+        match self {
+            Kind::ReadinessCheck => "AccessDenied",
+            Kind::Cell | Kind::RecoveryGroup | Kind::ResourceSet => "AccessDeniedException",
+        }
+    }
+
     /// The smallest create request that stores a record under `name`.
     fn create_body(self, name: &str) -> Value {
         match self {
@@ -233,10 +243,12 @@ async fn read(emulator: &Emulator, kind: Kind, name: &str) -> Reply {
 }
 
 /// RULE 1 (the account-eligibility gate): a create of a readiness resource passes input
-/// validation and is then DENIED account-wide with HTTP 403 `AccessDeniedException`,
-/// writing nothing — so every later read of that name still answers not-found and the
-/// lists stay empty. Rows differ along resource kind, name form and length, and which
-/// optional members (nested cells, member cells, tags) the request carries.
+/// validation and is then DENIED account-wide with HTTP 403, writing nothing — so every
+/// later read of that name still answers not-found and the lists stay empty. The wire
+/// error code of that 403 is the one recorded for the operation that answers it
+/// (`error_wire_contract.rs` is where that rule is pinned). Rows differ along resource
+/// kind, name form and length, and which optional members (nested cells, member cells,
+/// tags) the request carries.
 #[tokio::test]
 async fn a_create_is_denied_account_wide_and_stores_nothing() {
     let emulator = Emulator::with_account_eligibility(false);
@@ -271,7 +283,7 @@ async fn a_create_is_denied_account_wide_and_stores_nothing() {
                 &case,
                 &denied,
                 403,
-                "AccessDeniedException",
+                kind.denied_error_code(),
                 ACCOUNT_DENIED_MESSAGE,
             );
 
@@ -581,7 +593,7 @@ async fn every_resource_addressed_read_or_delete_answers_the_same_constant_not_f
 }
 
 /// RULE 3: a tagging call for an ARN no stored resource carries is refused with this
-/// service's `NotFoundException` (404) and its constant sentence, and writes nothing.
+/// service's `NotFoundException` (400) and its constant sentence, and writes nothing.
 /// Rows differ along which kind the ghost ARN names, whether the name exists under a
 /// DIFFERENT kind, and how far from an ARN of this service the value is.
 #[tokio::test]
@@ -643,7 +655,7 @@ async fn the_tagging_operations_refuse_an_arn_no_resource_carries() {
             assert_refused(
                 &case,
                 &reply,
-                404,
+                400,
                 "NotFoundException",
                 TAGGING_NOT_FOUND_MESSAGE,
             );

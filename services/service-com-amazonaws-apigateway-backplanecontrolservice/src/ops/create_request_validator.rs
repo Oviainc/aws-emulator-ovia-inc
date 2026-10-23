@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateRequestValidator
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateRequestValidator`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateRequestValidator::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: adds a `RequestValidator` to an existing `RestApi` under a freshly minted
+//! id, answers from the stored record, and emits one access record for the state change.
 //!
 //! ## Shape of an operation
 //!
@@ -88,6 +81,25 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::{RequestValidatorEntry, MAX_REQUEST_VALIDATORS_PER_API};
+
+/// The `RequestValidator` body for a stored validator — the one place this crate renders
+/// that shape, so `CreateRequestValidator` and `GetRequestValidator` cannot report one
+/// record differently.
+///
+/// `name` is reported exactly as the record carries it: `CreateRequestValidator$name` is
+/// optional, so a validator created without a name reports none rather than a name
+/// invented per read. Both flags are always reported, because the model gives each a
+/// default of `false`, so a stored validator always has both.
+pub fn request_validator_body(entry: &RequestValidatorEntry) -> CreateRequestValidatorOutput {
+    CreateRequestValidatorOutput {
+        id: Some(entry.id.clone()),
+        name: entry.name.clone(),
+        validate_request_body: entry.validate_request_body,
+        validate_request_parameters: entry.validate_request_parameters,
+    }
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -161,18 +173,79 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateRequestValidator` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateRequestValidatorErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateRequestValidator"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        let bad_request = |message: String| {
+            CreateRequestValidatorErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message),
+            })
+        };
+        // Both flags are modelled booleans carrying a default, so the boundary validator
+        // has already refused anything else for them. `name` is the only caller-sized
+        // member, and it is bounded BEFORE the store lock is taken, so an over-sized
+        // request never reaches the records.
+        if let Some(name) = &input.name {
+            crate::state::bound_chars("name", name, crate::state::MAX_STRING_CHARS)
+                .map_err(bad_request)?;
+        }
+
+        let mut store = state.lock();
+        // The id and the creation rank come off the store's own counters, so they are
+        // taken before the API is borrowed for writing; a refused request simply leaves
+        // the counters advanced, which no caller can observe.
+        let id = store.mint_id();
+        let sequence = store.next_sequence();
+        // ONE lookup of the API, for both the bound and the insert, so what is checked
+        // and what is written can never be two different records.
+        let api = store.rest_apis.get_mut(&input.rest_api_id).ok_or_else(|| {
+            CreateRequestValidatorErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::no_such_rest_api(&input.rest_api_id)),
+            })
+        })?;
+        // One validator per request, and at most this many per API: the store cannot grow
+        // past the bound however many requests arrive.
+        if api.request_validators.len() >= MAX_REQUEST_VALIDATORS_PER_API {
+            return Err(CreateRequestValidatorErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    retry_after_seconds: None,
+                    message: Some(format!(
+                        "Maximum number of request validators exceeded for this API: \
+                         {MAX_REQUEST_VALIDATORS_PER_API}"
+                    )),
+                },
+            )
+            .into());
+        }
+        // A name does not identify a validator: two validators of one API may carry the
+        // same name and the same flags, and each is its own record under its own minted
+        // id — which is what a `Method`'s `requestValidatorId` names.
+        let stored = RequestValidatorEntry {
+            id: id.clone(),
+            name: input.name,
+            validate_request_body: input.validate_request_body,
+            validate_request_parameters: input.validate_request_parameters,
+            sequence,
+        };
+        // Rendered from the record itself, through the one renderer a read of it also
+        // goes through, so the answer is the stored validator and not the request read
+        // back.
+        let body = request_validator_body(&stored);
+        api.request_validators.insert(id.clone(), stored);
+        // Everything below is owned, so the store lock is released before the access
+        // record is emitted: the critical section covers the state change only.
+        drop(store);
+        // The access record for a state-changing operation: who, what, and the outcome.
+        // Metadata only — never the validator's name or any other request content.
+        ::tracing::info!(
+            target: crate::state::AUDIT_TARGET,
+            operation = Self::NAME,
+            caller = ?crate::state::request_caller(ctx.parts()),
+            rest_api = ?input.rest_api_id,
+            request_validator = ?id,
+            outcome = "created",
+            "request validator created",
+        );
+        Ok(body)
     }
 }

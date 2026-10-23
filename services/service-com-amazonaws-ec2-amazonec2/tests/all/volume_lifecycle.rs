@@ -976,12 +976,15 @@ async fn describe_volumes_narrows_by_id_filter_and_page() {
         );
     }
 
-    // An id that names no volume is an error, not an absent row; a malformed one is
-    // refused before it is looked up.
+    // An id that names no volume is an error, not an absent row; an id that is not a volume
+    // id at all is refused before it is looked up, and because this operation validates its
+    // id LIST as a request parameter, that refusal is the parameter-level
+    // `InvalidParameterValue` naming the parameter and the form it expects.
     for (case, volume_id, expected_code) in [
         ("unknown", "vol-00000000000000999", "InvalidVolume.NotFound"),
-        ("malformed", "vol-not-hex", "InvalidVolumeID.Malformed"),
-        ("not an id at all", "banana", "InvalidVolumeID.Malformed"),
+        ("malformed", "vol-not-hex", "InvalidParameterValue"),
+        ("not an id at all", "banana", "InvalidParameterValue"),
+        ("another resource's prefix", "snap-00000000000000999", "InvalidParameterValue"),
     ] {
         let (status, body) = describe(&router, &indexed("VolumeId", &[volume_id])).await;
         assert_eq!(

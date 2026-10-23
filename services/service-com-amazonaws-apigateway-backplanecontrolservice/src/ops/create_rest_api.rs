@@ -520,6 +520,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // `CreateAuthorizer` is what adds an authorizer, and a clone copies the
             // source's resource tree only, so a created API starts with none.
             authorizers: BTreeMap::new(),
+            // Nor with any request validator: `CreateRequestValidator` is what adds one,
+            // and a clone copies the source's resource tree only.
+            request_validators: BTreeMap::new(),
             sequence,
         };
 

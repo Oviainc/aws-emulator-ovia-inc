@@ -23,16 +23,20 @@ use super::connection_lifecycle::{PROVIDER_TYPES, REGION, call, create, router};
 const VPC_LIST_MAX: usize = 10;
 
 /// One `CreateHost` request whose round trip this suite asserts.
-struct HostCase {
+///
+/// `pub(crate)` because the host table below is the set of host shapes every host
+/// suite needs: `list_hosts.rs` reports the same rows back rather than building a
+/// second table of its own.
+pub(crate) struct HostCase {
     /// What a failing assertion names this row by.
-    label: &'static str,
-    name: String,
-    provider_type: &'static str,
-    provider_endpoint: String,
+    pub(crate) label: &'static str,
+    pub(crate) name: String,
+    pub(crate) provider_type: &'static str,
+    pub(crate) provider_endpoint: String,
     /// The `VpcConfiguration` the create carries, or `None` for a host without one.
-    vpc_configuration: Option<serde_json::Value>,
+    pub(crate) vpc_configuration: Option<serde_json::Value>,
     /// Tags as `(Key, Value)`, in the order the create supplies them.
-    tags: Vec<(&'static str, &'static str)>,
+    pub(crate) tags: Vec<(&'static str, &'static str)>,
 }
 
 /// `subnet-<8 or 17 word characters>` — the modeled `SubnetId` pattern
@@ -65,7 +69,7 @@ fn vpc_configuration(subnets: usize, groups: usize, tls: Option<&str>) -> serde_
 /// The table: hosts differing in provider type, endpoint form and length, whether a
 /// VPC configuration is present and how large its lists are (each published bound),
 /// and how many tags they carry.
-fn host_cases() -> Vec<HostCase> {
+pub(crate) fn host_cases() -> Vec<HostCase> {
     vec![
         HostCase {
             label: "no vpc, no tags",
@@ -149,7 +153,7 @@ fn create_host_body(case: &HostCase) -> serde_json::Value {
 }
 
 /// Create a host and return its ARN, failing the test on any non-200.
-async fn create_host(router: &MultiServiceRouter, case: &HostCase) -> String {
+pub(crate) async fn create_host(router: &MultiServiceRouter, case: &HostCase) -> String {
     let (status, body) = call(router, "CreateHost", create_host_body(case)).await;
     assert_eq!(
         status, 200,
@@ -163,7 +167,7 @@ async fn create_host(router: &MultiServiceRouter, case: &HostCase) -> String {
 }
 
 /// A host of the simplest shape, named `name`, for a test that only needs one to exist.
-fn plain_host(name: &str, provider_type: &'static str) -> HostCase {
+pub(crate) fn plain_host(name: &str, provider_type: &'static str) -> HostCase {
     HostCase {
         label: "plain host",
         name: name.to_string(),

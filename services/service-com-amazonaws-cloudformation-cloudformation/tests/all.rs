@@ -43,6 +43,8 @@ mod provisioned_resources;
 mod published_type_schema;
 #[path = "all/resolved_properties.rs"]
 mod resolved_properties;
+#[path = "all/sam_transform.rs"]
+mod sam_transform;
 #[path = "all/scratch.rs"]
 mod scratch;
 #[path = "all/stack_lifecycle.rs"]

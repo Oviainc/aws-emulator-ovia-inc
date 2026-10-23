@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetTemplate
-//! IMPLEMENTED: answers the exact template body `CreateStack`/`UpdateStack` persisted
-//! for the named stack — a byte-identical round trip — for a running or a deleted stack.
+//! IMPLEMENTED: answers the template body `CreateStack`/`UpdateStack` persisted for the
+//! named stack — a byte-identical round trip — for a running or a deleted stack, at the
+//! `TemplateStage` the request asked for: the submitted body for `Original`, and for
+//! `Processed` (the documented default) the body with the macros this emulator processes
+//! expanded, which for a template declaring none is the submitted body itself.
 //! A request naming a `ChangeSetName` instead answers the template that change set would
 //! put on the stack, with the stages the change set's own creation has reached.
 //!
@@ -193,8 +196,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if change_set.status == crate::state::change_set_status::CREATE_COMPLETE {
                 stages_available.push(TEMPLATE_STAGE_PROCESSED.to_string());
             }
+            let processed = stages_available
+                .iter()
+                .any(|stage| stage == TEMPLATE_STAGE_PROCESSED);
             return Ok(GetTemplateOutput {
-                template_body: Some(change_set.template_body.clone()),
+                template_body: Some(reported_body(
+                    &change_set.template_body,
+                    input.template_stage.as_deref(),
+                    processed,
+                )),
                 stages_available: Some(stages_available),
             });
         }
@@ -221,15 +231,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ))
         })?;
 
-        // The body is answered verbatim for either stage: this emulator runs no template
-        // transforms, so the processed template IS the original one.
+        // Which STAGE of the template the request asked for: the submitted body, or the
+        // one CloudFormation processed the template's macros into.
         // "For stacks, the Original and Processed templates are always available."
         Ok(GetTemplateOutput {
-            template_body: Some(template_body),
+            template_body: Some(reported_body(
+                &template_body,
+                input.template_stage.as_deref(),
+                true,
+            )),
             stages_available: Some(vec![
                 TEMPLATE_STAGE_ORIGINAL.to_string(),
                 TEMPLATE_STAGE_PROCESSED.to_string(),
             ]),
         })
     }
+}
+
+/// The body one stage of a stored template reports.
+///
+/// "To get the user-submitted template, specify `Original`. To get the template after
+/// CloudFormation has processed all transforms, specify `Processed`. If the template doesn't
+/// include transforms, `Original` and `Processed` return the same template. By default,
+/// CloudFormation specifies `Processed`" — so the stored body is answered verbatim for
+/// `Original`, for a body declaring no macro this emulator processes (where the two stages
+/// are the same template), and wherever the processed stage is not available yet; otherwise
+/// the request is answered with the expansion
+/// ([`crate::state::template::processed`]).
+fn reported_body(stored: &str, stage: Option<&str>, processed_available: bool) -> String {
+    if stage == Some(TEMPLATE_STAGE_ORIGINAL) || !processed_available {
+        return stored.to_string();
+    }
+    crate::state::template::processed(stored).unwrap_or_else(|| stored.to_string())
 }

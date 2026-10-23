@@ -359,15 +359,18 @@ async fn create_subnet_refuses_a_block_it_cannot_place() {
             400,
         ),
         (
+            // A size the subnet range rules do not admit is a RANGE violation, the same
+            // code as a block outside the VPC's range; only a value that is not a CIDR
+            // block at all is a parameter-value refusal.
             "a block smaller than the smallest allowed",
             vec![param("VpcId", &vpc_id), param("CidrBlock", "10.20.32.0/29")],
-            "InvalidParameterValue",
+            "InvalidSubnet.Range",
             400,
         ),
         (
             "a block larger than the largest allowed",
             vec![param("VpcId", &vpc_id), param("CidrBlock", "10.0.0.0/15")],
-            "InvalidParameterValue",
+            "InvalidSubnet.Range",
             400,
         ),
         (

@@ -5,7 +5,9 @@
 //! Removes the named tag keys from the resource the given ARN addresses, resolved
 //! through this service's ARN index, answering 204 with no body. A tag is NOT removable
 //! from a resource that was never created: an ARN no stored resource carries is refused
-//! with the 404 `NotFoundException` this service's tagging operations answer.
+//! with the `NotFoundException` this service's tagging operations answer — HTTP 400, not
+//! the modelled `ResourceNotFoundException`'s 404 (see
+//! [`crate::scaffolded::NOT_FOUND_EXCEPTION_STATUS`]).
 //!
 //! ## Shape of an operation
 //!
