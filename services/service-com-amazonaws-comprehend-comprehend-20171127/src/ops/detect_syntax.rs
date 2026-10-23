@@ -96,8 +96,9 @@ const MAX_TEXT_BYTES: usize = crate::state::REALTIME_TEXT_QUOTA_BYTES;
 /// The lexicon and the morphological rules below are English. Every other value the
 /// modelled `SyntaxLanguageCode` enum names is answered with the modelled
 /// `UnsupportedLanguageException` rather than with a token list no analysis of that
-/// language produced.
-const TAGGABLE_LANGUAGES: &[&str] = &["en"];
+/// language produced. Shared with `crate::ops::batch_detect_syntax`, whose one
+/// `LanguageCode` covers every document in the batch.
+pub(crate) const TAGGABLE_LANGUAGES: &[&str] = &["en"];
 
 /// Confidence reported for a token whose class follows from its Unicode general
 /// categories alone (punctuation, symbol, digits): nothing about it is ambiguous.
@@ -607,7 +608,11 @@ fn word_end(characters: &[(usize, char)], start: usize) -> usize {
 /// `TokenId` is the token's 1-based position in the document and the offsets are a
 /// half-open range of zero-based character positions, so slicing the document by them
 /// returns the token's own `Text`.
-fn syntax_tokens(text: &str) -> Vec<SyntaxToken> {
+///
+/// Shared with `crate::ops::batch_detect_syntax`: batching changes how many documents
+/// one request carries, never how a document is segmented or tagged, so the two
+/// operations cannot drift apart.
+pub(crate) fn syntax_tokens(text: &str) -> Vec<SyntaxToken> {
     let tagger = tagger();
     let characters: Vec<(usize, char)> = text.char_indices().collect();
     let mut tokens: Vec<SyntaxToken> = Vec::new();
