@@ -271,7 +271,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(group) = store.log_groups.get(&log_group_name) else {
             return Err(GetLogEventsErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some("The specified log group does not exist.".to_string()),
+                    message: Some(crate::state::resource_not_found_message("log group")),
                 },
             )
             .into());
@@ -279,7 +279,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(stream) = group.streams.get(&input.log_stream_name) else {
             return Err(GetLogEventsErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some("The specified log stream does not exist.".to_string()),
+                    message: Some(crate::state::resource_not_found_message("log stream")),
                 },
             )
             .into());

@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetResourcePolicy
+//!
 //! Reports the one resource-based policy an app monitor carries, read off the
-//! [`crate::state::ResourcePolicyRecord`] `PutResourcePolicy` wrote. `@readonly`: it
-//! writes nothing.
+//! [`crate::state::ResourcePolicyRecord`] `PutResourcePolicy` wrote — the very document
+//! the authorization evaluation reads ([`crate::state::authorization`]), so a client
+//! reads back the grant it put. `@readonly`: it writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -148,9 +150,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // A pure read of this service's own state; the request's metadata says nothing
-        // about which policy is reported.
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetResourcePolicyErrorModeled::InternalServerException(
                 InternalServerException {
@@ -160,6 +159,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+
+        // The monitor and the policy in force, under a SHORT read lock: the decision
+        // below reads the IAM and STS stores and needs no lock of this service's.
+        let (resource_arn, held_policy) = {
+            let store = state.lock();
+            let Some(record) = store.app_monitors.get(&input.name) else {
+                return Err(GetResourcePolicyErrorModeled::ResourceNotFoundException(
+                    crate::state::app_monitor_not_found(&input.name),
+                )
+                .into());
+            };
+            (record.arn.clone(), record.resource_policy_document())
+        };
+        // May this caller read THIS app monitor's policy? Evaluated per call, like every
+        // other operation's.
+        if let Err(denial) = crate::state::authorization::authorize(
+            &*self.engine,
+            ctx,
+            crate::state::authorization::GET_RESOURCE_POLICY,
+            &resource_arn,
+            held_policy.as_deref(),
+            &[],
+        ) {
+            return Err(GetResourcePolicyErrorModeled::AccessDeniedException(
+                crate::state::access_denied(&denial),
+            )
+            .into());
+        }
 
         // `@readonly`: the lock is taken for reading only, so what this call reports is
         // exactly what the next caller sees.

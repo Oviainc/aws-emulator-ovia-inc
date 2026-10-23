@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteArtifact
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteArtifact`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteArtifact::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: removes the artifact entry from `crate::state`, so a later
+//! `DescribeArtifact` cannot find it and its name is free again. The artifact is
+//! resolved by `ArtifactArn` when the request carries one and otherwise by the
+//! `Source`'s URI within the Region the request signed for; a request carrying neither
+//! identifier, and one naming an artifact nothing created, are both refused.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -139,18 +136,58 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteArtifact` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteArtifactErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteArtifact"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        let mut store = state.lock();
+
+        // "Either ArtifactArn or Source must be specified": both members are optional on
+        // the wire, so the one-of rule is this handler's to enforce, and a request that
+        // identifies no artifact is a bad request rather than a missing artifact.
+        let (resolved, identifier) = match (&input.artifact_arn, &input.source) {
+            // An explicit ARN identifies the artifact directly, so it is what resolves
+            // the request whenever it is present.
+            (Some(artifact_arn), _) => (
+                store
+                    .artifacts
+                    .get(artifact_arn)
+                    .map(|artifact| artifact.arn.clone()),
+                artifact_arn.clone(),
+            ),
+            // A source-addressed delete resolves within the Region the request signed
+            // for, whose artifacts are the ones the caller is addressing.
+            (None, Some(source)) => (
+                store.artifact_arn_for_source(
+                    &crate::state::request_region(ctx),
+                    &source.source_uri,
+                ),
+                source.source_uri.clone(),
+            ),
+            (None, None) => {
+                return Err(crate::scaffolded::Scaffolded::validation(
+                    "Either ArtifactArn or Source must be specified.",
+                ));
+            }
+        };
+
+        // The message quotes the identifier the CALLER passed — an ARN or a source URI.
+        let Some(arn) = resolved else {
+            return Err(DeleteArtifactErrorModeled::ResourceNotFound(ResourceNotFound {
+                message: Some(format!("Could not find artifact \"{identifier}\".")),
+            })
+            .into());
+        };
+        let removed = store
+            .artifacts
+            .remove(&arn)
+            .expect("the artifact just resolved is still in the store under its ARN");
+        drop(store);
+
+        crate::state::record_state_change(Self::NAME, &removed.arn, ctx);
+        // The ARN the deleted artifact carried, so a source-addressed delete answers with
+        // the ARN `CreateArtifact` minted rather than with nothing.
+        Ok(DeleteArtifactOutput {
+            artifact_arn: Some(removed.arn),
+        })
     }
 }

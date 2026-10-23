@@ -2,6 +2,13 @@
 
 //! @op CreateAppMonitor
 //!
+//! Mints an app monitor and persists it, after the two decisions this operation makes
+//! before it writes: whether the calling principal is allowed `rum:CreateAppMonitor`
+//! ([`crate::state::authorization`]), and — for a request that creates the monitor with
+//! CloudWatch Logs delivery already on — whether it holds the `logs:PutResourcePolicy`
+//! permission that side effect needs, in which case the vended log group is created too
+//! ([`crate::state::cw_log_delivery`]).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -223,11 +230,94 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The ARN carries the region the request was signed for; `ctx` is the only place
         // that is readable from.
         let region = crate::state::request_region(ctx.parts());
+        let resource_arn = crate::state::app_monitor_arn(&region, &input.name);
+
+        // May this caller create an app monitor under this name? A monitor that does not
+        // exist yet carries no resource policy, so the decision is the caller's
+        // identity-based policies alone.
+        if let Err(denial) = crate::state::authorization::authorize_identity(
+            &*self.engine,
+            ctx,
+            crate::state::authorization::CREATE_APP_MONITOR,
+            &resource_arn,
+        ) {
+            return Err(CreateAppMonitorErrorModeled::AccessDeniedException(
+                crate::state::access_denied(&denial),
+            )
+            .into());
+        }
+        // Creating the monitor with CloudWatch Logs delivery already ON is the same
+        // managed side effect `UpdateAppMonitor` performs when it turns delivery on: the
+        // caller must hold `logs:PutResourcePolicy`, and the vended log group the
+        // response's monitor will advertise has to exist.
+        //
+        // The PERMISSION is decided here, before anything is written. Provisioning the
+        // group, though, is deferred until after the conflict and quota decisions below,
+        // so a create this service then refuses leaves no log group behind in CloudWatch
+        // Logs: the two refusals are read off the store, so they are taken under its lock
+        // and the group is created in the gap between that lock and the insert.
+        let enables_delivery = input.cw_log_enabled == Some(true);
+        if enables_delivery {
+            if let Err(denial) = crate::state::cw_log_delivery::caller_may_enable_delivery(
+                &*self.engine,
+                ctx,
+                &region,
+                &input.name,
+            ) {
+                return Err(CreateAppMonitorErrorModeled::AccessDeniedException(
+                    crate::state::access_denied(&denial),
+                )
+                .into());
+            }
+        }
+
+        // The two refusals this create is subject to, read off the store under a SHORT
+        // lock so the group below is provisioned with no lock held.
+        {
+            let store = state.lock();
+            // A name identifies an app monitor for every other operation, so a second
+            // monitor cannot take one that is in use.
+            if store.app_monitors.contains_key(&input.name) {
+                return Err(CreateAppMonitorErrorModeled::ConflictException(
+                    crate::state::app_monitor_already_exists(&input.name),
+                )
+                .into());
+            }
+            if store.app_monitors.len() >= crate::state::MAX_APP_MONITORS {
+                return Err(CreateAppMonitorErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: format!(
+                            "The maximum number of app monitors ({}) has already been created.",
+                            crate::state::MAX_APP_MONITORS
+                        ),
+                    },
+                )
+                .into());
+            }
+        }
+        if enables_delivery {
+            if let Err(detail) =
+                crate::state::cw_log_delivery::provision_log_group(ctx, &region, &input.name)
+                    .await
+            {
+                return Err(CreateAppMonitorErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: format!(
+                            "could not provision the app monitor's CloudWatch Logs log \
+                             group: {detail}"
+                        ),
+                        retry_after_seconds: None,
+                    },
+                )
+                .into());
+            }
+        }
         let now = crate::state::current_iso_timestamp();
 
         let mut store = state.lock();
-        // A name identifies an app monitor for every other operation, so a second
-        // monitor cannot take one that is in use.
+        // Both refusals are taken again under the write lock: the checks above held no
+        // lock across the provisioning step, so a concurrent create may have taken this
+        // name or the last slot in between.
         if store.app_monitors.contains_key(&input.name) {
             return Err(CreateAppMonitorErrorModeled::ConflictException(
                 crate::state::app_monitor_already_exists(&input.name),
@@ -246,10 +336,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let name = input.name.clone();
         let id = store.mint_app_monitor_id();
         store.insert_app_monitor(crate::state::AppMonitorRecord {
-            arn: crate::state::app_monitor_arn(&region, &name),
+            arn: resource_arn,
             id: id.clone(),
             name: input.name,
             domain: input.domain,

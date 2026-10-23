@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartADAssessment
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartADAssessment`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartADAssessment::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Starts a directory assessment: refuses a request that does not carry exactly one of
+//! `DirectoryId` and `AssessmentConfiguration`, mints an `AssessmentId`, persists the
+//! assessment record (its DNS name, self-managed DNS servers, VPC settings and managed
+//! node ids, taken from the configuration or from the named directory) in
+//! [`crate::state`] and answers with the minted id.
+//!
+//! The assessment is persisted `IN_PROGRESS` with its terminal status owed by the clock
+//! one [`crate::state::TRANSITION_SPAN`] later, so a caller that describes it
+//! immediately still sees the run in flight. That terminal status is
+//! [`crate::state::ASSESSMENT_STATUS_FAILED`]: the run probes a self-managed AD
+//! environment this emulator cannot reach, and the reason it reports says exactly that
+//! rather than reporting validations nothing performed — see
+//! [`crate::state::ASSESSMENT_FAILED_REASON`].
 //!
 //! ## Shape of an operation
 //!
@@ -171,18 +176,176 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartADAssessment` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartADAssessmentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartADAssessment"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        // This operation's own documentation: "You must provide exactly one DirectoryId
+        // or AssessmentConfiguration." Both members are optional in the model, so the
+        // boundary validator passes a request carrying neither or both.
+        let subject_request = match (input.directory_id, input.assessment_configuration) {
+            (Some(_), Some(_)) => {
+                return Err(invalid_parameter(
+                    "Exactly one of DirectoryId and AssessmentConfiguration must be provided, not both",
+                ));
+            }
+            (None, None) => {
+                return Err(invalid_parameter(
+                    "Exactly one of DirectoryId and AssessmentConfiguration must be provided, got neither",
+                ));
+            }
+            (Some(directory_id), None) => SubjectRequest::Directory(directory_id),
+            (None, Some(configuration)) => SubjectRequest::Configuration(configuration),
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.advance_clock(now);
+
+        // The quota is on the CUSTOMER assessments the account holds, which is what
+        // every assessment started through this operation is.
+        if store.customer_assessment_count() >= crate::state::MAX_CUSTOMER_ASSESSMENTS {
+            return Err(
+                StartADAssessmentErrorModeled::ADAssessmentLimitExceededException(
+                    ADAssessmentLimitExceededException {
+                        message: Some(format!(
+                            "Maximum number of {report_type} directory assessments has been \
+                             reached: {max}. Delete assessments to free up capacity before \
+                             trying again.",
+                            report_type = crate::state::ASSESSMENT_REPORT_TYPE_CUSTOMER,
+                            max = crate::state::MAX_CUSTOMER_ASSESSMENTS
+                        )),
+                        request_id: None,
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // What the assessment is run against: the configuration the request carried, or
+        // the directory it named.
+        let subject = match subject_request {
+            // `DirectoryId`'s own documentation: "This should be an existing directory"
+            // — an id naming no stored directory is refused rather than assessed.
+            SubjectRequest::Directory(directory_id) => {
+                let directory = store.directories.get(&directory_id).ok_or_else(|| {
+                    StartADAssessmentErrorModeled::DirectoryDoesNotExistException(
+                        DirectoryDoesNotExistException {
+                            message: Some(crate::state::no_such_directory(&directory_id)),
+                            request_id: None,
+                        },
+                    )
+                })?;
+                let vpc_settings = directory.vpc_settings.clone();
+                Subject {
+                    directory_id: Some(directory.directory_id.clone()),
+                    // The directory's own fully qualified name is the DNS name the
+                    // assessment is run against.
+                    dns_name: Some(directory.name.clone()),
+                    // A directory record carries no self-managed DNS servers and no
+                    // managed nodes — those reach this service only through an
+                    // `AssessmentConfiguration` — so they stay empty rather than
+                    // invented.
+                    customer_dns_ips: Vec::new(),
+                    self_managed_instance_ids: Vec::new(),
+                    vpc_id: vpc_settings
+                        .as_ref()
+                        .and_then(|settings| settings.vpc_id.clone()),
+                    subnet_ids: vpc_settings
+                        .as_ref()
+                        .and_then(|settings| settings.subnet_ids.clone())
+                        .unwrap_or_default(),
+                    security_group_ids: vpc_settings
+                        .as_ref()
+                        .and_then(|settings| settings.security_group_id.clone())
+                        .into_iter()
+                        .collect(),
+                }
+            }
+            SubjectRequest::Configuration(configuration) => Subject {
+                // An assessment that is not for an existing directory names none: "If
+                // the assessment is not for an existing directory, this parameter
+                // should be omitted."
+                directory_id: None,
+                dns_name: Some(configuration.dns_name),
+                // Both lists are kept in the order the request gave them:
+                // `InstanceIds` must keep its one-to-one positional correspondence
+                // with `CustomerDnsIps`.
+                customer_dns_ips: configuration.customer_dns_ips,
+                self_managed_instance_ids: configuration.instance_ids,
+                vpc_id: Some(configuration.vpc_settings.vpc_id),
+                subnet_ids: configuration.vpc_settings.subnet_ids,
+                security_group_ids: configuration.security_group_ids.unwrap_or_default(),
+            },
+        };
+
+        let assessment_id = store.mint_assessment_id();
+        let seq = store.next_seq();
+        let record = crate::state::AssessmentRecord {
+            assessment_id: assessment_id.clone(),
+            directory_id: subject.directory_id,
+            dns_name: subject.dns_name,
+            customer_dns_ips: subject.customer_dns_ips,
+            vpc_id: subject.vpc_id,
+            subnet_ids: subject.subnet_ids,
+            security_group_ids: subject.security_group_ids,
+            self_managed_instance_ids: subject.self_managed_instance_ids,
+            // Caller-started, so the CUSTOMER kind; a SYSTEM assessment is the one
+            // created automatically with a hybrid directory.
+            report_type: crate::state::ASSESSMENT_REPORT_TYPE_CUSTOMER.to_string(),
+            // "The assessment process is asynchronous and you can monitor it with
+            // DescribeADAssessment", so this call answers while the run is in flight.
+            status: crate::state::ASSESSMENT_STATUS_IN_PROGRESS.to_string(),
+            // No reason while the run is still in flight; the clock supplies one with
+            // the terminal status.
+            status_reason: None,
+            start_time: now,
+            last_update: now,
+            status_due_at: Some(now + crate::state::TRANSITION_SPAN),
+            seq,
+        };
+        store.assessments.insert(assessment_id.clone(), record);
+
+        // Read the id back out of the store, so the response cannot name an assessment
+        // the insert did not persist.
+        let stored = store
+            .assessments
+            .get(&assessment_id)
+            .ok_or_else(crate::state::state_unavailable)?;
+        Ok(StartADAssessmentOutput {
+            assessment_id: Some(stored.assessment_id.clone()),
+        })
     }
+}
+
+/// Which of the two mutually exclusive input forms the request carried, resolved before
+/// the store lock is taken.
+enum SubjectRequest {
+    /// `DirectoryId`: assess an existing directory.
+    Directory(String),
+    /// `AssessmentConfiguration`: assess a self-managed environment described in the
+    /// request.
+    Configuration(AssessmentConfiguration),
+}
+
+/// What the assessment is run against, resolved from whichever input form the request
+/// carried, so the stored record is built in ONE place rather than once per form.
+struct Subject {
+    directory_id: Option<String>,
+    dns_name: Option<String>,
+    customer_dns_ips: Vec<String>,
+    self_managed_instance_ids: Vec<String>,
+    vpc_id: Option<String>,
+    subnet_ids: Vec<String>,
+    security_group_ids: Vec<String>,
+}
+
+/// Refuse the request with the modelled `InvalidParameterException`, naming the members
+/// and the rule they broke so the caller can fix the request from the message alone.
+fn invalid_parameter(message: &str) -> StartADAssessmentError {
+    StartADAssessmentErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(message.to_string()),
+        request_id: None,
+    })
+    .into()
 }

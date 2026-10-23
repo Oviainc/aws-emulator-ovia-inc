@@ -149,9 +149,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `@readonly`: paging a list never changes what a later caller sees, and the
-        // page it reports depends on nothing in the request's metadata.
-        let _ = ctx;
+        // `@readonly`: paging a list never changes what a later caller sees. `ctx` carries
+        // the credential the authorization decision below is made for.
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ListRumMetricsDestinationsErrorModeled::InternalServerException(
                 InternalServerException {
@@ -192,6 +191,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .and_then(|requested| usize::try_from(requested).ok())
             .unwrap_or(DEFAULT_PAGE_SIZE)
             .clamp(1, MAX_PAGE_SIZE);
+
+        // May this caller read THIS app monitor's metric destinations? Decided per call,
+        // like every other operation's, with the monitor and the policy in force read
+        // under a SHORT lock ([`crate::state::authorization`]).
+        let (resource_arn, held_policy) = {
+            let store = state.lock();
+            let Some(record) = store.app_monitors.get(&input.app_monitor_name) else {
+                return Err(
+                    ListRumMetricsDestinationsErrorModeled::ResourceNotFoundException(
+                        crate::state::app_monitor_not_found(&input.app_monitor_name),
+                    )
+                    .into(),
+                );
+            };
+            (record.arn.clone(), record.resource_policy_document())
+        };
+        if let Err(denial) = crate::state::authorization::authorize(
+            &*self.engine,
+            ctx,
+            crate::state::authorization::LIST_RUM_METRICS_DESTINATIONS,
+            &resource_arn,
+            held_policy.as_deref(),
+            &[],
+        ) {
+            return Err(
+                ListRumMetricsDestinationsErrorModeled::AccessDeniedException(
+                    crate::state::access_denied(&denial),
+                )
+                .into(),
+            );
+        }
 
         let store = state.lock();
         // Destinations are held ON the app monitor record, so a request naming no stored
