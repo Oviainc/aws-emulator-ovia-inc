@@ -26,9 +26,19 @@
 //! inside ONE resource's results, so there is nothing to judge it against until the
 //! resource is known: a request naming a what-if forecast this service holds nothing for
 //! is `ResourceNotFoundException` even when it also carries a token this service never
-//! minted. The ARN's own SYNTAX is judged first of all — a `LongArn` outside its modelled
-//! pattern or length never reaches a lookup and is refused with `InvalidInputException`
-//! (see `crate::service::override_refusal`).
+//! minted.
+//!
+//! ## What is judged before the resource
+//!
+//! Two things, in this order. The ARN the request names first: its own modelled SYNTAX (a
+//! `LongArn` outside its pattern or length never reaches this handler — see
+//! `crate::service::override_refusal`) and then the resource kind it names, both refused
+//! with `InvalidInputException`. Then the SHAPE of the rest of the request — the values
+//! of `StartDate`, `EndDate` and the keys of `Filters` against the constraints of the
+//! shapes they target ([`crate::state::shape_validation_message`]) — answered with
+//! `ValidationException` (400) because it is the request's shape that is wrong, not this
+//! what-if forecast, and answered whether or not the store holds the what-if forecast the
+//! ARN names.
 //!
 //! ## The ARN must NAME a what-if forecast
 //!
@@ -185,7 +195,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // [`crate::state::WHAT_IF_FORECAST`]). The modelled pattern admits every Amazon
         // Forecast ARN equally, so an ARN that names a plain forecast, or a what-if
         // forecast ARN missing its analysis, identifies no what-if forecast at all,
-        // whatever the store holds: invalid input rather than an absent resource.
+        // whatever the store holds: invalid input rather than an absent resource. It is
+        // read FIRST, as the ARN's modelled syntax is (by the validation layer in front of
+        // this handler): the resource the request names is what the rest of it is about.
         if !crate::state::WHAT_IF_FORECAST.names(&input.what_if_forecast_arn) {
             return Err(QueryWhatIfForecastErrorModeled::InvalidInputException(
                 InvalidInputException {
@@ -196,6 +208,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
             .into());
+        }
+
+        // Then the SHAPE of the rest of the request, BEFORE the what-if forecast is
+        // resolved: a `DateTime` outside its pattern, or a `Filters` key outside the key
+        // shape's pattern or length, is a request this service cannot read — so it is
+        // refused whether or not the store holds the what-if forecast the ARN names, and
+        // with `ValidationException` (400) rather than one of this operation's own
+        // modelled errors. `Filters` KEYS are judged here because the framework's boundary
+        // walk captures a map key as a path segment and never judges it.
+        if let Some(message) = crate::state::shape_validation_message(
+            &input.filters,
+            input.start_date.as_deref(),
+            input.end_date.as_deref(),
+        ) {
+            return Err(crate::scaffolded::Scaffolded::validation(message));
         }
 
         let Some(state) = crate::state::service_state(&*self.engine) else {

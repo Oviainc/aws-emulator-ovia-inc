@@ -557,18 +557,25 @@ async fn a_date_outside_the_documented_format_is_refused() {
     let forecast_arn = arn("forecast/dates");
     seed_forecast(&engine, electricity_forecast(&forecast_arn));
 
-    let rejected: [&str; 8] = [
-        "2015-01-01",                 // date only
-        "2015-01-01T08:00",           // no seconds
-        "2015-01-01T08:00:00Z",       // offset the format does not carry
-        "2015-01-01 08:00:00",        // space instead of 'T'
-        "2015-13-01T00:00:00",        // month past 12
-        "2015-02-30T00:00:00",        // a day February never has
-        "2015-01-01T25:00:00",        // hour past 23
-        "tomorrow",
+    // Two layers refuse a date, and which one answers is what the expected code says.
+    // The SHAPE layer runs first and refuses a value that is not a date and a time of day
+    // at all (`crate::state::DATE_TIME_PATTERN`) with `ValidationException`; a value that
+    // IS one but is not the layout this service's points are stored in, or is not a real
+    // instant, reaches the projection and is the operation's own `InvalidInputException`.
+    // Either way the caller gets a 400. `shape_validation.rs` pins the first layer's own
+    // rule, including that it precedes resolving the ARN.
+    let rejected: [(&str, &str); 8] = [
+        ("2015-01-01", "ValidationException"), // date only: no time of day
+        ("2015-01-01T08:00", "InvalidInputException"), // a time, but no seconds
+        ("2015-01-01T08:00:00Z", "InvalidInputException"), // a zone the layout omits
+        ("2015-01-01 08:00:00", "ValidationException"), // space instead of 'T'
+        ("2015-13-01T00:00:00", "InvalidInputException"), // month past 12
+        ("2015-02-30T00:00:00", "InvalidInputException"), // a day February never has
+        ("2015-01-01T25:00:00", "InvalidInputException"), // hour past 23
+        ("tomorrow", "ValidationException"),
     ];
     for member in ["StartDate", "EndDate"] {
-        for value in rejected {
+        for (value, expected_code) in rejected {
             let mut request =
                 json!({"ForecastArn": forecast_arn, "Filters": {"item_id": "client_21"}});
             request[member] = json!(value);
@@ -579,8 +586,8 @@ async fn a_date_outside_the_documented_format_is_refused() {
             );
             assert_eq!(
                 error_code(&body),
-                "InvalidInputException",
-                "case {member}={value:?}: expected InvalidInputException, got {body}"
+                expected_code,
+                "case {member}={value:?}: expected {expected_code}, got {body}"
             );
         }
     }
@@ -819,11 +826,11 @@ async fn a_request_outside_the_modelled_constraints_is_refused() {
     // Every row is a 400. The code differs by WHAT was refused: a RESOURCE ARN outside
     // its modelled pattern or length is refused by the service itself, before the forecast
     // it names is resolved, with the operation's own modelled `InvalidInputException`
-    // (`crate::service::override_refusal`); a `Filters` KEY pattern (a map-key constraint
-    // the boundary does not walk) reaches the handler and is answered with the same
-    // modelled error; every other modelled constraint is checked by the framework's
-    // boundary validator before `handle` and keeps its generic `ValidationException`
-    // report. Either way the caller gets a 400, never a 404 or a 501.
+    // (`crate::service::override_refusal`); every other modelled constraint — including a
+    // `Filters` KEY, a map-key constraint the boundary walk does not judge and the handler
+    // enforces in its place (`crate::state::shape_validation_message`) — is a
+    // request-SHAPE constraint and keeps the generic `ValidationException` report. Either
+    // way the caller gets a 400, never a 404 or a 501.
     let cases: Vec<(&str, Value, &str)> = vec![
         (
             "ForecastArn that is not an ARN",
@@ -854,7 +861,7 @@ async fn a_request_outside_the_modelled_constraints_is_refused() {
         (
             "a Filters key outside its character pattern",
             json!({"ForecastArn": forecast_arn, "Filters": {"item id!": "client_21"}}),
-            "InvalidInputException",
+            "ValidationException",
         ),
         (
             "NextToken past its 3000-character bound",

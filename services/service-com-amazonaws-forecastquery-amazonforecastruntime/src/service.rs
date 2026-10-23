@@ -90,10 +90,12 @@ const INVALID_INPUT_EXCEPTION: &str = "InvalidInputException";
 /// resource their ARN names before anything else about the request is judged, so an
 /// unreadable ARN is what the caller is told about even when another member is also
 /// wrong. Every refusal that does NOT concern the resource ARN (an absent required
-/// member, a bound on `Filters` or `NextToken`, a `Filters` key outside its pattern)
-/// keeps the framework's generic request-validation wording: those are request-SHAPE
-/// constraints, reported by the validation layer in front of the service rather than by
-/// the service's own resolution of the resource.
+/// member, a bound on `Filters` or `NextToken`) keeps the framework's generic
+/// request-validation wording: those are request-SHAPE constraints, reported by the
+/// validation layer in front of the service rather than by the service's own resolution
+/// of the resource. A `Filters` KEY is such a constraint too, but one the boundary walk
+/// does not reach, so each handler reports it itself
+/// (`crate::state::shape_validation_message`) in the same shape-refusal envelope.
 ///
 /// A violation with no value to echo cannot be worded this way and is left alone: this
 /// message is built from the value the request supplied.

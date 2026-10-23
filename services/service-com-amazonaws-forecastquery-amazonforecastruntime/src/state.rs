@@ -25,9 +25,20 @@
 //! the forecast was created with. `Filters` selects the series; `StartDate`/`EndDate` clip
 //! its points. [`StoredForecast::query`] is that whole projection, shared by both
 //! operations so they cannot disagree about it.
+//!
+//! # The rules both operations share
+//!
+//! Beside the stored shape, this module holds what the two query operations must answer
+//! IDENTICALLY, so that they cannot drift apart: which resource an ARN names
+//! ([`ResourceKind`]), how an ARN they cannot read and a resource they cannot find are
+//! worded ([`ResourceKind::invalid_arn_message`], [`ResourceKind::not_found_message`]),
+//! and the shape-level validation that runs before either resolves anything
+//! ([`shape_validation_message`]).
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::SystemTime;
+
+use aws_smithy_schema_server::constraints;
 
 /// Per-service state for com-amazonaws-forecastquery-amazonforecastruntime. A handler reaches it through [`service_state`].
 ///
@@ -512,6 +523,227 @@ pub fn parse_date_time(value: &str) -> Option<i64> {
     .map(|parsed| parsed.secs())
 }
 
+// ---------------------------------------------------------------------------
+// Shape-level validation of a request
+// ---------------------------------------------------------------------------
+//
+// The layer in front of the service: it judges the VALUES a request carries against the
+// constraints of the shapes they target, and it runs before the service resolves
+// anything, so what it refuses it refuses whether or not the named resource exists. Its
+// answer is HTTP 400 `ValidationException` with the envelope AWS words every shape
+// refusal in — `N validation error(s) detected: <clause>; …` — and never a modelled
+// error of the operation, which is the service's own vocabulary for a request the shape
+// layer passed.
+//
+// The framework's boundary validator (`aws_smithy_schema_server::constraints`) is that
+// layer for every constraint the ON-DISK model carries and the walk reaches. What is
+// stated here is the rest: a constraint the model does not carry, and a constraint on a
+// MAP KEY, which that walk captures as a path segment and deliberately never judges
+// ("the key itself is not a constrained leaf"). Both query operations carry the same
+// members, so the check is written once and each handler runs it as its first step.
+
+/// The pattern a `DateTime` member must satisfy — `StartDate` and `EndDate` on both query
+/// operations.
+///
+/// The on-disk `com.amazonaws.forecastquery#DateTime` is a plain string with no
+/// `@pattern` (`smithy_query(query="shape",shape="com.amazonaws.forecastquery#DateTime",
+/// model_path="services/service-com-amazonaws-forecastquery-amazonforecastruntime/\
+/// smithy-model/com-amazonaws-forecastquery-amazonforecastruntime.json")`), so the
+/// boundary walk has nothing to enforce for it. The pattern below is the one the service
+/// itself quotes when it refuses a date: it admits the layout the member's own doc
+/// documents — "yyyy-MM-dd'T'HH:mm:ss (ISO 8601 format)" — plus the ISO 8601 spellings
+/// that extend it (a seconds field, a zone designator, an offset, fractional seconds),
+/// and refuses a value that is not a calendar date and a time of day at all.
+pub const DATE_TIME_PATTERN: &str =
+    r"^\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}[a-zA-Z0-9\:\+\-\[\]\.\/]*$";
+
+/// The pattern a `Filters` KEY must satisfy: the map's key targets `AttributeName`, whose
+/// `@pattern` this is (`smithy_query(query="shape",
+/// shape="com.amazonaws.forecastquery#Filters")`).
+pub const FILTER_KEY_PATTERN: &str = r"^[a-zA-Z0-9\_\-]+$";
+
+/// The minimum length a `Filters` key may have: `AttributeName`'s `@length` minimum, from
+/// the same model entry as [`FILTER_KEY_PATTERN`].
+pub const FILTER_KEY_MIN_LENGTH: i64 = 0;
+
+/// The maximum length a `Filters` key may have: `AttributeName`'s `@length` maximum, from
+/// the same model entry as [`FILTER_KEY_PATTERN`].
+pub const FILTER_KEY_MAX_LENGTH: i64 = 256;
+
+/// Ceiling on a value as rendered INTO a message, mirroring the one
+/// `aws_smithy_schema_server::constraints` applies to every value it echoes: a caller
+/// controls the length of what it sends, and a clause interpolates it, so an unelided
+/// echo amplifies a request into an arbitrarily long response.
+const MAX_ECHOED_VALUE: usize = 256;
+
+/// Whether `value` satisfies [`DATE_TIME_PATTERN`].
+///
+/// Read position by position rather than through a regex engine, for the same reason
+/// [`parse_date_time`] is: the pattern is a FIXED LAYOUT — `yyyy-MM-dd`, then `T` or `t`,
+/// then `HH:mm` — followed by one character class, so walking it IS the pattern, and the
+/// place this crate already judges a date does it exactly this way. It also keeps the
+/// check ASCII-only, as the pattern's `\d` and its trailing class are: a value spelled
+/// with non-ASCII digits is not a date this service can place on a timeline.
+///
+/// Every character after the layout must be one the trailing class admits: ASCII
+/// alphanumeric, or one of `:`, `+`, `-`, `[`, `]`, `.`, `/`.
+fn matches_date_time_pattern(value: &str) -> bool {
+    /// Length of the fixed layout the pattern opens with, up to and including the minutes.
+    const LAYOUT: usize = 16;
+
+    let bytes = value.as_bytes();
+    if bytes.len() < LAYOUT {
+        return false;
+    }
+    for (index, byte) in bytes.iter().enumerate().take(LAYOUT) {
+        let satisfied = match index {
+            4 | 7 => *byte == b'-',
+            10 => *byte == b'T' || *byte == b't',
+            13 => *byte == b':',
+            _ => byte.is_ascii_digit(),
+        };
+        if !satisfied {
+            return false;
+        }
+    }
+    bytes[LAYOUT..].iter().all(|byte| {
+        byte.is_ascii_alphanumeric()
+            || matches!(byte, b':' | b'+' | b'-' | b'[' | b']' | b'.' | b'/')
+    })
+}
+
+/// A value as it appears in a message: itself when short, a character-boundary-safe
+/// prefix with an elision when not.
+///
+/// RENDERING ONLY — every check below reads the original value, never this. Eliding
+/// before a check would compare text the caller never sent, so a legal 300-character key
+/// would be refused for the elision marker's own characters.
+fn echoed(value: &str) -> std::borrow::Cow<'_, str> {
+    if value.len() <= MAX_ECHOED_VALUE {
+        return std::borrow::Cow::Borrowed(value);
+    }
+    let mut end = MAX_ECHOED_VALUE;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    std::borrow::Cow::Owned(format!("{}... [{} bytes]", &value[..end], value.len()))
+}
+
+/// The clause a member outside a `@pattern` earns, worded by the framework's own
+/// [`constraints::Violation`] so a constraint this file enforces reads exactly like one
+/// the boundary walk enforces.
+fn pattern_clause(member: &str, value: &str, pattern: &str) -> String {
+    constraints::Violation {
+        path: constraints::path::member(member),
+        kind: constraints::ViolationKind::Pattern(pattern.to_string()),
+        value: Some(echoed(value).into_owned()),
+    }
+    .message()
+}
+
+/// The clause a MAP member earns when one of its keys is outside the key shape's
+/// constraints.
+///
+/// Reported at the map member, with the map as sent as the offending value and the key
+/// shape's WHOLE constraint set as the requirement: the key that failed is not named,
+/// because the constraint belongs to every key of the map. The requirement sentences are
+/// the ones [`constraints::Violation`] words a `@length` bound and a `@pattern` with —
+/// bundled here, which that type's own `message` cannot express.
+fn map_keys_clause(member: &str, map: &HashMap<String, String>) -> String {
+    let requirements = [
+        format!("Member must have length less than or equal to {FILTER_KEY_MAX_LENGTH}"),
+        format!("Member must have length greater than or equal to {FILTER_KEY_MIN_LENGTH}"),
+        format!("Member must satisfy regular expression pattern: {FILTER_KEY_PATTERN}"),
+    ];
+    format!(
+        "Value '{}' at '{}' failed to satisfy constraint: Map keys must satisfy \
+         constraint: [{}]",
+        echoed(&rendered_map(map)),
+        constraints::path::member(member),
+        requirements.join(", ")
+    )
+}
+
+/// A map as a message shows it: `{key=value, key=value}`.
+///
+/// Ordered by key — a map has no wire order, so the only deterministic rendering of one
+/// is a sorted one, and a message that varied run to run could not be matched on.
+fn rendered_map(map: &HashMap<String, String>) -> String {
+    let ordered: BTreeMap<&String, &String> = map.iter().collect();
+    let entries: Vec<String> = ordered
+        .into_iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect();
+    format!("{{{}}}", entries.join(", "))
+}
+
+/// `clauses` in the envelope a shape refusal is reported in: `1 validation error
+/// detected: <clause>`, or `N validation errors detected: <clause>; <clause>`.
+///
+/// The same sentence `constraints::envelope` renders, re-stated because that function
+/// takes `Violation`s and the map-key clause above is one no `ViolationKind` can express.
+fn validation_envelope(clauses: &[String]) -> Option<String> {
+    match clauses.len() {
+        0 => None,
+        1 => Some(format!("1 validation error detected: {}", clauses[0])),
+        n => Some(format!(
+            "{n} validation errors detected: {}",
+            clauses.join("; ")
+        )),
+    }
+}
+
+/// Whether `key` satisfies the `Filters` key shape: its `@length` bounds and its
+/// `@pattern`.
+///
+/// Length counts CHARACTERS, which is what the boundary walk counts for a string shape
+/// (`ValidatingSerializer::write_string` passes `value.chars().count()` to
+/// `LengthTrait::check`), so a multi-byte key is judged the same whichever layer sees it.
+/// The minimum is 0 for this shape, so only the maximum can actually refuse a key for
+/// its length; it is still read from the constant because the same bounds are the
+/// sentence the refusal states. The `@pattern` admits ASCII letters, digits, `_` and `-`,
+/// and its `+` requires at least one of them, so an empty key is outside it.
+fn filter_key_is_valid(key: &str) -> bool {
+    let length = key.chars().count() as i64;
+    (FILTER_KEY_MIN_LENGTH..=FILTER_KEY_MAX_LENGTH).contains(&length)
+        && !key.is_empty()
+        && key
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+}
+
+/// Every shape-level violation of a query request, in the `ValidationException` envelope
+/// — `None` when the request satisfies this layer.
+///
+/// The members judged are the ones both query operations share and the boundary walk
+/// leaves unjudged: the two `DateTime` bounds of the window, and the KEYS of `Filters`.
+/// A handler runs this BEFORE it RESOLVES anything — so the answer is the same whether
+/// the store holds the resource the ARN names or not — but AFTER it has read that ARN
+/// ([`ResourceKind::names`]), which is the member the rest of the request is about and is
+/// answered with [`ResourceKind::invalid_arn_message`] whatever else is also wrong. Do
+/// not reorder the two: that precedence is pinned by
+/// `tests/all/invalid_arn_message.rs`.
+pub fn shape_validation_message(
+    filters: &HashMap<String, String>,
+    start_date: Option<&str>,
+    end_date: Option<&str>,
+) -> Option<String> {
+    // In the model's own member order, so a request wrong in two places reads the same
+    // way every time.
+    let mut clauses: Vec<String> = Vec::new();
+    for (member, value) in [("StartDate", start_date), ("EndDate", end_date)] {
+        if let Some(value) = value {
+            if !matches_date_time_pattern(value) {
+                clauses.push(pattern_clause(member, value, DATE_TIME_PATTERN));
+            }
+        }
+    }
+    if filters.keys().any(|key| !filter_key_is_valid(key)) {
+        clauses.push(map_keys_clause("Filters", filters));
+    }
+    validation_envelope(&clauses)
+}
+
 /// The inclusive `[StartDate, EndDate]` window a query asked for; either bound may be
 /// absent, and with both absent the complete date range is returned (the model's
 /// documented default).
@@ -591,8 +823,11 @@ impl QueryRejection {
     pub fn message(&self) -> String {
         match self {
             Self::UnknownDimension { key, known } => format!(
-                "Filters key '{key}' is not a dimension of this forecast; \
+                "Filters key '{}' is not a dimension of this forecast; \
                  valid keys are [{}]",
+                // Through the module's one echo ceiling, like every other request-derived
+                // value a message interpolates.
+                echoed(key),
                 known.join(", ")
             ),
             Self::NoFilters => {
@@ -610,8 +845,12 @@ impl QueryRejection {
                  item, so supply a filter for every forecast dimension"
             ),
             Self::MalformedDate { member, value } => format!(
-                "{member} '{value}' is not a valid date; specify the date using this format: \
-                 yyyy-MM-dd'T'HH:mm:ss (ISO 8601 format)"
+                "{member} '{}' is not a valid date; specify the date using this format: \
+                 yyyy-MM-dd'T'HH:mm:ss (ISO 8601 format)",
+                // Through the module's one echo ceiling: this value satisfied the shape
+                // layer's pattern, whose trailing class is unbounded, so it is as long as
+                // the caller chose to make it.
+                echoed(value)
             ),
             Self::InvertedRange => {
                 "StartDate must not be later than EndDate".to_string()

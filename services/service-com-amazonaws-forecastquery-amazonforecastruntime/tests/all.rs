@@ -21,5 +21,7 @@ mod invalid_arn_message;
 mod resource_not_found_message;
 #[path = "all/service_claim.rs"]
 mod service_claim;
+#[path = "all/shape_validation.rs"]
+mod shape_validation;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
