@@ -166,6 +166,19 @@
 //! the seeded subnets are the ones of [`DEFAULT_REGION`]. Everything a later writer
 //! stores names the Region its own request was signed for.
 //!
+//! ## Account-level settings
+//!
+//! A setting is not a resource: it has no id, nothing creates or deletes it, and an
+//! account that has never touched it still has a value for it. So
+//! [`ComAmazonawsEc2Amazonec2State::snapshot_block_public_access`] is a single field
+//! holding the one word the *block public access for snapshots* setting is in —
+//! [`SNAPSHOT_BLOCK_PUBLIC_ACCESS_UNBLOCKED`] for an account that has never enabled it —
+//! rather than a map keyed by anything. The value stored is always a member of the
+//! modelled `SnapshotBlockPublicAccessState` catalog ([`snapshot_block_public_access_mode`]
+//! is what turns a request's word into one), never the request's own text, and the field
+//! is account-wide because this store is per ACCOUNT and not per Region (see "The default
+//! VPC's default subnets" below).
+//!
 //! ## The default security group of a VPC
 //!
 //! "Your VPC automatically comes with a default security group. … you can't delete a
@@ -943,6 +956,16 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// module docs. Ordered by endpoint id, which is the order
     /// `DescribeVpcEndpointConnections` reports and pages over.
     pub vpc_endpoint_connections: BTreeMap<String, VpcEndpointConnection>,
+    /// The state of the account's *block public access for snapshots* setting — see the
+    /// module docs.
+    ///
+    /// A `&'static str` so only a member of the modelled `SnapshotBlockPublicAccessState`
+    /// catalog can ever be stored here: the word comes from this module's own constants,
+    /// never from a request. Read it through
+    /// [`Self::snapshot_block_public_access_state`] and write it through
+    /// [`Self::set_snapshot_block_public_access_state`], so the operations that report and
+    /// the operations that change it cannot disagree.
+    snapshot_block_public_access: &'static str,
 }
 
 /// A fresh account's EC2 state: the ambient network AWS gives it — the default VPC, that
@@ -980,6 +1003,9 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             dedicated_hosts: BTreeMap::new(),
             dedicated_host_client_tokens: HashMap::new(),
             vpc_endpoint_connections: BTreeMap::new(),
+            // "Public sharing is not blocked" is where an account that has never called
+            // `EnableSnapshotBlockPublicAccess` sits.
+            snapshot_block_public_access: SNAPSHOT_BLOCK_PUBLIC_ACCESS_UNBLOCKED,
         };
         let default_vpc = state.insert_vpc(
             DEFAULT_VPC_CIDR_BLOCK,
@@ -5939,5 +5965,84 @@ pub fn vpc_endpoint_connection_payload_bytes(connection: &VpcEndpointConnection)
         + arn_bytes(connection.network_load_balancer_arns.as_ref())
         + arn_bytes(connection.gateway_load_balancer_arns.as_ref())
         + dns_bytes
+}
+
+// ---------------------------------------------------------------------------
+// Block public access for snapshots
+// ---------------------------------------------------------------------------
+
+/// "`unblocked` - Public sharing is not blocked. Users can publicly share snapshots"
+/// (`GetSnapshotBlockPublicAccessStateResult$State`): the `SnapshotBlockPublicAccessState`
+/// enum's `unblocked` member.
+///
+/// It is both where an account that has never enabled the setting sits and the state
+/// `DisableSnapshotBlockPublicAccess` returns it to — "after you disable block public
+/// access for snapshots in a Region, users can publicly share snapshots in that Region".
+pub const SNAPSHOT_BLOCK_PUBLIC_ACCESS_UNBLOCKED: &str = "unblocked";
+
+/// "`block-all-sharing` - Prevents all public sharing of snapshots in the Region"
+/// (`EnableSnapshotBlockPublicAccessRequest$State`): the `SnapshotBlockPublicAccessState`
+/// enum's `block-all-sharing` member.
+pub const SNAPSHOT_BLOCK_PUBLIC_ACCESS_BLOCK_ALL_SHARING: &str = "block-all-sharing";
+
+/// "`block-new-sharing` - Prevents only new public sharing of snapshots in the Region"
+/// (`EnableSnapshotBlockPublicAccessRequest$State`): the `SnapshotBlockPublicAccessState`
+/// enum's `block-new-sharing` member.
+pub const SNAPSHOT_BLOCK_PUBLIC_ACCESS_BLOCK_NEW_SHARING: &str = "block-new-sharing";
+
+/// The modes `EnableSnapshotBlockPublicAccess` accepts: the two blocking members of the
+/// `SnapshotBlockPublicAccessState` catalog, in the order its own documentation lists
+/// them.
+///
+/// The third member is NOT here on purpose: "`unblocked` is not a valid value for
+/// **EnableSnapshotBlockPublicAccess**" (`EnableSnapshotBlockPublicAccessRequest$State`) —
+/// turning the setting off is `DisableSnapshotBlockPublicAccess`'s job. The whole catalog
+/// is the generated `crate::ops::types::SNAPSHOT_BLOCK_PUBLIC_ACCESS_STATE_VALUES`.
+pub const SNAPSHOT_BLOCK_PUBLIC_ACCESS_MODES: [&str; 2] = [
+    SNAPSHOT_BLOCK_PUBLIC_ACCESS_BLOCK_ALL_SHARING,
+    SNAPSHOT_BLOCK_PUBLIC_ACCESS_BLOCK_NEW_SHARING,
+];
+
+/// "`account` - The state is managed by the account"
+/// (`GetSnapshotBlockPublicAccessStateResult$ManagedBy`): the `ManagedBy` enum's `account`
+/// member.
+///
+/// Every state this emulator can hold is one the account itself set through
+/// `EnableSnapshotBlockPublicAccess` / `DisableSnapshotBlockPublicAccess`, or the default
+/// it has never changed. The enum's other member, `declarative-policy`, names a state set
+/// OUTSIDE EC2 — by an Organizations declarative policy — and "can't be modified by the
+/// account", so no operation of this API can put the setting into it.
+pub const MANAGED_BY_ACCOUNT: &str = "account";
+
+/// The [`SNAPSHOT_BLOCK_PUBLIC_ACCESS_MODES`] member `requested` names, or `None` when it
+/// names none.
+///
+/// Answering a `&'static str` out of this module's own constants is what keeps request
+/// text out of the store: a writer stores what this returns, so the stored word is always
+/// a modelled catalog member.
+pub fn snapshot_block_public_access_mode(requested: &str) -> Option<&'static str> {
+    SNAPSHOT_BLOCK_PUBLIC_ACCESS_MODES
+        .into_iter()
+        .find(|mode| *mode == requested)
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// The state of the account's *block public access for snapshots* setting right now.
+    ///
+    /// A pure read: the setting has no clock-owed move — AWS reports the mode an enable
+    /// asked for as soon as the enable answers — so nothing about it changes with time.
+    pub fn snapshot_block_public_access_state(&self) -> &'static str {
+        self.snapshot_block_public_access
+    }
+
+    /// Put the setting into `state` and answer the state now in effect.
+    ///
+    /// `state` is a `&'static str` so only one of this module's catalog constants can be
+    /// stored; the answer is read back off the field rather than echoed, so a writer
+    /// reports exactly what a later read will.
+    pub fn set_snapshot_block_public_access_state(&mut self, state: &'static str) -> &'static str {
+        self.snapshot_block_public_access = state;
+        self.snapshot_block_public_access
+    }
 }
 

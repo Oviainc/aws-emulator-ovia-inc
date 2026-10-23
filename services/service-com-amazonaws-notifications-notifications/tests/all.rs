@@ -17,6 +17,8 @@ mod harness;
 mod notification_configurations;
 #[path = "all/notification_hubs.rs"]
 mod notification_hubs;
+#[path = "all/organization_access.rs"]
+mod organization_access;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/validation_message_rendering.rs"]

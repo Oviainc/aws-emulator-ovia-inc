@@ -968,48 +968,38 @@ async fn an_unstored_resource_is_reported_as_not_found() {
     }
 }
 
-/// The operations this crate implements answer from state; the ones still
-/// scaffolded must answer 501 rather than an empty 200.
+/// The operations this crate implements answer from state, and every operation
+/// this service models is implemented now: there is no scaffolded row left to
+/// assert a 501 for.
 ///
-/// `UpdateMonitor`, `TagResource`, `UntagResource` and `ListTagsForResource`
-/// are no longer among them: all four are implemented, and
-/// `tests/all/update_monitor.rs`, `tests/all/tagging.rs` and
-/// `tests/all/resource_tags.rs` assert what they do. Nor is `GetProbe`, which
-/// `tests/all/monitor_lifecycle_and_front_door.rs` asserts.
-///
-/// A fixer implementing one of the rows below deletes that row in the same
-/// change: the point of the case is that a not-yet-written operation never
-/// answers a success a client cannot tell from a real one.
+/// `UpdateProbe` was the last one — `tests/all/update_probe.rs` asserts what it
+/// does — and `UpdateMonitor`, `TagResource`, `UntagResource`,
+/// `ListTagsForResource` and `GetProbe` are pinned by
+/// `tests/all/update_monitor.rs`, `tests/all/tagging.rs`,
+/// `tests/all/resource_tags.rs` and
+/// `tests/all/monitor_lifecycle_and_front_door.rs`. The 501 census itself lives
+/// in the handlers: an operation nobody has written yet carries the
+/// `//! SCAFFOLDED, NOT IMPLEMENTED:` header, and this crate has none.
 #[tokio::test]
-async fn the_unimplemented_operations_still_answer_501() {
+async fn every_modelled_operation_answers_from_state() {
     let router = router();
-    let (status, _) = create_monitor(&router, r#"{"monitorName":"still-stubbed"}"#).await;
+    let (status, _) = create_monitor(&router, r#"{"monitorName":"no-longer-stubbed"}"#).await;
     assert_eq!(status, 200, "setup: CreateMonitor should succeed");
 
-    // (case, method, path, body)
-    let cases: Vec<(&str, &str, String, Option<String>)> = vec![
-        // `UpdateMonitor` used to be a row here, and so were the three tagging
-        // operations; they are implemented now, and their behaviour is pinned by
-        // `tests/all/update_monitor.rs`, `tests/all/tagging.rs` and
-        // `tests/all/resource_tags.rs`.
-        (
-            "UpdateProbe",
-            "PATCH",
-            format!("/monitors/still-stubbed/probes/probe-{}", "a".repeat(21)),
-            Some(r#"{"packetSize":56}"#.to_string()),
-        ),
-    ];
-
-    for (case, method, path, body) in cases {
-        let (status, refused) = call(&router, method, &path, body.as_deref()).await;
-        assert_eq!(
-            status, 501,
-            "case {case:?}: a scaffolded operation answers 501, got {status} {refused:?}"
-        );
-        assert_eq!(
-            error_code(&refused),
-            "NotImplemented",
-            "case {case:?}: expected NotImplemented, got {refused:?}"
-        );
-    }
+    // The route that used to answer 501 now answers the modelled 404 for a
+    // probe id nothing minted, which is what an implemented handler does.
+    let path = format!(
+        "/monitors/no-longer-stubbed/probes/probe-{}",
+        "a".repeat(21)
+    );
+    let (status, refused) = call(&router, "PATCH", &path, Some(r#"{"packetSize":56}"#)).await;
+    assert_eq!(
+        status, 404,
+        "UpdateProbe is implemented, so an unknown probe is 404, got {status} {refused:?}"
+    );
+    assert_eq!(
+        error_code(&refused),
+        "ResourceNotFoundException",
+        "expected ResourceNotFoundException, got {refused:?}"
+    );
 }

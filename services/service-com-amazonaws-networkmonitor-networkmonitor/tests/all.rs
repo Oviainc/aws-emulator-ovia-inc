@@ -23,3 +23,5 @@ mod state_roundtrip;
 mod tagging;
 #[path = "all/update_monitor.rs"]
 mod update_monitor;
+#[path = "all/update_probe.rs"]
+mod update_probe;

@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetEventSelectors
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetEventSelectors`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetEventSelectors::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the event selectors configured for one trail, as
+//! [`crate::state::TrailRecord::reported_event_selectors`] projects them: the advanced
+//! selectors when advanced selectors are configured, otherwise the basic ones — which
+//! for a trail nothing has configured is the documented default selector (all read and
+//! write management events, no data events). This is a READ: it resolves the trail the
+//! identifier names and writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -180,18 +178,54 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetEventSelectors` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetEventSelectorsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetEventSelectors"))
+        let region = crate::state::request_region(ctx.parts());
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetEventSelectorsErrorModeled::UnsupportedOperationException(
+                UnsupportedOperationException {
+                    message: Some(
+                        "GetEventSelectors needs the CloudTrail trail registry, which this \
+                         engine does not carry"
+                            .to_string(),
+                    ),
+                },
+            )
+        })?;
+        let store = state.lock();
+
+        // `TrailName` is either a bare trail name or a trail ARN; a malformed one is
+        // refused as whichever form it was written in. Reading selectors does not
+        // change the trail, so it is resolved the way the other reads resolve it.
+        let record = store
+            .resolve(&input.trail_name, &region)
+            .map_err(|rejection| match rejection {
+                crate::state::IdentifierRejection::InvalidArn(message) => {
+                    GetEventSelectorsErrorModeled::CloudTrailARNInvalidException(
+                        CloudTrailARNInvalidException {
+                            message: Some(message),
+                        },
+                    )
+                }
+                crate::state::IdentifierRejection::InvalidName(message) => {
+                    GetEventSelectorsErrorModeled::InvalidTrailNameException(
+                        InvalidTrailNameException {
+                            message: Some(message),
+                        },
+                    )
+                }
+            })?
+            .ok_or_else(|| {
+                GetEventSelectorsErrorModeled::TrailNotFoundException(TrailNotFoundException {
+                    message: Some(format!("Unknown trail: {}", input.trail_name)),
+                })
+            })?;
+
+        let (event_selectors, advanced_event_selectors) = record.reported_event_selectors();
+        Ok(GetEventSelectorsOutput {
+            // "The specified trail ARN that has the event selectors" — the stored
+            // ARN, so a call by bare name and one by ARN report the same trail.
+            trail_arn: Some(record.trail_arn.clone()),
+            event_selectors,
+            advanced_event_selectors,
+        })
     }
 }

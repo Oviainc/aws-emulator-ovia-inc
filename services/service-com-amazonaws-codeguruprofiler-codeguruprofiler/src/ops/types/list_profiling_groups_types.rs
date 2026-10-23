@@ -19,11 +19,41 @@ pub struct ListProfilingGroupsInput {
     pub include_description: Option<bool>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.codeguruprofiler#ListProfilingGroupsResponse")]
+/// `ListProfilingGroupsResponse`. Its schema and codec come from
+/// [`profiler_schema_and_codec!`] rather than `#[smithy_macros::smithy(shape = ...)]`
+/// because `profilingGroupNames` is `@required` in the model yet its own model doc says it
+/// is "returned only if `includeDescription` is `false`" — so the member has to be able to
+/// be ABSENT, which the derive (a `@required` member is a non-`Option` field the
+/// serializer always writes) cannot express. See `types/date_time_wire.rs`.
 #[derive(Debug, Clone, Default)]
 pub struct ListProfilingGroupsOutput {
-    pub profiling_group_names: Vec<String>,
+    pub profiling_group_names: Option<Vec<String>>,
     pub profiling_groups: Option<Vec<ProfilingGroupDescription>>,
     pub next_token: Option<String>,
 }
+
+profiler_schema_and_codec!(
+    ListProfilingGroupsOutput,
+    LIST_PROFILING_GROUPS_OUTPUT_SCHEMA,
+    "com.amazonaws.codeguruprofiler#ListProfilingGroupsResponse",
+    "com.amazonaws.codeguruprofiler",
+    "ListProfilingGroupsResponse",
+    (
+        M_PROFILING_GROUP_NAMES,
+        profiling_group_names,
+        "profilingGroupNames",
+        0,
+        opt,
+        list_of_string
+    ),
+    (
+        M_PROFILING_GROUPS,
+        profiling_groups,
+        "profilingGroups",
+        1,
+        opt,
+        list_of(ProfilingGroupDescription)
+    ),
+    (M_NEXT_TOKEN, next_token, "nextToken", 2, opt, string),
+);
 

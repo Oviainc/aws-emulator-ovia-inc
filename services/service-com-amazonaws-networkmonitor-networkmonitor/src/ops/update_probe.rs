@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateProbe
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateProbe`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateProbe::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Merges the members the request names into the probe record the stored
+//! monitor in [`crate::state`] holds under this `probeId`, then answers from the
+//! record it stored. The route is a `PATCH`, and every input member but the two
+//! `@httpLabel` ones is optional, so a member the request does not name leaves
+//! the stored value alone.
+//!
+//! The merged record goes through the SAME rules a create applies
+//! ([`crate::state::validate_probe_spec`]), so an update cannot leave behind a
+//! probe `CreateProbe` would have refused, and `addressFamily` is re-derived
+//! from the destination it stored. `modifiedAt` moves only when a stored value
+//! actually changed — the operation is `@idempotent`, so a repeat of the same
+//! update leaves the record exactly as it was.
 //!
 //! ## Shape of an operation
 //!
@@ -151,6 +155,43 @@ impl From<UpdateProbeErrorModeled> for UpdateProbeError {
     }
 }
 
+/// This service's modelled `ValidationException` (HTTP 400), carrying `message`.
+///
+/// Used for the probe rules the model documents in prose but its constraints
+/// cannot express — the `destination`, `destinationPort` and `protocol` rules
+/// checked by [`crate::state::validate_probe_spec`] on the MERGED record.
+fn validation(message: String) -> UpdateProbeError {
+    UpdateProbeErrorModeled::ValidationException(ValidationException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// This operation's answer, read out of the STORED probe record.
+fn output_for(probe: &crate::state::Probe) -> UpdateProbeOutput {
+    UpdateProbeOutput {
+        probe_id: Some(probe.probe_id.clone()),
+        probe_arn: Some(probe.probe_arn.clone()),
+        source_arn: probe.source_arn.clone(),
+        destination: probe.destination.clone(),
+        destination_port: probe.destination_port,
+        protocol: probe.protocol.clone(),
+        packet_size: probe.packet_size,
+        address_family: Some(probe.address_family.clone()),
+        vpc_id: probe.vpc_id.clone(),
+        state: Some(probe.state.clone()),
+        created_at: Some(::aws_smithy_types::DateTime::from(probe.created_at)),
+        modified_at: Some(::aws_smithy_types::DateTime::from(probe.modified_at)),
+        tags: Some(
+            probe
+                .tags
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+        ),
+    }
+}
+
 /// The `UpdateProbe` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -187,18 +228,92 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateProbe` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateProbeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateProbe"))
+        let _ = ctx;
+        // `monitorName`'s and `probeId`'s `@pattern`s, `destination`'s
+        // `@length`, `destinationPort`'s and `packetSize`'s `@range`s and the
+        // `state` / `protocol` enums are refused by the framework BEFORE this
+        // handler runs, so reaching here means each named member satisfies its
+        // own modelled constraint; what is left are the cross-member rules the
+        // model states in prose.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateProbeErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the networkmonitor monitor store is unavailable".to_string()),
+            })
+        })?;
+        let now = ::std::time::SystemTime::now();
+
+        let mut store = state.lock();
+        // The `PENDING` -> `ACTIVE` transition the clock already owed this
+        // monitor and its probes, materialised before the record is changed and
+        // reported — the same write `GetProbe` performs, owed at its due instant
+        // whether or not anybody called.
+        store.settle_monitor(&input.monitor_name, now);
+        let monitor = store.monitors.get_mut(&input.monitor_name).ok_or_else(|| {
+            UpdateProbeErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: Some(crate::state::monitor_not_found_message(&input.monitor_name)),
+            })
+        })?;
+        let probe = monitor.probes.get_mut(&input.probe_id).ok_or_else(|| {
+            UpdateProbeErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: Some(crate::state::probe_not_found_message(
+                    &input.probe_id,
+                    &input.monitor_name,
+                )),
+            })
+        })?;
+
+        // A `PATCH`: the request's members override the stored ones, and the
+        // members it does not name keep the values the record already holds.
+        let mut merged = probe.spec();
+        if let Some(destination) = input.destination {
+            merged.destination = destination;
+        }
+        if let Some(destination_port) = input.destination_port {
+            merged.destination_port = Some(destination_port);
+        }
+        if let Some(protocol) = input.protocol {
+            merged.protocol = protocol;
+        }
+        if let Some(packet_size) = input.packet_size {
+            merged.packet_size = Some(packet_size);
+        }
+        // The rules a create applies, applied to the MERGED record — checked
+        // BEFORE anything is written, so a refused update leaves the stored
+        // probe exactly as it was.
+        let address_family = crate::state::validate_probe_spec(&merged).map_err(validation)?;
+
+        // `modifiedAt` moves only when a stored value actually changed, so a
+        // repeat of the same update (the model marks this operation
+        // `@idempotent`) leaves the record as it was.
+        let mut changed = probe.destination != merged.destination
+            || probe.destination_port != merged.destination_port
+            || probe.protocol != merged.protocol
+            || probe.packet_size != merged.packet_size;
+        probe.destination = merged.destination;
+        probe.destination_port = merged.destination_port;
+        probe.protocol = merged.protocol;
+        probe.packet_size = merged.packet_size;
+        // `addressFamily` is a property of the destination the record now holds,
+        // never a value the caller sets.
+        probe.address_family = address_family.to_string();
+
+        if let Some(requested_state) = input.state {
+            if probe.state != requested_state {
+                changed = true;
+                if requested_state == crate::state::PROBE_STATE_PENDING {
+                    // A probe the caller puts back into `PENDING` is
+                    // provisioning again, so the clock owes it `ACTIVE` afresh.
+                    probe.schedule_activation(now);
+                } else {
+                    probe.state = requested_state;
+                }
+            }
+        }
+        if changed {
+            probe.modified_at = now;
+        }
+        // Answered from the STORED probe, so what the caller is told is what a
+        // later `GetProbe` and `GetMonitor` read back.
+        Ok(output_for(probe))
     }
 }
