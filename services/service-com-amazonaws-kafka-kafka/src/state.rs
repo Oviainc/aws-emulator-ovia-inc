@@ -103,6 +103,9 @@ pub const MAX_VOLUME_SIZE_GB: i32 = 16_384;
 /// for an operation that never existed.
 pub const MAX_OPERATIONS_PER_CLUSTER: usize = 64;
 
+/// The `OperationType` an `UpdateBrokerType` call records, in the same form.
+pub const OPERATION_TYPE_UPDATE_BROKER_TYPE: &str = "UPDATE_BROKER_TYPE";
+
 /// The `OperationType` an `UpdateStorage` call records, which is the API name in
 /// the SCREAMING_SNAKE_CASE form MSK's cluster-operation types take.
 pub const OPERATION_TYPE_UPDATE_STORAGE: &str = "UPDATE_STORAGE";
@@ -138,6 +141,17 @@ pub const CLUSTER_STATE_UPDATING: &str = "UPDATING";
 /// operation ARN and the pre-update configuration, while a caller that waits sees
 /// the new configuration and the new cluster version.
 pub const CLUSTER_UPDATE_DELAY: Duration = Duration::from_millis(500);
+
+/// Shortest and longest a broker instance type may be, from the `length` trait on
+/// `BrokerNodeGroupInfo$InstanceType` and `MutableClusterInfo$InstanceType`
+/// (`__stringMin5Max32`, 5..32) in the model.
+///
+/// `UpdateBrokerTypeRequest$TargetInstanceType` is a plain `__string`, so the
+/// boundary validator lets any value through: the constraint belongs to the
+/// member the update WRITES, and [`is_broker_instance_type`] is what enforces it.
+pub const INSTANCE_TYPE_MIN_LEN: usize = 5;
+/// See [`INSTANCE_TYPE_MIN_LEN`].
+pub const INSTANCE_TYPE_MAX_LEN: usize = 32;
 
 /// The largest number of broker nodes one provisioned cluster may hold, from the
 /// `range` on `CreateClusterRequest$NumberOfBrokerNodes` (`__integerMin1Max15`,
@@ -658,6 +672,9 @@ pub enum ClusterChange {
     /// their provisioned throughput, the cluster's storage mode, or any
     /// combination the request named.
     Storage(StorageChange),
+    /// `UpdateBrokerType`: the EC2 instance type every broker of the cluster
+    /// runs on.
+    BrokerType { instance_type: String },
 }
 
 /// The storage attributes one update call asked to change. A member left `None`
@@ -1693,9 +1710,8 @@ impl ComAmazonawsKafkaKafkaState {
     /// `UpdateBrokerStorage` both come through it, each naming its own
     /// `operation_type` — so the operation record, the cluster's pending change,
     /// its active operation ARN and its operation history cannot drift apart. The
-    /// history is bounded here: the records past
-    /// [`MAX_OPERATIONS_PER_CLUSTER`] are the cluster's own oldest, so the trim
-    /// costs one walk of THAT cluster's history rather than of the registry.
+    /// history is bounded where every update's record is filed, in
+    /// [`Self::file_cluster_operation`].
     pub fn start_storage_update(
         &mut self,
         region: &str,
@@ -1723,20 +1739,75 @@ impl ComAmazonawsKafkaKafkaState {
             source_cluster_info,
             target_cluster_info,
         };
-        cluster.operation_arns.push(operation_arn.clone());
-        // The history is bounded: anything past the ceiling is this cluster's
-        // own oldest record.
-        let excess = cluster
-            .operation_arns
-            .len()
-            .saturating_sub(MAX_OPERATIONS_PER_CLUSTER);
-        let evicted: Vec<String> = cluster.operation_arns.drain(..excess).collect();
+        self.file_cluster_operation(operation);
+        Some(operation_arn)
+    }
+
+    /// Start a broker-type update on the cluster `arn` names, as an endpoint for
+    /// `region` sees it: record the cluster operation, move the cluster to
+    /// `UPDATING`, and hand it the instance type the clock will apply at
+    /// [`CLUSTER_UPDATE_DELAY`]. Answers the new operation's ARN, or `None` when
+    /// this region holds no cluster for `arn`.
+    ///
+    /// The same shape as [`Self::start_storage_update`], and for the same
+    /// reasons: the cluster is resolved through [`Self::settled_cluster_in_mut`],
+    /// it mints the operation ARN and holds the pending change, and the record is
+    /// filed through [`Self::file_cluster_operation`].
+    pub fn start_broker_type_update(
+        &mut self,
+        region: &str,
+        arn: &str,
+        now: SystemTime,
+        instance_type: String,
+    ) -> Option<String> {
+        let cluster = self.settled_cluster_in_mut(region, arn, now)?;
+        let cluster_arn = cluster.arn.clone();
+        let operation_region = cluster.region.clone();
+        let source_cluster_info = cluster.broker_type_cluster_info();
+        let target_cluster_info = broker_type_cluster_info(&instance_type);
+        let operation_arn = cluster.begin_broker_type_update(now, instance_type);
+        let operation = ClusterOperation {
+            arn: operation_arn.clone(),
+            cluster_arn,
+            region: operation_region,
+            operation_type: OPERATION_TYPE_UPDATE_BROKER_TYPE.to_string(),
+            creation_time: now,
+            end_due: now + CLUSTER_UPDATE_DELAY,
+            source_cluster_info,
+            target_cluster_info,
+        };
+        self.file_cluster_operation(operation);
+        Some(operation_arn)
+    }
+
+    /// File `operation` in the registry and in its own cluster's history, so the
+    /// ARN a reader resolves and the history a cluster lists cannot drift apart.
+    ///
+    /// The history is bounded here: the records past
+    /// [`MAX_OPERATIONS_PER_CLUSTER`] are that cluster's own oldest, so the trim
+    /// costs one walk of THAT cluster's history rather than of the registry. The
+    /// one filing path, so every update operation bounds its history the same way.
+    fn file_cluster_operation(&mut self, operation: ClusterOperation) {
+        let operation_arn = operation.arn.clone();
+        let evicted = match self.clusters.get_mut(&operation.cluster_arn) {
+            Some(cluster) => {
+                cluster.operation_arns.push(operation_arn.clone());
+                let excess = cluster
+                    .operation_arns
+                    .len()
+                    .saturating_sub(MAX_OPERATIONS_PER_CLUSTER);
+                cluster.operation_arns.drain(..excess).collect::<Vec<_>>()
+            }
+            // Unreachable: an operation is filed for the cluster it was just
+            // started on, under the same lock. Filed anyway rather than dropped,
+            // so the ARN the caller was handed still resolves.
+            None => Vec::new(),
+        };
         self.cluster_operations
-            .insert(operation_arn.clone(), operation);
+            .insert(operation_arn, operation);
         for stale in evicted {
             self.cluster_operations.remove(&stale);
         }
-        Some(operation_arn)
     }
 
     /// How many topics the cluster `cluster_arn` names holds as a reader at
@@ -2664,6 +2735,13 @@ impl Cluster {
         }
     }
 
+    /// The cluster's broker type as the `MutableClusterInfo` a cluster operation
+    /// reports: the one attribute an `UpdateBrokerType` call changes, since an
+    /// operation describes what it touches rather than the whole cluster.
+    pub fn broker_type_cluster_info(&self) -> MutableClusterInfo {
+        broker_type_cluster_info(&self.broker_node_group_info.instance_type)
+    }
+
     /// Start a storage update: the cluster enters `UPDATING` with the returned
     /// operation as its active one, and the submitted storage settings become
     /// its own when [`Self::settle`] finds the operation due — the same
@@ -2675,6 +2753,16 @@ impl Cluster {
     /// storage attribute does not reset the others.
     pub fn begin_storage_update(&mut self, now: SystemTime, change: StorageChange) -> String {
         self.begin_update(now, ClusterChange::Storage(change))
+    }
+
+    /// Start a broker-type update: the cluster enters `UPDATING` with the
+    /// returned operation as its active one, and every broker moves to
+    /// `instance_type` when [`Self::settle`] finds the operation due — the
+    /// acceptance the real service gives an `UpdateBrokerType` call, which
+    /// reports the new instance type and the new cluster version only once that
+    /// operation finishes.
+    pub fn begin_broker_type_update(&mut self, now: SystemTime, instance_type: String) -> String {
+        self.begin_update(now, ClusterChange::BrokerType { instance_type })
     }
 
     /// Start a connectivity update: the cluster enters `UPDATING` with the
@@ -2740,6 +2828,12 @@ impl Cluster {
                 }
             }
             ClusterChange::Storage(change) => self.apply_storage_change(change),
+            ClusterChange::BrokerType { instance_type } => {
+                // Every broker of the cluster moves to the one type the update
+                // named, which is what `BrokerNodeGroupInfo$InstanceType` is: the
+                // type of the group's nodes, not of one node.
+                self.broker_node_group_info.instance_type = instance_type;
+            }
         }
     }
 
@@ -3053,6 +3147,18 @@ fn storage_cluster_info(
             volume_size_gb,
         }]),
         storage_mode: Some(storage_mode.to_string()),
+        ..MutableClusterInfo::default()
+    }
+}
+
+/// The broker type a cluster operation reports, as `MutableClusterInfo`.
+///
+/// `InstanceType` is the only member a broker-type update touches, so it is the
+/// only one set: an operation describes the attributes it changes, not the whole
+/// cluster — the same rule [`storage_cluster_info`] follows.
+fn broker_type_cluster_info(instance_type: &str) -> MutableClusterInfo {
+    MutableClusterInfo {
+        instance_type: Some(instance_type.to_string()),
         ..MutableClusterInfo::default()
     }
 }
@@ -3450,4 +3556,38 @@ pub fn topic_name_error(name: &str) -> Option<String> {
         ));
     }
     None
+}
+
+/// Whether `value` could be an Amazon MSK broker type.
+///
+/// Two conditions, both from what the model says such a value is:
+///
+/// * its length is within [`INSTANCE_TYPE_MIN_LEN`]..=[`INSTANCE_TYPE_MAX_LEN`],
+///   the `length` trait on the member that STORES it
+///   (`BrokerNodeGroupInfo$InstanceType`), which an update's own
+///   `TargetInstanceType` (a plain `__string`) does not carry; and
+/// * it has the `<prefix>.<family>.<size>` form every MSK broker type takes —
+///   `kafka.m5.large` … `kafka.m5.24xlarge` as `BrokerNodeGroupInfo$InstanceType`'s
+///   documentation lists them, and the families AWS added after that prose
+///   (`kafka.m7g.*`, `express.m7g.*`) alike.
+///
+/// The FORM is checked rather than the model's prose list, which no longer
+/// enumerates every type the service accepts; a value that cannot be a broker
+/// type at all is refused with `BadRequestException`.
+pub fn is_broker_instance_type(value: &str) -> bool {
+    let length = value.chars().count();
+    if !(INSTANCE_TYPE_MIN_LEN..=INSTANCE_TYPE_MAX_LEN).contains(&length) {
+        return false;
+    }
+    let mut segments = value.split('.');
+    matches!(
+        (
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next()
+        ),
+        (Some(prefix), Some(family), Some(size), None)
+            if !prefix.is_empty() && !family.is_empty() && !size.is_empty()
+    )
 }
