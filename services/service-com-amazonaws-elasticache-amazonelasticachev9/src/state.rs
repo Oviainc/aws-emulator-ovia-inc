@@ -14,10 +14,15 @@
 //! `CreateSnapshot` mints one from a stored cluster and `DescribeSnapshots`
 //! reports it, so [`SnapshotRecord`] below is the one copy both read.
 //!
-//! Beside those customer-created resources sits the one catalog this service
+//! Beside those customer-created resources sit the two catalogs this service
 //! publishes rather than mints: the service updates AWS releases for its cache
-//! engines. No operation creates one (the API has no such call), so the store
-//! starts out holding the catalog and `DescribeServiceUpdates` reports it.
+//! engines, and the cache engines and versions themselves. No operation creates
+//! either (the API has no such call), so the store starts out holding them and
+//! `DescribeServiceUpdates` / `DescribeCacheEngineVersions` report them. The
+//! engine-version catalog is also the one statement of which version is the
+//! newest of each engine and which parameter group family a version belongs to,
+//! so `CreateCacheCluster`'s defaults are read off it rather than from a second
+//! list.
 //!
 //! Everything else in this service (replication groups, users, parameter
 //! groups, migrations, update actions) is still a scaffolded 501 and owns its
@@ -35,12 +40,11 @@ use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    AvailabilityZone, CacheCluster, CacheNode, CacheParameterGroup, CacheParameterGroupStatus,
-    CacheSubnetGroup, CacheUsageLimits, DestinationDetails, Endpoint, LogDeliveryConfiguration,
-    LogDeliveryConfigurationRequest, NodeGroupConfiguration, NodeSnapshot,
+    AvailabilityZone, CacheCluster, CacheEngineVersion, CacheNode, CacheParameterGroup,
+    CacheParameterGroupStatus, CacheSubnetGroup, CacheUsageLimits, DestinationDetails, Endpoint,
+    LogDeliveryConfiguration, LogDeliveryConfigurationRequest, NodeGroupConfiguration, NodeSnapshot,
     NotificationConfiguration, PendingModifiedValues, RecurringCharge, ReservedCacheNodesOffering,
-    ScaleConfig, SecurityGroupMembership, ServerlessCache,
-    ServiceUpdate, Snapshot, Subnet, Tag,
+    ScaleConfig, SecurityGroupMembership, ServerlessCache, ServiceUpdate, Snapshot, Subnet, Tag,
 };
 
 /// The region a request is treated as having been made in when its SigV4
@@ -310,17 +314,19 @@ pub const MULTIPLE_AVAILABILITY_ZONES: &str = "Multiple";
 /// `single-az | cross-az`). `cross-az` is what spreads NEW nodes over zones.
 pub const AZ_MODE_CROSS: &str = "cross-az";
 
-/// The engine version a cluster runs when `CreateCacheCluster` names none.
+/// The engine version a cluster runs when `CreateCacheCluster` names none: the
+/// newest version this service publishes for that engine.
 ///
-/// `DescribeCacheEngineVersions` — the operation that publishes the supported
-/// set — is still a scaffolded 501, so these constants are the emulator's single
-/// statement of what the current version of each engine is.
+/// Read out of the ONE catalog `DescribeCacheEngineVersions` reports
+/// ([`CACHE_ENGINE_VERSIONS`]) rather than from a second list beside it, so a
+/// cluster is never created on a version the service does not say it supports.
+/// An engine the catalog publishes nothing for falls back to
+/// [`DEFAULT_ENGINE`]'s newest version, which is unreachable for the engines in
+/// [`ENGINES`] — the only ones a request gets past [`normalize_engine`] with.
 pub fn default_engine_version(engine: &str) -> &'static str {
-    match engine {
-        "memcached" => "1.6.22",
-        "valkey" => "8.0",
-        _ => "7.1",
-    }
+    latest_published_version(engine)
+        .or_else(|| latest_published_version(DEFAULT_ENGINE))
+        .unwrap_or_default()
 }
 
 /// The port a cluster's nodes listen on when `CreateCacheCluster` names none:
@@ -373,6 +379,9 @@ pub const DEFAULT_PARAMETER_GROUP_PREFIX: &str = "default.";
 /// least: `<major>.<minor>` (Memcached 1.6.22 is `memcached1.6`), then
 /// `<major>.x` (Redis OSS 6.2 is `redis6.x`), then `<major>` (Redis OSS 7.1 is
 /// `redis7`, Valkey 8.0 is `valkey8`).
+///
+/// This is also the one statement of which family a version in the published
+/// engine-version catalog reports — see [`published_cache_engine_versions`].
 pub fn parameter_group_family(engine: &str, engine_version: &str) -> Option<&'static str> {
     let mut parts = engine_version.split('.');
     let major = parts.next().unwrap_or_default();
@@ -1541,6 +1550,188 @@ impl CacheSubnetGroupRecord {
     }
 }
 
+/// One row of the cache-engine-version catalog this emulator publishes: an
+/// engine and one version of it.
+///
+/// The row carries NO parameter group family: which family a version belongs to
+/// is already stated once, by [`parameter_group_family`], and the catalog reads
+/// it from there so the family a version reports and the default group a cluster
+/// on that version joins cannot disagree.
+#[derive(Debug, Clone, Copy)]
+pub struct PublishedEngineVersion {
+    /// One of [`ENGINES`] — "the name of the cache engine"
+    /// (`CacheEngineVersion$Engine`).
+    pub engine: &'static str,
+    /// "The version number of the cache engine"
+    /// (`CacheEngineVersion$EngineVersion`).
+    pub engine_version: &'static str,
+}
+
+/// One catalog row, so the table below reads as a table.
+const fn engine_version_row(
+    engine: &'static str,
+    engine_version: &'static str,
+) -> PublishedEngineVersion {
+    PublishedEngineVersion {
+        engine,
+        engine_version,
+    }
+}
+
+/// The cache engines and versions this emulator publishes.
+///
+/// AWS publishes this catalog itself — the API has no operation that adds a
+/// version — so the store holds it from the moment it comes up and
+/// `DescribeCacheEngineVersions` reports it. Every row's version belongs to one
+/// of the published [`PARAMETER_GROUP_FAMILIES`], which is where its
+/// `CacheParameterGroupFamily` comes from.
+///
+/// The version numbers themselves are this emulator's published catalog rather
+/// than a claim about what any one AWS region offers today; what the rest of the
+/// service relies on is the SHAPE of it — several version lines per engine,
+/// several versions per line, at least one version per published family, and a
+/// newest version per engine, which is the one [`default_engine_version`] hands
+/// a cluster that names none.
+pub const CACHE_ENGINE_VERSIONS: [PublishedEngineVersion; 33] = [
+    engine_version_row("memcached", "1.4.5"),
+    // The version `EngineVersion`'s own documentation uses as its example.
+    engine_version_row("memcached", "1.4.14"),
+    engine_version_row("memcached", "1.4.24"),
+    engine_version_row("memcached", "1.4.33"),
+    engine_version_row("memcached", "1.4.34"),
+    engine_version_row("memcached", "1.5.10"),
+    engine_version_row("memcached", "1.5.16"),
+    engine_version_row("memcached", "1.6.6"),
+    engine_version_row("memcached", "1.6.12"),
+    engine_version_row("memcached", "1.6.17"),
+    engine_version_row("memcached", "1.6.22"),
+    engine_version_row("redis", "2.6.13"),
+    engine_version_row("redis", "2.8.6"),
+    engine_version_row("redis", "2.8.19"),
+    engine_version_row("redis", "2.8.22"),
+    engine_version_row("redis", "2.8.23"),
+    engine_version_row("redis", "2.8.24"),
+    engine_version_row("redis", "3.2.4"),
+    engine_version_row("redis", "3.2.6"),
+    engine_version_row("redis", "3.2.10"),
+    engine_version_row("redis", "4.0.10"),
+    engine_version_row("redis", "5.0.0"),
+    engine_version_row("redis", "5.0.3"),
+    engine_version_row("redis", "5.0.4"),
+    engine_version_row("redis", "5.0.5"),
+    engine_version_row("redis", "5.0.6"),
+    engine_version_row("redis", "6.0.5"),
+    engine_version_row("redis", "6.2.5"),
+    engine_version_row("redis", "6.2.6"),
+    engine_version_row("redis", "7.0.7"),
+    engine_version_row("redis", "7.1"),
+    engine_version_row("valkey", "7.2"),
+    engine_version_row("valkey", "8.0"),
+];
+
+/// How a published version's engine is described
+/// (`CacheEngineVersion$CacheEngineDescription`: "the description of the cache
+/// engine").
+///
+/// The three names the model itself uses for the engines, from
+/// `CreateCacheCluster`'s own documentation: "All nodes in the cluster run the
+/// same protocol-compliant cache engine software, either Memcached, Valkey or
+/// Redis OSS."
+pub fn engine_description(engine: &str) -> &'static str {
+    match engine {
+        "memcached" => "Memcached",
+        "valkey" => "Valkey",
+        _ => "Redis OSS",
+    }
+}
+
+/// `version` with every numeric component zero-padded to a fixed width, so
+/// comparing two of these byte-wise orders them the way version numbers compare
+/// — `1.6.22` AFTER `1.6.6`, which the raw strings get backwards.
+///
+/// Four digits is the width: no cache engine has ever carried a version
+/// component anywhere near 10000, and a component that wide would be the only
+/// thing this ordering got wrong.
+pub fn version_sort_key(version: &str) -> String {
+    version
+        .split('.')
+        .map(|part| match part.parse::<u32>() {
+            Ok(number) => format!("{number:04}"),
+            // A component that is not a number (the `x` of an open `6.x` line)
+            // sorts after every numbered one: `~` is above the digits in ASCII.
+            Err(_) => format!("~{part}"),
+        })
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+/// The catalog key of `engine_version` of `engine`.
+///
+/// The engine name and then the version's sort key, so the map is ordered by
+/// engine and, within an engine, by version from oldest to newest. That total
+/// order is what the `Marker` indexes into, and its last row per engine is the
+/// newest version of that engine.
+pub fn engine_version_key(engine: &str, engine_version: &str) -> String {
+    format!("{engine}|{}", version_sort_key(engine_version))
+}
+
+/// True when `version` is a version the filter value `filter` asks for: the same
+/// version, or one in the version line it names (`6.2` names `6.2.5` and
+/// `6.2.6`).
+///
+/// `EngineVersion` is "the cache engine version to return" with the example
+/// `1.4.14`, and `DefaultOnly` speaks of "the specified engine or engine and
+/// major version combination" — so a value that names only the leading
+/// components of a version names that whole line.
+pub fn version_matches(filter: &str, version: &str) -> bool {
+    version == filter
+        || version
+            .strip_prefix(filter)
+            .is_some_and(|rest| rest.starts_with('.'))
+}
+
+/// The highest version [`CACHE_ENGINE_VERSIONS`] publishes for `engine`, or
+/// `None` when it publishes none for it.
+fn latest_published_version(engine: &str) -> Option<&'static str> {
+    CACHE_ENGINE_VERSIONS
+        .iter()
+        .filter(|row| row.engine == engine)
+        .max_by_key(|row| version_sort_key(row.engine_version))
+        .map(|row| row.engine_version)
+}
+
+/// One published cache engine version, as this emulator holds it.
+#[derive(Debug, Clone)]
+pub struct CacheEngineVersionRecord {
+    /// See [`PublishedEngineVersion::engine`].
+    pub engine: String,
+    /// See [`PublishedEngineVersion::engine_version`].
+    pub engine_version: String,
+    /// The family the version belongs to, from [`parameter_group_family`] —
+    /// absent for a version no published family covers, which is how
+    /// `CacheEngineVersion$CacheParameterGroupFamily` reports "none" rather than
+    /// inventing a family name.
+    pub cache_parameter_group_family: Option<String>,
+    /// See [`engine_description`].
+    pub cache_engine_description: String,
+    /// "The description of the cache engine version"
+    /// (`CacheEngineVersion$CacheEngineVersionDescription`).
+    pub cache_engine_version_description: String,
+}
+
+impl CacheEngineVersionRecord {
+    /// This record as the modelled `CacheEngineVersion`.
+    pub fn to_modeled(&self) -> CacheEngineVersion {
+        CacheEngineVersion {
+            engine: Some(self.engine.clone()),
+            engine_version: Some(self.engine_version.clone()),
+            cache_parameter_group_family: self.cache_parameter_group_family.clone(),
+            cache_engine_description: Some(self.cache_engine_description.clone()),
+            cache_engine_version_description: Some(self.cache_engine_version_description.clone()),
+        }
+    }
+}
+
 /// `ServerlessCache$Status`'s values this slice writes and reads: "The current
 /// status of the serverless cache. The allowed values are CREATING, AVAILABLE,
 /// DELETING, CREATE-FAILED and MODIFYING." The member is a plain `String`
@@ -1956,6 +2147,38 @@ impl NodeSnapshotRecord {
             )),
         }
     }
+}
+
+/// The published cache-engine-version catalog, keyed by
+/// [`engine_version_key`].
+///
+/// A `BTreeMap` is what gives `DescribeCacheEngineVersions` the stable total
+/// order its `Marker` indexes into, and the per-engine order its `DefaultOnly`
+/// reads the newest version off.
+pub fn published_cache_engine_versions() -> BTreeMap<String, CacheEngineVersionRecord> {
+    CACHE_ENGINE_VERSIONS
+        .iter()
+        .map(|row| {
+            let description = engine_description(row.engine);
+            (
+                engine_version_key(row.engine, row.engine_version),
+                CacheEngineVersionRecord {
+                    engine: row.engine.to_string(),
+                    engine_version: row.engine_version.to_string(),
+                    cache_parameter_group_family: parameter_group_family(
+                        row.engine,
+                        row.engine_version,
+                    )
+                    .map(str::to_string),
+                    cache_engine_description: description.to_string(),
+                    cache_engine_version_description: format!(
+                        "{description} version {}",
+                        row.engine_version
+                    ),
+                },
+            )
+        })
+        .collect()
 }
 
 /// One snapshot, as this emulator persists it: the source cluster's
@@ -2410,6 +2633,11 @@ pub struct ComAmazonawsElasticacheAmazonelasticachev9State {
     /// rather than an account creating them, so the store holds the catalog
     /// from the moment it comes up — see [`published_service_updates`].
     pub service_updates: BTreeMap<String, ServiceUpdateRecord>,
+    /// The cache engine versions this emulator publishes, keyed by
+    /// [`engine_version_key`]. AWS publishes these rather than an account
+    /// creating them, so the store holds the catalog from the moment it comes
+    /// up — see [`published_cache_engine_versions`].
+    pub cache_engine_versions: BTreeMap<String, CacheEngineVersionRecord>,
     /// Every stored serverless cache, keyed by its (lowercased)
     /// `ServerlessCacheName`, ordered for the same reason.
     pub serverless_caches: BTreeMap<String, ServerlessCacheRecord>,
@@ -2445,6 +2673,7 @@ impl Default for ComAmazonawsElasticacheAmazonelasticachev9State {
             cache_parameter_groups: default_parameter_groups(),
             snapshots: BTreeMap::new(),
             service_updates: published_service_updates(SystemTime::now()),
+            cache_engine_versions: published_cache_engine_versions(),
             dns_token_seq: 0,
             vpc_seq: 0,
             subnet_seq: 0,

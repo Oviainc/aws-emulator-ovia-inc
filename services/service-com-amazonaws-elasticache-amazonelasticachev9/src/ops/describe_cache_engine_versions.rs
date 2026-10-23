@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeCacheEngineVersions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeCacheEngineVersions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeCacheEngineVersions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the cache engines and versions this service publishes — this is the ONLY
+//! file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -76,6 +69,15 @@
 //! * `CacheEngineVersions` (CacheEngineVersionList) — A list of cache engine version details.
 //!   Each element in the list contains detailed information about one cache engine version.
 //! * `Marker` (String) — Provides an identifier to allow retrieval of paginated results.
+//!
+//! ## Errors
+//!
+//! * `InvalidParameterValueException` (HTTP 400, awsQuery code `InvalidParameterValue`) —
+//!   widened in through `extra_errors` (see below): the model lists NO error for this
+//!   operation, yet `MaxRecords` carries documented bounds and `Marker` is a token only
+//!   this service mints, so a value it cannot serve needs a refusal to answer with.
+
+use std::collections::BTreeMap;
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -91,9 +93,23 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-elasticache-amazonelast
 // here — hence the `DescribeCacheEngineVersionsError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.elasticache#DescribeCacheEngineVersions")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.elasticache#DescribeCacheEngineVersions",
+    extra_errors = ["InvalidParameterValueException"]
+)]
 #[derive(Debug)]
 pub enum DescribeCacheEngineVersionsErrorModeled {
+    // The model declares NO error for this operation
+    // (`smithy_query(query="operation", operation="DescribeCacheEngineVersions")`:
+    // `errors: []`), which is a gap in the model rather than a claim that nothing
+    // can be refused: `MaxRecords` documents "minimum 20; maximum 100" and `Marker`
+    // is "an optional marker returned from a prior request".
+    // `InvalidParameterValueException` — the shape this SERVICE models for exactly
+    // that, and the one every sibling describe (`DescribeCacheClusters`,
+    // `DescribeServiceUpdates`) answers with — is widened in through `extra_errors`,
+    // so this handler refuses a value it cannot serve with the same 400
+    // `InvalidParameterValue` a client already handles.
+    InvalidParameterValueException(InvalidParameterValueException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -147,18 +163,130 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeCacheEngineVersions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeCacheEngineVersionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeCacheEngineVersions"))
+        // A pure read: "returns a list of the available cache engines and their
+        // versions". The catalog is published rather than created and carries
+        // nothing the clock makes due, so this handler writes nothing — a later
+        // caller sees exactly what it would have seen had this call never
+        // happened.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+
+        // `MaxRecords` documents "Default: 100. Constraints: minimum 20; maximum
+        // 100." but carries no modelled `@range`, so the boundary validator
+        // passes anything and the bounds are enforced here.
+        let page_size =
+            crate::state::page_size(input.max_records).map_err(invalid_parameter_value)?;
+        // A `Marker` only ever travels back unchanged, so one this service did
+        // not mint is a bad parameter value rather than an empty page.
+        let resume_from = match input.marker.as_deref() {
+            Some(marker) => match crate::state::decode_marker(marker) {
+                Some(key) => Some(key),
+                None => {
+                    return Err(invalid_parameter_value(format!(
+                        "Invalid value {marker} for Marker."
+                    )))
+                }
+            },
+            None => None,
+        };
+
+        let store = state.lock();
+
+        // The three filters select a subset of the published catalog. Each is a
+        // free-form string with no modelled constraint, and this operation
+        // reports a published catalog rather than an account's resources, so a
+        // filter value nothing matches is an empty page — not a not-found.
+        let mut selected: Vec<(&String, &crate::state::CacheEngineVersionRecord)> = store
+            .cache_engine_versions
+            .iter()
+            .filter(|(_, version)| {
+                input
+                    .engine
+                    .as_deref()
+                    // The stored engine name is lowercase, the way
+                    // `CreateCacheCluster` stores it, so the comparison ignores
+                    // case rather than demanding the stored spelling.
+                    .is_none_or(|engine| version.engine.eq_ignore_ascii_case(engine))
+                    && input
+                        .cache_parameter_group_family
+                        .as_deref()
+                        .is_none_or(|family| {
+                            version
+                                .cache_parameter_group_family
+                                .as_deref()
+                                .is_some_and(|published| published.eq_ignore_ascii_case(family))
+                        })
+                    && input.engine_version.as_deref().is_none_or(|wanted| {
+                        crate::state::version_matches(wanted, &version.engine_version)
+                    })
+            })
+            .collect();
+
+        // `DefaultOnly`: "if true, specifies that only the default version of
+        // the specified engine or engine and major version combination is to be
+        // returned". The combination is the engine and its version LINE, which is
+        // exactly what a `CacheParameterGroupFamily` names
+        // (`crate::state::parameter_group_family`), so the default version is the
+        // newest version published in each line — one row per line when the
+        // request narrows to none, and the single row of the line when a family
+        // or an `EngineVersion` narrowed to one. A version no published family
+        // covers is grouped under its engine alone, which is the coarsest line it
+        // has. The catalog's key is the engine and the version's ZERO-PADDED sort
+        // key (`crate::state::engine_version_key`), so its order is version order
+        // rather than string order and the last row seen in a group really is its
+        // newest version; grouping through a map keyed by the group keeps the
+        // answer in the catalog's own order.
+        if input.default_only.unwrap_or(false) {
+            let mut newest_per_line: BTreeMap<
+                (&str, Option<&str>),
+                (&String, &crate::state::CacheEngineVersionRecord),
+            > = BTreeMap::new();
+            for (key, version) in selected {
+                let line = (
+                    version.engine.as_str(),
+                    version.cache_parameter_group_family.as_deref(),
+                );
+                newest_per_line.insert(line, (key, version));
+            }
+            selected = newest_per_line.into_values().collect();
+            // The group key orders by engine then family name, which is not the
+            // catalog's version order, so the page is put back into it.
+            selected.sort_by_key(|(key, _)| *key);
+        }
+
+        let mut page: Vec<CacheEngineVersion> = Vec::new();
+        let mut marker = None;
+        for (key, version) in selected
+            .into_iter()
+            .filter(|(key, _)| resume_from.as_ref().is_none_or(|from| *key >= from))
+        {
+            if page.len() == page_size {
+                // More records exist than `MaxRecords`, so the response carries
+                // the marker the next call resumes from — the key of the first
+                // record this page did not return.
+                marker = Some(crate::state::encode_marker(key));
+                break;
+            }
+            page.push(version.to_modeled());
+        }
+
+        Ok(DescribeCacheEngineVersionsOutput {
+            marker,
+            cache_engine_versions: Some(page),
+        })
     }
+}
+
+/// `message` as this operation's `InvalidParameterValueException`.
+fn invalid_parameter_value(message: String) -> DescribeCacheEngineVersionsError {
+    DescribeCacheEngineVersionsErrorModeled::InvalidParameterValueException(
+        InvalidParameterValueException {
+            message: Some(message),
+        },
+    )
+    .into()
 }
