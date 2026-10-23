@@ -24,8 +24,9 @@
 //!   correctly. The default returns `None`, so every request resolves through the
 //!   generated routing table. Return `Some(op)` to route one yourself.
 //! - `override_refusal` — how this service words a request the framework refused
-//!   before any handler ran. The default returns `None`, keeping the framework's
-//!   wording. See the inline note on that method for how to reword.
+//!   before any handler ran. THIS SERVICE REWORDS IT: a request body whose member
+//!   violates a modelled VALUE constraint is MGN's front-end `BadRequestException`,
+//!   not the modelled `ValidationException`. See the inline note on that method.
 //! - `override_routing_error` — how this service words a request that reached it
 //!   but named no modeled operation. The default returns `None`, so the entry
 //!   renders the protocol-correct default (query -> 400 InvalidAction, awsJson ->
@@ -41,9 +42,55 @@
 //! do not write it; editing the entry would let this file drift from the model.
 
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, ErasedOperation, Refusal, Refused, Service, Violation, ViolationKind,
 };
 use std::sync::Arc;
+
+/// The error code MGN's REST front end answers a request body that fails the model's
+/// member value constraints with.
+///
+/// `BadRequestException` is NOT a shape in this service's model
+/// (`smithy_query(query="shape",shape="BadRequestException")` finds nothing): it is the
+/// code the REST front end in front of every MGN operation emits for a body that fails
+/// model validation, before any operation's own modelled errors are reachable. It is
+/// discriminating — a client branches on it to tell "this request is malformed" from the
+/// modelled 400s an operation raises itself (`ValidationException` for a rule the handler
+/// checks, `UninitializedAccountException` for account state) — so the refusal the
+/// framework makes ahead of the handler must carry it rather than `ValidationException`.
+const BAD_REQUEST_EXCEPTION: &str = "BadRequestException";
+
+/// The message that front end states a body-validation failure with.
+///
+/// The front end validates the body against the model and reports no member path and no
+/// submitted value, so the sentence is a constant rather than a rendering of the
+/// violations: a caller is told the body is invalid, not which member failed. (The
+/// requirement this pins is the 400 status and the `BadRequestException` code; this
+/// wording is the one the recordings carry.)
+const INVALID_REQUEST_BODY: &str = "Invalid request body";
+
+/// Whether `violation` is a VALUE that failed a constraint the model declares on its
+/// member, as opposed to a member that was absent altogether.
+///
+/// Those are two different refusals: a value outside `@length` / `@pattern` / `@range` /
+/// an enum's value set / `@uniqueItems` is a body the front end's model validation
+/// rejects, whereas an absent `@required` member keeps the framework's modelled
+/// `ValidationException` wording — nothing recorded says MGN answers absence with the
+/// front-end code, so it is left alone.
+///
+/// [`ViolationKind`] is `#[non_exhaustive]`, so a class added upstream answers `false`
+/// and keeps the framework's wording rather than being swept into the front-end code.
+fn is_value_constraint(violation: &Violation) -> bool {
+    matches!(
+        violation.kind,
+        ViolationKind::MinLength(_)
+            | ViolationKind::MaxLength(_)
+            | ViolationKind::MinValue(_)
+            | ViolationKind::MaxValue(_)
+            | ViolationKind::Pattern(_)
+            | ViolationKind::EnumValue(_)
+            | ViolationKind::UniqueItems
+    )
+}
 
 /// The `com-amazonaws-mgn-applicationmigrationservice` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -98,15 +145,31 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
         // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // service reword it.
+        //
+        // Every MGN operation sits behind a REST front end that validates the request
+        // body against the model before the operation is reached: a member whose value
+        // violates a modelled constraint — at any depth, in any operation — is refused
+        // there with HTTP 400 and the code `BAD_REQUEST_EXCEPTION`, which is not one of
+        // the operation's modelled errors. Both the code and the message are replaced
+        // together, because that code is what a client branches on to separate a
+        // malformed body from the modelled 400s a handler raises; the status (400)
+        // belongs to the protocol and is the same either way.
+        //
+        // Everything else keeps the framework's wording: an absent `@required` member
+        // (see [`is_value_constraint`]) and an authentication refusal, which is not an
+        // input-constraint failure at all.
+        match refusal {
+            Refusal::Invalid(violations)
+                if !violations.is_empty() && violations.iter().all(is_value_constraint) =>
+            {
+                Some(Refused {
+                    code: BAD_REQUEST_EXCEPTION.to_string(),
+                    message: INVALID_REQUEST_BODY.to_string(),
+                })
+            }
+            _ => None,
+        }
     }
 
     fn override_routing_error(

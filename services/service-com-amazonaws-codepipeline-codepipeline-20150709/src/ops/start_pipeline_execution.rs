@@ -158,91 +158,190 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let state = crate::state::require_state(&*self.engine)?;
-        let mut state = state.lock();
+        let region = crate::state::request_region(&ctx.parts().headers);
+        let execution_id = {
+            let mut state = state.lock();
 
-        let pipeline = state.pipelines.get(&input.name).ok_or_else(|| {
-            StartPipelineExecutionError::from(
-                StartPipelineExecutionErrorModeled::PipelineNotFoundException(
-                    PipelineNotFoundException {
-                        message: Some(format!("pipeline {} does not exist", input.name)),
-                    },
-                ),
-            )
-        })?;
+            let pipeline = state.pipelines.get(&input.name).ok_or_else(|| {
+                StartPipelineExecutionError::from(
+                    StartPipelineExecutionErrorModeled::PipelineNotFoundException(
+                        PipelineNotFoundException {
+                            message: Some(crate::state::pipeline_not_found_message(&input.name)),
+                        },
+                    ),
+                )
+            })?;
 
-        // `@idempotencyToken`: the same token for the same pipeline names the same
-        // execution, so repeating the request returns the id it already minted
-        // instead of starting another execution.
-        if let Some(token) = input.client_request_token.as_deref() {
-            if let Some(existing) = state
-                .idempotency
-                .get(&(input.name.clone(), token.to_string()))
-            {
-                return Ok(StartPipelineExecutionOutput {
-                    pipeline_execution_id: Some(existing.clone()),
-                });
+            // `@idempotencyToken`: the same token for the same pipeline names the same
+            // execution, so repeating the request returns the id it already minted
+            // instead of starting another execution.
+            if let Some(token) = input.client_request_token.as_deref() {
+                if let Some(existing) = state
+                    .idempotency
+                    .get(&(input.name.clone(), token.to_string()))
+                {
+                    return Ok(StartPipelineExecutionOutput {
+                        pipeline_execution_id: Some(existing.clone()),
+                    });
+                }
             }
-        }
 
-        // Resolve the execution's variables against the declaration — the same rule
-        // whichever call starts an execution, so it lives in
-        // `crate::state::resolve_execution_variables`. A variable that cannot be
-        // resolved is refused with the modelled `ValidationException` naming it.
-        let variables = crate::state::resolve_execution_variables(
-            &pipeline.declaration,
-            &input.variables.unwrap_or_default(),
-        )
-        .map_err(|message| {
-            StartPipelineExecutionError::from(
-                StartPipelineExecutionErrorModeled::ValidationException(ValidationException {
-                    message: Some(message),
-                }),
+            // Resolve the execution's variables against the declaration — the same rule
+            // whichever call starts an execution, so it lives in
+            // `crate::state::resolve_execution_variables`. A variable that cannot be
+            // resolved is refused with the modelled `ValidationException` naming it.
+            let variables = crate::state::resolve_execution_variables(
+                &pipeline.declaration,
+                &input.variables.unwrap_or_default(),
             )
-        })?;
+            .map_err(|message| {
+                StartPipelineExecutionError::from(
+                    StartPipelineExecutionErrorModeled::ValidationException(ValidationException {
+                        message: Some(message),
+                    }),
+                )
+            })?;
 
-        let now = ::std::time::SystemTime::now();
-        let record = crate::state::PipelineExecutionRecord {
-            // Minted against the store, so the id this call reports is the one the
-            // execution is filed under and no other execution can carry it.
-            pipeline_execution_id: state.new_execution_id(),
-            pipeline_name: input.name.clone(),
-            pipeline_version: pipeline.version,
-            status: crate::state::STATUS_IN_PROGRESS.to_string(),
-            status_summary: None,
-            start_time: now,
-            last_update_time: now,
-            trigger: ExecutionTrigger {
-                trigger_type: Some(
-                    crate::state::TRIGGER_TYPE_START_PIPELINE_EXECUTION.to_string(),
-                ),
-                // `ExecutionTrigger$triggerDetail` carries the ARN of the user who
-                // ran the command; this emulator does not resolve a caller identity,
-                // so the member is absent rather than invented.
-                trigger_detail: None,
-            },
-            execution_mode: crate::state::resolved_execution_mode(&pipeline.declaration),
-            execution_type: crate::state::EXECUTION_TYPE_STANDARD.to_string(),
-            variables,
-            source_revisions: input
-                .source_revisions
-                .unwrap_or_default()
-                .into_iter()
-                // `SourceRevisionOverride` carries a `revisionType` naming what kind
-                // of revision the value is (a commit id, an object version); the
-                // `SourceRevision` the listing reports models only the revision
-                // itself, so the override's value becomes the recorded revision id.
-                .map(|source_override| SourceRevision {
-                    action_name: source_override.action_name,
-                    revision_id: Some(source_override.revision_value),
-                    revision_summary: None,
-                    revision_url: None,
+            // The pipeline's artifact store is where every artifact this execution
+            // produces is written; a declaration with no store for this Region could
+            // not run an action at all, which is what the modelled `ValidationException`
+            // reports.
+            let Some((artifact_bucket, artifact_encryption_key)) =
+                crate::state::artifact_store(&pipeline.declaration, &region)
+            else {
+                return Err(StartPipelineExecutionErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(format!(
+                            "pipeline {} declares no artifactStore for region {region}",
+                            input.name
+                        )),
+                    },
+                )
+                .into());
+            };
+
+            let now = ::std::time::SystemTime::now();
+            let execution_mode = crate::state::resolved_execution_mode(&pipeline.declaration);
+            let stages = crate::state::plan_stages(&pipeline.declaration, now);
+            let pipeline_version = pipeline.version;
+
+            // The in-flight executions of this pipeline decide whether this start runs
+            // at once, waits, or is refused.
+            let in_flight: Vec<(String, bool)> = state
+                .executions_by_pipeline
+                .get(&input.name)
+                .map(|ids| {
+                    ids.iter()
+                        .filter_map(|id| state.executions.get(id))
+                        .filter(|record| !crate::state::is_terminal_status(&record.status))
+                        .map(|record| (record.pipeline_execution_id.clone(), record.queued))
+                        .collect()
                 })
-                .collect(),
+                .unwrap_or_default();
+
+            // The pipeline's concurrent-execution ceiling: past it the start is refused
+            // with the error the model declares for exactly this condition.
+            if in_flight.len() >= crate::state::MAX_CONCURRENT_EXECUTIONS_PER_PIPELINE {
+                return Err(
+                    StartPipelineExecutionErrorModeled::ConcurrentPipelineExecutionsLimitExceededException(
+                        ConcurrentPipelineExecutionsLimitExceededException {
+                            message: Some(format!(
+                                "pipeline {} already has {} executions in flight, which is \
+                                 the limit of concurrent executions for the pipeline",
+                                input.name,
+                                crate::state::MAX_CONCURRENT_EXECUTIONS_PER_PIPELINE
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+
+            // `PipelineDeclaration$executionMode`: in PARALLEL every execution runs on
+            // its own; QUEUED and SUPERSEDED run one at a time, and in SUPERSEDED mode
+            // the execution already waiting is superseded by this one.
+            let running = in_flight.iter().any(|(_, queued)| !queued);
+            let queued = execution_mode != "PARALLEL" && running;
+            if queued && execution_mode == crate::state::DEFAULT_EXECUTION_MODE {
+                let waiting: Vec<String> = in_flight
+                    .iter()
+                    .filter(|(_, queued)| *queued)
+                    .map(|(id, _)| id.clone())
+                    .collect();
+                for id in waiting {
+                    if let Some(record) = state.executions.get_mut(&id) {
+                        record.status = crate::state::STATUS_SUPERSEDED.to_string();
+                        record.status_summary = Some(
+                            "superseded by a later execution of the pipeline".to_string(),
+                        );
+                        record.last_update_time = now;
+                    }
+                }
+            }
+
+            let record = crate::state::PipelineExecutionRecord {
+                // Minted against the store, so the id this call reports is the one the
+                // execution is filed under and no other execution can carry it.
+                pipeline_execution_id: state.new_execution_id(),
+                pipeline_name: input.name.clone(),
+                pipeline_version,
+                status: crate::state::STATUS_IN_PROGRESS.to_string(),
+                status_summary: None,
+                start_time: now,
+                last_update_time: now,
+                trigger: ExecutionTrigger {
+                    trigger_type: Some(
+                        crate::state::TRIGGER_TYPE_START_PIPELINE_EXECUTION.to_string(),
+                    ),
+                    // `ExecutionTrigger$triggerDetail` carries the ARN of the user who
+                    // ran the command; this emulator does not resolve a caller identity,
+                    // so the member is absent rather than invented.
+                    trigger_detail: None,
+                },
+                execution_mode,
+                execution_type: crate::state::EXECUTION_TYPE_STANDARD.to_string(),
+                variables_map: variables
+                    .iter()
+                    .filter_map(|variable| {
+                        Some((
+                            format!("variables.{}", variable.name.clone()?),
+                            variable.resolved_value.clone()?,
+                        ))
+                    })
+                    .collect(),
+                variables,
+                source_revisions: input
+                    .source_revisions
+                    .unwrap_or_default()
+                    .into_iter()
+                    // `SourceRevisionOverride` carries a `revisionType` naming what kind
+                    // of revision the value is (a commit id, an object version); the
+                    // `SourceRevision` the listing reports models only the revision
+                    // itself, so the override's value becomes the recorded revision id.
+                    .map(|source_override| SourceRevision {
+                        action_name: source_override.action_name,
+                        revision_id: Some(source_override.revision_value),
+                        revision_summary: None,
+                        revision_url: None,
+                    })
+                    .collect(),
+                stages,
+                artifact_bucket,
+                artifact_encryption_key,
+                queued,
+                stop: None,
+                artifacts: ::std::collections::BTreeMap::new(),
+                manual_retry_attempts: 0,
+            };
+
+            state.record_execution(record, input.client_request_token)
         };
 
-        let execution_id = state.record_execution(record, input.client_request_token);
+        // The execution's first step is not due yet (it becomes due a span from now), so
+        // this only publishes the start; the steps the clock makes due are materialised
+        // by whichever call comes after each one.
+        crate::state::advance(&*self.engine, ctx, &input.name).await;
 
         Ok(StartPipelineExecutionOutput {
             pipeline_execution_id: Some(execution_id),

@@ -766,7 +766,8 @@ async fn a_client_token_spent_on_another_resource_still_creates_it() {
 // ---------------------------------------------------------------------------
 
 /// The limits every group below is created with, so a row that names none proves the
-/// stored structure survived the write.
+/// stored structure survived the write. Every member is named, so these ARE the group's
+/// effective limits: nothing is left for the service to default in.
 fn created_limits() -> Value {
     json!({
         "minIndexingCapacityInOCU": 2.0,
@@ -883,7 +884,10 @@ async fn a_collection_group_update_is_what_the_following_batch_get_reports() {
         };
         let expected_limits = match at(&update, "capacityLimits") {
             Value::Null => created_limits(),
-            limits => limits.clone(),
+            // One structure, so the limits the request states are the group's limits —
+            // through the same ceiling defaulting a create applies, because a group always
+            // has effective limits (the rule the `collection_group_capacity` suite owns).
+            limits => crate::collection_group_capacity::expected_capacity_limits(limits),
         };
         assert_eq!(
             at(&written, "description"),

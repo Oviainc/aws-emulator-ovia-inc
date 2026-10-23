@@ -19,12 +19,198 @@ pub struct CreatePrivateConnectionInput {
     pub tags: Option<std::collections::HashMap<String, String>>,
 }
 
-#[smithy_macros::smithy(union_for = "com.amazonaws.securityagent#PrivateConnectionMode")]
+/// The configuration for the private connection: "Specify either a service-managed or a
+/// self-managed mode" (`PrivateConnectionMode`'s own documentation).
+///
+/// Written out rather than carrying `#[smithy_macros::smithy(union_for = ...)]` for ONE
+/// reason: the wording of the refusal a request that sets NEITHER member gets. The
+/// generated codec refuses it with `union '<Shape>' had no member set`, which names an
+/// internal Smithy shape instead of the request member the caller has to fix and the
+/// alternatives it permits. Everything else below — the member schemas, their indices,
+/// the write and read arms, and the refusal of a second member — mirrors what that macro
+/// emits for this union, member for member; only [`empty_mode_message`] and
+/// [`ambiguous_mode_message`] replace its two `SerdeError::custom` texts.
+///
+/// The cost of the copy: this declaration no longer tracks the model automatically, so a
+/// model change to `PrivateConnectionMode` (a renamed, added or `@jsonName`d member) has
+/// to be carried here by hand. The seam that would avoid it is in the vendored codegen
+/// (`vendor/smithy-macros`), which is read-only here, and the service's own
+/// `override_refusal` seam cannot reach this failure either: a codec `SerdeError::custom`
+/// is not one `refusal_of` describes structurally. The structural fix is for that
+/// generator to word an empty union from the containing member, at which point this
+/// block goes back to the attribute — the same vendored gap
+/// `issues/things-that-do-not-work/20261022T132818Z-mediaconnect-router-interface-union-payload-rejected-no-flow.md`
+/// reports from the other side.
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum PrivateConnectionMode {
     serviceManaged(ServiceManagedInput),
     selfManaged(SelfManagedInput),
+}
+
+/// The request member that targets this union.
+///
+/// `CreatePrivateConnectionInput$mode` is the ONLY member of this service's model that
+/// targets `PrivateConnectionMode`, so the refusal can name the member a caller has to
+/// fix without guessing which one it travelled in.
+const MODE_MEMBER: &str = "mode";
+
+/// The resource the union configures, as the model's own shape names it
+/// (`com.amazonaws.securityagent#PrivateConnection`); the refusal spells it as words.
+const MODE_SUBJECT_SHAPE: &str = "PrivateConnection";
+
+impl PrivateConnectionMode {
+    const M_SERVICE_MANAGED: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.securityagent#PrivateConnectionMode$serviceManaged",
+                "com.amazonaws.securityagent",
+                "serviceManaged",
+            ),
+            ::aws_smithy_schema::ShapeType::Structure,
+            "serviceManaged",
+            0,
+        );
+
+    const M_SELF_MANAGED: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.securityagent#PrivateConnectionMode$selfManaged",
+                "com.amazonaws.securityagent",
+                "selfManaged",
+            ),
+            ::aws_smithy_schema::ShapeType::Structure,
+            "selfManaged",
+            1,
+        );
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.securityagent#PrivateConnectionMode",
+            "com.amazonaws.securityagent",
+            "PrivateConnectionMode",
+        ),
+        ::aws_smithy_schema::ShapeType::Union,
+        &[&Self::M_SERVICE_MANAGED, &Self::M_SELF_MANAGED],
+    );
+}
+
+pub static PRIVATE_CONNECTION_MODE_SCHEMA: &::aws_smithy_schema::Schema =
+    &PrivateConnectionMode::SCHEMA;
+
+/// Why a request whose `mode` carried no member at all is refused.
+///
+/// A validation message is BUILT FROM THE REQUEST: it names the offending member and the
+/// constraint it broke. Both halves come from the model here — the member is the one that
+/// targets this union ([`MODE_MEMBER`]), and the alternatives are the union's own member
+/// names, read off [`PrivateConnectionMode::SCHEMA`] in declaration order, so a member
+/// the model adds appears in the message without a second list to maintain.
+pub fn empty_mode_message() -> String {
+    format!(
+        "{} {MODE_MEMBER} must specify either {}",
+        shape_name_as_words(MODE_SUBJECT_SHAPE),
+        joined_alternatives()
+    )
+}
+
+/// Why a request whose `mode` carried MORE than one member is refused: the same member
+/// and the same alternatives, of which a union admits exactly one.
+pub fn ambiguous_mode_message() -> String {
+    format!(
+        "{} {MODE_MEMBER} must specify only one of {}",
+        shape_name_as_words(MODE_SUBJECT_SHAPE),
+        joined_alternatives()
+    )
+}
+
+/// The alternatives this union permits, as a message lists them: `a or b`, and
+/// `a, b or c` for more than two.
+///
+/// The names are not written out here: they are read off this union's own
+/// [`PRIVATE_CONNECTION_MODE_SCHEMA`] in declaration order, so the message and the
+/// schema the codec below reads and writes cannot disagree about which members exist.
+/// That schema is hand-written (see the note on [`PrivateConnectionMode`]), so it is
+/// the thing to keep in step with the model — exactly as the generated codec it
+/// replaces would be regenerated — and `tests/all/private_connection_lifecycle.rs`
+/// pins the refusal against both member names.
+fn joined_alternatives() -> String {
+    let alternatives: Vec<&str> = PRIVATE_CONNECTION_MODE_SCHEMA
+        .members()
+        .iter()
+        .filter_map(|member| member.member_name())
+        .collect();
+    match alternatives.as_slice() {
+        [] => String::new(),
+        [only] => (*only).to_string(),
+        [rest @ .., last] => format!("{} or {last}", rest.join(", ")),
+    }
+}
+
+/// A PascalCase shape name spelled as words (`PrivateConnection` -> `Private
+/// Connection`), which is how a service's prose names the resource a shape models.
+fn shape_name_as_words(shape_name: &str) -> String {
+    let mut words = String::with_capacity(shape_name.len() + 2);
+    for (index, character) in shape_name.char_indices() {
+        if index > 0 && character.is_uppercase() {
+            words.push(' ');
+        }
+        words.push(character);
+    }
+    words
+}
+
+impl ::aws_smithy_schema::serde::SerializableStruct for PrivateConnectionMode {
+    fn serialize_members(
+        &self,
+        serializer: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        match self {
+            Self::serviceManaged(value) => {
+                serializer.write_struct(&Self::M_SERVICE_MANAGED, value)?;
+            }
+            Self::selfManaged(value) => {
+                serializer.write_struct(&Self::M_SELF_MANAGED, value)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl ::aws_smithy_schema_server::DeserializableStruct for PrivateConnectionMode {
+    fn deserialize(
+        deserializer: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+    ) -> ::std::result::Result<Self, ::aws_smithy_schema::serde::SerdeError> {
+        let mut out: ::std::option::Option<Self> = ::std::option::Option::None;
+        deserializer.read_struct(&Self::SCHEMA, &mut |member, deserializer| {
+            match member.member_index() {
+                // A union carries EXACTLY one member, so a second one on the wire is
+                // ambiguous and is refused rather than overwritten: overwriting would
+                // answer 200 for a value the caller did not send.
+                ::std::option::Option::Some(0) | ::std::option::Option::Some(1)
+                    if out.is_some() =>
+                {
+                    return ::std::result::Result::Err(
+                        ::aws_smithy_schema::serde::SerdeError::custom(ambiguous_mode_message()),
+                    );
+                }
+                ::std::option::Option::Some(0) => {
+                    out = ::std::option::Option::Some(Self::serviceManaged(
+                        <ServiceManagedInput as ::aws_smithy_schema_server::DeserializableStruct>
+                            ::deserialize(deserializer)?,
+                    ));
+                }
+                ::std::option::Option::Some(1) => {
+                    out = ::std::option::Option::Some(Self::selfManaged(
+                        <SelfManagedInput as ::aws_smithy_schema_server::DeserializableStruct>
+                            ::deserialize(deserializer)?,
+                    ));
+                }
+                _ => {}
+            }
+            Ok(())
+        })?;
+        out.ok_or_else(|| ::aws_smithy_schema::serde::SerdeError::custom(empty_mode_message()))
+    }
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.securityagent#ServiceManagedInput")]

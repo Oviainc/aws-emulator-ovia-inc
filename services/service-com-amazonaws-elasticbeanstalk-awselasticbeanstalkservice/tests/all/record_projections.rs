@@ -51,7 +51,16 @@ fn published_solution_stack() -> String {
 }
 
 /// Call `action`, failing the named case unless it answered 200.
-async fn ok(emulator: &Emulator, case: &str, action: &str, params: &[(&str, &str)]) -> Answer {
+///
+/// `pub(crate)` for the same reason [`ReportedLifecycle`] is: a sibling suite
+/// driving the same preconditions reuses this one helper rather than keeping a
+/// second copy of the status assertion.
+pub(crate) async fn ok(
+    emulator: &Emulator,
+    case: &str,
+    action: &str,
+    params: &[(&str, &str)],
+) -> Answer {
     let answer = emulator.call(action, params).await;
     assert_eq!(
         answer.status, 200,
@@ -68,20 +77,24 @@ async fn ok(emulator: &Emulator, case: &str, action: &str, params: &[(&str, &str
 /// The four version-lifecycle settings a read must report, as the XML carries
 /// them: `(MaxAgeRule.Enabled, MaxAgeRule.MaxAgeInDays, MaxCountRule.Enabled,
 /// MaxCountRule.MaxCount)` plus both `DeleteSourceFromS3` flags.
+///
+/// `pub(crate)` so a sibling suite asserting the SAME projection on another
+/// operation's response reads it with this one reader rather than keeping a
+/// second copy of the element paths.
 #[derive(Debug, PartialEq, Eq)]
-struct ReportedLifecycle {
-    max_age_enabled: String,
-    max_age_in_days: String,
-    max_age_delete_source: String,
-    max_count_enabled: String,
-    max_count: String,
-    max_count_delete_source: String,
+pub(crate) struct ReportedLifecycle {
+    pub(crate) max_age_enabled: String,
+    pub(crate) max_age_in_days: String,
+    pub(crate) max_age_delete_source: String,
+    pub(crate) max_count_enabled: String,
+    pub(crate) max_count: String,
+    pub(crate) max_count_delete_source: String,
 }
 
 impl ReportedLifecycle {
     /// The configuration reported under `prefix` in `answer` (for example
     /// `Application/ResourceLifecycleConfig`).
-    fn of(answer: &Answer, prefix: &str, case: &str) -> Self {
+    pub(crate) fn of(answer: &Answer, prefix: &str, case: &str) -> Self {
         let at = |path: &str| {
             answer
                 .value(&format!("{prefix}/VersionLifecycleConfig/{path}"))
@@ -108,7 +121,7 @@ impl ReportedLifecycle {
     /// both rules present and disabled, keeping the source bundle, at the
     /// service's own retention figures (`eb::state::DEFAULT_MAX_AGE_IN_DAYS` /
     /// `DEFAULT_MAX_COUNT`).
-    fn service_default() -> Self {
+    pub(crate) fn service_default() -> Self {
         Self {
             max_age_enabled: "false".to_string(),
             max_age_in_days: eb::state::DEFAULT_MAX_AGE_IN_DAYS.to_string(),

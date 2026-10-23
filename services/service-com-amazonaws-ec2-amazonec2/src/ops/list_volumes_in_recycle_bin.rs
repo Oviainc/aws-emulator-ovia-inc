@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListVolumesInRecycleBin
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListVolumesInRecycleBin`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports the volumes [`crate::state`] holds in the account's Recycle Bin,
+//! narrowed to the ids the request names and cut into `MaxResults`-sized pages. This is the
+//! ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListVolumesInRecycleBin::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A volume reaches the Recycle Bin when it is deleted while a retention rule covers it
+//! ([`crate::state::ComAmazonawsEc2Amazonec2State::move_volume_to_recycle_bin`]) and leaves
+//! it when it is restored or when its retention period runs out, so a fresh account's bin is
+//! empty — which is what this reports. "Omit this parameter to list all of the volumes that
+//! are in the Recycle Bin" (`VolumeIds`): an id the request DOES name has to be a volume in
+//! the bin, so one that is not is an error rather than an absent row — a malformed id
+//! (`InvalidVolumeID.Malformed`) before an unknown one (`InvalidVolume.NotFound`), the order
+//! EC2 answers the two in.
+//!
+//! Reporting the bin is a READ: nothing here writes, so two calls answer the same.
 //!
 //! ## Shape of an operation
 //!
@@ -141,18 +146,106 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListVolumesInRecycleBin` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListVolumesInRecycleBinErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListVolumesInRecycleBin"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            MAX_RESOURCE_IDS, RECYCLE_BIN_PAGE_SIZE_RANGE, decode_page_token, dry_run_operation,
+            encode_page_token, invalid_pagination_token, invalid_volume_id_malformed,
+            invalid_volume_id_not_found, require_service_state, volume_id_is_well_formed,
+        };
+
+        // `ctx` carries request metadata only; this operation reads none of it. The store is
+        // reached through the engine held on `self`.
+        let _ = ctx;
+
+        let requested_ids = input.volume_ids.clone().unwrap_or_default();
+        if requested_ids.len() > MAX_RESOURCE_IDS {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "VolumeIds carries {} ids, above the maximum of {MAX_RESOURCE_IDS}",
+                requested_ids.len()
+            )));
+        }
+
+        // "Valid range: 5 - 500" (`ListVolumesInRecycleBinRequest$MaxResults`). The model
+        // declares no `@range`, so the handler is the only place the published one can be
+        // enforced.
+        let (min_page_size, max_page_size) = RECYCLE_BIN_PAGE_SIZE_RANGE;
+        if let Some(max_results) = input.max_results {
+            if max_results < min_page_size || max_results > max_page_size {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "Invalid value '{max_results}' for maxResults. It must be between \
+                     {min_page_size} and {max_page_size}"
+                )));
+            }
+        }
+
+        // "The token returned from a previous paginated request" — anything else is refused
+        // rather than read as an id, and it is refused before any other member is looked at.
+        let start_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(decode_page_token(token).ok_or_else(invalid_pagination_token)?),
+        };
+
+        // DryRun asks whether the CALLER MAY make this request — "checks whether you have
+        // the required permissions for the action, without actually making the request"
+        // (`ListVolumesInRecycleBinRequest$DryRun`) — so it is answered once the request's
+        // own members have been read and before any volume is resolved.
+        if input.dry_run == Some(true) {
+            return Err(dry_run_operation());
+        }
+
+        let state = require_service_state(&*self.engine)?;
+        let store = state.lock();
+
+        // An id the request named has to be a volume the bin holds: a malformed one is
+        // answered as malformed, and a well-formed one the bin does not hold as not found.
+        for volume_id in &requested_ids {
+            if !volume_id_is_well_formed(volume_id) {
+                return Err(invalid_volume_id_malformed(volume_id));
+            }
+            if !store.volumes_in_recycle_bin.contains_key(volume_id) {
+                return Err(invalid_volume_id_not_found(volume_id));
+            }
+        }
+
+        // The store is an ordered map, so its iteration order is the `VolumeId` order the
+        // cursor below names a position in.
+        let selected: Vec<&VolumeRecycleBinInfo> = store
+            .volumes_in_recycle_bin
+            .iter()
+            .filter(|(volume_id, _)| {
+                requested_ids.is_empty() || requested_ids.contains(volume_id)
+            })
+            .map(|(_, entry)| entry)
+            .collect();
+
+        let from = match start_at.as_deref() {
+            None => 0,
+            Some(cursor) => selected.partition_point(|entry| {
+                entry.volume_id.as_deref().unwrap_or_default() < cursor
+            }),
+        };
+        let page = selected.get(from..).unwrap_or_default();
+
+        // A request that names no page size gets the largest page this report serves, so the
+        // `NextToken` path behaves the same whether or not a page size was asked for.
+        let largest_page = usize::try_from(max_page_size).unwrap_or(1).max(1);
+        let limit = input
+            .max_results
+            .and_then(|max_results| usize::try_from(max_results).ok())
+            .unwrap_or(largest_page)
+            .clamp(1, largest_page);
+
+        // A token only when a volume follows this page: "the token to include in another
+        // request to get the next page of items. This value is null when there are no more
+        // items to return".
+        let next_token = page
+            .get(limit)
+            .and_then(|entry| entry.volume_id.as_deref())
+            .map(encode_page_token);
+
+        Ok(ListVolumesInRecycleBinOutput {
+            volumes: Some(page.iter().take(limit).map(|entry| (*entry).clone()).collect()),
+            next_token,
+        })
     }
 }

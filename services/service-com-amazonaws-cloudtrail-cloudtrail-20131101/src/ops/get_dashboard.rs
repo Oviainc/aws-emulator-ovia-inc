@@ -194,8 +194,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             refresh_schedule: record.refresh_schedule.clone(),
             created_timestamp: Some(::aws_smithy_types::DateTime::from(record.created_at)),
             updated_timestamp: Some(::aws_smithy_types::DateTime::from(record.updated_at)),
-            // A refresh has never run — `StartDashboardRefresh` is not implemented —
-            // so there is no refresh id or failure reason to report.
+            // The id of the refresh `StartDashboardRefresh` last began for this
+            // dashboard, and why the last one failed, as the record carries them.
             last_refresh_id: record.last_refresh_id.clone(),
             last_refresh_failure_reason: record.last_refresh_failure_reason.clone(),
             termination_protection_enabled: Some(record.termination_protection_enabled),

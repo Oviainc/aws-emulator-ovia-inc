@@ -141,17 +141,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let state = crate::state::require_state(&*self.engine)?;
+        // Materialise every step of this pipeline's executions the clock has already
+        // made due, so this report is of the execution as it stands now rather than as
+        // it stood at the last call that happened to touch it.
+        crate::state::advance(&*self.engine, ctx, &input.pipeline_name).await;
         let state = state.lock();
 
         if !state.pipelines.contains_key(&input.pipeline_name) {
             return Err(
                 GetPipelineExecutionErrorModeled::PipelineNotFoundException(
                     PipelineNotFoundException {
-                        message: Some(format!(
-                            "pipeline {} does not exist",
-                            input.pipeline_name
+                        message: Some(crate::state::pipeline_not_found_message(
+                            &input.pipeline_name,
                         )),
                     },
                 )

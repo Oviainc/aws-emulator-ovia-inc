@@ -6,14 +6,20 @@
 //! configuration onto the new record, stamps `creationTime` / `startTime` and persists it
 //! with `state.status` `initiating`.
 //!
-//! The move to `running`, and the terminal status the run earns after it, are owed to the
-//! clock rather than to this call, so a caller reading the experiment immediately still
-//! sees it initiating; see [`crate::state::ExperimentRecord::settle`]. A template id
-//! naming no record answers `ResourceNotFoundException` (HTTP 404); a template whose role
-//! does not let FIS assume it answers `ValidationException` (HTTP 400); a start beyond the
-//! published active-experiments quota answers `ServiceQuotaExceededException` (HTTP 402);
-//! and the `@idempotencyToken` either replays the experiment it already started or, when
-//! the request differs from the one it belongs to, answers `ConflictException` (HTTP 409).
+//! The move to `running`, the span the run lasts and the terminal status it earns after it
+//! are owed to the clock rather than to this call, so a caller reading the experiment
+//! immediately still sees it initiating; see [`crate::state::ExperimentRecord::settle`].
+//! What this call decides about the run is what the account's IAM store SHOWS about it:
+//! whether the template's role lets FIS assume it (a start it could never carry out is
+//! refused), and whether that role is allowed to perform the API calls the template's
+//! actions make — an action it is not allowed to perform does not refuse the start, it
+//! makes the run end `failed` with an insufficient-privileges reason, which is what AWS
+//! reports for it. A template id naming no record answers `ResourceNotFoundException`
+//! (HTTP 404); a template whose role does not let FIS assume it answers
+//! `ValidationException` (HTTP 400); a start beyond the published active-experiments quota
+//! answers `ServiceQuotaExceededException` (HTTP 402); and the `@idempotencyToken` either
+//! replays the experiment it already started or, when the request differs from the one it
+//! belongs to, answers `ConflictException` (HTTP 409).
 //!
 //! ## Shape of an operation
 //!
@@ -232,7 +238,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::STORE_UNAVAILABLE,
             ));
         };
-        let trust_refusal = crate::state::role_trust_refusal(&template.role_arn, &iam.lock());
+        // One guard for both things the IAM store is READ for here: whether the role's
+        // trust policy lets FIS assume it at all, and which policy documents are in force
+        // on it. Both are taken out of the guard as owned values, so the guard is dropped
+        // before anything is decided from them — the IAM store is not locked while this
+        // handler thinks.
+        let (trust_refusal, role_documents) = {
+            let iam = iam.lock();
+            (
+                crate::state::role_trust_refusal(&template.role_arn, &iam),
+                crate::state::action_permissions::role_documents(&template.role_arn, &iam),
+            )
+        };
         if let Some(refusal) = trust_refusal {
             return Err(StartExperimentErrorModeled::ValidationException(refusal).into());
         }
@@ -253,6 +270,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // Whether those documents SHOW the role cannot perform an action's own API calls.
+        // Decided after the quotas above, so a start this service refuses outright pays
+        // nothing for it, and from the documents already read rather than from the store.
+        // It does NOT refuse the start — an experiment AWS starts under an
+        // under-privileged role is accepted and then FAILS, which is the attribution a
+        // client reads off its state — so it is carried onto the record and spent when the
+        // run reaches its end.
+        let permission_failure = role_documents.and_then(|documents| {
+            crate::state::action_permissions::permission_failure(
+                &template.role_arn,
+                &template.actions,
+                &template.targets,
+                &documents,
+            )
+        });
+
         let id = store.mint_experiment_id();
         let arn = crate::state::experiment_arn(&region, &id);
         let record = crate::state::ExperimentRecord::from_template(
@@ -262,6 +295,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &actions_mode,
             input.tags.clone(),
             now,
+            permission_failure,
         );
         let experiment = record.to_experiment();
         store.experiments.insert(id.clone(), record);

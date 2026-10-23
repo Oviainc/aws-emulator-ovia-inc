@@ -21,6 +21,8 @@ mod compliance_inquiry_feedback;
 mod compliance_inquiry_lifecycle;
 #[path = "all/compliance_inquiry_listing.rs"]
 mod compliance_inquiry_listing;
+#[path = "all/compliance_inquiry_name_projection.rs"]
+mod compliance_inquiry_name_projection;
 #[path = "all/compliance_inquiry_queries.rs"]
 mod compliance_inquiry_queries;
 #[path = "all/customer_agreements.rs"]

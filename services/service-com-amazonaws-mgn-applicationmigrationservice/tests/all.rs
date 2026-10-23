@@ -17,6 +17,8 @@ mod application_lifecycle;
 mod network_migration_definition;
 #[path = "all/network_migration_definition_listing.rs"]
 mod network_migration_definition_listing;
+#[path = "all/request_body_validation.rs"]
+mod request_body_validation;
 #[path = "all/source_server_discovery.rs"]
 mod source_server_discovery;
 #[path = "all/state_roundtrip.rs"]

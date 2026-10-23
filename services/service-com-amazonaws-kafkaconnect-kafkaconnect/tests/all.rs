@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/custom_plugin_and_connector_lifecycle.rs"]
 mod custom_plugin_and_connector_lifecycle;
+#[path = "all/iso8601_timestamps.rs"]
+mod iso8601_timestamps;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/validation_messages.rs"]

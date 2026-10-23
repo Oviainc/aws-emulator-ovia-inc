@@ -2,16 +2,17 @@
 
 //! Comprehend's batched synchronous inference: `BatchDetectDominantLanguage`.
 //!
-//! The rule under test: the operation answers one `ResultList` entry per accepted
+//! The rule under test: the operation answers one `ResultList` entry per submitted
 //! document, carrying that document's own identified languages and the document's
-//! zero-based position in `TextList` as `Index`; a document the call cannot process
-//! takes an `ErrorList` entry at that same index instead; both lists come back in
-//! ascending index order; and a list longer than the documented 25 documents is
-//! refused with `BatchSizeLimitExceededException`.
+//! zero-based position in `TextList` as `Index`; the list comes back in ascending
+//! index order; and a list longer than the documented 25 documents is refused with
+//! `BatchSizeLimitExceededException`.
 //!
 //! Every suite spans the class the rule generalises over — batch size, document
 //! language, document ordering, repetition and document size — rather than one
-//! recorded request.
+//! recorded request. The two documented batch quotas refuse the REQUEST rather than
+//! one item of it; `sync_inference_refusals.rs` holds that rule for the whole batch
+//! family.
 
 use serde_json::{json, Value};
 use service_com_amazonaws_comprehend_comprehend_20171127::ops::types::LANGUAGE_CODE_VALUES;
@@ -30,7 +31,7 @@ const MAX_BATCH_DOCUMENTS: usize = 25;
 const MAX_DOCUMENT_BYTES: usize = 5_000;
 
 /// The byte length a quota misread as kibibytes would still accept — past the quota,
-/// so a document of this size is reported as an error at its index.
+/// so a batch carrying a document of this size is refused whole.
 const KIBIBYTE_ROUNDED_BYTES: usize = 5 * 1024;
 
 /// The `ResultList` of a successful call, as (Index, top LanguageCode) pairs in the
@@ -207,92 +208,93 @@ async fn a_batch_longer_than_the_documented_maximum_is_refused() {
 }
 
 #[tokio::test]
-async fn a_document_past_the_per_document_ceiling_is_reported_at_its_index() {
+async fn a_batch_whose_documents_all_fit_the_per_document_ceiling_is_identified_whole() {
     let comprehend = Comprehend::new();
     let english = DOCUMENTS[2].2;
     let at_ceiling = "a".repeat(MAX_DOCUMENT_BYTES);
     let past_ceiling = "a".repeat(MAX_DOCUMENT_BYTES + 1);
     let kibibyte_rounded = "a".repeat(KIBIBYTE_ROUNDED_BYTES);
 
-    // Rows differ in where the oversized documents sit and how many there are:
-    // (case, documents, the indices expected in ErrorList).
-    let cases: Vec<(&str, Vec<&str>, Vec<i64>)> = vec![
-        ("a document exactly at the ceiling", vec![&at_ceiling], vec![]),
-        ("one document, one byte past it", vec![&past_ceiling], vec![0]),
+    // The ceiling is measured per document and enforced over the REQUEST: a batch
+    // whose documents all fit is identified in full with an empty `ErrorList`, and a
+    // batch carrying one past it is refused whole rather than answered with a
+    // per-index error. Rows differ in document size, batch size and the position of
+    // the oversized document. `sync_inference_refusals.rs` asserts the refusal's code
+    // and message for the whole batch family.
+    let cases: Vec<(&str, Vec<&str>, bool)> = vec![
+        ("a document exactly at the ceiling", vec![&at_ceiling], true),
+        (
+            "a document at the ceiling beside a short one",
+            vec![english, &at_ceiling],
+            true,
+        ),
+        ("one document, one byte past it", vec![&past_ceiling], false),
         (
             "a document at the kibibyte-rounded size",
             vec![&kibibyte_rounded],
-            vec![0],
+            false,
         ),
         (
             "an oversized document first",
             vec![&past_ceiling, english, &at_ceiling],
-            vec![0],
+            false,
         ),
         (
             "an oversized document in the middle",
             vec![english, &past_ceiling, english],
-            vec![1],
-        ),
-        (
-            "two oversized documents apart",
-            vec![&past_ceiling, english, &past_ceiling],
-            vec![0, 2],
+            false,
         ),
         (
             "every document oversized",
             vec![&past_ceiling, &past_ceiling],
-            vec![0, 1],
+            false,
         ),
     ];
 
-    for (case, text_list, expected_errors) in cases {
-        let output = comprehend
-            .ok(
+    for (case, text_list, accepted) in cases {
+        let (status, body) = comprehend
+            .call(
                 "BatchDetectDominantLanguage",
                 &json!({ "TextList": text_list }),
             )
             .await;
 
-        let errors = output["ErrorList"]
-            .as_array()
-            .unwrap_or_else(|| panic!("case {case:?}: expected an ErrorList, got {output}"));
-        let error_indices: Vec<i64> = errors
-            .iter()
-            .map(|entry| entry["Index"].as_i64().unwrap_or(-1))
-            .collect();
-        assert_eq!(
-            error_indices, expected_errors,
-            "case {case:?}: expected ErrorList at indices {expected_errors:?} in \
-             ascending order, got {output}"
-        );
-        for entry in errors {
+        if !accepted {
             assert_eq!(
-                entry["ErrorCode"].as_str().unwrap_or_default(),
-                "TEXT_SIZE_LIMIT_EXCEEDED",
-                "case {case:?}: expected the text-size error code on {entry}"
+                status, 400,
+                "case {case:?}: a batch carrying an oversized document is refused \
+                 whole, got {status}: {body}"
             );
-            let message = entry["ErrorMessage"].as_str().unwrap_or_default();
-            assert!(
-                !message.is_empty(),
-                "case {case:?}: expected a non-empty ErrorMessage on {entry}"
+            assert_eq!(
+                error_code(&body),
+                "TextSizeLimitExceededException",
+                "case {case:?}: expected TextSizeLimitExceededException, got {body}"
             );
+            continue;
         }
 
-        // Every document NOT in ErrorList is in ResultList, still at its own index.
-        let result_indices: Vec<i64> = output["ResultList"]
+        assert_eq!(
+            status, 200,
+            "case {case:?}: every document fits the ceiling, expected 200, got \
+             {status}: {body}"
+        );
+        assert_eq!(
+            body["ErrorList"].as_array().map(Vec::len),
+            Some(0),
+            "case {case:?}: an accepted batch leaves no document unanalysed, so \
+             ErrorList is empty, got {body}"
+        );
+        let result_indices: Vec<i64> = body["ResultList"]
             .as_array()
-            .unwrap_or_else(|| panic!("case {case:?}: expected a ResultList, got {output}"))
+            .unwrap_or_else(|| panic!("case {case:?}: expected a ResultList, got {body}"))
             .iter()
             .map(|entry| entry["Index"].as_i64().unwrap_or(-1))
             .collect();
-        let expected_results: Vec<i64> = (0..text_list.len() as i64)
-            .filter(|index| !expected_errors.contains(index))
-            .collect();
+        let expected_results: Vec<i64> = (0..text_list.len() as i64).collect();
         assert_eq!(
             result_indices, expected_results,
             "case {case:?}: expected ResultList at indices {expected_results:?} in \
-             ascending order, got {output}"
+             ascending order, got {body}"
         );
     }
 }

@@ -37,36 +37,116 @@ use crate::ops::types::{
     StepState,
 };
 
-/// How long after `StartPlanExecution` the clock owes an execution its outcome.
+/// How long after the call that starts one the clock owes an execution its NEXT
+/// transition — the first step after `StartPlanExecution`, and the step after the one
+/// `ApprovePlanExecutionStep` just released.
 ///
 /// AWS documents no duration for it, so this is the emulator's own choice, inside the
 /// project's 250-750 ms band for a transition the clock owes: a caller that reads the
 /// execution straight after starting it still observes `pending`, and its state errors.
 pub const EXECUTION_START_SPAN: Duration = Duration::from_millis(500);
 
-/// The state an execution reaches once [`EXECUTION_START_SPAN`] has passed, from the
-/// model's `ExecutionState` enum.
+/// The `ExecutionState` an execution is created in, before the clock has reached its
+/// first step, from the model's `ExecutionState` enum
+/// (`smithy_query(query="shape", shape="ExecutionState", model_path="services/service-com-amazonaws-arcregionswitch-arcregionswitch/smithy-model/com-amazonaws-arcregionswitch-arcregionswitch.json")`).
+pub const PENDING: &str = "pending";
+
+/// The `ExecutionState` of an execution that is between steps: a step has just been
+/// decided and the clock has not yet reached the next one.
+pub const IN_PROGRESS: &str = "inProgress";
+
+/// The `ExecutionState` of an execution the clock has stopped at a manual-approval step.
 ///
-/// It is the service's modelled FAILURE state, and it is the honest one: a Region switch
-/// workflow's execution blocks drive other services' resources (Lambda, ECS, Auto
-/// Scaling, RDS, Route 53, ARC routing controls), which this emulator does not run, so
-/// nothing performed the work. Reporting `completed` would claim an outcome nothing
-/// produced, and staying `inProgress` for ever would report a run that is not running
-/// AND never release the plan. Failing with [`UNSUPPORTED_EXECUTION_REASON`] recorded on
-/// the execution's events says what happened and frees the plan.
+/// It is NOT terminal: the execution still holds the plan, the step itself reports
+/// [`STEP_PENDING_APPROVAL`], and `ApprovePlanExecutionStep` is what moves it on.
+pub const PENDING_MANUAL_APPROVAL: &str = "pendingManualApproval";
+
+/// The `ExecutionState` of an execution every step of which reached
+/// [`STEP_COMPLETED`] — including a workflow that configures no execution block at all,
+/// which has nothing to perform.
+pub const COMPLETED: &str = "completed";
+
+/// The `ExecutionState` of an execution stopped by a declined approval.
+pub const CANCELED: &str = "canceled";
+
+/// The `ExecutionState` of an execution whose manual-approval step was neither approved
+/// nor declined inside the window its own execution block configures.
+pub const PLAN_EXECUTION_TIMED_OUT: &str = "planExecutionTimedOut";
+
+/// The state an execution reaches when the clock gets to a step this emulator cannot
+/// perform, from the model's `ExecutionState` enum.
+///
+/// It is the service's modelled FAILURE state, and it is the honest one: most of a
+/// Region switch workflow's execution blocks drive OTHER services' resources (Lambda,
+/// ECS, Auto Scaling, RDS, Route 53, ARC routing controls), which this emulator does not
+/// run, so nothing performed that step. Reporting `completed` would claim an outcome
+/// nothing produced, and staying `inProgress` for ever would report a run that is not
+/// running AND never release the plan. Failing with [`UNSUPPORTED_EXECUTION_REASON`]
+/// recorded on the execution's events says what happened and frees the plan.
+///
+/// A manual-approval block is the exception: it drives nothing outside this service, so
+/// the clock really does reach it (see [`PENDING_MANUAL_APPROVAL`]).
 pub const FAILED: &str = "failed";
 
 /// Why a plan execution fails in this emulator, recorded on the `executionFailed` event
 /// `ListPlanExecutionEvents` reports, so a caller is told rather than left guessing.
 pub const UNSUPPORTED_EXECUTION_REASON: &str =
     "This emulator does not run a Region switch workflow's execution blocks, which drive \
-     other services' resources, so no step of this plan execution was performed.";
+     other services' resources, so the step this plan execution reached was not performed.";
+
+/// Why an execution waiting for a manual approval ends in [`PLAN_EXECUTION_TIMED_OUT`],
+/// recorded the same way.
+pub const APPROVAL_TIMEOUT_REASON: &str =
+    "The manual-approval step was neither approved nor declined inside the approval \
+     window its execution block configures, so the plan execution timed out.";
+
+/// The `StepStatus` of a step the clock has not reached, from the model's `StepStatus`
+/// enum
+/// (`smithy_query(query="shape", shape="StepStatus", model_path="services/service-com-amazonaws-arcregionswitch-arcregionswitch/smithy-model/com-amazonaws-arcregionswitch-arcregionswitch.json")`).
+pub const STEP_NOT_STARTED: &str = "notStarted";
+
+/// The `StepStatus` of a manual-approval step the clock has reached and that is waiting
+/// for `ApprovePlanExecutionStep`.
+pub const STEP_PENDING_APPROVAL: &str = "pendingApproval";
+
+/// The `StepStatus` of a step that is done: a manual approval that was approved.
+pub const STEP_COMPLETED: &str = "completed";
+
+/// The `StepStatus` of a step this emulator could not perform.
+pub const STEP_FAILED: &str = "failed";
+
+/// The `StepStatus` of a step that never ran because it was declined, or because its
+/// approval window closed first.
+pub const STEP_CANCELED: &str = "canceled";
 
 /// The `ExecutionEventType` recorded when an execution is created.
 pub const EVENT_EXECUTION_PENDING: &str = "executionPending";
 
-/// The `ExecutionEventType` recorded when an execution reaches [`FAILED`].
+/// The `ExecutionEventType` recorded when an execution reaches [`FAILED`] or
+/// [`PLAN_EXECUTION_TIMED_OUT`]; the event's `error` says which it was and why. The
+/// model's `ExecutionEventType` enum declares no timed-out member, so this is the
+/// nearest it has.
 pub const EVENT_EXECUTION_FAILED: &str = "executionFailed";
+
+/// The `ExecutionEventType` recorded when the clock stops at a manual-approval step.
+pub const EVENT_STEP_PENDING_APPROVAL: &str = "stepPendingApproval";
+
+/// The `ExecutionEventType` recorded when a manual-approval step is approved.
+pub const EVENT_STEP_SUCCEEDED: &str = "stepSucceeded";
+
+/// The `ExecutionEventType` recorded when an execution reaches [`COMPLETED`].
+pub const EVENT_EXECUTION_SUCCEEDED: &str = "executionSucceeded";
+
+/// The `ExecutionEventType` recorded when a declined approval stops an execution.
+pub const EVENT_EXECUTION_CANCELED: &str = "executionCanceled";
+
+/// The approval window this emulator falls back to, in minutes.
+///
+/// It is the model's own default for the member that carries it
+/// (`ExecutionApprovalConfiguration$timeoutMinutes`, "The timeout value specified for
+/// the configuration", `@range(min: 1)`, `@default: 60`), so a stored block that somehow
+/// carries no usable value waits exactly as long as one that spells the default out.
+pub const DEFAULT_APPROVAL_TIMEOUT_MINUTES: u64 = 60;
 
 /// The Region a request that carries no SigV4 credential scope is attributed to.
 /// Matches the Region generated emulators default to.
@@ -105,13 +185,39 @@ pub const MAX_CLIENT_TOKENS: usize = 2_048;
 /// `pausedByOperator`, `pendingManualApproval` — is a state the execution can still
 /// move out of, so it still holds the plan.
 pub const TERMINAL_EXECUTION_STATES: &[&str] = &[
-    "canceled",
-    "completed",
+    CANCELED,
+    COMPLETED,
     "completedMonitoringApplicationHealth",
     "completedWithExceptions",
     FAILED,
-    "planExecutionTimedOut",
+    PLAN_EXECUTION_TIMED_OUT,
 ];
+
+/// The two Regions of a plan name one switch between them, so they have to be two
+/// DIFFERENT Regions: `regions` is `@length(min: 2, max: 2)` (the boundary validator
+/// refuses any other count before a handler runs) and an execution shifts traffic from
+/// one of them to the other, which the same Region twice describes no such shift of.
+///
+/// `Some(message)` is the refusal, naming the member and the value, for a handler that
+/// takes a plan's Region pair — today `CreatePlan`, and `UpdatePlan` once it is written.
+pub fn region_pair_violation(regions: &[String]) -> Option<String> {
+    let mut seen: BTreeSet<&String> = BTreeSet::new();
+    let duplicate = regions.iter().find(|region| !seen.insert(region))?;
+    Some(format!(
+        "regions must name two different Amazon Web Services Regions, but {duplicate} is \
+         named twice"
+    ))
+}
+
+/// The `ResourceNotFoundException` message for a plan ARN this emulator holds no plan
+/// under, built from the ARN the REQUEST carried.
+///
+/// One function so every operation that looks a plan up by ARN — `GetPlan`, `DeletePlan`,
+/// `StartPlanExecution`, `ListRoute53HealthChecks`, `ListRoute53HealthChecksInRegion` —
+/// renders that refusal identically.
+pub fn plan_not_found_message(arn: &str) -> String {
+    format!("Plan not found for ARN: {arn}")
+}
 
 /// The page size a paginated operation of this service serves.
 ///
@@ -246,6 +352,55 @@ fn collect_route53_health_checks(steps: &[Step], found: &mut BTreeSet<(String, S
     }
 }
 
+/// What the clock needs to know about one step of the workflow an execution runs,
+/// captured when the execution is created so a later edit of the plan cannot change what
+/// a running execution does.
+///
+/// It sits beside the modelled [`StepState`] projection (same order, same length): the
+/// projection is what the API reports, this is what decides the next transition.
+#[derive(Debug, Clone)]
+pub struct PlannedStep {
+    /// The step's name, as `StepState$name` reports it.
+    pub name: String,
+    /// `Some(window)` when the step is a manual-approval execution block, and the window
+    /// its configuration gives the approval; `None` for every other block type, which
+    /// drives another service's resources and so is one this emulator cannot perform.
+    pub approval_window: Option<Duration>,
+}
+
+impl PlannedStep {
+    /// The clock's plan for one step of a stored workflow.
+    pub fn of(step: &Step) -> Self {
+        let approval_window = match &step.execution_block_configuration {
+            // A manual approval is the one execution block whose work is inside THIS
+            // service: it waits for `ApprovePlanExecutionStep` and drives nothing else.
+            ExecutionBlockConfiguration::executionApprovalConfig(config) => {
+                Some(approval_window(config.timeout_minutes))
+            }
+            _ => None,
+        };
+        Self {
+            name: step.name.clone(),
+            approval_window,
+        }
+    }
+}
+
+/// How long a manual-approval step waits, from the block's own configuration.
+///
+/// AWS documents the window on the block itself
+/// (`ExecutionApprovalConfiguration$timeoutMinutes`: "The timeout value specified for the
+/// configuration", `@range(min: 1)`, `@default: 60`), so the configured value is what is
+/// waited — this is not a duration the emulator chooses. A value the model does not admit
+/// falls back to its documented default.
+fn approval_window(timeout_minutes: i32) -> Duration {
+    let minutes = u64::try_from(timeout_minutes)
+        .ok()
+        .filter(|minutes| *minutes >= 1)
+        .unwrap_or(DEFAULT_APPROVAL_TIMEOUT_MINUTES);
+    Duration::from_secs(minutes * 60)
+}
+
 /// One execution of a plan, as this emulator persists it.
 #[derive(Debug, Clone)]
 pub struct StoredExecution {
@@ -265,11 +420,15 @@ pub struct StoredExecution {
     pub end_time: Option<DateTime>,
     pub updated_at: DateTime,
     pub step_states: Vec<StepState>,
+    /// What the clock needs to know about each of those steps, in the same order.
+    pub planned_steps: Vec<PlannedStep>,
     /// The execution's events, oldest first, as `ListPlanExecutionEvents` reports them.
     /// Bounded by the step count of the workflow the execution runs plus the two
     /// lifecycle events, so it cannot grow per request.
     pub events: Vec<ExecutionEvent>,
-    /// When the clock owes this execution its outcome; `None` once it has one.
+    /// When the clock owes this execution its next transition; `None` once it owes none —
+    /// because the execution has reached a state it never leaves, or because it is waiting
+    /// for a call (an approval) rather than for the clock.
     pub outcome_due_at: Option<SystemTime>,
 }
 
@@ -277,6 +436,27 @@ impl StoredExecution {
     /// Whether the execution has reached a state it never leaves, so the plan is free.
     pub fn is_terminal(&self) -> bool {
         TERMINAL_EXECUTION_STATES.contains(&self.execution_state.as_str())
+    }
+
+    /// The position of the step the execution is waiting for an approval decision on.
+    pub fn step_awaiting_approval(&self) -> Option<usize> {
+        self.step_states
+            .iter()
+            .position(|step| step.status.as_deref() == Some(STEP_PENDING_APPROVAL))
+    }
+
+    /// The position of the first step the clock has not reached yet.
+    pub fn next_unreached_step(&self) -> Option<usize> {
+        self.step_states
+            .iter()
+            .position(|step| step.status.as_deref() == Some(STEP_NOT_STARTED))
+    }
+
+    /// The position of the step called `name`, whatever state it is in.
+    pub fn step_named(&self, name: &str) -> Option<usize> {
+        self.step_states
+            .iter()
+            .position(|step| step.name.as_deref() == Some(name))
     }
 }
 
@@ -290,6 +470,33 @@ pub struct TokenRecord {
     pub execution_id: String,
     /// Where this record sits in the FIFO that bounds the token cache.
     pub recorded_at: u64,
+}
+
+/// The ONE transition the clock owes an execution, decided from the step it stands on.
+enum Advance {
+    /// Stop at the manual-approval step at this position, for the window given.
+    HoldForApproval { index: usize, window: Duration },
+    /// The step at this position is an execution block this emulator cannot perform.
+    UnsupportedStep(usize),
+    /// The approval window of the step at this position has closed undecided.
+    ApprovalWindowClosed(usize),
+    /// No step is left to reach.
+    WorkflowDone,
+}
+
+/// What [`ComAmazonawsArcregionswitchArcregionswitchState::apply_approval`] found when it
+/// tried to decide a step, so `ApprovePlanExecutionStep` can answer the right modelled
+/// failure for each case.
+#[derive(Debug)]
+pub enum ApprovalOutcome {
+    /// The decision was applied.
+    Applied,
+    /// This plan holds no execution with that id.
+    NoSuchExecution,
+    /// The execution runs no step of that name.
+    NoSuchStep,
+    /// The step is not waiting for a decision; it reports `status`.
+    NotAwaitingApproval { status: String },
 }
 
 /// Per-service state for com-amazonaws-arcregionswitch-arcregionswitch. A handler reaches it through [`service_state`].
@@ -323,16 +530,18 @@ impl ComAmazonawsArcregionswitchArcregionswitchState {
 
     /// Apply the state changes the clock already made due at `now`.
     ///
-    /// Only clock-owed work: an execution whose outcome was owed at `now` even if nobody
-    /// had called. EVERY handler runs this first — the reporting ones included, which is
+    /// Only clock-owed work: a transition that was owed at `now` even if nobody had
+    /// called. EVERY handler runs this first — the reporting ones included, which is
     /// what keeps them from disagreeing with the mutating ones about what the current
     /// state is — and it costs only the transitions that are due, never a walk of the
     /// store.
     ///
-    /// The outcome is [`FAILED`] with [`UNSUPPORTED_EXECUTION_REASON`] on an
-    /// `executionFailed` event: nothing ran the workflow's execution blocks, so this is
-    /// the service's modelled failure state and it RELEASES the plan — the plan becomes
-    /// deletable again and can be executed again.
+    /// The transitions are the workflow's own progression, one step at a time (see
+    /// [`Self::advance_execution`]): the clock reaches a step, and the step either stops
+    /// the execution for a manual approval, or is one this emulator cannot perform and
+    /// fails it. A transition that lands another one in the past (a long-expired approval
+    /// window, say) is applied in the same pass, which is why this loop re-reads the
+    /// index rather than taking a snapshot of it.
     pub fn settle(&mut self, now: SystemTime) {
         while let Some(next) = self.due_transitions.pop_first() {
             if next.0 > now {
@@ -340,36 +549,232 @@ impl ComAmazonawsArcregionswitchArcregionswitchState {
                 break;
             }
             let (due, plan_arn, execution_id) = next;
-            let key = (plan_arn, execution_id);
-            let at = DateTime::from(due);
-            let Some(execution) = self.executions.get_mut(&key) else {
-                continue;
-            };
-            execution.execution_state = FAILED.to_string();
-            execution.updated_at = at;
-            execution.end_time = Some(at);
-            execution.outcome_due_at = None;
-            self.push_event(
-                &key,
-                EVENT_EXECUTION_FAILED,
-                Some(UNSUPPORTED_EXECUTION_REASON.to_string()),
-                at,
-            );
-            // The execution has reached a state it never leaves, so it no longer holds
-            // the plan.
-            if let Some(plan) = self.plans.get_mut(&key.0) {
-                if plan.active_execution.as_ref() == Some(&key.1) {
-                    plan.active_execution = None;
+            self.advance_execution(&(plan_arn, execution_id), due);
+        }
+    }
+
+    /// Apply the ONE transition the clock owed `key` at `due`.
+    ///
+    /// The step the execution stands on decides which it is:
+    ///
+    /// * a step waiting for a manual approval whose window has closed →
+    ///   [`PLAN_EXECUTION_TIMED_OUT`];
+    /// * the next step not reached yet, when it IS a manual-approval block →
+    ///   [`PENDING_MANUAL_APPROVAL`], and the clock then owes the window's end;
+    /// * the next step not reached yet, when it is any other block → [`FAILED`], because
+    ///   that block drives another service's resources and nothing performed it;
+    /// * no step left to reach → [`COMPLETED`].
+    fn advance_execution(&mut self, key: &(String, String), due: SystemTime) {
+        let at = DateTime::from(due);
+        let Some(execution) = self.executions.get(key) else {
+            return;
+        };
+        let next = if execution.is_terminal() {
+            // Nothing is owed to an execution that has reached a state it never leaves;
+            // reaching here means a stale deadline outlived it, so it is dropped rather
+            // than allowed to move a settled outcome.
+            self.schedule(key, None);
+            return;
+        } else if let Some(index) = execution.step_awaiting_approval() {
+            Advance::ApprovalWindowClosed(index)
+        } else if let Some(index) = execution.next_unreached_step() {
+            match execution
+                .planned_steps
+                .get(index)
+                .and_then(|planned| planned.approval_window)
+            {
+                Some(window) => Advance::HoldForApproval { index, window },
+                None => Advance::UnsupportedStep(index),
+            }
+        } else {
+            // Every step of the workflow is done — or the workflow configures no
+            // execution block at all, which has nothing to perform. Either way no
+            // outcome is claimed for work nothing ran, because no work is left.
+            Advance::WorkflowDone
+        };
+
+        match next {
+            Advance::HoldForApproval { index, window } => {
+                let name = self.mark_step(key, index, STEP_PENDING_APPROVAL, at, false);
+                if let Some(execution) = self.executions.get_mut(key) {
+                    execution.execution_state = PENDING_MANUAL_APPROVAL.to_string();
+                    execution.updated_at = at;
                 }
+                self.push_detailed_event(key, EVENT_STEP_PENDING_APPROVAL, name, None, None, at);
+                // The clock owes the window's end, not the outcome: until then this is a
+                // call (`ApprovePlanExecutionStep`) the execution is waiting for.
+                self.schedule(key, Some(due + window));
+            }
+            Advance::UnsupportedStep(index) => {
+                self.mark_step(key, index, STEP_FAILED, at, true);
+                if let Some(execution) = self.executions.get_mut(key) {
+                    execution.execution_state = FAILED.to_string();
+                    execution.updated_at = at;
+                    execution.end_time = Some(at);
+                }
+                self.push_event(
+                    key,
+                    EVENT_EXECUTION_FAILED,
+                    Some(UNSUPPORTED_EXECUTION_REASON.to_string()),
+                    at,
+                );
+                self.finish_execution(key);
+            }
+            Advance::ApprovalWindowClosed(index) => {
+                let name = self.mark_step(key, index, STEP_CANCELED, at, true);
+                if let Some(execution) = self.executions.get_mut(key) {
+                    execution.execution_state = PLAN_EXECUTION_TIMED_OUT.to_string();
+                    execution.updated_at = at;
+                    execution.end_time = Some(at);
+                }
+                self.push_detailed_event(
+                    key,
+                    EVENT_EXECUTION_FAILED,
+                    name,
+                    None,
+                    Some(APPROVAL_TIMEOUT_REASON.to_string()),
+                    at,
+                );
+                self.finish_execution(key);
+            }
+            Advance::WorkflowDone => {
+                if let Some(execution) = self.executions.get_mut(key) {
+                    execution.execution_state = COMPLETED.to_string();
+                    execution.updated_at = at;
+                    execution.end_time = Some(at);
+                }
+                self.push_event(key, EVENT_EXECUTION_SUCCEEDED, None, at);
+                self.finish_execution(key);
             }
         }
     }
 
-    /// Append one event to an execution's timeline, chained to the one before it.
+    /// Apply a manual-approval decision to one step of one execution.
+    ///
+    /// Approving releases the step — it reports [`STEP_COMPLETED`], the execution
+    /// [`IN_PROGRESS`], and the clock owes the next step after [`EXECUTION_START_SPAN`],
+    /// so a caller reading straight after the approval still sees the execution between
+    /// steps. Declining stops the execution: the step is [`STEP_CANCELED`], the execution
+    /// [`CANCELED`], and the plan is released. Only the step the execution is actually
+    /// waiting on can be decided.
+    pub fn apply_approval(
+        &mut self,
+        key: &(String, String),
+        step_name: &str,
+        approved: bool,
+        comment: Option<String>,
+        now: SystemTime,
+    ) -> ApprovalOutcome {
+        let Some(execution) = self.executions.get(key) else {
+            return ApprovalOutcome::NoSuchExecution;
+        };
+        let Some(index) = execution.step_named(step_name) else {
+            return ApprovalOutcome::NoSuchStep;
+        };
+        if execution.step_awaiting_approval() != Some(index) {
+            let status = execution
+                .step_states
+                .get(index)
+                .and_then(|step| step.status.clone())
+                .unwrap_or_else(|| STEP_NOT_STARTED.to_string());
+            return ApprovalOutcome::NotAwaitingApproval { status };
+        }
+
+        let at = DateTime::from(now);
+        if approved {
+            let name = self.mark_step(key, index, STEP_COMPLETED, at, true);
+            if let Some(execution) = self.executions.get_mut(key) {
+                execution.execution_state = IN_PROGRESS.to_string();
+                execution.updated_at = at;
+            }
+            self.push_detailed_event(key, EVENT_STEP_SUCCEEDED, name, comment, None, at);
+            self.schedule(key, Some(now + EXECUTION_START_SPAN));
+        } else {
+            let name = self.mark_step(key, index, STEP_CANCELED, at, true);
+            if let Some(execution) = self.executions.get_mut(key) {
+                execution.execution_state = CANCELED.to_string();
+                execution.updated_at = at;
+                execution.end_time = Some(at);
+            }
+            self.push_detailed_event(key, EVENT_EXECUTION_CANCELED, name, comment, None, at);
+            self.finish_execution(key);
+        }
+        ApprovalOutcome::Applied
+    }
+
+    /// Move the step at `index` to `status`, timestamping it, and report its name.
+    ///
+    /// `startTime` is filled in only when the step carries none: a step the clock stopped
+    /// at for an approval already records the instant it was reached.
+    fn mark_step(
+        &mut self,
+        key: &(String, String),
+        index: usize,
+        status: &str,
+        at: DateTime,
+        finished: bool,
+    ) -> Option<String> {
+        let execution = self.executions.get_mut(key)?;
+        let step = execution.step_states.get_mut(index)?;
+        step.status = Some(status.to_string());
+        step.start_time = step.start_time.or(Some(at));
+        if finished {
+            step.end_time = Some(at);
+        }
+        step.name.clone()
+    }
+
+    /// Record when the clock next owes `key` a transition — `None` for never — keeping
+    /// the due-transition index and the execution's own `outcome_due_at` in step, so the
+    /// two can never disagree about what is outstanding.
+    fn schedule(&mut self, key: &(String, String), due: Option<SystemTime>) {
+        let previous = self
+            .executions
+            .get(key)
+            .and_then(|execution| execution.outcome_due_at);
+        if let Some(previous) = previous {
+            self.due_transitions
+                .remove(&(previous, key.0.clone(), key.1.clone()));
+        }
+        if let Some(execution) = self.executions.get_mut(key) {
+            execution.outcome_due_at = due;
+        }
+        if let Some(due) = due {
+            self.due_transitions
+                .insert((due, key.0.clone(), key.1.clone()));
+        }
+    }
+
+    /// The execution has reached a state it never leaves: the clock owes it nothing more,
+    /// and it no longer holds its plan — which becomes deletable and executable again.
+    fn finish_execution(&mut self, key: &(String, String)) {
+        self.schedule(key, None);
+        if let Some(plan) = self.plans.get_mut(&key.0) {
+            if plan.active_execution.as_ref() == Some(&key.1) {
+                plan.active_execution = None;
+            }
+        }
+    }
+
+    /// Append one execution-level event to an execution's timeline, chained to the one
+    /// before it.
     pub fn push_event(
         &mut self,
         key: &(String, String),
         event_type: &str,
+        error: Option<String>,
+        at: DateTime,
+    ) {
+        self.push_detailed_event(key, event_type, None, None, error, at);
+    }
+
+    /// Append one event, which may name the step it is about and carry a description.
+    pub fn push_detailed_event(
+        &mut self,
+        key: &(String, String),
+        event_type: &str,
+        step_name: Option<String>,
+        description: Option<String>,
         error: Option<String>,
         at: DateTime,
     ) {
@@ -382,11 +787,11 @@ impl ComAmazonawsArcregionswitchArcregionswitchState {
             execution.events.push(ExecutionEvent {
                 timestamp: Some(at),
                 r#type: Some(event_type.to_string()),
-                step_name: None,
+                step_name,
                 execution_block_type: None,
                 resources: None,
                 error,
-                description: None,
+                description,
                 event_id,
                 previous_event_id,
             });

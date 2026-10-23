@@ -36,10 +36,15 @@ const ACCOUNT_ID: &str = "000000000000";
 /// (`STATUS_TRANSITION_DELAY`, 500 ms) and the stream's (`TRANSITION_DELAY`, 600 ms).
 const PAST_BOTH_SPANS: Duration = Duration::from_millis(1_200);
 
-/// The emulator with the two services this suite exercises, mounted on ONE engine exactly
-/// as `core/router/src/lib.rs` mounts them. Request authentication is off, as in every
-/// other suite here; the in-process callback CloudFormation makes signs its request
-/// either way (the credential scope is what routes it).
+/// The emulator with the services this suite exercises, mounted on ONE engine exactly as
+/// `core/router/src/lib.rs` mounts them. Request authentication is off, as in every other
+/// suite here; the in-process callback CloudFormation makes signs its request either way
+/// (the credential scope is what routes it).
+///
+/// Firehose is the service whose streams the suite deploys, and Amazon S3 and IAM are
+/// here because the templates below declare an `AWS::S3::Bucket` and an `AWS::IAM::Role`
+/// beside each stream — resource types CloudFormation provisions too, so the services
+/// that own them have to be reachable for the stack to complete.
 fn build_router() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
@@ -50,7 +55,15 @@ fn build_router() -> MultiServiceRouter {
         )),
     );
     router.register_service(
-        service_com_amazonaws_firehose_firehose_20150804::EmulatedService::new(engine),
+        service_com_amazonaws_firehose_firehose_20150804::EmulatedService::new(Arc::clone(
+            &engine,
+        )),
+    );
+    router.register_service(service_com_amazonaws_s3_amazons3::EmulatedService::new(
+        Arc::clone(&engine),
+    ));
+    router.register_service(
+        service_com_amazonaws_iam_awsidentitymanagementv20100508::EmulatedService::new(engine),
     );
     router
 }

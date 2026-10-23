@@ -76,6 +76,18 @@ impl Mgn {
     /// POST `/<operation>` with `body`, answering the status and the parsed JSON body
     /// (`Value::Null` for an empty one).
     pub(crate) async fn call(&self, operation: &str, body: &Value) -> (u16, Value) {
+        let (status, _, parsed) = self.call_reporting_error_type(operation, body).await;
+        (status, parsed)
+    }
+
+    /// As [`Mgn::call`], also answering the `x-amzn-errortype` header — the header
+    /// restJson1 resolves an error SHAPE from, which a refusal must carry the same code
+    /// in as the body's `__type`.
+    pub(crate) async fn call_reporting_error_type(
+        &self,
+        operation: &str,
+        body: &Value,
+    ) -> (u16, Option<String>, Value) {
         let request = http::Request::builder()
             .method("POST")
             .uri(format!("https://mgn.{REGION}.amazonaws.com/{operation}"))
@@ -94,6 +106,11 @@ impl Mgn {
 
         let response = self.router.dispatch(request).await;
         let status = response.status().as_u16();
+        let error_type = response
+            .headers()
+            .get("x-amzn-errortype")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
         let raw = response.into_body();
         let parsed = if raw.is_empty() {
             Value::Null
@@ -102,7 +119,7 @@ impl Mgn {
                 panic!("{operation} answered a body that is not JSON: {error}")
             })
         };
-        (status, parsed)
+        (status, error_type, parsed)
     }
 
     /// `InitializeService` for the caller's own account.

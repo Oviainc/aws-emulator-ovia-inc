@@ -1492,15 +1492,12 @@ async fn a_requested_political_view_is_reported_in_alpha_three_form() {
     }
 }
 
-/// Autocomplete and Suggest are not implemented yet, and say so with HTTP 501
-/// rather than an empty success.
+/// Suggest is not implemented yet, and says so with HTTP 501 rather than an empty
+/// success.
 #[tokio::test]
 async fn the_operations_this_slice_leaves_out_still_answer_501() {
     let emulator = Emulator::new();
-    for (case, path) in [
-        ("autocomplete", "/v2/autocomplete"),
-        ("suggest", "/v2/suggest"),
-    ] {
+    for (case, path) in [("suggest", "/v2/suggest")] {
         let call = emulator
             .post(path, &json!({"QueryText": "Space Needle"}))
             .await;

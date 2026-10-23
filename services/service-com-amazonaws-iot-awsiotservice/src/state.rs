@@ -43,12 +43,14 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::SystemTime;
 
-use service_common::iot_job_executions::{is_modeled_thing_name, JobExecutionStore};
+use service_common::iot_job_executions::{
+    is_modeled_thing_name, JobExecutionRecord, JobExecutionStore,
+};
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    Action, CommandParameter, CommandPayload, CommandPreprocessor, GetCommandOutput, TopicRule,
-    TopicRulePayload,
+    Action, CommandParameter, CommandPayload, CommandPreprocessor, GetCommandOutput, JobExecution,
+    JobExecutionStatusDetails, TopicRule, TopicRulePayload,
 };
 
 /// The shared index of which IoT COMMANDS exist, which the IoT Jobs data plane's
@@ -885,6 +887,49 @@ pub fn job_execution_store<Eng: Send + Sync + 'static>(
     (engine as &dyn ::std::any::Any)
         .downcast_ref::<::engine::InMemoryEngine>()
         .map(::engine::InMemoryEngine::state::<JobExecutionStore>)
+}
+
+/// A stored job execution as the modeled `JobExecution` this CONTROL plane reports.
+///
+/// The shared store holds the execution; this is the only place that projects it onto
+/// the shapes THIS model declares, so every reader of a job execution here (today
+/// `DescribeJobExecution`) reports one value for one record.
+///
+/// `thingArn` is "The ARN of the thing on which the job execution is running", built
+/// from the thing NAME the execution is keyed by and the region the request is signed
+/// for ([`thing_arn`]) — a job may target a thing that is not in the registry, so the
+/// ARN comes from the execution and not from a registry lookup. `statusDetails` is
+/// reported only while the execution carries a name/value pair, matching the data
+/// plane's projection of the same record. `approximateSecondsBeforeTimedOut` is "the
+/// estimated number of seconds that remain before the job execution status will be
+/// changed to TIMED_OUT … This value will not be included if the job execution has
+/// reached a terminal status", which is exactly what
+/// [`JobExecutionRecord::approximate_seconds_before_timed_out`] answers.
+///
+/// `forceCanceled` is "true if the job execution was canceled with the optional force
+/// parameter set to true", and nothing in this emulator force-cancels an execution yet
+/// (`CancelJobExecution` is still a scaffold, its own issue), so there is no stored
+/// force-cancel to report and the member is left out rather than reported `false`.
+pub fn to_job_execution(record: &JobExecutionRecord, region: &str, now: i64) -> JobExecution {
+    JobExecution {
+        job_id: Some(record.job_id.clone()),
+        status: Some(record.status.clone()),
+        force_canceled: None,
+        status_details: (!record.status_details.is_empty()).then(|| JobExecutionStatusDetails {
+            details_map: Some(record.status_details_map()),
+        }),
+        thing_arn: Some(thing_arn(region, &record.thing_name)),
+        queued_at: Some(::aws_smithy_types::DateTime::from_secs(record.queued_at)),
+        started_at: record
+            .started_at
+            .map(::aws_smithy_types::DateTime::from_secs),
+        last_updated_at: Some(::aws_smithy_types::DateTime::from_secs(
+            record.last_updated_at,
+        )),
+        execution_number: Some(record.execution_number),
+        version_number: record.version_number,
+        approximate_seconds_before_timed_out: record.approximate_seconds_before_timed_out(now),
+    }
 }
 
 /// The SHARED index of which IoT commands exist, in the shared engine: call it with a

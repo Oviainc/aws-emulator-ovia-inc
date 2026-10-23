@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListCustomDetectionRules
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListCustomDetectionRules`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListCustomDetectionRules::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the custom detection rules GuardDuty publishes, as this
+//! service's store holds them, narrowed by the request's `Filters` and handed back
+//! one page at a time in `RuleId` order. This is the ONLY file to touch for this
+//! operation.
 //!
 //! ## Shape of an operation
 //!
@@ -146,18 +141,143 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListCustomDetectionRules` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListCustomDetectionRulesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListCustomDetectionRules"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                ListCustomDetectionRulesErrorModeled::InternalServerErrorException(
+                    crate::state::state_unavailable(),
+                )
+                .into(),
+            );
+        };
+        let region = crate::state::request_region(ctx);
+        let filters = input.filters.unwrap_or_default();
+
+        // `Name` and `Condition` are modelled enums, so the request boundary already
+        // refuses a value outside either — but a filter this handler could not apply
+        // must never narrow to a silent empty page, so the refusal is stated here
+        // too, built from the REQUEST and naming the member at fault.
+        let applicable = filters.iter().all(|filter| {
+            crate::state::DETECTION_RULE_FILTER_FIELDS.contains(&filter.name.as_str())
+                && filter
+                    .condition
+                    .as_deref()
+                    .is_none_or(|condition| CONDITIONS.contains(&condition))
+        });
+        if !applicable {
+            return Err(bad_request(crate::state::invalid_parameter_message(
+                crate::state::FILTERS_MEMBER,
+            )));
+        }
+
+        // A pure report: nothing below writes to the store.
+        let state = state.lock();
+
+        // `RuleId` order over the rules the filters selected — the catalogue's own
+        // order. A total order is what makes a page token mean the same thing on the
+        // call that handed it back, so a caller walks the pages with the same
+        // `Filters` it opened them with.
+        let selected: Vec<String> = state
+            .custom_detection_rules
+            .rules()
+            .iter()
+            .filter(|rule| filters.iter().all(|filter| matches_filter(rule, filter)))
+            .map(|rule| rule.rule_id.clone())
+            .collect();
+
+        let (page, next_token) = crate::state::paginate(
+            &selected,
+            input.max_results,
+            input.next_token.as_deref(),
+            MAX_RULES_PER_PAGE,
+        )
+        .map_err(|_| {
+            // Under the error CLASS, naming the parameter at fault and not quoting
+            // the token back.
+            bad_request(crate::state::invalid_parameter_message(
+                crate::state::NEXT_TOKEN_MEMBER,
+            ))
+        })?;
+
+        let rules = page
+            .iter()
+            .filter_map(|rule_id| state.custom_detection_rules.rule(rule_id))
+            .map(|rule| summary(rule, &region))
+            .collect();
+
+        Ok(ListCustomDetectionRulesOutput { rules, next_token })
     }
+}
+
+/// One page's ceiling. `MaxResults` is "The maximum number of results to return in a
+/// single page. Minimum value of 1, maximum value of 100"
+/// (`smithy_query(operation="ListCustomDetectionRules")`), so a request that names no
+/// page size is served the largest page that member can ask for.
+const MAX_RULES_PER_PAGE: usize = 100;
+
+/// The `DetectionRuleFilterCondition` members, for classifying a condition the
+/// request boundary let through.
+const CONDITIONS: [&str; 2] = [
+    crate::state::FILTER_CONDITION_EQUALS,
+    crate::state::FILTER_CONDITION_CONTAINS,
+];
+
+/// Does `rule` satisfy `filter`?
+///
+/// A filter selects on the value a list REPORTS for the field it names: `EQUALS`
+/// takes the rules whose field is one of the filter's values, `CONTAINS` the rules
+/// whose field has one of them as a substring. A filter's values are OR-ed —
+/// `Values` lists the alternatives for one field — and a request's filters are
+/// AND-ed, so each further filter narrows the page. Comparison is exact: every field
+/// a filter can name is either an enum member or a published identifier, and the
+/// same text in another case is a different value of both.
+///
+/// A filter always carries at least one value: `DetectionRuleFilterValues` is
+/// `len 1..50` and `Values` is `@required`
+/// (`smithy_query(operation="ListCustomDetectionRules")`), both refused at the
+/// request boundary, so "no value to match" is not a page this can answer.
+fn matches_filter(
+    rule: &crate::state::CustomDetectionRuleRecord,
+    filter: &DetectionRuleFilter,
+) -> bool {
+    let Some(actual) = rule.field(&filter.name) else {
+        return false;
+    };
+    let contains = filter.condition.as_deref() == Some(crate::state::FILTER_CONDITION_CONTAINS);
+    filter.values.iter().any(|wanted| {
+        if contains {
+            actual.contains(wanted.as_str())
+        } else {
+            actual == wanted
+        }
+    })
+}
+
+/// The `RuleSummary` projection of a stored rule, as `region`'s endpoint reports it.
+///
+/// Every member is read off the record; only the ARN is derived, from the rule's own
+/// id and the Region serving the read.
+fn summary(rule: &crate::state::CustomDetectionRuleRecord, region: &str) -> RuleSummary {
+    RuleSummary {
+        rule_id: rule.rule_id.clone(),
+        arn: crate::state::custom_detection_rule_arn(region, &rule.rule_id),
+        name: rule.name.clone(),
+        description: rule.description.clone(),
+        severity: rule.severity.clone(),
+        data_source: rule.data_source.clone(),
+        tactic: rule.tactic.clone(),
+        technique: rule.technique.clone(),
+        service: rule.service.clone(),
+        language: rule.language.clone(),
+        schema: rule.schema.clone(),
+        created_at: ::aws_smithy_types::DateTime::from_millis(rule.created_at_millis),
+        updated_at: rule
+            .updated_at_millis
+            .map(::aws_smithy_types::DateTime::from_millis),
+    }
+}
+
+/// Refuse the request the way GuardDuty does: HTTP 400 under the
+/// `InvalidInputException` class, in both the body's `__type` and its `type` member.
+fn bad_request(message: impl Into<String>) -> ListCustomDetectionRulesError {
+    crate::scaffolded::Scaffolded::invalid_input(message)
 }

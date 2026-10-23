@@ -26,7 +26,10 @@ pub struct ListConnectorOperationsOutput {
     pub next_token: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.kafkaconnect#ConnectorOperationSummary")]
+/// `creationTime` and `endTime` target `__timestampIso8601`
+/// (`@timestampFormat("date-time")`), so this shape's schema comes from
+/// `kc_schema_and_codec!` — see `types/date_time_wire.rs`. Member set, order and
+/// requiredness from `smithy_query(query="shape", shape="ConnectorOperationSummary")`.
 #[derive(Debug, Clone, Default)]
 pub struct ConnectorOperationSummary {
     pub connector_operation_arn: Option<String>,
@@ -35,4 +38,31 @@ pub struct ConnectorOperationSummary {
     pub creation_time: Option<::aws_smithy_types::DateTime>,
     pub end_time: Option<::aws_smithy_types::DateTime>,
 }
+
+kc_schema_and_codec!(
+    ConnectorOperationSummary,
+    CONNECTOR_OPERATION_SUMMARY_SCHEMA,
+    "com.amazonaws.kafkaconnect#ConnectorOperationSummary",
+    "com.amazonaws.kafkaconnect",
+    "ConnectorOperationSummary",
+    (M_CONNECTOR_OPERATION_ARN, connector_operation_arn, "connectorOperationArn", 0, opt, string),
+    (
+        M_CONNECTOR_OPERATION_TYPE,
+        connector_operation_type,
+        "connectorOperationType",
+        1,
+        opt,
+        string
+    ),
+    (
+        M_CONNECTOR_OPERATION_STATE,
+        connector_operation_state,
+        "connectorOperationState",
+        2,
+        opt,
+        string
+    ),
+    (M_CREATION_TIME, creation_time, "creationTime", 3, opt, date_time),
+    (M_END_TIME, end_time, "endTime", 4, opt, date_time),
+);
 

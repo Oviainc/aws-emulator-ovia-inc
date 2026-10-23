@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetCustomDetectionRule
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetCustomDetectionRule`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetCustomDetectionRule::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the custom detection rule the store holds under the request's
+//! `RuleId`, detection logic included, and refuses an id the catalogue does not
+//! publish with the modelled 404. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -141,18 +135,110 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetCustomDetectionRule` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetCustomDetectionRuleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetCustomDetectionRule"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                GetCustomDetectionRuleErrorModeled::InternalServerErrorException(
+                    crate::state::state_unavailable(),
+                )
+                .into(),
+            );
+        };
+        let region = crate::state::request_region(ctx);
+
+        // A pure report: nothing below writes to the store.
+        let state = state.lock();
+        let Some(rule) = state.custom_detection_rules.rule(&input.rule_id) else {
+            // `RuleId` carries its own length and pattern constraints, which the
+            // request boundary refuses before this handler runs, so a well-formed id
+            // the catalogue does not publish is the only way to get here: the
+            // modelled 404, never a hollow success.
+            return Err(GetCustomDetectionRuleErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::custom_detection_rule_not_found_message()),
+                    // "The error type"
+                    // (`smithy_query(shape="ResourceNotFoundException")`): the
+                    // class, the same value the body's `__type` carries.
+                    r#type: Some(RESOURCE_NOT_FOUND_EXCEPTION.to_string()),
+                },
+            )
+            .into());
+        };
+
+        Ok(GetCustomDetectionRuleOutput {
+            rule: RuleDetail {
+                rule_id: rule.rule_id.clone(),
+                // Derived from the rule's own id and the Region serving the read, so
+                // a read cannot report an ARN that disagrees with the id it was
+                // asked about.
+                arn: crate::state::custom_detection_rule_arn(&region, &rule.rule_id),
+                name: rule.name.clone(),
+                description: rule.description.clone(),
+                severity: rule.severity.clone(),
+                data_source: rule.data_source.clone(),
+                tactic: rule.tactic.clone(),
+                technique: rule.technique.clone(),
+                service: rule.service.clone(),
+                // "The detection logic definition for the rule" — the member
+                // `RuleSummary` does not carry, which is what makes this a detail
+                // read rather than a list entry.
+                definition: RuleDefinition {
+                    expression: rule.expression.clone(),
+                },
+                language: rule.language.clone(),
+                schema: rule.schema.clone(),
+                runtime_monitoring_details: runtime_details(rule),
+                created_at: ::aws_smithy_types::DateTime::from_millis(rule.created_at_millis),
+                updated_at: rule
+                    .updated_at_millis
+                    .map(::aws_smithy_types::DateTime::from_millis),
+            },
+        })
     }
+}
+
+/// The error CLASS a read of a rule the catalogue does not publish is named by on
+/// the wire.
+///
+/// `ResourceNotFoundException` is a modelled error of this operation (`httpError`
+/// 404 — `smithy_query(operation="GetCustomDetectionRule")`), so it is answered as
+/// the modelled shape rather than under the `BadRequestException` envelope this
+/// service's 400s use.
+const RESOURCE_NOT_FOUND_EXCEPTION: &str = "ResourceNotFoundException";
+
+/// The Runtime Monitoring details of `rule`, or `None` for a rule that is not a
+/// Runtime Monitoring rule.
+///
+/// "The presence of a platform member indicates that the rule is supported on that
+/// platform; the absence of a member indicates that the rule cannot run on that
+/// [platform]"
+/// (`smithy_query(query="doc",shape="DetectionRuleRuntimeMonitoringDetails",member="Platforms")`),
+/// so a platform the rule does not run on is left ABSENT rather than reported
+/// empty. `MinAgentVersion` stays absent too: it is the minimum agent version the
+/// rule requires, and these rules publish no minimum.
+fn runtime_details(
+    rule: &crate::state::CustomDetectionRuleRecord,
+) -> Option<DetectionRuleRuntimeMonitoringDetails> {
+    if rule.runtime_platforms.is_empty() {
+        return None;
+    }
+    let supported = |platform: &str| rule.runtime_platforms.iter().any(|held| held == platform);
+    Some(DetectionRuleRuntimeMonitoringDetails {
+        platforms: Some(DetectionRuleRuntimePlatforms {
+            eks: supported(crate::state::RUNTIME_PLATFORM_EKS).then_some(
+                DetectionRuleEksRequirements {
+                    min_agent_version: None,
+                },
+            ),
+            ec2: supported(crate::state::RUNTIME_PLATFORM_EC2).then_some(
+                DetectionRuleEc2Requirements {
+                    min_agent_version: None,
+                },
+            ),
+            ecs_fargate: supported(crate::state::RUNTIME_PLATFORM_ECS_FARGATE).then_some(
+                DetectionRuleEcsFargateRequirements {
+                    min_agent_version: None,
+                },
+            ),
+        }),
+    })
 }

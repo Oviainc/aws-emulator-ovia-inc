@@ -276,6 +276,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let now = ::std::time::SystemTime::now();
+        // The execution this revision report starts runs the same plan a
+        // `StartPipelineExecution` would, against the same artifact store (see
+        // `crate::state::driver`): a declaration with no store for this Region could not
+        // run an action at all, which is what the modelled `ValidationException` says.
+        let region = crate::state::request_region(&ctx.parts().headers);
+        let Some((artifact_bucket, artifact_encryption_key)) =
+            crate::state::artifact_store(&declaration, &region)
+        else {
+            return Err(PutActionRevisionErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "pipeline {} declares no artifactStore for region {region}",
+                        input.pipeline_name
+                    )),
+                },
+            )
+            .into());
+        };
         let record = crate::state::PipelineExecutionRecord {
             // Minted against the store, so the id this call reports is the one the
             // execution is filed under and no other execution can carry it.
@@ -295,6 +313,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             },
             execution_mode,
             execution_type: crate::state::EXECUTION_TYPE_STANDARD.to_string(),
+            // The placeholders an action's configuration resolves `#{variables.<name>}`
+            // against are the variables this execution runs with.
+            variables_map: variables
+                .iter()
+                .filter_map(|variable| {
+                    Some((
+                        format!("variables.{}", variable.name.clone()?),
+                        variable.resolved_value.clone()?,
+                    ))
+                })
+                .collect(),
             variables,
             // The execution runs the revision that started it, against the action it
             // was reported for.
@@ -304,6 +333,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 revision_summary: None,
                 revision_url: None,
             }],
+            // The stage/action plan this execution runs, and the state the engine moves
+            // through it (`crate::state::driver`).
+            stages: crate::state::plan_stages(&declaration, now),
+            artifact_bucket,
+            artifact_encryption_key,
+            // A revision report starts the execution at once: the concurrency gate
+            // above is what decided it may run.
+            queued: false,
+            stop: None,
+            artifacts: ::std::collections::BTreeMap::new(),
+            manual_retry_attempts: 0,
         };
 
         state.action_revisions.insert(action, revision);

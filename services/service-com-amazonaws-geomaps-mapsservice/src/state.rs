@@ -226,14 +226,32 @@ pub enum IconShape {
     Pin,
 }
 
-/// One icon in a sprite sheet: the name a style layer references, its size at
-/// `pixelRatio` 1, its shape and its colour.
+/// One icon in a sprite sheet: the name a style layer references, the box it
+/// occupies at `pixelRatio` 1, its shape and its colour.
+///
+/// The box is a width AND a height because a published sheet's icons are not
+/// square: a map pin is taller than it is wide and a route shield is wider than
+/// it is tall, and the index a client reads reports each icon's own rectangle.
 #[derive(Debug, Clone)]
 pub struct IconSpec {
     pub name: String,
-    pub size: u32,
+    pub width: u32,
+    pub height: u32,
     pub shape: IconShape,
     pub tint: Rgba,
+}
+
+impl IconSpec {
+    /// One icon of a family: its name, its box and how it is drawn.
+    fn new(name: &str, width: u32, height: u32, shape: IconShape, tint: Rgba) -> Self {
+        Self {
+            name: name.to_string(),
+            width,
+            height,
+            shape,
+            tint,
+        }
+    }
 }
 
 /// A sprite sheet: the icons it holds and how they are laid out on it.
@@ -242,11 +260,11 @@ pub struct SpriteSheetRecord {
     pub style: MapStyleKind,
     pub color_scheme: ColorSchemeKind,
     pub variant: VariantKind,
+    /// Every icon the sheet carries, in the order it is laid out.
     pub icons: Vec<IconSpec>,
-    /// Icons per row on the sheet.
-    pub columns: u32,
-    /// Transparent gap kept around each icon, at `pixelRatio` 1.
-    pub gutter: u32,
+    /// How wide the sheet may grow, in style pixels: an icon that does not fit
+    /// the current row starts the next one.
+    pub max_width: u32,
     pub cache_control: String,
 }
 
@@ -263,8 +281,28 @@ pub struct FontRecord {
     pub advance: u32,
     /// Ascender height in pixels, measured from the baseline.
     pub ascender: i32,
-    pub content_type: String,
     pub cache_control: String,
+}
+
+/// How the asset-delivery plane hands back a STORED map asset — a glyph range
+/// or a sprite file.
+///
+/// Those assets are not built per request: they are objects of a versioned,
+/// encrypted asset bucket the endpoint serves its static content from, so each
+/// of them reports the object's stored media type and the bucket's object
+/// headers rather than the media type of whatever is inside the object. The
+/// recorded responses for a glyph range, for `sprites.png` and for
+/// `sprites.json` all carry `Content-Type: binary/octet-stream` (S3's type for
+/// an object stored without one) together with `x-amz-version-id` and
+/// `x-amz-server-side-encryption: AES256`; the responses this service computes
+/// from the request — a style descriptor, a tile, a static map — carry none of
+/// that and keep their own media type.
+#[derive(Debug, Clone)]
+pub struct AssetDeliveryRecord {
+    /// The media type a stored asset is delivered with.
+    pub content_type: String,
+    /// The server-side-encryption algorithm the asset bucket reports.
+    pub server_side_encryption: String,
 }
 
 /// What `GetStaticMap` reports around the image it renders.
@@ -295,6 +333,8 @@ pub struct ComAmazonawsGeomapsMapsserviceState {
     /// `GetGlyphs` models no error, so every modeled-valid stack must answer.
     pub fallback_font: FontRecord,
     pub static_maps: StaticMapRecord,
+    /// How a STORED asset (a glyph range, a sprite file) is delivered.
+    pub asset_delivery: AssetDeliveryRecord,
     /// The pricing bucket reported for an asset whose own record carries none.
     pub default_pricing_bucket: String,
 }
@@ -352,6 +392,10 @@ fn seed() -> ComAmazonawsGeomapsMapsserviceState {
         sprites,
         fonts,
         fallback_font: font_record("Standard Regular", 24, 18, 20),
+        asset_delivery: AssetDeliveryRecord {
+            content_type: "binary/octet-stream".to_string(),
+            server_side_encryption: "AES256".to_string(),
+        },
         static_maps: StaticMapRecord {
             // `GetStaticMapResponse$Blob` documents the body as a jpeg.
             content_type: "image/jpeg".to_string(),
@@ -526,63 +570,367 @@ fn style_source(name: &str, tileset: &str) -> StyleSource {
     }
 }
 
-/// The sprite sheet for one (style, colour scheme, variant) triple. The icon
-/// tints come from that pair's palette, so the `Dark` sheet really is a
-/// different sheet rather than the same bytes under another key.
+/// The sprite sheet for one (style, colour scheme, variant) triple: the
+/// published iconography, tinted from that pair's palette — so the `Dark` sheet
+/// really is a different sheet rather than the same bytes under another key.
 fn seed_sprite_sheet(
     style: MapStyleKind,
     scheme: ColorSchemeKind,
     variant: VariantKind,
 ) -> SpriteSheetRecord {
     let p = palette(style, scheme);
-    let icons = vec![
-        IconSpec {
-            name: "poi-dot".to_string(),
-            size: 12,
-            shape: IconShape::Disc,
-            tint: p.marker,
-        },
-        IconSpec {
-            name: "poi-restaurant".to_string(),
-            size: 16,
-            shape: IconShape::Disc,
-            tint: p.label,
-        },
-        IconSpec {
-            name: "poi-hotel".to_string(),
-            size: 16,
-            shape: IconShape::Square,
-            tint: p.building,
-        },
-        IconSpec {
-            name: "poi-park".to_string(),
-            size: 16,
-            shape: IconShape::Disc,
-            tint: p.graticule,
-        },
-        IconSpec {
-            name: "transit-rail".to_string(),
-            size: 16,
-            shape: IconShape::Square,
-            tint: p.road,
-        },
-        IconSpec {
-            name: "marker".to_string(),
-            size: 20,
-            shape: IconShape::Pin,
-            tint: p.marker,
-        },
-    ];
+    let mut icons = Vec::with_capacity(
+        PLACE_ICONS.len()
+            + INCIDENT_ICONS.len()
+            + CITY_DOT_ICONS.len()
+            + MARKER_ICONS.len()
+            + ROUTE_SHIELD_ICONS.len()
+            + RESTRICTION_SHIELD_ICONS.len(),
+    );
+    for name in PLACE_ICONS {
+        icons.push(IconSpec::new(
+            name,
+            PLACE_ICON_BOX,
+            PLACE_ICON_BOX,
+            IconShape::Disc,
+            p.label,
+        ));
+    }
+    for name in INCIDENT_ICONS {
+        icons.push(IconSpec::new(
+            name,
+            INCIDENT_ICON_BOX,
+            INCIDENT_ICON_BOX,
+            IconShape::Square,
+            p.marker,
+        ));
+    }
+    for name in CITY_DOT_ICONS {
+        let box_size = city_dot_box(name);
+        icons.push(IconSpec::new(
+            name,
+            box_size,
+            box_size,
+            IconShape::Disc,
+            p.label,
+        ));
+    }
+    for name in MARKER_ICONS {
+        icons.push(IconSpec::new(
+            name,
+            MARKER_WIDTH,
+            MARKER_HEIGHT,
+            IconShape::Pin,
+            p.marker,
+        ));
+    }
+    for name in ROUTE_SHIELD_ICONS {
+        icons.push(IconSpec::new(
+            name,
+            route_shield_width(name),
+            SHIELD_HEIGHT,
+            IconShape::Square,
+            p.building,
+        ));
+    }
+    for name in RESTRICTION_SHIELD_ICONS {
+        icons.push(IconSpec::new(
+            name,
+            RESTRICTION_SHIELD_BOX,
+            RESTRICTION_SHIELD_BOX,
+            IconShape::Square,
+            p.road,
+        ));
+    }
+    // One sheet is laid out in one order: by icon name, so the rectangle a
+    // client is handed for an icon does not depend on the order the families
+    // happen to be listed in above.
+    icons.sort_by(|left, right| left.name.cmp(&right.name));
     SpriteSheetRecord {
         style,
         color_scheme: scheme,
         variant,
         icons,
-        columns: 3,
-        gutter: 2,
+        max_width: SHEET_MAX_WIDTH,
         cache_control: "max-age=86400".to_string(),
     }
 }
+
+// ---------------------------------------------------------------------------
+// The published sprite-sheet iconography
+// ---------------------------------------------------------------------------
+
+/// How wide a sheet may grow, in style pixels, before an icon starts a new row.
+pub const SHEET_MAX_WIDTH: u32 = 512;
+
+/// The box a place (point-of-interest) icon occupies at `pixelRatio` 1. The
+/// manifest the asset endpoint serves reports this size for every place icon
+/// (`accommodation` and `airport` come back as 21x21).
+pub const PLACE_ICON_BOX: u32 = 21;
+
+/// The box a traffic-incident icon occupies: bigger than a place icon, because
+/// an incident is drawn over the road it blocks (`accident` is 32x32).
+pub const INCIDENT_ICON_BOX: u32 = 32;
+
+/// The box a city dot occupies, and the smaller one its `_lowrank` variant
+/// gets — a lower-ranked place is drawn with a smaller dot.
+pub const CITY_DOT_BOX: u32 = 12;
+pub const CITY_DOT_LOWRANK_BOX: u32 = 8;
+
+/// The box a map pin (`marker`, `marker_*`) occupies: a pin is taller than it
+/// is wide, head plus stem.
+pub const MARKER_WIDTH: u32 = 24;
+pub const MARKER_HEIGHT: u32 = 32;
+
+/// A route shield's height, and the width of the box that holds a two-digit
+/// route number. A shield grows by [`SHIELD_DIGIT_WIDTH`] for every digit
+/// beyond [`SHIELD_BASE_DIGITS`] it must hold.
+pub const SHIELD_HEIGHT: u32 = 20;
+pub const SHIELD_BASE_WIDTH: u32 = 20;
+pub const SHIELD_BASE_DIGITS: u32 = 2;
+pub const SHIELD_DIGIT_WIDTH: u32 = 7;
+/// The widest route number a shield in this catalog holds.
+pub const SHIELD_MAX_DIGITS: u32 = 4;
+
+/// The box a heavy-goods-vehicle restriction sign (`shield-hgv-*`) occupies:
+/// a regulatory sign, square and larger than a route shield.
+pub const RESTRICTION_SHIELD_BOX: u32 = 24;
+
+/// The city-dot box for one dot name: a `_lowrank` dot is the smaller one.
+fn city_dot_box(name: &str) -> u32 {
+    if name.ends_with("_lowrank") {
+        CITY_DOT_LOWRANK_BOX
+    } else {
+        CITY_DOT_BOX
+    }
+}
+
+/// How wide the box of the route shield `name` is.
+///
+/// A shield is as wide as the longest route number it has to hold, which its
+/// own name states: either as a width word (`-long`, `-xlong`, `-wide`) or as a
+/// trailing digit-capacity suffix (`-3`, `-1-2`, `-3-4`). Everything else holds
+/// the catalog's base of [`SHIELD_BASE_DIGITS`] digits.
+pub fn route_shield_width(name: &str) -> u32 {
+    SHIELD_BASE_WIDTH + (route_shield_digits(name) - SHIELD_BASE_DIGITS) * SHIELD_DIGIT_WIDTH
+}
+
+/// The widest route number the shield `name` holds, in digits.
+fn route_shield_digits(name: &str) -> u32 {
+    if name.ends_with("-xlong") {
+        return SHIELD_MAX_DIGITS;
+    }
+    if name.ends_with("-long") || name.ends_with("-wide") {
+        return SHIELD_BASE_DIGITS + 1;
+    }
+    name.rsplit('-')
+        .take_while(|segment| !segment.is_empty() && segment.bytes().all(|b| b.is_ascii_digit()))
+        .filter_map(|segment| segment.parse::<u32>().ok())
+        .max()
+        .unwrap_or(SHIELD_BASE_DIGITS)
+        .clamp(SHIELD_BASE_DIGITS, SHIELD_MAX_DIGITS)
+}
+
+/// The place (point-of-interest) icons a published sheet carries.
+///
+/// Source for every name in this section: the `sprites.json` manifest the Maps
+/// asset endpoint serves for a sheet — the icon catalog `GetSprites`' own model
+/// documentation points at ("Style iconography with sprites" in the Amazon
+/// Location Service Developer Guide). The names are catalog data; the box each
+/// family occupies and the shape it is drawn as are the constants above.
+const PLACE_ICONS: &[&str] = &[
+    "accommodation",
+    "airport",
+    "attraction",
+    "bicycle",
+    "book",
+    "bus",
+    "cable-car",
+    "camping",
+    "car",
+    "cargo",
+    "cemetery",
+    "charging-station",
+    "cinema",
+    "cocktail",
+    "coffee",
+    "delivery-entrance",
+    "doctor",
+    "education",
+    "entrance",
+    "facilities",
+    "fast-food",
+    "ferry",
+    "funicular",
+    "game",
+    "gas-station",
+    "government",
+    "grocery",
+    "gym",
+    "harbour",
+    "hospital",
+    "information",
+    "light-rail",
+    "loading-zone",
+    "metro",
+    "money",
+    "monorail",
+    "museum",
+    "nature",
+    "nightclub",
+    "oneway",
+    "other",
+    "outdoor",
+    "park",
+    "parking",
+    "pharmacy",
+    "place-of-worship",
+    "police",
+    "pub",
+    "rail-yard",
+    "restaurant",
+    "salon",
+    "shopping",
+    "ski",
+    "stadium",
+    "swimming",
+    "taxi",
+    "theater",
+    "toll-booth",
+    "train",
+    "truck-parking",
+    "truck-services",
+    "truck-weigh-station",
+];
+
+/// The traffic-incident icons a published sheet carries.
+const INCIDENT_ICONS: &[&str] = &["accident", "congestion", "construction", "road_closure"];
+
+/// The city-dot icons a published sheet carries: the dot a place label is
+/// anchored to, open or filled, at full and at low rank.
+const CITY_DOT_ICONS: &[&str] = &[
+    "citydot",
+    "citydot-open",
+    "citydot-open_lowrank",
+    "citydot_lowrank",
+];
+
+/// The map-pin icons a published sheet carries.
+const MARKER_ICONS: &[&str] = &[
+    "marker",
+    "marker_arts_entertainment",
+    "marker_food_drink",
+    "marker_recreation",
+    "marker_stores_services",
+    "marker_transit",
+];
+
+/// The route shields a published sheet carries.
+const ROUTE_SHIELD_ICONS: &[&str] = &[
+    "shield-AE",
+    "shield-AU",
+    "shield-BAB",
+    "shield-BR",
+    "shield-CA",
+    "shield-CA-TransCanada",
+    "shield-CN",
+    "shield-CR",
+    "shield-DE",
+    "shield-Emirates routes",
+    "shield-HU",
+    "shield-IN-National",
+    "shield-IN-National-wide",
+    "shield-IN-State",
+    "shield-JP",
+    "shield-KR",
+    "shield-MX-Federal-1-2",
+    "shield-MX-Federal-3-4",
+    "shield-MY",
+    "shield-NL",
+    "shield-NL-ring",
+    "shield-PH",
+    "shield-PK",
+    "shield-Qatar motorways",
+    "shield-SA",
+    "shield-TR",
+    "shield-TW",
+    "shield-US-Hwy-1-2",
+    "shield-US-Hwy-3",
+    "shield-US-state",
+    "shield-UY",
+    "shield-VE",
+    "shield-ZM-roads",
+    "shield-autostrade-2-3",
+    "shield-autostrade-4-5",
+    "shield-blue-pentagon",
+    "shield-blue-pentagon-long",
+    "shield-blue-red-kite",
+    "shield-blue-red-kite-3",
+    "shield-ch",
+    "shield-cy",
+    "shield-green-hexagon",
+    "shield-green-red-kite",
+    "shield-green-red-kite-long",
+    "shield-green-square-kite",
+    "shield-kite-white",
+    "shield-kite-white-long",
+    "shield-mashreq",
+    "shield-md",
+    "shield-na",
+    "shield-rectangle-blue",
+    "shield-rectangle-blue-long",
+    "shield-rectangle-green",
+    "shield-rectangle-green-long",
+    "shield-rectangle-jp",
+    "shield-rectangle-red",
+    "shield-rectangle-white",
+    "shield-rectangle-white-long",
+    "shield-rectangle-white-xlong",
+    "shield-rectangle-yellow",
+    "shield-sadc",
+    "shield-white-red-square-kite",
+];
+
+/// The heavy-goods-vehicle restriction signs a published sheet carries.
+const RESTRICTION_SHIELD_ICONS: &[&str] = &[
+    "shield-hgv-axle_number_restriction",
+    "shield-hgv-axle_number_restriction_usa",
+    "shield-hgv-general_truck_restriction",
+    "shield-hgv-general_truck_restriction_usa",
+    "shield-hgv-hazmat_any_jpn",
+    "shield-hgv-hazmat_any_usa",
+    "shield-hgv-hazmat_corrosive_usa",
+    "shield-hgv-hazmat_explosives_usa",
+    "shield-hgv-hazmat_explosivesandflammable_usa",
+    "shield-hgv-hazmat_flammable_usa",
+    "shield-hgv-hazmat_flammablesolid_combustible_usa",
+    "shield-hgv-hazmat_gas_usa",
+    "shield-hgv-hazmat_general",
+    "shield-hgv-hazmat_harmful_for_water",
+    "shield-hgv-hazmat_harmfulforwater_usa",
+    "shield-hgv-hazmat_organic_usa",
+    "shield-hgv-hazmat_other_usa",
+    "shield-hgv-hazmat_permit_required",
+    "shield-hgv-hazmat_poison_inhalation_hazard_usa",
+    "shield-hgv-hazmat_poison_usa",
+    "shield-hgv-hazmat_radioactive_usa",
+    "shield-hgv-hazmat_tunnelcategory_usa",
+    "shield-hgv-hazmat_water",
+    "shield-hgv-height_restriction",
+    "shield-hgv-height_restriction_usa",
+    "shield-hgv-length_restriction",
+    "shield-hgv-length_restriction_kpra_usa",
+    "shield-hgv-length_restriction_usa",
+    "shield-hgv-speed_limit",
+    "shield-hgv-trailer_restriction",
+    "shield-hgv-trailer_restriction_usa",
+    "shield-hgv-weight_per_axle_restriction",
+    "shield-hgv-weight_per_axle_restriction_usa",
+    "shield-hgv-weight_restriction",
+    "shield-hgv-weight_restriction_usa",
+    "shield-hgv-width_restriction",
+    "shield-hgv-width_restriction_usa",
+];
 
 /// The font stacks this catalog has metrics for.
 fn seed_fonts() -> Vec<FontRecord> {
@@ -603,7 +951,6 @@ fn font_record(name: &str, em: u32, advance: u32, ascender: i32) -> FontRecord {
         buffer: 3,
         advance,
         ascender,
-        content_type: "application/octet-stream".to_string(),
         cache_control: "max-age=86400".to_string(),
     }
 }

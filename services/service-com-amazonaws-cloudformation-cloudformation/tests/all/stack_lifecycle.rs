@@ -33,10 +33,30 @@ pub(crate) fn router() -> MultiServiceRouter {
 
 /// The router AND the engine behind it, for a case that has to inspect the store or seed
 /// it with more records than a bound's worth of wire calls could create.
+///
+/// The services that OWN the resource types `state::provisioning` creates are mounted
+/// beside CloudFormation on the SAME engine, exactly as `core/router/src/lib.rs` mounts
+/// them: a stack's create calls those services, so a suite that deploys a template
+/// declaring one of those types must have them there. (Amazon Data Firehose is
+/// deliberately NOT one of them — `unprovisioned_resources.rs` is the suite that pins
+/// what a stack does when an owning service cannot be reached.)
 pub(crate) fn router_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.register_service(EmulatedService::new(Arc::clone(&engine)));
+    router.register_service(service_com_amazonaws_s3_amazons3::EmulatedService::new(
+        Arc::clone(&engine),
+    ));
+    router.register_service(
+        service_com_amazonaws_iam_awsidentitymanagementv20100508::EmulatedService::new(
+            Arc::clone(&engine),
+        ),
+    );
+    router.register_service(
+        service_com_amazonaws_codepipeline_codepipeline_20150709::EmulatedService::new(
+            Arc::clone(&engine),
+        ),
+    );
     (router, engine)
 }
 

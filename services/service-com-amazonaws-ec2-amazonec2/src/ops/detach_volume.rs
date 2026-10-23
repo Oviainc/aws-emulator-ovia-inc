@@ -1,15 +1,29 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DetachVolume
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DetachVolume`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: takes the attachment the request names down in [`crate::state`] and answers
+//! that attachment as it now reads. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DetachVolume::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "Detaches an EBS volume from an instance": there is something to detach only while the
+//! volume HAS an attachment, so a volume nothing holds — one in the `available` state — is
+//! refused with `IncorrectState`, the code EC2 answers when the resource exists but is not
+//! in a state that admits the request, and so is a volume attached to some instance other
+//! than the one the request named. A detach that is admitted puts the attachment into the
+//! non-terminal `detaching` state and the clock owes it `detached`
+//! ([`crate::state::VolumeRecord::detaching_at`]), at which point the volume holds no
+//! attachment and is `available` again — which is what `DescribeVolumes` then reports.
+//!
+//! The refusals in order: a malformed volume or instance id (`InvalidVolumeID.Malformed` /
+//! `InvalidInstanceID.Malformed`), then `DryRun` (`DryRunOperation`), then an id the account
+//! holds no volume for (`InvalidVolume.NotFound`), then the state (`IncorrectState`).
+//!
+//! `Force` "forces detachment if the previous detachment attempt did not occur cleanly": an
+//! attachment is only ever stuck because a file system inside a running instance holds the
+//! device, and this emulator runs no instance's file system, so every detach it admits
+//! completes on the clock and the flag changes nothing. A request that names neither an
+//! instance nor a device while the volume holds more than one attachment selects no single
+//! attachment, which is `InvalidParameterCombination` rather than a missing member: both
+//! members are optional, and it is the combination the request gave that cannot name one.
 //!
 //! ## Shape of an operation
 //!
@@ -170,18 +184,139 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DetachVolume` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DetachVolumeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DetachVolume"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            TRANSITION_DELAY, VOLUME_ATTACHMENT_STATE_DETACHING, VolumeRecord, dry_run_operation,
+            incorrect_state, instance_id_is_well_formed, invalid_volume_id_malformed,
+            invalid_volume_id_not_found, require_service_state, volume_id_is_well_formed,
+        };
+
+        // A volume carries its own Availability Zone, so nothing here depends on the Region
+        // the request was signed for.
+        let _ = ctx;
+
+        if !volume_id_is_well_formed(&input.volume_id) {
+            return Err(invalid_volume_id_malformed(&input.volume_id));
+        }
+        // "The ID of the instance" (`DetachVolumeRequest$InstanceId`) is optional, but a
+        // value that is not an instance id at all names nothing to detach from.
+        let requested_instance = input.instance_id.as_deref().filter(|id| !id.is_empty());
+        if let Some(instance_id) = requested_instance {
+            if !instance_id_is_well_formed(instance_id) {
+                return Err(Scaffolded::invalid_instance_id_malformed(instance_id));
+            }
+        }
+        let requested_device = input.device.as_deref().filter(|device| !device.is_empty());
+
+        // The permission question, answered before the resource one and before the write.
+        if input.dry_run == Some(true) {
+            return Err(dry_run_operation());
+        }
+
+        // "Forces detachment if the previous detachment attempt did not occur cleanly": see
+        // the module docs — no attachment this emulator holds can be stuck, so the flag
+        // selects nothing.
+        let _ = input.force;
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+        let now = ::std::time::Instant::now();
+
+        let Some(record) = store.volumes.get_mut(&input.volume_id) else {
+            return Err(invalid_volume_id_not_found(&input.volume_id));
+        };
+
+        // A detach the clock already finished took its attachment down: this write
+        // materialises that, so the record holds only the attachments a reader is already
+        // being shown and nothing is owed on an attachment that is gone.
+        record.materialize_due_detachments(now);
+
+        // The attachments the volume still holds, as of this instant: one whose detach the
+        // clock already made due is gone, so it cannot be detached a second time.
+        let held = record.attachments_at(now);
+        if held.is_empty() {
+            return Err(incorrect_state(format!(
+                "Volume '{}' is in the '{}' state, which is not a state it can be detached \
+                 from",
+                input.volume_id,
+                record.state_at(now)
+            )));
+        }
+        // The attachments the request names: an instance and a device each narrow the set,
+        // and a request naming neither names every attachment the volume holds.
+        let named: Vec<AttachVolumeOutput> = held
+            .iter()
+            .filter(|attachment| {
+                requested_instance
+                    .is_none_or(|instance_id| attachment.instance_id.as_deref() == Some(instance_id))
+                    && requested_device
+                        .is_none_or(|device| attachment.device.as_deref() == Some(device))
+            })
+            .cloned()
+            .collect();
+        let Some(attachment) = named.first().cloned() else {
+            return Err(incorrect_state(format!(
+                "Volume '{}' is not attached to {}",
+                input.volume_id,
+                match (requested_instance, requested_device) {
+                    (Some(instance_id), Some(device)) =>
+                        format!("instance '{instance_id}' at device '{device}'"),
+                    (Some(instance_id), None) => format!("instance '{instance_id}'"),
+                    (None, Some(device)) => format!("a device named '{device}'"),
+                    (None, None) => "any instance".to_string(),
+                }
+            )));
+        };
+        // "If you are detaching a Multi-Attach enabled volume, you must specify an instance
+        // ID" (`InstanceId`): more than one attachment answers the request as it stands, so
+        // there is no single one to take down and the request has to narrow it. The members
+        // are each optional and each valid, and it is the COMBINATION the request gave that
+        // cannot select one attachment, which is `InvalidParameterCombination`.
+        if named.len() > 1 {
+            return Err(Scaffolded::invalid_parameter_combination(format!(
+                "Volume '{}' holds {} attachments that the request names, so instanceId and \
+                 device must name the one to detach",
+                input.volume_id,
+                named.len()
+            )));
+        }
+        // The detach is a write: the attachment moves to `detaching` now, and the clock owes
+        // it `detached` — the same span, read off the same monotonic clock, as a volume's
+        // `creating` -> `available` move — at which point the volume holds it no more.
+        for stored in record.view.attachments.iter_mut().flatten() {
+            if stored.instance_id == attachment.instance_id
+                && stored.device == attachment.device
+            {
+                stored.state = Some(VOLUME_ATTACHMENT_STATE_DETACHING.to_string());
+            }
+        }
+        record.detaching_at.insert(
+            VolumeRecord::attachment_key(&attachment),
+            now + TRANSITION_DELAY,
+        );
+
+        // Read the answer back OUT of the store, so the caller is told what a later
+        // `DescribeVolumes` will report rather than the request object.
+        record
+            .attachments_at(now)
+            .into_iter()
+            .find(|held| held.instance_id == attachment.instance_id && held.device == attachment.device)
+            .map(|held| DetachVolumeOutput {
+                volume_id: held.volume_id,
+                instance_id: held.instance_id,
+                device: held.device,
+                state: held.state,
+                attach_time: held.attach_time,
+                delete_on_termination: held.delete_on_termination,
+                associated_resource: held.associated_resource,
+                instance_owning_service: held.instance_owning_service,
+                ebs_card_index: held.ebs_card_index,
+            })
+            .ok_or_else(|| {
+                Scaffolded::internal_error(format!(
+                    "the attachment of volume '{}' could not be read back",
+                    input.volume_id
+                ))
+            })
     }
 }

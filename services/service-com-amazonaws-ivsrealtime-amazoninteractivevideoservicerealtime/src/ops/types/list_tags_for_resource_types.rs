@@ -11,7 +11,16 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-ivsrealtime-amazoninteractivevideoservicerealtime.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.ivsrealtime#ListTagsForResourceRequest")]
+// `skip_validation = ["resourceArn"]`: the modelled `ResourceArn` `@pattern` cannot be
+// satisfied by any IVS ARN that exists (its resource-type element matches ONE character),
+// and the recordings show AWS accepting real ARNs here, so the walk must not refuse them.
+// The handler enforces `crate::state::check_resource_arn` instead, which carries the
+// member's modelled `@length(1..128)` unchanged and the model's pattern with only that one
+// element repeated, and is run by the framework's own constraint walk.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.ivsrealtime#ListTagsForResourceRequest",
+    skip_validation = ["resourceArn"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct ListTagsForResourceInput {
     pub resource_arn: String,

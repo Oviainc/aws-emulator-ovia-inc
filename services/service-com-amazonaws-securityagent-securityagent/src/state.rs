@@ -4,11 +4,11 @@
 //!
 //! The Application records every application operation reads and writes live here, so
 //! `CreateApplication`, `GetApplication`, `ListApplications`, `UpdateApplication` and
-//! `DeleteApplication` all see one copy of each resource. The target domain records
-//! live here for the same reason: `CreateTargetDomain` writes one and
-//! `BatchGetTargetDomains` reads that same record back. The helpers below (identity
-//! minting, the IdC application ARN, the modelled projections and the pagination cursor
-//! codec) are shared by those handlers rather than duplicated per operation.
+//! `DeleteApplication` all see one copy of each resource. The private connection records
+//! `CreatePrivateConnection`, `DescribePrivateConnection` and `ListPrivateConnections`
+//! share live here for the same reason, and so do the target domain records:
+//! `CreateTargetDomain` writes one and `BatchGetTargetDomains` reads that same record
+//! back.
 //!
 //! The agent space records sit beside them in the same struct, so `CreateAgentSpace`
 //! and `BatchGetAgentSpaces` — and every agent space operation implemented after them —
@@ -18,29 +18,36 @@
 //! `CreateSecurityRequirementPack`, `GetSecurityRequirementPack`,
 //! `ListSecurityRequirementPacks` — and every pack operation implemented after them —
 //! read and write ONE copy of each pack record.
+//!
+//! The helpers below (identity minting, the IdC application ARN, the account's network,
+//! the modelled projections and the pagination cursor codec) are shared by those
+//! handlers rather than duplicated per operation.
 
 use std::collections::BTreeMap;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
+
+use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
     AWSResources, AgentSpace, ApplicationSummary, CodeReviewSettings, DnsVerification,
-    HttpVerification, IdCConfiguration, SecurityRequirementPackSummary, TargetDomain,
-    VerificationDetails,
+    HttpVerification, IdCConfiguration, PrivateConnectionSummary,
+    SecurityRequirementPackSummary, TargetDomain, VerificationDetails,
 };
 
 /// The region every value this service derives from the request's region carries when
 /// the request arrived without a SigV4 credential scope to read one from.
 pub const DEFAULT_REGION: &str = "us-east-1";
 
-/// How many summary entries one `ListApplications` or `ListSecurityRequirementPacks`
-/// page holds when the caller asks for no page size.
+/// How many summary entries one listing page holds when the caller asks for no page
+/// size. Shared by every paginated listing of this service (`ListApplications`,
+/// `ListSecurityRequirementPacks`, `ListPrivateConnections`), which all take the one
+/// modelled `MaxResults` shape.
 ///
 /// CHOSEN, not cited: `MaxResults` carries neither `@default` nor `@range` in the
 /// model, so nothing pins this value. It only bounds the size of one response.
 pub const DEFAULT_MAX_RESULTS: i32 = 100;
 
-/// The most summary entries one `ListApplications` or `ListSecurityRequirementPacks`
-/// page can hold, whatever the caller asks for.
+/// The most summary entries one listing page can hold, whatever the caller asks for.
 ///
 /// CHOSEN, not cited, for the same reason as [`DEFAULT_MAX_RESULTS`]: `MaxResults`
 /// carries no `@range`, so nothing is refused at the boundary and a caller could
@@ -181,6 +188,11 @@ const PAGE_TOKEN_PREFIX: &str = "app-v1:";
 /// from [`PAGE_TOKEN_PREFIX`], so a cursor one list minted is not read as a resume
 /// point by the other.
 const PACK_PAGE_TOKEN_PREFIX: &str = "pack-v1:";
+
+/// The same, for `ListPrivateConnections`: a cursor minted for one listing names a
+/// resume point in another listing's key space, so each listing carries its own prefix
+/// and a cursor taken from the wrong one is refused.
+const PRIVATE_CONNECTION_PAGE_TOKEN_PREFIX: &str = "privconn-v1:";
 
 /// The IAM Identity Center instance id an `idcInstanceArn` that names none falls back
 /// to, so the minted `idcApplicationArn` is always well formed.
@@ -345,6 +357,163 @@ pub struct ApplicationIdentity {
     pub sequence: u64,
 }
 
+// ---------------------------------------------------------------------------
+// Private connections
+// ---------------------------------------------------------------------------
+
+/// The two `PrivateConnectionType` values
+/// (`smithy_query(query="shape",shape="PrivateConnectionType")`).
+pub const TYPE_SERVICE_MANAGED: &str = "SERVICE_MANAGED";
+/// See [`TYPE_SERVICE_MANAGED`].
+pub const TYPE_SELF_MANAGED: &str = "SELF_MANAGED";
+
+/// The `PrivateConnectionStatus` a connection carries while the clock still owes it its
+/// `ACTIVE` status, and the one it carries from then on
+/// (`smithy_query(query="shape",shape="PrivateConnectionStatus")`).
+pub const STATUS_CREATE_IN_PROGRESS: &str = "CREATE_IN_PROGRESS";
+/// See [`STATUS_CREATE_IN_PROGRESS`].
+pub const STATUS_ACTIVE: &str = "ACTIVE";
+
+/// How long after its create call a private connection still reports
+/// `CREATE_IN_PROGRESS`.
+///
+/// A created private connection is answered in the non-terminal
+/// `CREATE_IN_PROGRESS` status and reaches `ACTIVE` on its own, so the transition is
+/// one the CLOCK owes. AWS documents no duration for it, so this is the emulator's
+/// CHOSEN span, inside the 250–750 ms window this project fixes for such a
+/// transition. It is never zero, so a caller that reads straight back still observes
+/// the transient status; nothing sleeps for it — the due instant is stored and
+/// compared on read.
+pub const CREATE_TRANSITION: Duration = Duration::from_millis(500);
+
+/// The `dnsResolution` a service-managed create that names none takes.
+///
+/// Cited: `ServiceManagedInput$dnsResolution` — "The DNS resolution mode for the
+/// resource gateway. Defaults to PUBLIC when not set."
+pub const DEFAULT_DNS_RESOLUTION: &str = "PUBLIC";
+
+/// The most private connections this emulator stores for the account before
+/// `CreatePrivateConnection` answers the service's `ServiceQuotaExceededException`.
+///
+/// CHOSEN, not cited: the real service's private connection quota is not in the model.
+/// It is set far above any plausible client's connection count, so normal use never
+/// meets it, while the store a caller can grow stays bounded.
+pub const MAX_PRIVATE_CONNECTIONS: usize = 100;
+
+/// The ARN namespace (and SigV4 signing name) of VPC Lattice, the service that owns the
+/// resource gateways and resource configurations a private connection is built on.
+pub const VPC_LATTICE_ARN_SERVICE: &str = "vpc-lattice";
+
+/// The ARN resource type of a VPC Lattice resource gateway, as
+/// `com.amazonaws.vpclattice#ResourceGatewayArn`'s pattern spells it
+/// (`…:resourcegateway/rgw-…`).
+pub const KIND_RESOURCE_GATEWAY: &str = "resourcegateway";
+/// The ARN resource type of a VPC Lattice resource configuration, as
+/// `com.amazonaws.vpclattice#ResourceConfigurationArn`'s pattern spells it
+/// (`…:resourceconfiguration/rcfg-…`).
+pub const KIND_RESOURCE_CONFIGURATION: &str = "resourceconfiguration";
+
+/// The id prefix of a VPC Lattice resource gateway
+/// (`com.amazonaws.vpclattice#ResourceGatewayId`: `^rgw-[0-9a-z]{17}$`).
+pub const RESOURCE_GATEWAY_ID_PREFIX: &str = "rgw-";
+/// The id prefix of a VPC Lattice resource configuration
+/// (`com.amazonaws.vpclattice#ResourceConfigurationId`: `^rcfg-[0-9a-z]{17}$`).
+pub const RESOURCE_CONFIGURATION_ID_PREFIX: &str = "rcfg-";
+/// How many `[0-9a-z]` characters follow the prefix of either id, from those same two
+/// patterns.
+pub const LATTICE_ID_SUFFIX_LEN: usize = 17;
+
+/// The lowercase base-36 alphabet those id patterns admit (`[0-9a-z]`).
+const BASE36_LOWER: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+
+/// One stored private connection: the record every private connection operation reads.
+#[derive(Debug, Clone)]
+pub struct PrivateConnection {
+    /// The caller-chosen name, unique within the account — this record's key.
+    pub name: String,
+    /// `PrivateConnectionType`: [`TYPE_SERVICE_MANAGED`] or [`TYPE_SELF_MANAGED`].
+    pub connection_type: String,
+    /// The VPC Lattice resource gateway this connection reaches the provider through.
+    /// Present for a service-managed connection, whose gateway the service creates;
+    /// absent for a self-managed one, where the gateway is the caller's own and only
+    /// the resource configuration is named to the service.
+    pub resource_gateway_id: Option<String>,
+    /// The VPC Lattice resource configuration: the one the service created beside the
+    /// gateway for a service-managed connection, or the one the caller named for a
+    /// self-managed one, as the account holds it (the bare id, not the request's form).
+    pub resource_configuration_id: Option<String>,
+    /// `hostAddress` as the service-managed create supplied it.
+    pub host_address: Option<String>,
+    /// The VPC the service-managed resource gateway was created in.
+    pub vpc_id: Option<String>,
+    /// The subnets that gateway spans, persisted so a later read reports the placement
+    /// this connection was created with.
+    pub subnet_ids: Vec<String>,
+    /// The security groups attached to that gateway.
+    pub security_group_ids: Vec<String>,
+    /// `ipAddressType` as supplied, `None` when the create named none.
+    pub ip_address_type: Option<String>,
+    /// `ipv4AddressesPerEni` as supplied.
+    pub ipv4_addresses_per_eni: Option<i32>,
+    /// The TCP port ranges a consumer may reach the resource on, as supplied.
+    pub port_ranges: Vec<String>,
+    /// `ResourceConfigDnsResolution`, defaulted per [`DEFAULT_DNS_RESOLUTION`] for a
+    /// service-managed connection; `None` for a self-managed one, whose resource
+    /// configuration the caller owns and whose DNS mode this service does not choose.
+    pub dns_resolution: Option<String>,
+    /// The tags supplied at create time.
+    pub tags: BTreeMap<String, String>,
+    pub created_at: SystemTime,
+    /// The instant the clock owes this connection its `ACTIVE` status.
+    pub active_at: SystemTime,
+}
+
+impl PrivateConnection {
+    /// `PrivateConnectionStatus` at `now`: the transient create status until the stored
+    /// due instant passes, [`STATUS_ACTIVE`] from then on. A pure function of stored
+    /// state and the clock, so reading it changes nothing a later caller sees.
+    pub fn status(&self, now: SystemTime) -> &'static str {
+        if now >= self.active_at {
+            STATUS_ACTIVE
+        } else {
+            STATUS_CREATE_IN_PROGRESS
+        }
+    }
+
+    /// This connection projected onto the `PrivateConnectionSummary` shape, which
+    /// carries every member `CreatePrivateConnection`, `DescribePrivateConnection` and
+    /// `ListPrivateConnections` report — so the three answer ONE projection of the
+    /// stored record rather than three hand-written ones.
+    pub fn summary(&self, now: SystemTime) -> PrivateConnectionSummary {
+        PrivateConnectionSummary {
+            name: self.name.clone(),
+            r#type: self.connection_type.clone(),
+            status: self.status(now).to_string(),
+            resource_gateway_id: self.resource_gateway_id.clone(),
+            host_address: self.host_address.clone(),
+            vpc_id: self.vpc_id.clone(),
+            resource_configuration_id: self.resource_configuration_id.clone(),
+            // The certificate a create supplies is the CALLER's own PEM chain, and the
+            // expiry AWS reports here is that certificate's `notAfter`. This emulator
+            // reads the chain's PEM envelope but does not decode the X.509 inside it,
+            // so it reports no expiry rather than a value it would have had to invent;
+            // a value that is not a PEM certificate chain is still refused at create
+            // time.
+            certificate_expiry_time: None,
+            dns_resolution: self.dns_resolution.clone(),
+            // No stored connection has failed: this emulator moves a connection from
+            // `CREATE_IN_PROGRESS` to `ACTIVE` and never to a failed status, so there
+            // is no failure to describe. The member stays absent rather than carrying
+            // a message for a failure that did not happen.
+            failure_message: None,
+            // AWS reports no tag map for an untagged resource, so an empty map is
+            // absent rather than present and empty.
+            tags: (!self.tags.is_empty())
+                .then(|| self.tags.clone().into_iter().collect()),
+        }
+    }
+}
+
 /// One registered target domain: a web domain that must be verified before a pentest
 /// may target it.
 #[derive(Debug, Clone)]
@@ -478,6 +647,17 @@ impl TargetDomainRecord {
     }
 }
 
+/// The identity minted for a new private connection: the VPC Lattice resources the
+/// service creates for it, which are the service's to choose rather than the caller's
+/// to supply.
+#[derive(Debug, Clone)]
+pub struct PrivateConnectionIdentity {
+    /// The resource gateway id, in VPC Lattice's own `rgw-<17 of [0-9a-z]>` form.
+    pub resource_gateway_id: String,
+    /// The resource configuration id, in VPC Lattice's own `rcfg-<17 of [0-9a-z]>` form.
+    pub resource_configuration_id: String,
+}
+
 /// The identity minted for a new target domain: the two values that are the service's
 /// to choose rather than the caller's to supply.
 #[derive(Debug, Clone)]
@@ -497,6 +677,13 @@ pub struct ComAmazonawsSecurityagentSecurityagentState {
     /// Monotonic counter behind every minted `applicationId`, so two
     /// `CreateApplication` calls are two distinct records.
     pub next_application_seq: u64,
+    /// Every stored private connection, keyed by its name — which the API itself makes
+    /// the identifier ("A unique name for the private connection within your
+    /// account"). A `BTreeMap` for the same reason as `applications`.
+    pub private_connections: BTreeMap<String, PrivateConnection>,
+    /// Monotonic counter behind the VPC Lattice ids minted per private connection, so
+    /// two creates are two distinct gateways and configurations.
+    pub next_private_connection_seq: u64,
     /// Every registered target domain, keyed by its `targetDomainId`. A `BTreeMap` for
     /// the same reason as [`Self::applications`]: one stable order for the reads that
     /// walk the whole set.
@@ -541,6 +728,66 @@ impl ComAmazonawsSecurityagentSecurityagentState {
         }
     }
 
+    /// Mint the VPC Lattice resources a service-managed private connection is created
+    /// with: the resource gateway the service stands up in the caller's VPC, and the
+    /// resource configuration it creates beside it.
+    ///
+    /// Both ids are drawn from the monotonic counter — which advances once per id, so
+    /// the gateway and the configuration are two distinct resources — and rendered in
+    /// the base-36 form VPC Lattice's own id patterns declare.
+    pub fn mint_private_connection_identity(&mut self) -> PrivateConnectionIdentity {
+        let gateway_sequence = self.next_private_connection_seq.wrapping_add(1);
+        let configuration_sequence = self.next_private_connection_seq.wrapping_add(2);
+        self.next_private_connection_seq = configuration_sequence;
+        PrivateConnectionIdentity {
+            resource_gateway_id: format!(
+                "{RESOURCE_GATEWAY_ID_PREFIX}{}",
+                base36_id(u128::from(gateway_sequence))
+            ),
+            resource_configuration_id: format!(
+                "{RESOURCE_CONFIGURATION_ID_PREFIX}{}",
+                base36_id(u128::from(configuration_sequence))
+            ),
+        }
+    }
+
+    /// The VPC Lattice resource configuration `identifier` names in `region`, as the
+    /// account holds it (its bare id), or `None` when the account holds none under that
+    /// identifier — which a create answers with `ResourceNotFoundException`.
+    ///
+    /// `SelfManagedInput$resourceConfigurationId` is "The identifier or ARN of the
+    /// resource configuration", so both forms resolve: the bare id, and the ARN
+    /// `arn:aws:vpc-lattice:<region>:<account>:resourceconfiguration/<id>`
+    /// (`com.amazonaws.vpclattice#ResourceConfigurationArn`). Rather than taking an ARN
+    /// apart, each id the account holds is rendered as the ARN it has through
+    /// [`lattice_arn`] — the one ARN BUILDER this emulator mints resources with — and
+    /// the identifier has to equal one of the two forms. So an ARN naming another
+    /// partition, vendor, Region, account or resource type simply is not an ARN of any
+    /// resource configuration this request can reach, with no second ARN grammar
+    /// written down to disagree with the builder's.
+    ///
+    /// The resource configurations the emulated account holds are the ones it CREATED:
+    /// one per service-managed private connection, whose gateway and configuration are
+    /// the service's to create and are persisted on the record. VPC Lattice's own
+    /// `CreateResourceConfiguration` still answers 501 and keeps no store, so it
+    /// contributes none yet; when it is implemented, THIS is the one place that has to
+    /// start consulting that store beside these records.
+    pub fn resolve_resource_configuration(
+        &self,
+        region: &str,
+        identifier: &str,
+    ) -> Option<String> {
+        self.private_connections
+            .values()
+            .filter_map(|connection| connection.resource_configuration_id.as_deref())
+            .find(|id| {
+                identifier == *id
+                    || identifier
+                        == lattice_arn(region, KIND_RESOURCE_CONFIGURATION, id)
+            })
+            .map(str::to_string)
+    }
+
     /// Mint the identity of a new target domain.
     ///
     /// The id is 32 lowercase hex characters drawn from the monotonic counter, so it is
@@ -583,6 +830,102 @@ impl ComAmazonawsSecurityagentSecurityagentState {
             self.next_security_requirement_pack_seq.wrapping_add(1);
         format!("{:032x}", self.next_security_requirement_pack_seq)
     }
+}
+
+/// `sequence` as the `<17 of [0-9a-z]>` suffix VPC Lattice's resource-gateway and
+/// resource-configuration id patterns declare: base 36, lowercase, zero-padded to the
+/// pattern's exact length.
+fn base36_id(mut value: u128) -> String {
+    let mut digits = [b'0'; LATTICE_ID_SUFFIX_LEN];
+    for slot in digits.iter_mut().rev() {
+        *slot = BASE36_LOWER[(value % 36) as usize];
+        value /= 36;
+    }
+    String::from_utf8_lossy(&digits).into_owned()
+}
+
+/// The ARN a VPC Lattice resource of `kind` and id `id` has in `region`, built with the
+/// ONE ARN builder this emulator mints resources with (`engine::emulator_arn`, which
+/// carries the emulator's own partition and account). The form matches
+/// `com.amazonaws.vpclattice#ResourceConfigurationArn` /
+/// `#ResourceGatewayArn`: `arn:aws:vpc-lattice:<region>:<account>:<kind>/<id>`.
+pub fn lattice_arn(region: &str, kind: &str, id: &str) -> String {
+    ::engine::emulator_arn(VPC_LATTICE_ARN_SERVICE, region, &format!("{kind}/{id}"))
+}
+
+// ---------------------------------------------------------------------------
+// The account's network
+// ---------------------------------------------------------------------------
+
+/// How many hex characters an EC2 subnet identifier carries in its long form
+/// (`subnet-0bb1c79de3example`), which is the form [`region_subnets`] mints.
+const SUBNET_ID_HEX_LEN: usize = 17;
+
+/// How many digest BYTES go into an EC2 VPC identifier's short form (`vpc-1a2b3c4d`):
+/// two hex characters each, so four make the 8 the form carries.
+const VPC_ID_DIGEST_BYTES: usize = 4;
+
+/// The Availability Zone suffixes a Region's default subnets sit in. A Region has at
+/// least three Availability Zones, and a default VPC has one default subnet in each.
+const AVAILABILITY_ZONE_SUFFIXES: [&str; 3] = ["a", "b", "c"];
+
+/// A subnet of the account's network in one Region: the identifier a request names, the
+/// VPC it belongs to and the Availability Zone it sits in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubnetRecord {
+    pub subnet_id: String,
+    pub vpc_id: String,
+    pub availability_zone: String,
+}
+
+/// The id of the account's default VPC in `region`.
+///
+/// AWS gives an account a default VPC in every Region and this emulator models no
+/// other, so the id is DERIVED from the Region name — stable, so every read reports the
+/// same VPC — in EC2's short `vpc-<8 hex>` form.
+pub fn default_vpc_id(region: &str) -> String {
+    format!(
+        "vpc-{}",
+        hex::encode(&Sha256::digest(region.as_bytes())[..VPC_ID_DIGEST_BYTES])
+    )
+}
+
+/// The subnets that exist in `region`: the default VPC's default subnet in each
+/// Availability Zone of that Region.
+///
+/// THE SAME derivation, constant for constant, as the one
+/// `services/service-com-amazonaws-fsx-awssimbaapiservice-v20180301/src/state.rs` and
+/// `services/service-com-amazonaws-dax-amazondaxv3/src/state.rs` apply, all three
+/// written against the contract `services/common/src/network.rs` states, so no two
+/// services answer "does this subnet exist" differently and a client that places an FSx
+/// file system and a private connection's resource gateway in "the same" subnet is
+/// talking to one account. The derivation itself moves into that shared module once one
+/// change may carry every such service crate's manifest; keep them in step until then,
+/// and when EC2's subnet operations stop answering 501, [`resolve_subnet`] is the one
+/// place here that has to start consulting the stored subnets beside these derived ones.
+pub fn region_subnets(region: &str) -> Vec<SubnetRecord> {
+    let vpc_id = default_vpc_id(region);
+    AVAILABILITY_ZONE_SUFFIXES
+        .iter()
+        .map(|suffix| {
+            let availability_zone = format!("{region}{suffix}");
+            let digest = hex::encode(Sha256::digest(availability_zone.as_bytes()));
+            SubnetRecord {
+                subnet_id: format!("subnet-{}", &digest[..SUBNET_ID_HEX_LEN]),
+                vpc_id: vpc_id.clone(),
+                availability_zone,
+            }
+        })
+        .collect()
+}
+
+/// The subnet `subnet_id` names in `region`, or `None` when no subnet of that Region
+/// carries that identifier — which is what lets a request naming it be refused instead
+/// of stored.
+pub fn resolve_subnet(region: &str, subnet_id: &str) -> Option<SubnetRecord> {
+    region_subnets(region)
+        .into_iter()
+        .find(|subnet| subnet.subnet_id == subnet_id)
 }
 
 /// The verification token the owner of a target domain publishes: the SHA-256 of the
@@ -733,6 +1076,18 @@ pub fn encode_pack_page_token(pack_id: &str) -> String {
 /// that with a `ValidationException`).
 pub fn decode_pack_page_token(token: &str) -> Option<String> {
     decode_cursor(PACK_PAGE_TOKEN_PREFIX, token)
+}
+
+/// Encode the private connection name a `ListPrivateConnections` page resumes at as an
+/// opaque `nextToken`, on [`encode_page_token`]'s resume-AT rule.
+pub fn encode_connection_page_token(name: &str) -> String {
+    encode_cursor(PRIVATE_CONNECTION_PAGE_TOKEN_PREFIX, name)
+}
+
+/// The private connection name a `ListPrivateConnections` `nextToken` resumes at, or
+/// `None` when the token is not one this listing minted.
+pub fn decode_connection_page_token(token: &str) -> Option<String> {
+    decode_cursor(PRIVATE_CONNECTION_PAGE_TOKEN_PREFIX, token)
 }
 
 /// The region this request was signed for, from its SigV4 credential scope;

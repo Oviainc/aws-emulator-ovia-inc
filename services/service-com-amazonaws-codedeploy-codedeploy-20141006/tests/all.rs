@@ -35,6 +35,8 @@ mod git_hub_account_token_names;
 mod github_account_tokens;
 #[path = "all/lifecycle_event_hook_status.rs"]
 mod lifecycle_event_hook_status;
+#[path = "all/list_deployment_configs.rs"]
+mod list_deployment_configs;
 #[path = "all/list_deployment_groups.rs"]
 mod list_deployment_groups;
 #[path = "all/list_deployment_targets.rs"]

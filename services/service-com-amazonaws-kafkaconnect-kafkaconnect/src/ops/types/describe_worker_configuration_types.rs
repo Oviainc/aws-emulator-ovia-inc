@@ -17,7 +17,10 @@ pub struct DescribeWorkerConfigurationInput {
     pub worker_configuration_arn: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.kafkaconnect#DescribeWorkerConfigurationResponse")]
+/// `creationTime` targets `__timestampIso8601` (`@timestampFormat("date-time")`), so this
+/// shape's schema comes from `kc_schema_and_codec!` — see `types/date_time_wire.rs`.
+/// Member set, order and requiredness from
+/// `smithy_query(query="shape", shape="DescribeWorkerConfigurationResponse")`.
 #[derive(Debug, Clone, Default)]
 pub struct DescribeWorkerConfigurationOutput {
     pub creation_time: Option<::aws_smithy_types::DateTime>,
@@ -28,7 +31,45 @@ pub struct DescribeWorkerConfigurationOutput {
     pub worker_configuration_state: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.kafkaconnect#WorkerConfigurationRevisionDescription")]
+kc_schema_and_codec!(
+    DescribeWorkerConfigurationOutput,
+    DESCRIBE_WORKER_CONFIGURATION_OUTPUT_SCHEMA,
+    "com.amazonaws.kafkaconnect#DescribeWorkerConfigurationResponse",
+    "com.amazonaws.kafkaconnect",
+    "DescribeWorkerConfigurationResponse",
+    (M_CREATION_TIME, creation_time, "creationTime", 0, opt, date_time),
+    (M_DESCRIPTION, description, "description", 1, opt, string),
+    (
+        M_LATEST_REVISION,
+        latest_revision,
+        "latestRevision",
+        2,
+        opt,
+        struct_of(WorkerConfigurationRevisionDescription)
+    ),
+    (M_NAME, name, "name", 3, opt, string),
+    (
+        M_WORKER_CONFIGURATION_ARN,
+        worker_configuration_arn,
+        "workerConfigurationArn",
+        4,
+        opt,
+        string
+    ),
+    (
+        M_WORKER_CONFIGURATION_STATE,
+        worker_configuration_state,
+        "workerConfigurationState",
+        5,
+        opt,
+        string
+    ),
+);
+
+/// `creationTime` targets `__timestampIso8601` (`@timestampFormat("date-time")`), so this
+/// shape's schema comes from `kc_schema_and_codec!` — see `types/date_time_wire.rs`.
+/// Member set, order and requiredness from
+/// `smithy_query(query="shape", shape="WorkerConfigurationRevisionDescription")`.
 #[derive(Debug, Clone, Default)]
 pub struct WorkerConfigurationRevisionDescription {
     pub creation_time: Option<::aws_smithy_types::DateTime>,
@@ -36,4 +77,23 @@ pub struct WorkerConfigurationRevisionDescription {
     pub properties_file_content: Option<String>,
     pub revision: i64,
 }
+
+kc_schema_and_codec!(
+    WorkerConfigurationRevisionDescription,
+    WORKER_CONFIGURATION_REVISION_DESCRIPTION_SCHEMA,
+    "com.amazonaws.kafkaconnect#WorkerConfigurationRevisionDescription",
+    "com.amazonaws.kafkaconnect",
+    "WorkerConfigurationRevisionDescription",
+    (M_CREATION_TIME, creation_time, "creationTime", 0, opt, date_time),
+    (M_DESCRIPTION, description, "description", 1, opt, string),
+    (
+        M_PROPERTIES_FILE_CONTENT,
+        properties_file_content,
+        "propertiesFileContent",
+        2,
+        opt,
+        string
+    ),
+    (M_REVISION, revision, "revision", 3, def, long),
+);
 

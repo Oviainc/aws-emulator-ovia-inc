@@ -305,10 +305,13 @@ fn account_id_of(len: usize) -> String {
     }
 }
 
-/// A well-formed IAM role ARN of exactly `len` characters, padded in the role name.
-/// `len` has to be at least [`SHORTEST_ROLE_ARN`].
-fn role_arn_of(len: usize) -> String {
-    let prefix = "arn:aws:iam::000000000000:role/";
+/// A well-formed IAM role ARN of exactly `len` characters in the account `account_id`,
+/// padded in the role name. `len` has to be at least [`SHORTEST_ROLE_ARN`].
+///
+/// The account is the CONFIGURED one because a target account configuration's `roleArn`
+/// has to name a role of the account it configures.
+fn role_arn_of(account_id: &str, len: usize) -> String {
+    let prefix = format!("arn:aws:iam::{account_id}:role/");
     if len <= prefix.len() {
         format!("arn:aws:iam::1:role/{}", "x".repeat(len.saturating_sub(20)))[..len].to_string()
     } else {
@@ -339,14 +342,17 @@ fn rows() -> Vec<Row> {
         Row {
             case: "account id at the published floor, no description, no token",
             account_id: account_id_of(ACCOUNT_ID_FLOOR),
-            role_arn: role_arn_of(SHORTEST_ROLE_ARN),
+            role_arn: role_arn_of(&account_id_of(ACCOUNT_ID_FLOOR), SHORTEST_ROLE_ARN),
             description: None,
             client_token: None,
         },
         Row {
             case: "account id at the published ceiling, role at the published ceiling",
             account_id: account_id_of(ACCOUNT_ID_CEILING),
-            role_arn: role_arn_of(ROLE_ARN_CEILING),
+            // An `accountId` at `TargetAccountId`'s ceiling is no account NUMBER, so it
+            // names no account for a role to belong to: any well-formed role ARN is
+            // admissible for it.
+            role_arn: role_arn_of("000000000000", ROLE_ARN_CEILING),
             description: Some("the longest name this service accepts".to_string()),
             client_token: Some("token-ceiling".to_string()),
         },
@@ -766,7 +772,7 @@ async fn a_delete_outside_a_modelled_bound_is_refused_and_removes_nothing() {
         &template_id,
         &account_id,
         create_body(
-            "arn:aws:iam::000000000000:role/fis-bounds",
+            &format!("arn:aws:iam::{account_id}:role/fis-bounds"),
             Some("still here"),
             Some("token-delete-bounds"),
         ),

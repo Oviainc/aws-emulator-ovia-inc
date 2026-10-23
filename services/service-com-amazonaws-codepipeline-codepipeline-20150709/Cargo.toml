@@ -8,6 +8,27 @@ build = "build.rs"
 
 [dependencies]
 engine = { workspace = true }
+# The shared validation-message rules: `unanchored` is the staged home for rendering a
+# `@pattern` as the expression a value must satisfy, so this crate calls it rather than
+# inlining another copy.
+service-common = { path = "../common" }
+# The S3 client the pipeline execution engine moves artifacts with, over the in-process
+# callback into this same emulator (no network client feature: the transport is the
+# emulator's own).
+aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
+# The IAM client CreatePipeline checks the declaration's roleArn against.
+aws-sdk-iam = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
+# Reader for the artifact archive an S3 deploy action with Extract=true unzips.
+# Pinned to 9.x: RUSTSEC-2026-0368 affects every earlier release.
+#
+# The archive is CALLER-supplied (the bytes of an object a caller uploaded), so the
+# extraction is clamped before anything is allocated from it, at its one use site
+# (`state::driver::run_deploy`): at most `state::execution::MAX_ARCHIVE_ENTRIES` (1,024)
+# entries are read, and the running total of uncompressed bytes written is checked
+# against `state::execution::MAX_EXTRACTED_BYTES` (16 MiB) BEFORE each entry's bytes are
+# read, so neither the entry count nor the uncompressed size a declaration can ask for
+# grows the store or the heap past those figures.
+zip = { version = "9", default-features = false, features = ["deflate"] }
 smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }
 aws-smithy-schema-server = { workspace = true }
@@ -31,6 +52,11 @@ emulator-core-build-support = { workspace = true }
 [dev-dependencies]
 sha2 = { workspace = true }
 hex = { workspace = true }
+# The execution tests mount S3 and IAM beside codepipeline on one engine, because the
+# execution engine moves artifacts through S3 and CreatePipeline checks the role in IAM.
+service-com-amazonaws-s3-amazons3 = { workspace = true }
+service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
+zip = { version = "9", default-features = false, features = ["deflate"] }
 
 [lints]
 workspace = true

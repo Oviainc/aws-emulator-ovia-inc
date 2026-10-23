@@ -18,9 +18,14 @@
 //! `ServerlessGeneration` member plus the omitted case, capacity limits whole / partial /
 //! absent, four Regions, tags including non-ASCII values, and id- as well as
 //! name-addressed reads.
+//!
+//! The effective `capacityLimits` and the `storageConfiguration` every detail reports have
+//! their own suite beside this one (`collection_group_capacity`), whose
+//! [`expected_capacity_limits`] this suite reuses rather than restating the defaults.
 
 use serde_json::{json, Value};
 
+use crate::collection_group_capacity::expected_capacity_limits;
 use crate::collection_lifecycle::{at, call, call_in, emulator, is_collection_id, text, ACCOUNT};
 
 /// Every `ServerlessGeneration` member, from the model's own value list
@@ -142,7 +147,8 @@ async fn a_created_collection_group_round_trips_through_batch_get() {
         (
             "eu-west-1",
             // Every optional member omitted, so this row pins the default `generation`
-            // and that an absent `capacityLimits` stays absent.
+            // and the `capacityLimits` the service defaults in for a group that named
+            // none.
             json!({ "name": "gamma-group", "standbyReplicas": STANDBY_REPLICAS[1] }),
             "CLASSIC",
             STANDBY_REPLICAS[1],
@@ -205,8 +211,9 @@ async fn a_created_collection_group_round_trips_through_batch_get() {
         );
         assert_eq!(
             at(&detail, "capacityLimits"),
-            at(&requested, "capacityLimits"),
-            "case {case}: capacityLimits must be the requested ones, got {detail}"
+            &expected_capacity_limits(at(&requested, "capacityLimits")),
+            "case {case}: capacityLimits must be the requested ones, with the service \
+             default for each ceiling the request omitted, got {detail}"
         );
         let expected_tags = match at(&requested, "tags") {
             Value::Null => json!([]),
@@ -237,6 +244,7 @@ async fn a_created_collection_group_round_trips_through_batch_get() {
                 "generation",
                 "description",
                 "capacityLimits",
+                "storageConfiguration",
                 "tags",
                 "createdDate",
             ] {

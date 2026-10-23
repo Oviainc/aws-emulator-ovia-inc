@@ -9,15 +9,16 @@
 //! answers 501 again.
 //!
 //! A request that satisfies every precondition still answers HTTP 501
-//! `NotImplemented`, because recognising entities means running a trained
-//! named-entity recognition model and this emulator has no in-process engine for
-//! one: no maintained offline crate does it, and an invented `ResultList` — entities
-//! matched out of the request, or an empty `Entities` list claiming the document
-//! holds none — would be output nothing computed. The marker line above therefore
-//! STAYS: entity recognition is still unwritten, so this operation belongs in the
-//! stub census (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`) until an
-//! engine for it exists. `DetectEntities`, the single-document sibling, is a stub
-//! for the same reason and carries its own issue.
+//! `NotImplemented`, because the BATCH projection itself — one
+//! `BatchDetectEntitiesItemResult` per `TextList` index, with the per-document
+//! failures the modelled `ErrorList` carries — is unwritten. The recognition engine
+//! it needs now EXISTS in this crate: the single-document sibling `DetectEntities`
+//! is implemented and exports its in-process rule-and-lexicon recogniser as
+//! [`crate::ops::detect_entities::detect_entities`], so whoever implements this
+//! operation under its own issue calls that per document rather than inventing a
+//! `ResultList`. Until that wrapper is written the marker line above STAYS: this
+//! operation computes no result yet, so it belongs in the stub census
+//! (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`).
 //!
 //! ## Shape of an operation
 //!
@@ -98,13 +99,14 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-/// The most documents one `BatchDetectEntities` request may carry.
-///
-/// From the modelled member documentation of `BatchDetectEntitiesRequest$TextList`:
-/// "The list can contain a maximum of 25 documents" — the same limit the
-/// `BatchSizeLimitExceededException` this operation declares names ("The number of
-/// documents in the request exceeds the limit of 25").
-pub const MAX_BATCH_DOCUMENTS: usize = 25;
+/// The most documents one `BatchDetectEntities` request may carry: the ONE ceiling
+/// the whole `BatchDetect*` family shares,
+/// [`crate::state::MAX_BATCH_DOCUMENTS`], from the modelled member documentation of
+/// `BatchDetectEntitiesRequest$TextList`: "The list can contain a maximum of 25
+/// documents" — the same limit the `BatchSizeLimitExceededException` this operation
+/// declares names ("The number of documents in the request exceeds the limit of
+/// 25").
+pub const MAX_BATCH_DOCUMENTS: usize = crate::state::MAX_BATCH_DOCUMENTS;
 
 /// The largest single document in the batch, in UTF-8 bytes.
 ///
@@ -112,9 +114,10 @@ pub const MAX_BATCH_DOCUMENTS: usize = 25;
 /// enforces, [`crate::state::REALTIME_TEXT_QUOTA_BYTES`] — one document's quota
 /// cannot depend on whether it was submitted alone or in a batch. The member
 /// documentation rounds it to "5 KB"; the enforced quota is a count of BYTES, so it
-/// is that constant and not a multiple of 1024. A document past it is refused with
-/// the `TextSizeLimitExceededException` this operation declares ("The size of the
-/// input text exceeds the limit. Use a smaller document.").
+/// is that constant and not a multiple of 1024. A batch carrying a document past it
+/// is refused in its entirety with the `TextSizeLimitExceededException` this
+/// operation declares, through the ONE batch size precondition the family shares,
+/// [`crate::state::batch_text_size_refusal`].
 pub const MAX_DOCUMENT_BYTES: usize = crate::state::REALTIME_TEXT_QUOTA_BYTES;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -200,12 +203,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 BatchDetectEntitiesErrorModeled::BatchSizeLimitExceededException(
                     BatchSizeLimitExceededException {
-                        message: Some(format!(
-                            "TextList contains {} documents, which exceeds the limit of \
-                             {MAX_BATCH_DOCUMENTS}. Please use a smaller number of items in \
-                             a single batch.",
-                            input.text_list.len()
-                        )),
+                        message: Some(crate::state::batch_size_limit_refusal()),
                     },
                 )
                 .into(),
@@ -214,22 +212,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The documented per-document ceiling. The model's `@length` floor of 1 on
         // the list is enforced at the boundary; this byte ceiling is stated in prose
-        // only, so it is enforced here, naming the document that broke it.
-        if let Some((index, text)) = input
-            .text_list
-            .iter()
-            .enumerate()
-            .find(|(_, text)| text.len() > MAX_DOCUMENT_BYTES)
-        {
+        // only, so it is enforced here — over the whole request, through the ONE
+        // size check and the ONE size-report sentence every real-time inference
+        // operation shares, which names the quota and the offending document's byte
+        // length.
+        if let Some(message) = crate::state::batch_text_size_refusal(
+            input.text_list.iter().map(String::as_str),
+            MAX_DOCUMENT_BYTES,
+        ) {
             return Err(
                 BatchDetectEntitiesErrorModeled::TextSizeLimitExceededException(
                     TextSizeLimitExceededException {
-                        message: Some(format!(
-                            "The document at index {index} is {} bytes, which exceeds the \
-                             {MAX_DOCUMENT_BYTES} byte limit for one document in a batch. Use \
-                             a smaller document.",
-                            text.len()
-                        )),
+                        message: Some(message),
                     },
                 )
                 .into(),

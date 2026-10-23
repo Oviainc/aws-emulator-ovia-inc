@@ -15,6 +15,8 @@
 mod agent_space_lifecycle;
 #[path = "all/application_lifecycle.rs"]
 mod application_lifecycle;
+#[path = "all/private_connection_lifecycle.rs"]
+mod private_connection_lifecycle;
 #[path = "all/security_requirement_pack.rs"]
 mod security_requirement_pack;
 #[path = "all/security_requirement_packs.rs"]
