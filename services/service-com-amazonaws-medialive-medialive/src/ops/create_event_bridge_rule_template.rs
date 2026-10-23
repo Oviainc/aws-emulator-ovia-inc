@@ -246,7 +246,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
                 now,
             )
-            .map_err(|refusal| refused(refusal, &region))?;
+            .map_err(refused)?;
 
         if let Some(token) = input.request_id.as_deref() {
             // Bounded, evicting write, keyed by the region the token was
@@ -308,7 +308,6 @@ fn event_targets(
 /// full store its 429.
 fn refused(
     refusal: crate::state::EventBridgeRuleTemplateRefusal,
-    region: &str,
 ) -> CreateEventBridgeRuleTemplateError {
     match refusal {
         crate::state::EventBridgeRuleTemplateRefusal::GroupNotFound { identifier } => {
@@ -320,11 +319,9 @@ fn refused(
             })
             .into()
         }
-        crate::state::EventBridgeRuleTemplateRefusal::NameTaken { id, name } => {
+        crate::state::EventBridgeRuleTemplateRefusal::NameTaken { .. } => {
             CreateEventBridgeRuleTemplateErrorModeled::ConflictException(ConflictException {
-                message: Some(format!(
-                    "An eventbridge rule template named {name} already exists in {region} (id {id})"
-                )),
+                message: Some(crate::state::NAME_ALREADY_IN_USE_MESSAGE.to_string()),
             })
             .into()
         }
