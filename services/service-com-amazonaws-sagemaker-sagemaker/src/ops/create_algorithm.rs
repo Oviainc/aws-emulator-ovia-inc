@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateAlgorithm
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateAlgorithm`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateAlgorithm::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: registers an algorithm in `crate::state` under its `AlgorithmName`,
+//! minting the `AlgorithmArn` from the request's region, refusing a name already in use
+//! and a store at its quota. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -103,9 +97,17 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-sagemaker-sagemaker.jso
 // here — hence the `CreateAlgorithmError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.sagemaker#CreateAlgorithm")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.sagemaker#CreateAlgorithm",
+    // Widened in: the store this emulator keeps is in memory, so it refuses a create
+    // past its capacity guard (`crate::state::ALGORITHM_QUOTA`) with the shape THIS
+    // SERVICE models for exceeding a resource limit — the same shape `CreateModel`
+    // answers with — rather than growing without a ceiling.
+    extra_errors = ["ResourceLimitExceeded"]
+)]
 #[derive(Debug)]
 pub enum CreateAlgorithmErrorModeled {
+    ResourceLimitExceeded(ResourceLimitExceeded),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -159,18 +161,64 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateAlgorithm` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateAlgorithmErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateAlgorithm"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        let region = crate::state::request_region(ctx);
+        let arn = crate::state::resource_arn(&region, "algorithm", &input.algorithm_name);
+        let created_at = ::std::time::SystemTime::now();
+
+        let mut store = state.lock();
+        // A name already in use is refused, never overwritten: otherwise the caller
+        // reads a 200 for an algorithm it did not create, and the one it did create is
+        // gone. This operation models no client-input error, so the refusal goes out as
+        // the 400 `ValidationException` the framework renders. Checked BEFORE the quota,
+        // so a re-create of a stored name is told the specific reason even when the
+        // store happens to sit at its bound.
+        if store.algorithms.contains_key(&input.algorithm_name) {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "Cannot create already existing algorithm \"{arn}\"."
+            )));
+        }
+        // The store is bounded, so a caller varying `AlgorithmName` cannot grow it
+        // without end.
+        if !store.algorithms_below_quota() {
+            return Err(CreateAlgorithmErrorModeled::ResourceLimitExceeded(
+                ResourceLimitExceeded {
+                    message: Some(format!(
+                        "The account-level service limit for algorithms is {}, with current \
+                         utilization of {} and a request delta of 1.",
+                        crate::state::ALGORITHM_QUOTA,
+                        store.algorithms.len()
+                    )),
+                },
+            )
+            .into());
+        }
+
+        store.algorithms.insert(
+            input.algorithm_name.clone(),
+            crate::state::Algorithm {
+                name: input.algorithm_name.clone(),
+                arn: arn.clone(),
+                description: input.algorithm_description,
+                training_specification: input.training_specification,
+                inference_specification: input.inference_specification,
+                validation_specification: input.validation_specification,
+                certify_for_marketplace: input.certify_for_marketplace,
+                // A new algorithm is not ready yet: SageMaker reports `Pending` and the
+                // clock owes the move to its terminal status, so a caller describing it
+                // straight after this call still observes the transient one.
+                status: crate::state::ALGORITHM_STATUS_PENDING.to_string(),
+                tags: input.tags.unwrap_or_default(),
+                creation_time: created_at,
+                completed_at: created_at + crate::state::ALGORITHM_COMPLETED_AFTER,
+            },
+        );
+        drop(store);
+
+        crate::state::record_state_change(Self::NAME, &arn, ctx);
+        Ok(CreateAlgorithmOutput { algorithm_arn: arn })
     }
 }
+
