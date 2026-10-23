@@ -753,6 +753,23 @@ pub fn normalize_comment_id(raw: &str) -> Result<&str, CommentIdProblem> {
     Ok(trimmed)
 }
 
+/// The message `CommentDeletedException` carries: a FIXED sentence naming the
+/// action that was refused, carrying no value from the request.
+///
+/// CodeCommit answers a call against a comment whose content has been deleted with
+/// "You cannot <action> this comment. The specified comment has already been marked
+/// as deleted. Verify that you specified a valid comment ID, and then try again." —
+/// the recorded answer to a repeated `DeleteCommentContent` is that sentence with
+/// `delete` as the action. `refused_action` is the verb phrase for the operation
+/// doing the refusing, so the four operations that reject a deleted comment cannot
+/// disagree about the rest of the sentence.
+pub fn comment_deleted_message(refused_action: &str) -> String {
+    format!(
+        "You cannot {refused_action} this comment. The specified comment has already been marked \
+         as deleted. Verify that you specified a valid comment ID, and then try again."
+    )
+}
+
 /// A comment's opaque `commentId`: the same kind of version-8 UUID, over the
 /// account, the repository, the comment's post order and the instant it was
 /// posted. It is therefore stable for the life of the comment and distinct from

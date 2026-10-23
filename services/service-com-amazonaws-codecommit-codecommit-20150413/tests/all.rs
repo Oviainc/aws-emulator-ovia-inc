@@ -17,6 +17,8 @@ mod approval_rules_and_commits;
 mod blob_content;
 #[path = "all/branch_creation.rs"]
 mod branch_creation;
+#[path = "all/comment_content_deletion.rs"]
+mod comment_content_deletion;
 #[path = "all/comment_lifecycle.rs"]
 mod comment_lifecycle;
 #[path = "all/commit_reads.rs"]

@@ -94,15 +94,38 @@ pub(crate) async fn error_as(
     body: &Value,
     expected_status: u16,
 ) -> String {
+    refusal_as(router, access_key_id, operation, body, expected_status)
+        .await
+        .0
+}
+
+/// The modeled error code AND message of a failed call by a named caller, with
+/// the status asserted: the same parse as [`error_as`], for a suite that asserts
+/// what the error SAYS as well as which one it is. awsJson carries the code in
+/// `__type` (optionally namespace-qualified) and the message in `message`.
+pub(crate) async fn refusal_as(
+    router: &MultiServiceRouter,
+    access_key_id: &str,
+    operation: &str,
+    body: &Value,
+    expected_status: u16,
+) -> (String, String) {
     let (status, payload) = call_as(router, access_key_id, operation, body).await;
     assert_eq!(
         status, expected_status,
         "operation {operation} as {access_key_id}: expected HTTP {expected_status}, got {status} \
          with {payload}"
     );
-    payload
+    let code = payload
         .get("__type")
         .and_then(Value::as_str)
         .map(|shape| shape.rsplit('#').next().unwrap_or(shape).to_string())
-        .unwrap_or_else(|| panic!("operation {operation}: no __type in {payload}"))
+        .unwrap_or_else(|| panic!("operation {operation}: no __type in {payload}"));
+    let message = payload
+        .get("message")
+        .or_else(|| payload.get("Message"))
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("operation {operation}: no message in {payload}"))
+        .to_string();
+    (code, message)
 }

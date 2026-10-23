@@ -203,10 +203,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if comment.deleted {
             return Err(GetCommentErrorModeled::CommentDeletedException(
                 CommentDeletedException {
-                    message: Some(format!(
-                        "the comment {} has already been deleted",
-                        comment.comment_id
-                    )),
+                    message: Some(crate::state::comment_deleted_message("retrieve")),
                 },
             )
             .into());

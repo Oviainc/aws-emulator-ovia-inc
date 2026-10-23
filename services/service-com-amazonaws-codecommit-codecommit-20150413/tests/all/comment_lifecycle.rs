@@ -25,7 +25,7 @@ use crate::wire::{caller_arn, error_as, ok_as, DEFAULT_ACCESS_KEY_ID};
 /// The file every fixture repository holds, and the two versions of it the two
 /// commits carry. The line counts (2 and 3) are what a comment's `filePosition`
 /// is checked against.
-const PATH: &str = "README.md";
+pub(crate) const PATH: &str = "README.md";
 const BEFORE_CONTENT: &[u8] = b"alpha\nbeta\n";
 const AFTER_CONTENT: &[u8] = b"alpha\nbeta\ngamma\n";
 const BEFORE_LINES: i64 = 2;
@@ -34,25 +34,25 @@ const AFTER_LINES: i64 = 3;
 /// A second principal, so the tests can tell callers apart where the service
 /// does: only an author may edit a comment, and a reaction belongs to the caller
 /// that left it.
-const OTHER_ACCESS_KEY_ID: &str = "AKIDOTHERUSER";
+pub(crate) const OTHER_ACCESS_KEY_ID: &str = "AKIDOTHERUSER";
 
 /// The documented comment size bound: "The comment is too large. Comments are
 /// limited to 10,240 characters."
 /// (`smithy_query(query="shape",shape="CommentContentSizeLimitExceededException")`).
-const MAX_COMMENT_CHARACTERS: usize = 10_240;
+pub(crate) const MAX_COMMENT_CHARACTERS: usize = 10_240;
 
 /// A repository holding one file at two commits: everything a comment on a
 /// comparison needs.
-struct Fixture {
-    router: smithy_server_runtime::MultiServiceRouter,
-    repository: String,
-    before_commit: String,
-    after_commit: String,
-    before_blob: String,
-    after_blob: String,
+pub(crate) struct Fixture {
+    pub(crate) router: smithy_server_runtime::MultiServiceRouter,
+    pub(crate) repository: String,
+    pub(crate) before_commit: String,
+    pub(crate) after_commit: String,
+    pub(crate) before_blob: String,
+    pub(crate) after_blob: String,
 }
 
-async fn fixture(repository: &str) -> Fixture {
+pub(crate) async fn fixture(repository: &str) -> Fixture {
     let router = emulator();
     ok(
         &router,
