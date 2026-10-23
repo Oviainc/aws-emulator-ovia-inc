@@ -208,6 +208,69 @@ impl Workspace {
             .collect()
     }
 
+    /// Everything stored in this workspace that still REFERENCES the component
+    /// type `component_type_id`, each as a short description of where the
+    /// reference lives, in a stable (id-ordered) order.
+    ///
+    /// A stored reference to a component type is one of:
+    ///
+    /// * an entity's component, through `ComponentRequest::componentTypeId` —
+    ///   the component IS an instance of the type, so the type's definitions are
+    ///   what give the component's properties their meaning;
+    /// * another component type that `extendsFrom` it — the child inherits its
+    ///   property definitions;
+    /// * another component type that names it in its `compositeComponentTypes`
+    ///   — the composite type is built out of it.
+    ///
+    /// A `RELATIONSHIP` property definition's `targetComponentTypeId` is NOT
+    /// counted: it is a declared target no writer in this service requires to
+    /// resolve (a create stores it without checking, and it may name one of the
+    /// service's built-in types, of which this emulator holds no registry), so
+    /// counting it would refuse deletes the real service allows.
+    ///
+    /// Derived on every call rather than kept as a count beside the component
+    /// type, so a reference created or dropped afterwards cannot leave it stale
+    /// — the same choice [`has_child_entities`](Self::has_child_entities) makes.
+    pub fn component_type_references(&self, component_type_id: &str) -> Vec<String> {
+        let mut references = Vec::new();
+        for entity in self.entities.values() {
+            for component in entity.components.values() {
+                if component.component_type_id.as_deref() == Some(component_type_id) {
+                    references.push(format!(
+                        "entity {} component {}",
+                        entity.entity_id, component.component_name
+                    ));
+                }
+            }
+        }
+        for component_type in self.component_types.values() {
+            // A component type referencing ITSELF is not something that keeps
+            // it alive: the reference goes away with the record that carries it.
+            if component_type.component_type_id == component_type_id {
+                continue;
+            }
+            if component_type
+                .extends_from
+                .iter()
+                .any(|parent| parent == component_type_id)
+            {
+                references.push(format!(
+                    "componentType {} extendsFrom",
+                    component_type.component_type_id
+                ));
+            }
+            for (composite_name, composite) in &component_type.composite_component_types {
+                if composite.component_type_id.as_deref() == Some(component_type_id) {
+                    references.push(format!(
+                        "componentType {} compositeComponentTypes.{composite_name}",
+                        component_type.component_type_id
+                    ));
+                }
+            }
+        }
+        references
+    }
+
     /// Every id that some stored entity names as its parent, in ONE pass.
     ///
     /// A listing needs `hasChildEntities` for each entity it reports; asking

@@ -1,15 +1,27 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteComponentType
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteComponentType`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Deletes a component type from the workspace that contains it, so the next
+//! `GetComponentType` on it is a `ResourceNotFoundException` and the ARN it was
+//! minted with stops resolving.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteComponentType::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Nothing stored may still REFERENCE the component type: a contained
+//! control-plane resource is deleted only once the resources built on it are
+//! gone, so a component type an entity's component instantiates, or another
+//! component type extends or composes, is refused with the modelled
+//! `ValidationException` (HTTP 400) rather than deleted out from under them.
+//! [`crate::state::Workspace::component_type_references`] is the one place that
+//! says what counts as a reference.
+//!
+//! The removal is performed by this call, and the `state` it answers is the
+//! `DELETING` the service reports for the deletion it performs, the same
+//! reading `DeleteEntity` gives its own removal. Both labels address an EXISTING
+//! resource, so a workspace or a component type the store does not hold is the
+//! modelled `ResourceNotFoundException` (HTTP 404), the same reading
+//! `GetComponentType` gives the same two labels.
+//!
+//! Authorization is not emulated, so the modelled `AccessDeniedException` is
+//! never returned: a 200 from here is not an authorization decision.
 //!
 //! ## Shape of an operation
 //!
@@ -146,18 +158,92 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteComponentType` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteComponentTypeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteComponentType"))
+        // Every call is recorded, successful or refused: the real service logs
+        // control-plane access, and this one destroys tenant state.
+        ::tracing::info!(
+            operation = "DeleteComponentType",
+            workspace_id = %input.workspace_id,
+            component_type_id = %input.component_type_id,
+            "serving a request"
+        );
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteComponentTypeErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the iottwinmaker store is unavailable".to_string()),
+            })
+        })?;
+        let mut state = state.lock();
+
+        // Both labels address an EXISTING resource, so neither naming something
+        // the store does not hold is anything but a 404.
+        let Some(workspace) = state.workspaces.get_mut(&input.workspace_id) else {
+            return Err(DeleteComponentTypeErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::workspace_not_found_message(
+                        &input.workspace_id,
+                    )),
+                },
+            )
+            .into());
+        };
+        if !workspace
+            .component_types
+            .contains_key(&input.component_type_id)
+        {
+            return Err(DeleteComponentTypeErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::component_type_not_found_message(
+                        &input.workspace_id,
+                        &input.component_type_id,
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // What is built on the component type is deleted before the component
+        // type itself, so nothing stored is left instantiating or extending a
+        // type the store no longer holds.
+        let references = workspace.component_type_references(&input.component_type_id);
+        if !references.is_empty() {
+            return Err(DeleteComponentTypeErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "ComponentType {} in workspace {} is still referenced by {}: {}",
+                        input.component_type_id,
+                        input.workspace_id,
+                        references.len(),
+                        references.join(", ")
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let Some(removed) = workspace.component_types.remove(&input.component_type_id) else {
+            return Err(DeleteComponentTypeErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(format!(
+                        "componentType {} in workspace {} vanished",
+                        input.component_type_id, input.workspace_id
+                    )),
+                },
+            )
+            .into());
+        };
+        // The record is gone, so the ARN it was indexed under stops resolving
+        // with it: the index must never name a component type the store does
+        // not hold.
+        state.arn_index.remove(&removed.arn);
+        ::tracing::info!(
+            operation = "DeleteComponentType",
+            workspace_id = %input.workspace_id,
+            component_type_id = %input.component_type_id,
+            "removed a component type"
+        );
+
+        Ok(DeleteComponentTypeOutput {
+            state: crate::state::STATE_DELETING.to_string(),
+        })
     }
 }

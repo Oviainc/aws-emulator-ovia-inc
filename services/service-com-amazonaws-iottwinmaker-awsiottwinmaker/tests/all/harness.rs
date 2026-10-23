@@ -201,6 +201,21 @@ impl Emulator {
         .await
     }
 
+    /// `DeleteComponentType`: DELETE on the component type's own path, with both
+    /// ids carried as `@httpLabel`s and no body.
+    pub(crate) async fn delete_component_type(
+        &self,
+        workspace_id: &str,
+        component_type_id: &str,
+    ) -> Resp {
+        self.call(
+            "DELETE",
+            &format!("/workspaces/{workspace_id}/component-types/{component_type_id}"),
+            None,
+        )
+        .await
+    }
+
     /// `TagResource`: POST /tags with the ARN and the tag map in the body.
     pub(crate) async fn tag_resource(&self, resource_arn: &str, tags: Value) -> Resp {
         self.call(
