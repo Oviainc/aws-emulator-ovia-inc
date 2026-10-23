@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StopGraph
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StopGraph`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StopGraph::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Stops the specific graph: the graph keeps its identity, its configuration and its
+//! data, and stops serving. The stop is ACCEPTED here, not finished — the graph
+//! reports `STOPPING` until the clock makes the move to `STOPPED` due.
 //!
 //! ## Shape of an operation
 //!
@@ -167,18 +161,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StopGraph` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StopGraphErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StopGraph"))
+        // `graphIdentifier` is the whole request; nothing here depends on request
+        // metadata.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(StopGraphErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the neptune-graph store is not mounted on this engine".to_string(),
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::Instant::now();
+        let mut store = state.lock();
+        // The lookup settles the transitions the clock has already made due first, so a
+        // graph whose provisioning has come due is stoppable.
+        let Some(graph) = store.settled_graph_mut(&input.graph_identifier, now) else {
+            return Err(StopGraphErrorModeled::ResourceNotFoundException(
+                crate::state::graph_not_found(&input.graph_identifier),
+            )
+            .into());
+        };
+
+        // A stop starts from the one status it can start from: a serving graph. A graph
+        // with a transition still in flight (including a stop already accepted) and a
+        // graph already stopped both conflict with this request.
+        if graph.status != crate::state::GraphStatus::Available {
+            return Err(StopGraphErrorModeled::ConflictException(ConflictException {
+                message: format!(
+                    "graph {} is in status {} and cannot be stopped",
+                    graph.id,
+                    graph.status.as_wire()
+                ),
+                reason: None,
+            })
+            .into());
+        }
+
+        // The stop is accepted, not finished: the graph reports STOPPING until the clock
+        // makes the move to STOPPED due a fixed span later, so a caller that reads it
+        // straight after this call still sees the transient status.
+        graph.begin_transition(
+            crate::state::GraphStatus::Stopping,
+            crate::state::GraphStatus::Stopped,
+            now,
+        );
+
+        Ok(Self::Output::from(&*graph))
     }
 }

@@ -304,7 +304,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // later, so a caller that reads the graph straight after this call still sees
         // the transient status.
         if let Some(graph) = store.graphs.get_mut(&source_graph_id) {
-            graph.begin_transition(crate::state::GraphStatus::Snapshotting, now);
+            graph.begin_transition(
+                crate::state::GraphStatus::Snapshotting,
+                crate::state::GraphStatus::Available,
+                now,
+            );
         }
 
         // Report the record that was stored, so this response cannot drift from what a

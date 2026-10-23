@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartGraph
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartGraph`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartGraph::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Starts the specific graph: a stopped graph resumes serving with the
+//! configuration and data it was stopped with. The start is ACCEPTED here, not
+//! finished — the graph reports `STARTING` until the clock makes the move to
+//! `AVAILABLE` due.
 //!
 //! ## Shape of an operation
 //!
@@ -167,18 +162,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartGraph` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartGraphErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartGraph"))
+        // `graphIdentifier` is the whole request; nothing here depends on request
+        // metadata.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(StartGraphErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the neptune-graph store is not mounted on this engine".to_string(),
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::Instant::now();
+        let mut store = state.lock();
+        // The lookup settles the transitions the clock has already made due first, so a
+        // graph whose stop has come due is startable.
+        let Some(graph) = store.settled_graph_mut(&input.graph_identifier, now) else {
+            return Err(StartGraphErrorModeled::ResourceNotFoundException(
+                crate::state::graph_not_found(&input.graph_identifier),
+            )
+            .into());
+        };
+
+        // A start starts from the one status it can start from: a stopped graph. A graph
+        // with a transition still in flight (including a stop that has not come due) and
+        // a graph already serving both conflict with this request.
+        if graph.status != crate::state::GraphStatus::Stopped {
+            return Err(StartGraphErrorModeled::ConflictException(ConflictException {
+                message: format!(
+                    "graph {} is in status {} and cannot be started",
+                    graph.id,
+                    graph.status.as_wire()
+                ),
+                reason: None,
+            })
+            .into());
+        }
+
+        // The start is accepted, not finished: the graph reports STARTING until the
+        // clock makes the move to AVAILABLE due a fixed span later, so a caller that
+        // reads it straight after this call still sees the transient status.
+        graph.begin_transition(
+            crate::state::GraphStatus::Starting,
+            crate::state::GraphStatus::Available,
+            now,
+        );
+
+        Ok(Self::Output::from(&*graph))
     }
 }
