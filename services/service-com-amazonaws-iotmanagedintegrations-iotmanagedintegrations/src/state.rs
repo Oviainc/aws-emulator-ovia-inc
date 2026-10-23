@@ -3,10 +3,11 @@
 //! Engine state for the com-amazonaws-iotmanagedintegrations-iotmanagedintegrations service.
 
 use std::collections::HashMap;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::{
-    CapabilityReport, CapabilitySchemaItem, ResourceNotFoundException, WiFiSimpleSetupConfiguration,
+    CapabilityReport, CapabilitySchemaItem, ConfigurationStatus, ResourceNotFoundException,
+    WiFiSimpleSetupConfiguration,
 };
 
 /// The region an ARN carries when the request names none (the emulator's default
@@ -17,10 +18,14 @@ pub const DEFAULT_REGION: &str = "us-east-1";
 /// `ManagedThingArn` pattern (`^arn:aws:iotmanagedintegrations:…`) requires.
 pub const SERVICE_ARN_NAMESPACE: &str = "iotmanagedintegrations";
 
-/// The `Role`, `AuthMaterialType` and `HubNetworkMode` value lists the handlers
-/// validate against, re-exported from the MODEL-GENERATED constants in
-/// `crate::ops::types` so there is no second copy to drift from the model.
-pub use crate::ops::types::{AUTH_MATERIAL_TYPE_VALUES, HUB_NETWORK_MODE_VALUES, ROLE_VALUES};
+/// The `Role`, `AuthMaterialType`, `HubNetworkMode`, `EncryptionType` and
+/// `ConfigurationState` value lists the handlers validate against and report, re-exported
+/// from the MODEL-GENERATED constants in `crate::ops::types` so there is no second copy
+/// to drift from the model.
+pub use crate::ops::types::{
+    AUTH_MATERIAL_TYPE_VALUES, CONFIGURATION_STATE_VALUES, ENCRYPTION_TYPE_VALUES,
+    HUB_NETWORK_MODE_VALUES, ROLE_VALUES,
+};
 
 /// The `ProvisioningStatus` a freshly created managed thing carries: it is not yet
 /// associated with a physical device. Leaving this state needs the device to be
@@ -81,6 +86,124 @@ pub struct ManagedThing {
     pub sequence: u64,
 }
 
+/// The `EncryptionType` an account's managed-integrations data is encrypted with until a
+/// `PutDefaultEncryptionConfiguration` sets another: the service's own key, which needs no
+/// `KmsKeyArn`. A member of [`ENCRYPTION_TYPE_VALUES`].
+pub const DEFAULT_ENCRYPTION_TYPE: &str = "MANAGED_INTEGRATIONS_DEFAULT_ENCRYPTION";
+
+/// The `EncryptionType` that encrypts with a customer managed AWS KMS key — the type
+/// `KmsKeyArn` belongs to. A member of [`ENCRYPTION_TYPE_VALUES`].
+pub const CUSTOMER_KEY_ENCRYPTION_TYPE: &str = "CUSTOMER_KEY_ENCRYPTION";
+
+/// The `ConfigurationState` a default encryption configuration carries once the
+/// encryption it names is in force. A member of [`CONFIGURATION_STATE_VALUES`].
+pub const CONFIGURATION_STATE_ENABLED: &str = "ENABLED";
+
+/// The `ConfigurationState` a default encryption configuration carries while the switch a
+/// put started is not in force yet. A member of [`CONFIGURATION_STATE_VALUES`].
+pub const CONFIGURATION_STATE_UPDATE_IN_PROGRESS: &str = "UPDATE_IN_PROGRESS";
+
+/// How long after a `PutDefaultEncryptionConfiguration` that CHANGES the configuration the
+/// new encryption is in force.
+///
+/// The model declares `UPDATE_IN_PROGRESS` beside `ENABLED` on `ConfigurationState`, so
+/// changing the key an account's data is encrypted under is an ASYNCHRONOUS change: the
+/// call that starts it answers with a configuration that is not in force yet, and the
+/// clock completes it. AWS publishes no duration for it, so this span is CHOSEN — inside
+/// the emulator's 250..750 ms window, so a caller that reads straight after the put still
+/// observes `UPDATE_IN_PROGRESS`. It is stored as a due instant and never slept on.
+pub const ENCRYPTION_UPDATE_DELAY: Duration = Duration::from_millis(500);
+
+/// The most regions one store keeps a default encryption configuration for.
+///
+/// The configuration is keyed by the region the request was SIGNED for, which comes from
+/// the caller, so past this bound a put for a region the store does not already hold is
+/// refused rather than grown into: a caller that varies its signing region cannot make
+/// this emulator's memory grow without end. A bound CHOSEN for the emulator (AWS publishes
+/// no such quota, and offers far fewer regions than this), like [`MAX_MANAGED_THINGS`].
+pub const MAX_CONFIGURED_REGIONS: usize = 64;
+
+/// The longest region name this service will key a stored configuration by, in
+/// characters: longer than every region AWS publishes (`us-gov-east-1` is 13), and short
+/// enough that a stored key is bounded in size as well as in count.
+pub const MAX_REGION_NAME_LENGTH: usize = 32;
+
+/// Whether `region` is shaped like an AWS region name — 1..=[`MAX_REGION_NAME_LENGTH`]
+/// characters of lowercase letters, digits and hyphens.
+///
+/// [`request_region`] reads the region out of the request's SigV4 credential scope, so an
+/// operation that keys STATE by it checks the shape first: a configuration is then never
+/// held under an arbitrary caller-supplied string.
+pub fn is_region_name(region: &str) -> bool {
+    !region.is_empty()
+        && region.len() <= MAX_REGION_NAME_LENGTH
+        && region
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
+/// The default encryption configuration of this account in ONE region: what the last
+/// `PutDefaultEncryptionConfiguration` wrote, and when the switch it started comes into
+/// force.
+#[derive(Debug, Clone)]
+pub struct DefaultEncryptionConfiguration {
+    /// `EncryptionType` enum value.
+    pub encryption_type: String,
+    /// The customer managed KMS key the data is encrypted under. Set only with
+    /// [`CUSTOMER_KEY_ENCRYPTION_TYPE`]: the service-owned encryption uses no key of the
+    /// caller's, so it stores none.
+    pub kms_key_arn: Option<String>,
+    /// The instant the change the last put started comes into force, or `None` when
+    /// nothing is changing. Before it the configuration reports
+    /// [`CONFIGURATION_STATE_UPDATE_IN_PROGRESS`], from it
+    /// [`CONFIGURATION_STATE_ENABLED`] — see [`Self::state_at`]. Storing the instant is
+    /// what keeps a read a pure read: the state is DERIVED from the clock, so nothing has
+    /// to be written when the switch becomes due.
+    pub update_due_at: Option<SystemTime>,
+}
+
+impl Default for DefaultEncryptionConfiguration {
+    /// The configuration an account has in a region no call has configured: managed
+    /// integrations' own key, no customer key, and nothing in progress.
+    fn default() -> Self {
+        Self {
+            encryption_type: DEFAULT_ENCRYPTION_TYPE.to_string(),
+            kms_key_arn: None,
+            update_due_at: None,
+        }
+    }
+}
+
+impl DefaultEncryptionConfiguration {
+    /// The `ConfigurationState` this configuration is in at `now`: the switch a put
+    /// started is in progress until its due instant, and enabled from it.
+    pub fn state_at(&self, now: SystemTime) -> &'static str {
+        if self.update_due_at.is_some_and(|due| now < due) {
+            CONFIGURATION_STATE_UPDATE_IN_PROGRESS
+        } else {
+            CONFIGURATION_STATE_ENABLED
+        }
+    }
+
+    /// The modelled `ConfigurationStatus` of this configuration at `now`.
+    ///
+    /// `Error` stays absent: it describes a FAILED configuration update
+    /// (`smithy_query(query="shape",shape="ConfigurationStatus")`), and no switch this
+    /// emulator performs fails.
+    pub fn status_at(&self, now: SystemTime) -> ConfigurationStatus {
+        ConfigurationStatus {
+            error: None,
+            state: self.state_at(now).to_string(),
+        }
+    }
+
+    /// Whether putting `encryption_type` with `kms_key_arn` would CHANGE this
+    /// configuration — which is what decides whether a put starts a switch at all.
+    pub fn would_change(&self, encryption_type: &str, kms_key_arn: Option<&str>) -> bool {
+        self.encryption_type != encryption_type || self.kms_key_arn.as_deref() != kms_key_arn
+    }
+}
+
 /// Per-service state for com-amazonaws-iotmanagedintegrations-iotmanagedintegrations. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsIotmanagedintegrationsIotmanagedintegrationsState {
@@ -96,6 +219,12 @@ pub struct ComAmazonawsIotmanagedintegrationsIotmanagedintegrationsState {
     /// Source of [`ManagedThing::sequence`] values and of the per-record suffix that
     /// makes a generated id unique.
     pub next_sequence: u64,
+    /// This account's default encryption configuration, keyed by region: the setting is
+    /// per account AND per region (`GetDefaultEncryptionConfiguration` reports it "for the
+    /// Amazon Web Services account in the default or specified region"), so each region's
+    /// endpoint reports its own. A region no put has configured holds no entry and reports
+    /// [`DefaultEncryptionConfiguration::default`].
+    pub default_encryption: HashMap<String, DefaultEncryptionConfiguration>,
 }
 
 /// The most `ManagedThingSummary` items one `ListManagedThings` page carries, and the
@@ -140,6 +269,41 @@ impl ComAmazonawsIotmanagedintegrationsIotmanagedintegrationsState {
         self.managed_things
             .get_mut(id)
             .filter(|thing| thing.region == region)
+    }
+
+    /// The default encryption configuration `region`'s endpoint reports: the one a put
+    /// stored there, or the account default for a region none has configured.
+    ///
+    /// A pure read: a region nobody configured gets NO record written for it, so reading
+    /// one region's configuration cannot change what a later caller sees anywhere.
+    pub fn default_encryption_in(&self, region: &str) -> DefaultEncryptionConfiguration {
+        self.default_encryption
+            .get(region)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Store `configuration` as the default encryption configuration of `region`,
+    /// answering whether it was stored.
+    ///
+    /// The counterpart of [`Self::default_encryption_in`], so the keying rule — the region
+    /// selects the record — lives in one place for both sides. Overwriting a region the
+    /// store already holds always succeeds; taking on a region it does not is refused once
+    /// the store holds [`MAX_CONFIGURED_REGIONS`] of them, which is what bounds this map's
+    /// cardinality however many distinct regions a caller signs for.
+    pub fn set_default_encryption_in(
+        &mut self,
+        region: &str,
+        configuration: DefaultEncryptionConfiguration,
+    ) -> bool {
+        if !self.default_encryption.contains_key(region)
+            && self.default_encryption.len() >= MAX_CONFIGURED_REGIONS
+        {
+            return false;
+        }
+        self.default_encryption
+            .insert(region.to_string(), configuration);
+        true
     }
 
     /// Take the next insertion sequence number.
