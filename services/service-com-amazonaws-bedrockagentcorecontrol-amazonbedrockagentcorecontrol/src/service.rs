@@ -21,12 +21,11 @@
 //!   for anything the model does not express: a signing name shared by several
 //!   services, or routing that keys on the access-key id.
 //! - `override_operation` — serve a request the model's routing key cannot name
-//!   correctly. The default returns `None`, so every request resolves through the
-//!   generated routing table. Return `Some(op)` to route one yourself.
+//!   correctly. This service DOES use it, not to re-route but to serve each
+//!   modelled operation wrapped in [`StatedPerOperation`]; see below.
 //! - `override_refusal` — how this service words a request the framework refused
-//!   before any handler ran. This service DOES reword one thing: a `@pattern` is
-//!   quoted without the `^` / `$` anchors the model spells it with. See the inline
-//!   note on that method.
+//!   before any handler ran. It states one through [`validation`], the same module
+//!   [`StatedPerOperation`] states one through.
 //! - `override_routing_error` — how this service words a request that reached it
 //!   but named no modeled operation. The default returns `None`, so the entry
 //!   renders the protocol-correct default (query -> 400 InvalidAction, awsJson ->
@@ -40,91 +39,44 @@
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
+//!
+//! ## This service's edited seam: how a broken constraint is stated
+//!
+//! [`validation`] owns the sentence (its module docs state the rules); this file owns the
+//! seam that feeds it. Three parts of that sentence the framework cannot produce on its
+//! own, because [`Service::override_refusal`] is handed the violations ALONE — no
+//! operation, no request:
+//!
+//! * WHICH BACKEND answered. This endpoint fronts several AgentCore services, one per
+//!   resource family, and the recorded refusals of the `/memories`,
+//!   `/configuration-bundles` and `/identities` families quote no value while every other
+//!   family quotes the one the request carried — for violations that are otherwise
+//!   identical (the same member path, the same `@pattern`). The family is a property of the
+//!   OPERATION, read off the `@http` URI its input schema declares.
+//! * the ELEMENT CONSTRAINT SET a clause states at a collection member, which is read off
+//!   that operation's input schema rather than off the refusal (a refusal carries only the
+//!   constraints that failed).
+//! * the VALUE a clause echoes: the framework's walk stores it ELIDED (a 256-byte prefix
+//!   plus `... [<n> bytes]`, a marker AWS never emits), and the value a clause states at a
+//!   LIST member is the whole list, which no violation carries.
+//!
+//! [`StatedPerOperation`] is where all three come from: every modelled operation is served
+//! wrapped in it, the wrapper asks `service_common::validation` for the framework's OWN
+//! violations against that operation's input schema — echoes restored — together with the
+//! request's own lists, and [`validation`] turns them into the sentence. `override_refusal`
+//! words a refusal that reaches the centralized walk anyway through that same module, so
+//! the wording lives in ONE place.
 
-use aws_smithy_schema_server::constraints::{self, Violation, ViolationKind};
+mod validation;
+
+use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
+use aws_smithy_schema_server::ProtocolError;
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, BoxFuture, ErasedOperation, Operation, OperationContext, OperationRoutingTable, Refusal,
+    Refused, ServerHttpProtocol, Service, Violation,
 };
+use std::collections::HashMap;
 use std::sync::Arc;
-
-/// The wire error code for a request this service refuses as invalid: the shape
-/// `com.amazonaws.bedrockagentcorecontrol#ValidationException`, which every operation of
-/// this service declares and whose `@httpError` is 400.
-const VALIDATION_EXCEPTION: &str = "ValidationException";
-
-/// A `@pattern` expression without the anchors a model may spell it with.
-///
-/// Only a `^…$` PAIR bracketing the whole expression is dropped: `^` alone, or `$` alone,
-/// is an expression anchored at one end — a different language, not an anchored spelling
-/// of this one — and an anchor left INSIDE after the pair is removed means the pair
-/// bracketed one branch of an alternation (`^a$|^b$`) rather than the whole expression, so
-/// such a pattern is reported exactly as the model spells it. A `$` escaped by a backslash
-/// is a literal dollar sign, not the end anchor, so it stays.
-///
-/// Inlined here rather than shared: every service that states this rule carries its own
-/// copy, pinned by its own recordings (`grep -rln 'fn unanchored' services/*/src`), and
-/// `services/common/src/validation.rs` keeps the envelope-and-clause half with the service
-/// deliberately, because services do not agree on it.
-fn unanchored(pattern: &str) -> &str {
-    let Some(body) = pattern.strip_prefix('^') else {
-        return pattern;
-    };
-    let Some(body) = without_end_anchor(body) else {
-        return pattern;
-    };
-    if has_interior_anchor(body) {
-        return pattern;
-    }
-    body
-}
-
-/// `pattern` without its end anchor, or `None` when it carries none. A trailing `$`
-/// preceded by an ODD number of backslashes is escaped — a literal dollar sign inside the
-/// expression — so it is not an anchor.
-fn without_end_anchor(pattern: &str) -> Option<&str> {
-    let body = pattern.strip_suffix('$')?;
-    let escapes = body.len() - body.trim_end_matches('\\').len();
-    (escapes % 2 == 0).then_some(body)
-}
-
-/// Whether `expression` still carries an anchor of its own — a `^` or `$` that is neither
-/// escaped nor inside a character class — after the outer pair was stripped.
-///
-/// A character class is skipped because `^` is a NEGATION there (`[^:]`, which half of
-/// this model's ARN patterns are built from) and `$` an ordinary character, so neither
-/// anchors anything and an expression built from one must still have its outer anchors
-/// removed.
-fn has_interior_anchor(expression: &str) -> bool {
-    let mut escaped = false;
-    let mut in_class = false;
-    for ch in expression.chars() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        match ch {
-            '\\' => escaped = true,
-            '[' if !in_class => in_class = true,
-            ']' if in_class => in_class = false,
-            '^' | '$' if !in_class => return true,
-            _ => {}
-        }
-    }
-    false
-}
-
-/// The same violation with a `@pattern` reported unanchored; every other class is
-/// untouched, so the requirement each one words stays the framework's.
-fn as_stated(violation: &Violation) -> Violation {
-    match &violation.kind {
-        ViolationKind::Pattern(pattern) => Violation {
-            path: violation.path.clone(),
-            kind: ViolationKind::Pattern(unanchored(pattern).to_string()),
-            value: violation.value.clone(),
-        },
-        _ => violation.clone(),
-    }
-}
 
 /// The host-style endpoint this service is addressed by:
 /// `bedrock-agentcore-control.<region>.amazonaws.com`.
@@ -144,6 +96,28 @@ const ENDPOINT_PREFIX: &str = "bedrock-agentcore-control";
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// The same modelled operations the generated table holds, each wrapped in
+    /// [`StatedPerOperation`] so a refused request is worded the way the backend serving
+    /// that operation words it. Keyed by the routing key the protocol resolves — the key
+    /// the generated table uses — and built from the SAME shared engine, so a wrapped
+    /// operation reads and writes the one store.
+    stated: OperationRoutingTable,
+}
+
+/// Wire one `crate::ops::<module>::<Operation>` per line into `table`, each wrapped in
+/// [`StatedPerOperation`] and keyed by its operation shape name — the routing key
+/// `ServerProtocol::routing_key` resolves and the generated table is keyed by.
+macro_rules! wrap_operations {
+    ($table:expr, $engine:expr, $($module:ident :: $operation:ident),+ $(,)?) => {
+        $(
+            $table.add_operation(
+                stringify!($operation),
+                ::std::boxed::Box::new(StatedPerOperation::new(
+                    crate::ops::$module::$operation::new(::std::sync::Arc::clone(&$engine)),
+                )) as ::std::boxed::Box<dyn ErasedOperation>,
+            );
+        )+
+    };
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -151,9 +125,283 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// generated [`ServiceDefinition`], which constructs each operation from it; the
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
+        let mut stated = OperationRoutingTable::new();
+        // EVERY modelled operation (171 of them, one per file in `src/ops/`), because the
+        // wording rule is the SERVICE's and not one operation's: which family an operation
+        // belongs to, and what its collections' elements must satisfy, are read off that
+        // operation's own input schema, so one code path words every refusal. An operation
+        // whose input declares no constraint simply never has a violation to state, and a
+        // still-scaffolded one is wrapped too — the framework refuses a bad request before
+        // any handler runs, so its refusals are this service's words even while its success
+        // path is a 501. An operation added later is added here as well, or it answers a
+        // refusal in the framework's wording rather than this service's;
+        // `tests::every_modelled_operation_is_served_with_this_services_refusal_wording`
+        // fails when one is missing.
+        wrap_operations!(
+            stated,
+            engine,
+            add_dataset_examples::AddDatasetExamples,
+            batch_put_gateway_rate_limits::BatchPutGatewayRateLimits,
+            create_agent_runtime::CreateAgentRuntime,
+            create_agent_runtime_endpoint::CreateAgentRuntimeEndpoint,
+            create_api_key_credential_provider::CreateApiKeyCredentialProvider,
+            create_browser::CreateBrowser,
+            create_browser_profile::CreateBrowserProfile,
+            create_capacity_provider::CreateCapacityProvider,
+            create_code_interpreter::CreateCodeInterpreter,
+            create_configuration_bundle::CreateConfigurationBundle,
+            create_consent_portal::CreateConsentPortal,
+            create_dataset::CreateDataset,
+            create_dataset_version::CreateDatasetVersion,
+            create_evaluator::CreateEvaluator,
+            create_gateway::CreateGateway,
+            create_gateway_rate_limit::CreateGatewayRateLimit,
+            create_gateway_rule::CreateGatewayRule,
+            create_gateway_target::CreateGatewayTarget,
+            create_harness::CreateHarness,
+            create_harness_endpoint::CreateHarnessEndpoint,
+            create_memory::CreateMemory,
+            create_oauth2_credential_provider::CreateOauth2CredentialProvider,
+            create_online_evaluation_config::CreateOnlineEvaluationConfig,
+            create_payment_connector::CreatePaymentConnector,
+            create_payment_credential_provider::CreatePaymentCredentialProvider,
+            create_payment_manager::CreatePaymentManager,
+            create_policy::CreatePolicy,
+            create_policy_engine::CreatePolicyEngine,
+            create_registry::CreateRegistry,
+            create_registry_record::CreateRegistryRecord,
+            create_workload_identity::CreateWorkloadIdentity,
+            delete_agent_runtime::DeleteAgentRuntime,
+            delete_agent_runtime_endpoint::DeleteAgentRuntimeEndpoint,
+            delete_api_key_credential_provider::DeleteApiKeyCredentialProvider,
+            delete_browser::DeleteBrowser,
+            delete_browser_profile::DeleteBrowserProfile,
+            delete_capacity_provider::DeleteCapacityProvider,
+            delete_code_interpreter::DeleteCodeInterpreter,
+            delete_configuration_bundle::DeleteConfigurationBundle,
+            delete_consent_portal::DeleteConsentPortal,
+            delete_dataset::DeleteDataset,
+            delete_dataset_examples::DeleteDatasetExamples,
+            delete_evaluator::DeleteEvaluator,
+            delete_gateway::DeleteGateway,
+            delete_gateway_rate_limit::DeleteGatewayRateLimit,
+            delete_gateway_rule::DeleteGatewayRule,
+            delete_gateway_target::DeleteGatewayTarget,
+            delete_harness::DeleteHarness,
+            delete_harness_endpoint::DeleteHarnessEndpoint,
+            delete_memory::DeleteMemory,
+            delete_oauth2_credential_provider::DeleteOauth2CredentialProvider,
+            delete_online_evaluation_config::DeleteOnlineEvaluationConfig,
+            delete_payment_connector::DeletePaymentConnector,
+            delete_payment_credential_provider::DeletePaymentCredentialProvider,
+            delete_payment_manager::DeletePaymentManager,
+            delete_policy::DeletePolicy,
+            delete_policy_engine::DeletePolicyEngine,
+            delete_registry::DeleteRegistry,
+            delete_registry_record::DeleteRegistryRecord,
+            delete_resource_policy::DeleteResourcePolicy,
+            delete_workload_identity::DeleteWorkloadIdentity,
+            get_agent_runtime::GetAgentRuntime,
+            get_agent_runtime_endpoint::GetAgentRuntimeEndpoint,
+            get_api_key_credential_provider::GetApiKeyCredentialProvider,
+            get_browser::GetBrowser,
+            get_browser_profile::GetBrowserProfile,
+            get_capacity_provider::GetCapacityProvider,
+            get_code_interpreter::GetCodeInterpreter,
+            get_configuration_bundle::GetConfigurationBundle,
+            get_configuration_bundle_version::GetConfigurationBundleVersion,
+            get_consent_portal::GetConsentPortal,
+            get_dataset::GetDataset,
+            get_evaluator::GetEvaluator,
+            get_gateway::GetGateway,
+            get_gateway_rate_limit::GetGatewayRateLimit,
+            get_gateway_rule::GetGatewayRule,
+            get_gateway_target::GetGatewayTarget,
+            get_harness::GetHarness,
+            get_harness_endpoint::GetHarnessEndpoint,
+            get_memory::GetMemory,
+            get_oauth2_credential_provider::GetOauth2CredentialProvider,
+            get_online_evaluation_config::GetOnlineEvaluationConfig,
+            get_payment_connector::GetPaymentConnector,
+            get_payment_credential_provider::GetPaymentCredentialProvider,
+            get_payment_manager::GetPaymentManager,
+            get_policy::GetPolicy,
+            get_policy_engine::GetPolicyEngine,
+            get_policy_engine_summary::GetPolicyEngineSummary,
+            get_policy_generation::GetPolicyGeneration,
+            get_policy_generation_summary::GetPolicyGenerationSummary,
+            get_policy_summary::GetPolicySummary,
+            get_registry::GetRegistry,
+            get_registry_record::GetRegistryRecord,
+            get_resource_policy::GetResourcePolicy,
+            get_token_vault::GetTokenVault,
+            get_workload_identity::GetWorkloadIdentity,
+            list_agent_runtime_endpoints::ListAgentRuntimeEndpoints,
+            list_agent_runtime_versions::ListAgentRuntimeVersions,
+            list_agent_runtime_versions_by_capacity_provider::ListAgentRuntimeVersionsByCapacityProvider,
+            list_agent_runtimes::ListAgentRuntimes,
+            list_api_key_credential_providers::ListApiKeyCredentialProviders,
+            list_browser_profiles::ListBrowserProfiles,
+            list_browsers::ListBrowsers,
+            list_capacity_providers::ListCapacityProviders,
+            list_code_interpreters::ListCodeInterpreters,
+            list_configuration_bundle_versions::ListConfigurationBundleVersions,
+            list_configuration_bundles::ListConfigurationBundles,
+            list_consent_portals::ListConsentPortals,
+            list_dataset_examples::ListDatasetExamples,
+            list_dataset_versions::ListDatasetVersions,
+            list_datasets::ListDatasets,
+            list_evaluators::ListEvaluators,
+            list_gateway_rate_limits::ListGatewayRateLimits,
+            list_gateway_rules::ListGatewayRules,
+            list_gateway_targets::ListGatewayTargets,
+            list_gateways::ListGateways,
+            list_harness_endpoints::ListHarnessEndpoints,
+            list_harness_versions::ListHarnessVersions,
+            list_harnesses::ListHarnesses,
+            list_memories::ListMemories,
+            list_oauth2_credential_providers::ListOauth2CredentialProviders,
+            list_online_evaluation_configs::ListOnlineEvaluationConfigs,
+            list_payment_connectors::ListPaymentConnectors,
+            list_payment_credential_providers::ListPaymentCredentialProviders,
+            list_payment_managers::ListPaymentManagers,
+            list_policies::ListPolicies,
+            list_policy_engine_summaries::ListPolicyEngineSummaries,
+            list_policy_engines::ListPolicyEngines,
+            list_policy_generation_assets::ListPolicyGenerationAssets,
+            list_policy_generation_summaries::ListPolicyGenerationSummaries,
+            list_policy_generations::ListPolicyGenerations,
+            list_policy_summaries::ListPolicySummaries,
+            list_registries::ListRegistries,
+            list_registry_records::ListRegistryRecords,
+            list_tags_for_resource::ListTagsForResource,
+            list_workload_identities::ListWorkloadIdentities,
+            put_resource_policy::PutResourcePolicy,
+            rotate_payment_connector_credentials::RotatePaymentConnectorCredentials,
+            set_token_vault_cmk::SetTokenVaultCMK,
+            start_policy_generation::StartPolicyGeneration,
+            submit_registry_record_for_approval::SubmitRegistryRecordForApproval,
+            synchronize_gateway_targets::SynchronizeGatewayTargets,
+            tag_resource::TagResource,
+            untag_resource::UntagResource,
+            update_agent_runtime::UpdateAgentRuntime,
+            update_agent_runtime_endpoint::UpdateAgentRuntimeEndpoint,
+            update_api_key_credential_provider::UpdateApiKeyCredentialProvider,
+            update_capacity_provider::UpdateCapacityProvider,
+            update_configuration_bundle::UpdateConfigurationBundle,
+            update_consent_portal::UpdateConsentPortal,
+            update_dataset::UpdateDataset,
+            update_dataset_examples::UpdateDatasetExamples,
+            update_evaluator::UpdateEvaluator,
+            update_gateway::UpdateGateway,
+            update_gateway_rate_limit::UpdateGatewayRateLimit,
+            update_gateway_rule::UpdateGatewayRule,
+            update_gateway_target::UpdateGatewayTarget,
+            update_harness::UpdateHarness,
+            update_harness_endpoint::UpdateHarnessEndpoint,
+            update_memory::UpdateMemory,
+            update_oauth2_credential_provider::UpdateOauth2CredentialProvider,
+            update_online_evaluation_config::UpdateOnlineEvaluationConfig,
+            update_payment_connector::UpdatePaymentConnector,
+            update_payment_credential_provider::UpdatePaymentCredentialProvider,
+            update_payment_manager::UpdatePaymentManager,
+            update_policy::UpdatePolicy,
+            update_policy_engine::UpdatePolicyEngine,
+            update_registry::UpdateRegistry,
+            update_registry_record::UpdateRegistryRecord,
+            update_registry_record_status::UpdateRegistryRecordStatus,
+            update_workload_identity::UpdateWorkloadIdentity,
+        );
         Self {
             entry: crate::ServiceDefinition::new(engine),
+            stated,
         }
+    }
+}
+
+/// One modelled operation, served so that a refused request is stated the way the backend
+/// serving that operation states it: the family's value policy, the element constraint sets
+/// its own input schema declares, and the value as submitted.
+///
+/// Nothing else is re-implemented. A request this wrapper does not refuse is handed to the
+/// generated [`ErasedOperation::run`], which owns deserialize -> validate -> handle ->
+/// serialize, telemetry and every modelled error. The violations come from the framework's
+/// own machinery ([`stated_refusal`]), so this cannot refuse a request the framework's own
+/// walk would accept, nor accept one it would refuse. The cost is that a request this
+/// wrapper does not refuse is read twice, once here and once in the operation's own
+/// sequence, because the framework hands no already-built input to an operation. The
+/// structurally right place for the collecting half is the frozen crate — handing a
+/// handler, or `override_refusal`, the input it already built — which
+/// `services/common/src/validation.rs` records as the core seam this re-read exists only
+/// until.
+struct StatedPerOperation<O> {
+    operation: O,
+}
+
+impl<O> StatedPerOperation<O> {
+    /// Wrap one operation, already constructed from the shared engine.
+    fn new(operation: O) -> Self {
+        Self { operation }
+    }
+}
+
+/// This service's answer to every modelled constraint `req` breaks, for the operation `O`:
+/// the violations the framework's own walk finds, and the wording [`validation`] gives
+/// them. `None` when the request breaks none — and for a failure that is NOT a refusal (a
+/// body the codec cannot read at all, a member of the wrong type), which the framework's
+/// own walk answers in its own envelope.
+///
+/// The collecting half is the tree's shared one,
+/// `service_common::validation::refusing_violations_with_lists`: one read of the request
+/// yields the framework's own violations (the protocol's deserializer for an absent
+/// `@required` member, `constraints::validate` over the built input) with each value echo
+/// restored to the bytes the caller sent, plus the request's own lists — the value a clause
+/// states at a LIST member, which no violation carries. Nothing is re-checked here, and no
+/// second copy of that walk lives in this crate: both halves are bounded where those
+/// bounds are stated.
+fn stated_refusal<O: Operation>(
+    protocol: &dyn ServerHttpProtocol,
+    req: &RtRequest,
+) -> Option<(Vec<Violation>, Refused)> {
+    let (violations, lists) =
+        service_common::validation::refusing_violations_with_lists::<O>(protocol, req);
+    let stated = validation::refusal(
+        &violations,
+        Some(O::INPUT_SCHEMA),
+        validation::echo_of(O::INPUT_SCHEMA),
+        &lists,
+    )?;
+    Some((violations, stated))
+}
+
+impl<O> ErasedOperation for StatedPerOperation<O>
+where
+    O: Operation + ErasedOperation,
+{
+    fn run<'r>(
+        &'r self,
+        svc: &'r dyn Service,
+        req: &'r RtRequest,
+        ctx: &'r OperationContext<'r>,
+    ) -> BoxFuture<'r, RtResponse> {
+        Box::pin(async move {
+            // The definition is read, used and dropped inside each statement:
+            // `&dyn ErasedServiceDefinition` is not `Sync`, so holding it across the await
+            // below would make this future non-`Send`.
+            let refused = stated_refusal::<O>(svc.definition().protocol(), req);
+            if let Some((violations, stated)) = refused {
+                return svc
+                    .definition()
+                    .refusal_response(ProtocolError::Invalid(violations), Some(stated));
+            }
+            self.operation.run(svc, req, ctx).await
+        })
+    }
+
+    /// The wrapped operation's modelled auth schemes: wrapping an operation must not
+    /// change which schemes sign it.
+    fn auth_schemes(&self) -> Option<&'static [&'static str]> {
+        self.operation.auth_schemes()
     }
 }
 
@@ -201,43 +449,40 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // Return `Some(op)` to serve a request the model's routing key cannot name
-        // correctly; `None` (the default) lets the generated routing table resolve
-        // it. `req` is the whole request, so a decision that depends on the body —
-        // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
-        None
+        // NOT a re-route: the key is the one the generated table's own protocol resolves,
+        // and the operation it names is the one served — wrapped in
+        // [`StatedPerOperation`] so a request that breaks a modelled constraint is refused
+        // in the words the backend serving THAT operation uses. A key the model does not
+        // name resolves to `None` here exactly as it does in the generated table, so the
+        // router's routing-error path is unchanged.
+        let key = self.entry.protocol().routing_key(req).ok()?;
+        self.stated.get(key)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
         // required member, or a value outside a declared bound) to let this service
-        // reword it. This service states such a refusal in the framework's own envelope
-        // and the framework's own clause — the count, `Value '<what was sent>' at
-        // '<member>' failed to satisfy constraint: <requirement>`, the clauses joined by
-        // `"; "` — with ONE difference, which is RECORDED: the `@pattern` a clause quotes
-        // is the expression a value has to satisfy, NOT the `^` / `$` anchoring the model
-        // writes to make that match total. The anchoring is how Smithy turns a find into a
-        // whole-string match, not part of the character grammar the caller is told about,
-        // and a client that lifts the advertised expression into its own pre-flight check
-        // still has to anchor the match itself, exactly as it would against AWS.
+        // reword it. A constraint refusal of a modelled operation is already stated by
+        // [`StatedPerOperation`], which runs ahead of this walk; this seam states one that
+        // reaches the walk anyway — and it states it through the SAME module, so there is
+        // one renderer rather than two that can drift.
         //
-        // The code stays `ValidationException`, which is both what the framework would
-        // answer and the shape this service's model declares (`@httpError` 400), because a
-        // client branches on the code and `Refused` replaces the code and the message
-        // together.
-        match refusal {
-            Refusal::Invalid(violations) => {
-                let stated: Vec<Violation> = violations.iter().map(as_stated).collect();
-                Some(Refused {
-                    code: VALIDATION_EXCEPTION.to_string(),
-                    message: constraints::envelope(&stated)?,
-                })
-            }
-            // Authentication is the framework's to word: the request never reached a
-            // modelled constraint, so there is no clause of this service's to state.
-            _ => None,
-        }
+        // What it cannot know here is the operation: no input schema, so a collection
+        // clause states the constraints that failed rather than the element shape's whole
+        // set, and the value policy is the one every family but three shows. Both are the
+        // conservative choice for a refusal whose operation is unknown.
+        //
+        // Authentication is the framework's to word: the request never reached a modelled
+        // constraint, so there is no clause of this service's to state.
+        let Refusal::Invalid(violations) = refusal else {
+            return None;
+        };
+        validation::refusal(
+            violations,
+            None,
+            validation::Echo::Submitted,
+            &HashMap::new(),
+        )
     }
 
     fn override_routing_error(
@@ -271,46 +516,60 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
 
 #[cfg(test)]
 mod tests {
-    use super::unanchored;
+    //! The one thing about the wiring above that a wire test cannot see: that the
+    //! hand-maintained `wrap_operations!` list is the WHOLE surface.
 
-    /// The anchoring a model spells a `@pattern` with is dropped only when the `^…$` pair
-    /// brackets the WHOLE expression; anything else is reported as the model writes it.
+    use super::*;
+
+    /// This service's Smithy model, as it ships beside this crate. Read at test time rather
+    /// than embedded: it is megabytes of JSON that no non-test build needs.
+    const MODEL_PATH: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/smithy-model/com-amazonaws-bedrockagentcorecontrol-amazonbedrockagentcorecontrol.json"
+    );
+
+    /// RULE applied to the whole surface: every operation the model declares is served
+    /// behind [`StatedPerOperation`], under the same key the generated routing table is
+    /// keyed by.
     ///
-    /// The rows span this model's own pattern shapes (a character class, a class whose `^`
-    /// is a NEGATION, an alternation of groups) and the shapes the rule must leave alone
-    /// (one-end anchors, an escaped trailing dollar, individually anchored branches).
+    /// The names come from the MODEL rather than from a second hand list, so an operation
+    /// added to the model and not to `wrap_operations!` fails here instead of silently
+    /// answering a refusal in the framework's wording — and a key spelled differently from
+    /// the generated table's fails here instead of silently never being reached by
+    /// `override_operation`.
     #[test]
-    fn only_a_whole_expression_anchor_pair_is_dropped() {
-        // (case, the model's expression, what a clause quotes)
-        let rows: [(&str, &str, &str); 9] = [
-            (
-                "HarnessName's character class",
-                "^[a-zA-Z][a-zA-Z0-9_]{0,39}$",
-                "[a-zA-Z][a-zA-Z0-9_]{0,39}",
-            ),
-            (
-                "RoleArn, whose class negation is not an anchor",
-                "^arn:aws(-[^:]+)?:iam::([0-9]{12})?:role/.+$",
-                "arn:aws(-[^:]+)?:iam::([0-9]{12})?:role/.+",
-            ),
-            (
-                "HarnessVersion's anchored group",
-                "^([1-9][0-9]{0,4})$",
-                "([1-9][0-9]{0,4})",
-            ),
-            ("anchored at the start only", "^arn:aws:", "^arn:aws:"),
-            ("anchored at the end only", "[0-9]{12}$", "[0-9]{12}$"),
-            ("no anchor at all", r"\d{3}", r"\d{3}"),
-            ("a fully anchored alternation", "^a$|^b$", "^a$|^b$"),
-            ("an escaped dollar before the anchor", r"^costs\$$", r"costs\$"),
-            ("an escaped backslash before the anchor", r"^path\\$", r"path\\"),
-        ];
+    fn every_modelled_operation_is_served_with_this_services_refusal_wording() {
+        let model = std::fs::read_to_string(MODEL_PATH)
+            .expect("the model that generated this crate ships beside it");
+        let model: serde_json::Value =
+            serde_json::from_str(&model).expect("the model that generated this crate is JSON");
+        let shapes = model["shapes"]
+            .as_object()
+            .expect("a Smithy model declares shapes");
+        let operations: Vec<&str> = shapes
+            .iter()
+            .filter(|(_, shape)| shape["type"] == "operation")
+            .filter_map(|(id, _)| id.rsplit('#').next())
+            .collect();
+        assert_eq!(
+            operations.len(),
+            171,
+            "case the model's surface: expected this service's 171 operations, got {}",
+            operations.len()
+        );
 
-        for (case, modelled, expected) in rows {
-            let actual = unanchored(modelled);
-            assert_eq!(
-                actual, expected,
-                "case {case:?}: expected {expected:?} from {modelled:?}, got {actual:?}"
+        let service = EmulatedService::new(Arc::new(engine::InMemoryEngine::new()));
+        for operation in operations {
+            assert!(
+                service.entry.routing_table().get(operation).is_some(),
+                "case {operation}: the generated table keys an operation by its shape \
+                 name; this one resolved to nothing, so the wrapper's key spelling is wrong"
+            );
+            assert!(
+                service.stated.get(operation).is_some(),
+                "case {operation}: every modelled operation is served behind \
+                 StatedPerOperation; this one is missing from wrap_operations!, so it \
+                 answers a refusal in the framework's wording instead of this service's"
             );
         }
     }
