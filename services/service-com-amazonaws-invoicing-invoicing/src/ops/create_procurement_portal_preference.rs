@@ -163,12 +163,6 @@ impl From<CreateProcurementPortalPreferenceErrorModeled> for CreateProcurementPo
 /// ARN it reports is one of.
 const RESOURCE_TYPE: &str = "procurement-portal-preference";
 
-/// `ProcurementPortalName$COUPA` — the portal whose Marketplace PunchOut configuration
-/// the model documents as required (`MarketplacePunchOutPreference`: "Required for Coupa
-/// when MarketplacePunchOutEnabled is true"). One of the values the modelled enum admits
-/// ([`PROCUREMENT_PORTAL_NAME_VALUES`]).
-const PORTAL_COUPA: &str = "COUPA";
-
 /// The `CreateProcurementPortalPreference` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -207,26 +201,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
 
-        // `MarketplacePunchOutEnabled` "defaults to false if not provided", and
-        // `MarketplacePunchOutPreference` is "required for Coupa when
-        // MarketplacePunchOutEnabled is true" — a combination of members the model
-        // cannot express, so the boundary validator passed it and it is refused here as
-        // the modelled 400.
+        // The Marketplace PunchOut combination no modelled constraint can express —
+        // enabled for Coupa without the preference that portal requires — is refused as
+        // the modelled 400, by the one rule every write of a preference applies
+        // (`crate::state::marketplace_punch_out_preference_required`).
         let marketplace_punch_out_enabled = input.marketplace_punch_out_enabled.unwrap_or(false);
         if marketplace_punch_out_enabled
-            && input.procurement_portal_name == PORTAL_COUPA
+            && input.procurement_portal_name == crate::state::PORTAL_COUPA
             && input.marketplace_punch_out_preference.is_none()
         {
             return Err(CreateProcurementPortalPreferenceErrorModeled::ValidationException(
-                ValidationException {
-                    message: Some(format!(
-                        "MarketplacePunchOutPreference is required when \
-                         MarketplacePunchOutEnabled is true and ProcurementPortalName is \
-                         {PORTAL_COUPA}"
-                    )),
-                    reason: Some("invalidInput".to_string()),
-                    ..Default::default()
-                },
+                crate::state::marketplace_punch_out_preference_required(
+                    &input.procurement_portal_name,
+                ),
             )
             .into());
         }
@@ -354,6 +341,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 preference,
                 // Nothing has requested a portal validation for this preference yet.
                 validation: None,
+                unconfirmed_validation_attempts: 0,
+                failed_verification_attempts: 0,
             },
         );
 

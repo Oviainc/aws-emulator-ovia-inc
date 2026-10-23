@@ -7,9 +7,10 @@
 //! Every call here goes through the same `MultiServiceRouter` the production router
 //! uses: `POST /` with `X-Amz-Target: Invoicing.<OperationName>` and an awsJson1_0
 //! body, so what these tests see is what an SDK client sees. The one exception is the
-//! portal-validation code, which the real service delivers OUT OF BAND and the modelled
-//! responses never carry: the tests below read it out of this service's state, because
-//! there is no wire to read it from.
+//! portal-validation code, which the real service delivers OUT OF BAND inside the test
+//! e-invoice it posts to the portal and the modelled responses never carry: the tests
+//! below issue it into, and read it out of, this service's state, because there is no
+//! wire to carry it.
 //!
 //! The tables span the class each rule generalises over rather than one recorded
 //! request: a unit's whole lifetime at several version counts, tagged and untagged; the
@@ -25,7 +26,8 @@ use smithy_server_runtime::multi_service_router::MultiServiceRouter;
 
 use service_com_amazonaws_invoicing_invoicing::ops::types::ProcurementPortalPreference;
 use service_com_amazonaws_invoicing_invoicing::state::{
-    self, ComAmazonawsInvoicingInvoicingState, StoredProcurementPortalPreference,
+    self, ComAmazonawsInvoicingInvoicingState, IssuedPortalValidation,
+    StoredProcurementPortalPreference,
 };
 
 /// The per-RESOURCE tag quota this service enforces: the AWS-wide tagging quota,
@@ -680,10 +682,9 @@ fn preference_arn(id: &str) -> String {
 
 /// Put a procurement portal preference in state, as a create would.
 ///
-/// `CreateProcurementPortalPreference` and `PutProcurementPortalPreference` are still
-/// scaffolded (their own stub issues own them), so a test that needs a preference to
-/// EXIST seeds the registry the validation flow reads — the same one copy those
-/// operations will write.
+/// A test that needs a preference to EXIST at a chosen ARN seeds the registry the
+/// validation flow reads — the same one copy `CreateProcurementPortalPreference` and
+/// `PutProcurementPortalPreference` write — so the ARN is the test's to name.
 fn seed_preference(engine: &Arc<engine::InMemoryEngine>, arn: &str, portal: &str) {
     let at = state::now();
     let stored = StoredProcurementPortalPreference {
@@ -715,12 +716,42 @@ fn seed_preference(engine: &Arc<engine::InMemoryEngine>, arn: &str, portal: &str
             last_update_date: at,
         },
         validation: None,
+        // No validation has been requested for a freshly seeded preference, so neither
+        // attempt counter has anything on it.
+        unconfirmed_validation_attempts: 0,
+        failed_verification_attempts: 0,
     };
     engine
         .state::<ComAmazonawsInvoicingInvoicingState>()
         .lock()
         .procurement_portal_preferences
         .insert(arn.to_string(), stored);
+}
+
+/// Make a validation code outstanding for `arn`, as a CONFIRMED delivery of the test
+/// e-invoice would.
+///
+/// `SendProcurementPortalValidation` cannot confirm that delivery in this emulator — it
+/// performs no outbound delivery and hosts no procurement portal, so the send answers the
+/// modelled 400 (see `procurement_portal_preference_lifecycle.rs`, which pins that
+/// refusal). The rules of `VerifyProcurementPortalValidation` are about an OUTSTANDING
+/// code, so the code is issued through the state the verify reads, from the same
+/// generator the service mints one with.
+fn issue_code(engine: &Arc<engine::InMemoryEngine>, arn: &str) -> String {
+    let handle = engine.state::<ComAmazonawsInvoicingInvoicingState>();
+    let mut store = handle.lock();
+    let code = store.issue_portal_validation_code();
+    let issued_at = state::now();
+    store
+        .procurement_portal_preferences
+        .get_mut(arn)
+        .unwrap_or_else(|| panic!("case issue a code: {arn} must name a seeded preference"))
+        .validation = Some(IssuedPortalValidation {
+        code: code.clone(),
+        issued_at,
+        verified_at: None,
+    });
+    code
 }
 
 /// The validation code this service issued for `arn` and has not seen back yet, read
@@ -813,7 +844,7 @@ async fn portal_validation_accepts_only_the_code_it_issued() {
     seed_preference(&engine, &first, PORTAL_NAMES[0]);
     seed_preference(&engine, &second, PORTAL_NAMES[2]);
 
-    // Nothing has been sent yet, so there is no code any submission could match.
+    // No code is outstanding yet, so there is no code any submission could match.
     let (status, body) = call(
         &router,
         "VerifyProcurementPortalValidation",
@@ -831,32 +862,38 @@ async fn portal_validation_accepts_only_the_code_it_issued() {
     );
 
     for arn in [&first, &second] {
-        let sent = ok(
+        let (status, body) = call(
             &router,
             "SendProcurementPortalValidation",
             &json!({"ProcurementPortalPreferenceArn": arn}),
         )
         .await;
         assert_eq!(
-            sent.get("ProcurementPortalPreferenceArn")
-                .and_then(Value::as_str),
-            Some(arn.as_str()),
-            "case send {arn}: the send answers with the ARN it validated, got {sent}"
+            status, 400,
+            "case send {arn}: the send cannot confirm delivery, so it refuses: got {status} {body}"
         );
     }
 
-    let issued = outstanding_code(&engine, &first)
-        .unwrap_or_else(|| panic!("case send: a code must be outstanding for {first}"));
-    let other = outstanding_code(&engine, &second)
-        .unwrap_or_else(|| panic!("case send: a code must be outstanding for {second}"));
+    let issued = issue_code(&engine, &first);
+    let other = issue_code(&engine, &second);
+    assert_eq!(
+        outstanding_code(&engine, &first).as_deref(),
+        Some(issued.as_str()),
+        "case issue a code: the code is outstanding for {first}"
+    );
+    assert_eq!(
+        outstanding_code(&engine, &second).as_deref(),
+        Some(other.as_str()),
+        "case issue a code: the code is outstanding for {second}"
+    );
     assert_eq!(
         issued.len(),
         6,
-        "case send: the issued code is six digits, got {issued:?}"
+        "case issue a code: the issued code is six digits, got {issued:?}"
     );
     assert!(
         issued.chars().all(|digit| digit.is_ascii_digit()),
-        "case send: the issued code is six digits, got {issued:?}"
+        "case issue a code: the issued code is six digits, got {issued:?}"
     );
 
     // Rows differing along how a submitted code can be wrong: every digit off, a longer
@@ -935,20 +972,13 @@ async fn portal_validation_accepts_only_the_code_it_issued() {
         "case verify a consumed code: expected HTTP 400, got {status} {body}"
     );
 
-    // The other preference was untouched by all of that, and a new send issues a new
-    // outstanding code for it.
+    // The other preference was untouched by all of that, and a newly issued code is
+    // outstanding for it.
     assert!(
         !is_verified(&engine, &second),
         "case verify: one preference's validation must not complete another's"
     );
-    ok(
-        &router,
-        "SendProcurementPortalValidation",
-        &json!({"ProcurementPortalPreferenceArn": second}),
-    )
-    .await;
-    let reissued = outstanding_code(&engine, &second)
-        .unwrap_or_else(|| panic!("case re-send: a code must be outstanding for {second}"));
+    let reissued = issue_code(&engine, &second);
     ok(
         &router,
         "VerifyProcurementPortalValidation",
@@ -957,7 +987,7 @@ async fn portal_validation_accepts_only_the_code_it_issued() {
     .await;
     assert!(
         is_verified(&engine, &second),
-        "case re-send then verify: the code the latest send issued completes the validation"
+        "case re-issue then verify: the latest code issued completes the validation"
     );
 }
 
@@ -1017,9 +1047,8 @@ async fn every_declared_procurement_portal_name_is_accepted_and_enumerated() {
         "case NOT_A_REAL_PORTAL: the clause must enumerate every declared portal, got {message:?}"
     );
 
-    // And every declared value passes the enum constraint. The operation itself is still
-    // scaffolded (its own stub issue owns it), so what matters here is that the request
-    // is NOT refused for the value it carries.
+    // And every declared value passes the enum constraint, so what matters here is that
+    // the request is NOT refused for the value it carries.
     for portal in PORTAL_NAMES {
         let (status, body) = call(
             &router,
