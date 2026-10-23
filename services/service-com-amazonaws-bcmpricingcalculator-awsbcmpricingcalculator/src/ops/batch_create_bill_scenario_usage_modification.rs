@@ -11,6 +11,12 @@
 //! the model requires to be unique within a request for exactly that reason, while the
 //! other entries are still created.
 //!
+//! WHICH ACCOUNTS MAY CALL: a usage modification only exists inside a bill scenario, so
+//! it belongs to the same account class that may plan one — a member account's request is
+//! refused with the modelled `ValidationException` (HTTP 400) carrying `reason`
+//! `invalidRequestFromMember` before the request is read and before anything is written
+//! (the store's own `member_account_refusal`).
+//!
 //! The operation is `@idempotent` and `clientToken` is an `@idempotencyToken`, so a
 //! replayed token answers with the modifications the first call created instead of
 //! minting a second set. A token carrying a request the first call did not make
@@ -104,13 +110,21 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-bcmpricingcalculator-aw
 // here — hence the `BatchCreateBillScenarioUsageModificationError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.bcmpricingcalculator#BatchCreateBillScenarioUsageModification")]
+// `ValidationException` is widened in through `extra_errors`: this SERVICE models it
+// (smithy_query `query="service_info"`: `common_errors`) but this operation does not
+// list it, and it is the modelled answer to a request the caller's account class does
+// not permit — the only one of this operation's errors that carries a `reason`.
+#[smithy_macros::operation_error(
+    "com.amazonaws.bcmpricingcalculator#BatchCreateBillScenarioUsageModification",
+    extra_errors = ["ValidationException"]
+)]
 #[derive(Debug)]
 pub enum BatchCreateBillScenarioUsageModificationErrorModeled {
     ConflictException(ConflictException),
     DataUnavailableException(DataUnavailableException),
     ResourceNotFoundException(ResourceNotFoundException),
     ServiceQuotaExceededException(ServiceQuotaExceededException),
+    ValidationException(ValidationException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -220,6 +234,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
         let mut state = store.lock();
+        // The account-class gate, before the request is read and before anything is
+        // written: a usage modification only exists inside a bill scenario, so it
+        // belongs to the same account class that may plan one.
+        if let Some(refusal) = state.member_account_refusal(Self::NAME) {
+            return Err(
+                BatchCreateBillScenarioUsageModificationErrorModeled::ValidationException(refusal)
+                    .into(),
+            );
+        }
         // Materialise the expiry the clock has already made due, so this call does not
         // store anything under a scenario that is already past its `expiresAt`.
         state.purge_expired(crate::state::now_secs());

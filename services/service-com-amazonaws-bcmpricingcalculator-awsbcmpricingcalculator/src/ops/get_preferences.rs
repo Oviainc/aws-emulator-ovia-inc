@@ -2,11 +2,13 @@
 
 //! @op GetPreferences
 //!
-//! Reports the rate-type preferences `UpdatePreferences` last stored
-//! (`crate::state::Preferences`), member for member: a selection that was stored is
-//! reported exactly as stored, and a selection nobody ever stated is not reported at
-//! all — the members are optional and the service documents no selection it applies
-//! in the account's place, so there is nothing to report for one.
+//! Reports the account's EFFECTIVE rate-type preferences (`crate::state::Preferences`),
+//! member for member: all three selections, always — a selection that was stored is
+//! reported exactly as stored, and one nobody ever wrote is reported as the selection
+//! the account has in effect until it does
+//! (`crate::state::DEFAULT_RATE_TYPE_SELECTION`). The rate types Pricing Calculator
+//! quotes with exist from the moment the account does, and `RateTypes` is `@length 1..3`,
+//! so there is no account for which this read has nothing to report.
 //!
 //! A pure read: `@readonly`, and it writes nothing, so two consecutive reads of an
 //! untouched store answer identically.
@@ -145,14 +147,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         // A read: the guard is taken, the stored record is copied out, and nothing is
         // written — what a later caller sees is exactly what this call saw.
+        //
+        // No account-class gate here, unlike the write: reading the rate types one's own
+        // bills are quoted with is permitted to every account class, which is why the
+        // record holds a selection for each of the three.
         let preferences = store.lock().preferences.clone();
 
+        // Each selection is a non-empty list in the store, so every member of the
+        // response is reported; the `Option` is the modelled member's, not a statement
+        // that a selection might be missing.
         Ok(GetPreferencesOutput {
-            management_account_rate_type_selections: preferences
-                .management_account_rate_type_selections,
-            member_account_rate_type_selections: preferences.member_account_rate_type_selections,
-            standalone_account_rate_type_selections: preferences
-                .standalone_account_rate_type_selections,
+            management_account_rate_type_selections: Some(
+                preferences.management_account_rate_type_selections,
+            ),
+            member_account_rate_type_selections: Some(
+                preferences.member_account_rate_type_selections,
+            ),
+            standalone_account_rate_type_selections: Some(
+                preferences.standalone_account_rate_type_selections,
+            ),
         })
     }
 }
