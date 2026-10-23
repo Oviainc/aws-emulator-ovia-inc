@@ -13,8 +13,9 @@
 //!   operation answers from that stored record.
 //! * A VLAN subnet CIDR block is between /24 and /28 and may not overlap another of
 //!   the same environment (`InitialVlans` doc).
-//! * `SELF_DEPLOYED` supports none of `licenseInfo`, `hosts`, `vcfHostnames`,
-//!   `siteId`, `connectivityInfo` (`CreateEnvironment` doc).
+//! * The `vpcId` and `serviceAccessSubnetId` name a VPC and a subnet of it that the
+//!   account holds — read from Amazon EC2's own store, which is why every test here
+//!   registers the network it names ([`Emulator::fresh_network`]).
 //! * `dedicatedHostId` and `placementGroupId` cannot be used together in one
 //!   `HostInfoForCreate` (its own doc).
 //! * `hcxNetworkAclId` is required when `isHcxPublic` is true (its own doc).
@@ -31,6 +32,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{json, Value};
+use service_com_amazonaws_ec2_amazonec2 as ec2;
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The Region the test client signs for, so the ARNs under test carry it.
@@ -44,16 +46,115 @@ pub(crate) const ACCOUNT: &str = "000000000000";
 const PAST_THE_TRANSITION: Duration = Duration::from_millis(900);
 
 /// The emulator a test drives: one shared engine, this service mounted on it.
-pub(crate) fn emulator() -> MultiServiceRouter {
+///
+/// The engine is kept beside the router because the account's own Amazon EC2 store
+/// lives on it, and that store is where `CreateEnvironment` reads the VPC and subnet a
+/// request names from — so a request builder has to put them there first
+/// ([`Emulator::fresh_network`]).
+pub(crate) struct Emulator {
+    router: MultiServiceRouter,
+    pub(crate) engine: Arc<engine::InMemoryEngine>,
+}
+
+/// So a test that only dispatches requests passes `&emulator` where a
+/// `&MultiServiceRouter` is expected.
+impl std::ops::Deref for Emulator {
+    type Target = MultiServiceRouter;
+
+    fn deref(&self) -> &MultiServiceRouter {
+        &self.router
+    }
+}
+
+impl Emulator {
+    /// A VPC and a subnet inside it, written into the account's own Amazon EC2 store —
+    /// the store `CreateEnvironment` checks the network a request names against.
+    ///
+    /// A fresh pair per call, because Amazon EVS allows one deployed environment per
+    /// VPC ("The VPC cannot be used with any other deployed Amazon EVS environment",
+    /// `vpcId` doc), so a test that creates several environments gives each its own.
+    /// The ids are minted by EC2's own id minter, so they are the ids that service
+    /// would hand out.
+    pub(crate) fn fresh_network(&self) -> (String, String) {
+        let ec2_state = ec2::state::service_state(&*self.engine)
+            .expect("the in-memory engine carries the account's EC2 store");
+        let (vpc_id, subnet_id) = {
+            let mut store = ec2_state.lock();
+            (store.next_id("vpc"), store.next_id("subnet"))
+        };
+        register_network(&self.engine, &vpc_id, &subnet_id);
+        (vpc_id, subnet_id)
+    }
+
+    /// A `CreateEnvironment` request that satisfies every rule, optionally named, in a
+    /// VPC and subnet this account holds.
+    pub(crate) fn create_request(&self, name: Option<&str>) -> Value {
+        let (vpc_id, subnet_id) = self.fresh_network();
+        let mut body = json!({
+            "vpcId": vpc_id,
+            "serviceAccessSubnetId": subnet_id,
+            "vcfVersion": "VCF-5.2.1",
+            "termsAccepted": true,
+            "initialVlans": vlans(),
+        });
+        if let Some(name) = name {
+            body["environmentName"] = json!(name);
+        }
+        body
+    }
+}
+
+/// Write one VPC and one subnet inside it into the account's own Amazon EC2 store, at
+/// the ids given.
+///
+/// `CreateEnvironment` checks the network a request names against THAT store (an
+/// environment is deployed into the caller's existing VPC), so every test that expects
+/// a create to be accepted registers the VPC and subnet it names here first. The other
+/// suites of this target use it for the fixed ids their requests carry.
+pub(crate) fn register_network(
+    engine: &engine::InMemoryEngine,
+    vpc_id: &str,
+    subnet_id: &str,
+) {
+    let ec2_state = ec2::state::service_state(engine)
+        .expect("the in-memory engine carries the account's EC2 store");
+    let mut store = ec2_state.lock();
+    store.vpcs.insert(
+        vpc_id.to_string(),
+        ec2::ops::types::Vpc {
+            vpc_id: Some(vpc_id.to_string()),
+            state: Some(ec2::state::VPC_STATE_AVAILABLE.to_string()),
+            cidr_block: Some("10.0.0.0/16".to_string()),
+            ..Default::default()
+        },
+    );
+    store.subnets.insert(
+        subnet_id.to_string(),
+        ec2::ops::types::Subnet {
+            subnet_id: Some(subnet_id.to_string()),
+            vpc_id: Some(vpc_id.to_string()),
+            state: Some(ec2::state::SUBNET_STATE_AVAILABLE.to_string()),
+            cidr_block: Some("10.0.0.0/24".to_string()),
+            ..Default::default()
+        },
+    );
+}
+
+/// The emulator a test drives: one shared engine, this service mounted on it.
+pub(crate) fn emulator() -> Emulator {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // The tests exercise behaviour, not signing: the credentials below are unsigned.
     router.set_request_authentication(false);
     router.register_service(
-        service_com_amazonaws_evs_amazonelasticvmwareservice::EmulatedService::new(engine),
+        service_com_amazonaws_evs_amazonelasticvmwareservice::EmulatedService::new(engine.clone()),
     );
-    router
+    Emulator { router, engine }
 }
+
+/// The access key id the test client signs with by default: one no session of this
+/// emulator was minted for, so it speaks for the account's own published credential.
+pub(crate) const DEFAULT_ACCESS_KEY_ID: &str = "AKIDTESTONLY";
 
 /// Call one operation and return its HTTP status and JSON body.
 pub(crate) async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16, Value) {
@@ -67,6 +168,19 @@ pub(crate) async fn call_in_region(
     operation: &str,
     body: &Value,
 ) -> (u16, Value) {
+    call_as(router, DEFAULT_ACCESS_KEY_ID, region, operation, body).await
+}
+
+/// Call one operation as a client signing for `region` with `access_key_id` — which is
+/// what names the principal the request speaks for, and so what the service's
+/// authorization gate decides against.
+pub(crate) async fn call_as(
+    router: &MultiServiceRouter,
+    access_key_id: &str,
+    region: &str,
+    operation: &str,
+    body: &Value,
+) -> (u16, Value) {
     let request = ::http::Request::builder()
         .method("POST")
         .uri("https://evs.us-west-2.amazonaws.com/")
@@ -76,11 +190,12 @@ pub(crate) async fn call_in_region(
             format!("AmazonElasticVMwareService.{operation}"),
         )
         // The SigV4 credential scope is what routes the request to `evs` and what
-        // names the Region the service builds ARNs in.
+        // names the Region the service builds ARNs in; the access key id in it is what
+        // names the principal the request speaks for.
         .header(
             "authorization",
             format!(
-                "AWS4-HMAC-SHA256 Credential=AKIDTESTONLY/20260101/{region}/evs/aws4_request, \
+                "AWS4-HMAC-SHA256 Credential={access_key_id}/20260101/{region}/evs/aws4_request, \
                  SignedHeaders=host;x-amz-target, Signature=0"
             ),
         )
@@ -120,33 +235,6 @@ pub(crate) fn vlans_with_prefix(prefix_len: u8) -> Value {
 /// The ten VLAN subnets a valid create uses, at the smallest allowed size.
 fn vlans() -> Value {
     vlans_with_prefix(28)
-}
-
-/// A VPC id no other request in this test target has used, as the modelled
-/// `^vpc-[a-f0-9]{8}([a-f0-9]{9})?$` spells one.
-///
-/// Amazon EVS refuses a VPC that already carries a deployed environment ("The VPC
-/// cannot be used with any other deployed Amazon EVS environment", `vpcId` doc), so a
-/// test that creates several environments gives each its own VPC.
-pub(crate) fn fresh_vpc_id() -> String {
-    static NEXT: ::std::sync::atomic::AtomicU64 = ::std::sync::atomic::AtomicU64::new(1);
-    let ordinal = NEXT.fetch_add(1, ::std::sync::atomic::Ordering::Relaxed);
-    format!("vpc-{ordinal:017x}")
-}
-
-/// A `CreateEnvironment` request that satisfies every rule, optionally named.
-pub(crate) fn create_request(name: Option<&str>) -> Value {
-    let mut body = json!({
-        "vpcId": fresh_vpc_id(),
-        "serviceAccessSubnetId": "subnet-0123456789abcdef0",
-        "vcfVersion": "VCF-5.2.1",
-        "termsAccepted": true,
-        "initialVlans": vlans(),
-    });
-    if let Some(name) = name {
-        body["environmentName"] = json!(name);
-    }
-    body
 }
 
 /// Four hosts, as `hosts` requires (len 4..4), with `extra` merged into the first.
@@ -192,8 +280,8 @@ pub(crate) fn error_type(body: &Value) -> String {
 }
 
 /// Create an environment and return its id, failing the test if it is refused.
-pub(crate) async fn create(router: &MultiServiceRouter, name: Option<&str>) -> String {
-    let (status, body) = call(router, "CreateEnvironment", &create_request(name)).await;
+pub(crate) async fn create(router: &Emulator, name: Option<&str>) -> String {
+    let (status, body) = call(router, "CreateEnvironment", &router.create_request(name)).await;
     assert_eq!(
         status, 200,
         "create {name:?}: expected 200, got {status} {body}"
@@ -208,7 +296,7 @@ pub(crate) async fn create(router: &MultiServiceRouter, name: Option<&str>) -> S
 async fn an_environment_round_trips_through_create_get_list_vlans_and_delete() {
     let router = emulator();
 
-    let request = create_request(Some("demo-env"));
+    let request = router.create_request(Some("demo-env"));
     let (status, created) = call(&router, "CreateEnvironment", &request).await;
     assert_eq!(status, 200, "create: expected 200, got {status} {created}");
     let environment = created["environment"].clone();
@@ -236,7 +324,7 @@ async fn an_environment_round_trips_through_create_get_list_vlans_and_delete() {
     for (member, expected) in [
         ("environmentName", json!("demo-env")),
         ("vpcId", request["vpcId"].clone()),
-        ("serviceAccessSubnetId", json!("subnet-0123456789abcdef0")),
+        ("serviceAccessSubnetId", request["serviceAccessSubnetId"].clone()),
         ("vcfVersion", json!("VCF-5.2.1")),
         ("termsAccepted", json!(true)),
         ("environmentStatus", json!("UNKNOWN")),
@@ -492,30 +580,33 @@ async fn create_environment_enforces_the_documented_request_rules() {
     public_hcx_with_acl["hcxNetworkAclId"] = json!("acl-0123456789abcdef0");
 
     let rows: Vec<(&str, Value, u16)> = vec![
+        // The five parameters `SELF_DEPLOYED` "does not support" are ACCEPTED: the mode
+        // does nothing with them, and the recorded wire shows AWS refusing nothing for
+        // carrying them (see this operation's handler docs).
         (
-            "SELF_DEPLOYED supports none of the five install parameters: siteId",
+            "SELF_DEPLOYED accepts the install parameters it does not use: siteId",
             json!({ "vcfVersion": "SELF_DEPLOYED", "siteId": "site-1" }),
-            400,
+            200,
         ),
         (
-            "SELF_DEPLOYED supports none of the five install parameters: licenseInfo",
+            "SELF_DEPLOYED accepts the install parameters it does not use: licenseInfo",
             json!({ "vcfVersion": "SELF_DEPLOYED", "licenseInfo": license }),
-            400,
+            200,
         ),
         (
-            "SELF_DEPLOYED supports none of the five install parameters: hosts",
+            "SELF_DEPLOYED accepts the install parameters it does not use: hosts",
             json!({ "vcfVersion": "SELF_DEPLOYED", "hosts": four_hosts(json!({})) }),
-            400,
+            200,
         ),
         (
-            "SELF_DEPLOYED supports none of the five install parameters: vcfHostnames",
+            "SELF_DEPLOYED accepts the install parameters it does not use: vcfHostnames",
             json!({ "vcfVersion": "SELF_DEPLOYED", "vcfHostnames": hostnames }),
-            400,
+            200,
         ),
         (
-            "SELF_DEPLOYED supports none of the five install parameters: connectivityInfo",
+            "SELF_DEPLOYED accepts the install parameters it does not use: connectivityInfo",
             json!({ "vcfVersion": "SELF_DEPLOYED", "connectivityInfo": connectivity }),
-            400,
+            200,
         ),
         (
             "SELF_DEPLOYED with none of them is accepted",
@@ -523,7 +614,7 @@ async fn create_environment_enforces_the_documented_request_rules() {
             200,
         ),
         (
-            "an installed version accepts the same parameters SELF_DEPLOYED refuses",
+            "an installed version accepts those parameters too",
             json!({
                 "vcfVersion": "VCF-5.2.2",
                 "siteId": "site-1",
@@ -597,7 +688,7 @@ async fn create_environment_enforces_the_documented_request_rules() {
 
     for (case, overrides, expected_status) in rows {
         let router = emulator();
-        let mut request = create_request(None);
+        let mut request = router.create_request(None);
         for (member, value) in overrides.as_object().expect("the overrides are an object") {
             request[member] = value.clone();
         }
@@ -632,7 +723,7 @@ async fn an_environment_name_is_unique_within_the_account_and_region() {
     let (status, body) = call(
         &router,
         "CreateEnvironment",
-        &create_request(Some("shared-name")),
+        &router.create_request(Some("shared-name")),
     )
     .await;
     assert_eq!(
@@ -661,7 +752,7 @@ async fn an_environment_name_is_unique_within_the_account_and_region() {
             &router,
             other_region,
             "CreateEnvironment",
-            &create_request(Some("shared-name")),
+            &router.create_request(Some("shared-name")),
         )
         .await;
         assert_eq!(
@@ -689,7 +780,7 @@ async fn an_environment_name_is_unique_within_the_account_and_region() {
             &router,
             other_region,
             "CreateEnvironment",
-            &create_request(Some("shared-name")),
+            &router.create_request(Some("shared-name")),
         )
         .await;
         assert_eq!(
@@ -761,13 +852,15 @@ async fn the_client_token_has_no_effect_on_which_environment_is_created() {
     // this parameter, it will have no effect." (`clientToken` doc.) Two creates that
     // repeat one token are therefore two environments.
     let router = emulator();
-    let mut request = create_request(None);
+    let mut request = router.create_request(None);
     request["clientToken"] = json!("tok-1");
 
     let (first_status, first) = call(&router, "CreateEnvironment", &request).await;
     // A second VPC, because one VPC carries one deployed environment: the repeated
     // token is what this test varies, nothing else.
-    request["vpcId"] = json!(fresh_vpc_id());
+    let (vpc_id, subnet_id) = router.fresh_network();
+    request["vpcId"] = json!(vpc_id);
+    request["serviceAccessSubnetId"] = json!(subnet_id);
     let (second_status, second) = call(&router, "CreateEnvironment", &request).await;
     assert_eq!(
         (first_status, second_status),
@@ -986,7 +1079,7 @@ async fn tags_are_stored_on_the_environment_and_read_back_by_arn() {
         &router,
         "CreateEnvironment",
         &{
-            let mut request = create_request(Some("tagged-env"));
+            let mut request = router.create_request(Some("tagged-env"));
             request["tags"] = json!({ "team": "platform", "stage": "dev" });
             request
         },
@@ -1057,7 +1150,7 @@ async fn the_store_is_bounded_and_reclaims_only_finished_environments() {
     let router = emulator();
     let first = create(&router, None).await;
     for index in 1..MAX_ENVIRONMENTS {
-        let (status, body) = call(&router, "CreateEnvironment", &create_request(None)).await;
+        let (status, body) = call(&router, "CreateEnvironment", &router.create_request(None)).await;
         assert_eq!(
             status, 200,
             "create {index} of {MAX_ENVIRONMENTS}: expected 200, got {status} {body}"
@@ -1065,7 +1158,7 @@ async fn the_store_is_bounded_and_reclaims_only_finished_environments() {
     }
 
     // At the cap, a create is refused with a quota error rather than growing the store.
-    let (status, body) = call(&router, "CreateEnvironment", &create_request(None)).await;
+    let (status, body) = call(&router, "CreateEnvironment", &router.create_request(None)).await;
     assert_eq!(
         status, 400,
         "create past the cap of {MAX_ENVIRONMENTS}: expected HTTP 400, got {status} {body}"
@@ -1085,7 +1178,7 @@ async fn the_store_is_bounded_and_reclaims_only_finished_environments() {
     )
     .await;
     assert_eq!(status, 200, "delete: expected 200, got {status} {body}");
-    let (status, body) = call(&router, "CreateEnvironment", &create_request(None)).await;
+    let (status, body) = call(&router, "CreateEnvironment", &router.create_request(None)).await;
     assert_eq!(
         status, 400,
         "create while the only deletion is still DELETING: expected HTTP 400, got {status} {body}"
@@ -1094,7 +1187,7 @@ async fn the_store_is_bounded_and_reclaims_only_finished_environments() {
     // Once it is DELETED, its room is reclaimed and the next create is admitted; the
     // purged environment is then reported as absent.
     std::thread::sleep(PAST_THE_TRANSITION);
-    let (status, body) = call(&router, "CreateEnvironment", &create_request(None)).await;
+    let (status, body) = call(&router, "CreateEnvironment", &router.create_request(None)).await;
     assert_eq!(
         status, 200,
         "create after a deletion came due: expected 200, got {status} {body}"

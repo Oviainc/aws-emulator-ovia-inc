@@ -186,6 +186,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // records instead — see the entry match below.
         let _ = &input.client_token;
         let region = crate::state::request_region(ctx.parts());
+        // Authorization first: AWS decides it at the IAM layer, BEFORE the resource the
+        // request names is evaluated, so the ARN is the one the REQUEST names.
+        if let Some(denied) = crate::state::authorization::denied(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            Some(&crate::state::environment_arn(&region, &input.environment_id)),
+        ) {
+            return Err(denied);
+        }
         let created_at_ms = crate::state::now_ms();
 
         let mut state = state.lock();
@@ -251,7 +261,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the clock owes it the move to CREATED. One pending change for the whole call,
         // so every entitlement a single request creates comes due together.
         let pending =
-            crate::state::PendingEntitlementStatus::starting_now(crate::state::ENTITLEMENT_CREATED);
+            crate::state::PendingStatus::starting_now(crate::state::ENTITLEMENT_CREATED);
         let due_at = pending.due_at;
         let mut minted = false;
         let mut entitlements = Vec::with_capacity(wanted.len());
