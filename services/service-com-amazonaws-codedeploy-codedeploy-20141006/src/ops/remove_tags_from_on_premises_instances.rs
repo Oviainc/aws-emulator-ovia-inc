@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RemoveTagsFromOnPremisesInstances
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RemoveTagsFromOnPremisesInstances`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Removes tags from on-premises instances the service holds a registration for.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RemoveTagsFromOnPremisesInstances::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The mirror image of `AddTagsToOnPremisesInstances`, and refused by the same
+//! preconditions: every name in the request must resolve to a live registration
+//! before anything is written, so a partially applied call cannot be observed. A
+//! tag is identified by the key-value PAIR the request names, so a pair the
+//! instance does not carry removes nothing and the call still succeeds — the
+//! instance is already in the state the caller asked for.
 //!
 //! ## Shape of an operation
 //!
@@ -133,6 +132,20 @@ impl From<RemoveTagsFromOnPremisesInstancesErrorModeled> for RemoveTagsFromOnPre
     }
 }
 
+/// This operation's `InstanceNameRequiredException`, carrying the one sentence
+/// that error shape owns ([`crate::state::INSTANCE_NAME_MISSING`]): an empty
+/// list and a blank name are both "you did not give me an instance name", so
+/// they are worded the same here as at the boundary and in the other operations
+/// that raise this shape.
+fn name_required() -> RemoveTagsFromOnPremisesInstancesError {
+    RemoveTagsFromOnPremisesInstancesErrorModeled::InstanceNameRequiredException(
+        InstanceNameRequiredException {
+            message: Some(crate::state::INSTANCE_NAME_MISSING.to_string()),
+        },
+    )
+    .into()
+}
+
 /// The `RemoveTagsFromOnPremisesInstances` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -171,16 +184,133 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // The engine is reachable from `&self` (constructor-injected); `ctx` carries
         // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RemoveTagsFromOnPremisesInstances` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RemoveTagsFromOnPremisesInstancesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RemoveTagsFromOnPremisesInstances"))
+        let _ = ctx;
+        // `instanceNames` and `tags` are modelled required, so the boundary
+        // already refused a request that omits either — but NEITHER list carries
+        // a modelled `@length`, so an EMPTY list reaches here and is this
+        // service's own "you did not give me a name / a tag" refusal, worded as
+        // the tag-adding operation words it.
+        let names = input.instance_names;
+        if names.is_empty() {
+            return Err(name_required());
+        }
+        if names.len() > crate::state::MAX_INSTANCE_NAMES_PER_CALL {
+            return Err(
+                RemoveTagsFromOnPremisesInstancesErrorModeled::InstanceLimitExceededException(
+                    InstanceLimitExceededException {
+                        message: Some(format!(
+                            "The maximum number of on-premises instances in a single call is {}; \
+                             the request named {}",
+                            crate::state::MAX_INSTANCE_NAMES_PER_CALL,
+                            names.len()
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        for name in &names {
+            match crate::state::check_instance_name(name) {
+                Ok(()) => {}
+                Err(crate::state::NameRefusal::Missing) => return Err(name_required()),
+                Err(crate::state::NameRefusal::Malformed) => {
+                    return Err(
+                        RemoveTagsFromOnPremisesInstancesErrorModeled::InvalidInstanceNameException(
+                            InvalidInstanceNameException {
+                                message: Some(format!(
+                                    "The on-premises instance name {name} was specified in an \
+                                     invalid format"
+                                )),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+            }
+        }
+
+        if input.tags.is_empty() {
+            return Err(
+                RemoveTagsFromOnPremisesInstancesErrorModeled::TagRequiredException(
+                    TagRequiredException {
+                        message: Some("tags must carry at least one tag".to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+        // The request's OWN tag list is capped at what one instance can hold, as
+        // it is when tags are added: a longer list names more tags than any
+        // instance carries, and refusing it here bounds this call's work to at
+        // most MAX_INSTANCE_NAMES_PER_CALL x MAX_TAGS_PER_ON_PREMISES_INSTANCE
+        // rather than letting the caller choose one factor of it.
+        if input.tags.len() > crate::state::MAX_TAGS_PER_ON_PREMISES_INSTANCE {
+            return Err(
+                RemoveTagsFromOnPremisesInstancesErrorModeled::TagLimitExceededException(
+                    TagLimitExceededException {
+                        message: Some(format!(
+                            "The maximum number of tags for an on-premises instance is {}; the \
+                             request carried {}",
+                            crate::state::MAX_TAGS_PER_ON_PREMISES_INSTANCE,
+                            input.tags.len()
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        let mut tags: Vec<(&str, &str)> = Vec::with_capacity(input.tags.len());
+        for tag in &input.tags {
+            let Some(pair) = crate::state::tag_key_value(tag) else {
+                return Err(
+                    RemoveTagsFromOnPremisesInstancesErrorModeled::InvalidTagException(
+                        InvalidTagException {
+                            message: Some(
+                                "Each tag must carry both a key and a value, and a key cannot be \
+                                 an empty string"
+                                    .to_string(),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            };
+            tags.push(pair);
+        }
+
+        crate::state::with_state(&*self.engine, |state| {
+            // Resolve EVERY name before removing anything: a refused call leaves
+            // every instance's tags as they were, so a caller never observes a
+            // half-applied request.
+            for name in &names {
+                let registered = state
+                    .on_premises_instances
+                    .get(name)
+                    .is_some_and(crate::state::OnPremisesInstance::is_registered);
+                if !registered {
+                    return Err(
+                        RemoveTagsFromOnPremisesInstancesErrorModeled::InstanceNotRegisteredException(
+                            InstanceNotRegisteredException {
+                                message: Some(format!(
+                                    "No on-premises instance found for name: {name}"
+                                )),
+                            },
+                        ),
+                    );
+                }
+            }
+            for name in &names {
+                let Some(instance) = state.on_premises_instances.get_mut(name) else {
+                    continue;
+                };
+                for (key, value) in &tags {
+                    instance.remove_tag(key, value);
+                }
+            }
+            Ok(())
+        })
+        .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE))??;
+
+        Ok(RemoveTagsFromOnPremisesInstancesOutput)
     }
 }
