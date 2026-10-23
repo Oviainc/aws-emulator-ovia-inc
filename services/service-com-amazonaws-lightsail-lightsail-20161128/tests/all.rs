@@ -49,6 +49,8 @@ mod instance_error_envelope;
 mod instance_lifecycle;
 #[path = "all/instance_metric_data.rs"]
 mod instance_metric_data;
+#[path = "all/load_balancer_provisioning.rs"]
+mod load_balancer_provisioning;
 #[path = "all/region_catalog.rs"]
 mod region_catalog;
 #[path = "all/relational_database_blueprints.rs"]

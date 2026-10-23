@@ -10,7 +10,9 @@
 //! deployed to), the **bucket** (an object-storage resource of the Lightsail
 //! object storage service) together with the **access keys** it grants
 //! programmatic access through, the **managed relational database** (a MySQL or
-//! PostgreSQL database the service runs for the account), the append-only
+//! PostgreSQL database the service runs for the account), the **load balancer**
+//! (a regional resource that spreads HTTP traffic across the instances attached
+//! to it), the append-only
 //! **operation log** every mutating call
 //! writes, and the service's static **Region catalog** — the Regions and
 //! Availability Zones `GetRegions` lists and every other operation validates a
@@ -40,7 +42,8 @@ use crate::ops::types::{
     ContainerService, ContainerServiceDeployment, ContainerServiceDeploymentRequest,
     ContainerServiceECRImagePullerRole, ContainerServiceEndpoint,
     ContainerServiceHealthCheckConfig, ContainerServiceStateDetail, Domain, DomainEntry, Instance,
-    InstanceHardware, InstanceMetadataOptions, InstanceNetworking, InstancePortInfo, InstanceState,
+    InstanceHardware, InstanceHealthSummary, InstanceMetadataOptions, InstanceNetworking,
+    InstancePortInfo, InstanceState, LoadBalancer, LoadBalancerTlsCertificateSummary,
     MonitoredResourceInfo, MonthlyTransfer, Operation, PrivateRegistryAccess, Region,
     RelationalDatabaseBundle,
     ResourceLocation, ResourceReceivingAccess, Tag, REGION_NAME_VALUES,
@@ -146,15 +149,20 @@ pub const RESOURCE_TYPE_DISK_SNAPSHOT: &str = "DiskSnapshot";
 /// carries ("The Lightsail resource type of the alarm").
 pub const RESOURCE_TYPE_ALARM: &str = "Alarm";
 
-/// The `resourceType` of a load balancer, from the same modelled `ResourceType`
-/// enum.
+/// The `resourceType` a load balancer and its operations report, from the same
+/// modelled `ResourceType` enum — the value the modelled
+/// `LoadBalancer$resourceType` member carries ("The resource type
+/// (`LoadBalancer`").
 ///
-/// No operation in this slice creates a load balancer yet, so no record of this
-/// type is stored. The constant exists because the alarm metric catalog is keyed
-/// by the resource type each metric belongs to, and the modelled
+/// It is also what keys the alarm metric catalog, because the modelled
 /// `PutAlarmRequest$metricName` documentation names load balancers as one of the
 /// three kinds of resource an alarm monitors.
 pub const RESOURCE_TYPE_LOAD_BALANCER: &str = "LoadBalancer";
+
+/// The resource portion a load balancer ARN carries before its id. Mirrors the
+/// `Instance/<uuid>` form the modelled `Instance$arn` documentation shows, with
+/// this resource's own `ResourceType` value.
+pub const LOAD_BALANCER_ARN_RESOURCE_PREFIX: &str = "LoadBalancer/";
 
 /// The resource portion an alarm ARN carries before its id. Mirrors the
 /// `Instance/<uuid>` form the modelled `Instance$arn` documentation shows, with
@@ -325,6 +333,8 @@ pub const OPERATION_TYPE_CREATE_BUCKET: &str = "CreateBucket";
 pub const OPERATION_TYPE_CREATE_DISK: &str = "CreateDisk";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_CREATE_RELATIONAL_DATABASE: &str = "CreateRelationalDatabase";
+/// See [`OPERATION_TYPE_CREATE_INSTANCE`].
+pub const OPERATION_TYPE_CREATE_LOAD_BALANCER: &str = "CreateLoadBalancer";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_CREATE_DISK_SNAPSHOT: &str = "CreateDiskSnapshot";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
@@ -4856,6 +4866,290 @@ impl StoredAlarm {
 }
 
 // ---------------------------------------------------------------------------
+// Load balancers
+// ---------------------------------------------------------------------------
+
+/// `LoadBalancerState` values this slice uses, from the modelled enum and the
+/// `LoadBalancer$state` documentation ("The status of your load balancer"): a
+/// load balancer Lightsail is still standing up is `provisioning`, and one that
+/// is serving is `active`.
+///
+/// The enum's `active_impaired`, `failed` and `unknown` members describe a load
+/// balancer whose instances are unhealthy, one whose creation failed, and one
+/// whose status Lightsail cannot report — none of which this store produces,
+/// because nothing here fails a provision.
+pub const LOAD_BALANCER_STATE_PROVISIONING: &str = "provisioning";
+/// See [`LOAD_BALANCER_STATE_PROVISIONING`].
+pub const LOAD_BALANCER_STATE_ACTIVE: &str = "active";
+
+/// `LoadBalancerProtocol` values, from the modelled enum and the
+/// `LoadBalancer$protocol` documentation: "You can't just have `HTTP_HTTPS`, but
+/// you can have just `HTTP`" — so a load balancer with no SSL/TLS certificate
+/// ATTACHED serves `HTTP`, and one with an attached certificate serves both.
+pub const LOAD_BALANCER_PROTOCOL_HTTP: &str = "HTTP";
+/// See [`LOAD_BALANCER_PROTOCOL_HTTP`].
+pub const LOAD_BALANCER_PROTOCOL_HTTP_HTTPS: &str = "HTTP_HTTPS";
+
+/// The public ports a load balancer listens on, from the modelled
+/// `LoadBalancer$publicPorts` documentation: "For HTTP, use port 80. For HTTPS,
+/// use port 443."
+pub const LOAD_BALANCER_HTTP_PORT: i32 = 80;
+/// See [`LOAD_BALANCER_HTTP_PORT`].
+pub const LOAD_BALANCER_HTTPS_PORT: i32 = 443;
+
+/// The health check path a load balancer uses when the request named none, from
+/// the modelled `CreateLoadBalancerRequest$healthCheckPath` documentation: "If
+/// you didn't specify a health check path, Lightsail uses the root path of your
+/// website (`"/"`)."
+pub const DEFAULT_HEALTH_CHECK_PATH: &str = "/";
+
+/// The most load balancers this account may hold in ONE Region.
+///
+/// An AWS quota, not an emulator guard: the modelled `CreateLoadBalancer`
+/// documentation states it — "You can create up to 10 load balancers per AWS
+/// Region in your account."
+pub const MAX_LOAD_BALANCERS_PER_REGION: usize = 10;
+
+/// The modelled `LoadBalancerAttributeName` members, which are the keys of
+/// `LoadBalancer$configurationOptions` ("A string to string map of the
+/// configuration options for your load balancer").
+pub const LOAD_BALANCER_ATTRIBUTE_HEALTH_CHECK_PATH: &str = "HealthCheckPath";
+/// See [`LOAD_BALANCER_ATTRIBUTE_HEALTH_CHECK_PATH`].
+pub const LOAD_BALANCER_ATTRIBUTE_SESSION_STICKINESS_ENABLED: &str = "SessionStickinessEnabled";
+/// See [`LOAD_BALANCER_ATTRIBUTE_HEALTH_CHECK_PATH`].
+pub const LOAD_BALANCER_ATTRIBUTE_SESSION_STICKINESS_COOKIE_DURATION: &str =
+    "SessionStickiness_LB_CookieDurationSeconds";
+/// See [`LOAD_BALANCER_ATTRIBUTE_HEALTH_CHECK_PATH`].
+pub const LOAD_BALANCER_ATTRIBUTE_HTTPS_REDIRECTION_ENABLED: &str = "HttpsRedirectionEnabled";
+/// See [`LOAD_BALANCER_ATTRIBUTE_HEALTH_CHECK_PATH`].
+pub const LOAD_BALANCER_ATTRIBUTE_TLS_POLICY_NAME: &str = "TlsPolicyName";
+
+/// The session-stickiness cookie lifetime a load balancer starts with, in
+/// seconds.
+///
+/// A Lightsail load balancer IS an Elastic Load Balancer, whose
+/// `stickiness.lb_cookie.duration_seconds` attribute AWS documents as
+/// "`86400` seconds (1 day)" by default; Lightsail surfaces that same attribute
+/// as `SessionStickiness_LB_CookieDurationSeconds`.
+pub const DEFAULT_SESSION_STICKINESS_COOKIE_DURATION_SECONDS: i64 = 86_400;
+
+/// The DNS suffix a load balancer's `dnsName` is published under.
+///
+/// AWS publishes it under its own `elb.amazonaws.com` zone. That HOSTNAME is
+/// environment-specific and no caller may assume it, while the PROMISE
+/// `LoadBalancer$dnsName` makes is not — it is "The DNS name of your Lightsail
+/// load balancer", so it must never be a name that sends the next client OUT of
+/// the emulator. This emulator owns no DNS zone, so the name keeps the ELB SHAPE
+/// (`<load balancer name>-<id>.<region>`) under a suffix that belongs to the
+/// emulator and cannot resolve off-machine, exactly as a managed database's
+/// master endpoint does ([`RELATIONAL_DATABASE_ENDPOINT_SUFFIX`]): `.local` is
+/// reserved for link-local multicast name resolution (RFC 6762 §3).
+///
+/// This emulator terminates no HTTP traffic on it: a load balancer's DATA plane
+/// is not served. Everything the control plane owns — the record, its state,
+/// its ports, its configuration options and its certificate summaries — is
+/// real.
+const LOAD_BALANCER_DNS_SUFFIX: &str = "lb.lightsail.local";
+
+/// How many characters of the load balancer's own id go into its `dnsName`: the
+/// 10-character suffix ELB puts between the load balancer's name and its Region
+/// (`my-load-balancer-1234567890.us-east-2.elb.amazonaws.com`).
+const LOAD_BALANCER_DNS_ID_LEN: usize = 10;
+
+/// The ARN of the load balancer `id` in `region`.
+pub fn load_balancer_arn(region: &str, id: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!("{LOAD_BALANCER_ARN_RESOURCE_PREFIX}{id}"),
+    )
+}
+
+/// The `dnsName` of the load balancer `name` in `region`, minted as `id`. See
+/// [`LOAD_BALANCER_DNS_SUFFIX`].
+pub fn load_balancer_dns_name(region: &str, name: &str, id: &str) -> String {
+    let token: String = id
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .take(LOAD_BALANCER_DNS_ID_LEN)
+        .collect();
+    format!("{name}-{token}.{region}.{LOAD_BALANCER_DNS_SUFFIX}")
+}
+
+/// The SSL/TLS certificate a load balancer holds: the one
+/// `CreateLoadBalancer`'s certificate members asked for, or one
+/// `CreateLoadBalancerTlsCertificate` added.
+#[derive(Debug, Clone)]
+pub struct StoredLoadBalancerCertificate {
+    /// The certificate name the request named, kept verbatim — it is what every
+    /// certificate operation addresses this certificate by.
+    pub name: String,
+    /// The domain the certificate is associated with.
+    pub domain_name: String,
+    /// The alternative domains and subdomains the certificate also covers.
+    pub alternative_names: Vec<String>,
+    /// Whether the certificate is attached to the load balancer, which is what
+    /// `LoadBalancerTlsCertificateSummary$isAttached` reports. A certificate is
+    /// attached only by `AttachLoadBalancerTlsCertificate`, never by the call
+    /// that requested it: it has to be validated first.
+    pub is_attached: bool,
+}
+
+/// One stored load balancer: the configuration the caller asked for, the members
+/// the service assigned, and the lifecycle it is in.
+#[derive(Debug, Clone)]
+pub struct StoredLoadBalancer {
+    /// The load balancer name the request named, kept verbatim — it is this
+    /// record's store key and the `name` every read reports.
+    pub name: String,
+    pub arn: String,
+    pub support_code: String,
+    pub created_at_ms: i64,
+    /// Where the load balancer lives. A load balancer carries no availability
+    /// zone: the modelled `LoadBalancer$location` documentation says "Lightsail
+    /// automatically creates your load balancer across Availability Zones", so
+    /// there is no single zone to name.
+    pub location: StoredLocation,
+    pub tags: Vec<Tag>,
+    pub dns_name: String,
+    /// The current `LoadBalancerState`.
+    pub state: &'static str,
+    /// The state the clock owes this load balancer, while one is outstanding.
+    pub due: Option<DueNamedState>,
+    /// The instance port traffic is directed to, kept as the request asked.
+    pub instance_port: i32,
+    pub health_check_path: String,
+    pub ip_address_type: String,
+    /// The TLS security policy the request named, or `None` when it named none.
+    pub tls_policy_name: Option<String>,
+    /// The certificate this load balancer holds, if any.
+    pub certificate: Option<StoredLoadBalancerCertificate>,
+    /// The instances registered with this load balancer, in registration order
+    /// — what `instanceHealthSummary` reports one entry per.
+    pub attached_instances: Vec<String>,
+    /// Whether session stickiness is on, and for how long its cookie lives.
+    ///
+    /// `CreateLoadBalancer` exposes no stickiness parameter at all and its
+    /// documentation says "To change additional load balancer settings, use the
+    /// UpdateLoadBalancerAttribute operation", so a load balancer is created
+    /// without stickiness and that operation is what turns it on.
+    pub session_stickiness_enabled: bool,
+    /// See [`DEFAULT_SESSION_STICKINESS_COOKIE_DURATION_SECONDS`].
+    pub session_stickiness_cookie_duration_seconds: i64,
+    /// Whether HTTP requests are redirected to HTTPS. Off on a load balancer
+    /// this call just created, for the same reason stickiness is: it is an
+    /// `UpdateLoadBalancerAttribute` setting, and there is no HTTPS listener to
+    /// redirect to until a certificate is attached.
+    pub https_redirection_enabled: bool,
+}
+
+impl StoredLoadBalancer {
+    /// Whether an SSL/TLS certificate is ATTACHED to this load balancer, which
+    /// is what decides its protocol and its public ports.
+    fn serves_https(&self) -> bool {
+        self.certificate
+            .as_ref()
+            .is_some_and(|certificate| certificate.is_attached)
+    }
+
+    /// The modelled `configurationOptions` map: one entry per
+    /// `LoadBalancerAttributeName` this record holds a value for.
+    fn configuration_options(&self) -> HashMap<String, String> {
+        let mut options = HashMap::new();
+        options.insert(
+            LOAD_BALANCER_ATTRIBUTE_HEALTH_CHECK_PATH.to_string(),
+            self.health_check_path.clone(),
+        );
+        options.insert(
+            LOAD_BALANCER_ATTRIBUTE_SESSION_STICKINESS_ENABLED.to_string(),
+            self.session_stickiness_enabled.to_string(),
+        );
+        options.insert(
+            LOAD_BALANCER_ATTRIBUTE_SESSION_STICKINESS_COOKIE_DURATION.to_string(),
+            self.session_stickiness_cookie_duration_seconds.to_string(),
+        );
+        options.insert(
+            LOAD_BALANCER_ATTRIBUTE_HTTPS_REDIRECTION_ENABLED.to_string(),
+            self.https_redirection_enabled.to_string(),
+        );
+        if let Some(tls_policy_name) = &self.tls_policy_name {
+            options.insert(
+                LOAD_BALANCER_ATTRIBUTE_TLS_POLICY_NAME.to_string(),
+                tls_policy_name.clone(),
+            );
+        }
+        options
+    }
+
+    /// This record as the modelled `LoadBalancer`.
+    pub fn view(&self) -> LoadBalancer {
+        let serves_https = self.serves_https();
+        LoadBalancer {
+            name: Some(self.name.clone()),
+            arn: Some(self.arn.clone()),
+            support_code: Some(self.support_code.clone()),
+            created_at: Some(timestamp(self.created_at_ms)),
+            location: Some(self.location.view()),
+            resource_type: Some(RESOURCE_TYPE_LOAD_BALANCER.to_string()),
+            tags: Some(self.tags.clone()),
+            dns_name: Some(self.dns_name.clone()),
+            state: Some(self.state.to_string()),
+            protocol: Some(
+                if serves_https {
+                    LOAD_BALANCER_PROTOCOL_HTTP_HTTPS
+                } else {
+                    LOAD_BALANCER_PROTOCOL_HTTP
+                }
+                .to_string(),
+            ),
+            public_ports: Some(if serves_https {
+                vec![LOAD_BALANCER_HTTP_PORT, LOAD_BALANCER_HTTPS_PORT]
+            } else {
+                vec![LOAD_BALANCER_HTTP_PORT]
+            }),
+            health_check_path: Some(self.health_check_path.clone()),
+            instance_port: Some(self.instance_port),
+            // A registered instance starts out `initial`, and the modelled
+            // `instanceHealthReason` documentation gives the reason for that:
+            // "`Lb.RegistrationInProgress` - The target instance is in the
+            // process of being registered with the load balancer." This
+            // emulator runs no health checks, so no instance ever leaves it.
+            instance_health_summary: Some(
+                self.attached_instances
+                    .iter()
+                    .map(|instance_name| InstanceHealthSummary {
+                        instance_name: Some(instance_name.clone()),
+                        instance_health: Some(INSTANCE_HEALTH_INITIAL.to_string()),
+                        instance_health_reason: Some(
+                            INSTANCE_HEALTH_REASON_REGISTRATION_IN_PROGRESS.to_string(),
+                        ),
+                    })
+                    .collect(),
+            ),
+            tls_certificate_summaries: Some(
+                self.certificate
+                    .iter()
+                    .map(|certificate| LoadBalancerTlsCertificateSummary {
+                        name: Some(certificate.name.clone()),
+                        is_attached: Some(certificate.is_attached),
+                    })
+                    .collect(),
+            ),
+            configuration_options: Some(self.configuration_options()),
+            ip_address_type: Some(self.ip_address_type.clone()),
+            https_redirection_enabled: Some(self.https_redirection_enabled),
+            tls_policy_name: self.tls_policy_name.clone(),
+        }
+    }
+}
+
+/// The `InstanceHealthState` an instance registered with a load balancer starts
+/// in, from the modelled enum and the `instanceHealthReason` documentation.
+pub const INSTANCE_HEALTH_INITIAL: &str = "initial";
+/// See [`INSTANCE_HEALTH_INITIAL`].
+pub const INSTANCE_HEALTH_REASON_REGISTRATION_IN_PROGRESS: &str = "Lb.RegistrationInProgress";
+
+// ---------------------------------------------------------------------------
 // The store
 // ---------------------------------------------------------------------------
 
@@ -4905,6 +5199,14 @@ pub struct ComAmazonawsLightsailLightsail20161128State {
     /// `BTreeMap` so `GetAlarms` walks a stable, total order and a page token can
     /// name the next alarm.
     pub alarms: BTreeMap<String, StoredAlarm>,
+    /// Every load balancer, keyed by the region it was created in and its name.
+    ///
+    /// A load balancer is a REGIONAL resource — the modelled
+    /// `CreateLoadBalancer` documentation caps them "per AWS Region in your
+    /// account" — so the region is part of its identity, exactly as it is for a
+    /// container service and a bucket. A `BTreeMap` so a listing walks a stable,
+    /// total order and a page token can name the next load balancer.
+    pub load_balancers: BTreeMap<(String, String), StoredLoadBalancer>,
     /// Offset of the next address pair to hand out, so two instances never share
     /// a public or a private address within one process.
     next_address: u32,
@@ -5109,6 +5411,29 @@ impl ComAmazonawsLightsailLightsail20161128State {
         );
     }
 
+    /// The load balancer `name` names in `region`, for a reporting operation.
+    pub fn load_balancer(&self, region: &str, name: &str) -> Option<&StoredLoadBalancer> {
+        self.load_balancers
+            .get(&(region.to_string(), name.to_string()))
+    }
+
+    /// Every load balancer in `region`, in the store's stable order.
+    pub fn load_balancers_in(&self, region: &str) -> Vec<&StoredLoadBalancer> {
+        self.load_balancers
+            .iter()
+            .filter(|((balancer_region, _), _)| balancer_region == region)
+            .map(|(_, balancer)| balancer)
+            .collect()
+    }
+
+    /// Store a newly created load balancer.
+    pub fn insert_load_balancer(&mut self, balancer: StoredLoadBalancer) {
+        self.load_balancers.insert(
+            (balancer.location.region_name.clone(), balancer.name.clone()),
+            balancer,
+        );
+    }
+
     /// A token for one container service's default domain: see
     /// [`DOMAIN_TOKEN_LEN`].
     ///
@@ -5255,7 +5580,8 @@ impl ComAmazonawsLightsailLightsail20161128State {
     }
 
     /// Materialise every transition the clock had already made due at `now_ms`:
-    /// an instance, a disk, a disk snapshot or a managed relational database
+    /// an instance, a disk, a disk snapshot, a managed relational database or a
+    /// load balancer
     /// settles into the state it was owed, a container service walks
     /// into the phase it was owed (activating the deployment that was waiting),
     /// and an operation whose work is done settles into `Succeeded`.
@@ -5266,7 +5592,7 @@ impl ComAmazonawsLightsailLightsail20161128State {
     ///
     /// Every walk is bounded by [`MAX_INSTANCES`], [`MAX_DISKS`],
     /// [`MAX_DISK_SNAPSHOTS`], [`MAX_CONTAINER_SERVICES`],
-    /// [`MAX_RELATIONAL_DATABASES`] and
+    /// [`MAX_RELATIONAL_DATABASES`], [`MAX_LOAD_BALANCERS_PER_REGION`] and
     /// [`MAX_OPERATION_HISTORY`], and a record drops out of the work as soon as
     /// it has nothing outstanding.
     fn advance_clock(&mut self, now_ms: i64) {
@@ -5299,6 +5625,13 @@ impl ComAmazonawsLightsailLightsail20161128State {
             if due.at_ms <= now_ms {
                 database.state = due.state;
                 database.due = None;
+            }
+        }
+        for balancer in self.load_balancers.values_mut() {
+            let Some(due) = balancer.due else { continue };
+            if due.at_ms <= now_ms {
+                balancer.state = due.state;
+                balancer.due = None;
             }
         }
         for operation in &mut self.operations {
