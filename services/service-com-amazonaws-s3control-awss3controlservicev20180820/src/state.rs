@@ -5,9 +5,9 @@
 //! Besides the state struct itself this module holds the derivations every
 //! handler shares — the access point ARN, alias, network origin and
 //! `ListAccessPoints` page token, the Multi-Region Access Point alias and the
-//! asynchronous request token ARN, the Storage Lens configuration ARN, and the
-//! refusals the resource lifecycles answer — so the handlers under `src/ops/`
-//! compute each one way instead of once per handler.
+//! asynchronous request token ARN, the Storage Lens configuration and Storage
+//! Lens group ARNs, and the refusals every resource lifecycle answers — so the
+//! handlers under `src/ops/` compute each one way instead of once per handler.
 
 use crate::ops::types::{
     AccessPoint, AsyncOperation, AsyncRequestParameters, AsyncResponseDetails, CreateJobInput,
@@ -15,8 +15,9 @@ use crate::ops::types::{
     JobManifest, JobManifestGenerator, JobOperation, JobReport,
     MultiRegionAccessPointRegionalResponse, MultiRegionAccessPointReport,
     MultiRegionAccessPointsAsyncResponse, PublicAccessBlockConfiguration, RegionReport, S3Tag,
-    StorageLensConfiguration, StorageLensTag, Tag, VpcConfiguration, ASYNC_OPERATION_NAME_VALUES,
-    JOB_STATUS_VALUES, MULTI_REGION_ACCESS_POINT_STATUS_VALUES, NETWORK_ORIGIN_VALUES,
+    StorageLensConfiguration, StorageLensGroup, StorageLensTag, Tag, VpcConfiguration,
+    ASYNC_OPERATION_NAME_VALUES, JOB_STATUS_VALUES, MULTI_REGION_ACCESS_POINT_STATUS_VALUES,
+    NETWORK_ORIGIN_VALUES,
 };
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -150,6 +151,46 @@ pub const STORAGE_LENS_CONFIGURATION_QUOTA: usize = 1_000;
 /// `PutStorageLensConfigurationTaggingRequest$Tags`): "You can set up to a
 /// maximum of 50 tags."
 pub const MAX_STORAGE_LENS_TAGS: usize = 50;
+
+/// One stored S3 Storage Lens group: the grouping document the group was
+/// created with, and the Amazon Web Services resource tags it carries.
+#[derive(Debug, Clone)]
+pub struct StorageLensGroupRecord {
+    /// The group document as the create call left it, with
+    /// `StorageLensGroupArn` set to the ARN this service assigns (that member
+    /// is documented read-only).
+    pub group: StorageLensGroup,
+    /// The resource tags the group carries.
+    ///
+    /// Held BESIDE the document rather than inside it, because the two are
+    /// separate resources on the wire: `GetStorageLensGroup` reports the
+    /// document and no tags at all, and the generic resource tagging operations
+    /// (`TagResource`, `ListTagsForResource`, `UntagResource`) are what report
+    /// and replace them. Those three are still scaffolds with their own gap
+    /// issues, and will read this field rather than a second copy.
+    pub tags: Vec<Tag>,
+}
+
+/// How a stored S3 Storage Lens group is keyed: the owning account id and the
+/// group name, which is the pair a name is unique within.
+pub type StorageLensGroupKey = (String, String);
+
+/// How many S3 Storage Lens groups the store holds before
+/// `CreateStorageLensGroup` refuses to add another.
+///
+/// S3 Storage Lens limits how many groups an account may hold in a Region, and
+/// this emulator models neither Service Quotas nor an account's adjustments —
+/// so this is the emulator's OWN bound on the store rather than a claim about
+/// any account's limit, and it counts every record the store holds rather than
+/// one account's: `AccountId` is a request member constrained only to
+/// `^\d{12}$`, which bounds the shape of a key and not how many of them a
+/// caller can name. It is set far above any workflow an emulator serves, and
+/// together with the model's own length bounds on every member of the group
+/// document and on its tag set (`TagList`, len 0..50) it is what stops this
+/// part of the state growing without end. (The record a create adds is released
+/// by `DeleteStorageLensGroup`, which is still a scaffold with its own gap
+/// issue; until it is written the bound is the only limit.)
+pub const STORAGE_LENS_GROUP_QUOTA: usize = 1_000;
 
 // ---------------------------------------------------------------------------
 // S3 Batch Operations jobs
@@ -663,6 +704,18 @@ pub struct ComAmazonawsS3controlAwss3controlservicev20180820State {
     pub storage_lens_configurations:
         BTreeMap<StorageLensConfigurationKey, StorageLensConfigurationRecord>,
 
+    /// S3 Storage Lens groups by (account id, group name).
+    ///
+    /// A `BTreeMap` for the same reason as the two maps above:
+    /// `ListStorageLensGroups` is `@paginated`, and a page token can only
+    /// resume a scan whose order does not change between calls.
+    ///
+    /// BOUNDED: `CreateStorageLensGroup` refuses a new group once the map holds
+    /// [`STORAGE_LENS_GROUP_QUOTA`] records in total, whatever account ids they
+    /// are keyed under, and every member of the group document and of its tag
+    /// set is length-bounded by the model.
+    pub storage_lens_groups: BTreeMap<StorageLensGroupKey, StorageLensGroupRecord>,
+
     /// S3 Batch Operations jobs by (account id, job id).
     ///
     /// A `BTreeMap` for the same reason as `access_points`: `ListJobs` is
@@ -818,6 +871,19 @@ pub fn access_point_arn(region: &str, name: &str) -> String {
 /// canonical emulator account.
 pub fn storage_lens_configuration_arn(region: &str, config_id: &str) -> String {
     ::emulator_server::emulator_arn("s3", region, &format!("storage-lens/{config_id}"))
+}
+
+/// The ARN of an S3 Storage Lens group.
+///
+/// `StorageLensGroup$StorageLensGroupArn` documents the member as read-only,
+/// and the `StorageLensGroupArn` shape constrains it to
+/// `^arn:[a-z\-]+:s3:[a-z0-9\-]+:\d{12}:storage\-lens\-group\/` — so the
+/// service assigns it from the group's own identity (its region and name)
+/// rather than taking whatever a request submitted. The account segment comes
+/// from [`::emulator_server::emulator_arn`], the single source of truth for the
+/// canonical emulator account.
+pub fn storage_lens_group_arn(region: &str, name: &str) -> String {
+    ::emulator_server::emulator_arn("s3", region, &format!("storage-lens-group/{name}"))
 }
 
 /// The suffix length AWS access point aliases carry between the name and the
@@ -1150,6 +1216,41 @@ pub fn too_many_storage_lens_configurations<E>() -> crate::scaffolded::Scaffolde
     )
 }
 
+/// `NoSuchStorageLensGroup` (HTTP 404): no S3 Storage Lens group of that name
+/// is owned by the account the request names.
+///
+/// S3 Control declares no error for the Storage Lens group operations, so — as
+/// for every refusal above — it is carried in the S3-style XML
+/// `<Code>`/`<Message>` envelope, with the `NoSuch…` code and the 404 status S3
+/// answers a read of an absent resource with (the same pairing as
+/// [`no_such_access_point`] and [`no_such_storage_lens_configuration`]).
+pub fn no_such_storage_lens_group<E>(name: &str) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_failure(
+        "NoSuchStorageLensGroup",
+        404,
+        format!("The specified Storage Lens group does not exist: {name}"),
+    )
+}
+
+/// `InvalidRequestException` (HTTP 400): the account already owns an S3 Storage
+/// Lens group of that name, so creating it again would be a second resource
+/// under one name — which is what `UpdateStorageLensGroup` is for.
+///
+/// The code and status are this service's own modelled `InvalidRequestException`
+/// (`com.amazonaws.s3control#InvalidRequestException`, a 400 client error),
+/// which this operation's model does not list; the group operations model no
+/// error of their own.
+pub fn storage_lens_group_already_exists<E>(name: &str) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_failure(
+        "InvalidRequestException",
+        400,
+        format!(
+            "A Storage Lens group named {name} already exists in this account; \
+             change it with UpdateStorageLensGroup."
+        ),
+    )
+}
+
 /// `InvalidRequest` (HTTP 400): the account the request names owns no job of
 /// that id.
 ///
@@ -1211,6 +1312,27 @@ pub fn too_many_multi_region_access_points<E>() -> crate::scaffolded::Scaffolded
         format!(
             "This emulator holds the maximum of {MULTI_REGION_ACCESS_POINT_QUOTA} \
              Multi-Region Access Points."
+        ),
+    )
+}
+
+/// `TooManyStorageLensGroups` (HTTP 400): the store already holds
+/// [`STORAGE_LENS_GROUP_QUOTA`] Storage Lens groups across every account it
+/// holds records for, so another record would grow it without end. Released by
+/// `DeleteStorageLensGroup`.
+///
+/// The bound is the emulator's OWN and is store-wide — `AccountId` is a request
+/// member constrained only to `^\d{12}$`, which bounds the shape of a key and
+/// not how many of them a caller can name — so the code names the resource it
+/// bounds, the `TooMany<Resource>` form this service already answers for access
+/// points and Multi-Region Access Points.
+pub fn too_many_storage_lens_groups<E>() -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_failure(
+        "TooManyStorageLensGroups",
+        400,
+        format!(
+            "This emulator holds the maximum of {STORAGE_LENS_GROUP_QUOTA} \
+             Storage Lens groups."
         ),
     )
 }

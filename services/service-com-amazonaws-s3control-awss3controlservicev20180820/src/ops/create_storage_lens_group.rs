@@ -1,15 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateStorageLensGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateStorageLensGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Records one S3 Storage Lens group under the name its document carries, for
+//! the account the request names. The document is stored WHOLE, so every later
+//! `GetStorageLensGroup` of that name reports exactly the members the submitted
+//! document carried.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateStorageLensGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `StorageLensGroupArn` is documented read-only, so this handler assigns it
+//! from the group's own identity ([`crate::state::storage_lens_group_arn`])
+//! rather than keeping whatever a request submitted in that member.
+//!
+//! A name the account already owns is REFUSED rather than replaced: a create is
+//! not an update, and `UpdateStorageLensGroup` is what changes a group that is
+//! already there. A name is unique within the owning account only, so two
+//! accounts may each hold a group of the same name.
+//!
+//! The optional `Tags` member is the Amazon Web Services resource tags the
+//! group is created with. They are recorded beside the document, because the
+//! generic resource tagging operations are what report and replace them, and
+//! `GetStorageLensGroup` reports the document alone.
 //!
 //! ## Shape of an operation
 //!
@@ -165,18 +174,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateStorageLensGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateStorageLensGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateStorageLensGroup"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::state_unavailable());
+        };
+
+        // `StorageLensGroupArn` is read-only: the service assigns it from the
+        // group's identity, so whatever the request carried in that member is
+        // replaced rather than stored.
+        let mut group = input.storage_lens_group;
+        let region = crate::state::signing_region(ctx.parts());
+        group.storage_lens_group_arn =
+            Some(crate::state::storage_lens_group_arn(&region, &group.name));
+
+        // A group's name is unique within the account that owns it, which is
+        // the pair the store is keyed by.
+        let key = (input.account_id, group.name.clone());
+        let mut store = state.lock();
+        if store.storage_lens_groups.contains_key(&key) {
+            return Err(crate::state::storage_lens_group_already_exists(&key.1));
+        }
+        // The store is bounded STORE-WIDE, the shape the sibling creates in
+        // this service use: `AccountId` is a request member constrained only to
+        // `^\d{12}$`, so a per-account count would hand a caller a fresh
+        // allowance for every account id it names and the map would grow
+        // without end. Counting every record instead is what makes the bound
+        // dominate the growth site, and it is O(1).
+        if store.storage_lens_groups.len() >= crate::state::STORAGE_LENS_GROUP_QUOTA {
+            return Err(crate::state::too_many_storage_lens_groups());
+        }
+        store.storage_lens_groups.insert(
+            key,
+            crate::state::StorageLensGroupRecord {
+                group,
+                // `TagList` is modelled at 0..50 entries, so a longer tag set
+                // is already refused before this handler runs.
+                tags: input.tags.unwrap_or_default(),
+            },
+        );
+
+        Ok(CreateStorageLensGroupOutput)
     }
 }
