@@ -270,6 +270,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Only quick create's `$default` route is API-Gateway-managed; a route the
             // caller asked for is its own.
             api_gateway_managed: false,
+            // A fresh route carries no route responses; `CreateRouteResponse` is what
+            // mints them under it.
+            route_responses: ::std::collections::BTreeMap::new(),
+            route_response_id_seed: 0,
         };
 
         // Read the response back out of the STORE, so what the caller gets is what a

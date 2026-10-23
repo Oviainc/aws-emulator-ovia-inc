@@ -54,6 +54,11 @@ pub const DEFAULT_API_KEY_SELECTION_EXPRESSION: &str = "$request.header.x-api-ke
 /// default for a new API.
 pub const DEFAULT_IP_ADDRESS_TYPE: &str = "ipv4";
 
+/// The `ProtocolType` value that selects a WebSocket API, from
+/// `PROTOCOL_TYPE_VALUES` (`HTTP | WEBSOCKET`) — the protocol whose two-way
+/// communication the route-response resources belong to.
+pub const WEBSOCKET_PROTOCOL_TYPE: &str = "WEBSOCKET";
+
 /// The `AuthorizationType` a route gets when the request names none. One of
 /// `AUTHORIZATION_TYPE_VALUES`; `NONE` is the value the `Route$AuthorizationType`
 /// doc gives for open access.
@@ -77,6 +82,17 @@ pub const MAX_ROUTES_PER_API: usize = 300;
 /// The most integrations one api may hold, after which CreateIntegration is refused.
 /// AWS's published API Gateway quota is 300 integrations per API.
 pub const MAX_INTEGRATIONS_PER_API: usize = 300;
+
+/// The most route responses one route may hold, after which CreateRouteResponse is
+/// refused.
+///
+/// AWS publishes no separate route-responses-per-route quota, so this is a CHOSEN
+/// bound, set to the per-parent quota this service already enforces for routes
+/// ([`MAX_ROUTES_PER_API`]): what it buys is that no loop of CreateRouteResponse calls
+/// can grow this store without end, and that the per-route duplicate-key scan stays
+/// bounded. `TooManyRequestsException` ("A limit has been exceeded") is the modelled
+/// error the operation refuses with.
+pub const MAX_ROUTE_RESPONSES_PER_ROUTE: usize = 300;
 
 /// The most models one api may hold, after which CreateModel is refused.
 ///
@@ -266,9 +282,23 @@ pub struct Route {
     /// "If you created an API using quick create, the $default route is managed by
     /// API Gateway" (`Route$ApiGatewayManaged`).
     pub api_gateway_managed: bool,
+    /// This route's route responses, keyed by `RouteResponseId`. Owned by the route,
+    /// so deleting the route (or its api) cascades to them in one `remove`.
+    pub route_responses: BTreeMap<String, RouteResponse>,
+    /// Drives [`Route::mint_route_response_id`]. Per-route, because a
+    /// `RouteResponseId` only has to be unique within the route that owns the
+    /// response.
+    pub route_response_id_seed: u64,
 }
 
 impl Route {
+    /// Mint a fresh `RouteResponseId` for this route: ten lowercase alphanumerics,
+    /// never one this route already minted.
+    pub fn mint_route_response_id(&mut self) -> String {
+        self.route_response_id_seed = self.route_response_id_seed.wrapping_add(1);
+        mint_id(self.route_response_id_seed)
+    }
+
     /// Project the record onto the modelled `Route` shape.
     pub fn to_wire(&self) -> wire::Route {
         wire::Route {
@@ -295,6 +325,45 @@ impl Route {
             route_key: self.route_key.clone(),
             route_response_selection_expression: self.route_response_selection_expression.clone(),
             target: self.target.clone(),
+        }
+    }
+}
+
+/// A persisted `RouteResponse` resource, owned by its parent [`Route`].
+///
+/// A route response is WebSocket-only: `RouteResponse$ModelSelectionExpression` is
+/// "Supported only for WebSocket APIs", and the selection keys it is matched against
+/// are the WebSocket API's route response selection expressions.
+#[derive(Debug, Clone, Default)]
+pub struct RouteResponse {
+    pub route_response_id: String,
+    /// Required on the modelled `RouteResponse` shape, so the record always carries
+    /// one. Unique within the owning route.
+    pub route_response_key: String,
+    pub model_selection_expression: Option<String>,
+    pub response_models: BTreeMap<String, String>,
+    pub response_parameters: BTreeMap<String, wire::ParameterConstraints>,
+}
+
+impl RouteResponse {
+    /// Project the record onto the modelled `RouteResponse` shape.
+    pub fn to_wire(&self) -> wire::RouteResponse {
+        wire::RouteResponse {
+            model_selection_expression: self.model_selection_expression.clone(),
+            response_models: Some(
+                self.response_models
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+            ),
+            response_parameters: Some(
+                self.response_parameters
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+            ),
+            route_response_id: Some(self.route_response_id.clone()),
+            route_response_key: self.route_response_key.clone(),
         }
     }
 }
