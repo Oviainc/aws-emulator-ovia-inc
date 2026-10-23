@@ -16,11 +16,19 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::{
-    AppMonitor, AppMonitorConfiguration, AppMonitorDetails, AppMonitorSummary,
-    ConflictException, CustomEvents, CwLog, DataStorage, DeobfuscationConfiguration,
-    InvalidPolicyRevisionIdException, MetricDestinationSummary, PolicyNotFoundException,
-    ResourceNotFoundException, METRIC_DESTINATION_VALUES,
+    AccessDeniedException, AppMonitor, AppMonitorConfiguration, AppMonitorDetails,
+    AppMonitorSummary, ConflictException, CustomEvents, CwLog, DataStorage,
+    DeobfuscationConfiguration, InvalidPolicyRevisionIdException, MetricDestinationSummary,
+    PolicyNotFoundException, ResourceNotFoundException, METRIC_DESTINATION_VALUES,
 };
+
+/// Who a request speaks for, and whether IAM lets it do what it asks: the authorization
+/// evaluation every operation in this service runs before it reads or writes.
+pub mod authorization;
+
+/// The CloudWatch Logs side of `DataStorage.CwLog`: the permission turning log delivery
+/// on requires, and the vended log group RUM provisions when it is on.
+pub mod cw_log_delivery;
 
 /// This service's ARN namespace / sigv4 signing name (`OPERATIONS.md`,
 /// `## Wire protocol`: both are `rum`).
@@ -233,7 +241,8 @@ impl MetricDestinationRecord {
 /// `PutResourcePolicy` documents "Each app monitor can have one resource-based policy",
 /// so a monitor holds at most one of these, and it lives ON the monitor's record: a
 /// policy cannot outlive the resource whose access it controls, so `DeleteAppMonitor`
-/// takes it away with the monitor.
+/// takes it away with the monitor. It is also what the authorization evaluation consults
+/// beside the caller's identity-based policies ([`authorization`]).
 #[derive(Debug, Clone)]
 pub struct ResourcePolicyRecord {
     /// `PolicyDocument` exactly as the `PutResourcePolicy` call delivered it — kept
@@ -298,7 +307,8 @@ pub struct AppMonitorRecord {
     pub metric_destinations: BTreeMap<MetricDestinationKey, MetricDestinationRecord>,
     /// This monitor's one resource-based policy, or `None` while it carries none — the
     /// state `GetResourcePolicy` and `DeleteResourcePolicy` answer
-    /// `PolicyNotFoundException` for.
+    /// `PolicyNotFoundException` for, and what the authorization evaluation reads beside
+    /// the caller's identity-based policies.
     pub resource_policy: Option<ResourcePolicyRecord>,
 }
 
@@ -307,8 +317,15 @@ impl AppMonitorRecord {
     /// `None` when `CwLogEnabled` is false — a monitor that stores no copy has no group
     /// (`CwLog$CwLogGroup` is "The name of the log group where the copies are stored").
     pub fn cw_log_group(&self) -> Option<String> {
-        self.cw_log_enabled
-            .then(|| format!("{CW_LOG_GROUP_PREFIX}{}", self.name))
+        self.cw_log_enabled.then(|| cw_log_group_name(&self.name))
+    }
+
+    /// The resource policy document this monitor carries, for the authorization
+    /// evaluation to consult.
+    pub fn resource_policy_document(&self) -> Option<String> {
+        self.resource_policy
+            .as_ref()
+            .map(|policy| policy.document.clone())
     }
 
     /// This monitor's tags as the model's `TagMap` — the ONE projection every operation
@@ -489,6 +506,14 @@ impl ComAmazonawsRumRumState {
         self.app_monitors.get_mut(&name)
     }
 
+    /// The same lookup for a caller that only READS the monitor — the authorization
+    /// evaluation, which needs the monitor's ARN and its resource policy before any write
+    /// is decided on.
+    pub fn app_monitor_by_id(&self, id: &str) -> Option<&AppMonitorRecord> {
+        let name = self.monitor_ids.get(id)?;
+        self.app_monitors.get(name)
+    }
+
     /// The stored monitor whose ARN is exactly `arn`, for a caller that mutates it (the
     /// tagging operations, which name a resource by `ResourceArn` and by nothing else).
     ///
@@ -567,6 +592,16 @@ pub fn app_monitor_arn(region: &str, name: &str) -> String {
         region,
         &format!("{APP_MONITOR_RESOURCE}/{name}"),
     )
+}
+
+/// The ARN of the account's whole app-monitor collection in `region`:
+/// `arn:aws:rum:<region>:<account>:appmonitor/*`.
+///
+/// What an operation that acts on the collection rather than on one monitor
+/// (`ListAppMonitors`) is authorized against, so a policy scoped to one monitor's ARN
+/// does not also grant the listing.
+pub fn app_monitor_collection_arn(region: &str) -> String {
+    app_monitor_arn(region, "*")
 }
 
 /// The region this request was signed for, or [`DEFAULT_REGION`] when it carries no
@@ -733,6 +768,36 @@ pub fn app_monitor_not_found(name_or_id: &str) -> ResourceNotFoundException {
         message: format!("App monitor {name_or_id} does not exist."),
         resource_name: name_or_id.to_string(),
         resource_type: Some(APP_MONITOR_RESOURCE_TYPE.to_string()),
+    }
+}
+
+/// The name of the CloudWatch Logs group an app monitor's telemetry is copied into.
+///
+/// One definition, used by the record's own [`AppMonitorRecord::cw_log_group`] (what
+/// `GetAppMonitor` reports) and by the handlers that PROVISION the group in CloudWatch
+/// Logs when delivery is turned on — so the name RUM advertises and the group it creates
+/// cannot differ.
+pub fn cw_log_group_name(app_monitor_name: &str) -> String {
+    format!("{CW_LOG_GROUP_PREFIX}{app_monitor_name}")
+}
+
+/// The ARN of that log group, which is the resource the caller's
+/// `logs:PutResourcePolicy` permission is evaluated against.
+///
+/// A CloudWatch Logs log-group ARN ends in `:*`, the form CloudWatch Logs itself reports
+/// (`service-com-amazonaws-cloudwatchlogs-logs-20140328`'s `log_group_arn`).
+pub fn cw_log_group_arn(region: &str, log_group_name: &str) -> String {
+    ::engine::emulator_arn("logs", region, &format!("log-group:{log_group_name}:*"))
+}
+
+/// `AccessDeniedException` for a request IAM does not allow.
+///
+/// The message is the refusal's own wording — the principal, the action and the resource
+/// the decision was made about — so a client can tell "this caller may not do this" from
+/// any other 4xx.
+pub fn access_denied(denial: &authorization::Denied) -> AccessDeniedException {
+    AccessDeniedException {
+        message: denial.message(),
     }
 }
 

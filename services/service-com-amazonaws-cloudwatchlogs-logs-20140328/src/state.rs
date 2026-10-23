@@ -953,6 +953,43 @@ pub fn mint_sequence_token(seq: u64) -> String {
     format!("{seq:056}")
 }
 
+/// The refusal CloudWatch Logs answers when the resource an operation names is not
+/// there. The service states the resource KIND that is missing, in the sentence form the
+/// model documents for `ResourceNotFoundException` — "The specified resource does not
+/// exist." — terminated like that sentence, so every operation of this service refuses a
+/// missing resource the same way.
+pub fn resource_not_found_message(resource_kind: &str) -> String {
+    format!("The specified {resource_kind} does not exist.")
+}
+
+/// The refusal CloudWatch Logs builds from the request when the resource policy the
+/// caller named is not there. The message interpolates the requested `policyName`, so a
+/// caller deleting policies in a loop can attribute the refusal to one policy name
+/// instead of guessing which of its requests failed.
+pub fn policy_not_found_message(policy_name: &str) -> String {
+    format!("Policy with name [{policy_name}] does not exist.")
+}
+
+/// The refusal for a value outside the set a member's own documentation enumerates: the
+/// value is declared invalid and the permitted set is then listed, so the refusal itself
+/// tells a caller which values it may use.
+///
+/// `subject` names what was invalid (the "retention" of `retentionInDays`, say) and
+/// `valid` is the catalogue the model states — [`RETENTION_IN_DAYS_VALUES`] or
+/// [`SUBSCRIPTION_SYSTEM_FIELDS`] — rendered in the documented order, never a list typed
+/// into a message.
+pub fn invalid_value_message<T: std::fmt::Display>(
+    subject: &str,
+    valid: impl IntoIterator<Item = T>,
+) -> String {
+    let listed = valid
+        .into_iter()
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("Invalid {subject} value. Valid values are: [{listed}]")
+}
+
 /// Encode a pagination cursor as an opaque token.
 ///
 /// The payload is this service's own structure; hex-encoding it keeps the token

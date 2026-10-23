@@ -153,13 +153,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let store = state.lock();
+        let caller = st::caller_account_id();
         match store.memberships.get(&input.membership_identifier) {
             Some(membership) => Ok(GetMembershipOutput {
                 membership: membership.clone(),
             }),
             None => Err(GetMembershipErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: format!("membership {} not found", input.membership_identifier),
+                    message: st::membership_not_found_message(
+                        &input.membership_identifier,
+                        caller,
+                    ),
                     resource_id: input.membership_identifier,
                     resource_type: st::RESOURCE_TYPE_MEMBERSHIP.to_string(),
                 },

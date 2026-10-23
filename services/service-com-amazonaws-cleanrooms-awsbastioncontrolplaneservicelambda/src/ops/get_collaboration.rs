@@ -3,9 +3,12 @@
 //! @op GetCollaboration
 //!
 //! Reporting only: looks the stored collaboration up by id and projects it for the
-//! calling account. A collaboration this account is not part of — including one that
-//! does not exist, or has been deleted — is refused with the only client error the
-//! model declares here, `ValidationException` (400); there is no 404 on this operation.
+//! calling account. A collaboration this account is not authorized to — one that was
+//! never created, one `DeleteCollaboration` removed, or one the account is not part of
+//! — is refused as an authorization failure, `AccessDeniedException` (403): the model
+//! declares no not-found error here, and a caller's authorization to a collaboration
+//! disappears with the collaboration. `ValidationException` (400) stays for input that
+//! fails the modelled constraints.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +158,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let caller = st::caller_account_id();
         match store.collaboration_view_by_id(&input.collaboration_identifier, caller) {
             Some(collaboration) => Ok(GetCollaborationOutput { collaboration }),
-            None => Err(GetCollaborationErrorModeled::ValidationException(
-                ValidationException {
-                    message: Some(format!(
-                        "collaboration {} not found",
-                        input.collaboration_identifier
+            None => Err(GetCollaborationErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(st::collaboration_access_denied_message(
+                        &input.collaboration_identifier,
+                        caller,
                     )),
-                    reason: Some(st::VALIDATION_REASON_FIELD_VALIDATION_FAILED.to_string()),
-                    field_list: Some(vec![ValidationExceptionField {
-                        name: "collaborationIdentifier".to_string(),
-                        message: "must name a collaboration this account is a member of"
-                            .to_string(),
-                    }]),
+                    reason: Some(st::ACCESS_DENIED_REASON_INSUFFICIENT_PERMISSIONS.to_string()),
                 },
             )
             .into()),
