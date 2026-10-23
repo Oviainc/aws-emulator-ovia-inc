@@ -977,17 +977,48 @@ pub fn instant_key(at: DateTime) -> (i64, u32) {
 }
 
 /// The total order a visibility listing of workflow executions pages through: the
-/// execution's start instant, then its `(workflowId, runId)` identity.
+/// instant the listing works from, then the execution's `(workflowId, runId)` identity.
 ///
 /// The identity is part of the key because the store holds executions in a map with no
-/// order of its own: two runs started in the same instant would otherwise have no
-/// defined position, and a page boundary between them would not be reproducible.
+/// order of its own: two runs sharing an instant would otherwise have no defined
+/// position, and a page boundary between them would not be reproducible.
 pub type ExecutionOrderKey = ((i64, u32), String, String);
 
-/// The [`ExecutionOrderKey`] of one stored execution.
-pub fn execution_order_key(execution: &Execution) -> ExecutionOrderKey {
+/// Which stored instant a visibility listing of workflow executions filters, orders
+/// and pages by.
+///
+/// The listing itself chooses: `ListClosedWorkflowExecutions` documents the choice on
+/// each of its two time filters — `closeTimeFilter` "if this parameter is specified,
+/// the returned results are ordered by their close times" against `startTimeFilter`
+/// "ordered by their start times" — so the instant is a parameter of the listing
+/// rather than a property of this module.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionTimeBasis {
+    /// The instant the run was started — `WorkflowExecutionInfo.startTimestamp`,
+    /// which every stored run carries.
+    StartTime,
+    /// The instant the run was closed — `WorkflowExecutionInfo.closeTimestamp`, "Set
+    /// only if the execution status is CLOSED", so an OPEN run has none.
+    CloseTime,
+}
+
+/// The instant `basis` names on one stored execution, or `None` when that execution
+/// has no such instant (only a CLOSED run carries a close instant).
+pub fn execution_instant(execution: &Execution, basis: ExecutionTimeBasis) -> Option<DateTime> {
+    match basis {
+        ExecutionTimeBasis::StartTime => Some(execution.start_timestamp),
+        ExecutionTimeBasis::CloseTime => execution.close_timestamp,
+    }
+}
+
+/// The [`ExecutionOrderKey`] of one stored execution under `basis`.
+///
+/// An execution with no instant for `basis` falls back to its start instant, which
+/// keeps the order total: such a run is still OPEN, and a listing ordered by close
+/// time reports only closed ones, so the fallback orders nothing a caller sees.
+pub fn execution_order_key(execution: &Execution, basis: ExecutionTimeBasis) -> ExecutionOrderKey {
     (
-        instant_key(execution.start_timestamp),
+        instant_key(execution_instant(execution, basis).unwrap_or(execution.start_timestamp)),
         execution.workflow_id.clone(),
         execution.run_id.clone(),
     )
@@ -1059,42 +1090,78 @@ pub fn validate_exclusive_filters(filters: &[(&str, bool)]) -> Result<(), String
     Ok(())
 }
 
+/// The time window a closed-execution visibility request selects on, and the instant
+/// it is taken on, from the two time filters such a request may name.
+///
+/// Both members document the same rule: "startTimeFilter and closeTimeFilter are
+/// mutually exclusive. You must specify one of these in a request but not both." So
+/// exactly one is given, and which one it is chooses the basis; a request naming both,
+/// or neither, names no window and is refused. The model cannot express the rule, so
+/// the boundary validator passes it and the handler applies this.
+pub fn resolve_execution_time_window<'a>(
+    start_time_filter: Option<&'a ExecutionTimeFilter>,
+    close_time_filter: Option<&'a ExecutionTimeFilter>,
+) -> Result<(ExecutionTimeBasis, &'a ExecutionTimeFilter), String> {
+    let refused = |got: &str| {
+        format!(
+            "startTimeFilter and closeTimeFilter are mutually exclusive; specify one of them \
+             in a request but not both, got {got}"
+        )
+    };
+    match (start_time_filter, close_time_filter) {
+        (Some(window), None) => Ok((ExecutionTimeBasis::StartTime, window)),
+        (None, Some(window)) => Ok((ExecutionTimeBasis::CloseTime, window)),
+        (Some(_), Some(_)) => Err(refused("both")),
+        (None, None) => Err(refused("neither")),
+    }
+}
+
 /// A visibility listing's `nextPageToken` for the next unread execution: the ordering
 /// the page was read in, then the [`ExecutionOrderKey`] the page ended on.
 ///
 /// The token names a POSITION IN THE ORDER rather than a stored execution, so a run
 /// that starts or closes between two pages cannot invalidate it: the next page is
-/// whatever still sorts after that key. The ordering is part of the token because
-/// "after this one" means the opposite thing in the two orderings; carrying it lets a
-/// token replayed against the other ordering be refused instead of silently skipping
-/// or repeating executions.
-pub fn encode_execution_page_token(reverse_order: bool, key: &ExecutionOrderKey) -> String {
+/// whatever still sorts after that key. The ordering — both its direction and the
+/// instant it is taken on — is part of the token because "after this one" means
+/// something different in each of them; carrying it lets a token replayed against
+/// another ordering be refused instead of silently skipping or repeating executions,
+/// which is what "Keep all other arguments unchanged" asks of the caller.
+pub fn encode_execution_page_token(
+    reverse_order: bool,
+    basis: ExecutionTimeBasis,
+    key: &ExecutionOrderKey,
+) -> String {
     let ((secs, nanos), workflow_id, run_id) = key;
     // Hex-encoded because the token is a response member with no structure of its own,
     // and a `workflowId` may hold any character SWF's naming rule allows.
     let payload = format!("{secs}.{nanos}\u{0}{workflow_id}\u{0}{run_id}");
     format!(
         "{}{}",
-        execution_order_tag(reverse_order),
+        execution_order_tag(reverse_order, basis),
         ::hex::encode(payload)
     )
 }
 
 /// The [`ExecutionOrderKey`] a `nextPageToken` resumes AFTER, for a request listing in
-/// `reverse_order`.
+/// `reverse_order` on `basis`.
 pub fn decode_execution_page_token(
     token: &str,
     reverse_order: bool,
+    basis: ExecutionTimeBasis,
 ) -> Result<ExecutionOrderKey, String> {
     let rejected = || {
         format!(
             "nextPageToken {token:?} was not issued for a reverseOrder={reverse_order} listing \
-             of this domain's workflow executions; pass the token back unchanged, with every \
-             other argument unchanged"
+             of this domain's workflow executions ordered by {}; pass the token back \
+             unchanged, with every other argument unchanged",
+            match basis {
+                ExecutionTimeBasis::StartTime => "start time",
+                ExecutionTimeBasis::CloseTime => "close time",
+            }
         )
     };
     let payload = token
-        .strip_prefix(execution_order_tag(reverse_order))
+        .strip_prefix(execution_order_tag(reverse_order, basis))
         .and_then(|encoded| ::hex::decode(encoded).ok())
         .and_then(|bytes| String::from_utf8(bytes).ok())
         .ok_or_else(rejected)?;
@@ -1114,12 +1181,14 @@ pub fn decode_execution_page_token(
     ))
 }
 
-/// The ordering tag [`encode_execution_page_token`] stamps into a page token.
-fn execution_order_tag(reverse_order: bool) -> &'static str {
-    if reverse_order {
-        "a"
-    } else {
-        "d"
+/// The ordering tag [`encode_execution_page_token`] stamps into a page token: the
+/// direction the page was walked in, then the instant the order was taken on.
+fn execution_order_tag(reverse_order: bool, basis: ExecutionTimeBasis) -> &'static str {
+    match (reverse_order, basis) {
+        (false, ExecutionTimeBasis::StartTime) => "ds",
+        (true, ExecutionTimeBasis::StartTime) => "as",
+        (false, ExecutionTimeBasis::CloseTime) => "dc",
+        (true, ExecutionTimeBasis::CloseTime) => "ac",
     }
 }
 

@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListClosedWorkflowExecutions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListClosedWorkflowExecutions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! A visibility listing of the CLOSED workflow executions stored in one domain.
+//! Answers from state alone: every reported `WorkflowExecutionInfo` is the stored
+//! record the per-execution reader reports, and the listing writes nothing.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListClosedWorkflowExecutions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The rule it applies, from the model's own doc for this operation and its members:
+//! the listing reports exactly the addressed domain's stored runs that are CLOSED,
+//! whose instant for the single time filter the request names lies inside that
+//! filter's window, and which satisfy whichever single one of `closeStatusFilter` /
+//! `executionFilter` / `typeFilter` / `tagFilter` the request names — ordered by that
+//! same instant (descending by default, ascending under `reverseOrder`) and paged by
+//! `maximumPageSize` / `nextPageToken`.
 //!
 //! ## Shape of an operation
 //!
@@ -197,20 +199,125 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListClosedWorkflowExecutions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListClosedWorkflowExecutionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListClosedWorkflowExecutions"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListClosedWorkflowExecutionsErrorModeled::OperationNotPermittedFault(
+                OperationNotPermittedFault {
+                    message: Some("the SWF domain store is unavailable".to_string()),
+                },
+            )
+        })?;
+
+        // "closeStatusFilter, executionFilter, typeFilter and tagFilter are mutually
+        // exclusive. You can specify at most one of these in a request."
+        crate::state::validate_exclusive_filters(&[
+            ("closeStatusFilter", input.close_status_filter.is_some()),
+            ("executionFilter", input.execution_filter.is_some()),
+            ("typeFilter", input.type_filter.is_some()),
+            ("tagFilter", input.tag_filter.is_some()),
+        ])
+        .map_err(crate::scaffolded::Scaffolded::validation)?;
+
+        // "startTimeFilter and closeTimeFilter are mutually exclusive. You must specify
+        // one of these in a request but not both." Which one is given also chooses the
+        // instant this listing selects, orders and pages on: "if this parameter is
+        // specified, the returned results are ordered by their close times".
+        let (basis, window) = crate::state::resolve_execution_time_window(
+            input.start_time_filter.as_ref(),
+            input.close_time_filter.as_ref(),
+        )
+        .map_err(crate::scaffolded::Scaffolded::validation)?;
+
+        let guard = state.lock();
+        // A listing is scoped to one domain, and the domain's registration status does
+        // not gate it: deprecating a domain stops new registrations and starts in it,
+        // while its executions stay visible.
+        let domain = guard.domains.get(&input.domain).ok_or_else(|| {
+            ListClosedWorkflowExecutionsErrorModeled::UnknownResourceFault(UnknownResourceFault {
+                message: Some(format!("Unknown domain: {}", input.domain)),
+            })
+        })?;
+
+        let mut matching: Vec<&crate::state::Execution> = domain
+            .executions
+            .values()
+            .filter(|execution| {
+                // CLOSED only: a run still running is reported by the open-execution
+                // listing instead, and it carries no close instant for a close-time
+                // window to select on either.
+                !execution.is_open()
+                    && crate::state::execution_instant(execution, basis)
+                        .is_some_and(|at| crate::state::within_time_window(at, window))
+                    // "only workflow executions that match this close status are
+                    // listed": the stored close status is what it matches against.
+                    && input.close_status_filter.as_ref().is_none_or(|filter| {
+                        execution.close_status.as_deref() == Some(filter.status.as_str())
+                    })
+                    && crate::state::execution_matches_filters(
+                        execution,
+                        input.execution_filter.as_ref(),
+                        input.type_filter.as_ref(),
+                        input.tag_filter.as_ref(),
+                    )
+            })
+            .collect();
+
+        // "By default the results are returned in descending order of the start or the
+        // close time of the executions"; `reverseOrder` returns them ascending instead.
+        // Sorting is by the full order key, so the position of two runs sharing an
+        // instant is still defined — the store holds them in a map with no order of its
+        // own.
+        matching.sort_by_key(|execution| crate::state::execution_order_key(execution, basis));
+        if !input.reverse_order {
+            matching.reverse();
+        }
+
+        // `maximumPageSize` defaults to 0 ("not specified"), which means every match up
+        // to the modelled page maximum. The modelled `PageSize` range (0..1000) is
+        // enforced by the boundary validator before this handler runs, so a value above
+        // the maximum never reaches here; the clamp is the internal safety bound that
+        // keeps one response bounded regardless.
+        let page_size = match usize::try_from(input.maximum_page_size) {
+            Ok(size) if size > 0 => size.min(crate::state::MAX_EXECUTION_PAGE_SIZE),
+            _ => crate::state::MAX_EXECUTION_PAGE_SIZE,
+        };
+
+        // The token names the position the previous page ended at, so this page starts
+        // at the first match that sorts after it in THIS ordering. `partition_point`
+        // reads that off the sorted ordering, so a run that closed between the two
+        // calls shifts nothing the token addresses.
+        let start = match crate::state::non_empty(&input.next_page_token) {
+            Some(token) => {
+                let resume_after =
+                    crate::state::decode_execution_page_token(&token, input.reverse_order, basis)
+                        .map_err(crate::scaffolded::Scaffolded::validation)?;
+                matching.partition_point(|execution| {
+                    let key = crate::state::execution_order_key(execution, basis);
+                    if input.reverse_order {
+                        key <= resume_after
+                    } else {
+                        key >= resume_after
+                    }
+                })
+            }
+            None => 0,
+        };
+        let total = matching.len();
+        let end = (start + page_size).min(total);
+        let page = &matching[start..end];
+
+        Ok(ListClosedWorkflowExecutionsOutput {
+            execution_infos: page.iter().map(|execution| execution.info()).collect(),
+            // The token names the last execution of THIS page, so `last()` is what the
+            // cursor is built from, and it is issued only while matches remain.
+            next_page_token: page.last().filter(|_| end < total).map(|last| {
+                crate::state::encode_execution_page_token(
+                    input.reverse_order,
+                    basis,
+                    &crate::state::execution_order_key(last, basis),
+                )
+            }),
+        })
     }
 }
