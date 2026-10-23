@@ -18,8 +18,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::ops::types::{
     AccessDeniedException, AppMonitor, AppMonitorConfiguration, AppMonitorDetails,
     AppMonitorSummary, ConflictException, CustomEvents, CwLog, DataStorage,
-    DeobfuscationConfiguration, InvalidPolicyRevisionIdException, MetricDestinationSummary,
-    PolicyNotFoundException, ResourceNotFoundException, METRIC_DESTINATION_VALUES,
+    DeobfuscationConfiguration, InvalidPolicyRevisionIdException, JavaScriptSourceMaps,
+    MetricDestinationSummary, PolicyNotFoundException, ResourceNotFoundException,
+    METRIC_DESTINATION_VALUES,
 };
 
 /// Who a request speaks for, and whether IAM lets it do what it asks: the authorization
@@ -42,18 +43,37 @@ const APP_MONITOR_RESOURCE: &str = "appmonitor";
 pub const DEFAULT_REGION: &str = "us-east-1";
 
 /// `State` of an app monitor this emulator creates — a member of
-/// [`crate::ops::types::STATE_ENUM_VALUES`].
+/// [`crate::ops::types::STATE_ENUM_VALUES`] (`CREATED`, `DELETING`, `ACTIVE`).
 ///
 /// `CreateAppMonitor` is synchronous and the monitor it returns is immediately able to
 /// accept `PutRumEvents`, so the resource is created in a terminal state with no
-/// clock-owed transition pending.
-pub const ACTIVE_STATE: &str = "ACTIVE";
+/// clock-owed transition pending. Recorded behaviour: the terminal state RUM reports for
+/// a monitor that exists and is not being torn down is `CREATED` — on a freshly created
+/// monitor and on one that has since been updated alike — so that is the single value the
+/// detail and the summary projections both report.
+pub const CREATED_STATE: &str = "CREATED";
+
+/// The `AppMonitorPlatform` of an app monitor for a WEB application — the one platform
+/// whose application has an internet domain at all, and so the one a monitor's domain
+/// authority can describe.
+///
+/// From the model: `AppMonitorPlatform` admits `Web`, `Android` and `iOS`
+/// ([`crate::ops::types::APP_MONITOR_PLATFORM_VALUES`]), documented "Web for web
+/// applications, Android for Android applications, and iOS for IOS applications", while
+/// `Domain` is "The top-level internet domain name for which your application has
+/// administrative authority" — a property only a web application has.
+pub const WEB_PLATFORM: &str = "Web";
 
 /// `Platform` of an app monitor whose create request named none.
 ///
 /// From the model: `CreateAppMonitorRequest$Platform` documents "If you omit this
 /// parameter, the default is Web."
-pub const DEFAULT_PLATFORM: &str = "Web";
+pub const DEFAULT_PLATFORM: &str = WEB_PLATFORM;
+
+/// `JavaScriptSourceMaps$Status` of an app monitor whose create request named no
+/// `DeobfuscationConfiguration`: deobfuscation is off until a request turns it on. A
+/// member of [`crate::ops::types::DEOBFUSCATION_STATUS_VALUES`].
+pub const DEFAULT_DEOBFUSCATION_STATUS: &str = "DISABLED";
 
 /// `CustomEvents$Status` of an app monitor whose create request named no `CustomEvents`.
 ///
@@ -303,8 +323,15 @@ pub struct AppMonitorRecord {
     pub domain_list: Option<Vec<String>>,
     /// `Created` as the modelled 19-character `ISOTimestampString`.
     pub created: String,
-    /// `LastModified` as the modelled 19-character `ISOTimestampString`.
-    pub last_modified: String,
+    /// `LastModified` as the modelled 19-character `ISOTimestampString`, or `None` while
+    /// this monitor has only ever been created.
+    ///
+    /// The member is "the date and time of the most recent changes to this app monitor's
+    /// configuration", so a monitor nothing has changed yet HAS no such instant and the
+    /// member is absent from every projection of it; it is set by the operations that
+    /// change the configuration. Its presence is therefore the answer to "has this
+    /// monitor been modified since it was created?".
+    pub last_modified: Option<String>,
     /// `State`, a member of [`crate::ops::types::STATE_ENUM_VALUES`].
     pub state: String,
     /// `Platform`, a member of [`crate::ops::types::APP_MONITOR_PLATFORM_VALUES`].
@@ -314,7 +341,10 @@ pub struct AppMonitorRecord {
     pub cw_log_enabled: bool,
     pub app_monitor_configuration: AppMonitorConfiguration,
     pub custom_events: CustomEvents,
-    pub deobfuscation_configuration: Option<DeobfuscationConfiguration>,
+    /// `DeobfuscationConfiguration`, materialised for every monitor: a create that named
+    /// none stores [`default_deobfuscation_configuration`] rather than leaving the member
+    /// unset, so a read always reports the structure and its status.
+    pub deobfuscation_configuration: DeobfuscationConfiguration,
     /// This monitor's tags: the map `CreateAppMonitor` seeds and `UntagResource` removes
     /// keys from, what `GetAppMonitor` reports as `AppMonitor$Tags` and what
     /// `ListTagsForResource` reports as its own `Tags`. A `BTreeMap` so the stored record
@@ -380,7 +410,7 @@ impl AppMonitorRecord {
             domain_list: self.domain_list.clone(),
             id: Some(self.id.clone()),
             created: Some(self.created.clone()),
-            last_modified: Some(self.last_modified.clone()),
+            last_modified: self.last_modified.clone(),
             tags: Some(self.tag_map()),
             state: Some(self.state.clone()),
             app_monitor_configuration: Some(self.app_monitor_configuration.clone()),
@@ -391,7 +421,7 @@ impl AppMonitorRecord {
                 }),
             }),
             custom_events: Some(self.custom_events.clone()),
-            deobfuscation_configuration: self.deobfuscation_configuration.clone(),
+            deobfuscation_configuration: Some(self.deobfuscation_configuration.clone()),
             platform: Some(self.platform.clone()),
         }
     }
@@ -403,7 +433,7 @@ impl AppMonitorRecord {
             name: Some(self.name.clone()),
             id: Some(self.id.clone()),
             created: Some(self.created.clone()),
-            last_modified: Some(self.last_modified.clone()),
+            last_modified: self.last_modified.clone(),
             state: Some(self.state.clone()),
             platform: Some(self.platform.clone()),
         }
@@ -701,6 +731,25 @@ pub fn default_custom_events() -> CustomEvents {
     }
 }
 
+/// The deobfuscation configuration an app monitor gets when its create request carried
+/// none: source-map deobfuscation off, and no bucket to read maps from.
+///
+/// `DeobfuscationConfiguration` is `{ JavaScriptSourceMaps }` and
+/// `JavaScriptSourceMaps$Status` is `@required` (a member of
+/// [`crate::ops::types::DEOBFUSCATION_STATUS_VALUES`]), so there is no such thing as a
+/// configuration that leaves the status open: a monitor created without one is created
+/// with deobfuscation DISABLED, and recorded behaviour reports exactly that structure
+/// rather than omitting the member. Which is also why a read never has to decide: the
+/// record always holds one ([`AppMonitorRecord::deobfuscation_configuration`]).
+pub fn default_deobfuscation_configuration() -> DeobfuscationConfiguration {
+    DeobfuscationConfiguration {
+        java_script_source_maps: Some(JavaScriptSourceMaps {
+            status: DEFAULT_DEOBFUSCATION_STATUS.to_string(),
+            s3_uri: None,
+        }),
+    }
+}
+
 /// Why this request's `Domain`/`DomainList` pair cannot be applied, or `None` when it
 /// can.
 ///
@@ -710,8 +759,10 @@ pub fn default_custom_events() -> CustomEvents {
 /// domain or the domain list" — a monitor's domain authority is held in exactly ONE of
 /// the two forms. Neither constraint is expressible in the model, so every operation that
 /// accepts the pair refuses it here with the `ValidationException` it declares.
-/// `required` is true for the operation that must end up with one (a create), false for
-/// one that may leave the stored choice alone (an update).
+/// `required` is true for the operation that must end up with one (a create of a monitor
+/// whose platform HAS an internet domain — see [`platform_requires_domain`]), false for
+/// one that may leave the stored choice alone (an update) or for a monitor that has no
+/// domain to name.
 pub fn domain_choice_refusal(
     domain: Option<&str>,
     domain_list: Option<&[String]>,
@@ -728,6 +779,24 @@ pub fn domain_choice_refusal(
         }
         _ => None,
     }
+}
+
+/// Whether an app monitor created for `platform` must name its domain authority.
+///
+/// From the model: `CreateAppMonitorRequest$DomainList` documents "The CreateAppMonitor
+/// requires either the domain or the domain list", and `Domain` is "the top-level
+/// internet domain name for which your application has administrative authority". An
+/// application on a platform other than [`WEB_PLATFORM`] — an Android or an iOS
+/// application — is not served from an internet domain, so there is no domain authority
+/// for it to hold and the requirement applies to the web platform alone. Recorded
+/// behaviour agrees: a monitor created for a mobile platform with neither member is
+/// accepted and read back carrying neither.
+///
+/// The OTHER half of the rule is platform-independent: whichever platform a monitor is
+/// for, its domain authority is held in at most one of the two forms, so naming both is
+/// refused for every platform ([`domain_choice_refusal`]).
+pub fn platform_requires_domain(platform: &str) -> bool {
+    platform == WEB_PLATFORM
 }
 
 /// Why this `AppMonitorConfiguration` cannot be applied, or `None` when it can.
@@ -1193,21 +1262,39 @@ pub const CONFLICT_MESSAGE_PREFIX: &str = "Resource ";
 /// See [`CONFLICT_MESSAGE_PREFIX`].
 pub const CONFLICT_MESSAGE_SUFFIX: &str = " already exists";
 
-/// The media type every RUM response announces for the JSON body it carries.
+/// The media type RUM announces for the JSON body of an answer to a request that carried
+/// no payload, and so declared no media type of its own.
 ///
 /// RECORDED BEHAVIOUR: the model declares `restJson1`, whose serializer stamps
-/// [`JSON_CONTENT_TYPE`] on a JSON body, but every recorded real-RUM response — every
-/// operation, success and failure alike, on 200s and on 404s — carries
-/// `application/x-amz-json-1.1`, which is the media type a client selecting a parser or
-/// asserting on the response reads. The body is the same JSON either way, so nothing but
-/// the announced type changes. Applied in [`crate::service::EmulatedService`], the one
-/// place every response this service produces passes through.
+/// [`JSON_CONTENT_TYPE`] on a JSON body, but a recorded real-RUM answer to a request with
+/// no payload — `GetAppMonitor`, `ListAppMonitors`, `DeleteAppMonitor`, the resource-policy
+/// reads, `ListRumMetricsDestinations`, their 404s included — carries
+/// `application/x-amz-json-1.1`: the frontend answers in the media type the request's
+/// payload declared, and a payload-less request declared none, so it falls back to RUM's
+/// own JSON type. An answer to a request that DID carry a payload (`CreateAppMonitor`,
+/// `UpdateAppMonitor`, `PutResourcePolicy`, `PutRumEvents`,
+/// `BatchCreateRumMetricDefinitions`, their 4xxs included) is recorded in
+/// [`JSON_CONTENT_TYPE`], the type that payload declared. The body is the same JSON
+/// either way, so nothing but the announced type differs.
+///
+/// How the payload half is known: a replay of the recorded fixture
+/// `rum-multi-platform-monitors` with `application/x-amz-json-1.1` announced on EVERY
+/// answer reports `rum|CreateAppMonitor|2xx->2xx|$headers.content-type` as a divergence on
+/// a step whose status and body both match, and the same replay passes end to end once a
+/// payload-carrying request is answered in [`JSON_CONTENT_TYPE`]. Before the blanket
+/// re-announce existed this service answered `application/json` everywhere and no sweep
+/// ever filed a `CreateAppMonitor` content-type cluster, which agrees: the create's
+/// recorded header was matching then.
+///
+/// Applied in [`crate::service::EmulatedService`], the one place every response this
+/// service produces passes through.
 pub const RESPONSE_CONTENT_TYPE: &str = "application/x-amz-json-1.1";
 
 /// The media type the `restJson1` serializer stamps on a JSON body — the one value
-/// [`RESPONSE_CONTENT_TYPE`] replaces. A response whose body is NOT that JSON envelope
-/// (a `@httpPayload` blob's `application/octet-stream`, a string payload's `text/plain`)
-/// announces the type its own target shape maps to and is left alone.
+/// [`RESPONSE_CONTENT_TYPE`] replaces, and the one a request's JSON payload declares. A
+/// response whose body is NOT that JSON envelope (a `@httpPayload` blob's
+/// `application/octet-stream`, a string payload's `text/plain`) announces the type its own
+/// target shape maps to and is left alone.
 pub const JSON_CONTENT_TYPE: &str = "application/json";
 
 /// What separates the components of a continuation token's resume key: a control

@@ -1,15 +1,35 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AddTags
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AddTags`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Adds tags to the resource its `ResourceId` ARN names, in the registries
+//! `crate::state` owns.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AddTags::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The rules it applies, each from the modelled contract below:
+//!
+//! * a tagging operation addresses a resource ONLY by ARN, and the ARN's resource
+//!   TYPE segment (`trail`, `eventdatastore`, `dashboard`, `channel`) decides which
+//!   registry the id is resolved in — and therefore which modelled error an ARN that
+//!   is malformed (`CloudTrailARNInvalid` / `EventDataStoreARNInvalid` /
+//!   `ChannelARNInvalid`), names an untaggable type (`ResourceTypeNotSupported`) or
+//!   names nothing (`ResourceNotFound` for a trail or dashboard,
+//!   `EventDataStoreNotFound` / `ChannelNotFound` for the CloudTrail Lake types)
+//!   answers with;
+//! * a tag whose key the resource already carries takes the request's value, and a
+//!   key it does not carry is added;
+//! * the REQUEST's own tag set is held to the tag rules first — one key may not
+//!   appear twice, and no request may carry more than the 50-tag limit — so a tag a
+//!   caller cannot ask for is refused whether or not the ARN names anything;
+//! * a resource carries at most 50 tags, counted AFTER the merge;
+//! * a dashboard CloudTrail has not finished loading is not ready to be tagged;
+//! * an event data store awaiting deletion is inactive;
+//! * a trail or event data store that applies to all Regions is tagged only from its
+//!   home Region.
+//!
+//! A tag key or value outside the modelled `TagKey` / `TagValue` length bounds is
+//! refused by the framework's boundary walk before this handler runs, as
+//! `InvalidTagParameterException` — see `Service::override_refusal` in
+//! `crate::service`, which words that refusal for every operation carrying a
+//! `TagsList`.
 //!
 //! ## Shape of an operation
 //!
@@ -208,18 +228,237 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AddTags` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AddTagsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let request_region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+
+        // "Specifies the ARN of the trail, event data store, dashboard, or channel to
+        // which one or more tags will be added": the resource is addressed only by
+        // ARN, and the ARN's resource type decides how a bad one is refused. The ARN is
+        // read through the one tagging parse `crate::state` owns, so `AddTags`,
+        // `RemoveTags` and `ListTags` classify the same value the same way.
+        let arn = crate::state::parse_taggable_arn(&input.resource_id)
+            .map_err(|rejection| AddTagsError::from(arn_rejection(rejection)))?;
+
+        // The REQUEST's own tag set is held to the tag rules before any resource is
+        // looked up, so a tag a caller cannot ask for is refused whether or not the
+        // ARN names something.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AddTags"))
+        // `InvalidTagParameterException` covers "duplicate tags": "Tag key names must
+        // be unique; you cannot have two keys with the same name but different
+        // values", so one request cannot carry a key twice.
+        if crate::state::first_duplicate_tag_key(&input.tags_list).is_some() {
+            return Err(AddTagsErrorModeled::InvalidTagParameterException(
+                InvalidTagParameterException {
+                    message: Some("Multiple tags cannot have the same key.".to_string()),
+                },
+            )
+            .into());
+        }
+        // "Adds one or more tags … up to a limit of 50": a request carrying more than
+        // the limit cannot be satisfied by any resource.
+        if input.tags_list.len() > crate::state::TAGS_PER_RESOURCE_LIMIT {
+            return Err(AddTagsErrorModeled::TagsLimitExceededException(
+                TagsLimitExceededException {
+                    message: Some(format!(
+                        "TagsList carries {} tags; the limit is {} tags per resource",
+                        input.tags_list.len(),
+                        crate::state::TAGS_PER_RESOURCE_LIMIT
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            AddTagsErrorModeled::UnsupportedOperationException(UnsupportedOperationException {
+                message: Some(
+                    "AddTags needs the CloudTrail resource registries, which this engine \
+                     does not carry"
+                        .to_string(),
+                ),
+            })
+        })?;
+        let mut store = state.lock();
+
+        // `ConflictException` is "thrown when the specified resource is not ready for
+        // an operation … before CloudTrail has time to fully load the resource": a
+        // dashboard still `CREATING` cannot be tagged. Settling it first materialises
+        // only the transition the clock already owed.
+        if let crate::state::TaggableArn::Dashboard { region, name } = &arn {
+            if let Some(dashboard) = store.dashboards.get_mut(&(name.clone(), region.clone())) {
+                dashboard.settle(now);
+                if dashboard.status == crate::state::DASHBOARD_STATUS_CREATING {
+                    return Err(AddTagsErrorModeled::ConflictException(ConflictException {
+                        message: Some(format!(
+                            "Dashboard {} is {} and is not ready to be tagged; wait for it \
+                             to be {} and try again",
+                            input.resource_id,
+                            crate::state::DASHBOARD_STATUS_CREATING,
+                            crate::state::DASHBOARD_STATUS_CREATED,
+                        )),
+                    })
+                    .into());
+                }
+            }
+        }
+
+        // "You can tag a trail or event data store that applies to all Amazon Web
+        // Services Regions only from the Region in which the trail or event data store
+        // was created (also known as its home Region)": an all-Regions resource's ARN
+        // is reachable from every Region, but only its home Region may write its tags.
+        // Both resource types the sentence names are held to it.
+        //
+        // It is NARROWER than `State::resolve_for_mutation`, which refuses every
+        // cross-Region trail ARN for the operations that CHANGE a trail's
+        // configuration: the sentence restricts the all-Regions case alone, and the
+        // model gives `AddTags` no `InvalidHomeRegionException` to refuse a
+        // single-Region resource addressed from elsewhere — which therefore keeps
+        // resolving by ARN, exactly as the reads do.
+        let addressed_from_another_region = match &arn {
+            crate::state::TaggableArn::Trail { region, name } => store
+                .trails
+                .get(&(name.clone(), region.clone()))
+                .is_some_and(|trail| trail.is_multi_region_trail && *region != request_region),
+            crate::state::TaggableArn::EventDataStore { region, id } => store
+                .event_data_stores
+                .get(id)
+                .filter(|record| record.region == *region)
+                .is_some_and(|record| record.multi_region_enabled && *region != request_region),
+            // A dashboard and a channel are regional resources the model states no
+            // all-Regions form for, so the sentence does not reach them.
+            crate::state::TaggableArn::Dashboard { .. }
+            | crate::state::TaggableArn::Channel { .. } => false,
+        };
+        if addressed_from_another_region {
+            let home_region = match &arn {
+                crate::state::TaggableArn::Trail { region, .. }
+                | crate::state::TaggableArn::Dashboard { region, .. }
+                | crate::state::TaggableArn::EventDataStore { region, .. }
+                | crate::state::TaggableArn::Channel { region, .. } => region,
+            };
+            return Err(AddTagsErrorModeled::OperationNotPermittedException(
+                OperationNotPermittedException {
+                    message: Some(format!(
+                        "{} applies to all Regions and was created in {home_region}, so it is \
+                         tagged from {home_region} rather than from {request_region}",
+                        input.resource_id,
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "The event data store is inactive": a store awaiting deletion no longer
+        // holds a lake to tag, which is what `InactiveEventDataStoreException`
+        // reports (the same reading `EventDataStoreState::is_queryable` applies for
+        // the query operations).
+        if let crate::state::TaggableArn::EventDataStore { region, id } = &arn {
+            if let Some(record) = store
+                .event_data_stores
+                .get(id)
+                .filter(|record| record.region == *region && !record.status.is_queryable())
+            {
+                return Err(AddTagsErrorModeled::InactiveEventDataStoreException(
+                    InactiveEventDataStoreException {
+                        message: Some(format!(
+                            "The event data store {} is {} and is inactive.",
+                            input.resource_id,
+                            record.status.as_wire()
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // The resource's own tag set, read out of the registry its ARN names.
+        let Some(held) = store.resource_tags_mut(&arn) else {
+            return Err(not_found(&arn, &input.resource_id));
+        };
+
+        // "Overwrites an existing tag's value when a new value is specified for an
+        // existing tag key" — so the merged set, not the request, is what the limit
+        // ("up to a limit of 50") is held against.
+        let merged = crate::state::tags_merged(held, input.tags_list);
+        if merged.len() > crate::state::TAGS_PER_RESOURCE_LIMIT {
+            return Err(AddTagsErrorModeled::TagsLimitExceededException(
+                TagsLimitExceededException {
+                    message: Some(format!(
+                        "{} would carry {} tags; the limit is {} tags per resource",
+                        input.resource_id,
+                        merged.len(),
+                        crate::state::TAGS_PER_RESOURCE_LIMIT
+                    )),
+                },
+            )
+            .into());
+        }
+
+        *held = merged;
+        Ok(AddTagsOutput {})
+    }
+}
+
+/// The modelled error a malformed `ResourceId` is refused with: the kind-specific
+/// invalid-ARN shape where the model declares one, and
+/// `ResourceTypeNotSupportedException` for a CloudTrail ARN naming a resource type
+/// that carries no tags. Every one of them is a modelled 400, so none needs a status
+/// of its own. The classification itself is `crate::state`'s, shared with the other
+/// tagging operations.
+fn arn_rejection(rejection: crate::state::TaggableArnRejection) -> AddTagsErrorModeled {
+    let message = Some(rejection.message());
+    match rejection {
+        crate::state::TaggableArnRejection::ChannelArn(_) => {
+            AddTagsErrorModeled::ChannelARNInvalidException(ChannelARNInvalidException { message })
+        }
+        crate::state::TaggableArnRejection::EventDataStoreArn(_) => {
+            AddTagsErrorModeled::EventDataStoreARNInvalidException(
+                EventDataStoreARNInvalidException { message },
+            )
+        }
+        crate::state::TaggableArnRejection::CloudTrailArn(_) => {
+            AddTagsErrorModeled::CloudTrailARNInvalidException(CloudTrailARNInvalidException {
+                message,
+            })
+        }
+        crate::state::TaggableArnRejection::UnsupportedResourceType { .. } => {
+            AddTagsErrorModeled::ResourceTypeNotSupportedException(
+                ResourceTypeNotSupportedException { message },
+            )
+        }
+    }
+}
+
+/// The refusal for an ARN that is well formed but names no resource this account
+/// holds: the kind-specific not-found shape where the model declares one, and
+/// `ResourceNotFoundException` for the kinds it does not, worded as
+/// `TaggableArn::not_found_message` words that kind — the one wording the tagging
+/// operations share.
+///
+/// The two kind-specific shapes are the ones the model marks `@httpError(404)` and
+/// CloudTrail answers with [`crate::state::TAGGING_REFUSAL_STATUS`], so they travel
+/// through the wrapper's status override; `ResourceNotFoundException` is a modelled
+/// 400 already.
+fn not_found(arn: &crate::state::TaggableArn, resource_id: &str) -> AddTagsError {
+    let message = Some(arn.not_found_message(resource_id));
+    match arn {
+        crate::state::TaggableArn::Channel { .. } => {
+            crate::scaffolded::Scaffolded::modeled_with_status(
+                AddTagsErrorModeled::ChannelNotFoundException(ChannelNotFoundException { message }),
+                crate::state::TAGGING_REFUSAL_STATUS,
+            )
+        }
+        crate::state::TaggableArn::EventDataStore { .. } => {
+            crate::scaffolded::Scaffolded::modeled_with_status(
+                AddTagsErrorModeled::EventDataStoreNotFoundException(
+                    EventDataStoreNotFoundException { message },
+                ),
+                crate::state::TAGGING_REFUSAL_STATUS,
+            )
+        }
+        crate::state::TaggableArn::Trail { .. } | crate::state::TaggableArn::Dashboard { .. } => {
+            AddTagsErrorModeled::ResourceNotFoundException(ResourceNotFoundException { message })
+                .into()
+        }
     }
 }

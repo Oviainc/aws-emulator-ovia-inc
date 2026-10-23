@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! End-to-end cover for `UpdateFileSystem`: the throughput change it applies to the
-//! stored file system, the `updating` phase it reports while the change settles, and
-//! every refusal the operation models.
+//! End-to-end cover for `UpdateFileSystem`: the throughput change it ACCEPTS for the
+//! stored file system, the `updating` phase and still-current throughput it reports while
+//! that change settles, the change becoming the file system's own configuration when the
+//! transition completes, and every refusal the operation models.
 //!
 //! The rules are asserted over a SET of inputs rather than on one call: the tables below
 //! vary the starting throughput mode, the requested mode, which members the request
@@ -62,12 +63,12 @@ fn mibps_of(description: &Value) -> Option<f64> {
 }
 
 // ---------------------------------------------------------------------------
-// The accepted changes: each is persisted, and reported as `updating` until the
-// clock owes the file system `available` again.
+// The accepted changes: each is reported as `updating` over the file system's still
+// current throughput, and becomes its configuration when the transition completes.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn each_accepted_throughput_change_is_persisted_and_settles_to_available() {
+async fn each_accepted_throughput_change_is_applied_when_the_transition_completes() {
     // (case, CreateFileSystem body, UpdateFileSystem body, expected mode, expected MiBps).
     // The modes are the modelled `ThroughputMode` closure
     // (`smithy_query(query="shape",shape="ThroughputMode")` -> bursting | elastic |
@@ -138,7 +139,11 @@ async fn each_accepted_throughput_change_is_persisted_and_settles_to_available()
 
     let efs = Emulator::new();
     for (case, create_body, update_body, mode, mibps) in cases {
-        let id = settled_file_system(&efs, create_body).await;
+        // What the file system reads as BEFORE the update: the 202 that accepts a change
+        // reports this, not what was asked for.
+        let mode_before = create_body["ThroughputMode"].as_str().unwrap_or("bursting");
+        let mibps_before = create_body["ProvisionedThroughputInMibps"].as_f64();
+        let id = settled_file_system(&efs, create_body.clone()).await;
         let updated = update_file_system(&efs, &id, update_body.clone()).await;
 
         assert_eq!(
@@ -153,33 +158,49 @@ async fn each_accepted_throughput_change_is_persisted_and_settles_to_available()
             updated.get("FileSystemId")
         );
         assert_eq!(
+            updated.string("LifeCycleState"),
+            "updating",
+            "case {case:?}: the 202 reports the transition it started, got {:?}",
+            updated.get("LifeCycleState")
+        );
+        assert_eq!(
             updated.string("ThroughputMode"),
-            mode,
-            "case {case:?}: expected ThroughputMode {mode:?}, got {:?}",
+            mode_before,
+            "case {case:?}: the 202 accepts the change and still reports ThroughputMode \
+             {mode_before:?}, got {:?}",
             updated.get("ThroughputMode")
         );
         assert_eq!(
             mibps_of(&updated.body),
-            mibps,
-            "case {case:?}: expected ProvisionedThroughputInMibps {mibps:?}, got {:?}",
+            mibps_before,
+            "case {case:?}: the 202 still reports ProvisionedThroughputInMibps \
+             {mibps_before:?}, got {:?}",
             updated.get("ProvisionedThroughputInMibps")
         );
 
-        // The change is on the record the next caller reads, whatever its lifecycle
-        // phase: the update is a WRITE, not an echo.
+        // While the transition runs, the next caller reads the same still-current
+        // configuration: the accepted change is not visible before it is applied.
         let before_settle = stored(&efs, &id).await;
         assert_eq!(
+            before_settle["LifeCycleState"].as_str(),
+            Some("updating"),
+            "case {case:?}: the stored file system is updating, got {before_settle:?}"
+        );
+        assert_eq!(
             before_settle["ThroughputMode"].as_str(),
-            Some(mode),
-            "case {case:?}: the stored file system must carry the new mode, got {before_settle:?}"
+            Some(mode_before),
+            "case {case:?}: the stored file system still carries its current mode, got \
+             {before_settle:?}"
         );
         assert_eq!(
             mibps_of(&before_settle),
-            mibps,
-            "case {case:?}: the stored file system must carry the new amount, got {before_settle:?}"
+            mibps_before,
+            "case {case:?}: the stored file system still carries its current amount, got \
+             {before_settle:?}"
         );
 
-        // `updating` is clock-owed back to `available`, exactly like `creating`.
+        // The transition is clock-owed, exactly like `creating`, and completing it is
+        // what applies the change.
         settle().await;
         let after_settle = stored(&efs, &id).await;
         assert_eq!(
@@ -190,12 +211,12 @@ async fn each_accepted_throughput_change_is_persisted_and_settles_to_available()
         assert_eq!(
             after_settle["ThroughputMode"].as_str(),
             Some(mode),
-            "case {case:?}: the settled file system keeps the new mode, got {after_settle:?}"
+            "case {case:?}: the settled file system carries the new mode, got {after_settle:?}"
         );
         assert_eq!(
             mibps_of(&after_settle),
             mibps,
-            "case {case:?}: the settled file system keeps the new amount, got {after_settle:?}"
+            "case {case:?}: the settled file system carries the new amount, got {after_settle:?}"
         );
         assert_eq!(
             after_settle["CreationToken"], updated.body["CreationToken"],
@@ -205,7 +226,7 @@ async fn each_accepted_throughput_change_is_persisted_and_settles_to_available()
 }
 
 #[tokio::test]
-async fn an_applied_change_reports_updating_and_refuses_a_second_one_until_it_settles() {
+async fn an_accepted_change_reports_updating_and_refuses_a_second_one_until_it_settles() {
     let efs = Emulator::new();
     let id = settled_file_system(&efs, json!({ "CreationToken": "transient" })).await;
 
@@ -223,7 +244,7 @@ async fn an_applied_change_reports_updating_and_refuses_a_second_one_until_it_se
     assert_eq!(
         updated.string("LifeCycleState"),
         "updating",
-        "UpdateFileSystem: an applied change is reported while still updating, got {:?}",
+        "UpdateFileSystem: an accepted change is reported while still updating, got {:?}",
         updated.get("LifeCycleState")
     );
 
@@ -245,8 +266,13 @@ async fn an_applied_change_reports_updating_and_refuses_a_second_one_until_it_se
     let stored_now = stored(&efs, &id).await;
     assert_eq!(
         mibps_of(&stored_now),
-        Some(64.0),
-        "a refused update must change nothing, got {stored_now:?}"
+        None,
+        "neither the accepted nor the refused update is visible yet, got {stored_now:?}"
+    );
+    assert_eq!(
+        stored_now["ThroughputMode"].as_str(),
+        Some("bursting"),
+        "the file system still carries the mode it was created with, got {stored_now:?}"
     );
 
     settle().await;
@@ -255,6 +281,17 @@ async fn an_applied_change_reports_updating_and_refuses_a_second_one_until_it_se
         settled["LifeCycleState"].as_str(),
         Some("available"),
         "after the updating span the file system is available again, got {settled:?}"
+    );
+    // The accepted change, and only it, is what the completed transition applied.
+    assert_eq!(
+        settled["ThroughputMode"].as_str(),
+        Some("provisioned"),
+        "the accepted change is applied by the transition, got {settled:?}"
+    );
+    assert_eq!(
+        mibps_of(&settled),
+        Some(64.0),
+        "the refused update changed nothing, got {settled:?}"
     );
 }
 
@@ -348,11 +385,16 @@ async fn a_file_system_id_is_accepted_as_an_id_or_as_an_arn() {
         );
         assert_eq!(
             updated.string("ThroughputMode"),
-            "elastic",
-            "case {case:?}: expected ThroughputMode \"elastic\", got {:?}",
+            "bursting",
+            "case {case:?}: the 202 reports the mode the file system still has, got {:?}",
             updated.get("ThroughputMode")
         );
         settle().await;
+        assert_eq!(
+            stored(&efs, &id).await["ThroughputMode"].as_str(),
+            Some("elastic"),
+            "case {case:?}: the change either form accepted is the one that is applied"
+        );
     }
 }
 

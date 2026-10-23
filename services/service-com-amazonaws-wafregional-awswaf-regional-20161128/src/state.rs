@@ -178,6 +178,33 @@ pub const MAX_CHANGE_TOKENS: usize = 1_000;
 /// SizeConstraintSet state a caller can grow bounded.
 pub const MAX_SIZE_CONSTRAINT_SETS: usize = 100;
 
+/// The most `SizeConstraint`s one `SizeConstraintSet` may hold.
+///
+/// The model states no quota, so this bound is the one AWS WAF Classic publishes per
+/// size constraint condition (10 filters — the same source as
+/// [`MAX_SQL_INJECTION_MATCH_TUPLES`]). Together with [`MAX_SIZE_CONSTRAINT_SETS`] it
+/// bounds the constraint state a caller can grow over many `UpdateSizeConstraintSet`
+/// requests, not just the number of sets.
+pub const MAX_SIZE_CONSTRAINTS: usize = 10;
+
+/// The most `SizeConstraintSetUpdate`s one `UpdateSizeConstraintSet` request may carry.
+///
+/// The model states no per-request quota for this operation, so this bound is CHOSEN,
+/// not cited, on the same reasoning as
+/// [`MAX_SQL_INJECTION_MATCH_SET_UPDATES_PER_REQUEST`]: a request can at most empty a
+/// set ([`MAX_SIZE_CONSTRAINTS`] deletes) and then fill it again
+/// ([`MAX_SIZE_CONSTRAINTS`] inserts), since a delete must name a constraint the set
+/// holds and an insert one it does not, so no larger request can leave the set in a
+/// state a request of this size cannot. It caps the work one caller can ask for before
+/// the handler takes the shared store's lock.
+pub const MAX_SIZE_CONSTRAINT_SET_UPDATES_PER_REQUEST: usize = 2 * MAX_SIZE_CONSTRAINTS;
+
+/// The largest `Size` a `SizeConstraint` may compare against, in bytes.
+///
+/// Source: `Size`'s modelled `@range` of 0..21474836480, which its own documentation
+/// repeats — "Valid values for size are 0 - 21474836480 bytes (0 - 20 GB)".
+pub const MAX_SIZE_CONSTRAINT_SIZE: i64 = 21_474_836_480;
+
 /// The most `WebACL`s this emulator stores for the account before `CreateWebACL`
 /// answers its modelled `WAFLimitsExceededException`.
 ///
@@ -661,6 +688,36 @@ impl RegexPatternSetEntry {
     }
 }
 
+/// One `SizeConstraint`'s identity: the part of the request it measures and the
+/// transformation applied first (the shared [`MatchFilterKey`]), plus the comparison it
+/// makes against a size.
+///
+/// `UpdateSizeConstraintSet` documents that "if you want to change a
+/// SizeConstraintSetUpdate object, you delete the existing object and add a new one", so
+/// two constraints are the same constraint exactly when every member of the modelled
+/// `SizeConstraint` agrees — which is what the derived `Eq` here means, with the `Data`
+/// name normalised the one way [`match_filter_key`] normalises it (it is "not case
+/// sensitive", and omitted for the types that name no header or query argument).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct SizeConstraintKey {
+    /// What part of the request is measured, and the text transformation applied before
+    /// measuring it.
+    pub filter: MatchFilterKey,
+    /// A `ComparisonOperator` value.
+    pub comparison_operator: String,
+    /// The `Size` the comparison is against, in bytes.
+    pub size: i64,
+}
+
+/// The identity of `constraint` — see [`SizeConstraintKey`].
+pub fn size_constraint_key(constraint: &SizeConstraint) -> SizeConstraintKey {
+    SizeConstraintKey {
+        filter: match_filter_key(&constraint.field_to_match, &constraint.text_transformation),
+        comparison_operator: constraint.comparison_operator.clone(),
+        size: constraint.size,
+    }
+}
+
 /// One stored `SizeConstraintSet`.
 ///
 /// A set is created empty — `CreateSizeConstraintSet` documents that it answers "a
@@ -670,7 +727,12 @@ impl RegexPatternSetEntry {
 pub struct SizeConstraintSetEntry {
     pub size_constraint_set_id: String,
     pub name: String,
-    /// The constraints in insertion order.
+    /// The constraints in insertion order, deduplicated by [`SizeConstraintKey`]. The
+    /// modelled shape is stored as it was accepted, so a read reports the stored record
+    /// rather than a re-rendering of it. No separate membership index is kept beside it
+    /// (as `ByteMatchSetEntry` keeps one): one set holds at most
+    /// [`MAX_SIZE_CONSTRAINTS`] constraints, so a lookup over this list is a walk of a
+    /// bounded handful, and the list stays the single copy of the record.
     pub size_constraints: Vec<SizeConstraint>,
 }
 
@@ -692,6 +754,35 @@ impl SizeConstraintSetEntry {
             name: Some(self.name.clone()),
             size_constraints: self.size_constraints.clone(),
         }
+    }
+
+    /// Whether this set holds a constraint whose identity equals `key`'s.
+    fn holds(&self, key: &SizeConstraintKey) -> bool {
+        self.size_constraints
+            .iter()
+            .any(|stored| &size_constraint_key(stored) == key)
+    }
+
+    /// Add a constraint, unless one with the same identity is already stored. Answers
+    /// whether the set changed.
+    pub fn insert_constraint(&mut self, constraint: &SizeConstraint) -> bool {
+        if self.holds(&size_constraint_key(constraint)) {
+            return false;
+        }
+        self.size_constraints.push(constraint.clone());
+        true
+    }
+
+    /// Remove the constraint whose identity equals `constraint`'s, if the set holds one.
+    /// Answers whether the set changed.
+    pub fn remove_constraint(&mut self, constraint: &SizeConstraint) -> bool {
+        let key = size_constraint_key(constraint);
+        if !self.holds(&key) {
+            return false;
+        }
+        self.size_constraints
+            .retain(|stored| size_constraint_key(stored) != key);
+        true
     }
 }
 

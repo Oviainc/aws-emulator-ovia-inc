@@ -1438,7 +1438,11 @@ fn declared_metadata(declared: &DeclaredResource) -> Option<String> {
 /// condition evaluates TRUE. A condition this module cannot evaluate is not an answer of
 /// `false`: the resource is created, because dropping a resource the template declares
 /// would be a worse answer than materialising one a false condition would have excluded.
-fn is_created(declared: &DeclaredResource, scope: &Scope<'_>, budget: &mut Budget) -> bool {
+fn is_created(
+    declared: &DeclaredResource,
+    scope: &Scope<'_>,
+    budget: &mut Budget,
+) -> bool {
     declared.condition.as_deref().is_none_or(|condition| {
         condition_holds(condition, scope, 0, budget).unwrap_or(true)
     })
@@ -1995,6 +1999,7 @@ pub const IMPLEMENTED_RESOURCE_TYPES: &[&str] = &[
     ELB_LISTENER_RULE,
     ELB_LOAD_BALANCER,
     ELB_TARGET_GROUP,
+    FIS_EXPERIMENT_TEMPLATE,
     "AWS::IAM::Role",
     FIREHOSE_DELIVERY_STREAM,
     "AWS::Lambda::Function",
@@ -2587,8 +2592,46 @@ fn return_values(
             );
             (name.to_string(), attributes)
         }
+        // "Ref returns the experiment template ID"; Fn::GetAtt: Id. FIS ASSIGNS that id —
+        // the type has no name property for a template to set — so a declaration reports an
+        // identifier of FIS's own shape (its `EXT` prefix and its 12-character suffix, each
+        // character one FIS's own minting admits) rather than CloudFormation's
+        // `<stack>-<logical id>-<unique id>` name (the case AWS::Transfer::Server and
+        // AWS::RUM::AppMonitor are in). The characters here are uppercase hexadecimal, a
+        // subset of the base-36 alphabet FIS mints from: a stand-in, since this is also the
+        // type `super::provisioning` creates in FIS itself, which reports the id IT minted
+        // back over the `Id` attribute — and THAT id, not this one, is what the stack
+        // reports for a resource FIS created.
+        FIS_EXPERIMENT_TEMPLATE => {
+            let id = format!(
+                "{FIS_TEMPLATE_ID_PREFIX}{}",
+                derived_digits(
+                    FIS_TEMPLATE_ID_PREFIX,
+                    name,
+                    FIS_TEMPLATE_ID_DIGITS,
+                    Alphabet::Upper,
+                )
+            );
+            attributes.insert("Id".to_string(), id.clone());
+            (id, attributes)
+        }
         _ => (name.to_string(), attributes),
     }
+}
+
+/// Whether the PHYSICAL ID of a resource of this type is assigned by the service that owns
+/// it rather than derived from what the template declares.
+///
+/// For such a type the identifier in force is the one that service minted: it cannot be
+/// recomputed from the template, so a later deployment of the same declaration carries the
+/// recorded one forward instead of replacing the resource
+/// ([`super::StoredStack::deploy_template`]). Every other type's physical id is a function
+/// of its declared or generated name, which any deployment recomputes identically.
+///
+/// One type this emulator provisions is in that position: an experiment template's id is
+/// minted by FIS (`Ref` returns it, and the type has no name property at all).
+pub fn identity_is_service_assigned(resource_type: &str) -> bool {
+    resource_type == FIS_EXPERIMENT_TEMPLATE
 }
 
 /// The `AWS::<cloudFormationName>::<Resource>` type of an Amazon Data Firehose stream.
@@ -2630,6 +2673,19 @@ pub const ELB_LOAD_BALANCER: &str = "AWS::ElasticLoadBalancingV2::LoadBalancer";
 
 /// An Elastic Load Balancing v2 target group's resource type.
 pub const ELB_TARGET_GROUP: &str = "AWS::ElasticLoadBalancingV2::TargetGroup";
+
+/// An AWS Fault Injection Service experiment template's resource type (the FIS model:
+/// `cloudFormationName: FIS`). This is the type `super::provisioning` creates in FIS
+/// itself, so the id a stack's output reports for it is the id FIS minted.
+pub const FIS_EXPERIMENT_TEMPLATE: &str = "AWS::FIS::ExperimentTemplate";
+
+/// The prefix of an experiment-template id, as FIS mints one (`EXT` + a base-36 suffix;
+/// FIS's own `TEMPLATE_ID_PREFIX`).
+const FIS_TEMPLATE_ID_PREFIX: &str = "EXT";
+
+/// How many characters follow [`FIS_TEMPLATE_ID_PREFIX`] in an experiment-template id:
+/// FIS's own `ID_SUFFIX_LEN`, the width of the base-36 suffix every id it mints carries.
+const FIS_TEMPLATE_ID_DIGITS: usize = 12;
 
 /// The revision a task definition registered for a family the account does not hold yet
 /// carries: "the first task definition that you registered to a family is given a revision

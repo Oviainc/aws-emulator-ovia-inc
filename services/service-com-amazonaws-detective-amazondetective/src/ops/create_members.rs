@@ -144,6 +144,16 @@ impl From<CreateMembersErrorModeled> for CreateMembersError {
     }
 }
 
+/// The `Account` member of `account` outside its modelled `@pattern`, in the
+/// API-level spelling Detective's own message names it by, or `None` when the entry
+/// satisfies every pattern this operation checks.
+///
+/// `AccountId` is the modelled 12-character `^[0-9]+$`, which
+/// [`crate::state::is_account_id`] is the one test of.
+fn invalid_account_member(account: &Account) -> Option<&'static str> {
+    (!crate::state::is_account_id(&account.account_id)).then_some("AccountId")
+}
+
 /// The `CreateMembers` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -181,12 +191,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
-        // `GraphArn`'s pattern, `Accounts`' 1..50 length and each account's 12-digit
-        // `AccountId` and `EmailAddress` pattern are modelled constraints, so the
-        // centralized walk has already refused anything outside them with a 400
-        // before this body runs: an account that reaches here is well formed, and the
-        // reasons an account lands in `UnprocessedAccounts` below are the ones the
-        // model cannot express.
+        // Detective validates each account's own members ITSELF rather than leaving
+        // them to the generic constraint reporter: a `@pattern` failure of a member of
+        // an `Accounts` entry is answered with the service's own fixed message (see
+        // `crate::state::account_member_pattern_message`), which the refusal renderer
+        // in `crate::service` words identically for the same violation found at the
+        // boundary. Owning the check here is what makes the rule hold wherever the
+        // boundary walk cannot: it treats a `@pattern` it fails to compile as
+        // satisfied.
+        if let Some(member) = input.accounts.iter().find_map(invalid_account_member) {
+            return Err(CreateMembersErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::account_member_pattern_message(member)),
+                    ..Default::default()
+                },
+            )
+            .into());
+        }
+        // `GraphArn`'s pattern and `Accounts`' 1..50 length are modelled constraints,
+        // so the centralized walk has already refused anything outside them with a 400
+        // before this body runs: the reasons an account lands in
+        // `UnprocessedAccounts` below are the ones the model cannot express.
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             CreateMembersErrorModeled::InternalServerException(InternalServerException {
                 message: Some("the behavior graph store is unavailable".to_string()),
@@ -196,9 +221,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = crate::state::now_epoch_millis();
         let mut store = state.lock();
         let graph = store.graph_mut(&input.graph_arn).ok_or_else(|| {
-            CreateMembersErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: Some(format!("behavior graph {} does not exist", input.graph_arn)),
-            })
+            CreateMembersErrorModeled::ResourceNotFoundException(crate::state::graph_not_found())
         })?;
 
         // The graph is finite, and the quota is the service's own: "A behavior graph

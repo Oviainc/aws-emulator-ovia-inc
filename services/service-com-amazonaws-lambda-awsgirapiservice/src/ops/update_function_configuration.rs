@@ -570,9 +570,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // is processing events with the new configuration." The move back to
         // `Successful` is owed by the clock at `last_update_due`, and nothing waits for
         // it here.
-        record.last_update_status =
-            Some(crate::state::LAST_UPDATE_STATUS_IN_PROGRESS.to_string());
-        record.last_update_due = Some(now + crate::state::UPDATE_DELAY);
+        record.begin_update(now);
 
         // Answered by reading the record back out of the store, so
         // `GetFunctionConfiguration` reports exactly what this call persisted.

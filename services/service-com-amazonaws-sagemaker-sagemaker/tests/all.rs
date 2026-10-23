@@ -119,3 +119,10 @@ mod state_roundtrip;
 mod studio_app_lifecycle;
 #[path = "all/trial_component_tracking.rs"]
 mod trial_component_tracking;
+// Declared after the sorted list rather than among the other `hyperpod_*` suites: the
+// cluster operations are being implemented one issue at a time, so that run of lines is
+// where every concurrent cluster change inserts its own suite.
+#[path = "all/hyperpod_cluster_lifecycle.rs"]
+mod hyperpod_cluster_lifecycle;
+#[path = "all/create_cluster_admission.rs"]
+mod create_cluster_admission;

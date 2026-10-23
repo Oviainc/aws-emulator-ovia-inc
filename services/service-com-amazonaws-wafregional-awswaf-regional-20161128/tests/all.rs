@@ -36,6 +36,8 @@ mod rule_lifecycle;
 mod rule_predicates;
 #[path = "all/size_constraint_set.rs"]
 mod size_constraint_set;
+#[path = "all/size_constraint_set_updates.rs"]
+mod size_constraint_set_updates;
 #[path = "all/sql_injection_match_set.rs"]
 mod sql_injection_match_set;
 #[path = "all/sql_injection_match_set_updates.rs"]

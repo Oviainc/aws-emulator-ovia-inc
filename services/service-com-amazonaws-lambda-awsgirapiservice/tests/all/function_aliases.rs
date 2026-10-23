@@ -10,9 +10,10 @@
 //! qualified by the alias name — and answers that stored configuration; it refuses a
 //! name the function already has an alias of, a version the function does not hold, and
 //! a routing configuration that names more than one other version, the version the alias
-//! already invokes, a version the function does not hold, or a second version beside the
-//! unpublished one. The alias is then a qualifier of the function: reading the function
-//! through it reports the version it invokes.
+//! already invokes, a version the function does not hold, a second version that is not a
+//! published version number, or a second version beside the unpublished one. The alias is
+//! then a qualifier of the function: reading the function through it reports the version
+//! it invokes.
 //!
 //! Every row drives real HTTP requests through the router and reads the alias back
 //! through `GetAlias`, so an alias that was answered but never stored fails here. The
@@ -719,6 +720,78 @@ async fn an_all_digit_alias_name_is_refused() {
         record.aliases.is_empty(),
         "no alias may have been stored, got {:?}",
         record.aliases.keys().collect::<Vec<_>>()
+    );
+}
+
+/// The second version a traffic shift names is a PUBLISHED version: the key shape of
+/// `AliasRoutingConfiguration$AdditionalVersionWeights` (`AdditionalVersion`, pattern
+/// `^[0-9]+$`, from `smithy_query(query="shape", shape="AdditionalVersionWeights")`)
+/// admits only a version number — so the unpublished version's label, an alias name and
+/// anything else that is not one are refused as the bad requests they are, rather than
+/// creating an alias that shifts traffic to a version the map could never have named.
+#[tokio::test]
+async fn a_second_version_that_is_not_a_version_number_is_refused() {
+    let engine = Arc::new(engine::InMemoryEngine::new());
+    let router = router_on(&engine);
+
+    create_function_with_versions(&router, "unnumbered-shift", 2).await;
+    let alias = create_alias(
+        &router,
+        "unnumbered-shift",
+        &json!({ "Name": "live", "FunctionVersion": "1" }),
+    )
+    .await;
+    assert_eq!(
+        alias.status,
+        201,
+        "the alias a row could collide with must be created, got {} {}",
+        alias.status,
+        alias.text()
+    );
+
+    // Each row names a second version the key pattern does not admit: the unpublished
+    // version's label, an alias of this very function, a name with a non-digit in it, a
+    // version number with a sign, and the empty string (the key's `@length(min: 1)`).
+    for key in [VERSION_LATEST, "live", "2a", "+2", ""] {
+        let answer = create_alias(
+            &router,
+            "unnumbered-shift",
+            &json!({
+                "Name": "shift",
+                "FunctionVersion": "1",
+                "RoutingConfig": { "AdditionalVersionWeights": { key: 0.5 } },
+            }),
+        )
+        .await;
+        assert_eq!(
+            (answer.status, answer.error_code()),
+            (400, "InvalidParameterValueException".to_string()),
+            "case {key:?}: expected 400 InvalidParameterValueException for a second version \
+             that is not a version number, got {} {}",
+            answer.status,
+            answer.text()
+        );
+    }
+
+    // None of them created an alias, and the one that existed is unchanged.
+    let state = engine.state::<ComAmazonawsLambdaAwsgirapiserviceState>();
+    let store = state.lock();
+    let record = store
+        .functions
+        .get("unnumbered-shift")
+        .expect("the function must be stored");
+    let names: Vec<&String> = record.aliases.keys().collect();
+    assert_eq!(
+        names,
+        vec!["live"],
+        "a refused CreateAlias must store nothing, got {names:?}"
+    );
+    assert!(
+        record.aliases["live"]
+            .additional_version_weights
+            .is_empty(),
+        "a refused CreateAlias must not give the existing alias a traffic shift, got {:?}",
+        record.aliases["live"].additional_version_weights
     );
 }
 

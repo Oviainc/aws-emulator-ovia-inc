@@ -204,12 +204,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // are the rules the model states in prose only.
         //
         // `AppMonitorDomainList`: "The CreateAppMonitor requires either the domain or the
-        // domain list." A monitor's domain authority is held in exactly ONE of the two
-        // forms, so neither and both are equally refusable.
+        // domain list." A monitor's domain authority is held in at most ONE of the two
+        // forms, so naming both is refused whatever the platform; whether naming NEITHER
+        // is refused depends on the platform, since only a web application is served from
+        // an internet domain (`crate::state::platform_requires_domain`).
+        let platform = input
+            .platform
+            .clone()
+            .unwrap_or_else(|| crate::state::DEFAULT_PLATFORM.to_string());
         if let Some(message) = crate::state::domain_choice_refusal(
             input.domain.as_deref(),
             input.domain_list.as_deref(),
-            true,
+            crate::state::platform_requires_domain(&platform),
         ) {
             return Err(
                 CreateAppMonitorErrorModeled::ValidationException(ValidationException { message })
@@ -343,14 +349,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             name: input.name,
             domain: input.domain,
             domain_list: input.domain_list,
-            // `Created` and `LastModified` start equal: nothing has changed the monitor
-            // since the call that created it.
-            created: now.clone(),
-            last_modified: now,
-            state: crate::state::ACTIVE_STATE.to_string(),
-            platform: input
-                .platform
-                .unwrap_or_else(|| crate::state::DEFAULT_PLATFORM.to_string()),
+            // `Created` is the instant of the call that created the monitor;
+            // `LastModified` reports "the most recent changes to this app monitor's
+            // configuration", and nothing has changed it yet, so it stays ABSENT until
+            // something does.
+            created: now,
+            last_modified: None,
+            state: crate::state::CREATED_STATE.to_string(),
+            platform,
             cw_log_enabled: input.cw_log_enabled.unwrap_or(false),
             app_monitor_configuration: input
                 .app_monitor_configuration
@@ -358,7 +364,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             custom_events: input
                 .custom_events
                 .unwrap_or_else(crate::state::default_custom_events),
-            deobfuscation_configuration: input.deobfuscation_configuration,
+            deobfuscation_configuration: input
+                .deobfuscation_configuration
+                .unwrap_or_else(crate::state::default_deobfuscation_configuration),
             tags: input.tags.unwrap_or_default().into_iter().collect(),
             // No telemetry has arrived for a monitor this call just created.
             events: ::std::collections::VecDeque::new(),

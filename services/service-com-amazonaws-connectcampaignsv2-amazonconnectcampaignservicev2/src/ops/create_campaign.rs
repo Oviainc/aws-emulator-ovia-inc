@@ -3,9 +3,12 @@
 //! @op CreateCampaign
 //! Creates a campaign and stores it: the response's `id`, `arn` and `tags` are read
 //! back out of the record this call wrote, and `DescribeCampaign` /
-//! `GetCampaignState` serve the same record. The store is bounded at
-//! `crate::state::MAX_CAMPAIGNS`; past that a create answers the modelled
-//! `ServiceQuotaExceededException` (HTTP 402).
+//! `GetCampaignState` serve the same record. The create is GATED on the Connect
+//! instance it names being onboarded to Campaigns — the instance store
+//! `StartInstanceOnboardingJob` writes and `GetConnectInstanceConfig` reads — and
+//! answers the modelled `ResourceNotFoundException` (HTTP 404) when it is not. The
+//! store is bounded at `crate::state::MAX_CAMPAIGNS`; past that a create answers the
+//! modelled `ServiceQuotaExceededException` (HTTP 402).
 //!
 //! ## Shape of an operation
 //!
@@ -184,6 +187,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // creates can never be handed the same id.
         let region = crate::state::request_region(ctx);
         let mut store = state.lock();
+
+        // A campaign belongs to a Connect instance that is onboarded to Campaigns:
+        // the instance-onboarding store is the one record of which instances those
+        // are, and an id whose onboarding job has not finished there is not a campaign
+        // target, so the create is refused with the error the model declares for a
+        // resource that was not found BEFORE anything is stored.
+        if !store.is_onboarded(&input.connect_instance_id, ::std::time::SystemTime::now()) {
+            return Err(CreateCampaignErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!(
+                        "Connect instance {} does not exist or is not enabled to use Campaigns",
+                        input.connect_instance_id
+                    ),
+                    x_amz_error_type: None,
+                },
+            )
+            .into());
+        }
+
         let id = store.next_campaign_id();
         let arn = crate::state::campaign_arn(&region, &id);
 
@@ -203,6 +225,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             tags: input.tags.unwrap_or_default().into_iter().collect(),
             state: crate::state::CampaignState::Initialized,
             created_at: std::time::SystemTime::now(),
+            outbound_requests: std::collections::BTreeMap::new(),
         });
 
         let stored = match stored {

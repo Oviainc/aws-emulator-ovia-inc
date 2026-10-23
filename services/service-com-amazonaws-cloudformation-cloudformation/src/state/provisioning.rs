@@ -138,6 +138,7 @@
 //! `core/router/tests/all/cloudformation_provisions_stack_resources.rs` and by
 //! `tests/all/stack_resource_provisioning.rs`.
 
+use std::collections::BTreeMap;
 use std::time::SystemTime;
 
 use serde_json::Value;
@@ -151,6 +152,35 @@ use super::StoredResource;
 /// publishes.
 pub(super) const AWS_JSON_1_0: &str = "application/x-amz-json-1.0";
 pub(super) const AWS_JSON_1_1: &str = "application/x-amz-json-1.1";
+
+/// The media type a REST-JSON service's requests and answers carry
+/// ([`call_rest_json`]): a `restJson1` service publishes `application/json`, not one of
+/// the awsJson versions above.
+pub(super) const REST_JSON: &str = "application/json";
+
+/// What the service that owns a resource answered when it created it.
+///
+/// `physical_resource_id` is set only by a type whose id that service ASSIGNS (an FIS
+/// experiment template's `EXT…`), which no naming rule could have computed: it replaces
+/// the computed id, because it is what `Ref` resolves to and what a client calls the
+/// service with. For every other type the computed id IS the one the resource was created
+/// under (a queue's name, a cluster's name), so the arm leaves it alone.
+#[derive(Debug, Clone, Default)]
+pub(super) struct Created {
+    pub(super) physical_resource_id: Option<String>,
+    pub(super) attributes: BTreeMap<String, String>,
+}
+
+impl Created {
+    /// What a create that reported only ATTRIBUTES answered: the resource keeps the
+    /// physical id the naming rules computed.
+    pub(super) fn attributes(attributes: BTreeMap<String, String>) -> Self {
+        Self {
+            physical_resource_id: None,
+            attributes,
+        }
+    }
+}
 
 // The stack whose resources are being created or deleted is identified by its Region
 // alone — what the credential scope of every call this module makes names.
@@ -231,9 +261,14 @@ pub async fn reconcile(
         };
         match created {
             // The owning service created it, and what IT answered wins over the computed
-            // value: that is the resource's real identity.
-            Ok(reported) => {
-                resource.attributes.extend(reported);
+            // value: that is the resource's real identity — including the physical id
+            // itself, where that service ASSIGNS the id rather than taking it from a name
+            // the template or CloudFormation decided.
+            Ok(created) => {
+                if let Some(id) = created.physical_resource_id {
+                    resource.physical_resource_id = id;
+                }
+                resource.attributes.extend(created.attributes);
                 resource.materialised = true;
             }
             Err(refusal) => {
@@ -435,13 +470,51 @@ pub(super) async fn call_json_rpc(
         ("content-type", content_type.to_string()),
         ("x-amz-target", target.to_string()),
     ];
-    let (status, payload) = dispatch(ctx, signing_name, region, headers, body)
+    let (status, payload) = dispatch(ctx, signing_name, region, "POST", "/", headers, body)
         .await
         .map_err(|message| Refusal {
             code: "InternalFailure".to_string(),
             message,
         })?;
     let document: Value = serde_json::from_slice(&payload).unwrap_or(Value::Null);
+    if (200..300).contains(&status) {
+        return Ok(document);
+    }
+    Err(refusal_of(status, &document))
+}
+
+/// Call one REST-JSON operation of another emulated service in-process and read its answer
+/// document. `Err(refusal)` is that service's own refusal, exactly as for
+/// [`call_json_rpc`].
+///
+/// A `restJson1` service binds each operation to an HTTP method and a URI rather than to an
+/// `X-Amz-Target` header (AWS FIS: `POST /experimentTemplates`,
+/// `DELETE /experimentTemplates/{id}`), so the caller passes the binding the called
+/// operation's model declares and this writes the request on it. `body` is `None` for an
+/// operation whose input is entirely in the URI.
+pub(super) async fn call_rest_json(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    signing_name: &str,
+    region: &str,
+    method: &'static str,
+    uri: &str,
+    body: Option<&Value>,
+) -> Result<Value, Refusal> {
+    let payload = match body {
+        Some(document) => serde_json::to_vec(document).map_err(|error| Refusal {
+            code: "SerializationException".to_string(),
+            message: error.to_string(),
+        })?,
+        None => Vec::new(),
+    };
+    let headers = vec![("content-type", REST_JSON.to_string())];
+    let (status, answer) = dispatch(ctx, signing_name, region, method, uri, headers, payload)
+        .await
+        .map_err(|message| Refusal {
+            code: "InternalFailure".to_string(),
+            message,
+        })?;
+    let document: Value = serde_json::from_slice(&answer).unwrap_or(Value::Null);
     if (200..300).contains(&status) {
         return Ok(document);
     }
@@ -476,20 +549,22 @@ fn refusal_of(status: u16, document: &Value) -> Refusal {
 /// authentication is on; the credential scope is also what routes it, so the service that
 /// owns the resource is the one that serves the call.
 ///
-/// An awsJson operation names what it acts on in its document rather than in the request
-/// line, so the method and the path are the protocol's own `POST /` for every call that
-/// rides this transport.
+/// `method` and `uri` are the called operation's own HTTP binding: an RPC protocol binds
+/// every operation to `POST /` and names what it acts on in its document, while a REST
+/// protocol binds each operation to its own method and path.
 async fn dispatch(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     signing_name: &str,
     region: &str,
+    method: &'static str,
+    uri: &str,
     headers: Vec<(&'static str, String)>,
     body: Vec<u8>,
 ) -> Result<(u16, Vec<u8>), String> {
     let host = format!("{signing_name}.{region}.amazonaws.com");
     let mut request = ::http::Request::builder()
-        .method("POST")
-        .uri("/")
+        .method(method)
+        .uri(uri)
         .header("host", host);
     for (name, value) in &headers {
         request = request.header(*name, value);

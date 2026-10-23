@@ -464,6 +464,8 @@ pub const AWS_RESOURCE_TYPES: &[&str] = &[
     "AWS::Events::EventBus",
     "AWS::Events::EventBusPolicy",
     "AWS::Events::Rule",
+    // AWS Fault Injection Service
+    "AWS::FIS::ExperimentTemplate",
     // Amazon FSx
     "AWS::FSx::FileSystem",
     // AWS Global Accelerator

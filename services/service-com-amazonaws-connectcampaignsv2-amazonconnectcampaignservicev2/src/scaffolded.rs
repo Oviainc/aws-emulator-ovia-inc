@@ -40,6 +40,15 @@
 //! place it can return an error its own model does not declare — `validation` above,
 //! for a service whose model carries no client-input error. Delete the wrapper and the
 //! handler has no way to refuse a bad request at all.
+//!
+//! ## When the wire code is not a modelled shape name
+//!
+//! [`Scaffolded::wire_coded`] is the third channel: a refusal whose error CODE is not
+//! the name of any shape in this service's model. ConnectCampaignsV2's tag operations
+//! are recorded answering `NotFoundException` (404) and `BadRequestException` (400)
+//! where the model declares `ResourceNotFoundException` and `ValidationException`, and a
+//! client branches on the code it is sent. See [`WireCoded`] — and use it ONLY where the
+//! recorded code and the modelled shape name actually disagree.
 
 use aws_smithy_schema::serde::{SerdeError, SerializableStruct, ShapeSerializer};
 use aws_smithy_schema::{Schema, ShapeId, ShapeType};
@@ -177,6 +186,74 @@ impl SerializableStruct for ValidationException {
     }
 }
 
+/// The `message` member of the synthetic wire-coded error shape.
+static WIRE_CODED_MESSAGE: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "smithy.framework#WireCodedError$message",
+        "smithy.framework",
+        "message",
+    ),
+    ShapeType::String,
+    "message",
+    0,
+)
+.with_xml_name("Message");
+
+/// Schema for the synthetic wire-coded error shape.
+///
+/// In the `smithy.framework` namespace for the same reason as `NotImplemented`: the
+/// shape is not in any service's model, so it must not collide with a modeled one.
+/// The wire code clients branch on comes from [`OperationError::shape_name`] — i.e.
+/// from [`WireCoded::code`] — not from this schema, so one schema serves every code.
+pub static WIRE_CODED_SCHEMA: Schema = Schema::new_struct(
+    ShapeId::from_static(
+        "smithy.framework#WireCodedError",
+        "smithy.framework",
+        "WireCodedError",
+    ),
+    ShapeType::Structure,
+    &[&WIRE_CODED_MESSAGE],
+);
+
+/// A refusal whose WIRE error code is not the name of any shape this service's model
+/// declares.
+///
+/// ConnectCampaignsV2 does not always name its own modelled shape on the wire: the
+/// recorded responses of its tag operations carry `NotFoundException` (HTTP 404) for a
+/// well-formed ARN that matches no resource and `BadRequestException` (HTTP 400) for an
+/// ARN whose resource path is not a connect-campaigns resource, while the model's
+/// corresponding shapes are `ResourceNotFoundException` and `ValidationException`. A
+/// client branches on the code it is SENT, so the emulator sends the code the service
+/// sends; this is the one channel for that, and it carries the status beside the code so
+/// the two can never drift apart.
+///
+/// Reach for it ONLY where the recorded wire code and the modelled shape name disagree.
+/// Everything the model names is a modeled variant.
+#[derive(Debug, Clone)]
+pub struct WireCoded {
+    /// The error code the response carries (`__type` on JSON/CBOR, `<Code>` on XML).
+    pub code: &'static str,
+    /// The HTTP status the response carries.
+    pub status: u16,
+    /// Why the request was refused.
+    pub message: String,
+}
+
+impl std::fmt::Display for WireCoded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.code, self.message)
+    }
+}
+
+impl std::error::Error for WireCoded {}
+
+impl SerializableStruct for WireCoded {
+    fn serialize_members(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
+        s.write_string(&WIRE_CODED_MESSAGE, self.message.as_str())?;
+        Ok(())
+    }
+}
+
 /// An operation's error channel: either the synthetic scaffold signal, or one of the
 /// operation's own modeled errors.
 #[derive(Debug)]
@@ -196,6 +273,9 @@ pub enum Scaffolded<E> {
     /// `MalformedQueryString` rather than `ValidationException`, so a client
     /// matching on the error code there sees two codes for one logical failure.
     ValidationException(ValidationException),
+    /// The request was refused with a code this service's model does not declare as a
+    /// shape name, at the status that code carries. See [`WireCoded`].
+    WireCoded(WireCoded),
 }
 
 impl<E> Scaffolded<E> {
@@ -221,6 +301,17 @@ impl<E> Scaffolded<E> {
     pub fn validation(message: impl Into<String>) -> Self {
         Self::ValidationException(ValidationException::new(message))
     }
+
+    /// Refuse the request with `code` at `status` — the code and status the emulated
+    /// service answers on the wire where that code is not the name of any shape its
+    /// model declares. See [`WireCoded`] for when that is the right channel.
+    pub fn wire_coded(code: &'static str, status: u16, message: impl Into<String>) -> Self {
+        Self::WireCoded(WireCoded {
+            code,
+            status,
+            message: message.into(),
+        })
+    }
 }
 
 impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
@@ -229,6 +320,7 @@ impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
             Self::NotImplemented(e) => write!(f, "{e}"),
             Self::Modeled(e) => write!(f, "{e}"),
             Self::ValidationException(e) => write!(f, "{e}"),
+            Self::WireCoded(e) => write!(f, "{e}"),
         }
     }
 }
@@ -241,6 +333,7 @@ impl<E: std::error::Error + 'static> std::error::Error for Scaffolded<E> {
             Self::NotImplemented(e) => e.source(),
             Self::Modeled(e) => e.source(),
             Self::ValidationException(e) => e.source(),
+            Self::WireCoded(e) => e.source(),
         }
     }
 }
@@ -255,6 +348,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::NotImplemented(e) => e,
             Self::Modeled(e) => e.as_serializable(),
             Self::ValidationException(e) => e,
+            Self::WireCoded(e) => e,
         }
     }
 
@@ -263,6 +357,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::NotImplemented(_) => &NOT_IMPLEMENTED_SCHEMA,
             Self::Modeled(e) => e.variant_schema(),
             Self::ValidationException(_) => &VALIDATION_EXCEPTION_SCHEMA,
+            Self::WireCoded(_) => &WIRE_CODED_SCHEMA,
         }
     }
 
@@ -275,6 +370,9 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::NotImplemented(_) => "NotImplemented",
             Self::Modeled(e) => e.shape_name(),
             Self::ValidationException(_) => "ValidationException",
+            // The code the emulated service answers, which is why this variant
+            // exists: it is not the name of any shape in the model.
+            Self::WireCoded(e) => e.code,
         }
     }
 
@@ -287,6 +385,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::NotImplemented(_) => 501,
             Self::Modeled(e) => e.http_status(),
             Self::ValidationException(_) => 400,
+            Self::WireCoded(e) => e.status,
         }
     }
 
@@ -299,6 +398,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::Modeled(e) => e.query_error_code(),
             // Same reason: the synthetic shape carries no `awsQueryError` trait.
             Self::ValidationException(_) => None,
+            Self::WireCoded(_) => None,
         }
     }
 }

@@ -47,3 +47,27 @@ with a `ValidationException`, and its `//! SCAFFOLDED, NOT IMPLEMENTED:` census 
 deleted. The report is left here rather than moved because the move belongs to whoever
 is dispatched for this issue; anyone picking it up should verify the handler and the
 `tests/all/hyperpod_cluster_listing.rs` coverage and then close it.
+
+## Closing note (this issue's fix)
+
+Verified: `src/ops/create_cluster.rs` carries no `//! SCAFFOLDED, NOT IMPLEMENTED:`
+line, persists the cluster in `crate::state::ComAmazonawsSagemakerSagemakerState::clusters`
+and answers a minted `ClusterArn`. The change that closes this report:
+
+* implements `DescribeCluster` (its census line deleted), the reader that proves the
+  create round trip, with the `*Details` / `*Output` projections and the
+  `ClusterNameOrArn` lookup in `src/state/cluster.rs`;
+* adds `tests/all/hyperpod_cluster_lifecycle.rs` (the create/describe round trip, the
+  minted ARN, the clock-owed `Creating` -> `InService` move, `ResourceInUse`,
+  `ResourceNotFound` and the `Orchestrator` rule) and
+  `tests/all/create_cluster_admission.rs` (the account quota bound, `InstanceGroups`'
+  `1..100` list bounds, `ClusterInstanceCount`'s `0..6758` range, and `ClusterName`'s
+  length and pattern);
+* makes the modelled `ResourceInUse` conflict precede the `ResourceLimitExceeded` quota
+  check, so a create that cannot add a record is refused for the conflict whatever the
+  store's occupancy.
+
+The other operations the recorded units also call (`DeleteCluster`,
+`BatchAddClusterNodes`, `BatchDeleteClusterNodes`, `BatchReplaceClusterNodes`,
+`AttachClusterNodeVolume`, `BatchRebootClusterNodes`) are still scaffolds answering 501
+under their own stub issues.
