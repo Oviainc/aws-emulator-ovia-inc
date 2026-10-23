@@ -31,7 +31,15 @@ pub struct UpdateAgentRuntimeInput {
     pub client_token: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.bedrockagentcorecontrol#UpdateAgentRuntimeResponse")]
+/// `UpdateAgentRuntimeResponse`. Its schema and codec come from
+/// [`agentcore_schema_and_codec!`] rather than `#[smithy_macros::smithy(shape = ...)]`
+/// because `createdAt` and `lastUpdatedAt` target `DateTimestamp`, which carries
+/// `@timestampFormat("date-time")` (`smithy_query(query="operation",
+/// operation="UpdateAgentRuntime")`), and the derive does not put that trait on a member
+/// schema — see `types/date_time_wire.rs`.
+///
+/// The member list below is the model's, member for member: same shape ids, same wire
+/// names, same order, same shape types.
 #[derive(Debug, Clone)]
 pub struct UpdateAgentRuntimeOutput {
     pub agent_runtime_arn: String,
@@ -42,4 +50,54 @@ pub struct UpdateAgentRuntimeOutput {
     pub last_updated_at: ::aws_smithy_types::DateTime,
     pub status: String,
 }
+
+agentcore_schema_and_codec!(
+    UpdateAgentRuntimeOutput,
+    UPDATE_AGENT_RUNTIME_OUTPUT_SCHEMA,
+    "com.amazonaws.bedrockagentcorecontrol#UpdateAgentRuntimeResponse",
+    "com.amazonaws.bedrockagentcorecontrol",
+    "UpdateAgentRuntimeResponse",
+    (
+        M_AGENT_RUNTIME_ARN,
+        agent_runtime_arn,
+        "agentRuntimeArn",
+        0,
+        req,
+        string
+    ),
+    (
+        M_AGENT_RUNTIME_ID,
+        agent_runtime_id,
+        "agentRuntimeId",
+        1,
+        req,
+        string
+    ),
+    (
+        M_WORKLOAD_IDENTITY_DETAILS,
+        workload_identity_details,
+        "workloadIdentityDetails",
+        2,
+        opt,
+        struct_of(WorkloadIdentityDetails)
+    ),
+    (
+        M_AGENT_RUNTIME_VERSION,
+        agent_runtime_version,
+        "agentRuntimeVersion",
+        3,
+        req,
+        string
+    ),
+    (M_CREATED_AT, created_at, "createdAt", 4, req, date_time),
+    (
+        M_LAST_UPDATED_AT,
+        last_updated_at,
+        "lastUpdatedAt",
+        5,
+        req,
+        date_time
+    ),
+    (M_STATUS, status, "status", 6, req, string),
+);
 

@@ -753,14 +753,19 @@ pub fn gateway_arn(region: &str, gateway_id: &str) -> String {
     ::engine::emulator_arn(ARN_SERVICE, region, &format!("gateway/{gateway_id}"))
 }
 
-/// The gateway's MCP endpoint, in the form AWS documents for a Bedrock AgentCore
-/// gateway: `https://{gatewayId}.gateway.bedrock-agentcore.{region}.amazonaws.com/mcp`.
+/// The gateway's endpoint, in the form AWS returns for a Bedrock AgentCore
+/// gateway: `https://{gatewayId}.gateway.bedrock-agentcore.{region}.amazonaws.com`.
+///
+/// HOST ONLY, with no path: the recorded `CreateGateway`/`GetGateway` responses
+/// report exactly this origin, and the protocol's own path (`/mcp` for MCP) is
+/// the client's to append — a URL that already carried it sent an MCP client to
+/// `/mcp/mcp`.
 ///
 /// Derived from the gateway id and the request's Region, so a caller that reads
 /// one gateway twice sees one URL. `GatewayUrl` is only constrained in length
 /// (1..1024), which this form satisfies for every id the pattern admits.
 pub fn gateway_url(region: &str, gateway_id: &str) -> String {
-    format!("https://{gateway_id}.gateway.{ARN_SERVICE}.{region}.amazonaws.com/mcp")
+    format!("https://{gateway_id}.gateway.{ARN_SERVICE}.{region}.amazonaws.com")
 }
 
 /// How long a freshly created gateway or gateway target stays in its transient
