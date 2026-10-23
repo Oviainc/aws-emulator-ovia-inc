@@ -359,7 +359,7 @@ async fn preferences_merge_and_read_back_with_the_service_defaults() {
     // `memberAccountDiscountVisibility` has no default: the preference is the
     // management account's to set, so it is reported only once it is set.
     let defaults = json!({
-        "savingsEstimationMode": "AfterDiscounts",
+        "savingsEstimationMode": "BeforeDiscounts",
         "preferredCommitment": {"term": "ThreeYears", "paymentOption": "AllUpfront"},
     });
     let initial = ok(&router, "GetPreferences", &json!({})).await;
@@ -962,7 +962,8 @@ async fn get_recommendation_rejects_an_unknown_id() {
 /// The stored `savingsEstimationMode` decides whether the money members are
 /// reported before or after discounts — the same stored prices, read two ways —
 /// and an account that has stated no preference is reported under the default
-/// the service applies (`AfterDiscounts`), the same mode `GetPreferences` names.
+/// the service applies (`BeforeDiscounts`), the same mode `GetPreferences`
+/// names.
 #[tokio::test]
 async fn savings_estimation_mode_changes_the_reported_money() {
     let router = enrolled_router().await;
@@ -976,11 +977,11 @@ async fn savings_estimation_mode_changes_the_reported_money() {
     // `SavingsEstimationMode` enum written explicitly, and the last row shows
     // the mode can be moved back.
     let cases: [(Option<&str>, f64, f64); 5] = [
-        (None, 252.29, 126.15),
-        (Some("BeforeDiscounts"), 280.32, 140.16),
+        (None, 280.32, 140.16),
         (Some("BeforeDiscounts"), 280.32, 140.16),
         (Some("AfterDiscounts"), 252.29, 126.15),
         (Some("BeforeDiscounts"), 280.32, 140.16),
+        (Some("AfterDiscounts"), 252.29, 126.15),
     ];
 
     for (mode, expected_cost, expected_savings) in &cases {

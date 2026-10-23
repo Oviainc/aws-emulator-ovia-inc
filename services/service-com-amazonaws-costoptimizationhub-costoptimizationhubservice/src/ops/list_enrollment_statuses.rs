@@ -240,11 +240,15 @@ const PAGE_KIND: &str = "enrollment-statuses";
 /// Refuse a `nextToken` this service did not issue for this list.
 fn invalid_next_token() -> ListEnrollmentStatusesError {
     ListEnrollmentStatusesErrorModeled::ValidationException(
-        crate::service::field_validation_exception(vec![ValidationExceptionDetail {
-            field_name: "nextToken".to_string(),
-            message: "the value is not a pagination token issued by ListEnrollmentStatuses"
+        crate::service::stated_validation_exception(
+            "Invalid nextToken specified. The token was not issued by ListEnrollmentStatuses."
                 .to_string(),
-        }]),
+            vec![ValidationExceptionDetail {
+                field_name: "nextToken".to_string(),
+                message: "the value is not a pagination token issued by ListEnrollmentStatuses"
+                    .to_string(),
+            }],
+        ),
     )
     .into()
 }

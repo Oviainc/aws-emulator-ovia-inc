@@ -29,6 +29,11 @@ use cost_optimization_hub::ops::types::shared_types::{
     SAVINGS_ESTIMATION_MODE_VALUES, TERM_VALUES,
 };
 
+/// The `savingsEstimationMode` a read reports for an account that has set none —
+/// read from the service rather than copied here, so the expectation cannot
+/// drift from the mode the service applies.
+use cost_optimization_hub::state::DEFAULT_SAVINGS_ESTIMATION_MODE;
+
 use crate::cost_optimization_hub::{call, error_code, ok, router};
 
 /// The defaults the service applies for the commitment members an account has
@@ -37,9 +42,6 @@ use crate::cost_optimization_hub::{call, error_code, ok, router};
 /// `$paymentOption` the same for `AllUpfront`.
 const DEFAULT_TERM: &str = "ThreeYears";
 const DEFAULT_PAYMENT_OPTION: &str = "AllUpfront";
-
-/// The `savingsEstimationMode` a read reports for an account that has set none.
-const DEFAULT_SAVINGS_ESTIMATION_MODE: &str = "AfterDiscounts";
 
 /// The effective record that follows from a request's members, given what was
 /// stored before it: every member the request states replaces the stored one,

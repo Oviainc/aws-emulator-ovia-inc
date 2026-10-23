@@ -13,9 +13,20 @@
 //! the rows' stored prices under the caller's effective `savingsEstimationMode`
 //! preference, so a summary never disagrees with `ListRecommendations`.
 //!
+//! `metrics` asks for the additional metric `savingsPercentage`, which
+//! `SummaryMetricsResult` models as carrying "the results OR DESCRIPTIONS for
+//! the additional metrics": a figure where the metric is supported for the view
+//! the request asked for, and otherwise the description of why no figure is
+//! reported — the view is narrowed by a dimension the metric is not defined
+//! over, or the caller's effective `savingsEstimationMode` is the undiscounted
+//! one.
+//!
 //! `filter.accountIds` asks for other accounts' recommendations, which only the
 //! organization's management account may do, so a populated `accountIds` from
-//! any other caller is refused with the modelled `AccessDeniedException`.
+//! any other caller is refused with the modelled `AccessDeniedException`. The
+//! three `filter` members this API documents as unsupported are refused with the
+//! modelled `ValidationException`, whose `message` names the filter that was
+//! rejected and that this operation does not support it.
 //!
 //! ## Shape of an operation
 //!
@@ -197,17 +208,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The three filters this API does not support are refused rather than
         // ignored, so a caller is never served a list it believes was narrowed.
+        // The three are the ones this operation's doc names ("The following
+        // filters are not supported for this API: recommendationIds,
+        // resourceArns, and resourceIds"), each paired with the dimension the
+        // refusal states it by — the member filters on one identifier, so the
+        // refusal names it in the singular.
         if let Some(filter) = &input.filter {
-            for (member, supplied) in [
+            for (member, dimension, supplied) in [
                 (
                     "filter.recommendationIds",
+                    "recommendationId",
                     filter.recommendation_ids.is_some(),
                 ),
-                ("filter.resourceIds", filter.resource_ids.is_some()),
-                ("filter.resourceArns", filter.resource_arns.is_some()),
+                (
+                    "filter.resourceArns",
+                    "resourceArn",
+                    filter.resource_arns.is_some(),
+                ),
+                (
+                    "filter.resourceIds",
+                    "resourceId",
+                    filter.resource_ids.is_some(),
+                ),
             ] {
                 if supplied {
-                    return Err(unsupported_filter(member));
+                    return Err(unsupported_filter(member, dimension));
                 }
             }
         }
@@ -337,11 +362,20 @@ const SAVINGS_PERCENTAGE: &str = "SavingsPercentage";
 
 /// What `metrics.savingsPercentage` reports when the request asked for the
 /// metric but narrowed the view by a dimension the metric is not defined over.
-/// `SummaryMetricsResult.savingsPercentage` is documented to carry the result
-/// OR the description of a metric, and the model's note on it says the metric
-/// "is only supported when filtering by Region, account ID, or tags".
-const SAVINGS_PERCENTAGE_UNSUPPORTED: &str =
-    "savingsPercentage is only supported when filtering by Region, account ID, or tags";
+/// `SummaryMetricsResult` is documented as "the results OR DESCRIPTIONS for the
+/// additional metrics", and the model's note on this member says the metric "is
+/// only supported when filtering by Region, account ID, or tags".
+const SAVINGS_PERCENTAGE_FILTER_UNSUPPORTED: &str =
+    "Savings percentage is only supported when filtering by Region, account ID, or tags.";
+
+/// What `metrics.savingsPercentage` reports when the metric was asked for while
+/// the caller's effective `savingsEstimationMode` preference is the undiscounted
+/// one: the percentage is the share of the account's spend the recommendations
+/// would remove, which the service reports against discounted spend, so under
+/// `BeforeDiscounts` there is no figure to report and the member carries the
+/// description of why instead.
+const SAVINGS_PERCENTAGE_BEFORE_DISCOUNTS: &str = "Savings percentage is not supported when \
+     savings estimation mode preference is set to before discounts.";
 
 /// Total the rows per group: one `RecommendationSummary` per distinct value of
 /// the grouping dimension, carrying how many recommendations fall under that
@@ -380,22 +414,41 @@ fn summarise(
 
 /// The `savingsPercentage` metric: the de-duped monthly saving as a percentage
 /// of what the summarised resources cost per month — the share of the spend the
-/// recommendations would remove — or, where the metric is not defined over the
-/// requested view, the description of why no figure is reported.
+/// recommendations would remove — or, where the metric is not SUPPORTED for the
+/// requested view, the description of why no figure is reported
+/// ([`savings_percentage_unsupported`]).
 fn savings_percentage(
     filter: Option<&Filter>,
     deduped: &[crate::state::StoredRecommendation],
     total_savings: f64,
     mode: Option<&str>,
 ) -> String {
-    if !savings_percentage_is_defined(filter) {
-        return SAVINGS_PERCENTAGE_UNSUPPORTED.to_string();
+    if let Some(description) = savings_percentage_unsupported(filter, mode) {
+        return description.to_string();
     }
     let spend: f64 = deduped.iter().map(|row| row.monthly_cost(mode)).sum();
     format!(
         "{:.2}",
         crate::state::percentage_of(total_savings, crate::state::round_cents(spend))
     )
+}
+
+/// Why the `savingsPercentage` metric is not supported for the view the request
+/// asked for — the description the member then carries — or `None` where it is
+/// supported and a figure is reported.
+///
+/// Two conditions decide it, and both are about the view: the preference the
+/// figures are computed under, and the dimensions the request narrowed by. The
+/// preference is read first because it governs every figure this service reports
+/// to the account, whatever the request narrowed by.
+fn savings_percentage_unsupported(
+    filter: Option<&Filter>,
+    mode: Option<&str>,
+) -> Option<&'static str> {
+    if mode != Some(crate::state::AFTER_DISCOUNTS) {
+        return Some(SAVINGS_PERCENTAGE_BEFORE_DISCOUNTS);
+    }
+    (!savings_percentage_is_defined(filter)).then_some(SAVINGS_PERCENTAGE_FILTER_UNSUPPORTED)
 }
 
 /// Whether the `savingsPercentage` metric is defined over the requested view:
@@ -415,7 +468,9 @@ fn savings_percentage_is_defined(filter: Option<&Filter>) -> bool {
 
 /// Refuse a `nextToken` this service did not issue for this list.
 fn invalid_next_token() -> ListRecommendationSummariesError {
-    field_refusal(
+    stated_refusal(
+        "Invalid nextToken specified. The token was not issued by ListRecommendationSummaries."
+            .to_string(),
         "nextToken",
         "the value is not a pagination token issued by ListRecommendationSummaries".to_string(),
     )
@@ -424,23 +479,33 @@ fn invalid_next_token() -> ListRecommendationSummariesError {
 /// Refuse a `groupBy` that names no dimension recommendations can be summarised
 /// by.
 fn unknown_group_by(group_by: &str) -> ListRecommendationSummariesError {
-    field_refusal(
+    stated_refusal(
+        format!("Invalid groupBy specified. Cannot group by {group_by} for this operation."),
         "groupBy",
         format!("{group_by} is not a dimension recommendations can be grouped by"),
     )
 }
 
-/// Refuse a `filter` member this API documents as unsupported.
-fn unsupported_filter(member: &str) -> ListRecommendationSummariesError {
-    field_refusal(
+/// Refuse a `filter` member this API documents as unsupported: `member` is the
+/// member the refusal is attributed to and `dimension` the identifier it filters
+/// on, which is what the message states was rejected.
+fn unsupported_filter(member: &str, dimension: &str) -> ListRecommendationSummariesError {
+    stated_refusal(
+        format!(
+            "Invalid filter specified. Cannot include {dimension} as a filter for this operation."
+        ),
         member,
         format!("{member} is not a filter this operation supports"),
     )
 }
 
-/// Refuse a requested metric this operation cannot report.
+/// Refuse a requested metric this operation cannot report. `metrics` targets a
+/// modelled enum (`SummaryMetrics`), so the constraint walk refuses a value
+/// outside it first; this is reached only for a value that set admits and this
+/// operation still cannot report.
 fn unknown_metric(metric: &str) -> ListRecommendationSummariesError {
-    field_refusal(
+    stated_refusal(
+        format!("Invalid metrics specified. Cannot report {metric} for this operation."),
         "metrics",
         format!("{metric} is not a metric this operation reports"),
     )
@@ -458,16 +523,25 @@ fn not_an_organization_view() -> ListRecommendationSummariesError {
 }
 
 /// One refused request, attributed to the member it is about: the shape every
-/// handler-raised refusal in this service answers with — the service's fixed
-/// summary, `reason` = `FieldValidationFailed`, and the diagnosis in `fields`,
-/// built by [`crate::service::field_validation_exception`], the one place that
-/// envelope is built.
-fn field_refusal(field_name: &str, field_message: String) -> ListRecommendationSummariesError {
+/// handler-raised refusal in this service answers with — `statement` as the
+/// top-level `message`, naming the rejected member and the rule that rejects it
+/// because every rule this operation enforces itself is one the model cannot
+/// express, `reason` = `FieldValidationFailed`, and the same diagnosis in
+/// `fields`, built by [`crate::service::stated_validation_exception`], the one
+/// place that envelope is built.
+fn stated_refusal(
+    statement: String,
+    field_name: &str,
+    field_message: String,
+) -> ListRecommendationSummariesError {
     ListRecommendationSummariesErrorModeled::ValidationException(
-        crate::service::field_validation_exception(vec![ValidationExceptionDetail {
-            field_name: field_name.to_string(),
-            message: field_message,
-        }]),
+        crate::service::stated_validation_exception(
+            statement,
+            vec![ValidationExceptionDetail {
+                field_name: field_name.to_string(),
+                message: field_message,
+            }],
+        ),
     )
     .into()
 }

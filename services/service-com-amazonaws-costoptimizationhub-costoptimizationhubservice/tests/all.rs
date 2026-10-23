@@ -25,5 +25,7 @@ mod recommendation_summaries;
 mod rejection_fidelity;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/summary_metrics_and_refusals.rs"]
+mod summary_metrics_and_refusals;
 #[path = "all/validation_exception_fields.rs"]
 mod validation_exception_fields;

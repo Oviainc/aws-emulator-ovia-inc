@@ -61,11 +61,28 @@
 //! set and one `fields` entry per invalid member. A refusal a handler raises for a rule
 //! the model cannot express (an unknown `nextToken`, an `orderBy` dimension that
 //! names no member) fills the same two members through
-//! [`field_validation_exception`], the one place that envelope is built. The
+//! [`stated_validation_exception`], the one place that envelope is built. The
 //! model's other reason (`Other`) names a refusal no field accounts for, and no
 //! operation of this service raises one: a preference write, for instance,
 //! declares no rule about the CALLER, so every refusal it can answer is a
 //! member outside its declared constraint.
+//!
+//! # What the top-level `message` of a refusal says
+//!
+//! Two classes of refusal, two messages, because what is known about the request
+//! differs:
+//!
+//! - a member outside a constraint the MODEL declares (a `@pattern`, a `@range`,
+//!   an enum value set) is answered with [`FIELD_VALIDATION_SUMMARY`], the fixed
+//!   summary that points at the field list the constraint walk produced
+//!   ([`field_validation_exception`]);
+//! - a refusal a HANDLER raises for a rule of the operation the model cannot
+//!   express — a filter member the operation does not support, a dimension that
+//!   names no member, a pagination token this service never issued — is built
+//!   FROM the request, so its message states the rejected member and the rule
+//!   that rejects it ([`stated_validation_exception`]), with the same per-member
+//!   diagnosis still in `fields`. An SDK error surface commonly shows only
+//!   `message`, so the actionable part of such a refusal belongs there.
 //!
 //! # A member's own value set or bound is the one its operation enforces
 //!
@@ -275,20 +292,37 @@ fn validation_exception(
         .ok()
 }
 
-/// This service's `ValidationException` for a request refused because of the
-/// members `fields` names: the fixed summary, `reason` =
+/// This service's `ValidationException` for a member outside a constraint the
+/// MODEL declares: the fixed summary ([`FIELD_VALIDATION_SUMMARY`]), `reason` =
 /// `FieldValidationFailed`, and the per-member diagnosis in `fields`.
 ///
-/// The ONE place that envelope is built, so a refusal a HANDLER raises for a
-/// rule the model cannot express (an unknown `nextToken`, a bound the member's
-/// own `@range` declares) reads exactly like one the constraint walk raised.
+/// This is the envelope of a refusal whose whole diagnosis is the field list —
+/// the constraint walk's own, and a bound or value set a handler enforces in the
+/// walk's place ([`out_of_range`], [`not_in_enum`]) — so a handler-enforced
+/// constraint reads exactly like a walk-enforced one.
 pub(crate) fn field_validation_exception(
     fields: Vec<ValidationExceptionDetail>,
 ) -> ValidationException {
+    stated_validation_exception(FIELD_VALIDATION_SUMMARY.to_string(), fields)
+}
+
+/// This service's `ValidationException` for a request a HANDLER refused for a
+/// rule of the OPERATION the model cannot express: `statement` is the top-level
+/// `message`, which names the rejected member and the rule that rejects it
+/// because the refusal is built from the request, and `fields` carries the same
+/// diagnosis attributed to that member.
+///
+/// The ONE place this service's `ValidationException` is built, so every refusal
+/// of this service — whichever layer raised it — fills `reason` and `fields` the
+/// same way; only the summary differs, and the note on `message` above says why.
+pub(crate) fn stated_validation_exception(
+    statement: String,
+    fields: Vec<ValidationExceptionDetail>,
+) -> ValidationException {
     ValidationException {
-        message: FIELD_VALIDATION_SUMMARY.to_string(),
-        // Every violation here is a member outside a declared constraint, which
-        // is exactly what this reason names.
+        message: statement,
+        // Every refusal built here is attributed to a member of the request,
+        // which is exactly what this reason names.
         reason: Some(REASON_FIELD_VALIDATION_FAILED.to_string()),
         fields: Some(fields),
     }

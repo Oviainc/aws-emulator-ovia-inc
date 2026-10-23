@@ -41,9 +41,14 @@ use crate::ops::types::{
 
 /// The `SavingsEstimationMode` value that subtracts commitment and discount
 /// amounts from the figures a recommendation reports; the other value
-/// (`BeforeDiscounts`) reports the undiscounted cost. Both come from the model's
-/// `SavingsEstimationMode` enum (`shared_types::SAVINGS_ESTIMATION_MODE_VALUES`).
+/// ([`BEFORE_DISCOUNTS`]) reports the undiscounted cost. Both come from the
+/// model's `SavingsEstimationMode` enum
+/// (`shared_types::SAVINGS_ESTIMATION_MODE_VALUES`).
 pub const AFTER_DISCOUNTS: &str = "AfterDiscounts";
+
+/// The other `SavingsEstimationMode` value: the figures are reported before any
+/// commitment or discount amount is subtracted.
+pub const BEFORE_DISCOUNTS: &str = "BeforeDiscounts";
 
 /// `EnrollmentStatus` values, from the model's enum of the same name.
 pub const STATUS_ACTIVE: &str = "Active";
@@ -120,10 +125,17 @@ impl Enrollment {
 }
 
 /// The `SavingsEstimationMode` the service applies to an account that has
-/// expressed no preference: savings are reported net of the commitment and
-/// discount amounts that already apply to the account, which is also the mode
-/// `GetPreferences` reports for such an account.
-pub const DEFAULT_SAVINGS_ESTIMATION_MODE: &str = AFTER_DISCOUNTS;
+/// expressed no preference: the figures are reported BEFORE any discount, which
+/// is also the mode `GetPreferences` reports for such an account.
+///
+/// Recorded behavior: an account that has written no preference is served under
+/// before-discounts. The recorded `ListRecommendationSummaries` of such an
+/// account reports the `savingsPercentage` metric as unsupported "when savings
+/// estimation mode preference is set to before discounts", and a recorded
+/// `UpdatePreferences` that sets only another member echoes
+/// `savingsEstimationMode` = `BeforeDiscounts` back. The discounted view is the
+/// one an account moves itself to with `UpdatePreferences`.
+pub const DEFAULT_SAVINGS_ESTIMATION_MODE: &str = BEFORE_DISCOUNTS;
 
 // `memberAccountDiscountVisibility` has NO default the service applies in an
 // account's place, so there is no constant for it: the model documents a null
@@ -1251,10 +1263,10 @@ mod tests {
     /// What a stored `savingsEstimationMode` does to a row's money members:
     /// `AfterDiscounts` reports the cost net of every discount the price
     /// carries, and every other state of the preference — `BeforeDiscounts`,
-    /// or no preference at all — reports the undiscounted cost. Asserted on
-    /// the stored prices directly, because the mode is the management
-    /// account's to enable (see `ops::update_preferences`) and so cannot be
-    /// reached over the wire by the account this emulator presents.
+    /// or no preference at all, which is served under the same mode
+    /// ([`DEFAULT_SAVINGS_ESTIMATION_MODE`]) — reports the undiscounted cost.
+    /// Asserted on the stored prices directly; the wire behaviour of each mode
+    /// is `tests/all/cost_optimization_hub.rs`.
     #[test]
     fn the_mode_decides_whether_discounts_are_subtracted() {
         let pricing = Pricing {
@@ -1267,7 +1279,7 @@ mod tests {
         // (the stored mode, the cost it reports)
         let cases: [(Option<&str>, f64); 4] = [
             (None, 280.32),
-            (Some("BeforeDiscounts"), 280.32),
+            (Some(BEFORE_DISCOUNTS), 280.32),
             (Some(AFTER_DISCOUNTS), 252.29),
             // A value outside the enum cannot reach the store, and an
             // unrecognised one is not `AfterDiscounts`: the undiscounted cost.

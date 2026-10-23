@@ -228,13 +228,14 @@ async fn the_total_is_deduped_across_recommendation_types() {
     let router = enrolled_router().await;
 
     // (case, the mode to store first) — the absent preference is the store's
-    // initial value, read under the mode the service applies by default. An
-    // explicit `AfterDiscounts` is the management account's to set (see
-    // `management_account_gating`), so the two reachable states are the default
-    // and an explicit `BeforeDiscounts`.
-    let modes: [(&str, Option<&str>); 2] = [
+    // initial value, read under the mode the service applies by default
+    // (`BeforeDiscounts`), and each value of the model's enum is then stored
+    // explicitly. The de-duped total is checked against the list view under the
+    // same mode, so every row is mode-agnostic by construction.
+    let modes: [(&str, Option<&str>); 3] = [
         ("no stored preference", None),
         ("BeforeDiscounts", Some("BeforeDiscounts")),
+        ("AfterDiscounts", Some("AfterDiscounts")),
     ];
 
     for (case, mode) in modes {
@@ -449,9 +450,14 @@ async fn summary_pagination_resumes_where_the_previous_page_ended() {
 /// as the metric's own description where the view is narrowed by a dimension
 /// the metric is not defined over (the model's note: "Savings percentage is only
 /// supported when filtering by Region, account ID, or tags").
+///
+/// The account is moved to the discounted `savingsEstimationMode` first, because
+/// the metric is supported only under that mode — the other half of the rule,
+/// which `summary_metrics_and_refusals` owns.
 #[tokio::test]
 async fn the_savings_percentage_metric_is_reported_only_when_requested() {
     let router = enrolled_router().await;
+    set_mode(&router, "AfterDiscounts").await;
 
     // No metric asked for: nothing to report.
     for request in [
@@ -584,6 +590,10 @@ async fn an_unreportable_metric_is_refused() {
 async fn a_summary_reports_only_what_the_caller_may_read() {
     let router = router();
     let request = json!({"groupBy": "ResourceType", "metrics": ["SavingsPercentage"]});
+    // The discounted mode, under which the metric reports a figure at all
+    // (`summary_metrics_and_refusals`), so the percentage below follows what is
+    // visible rather than the mode.
+    set_mode(&router, "AfterDiscounts").await;
 
     // (the status this step moves the account to — `None` is "never called" —
     // whether the summary reports groups in the instant after that call, and

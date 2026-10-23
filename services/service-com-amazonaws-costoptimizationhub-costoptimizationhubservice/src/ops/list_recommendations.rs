@@ -335,24 +335,35 @@ fn render(row: &crate::state::StoredRecommendation, mode: Option<&str>) -> Recom
 
 /// Refuse a `nextToken` this service did not issue for this list.
 fn invalid_next_token() -> ListRecommendationsError {
-    ListRecommendationsErrorModeled::ValidationException(crate::service::field_validation_exception(
-        vec![ValidationExceptionDetail {
-            field_name: "nextToken".to_string(),
-            message: "the value is not a pagination token issued by ListRecommendations"
+    ListRecommendationsErrorModeled::ValidationException(
+        crate::service::stated_validation_exception(
+            "Invalid nextToken specified. The token was not issued by ListRecommendations."
                 .to_string(),
-        }],
-    ))
+            vec![ValidationExceptionDetail {
+                field_name: "nextToken".to_string(),
+                message: "the value is not a pagination token issued by ListRecommendations"
+                    .to_string(),
+            }],
+        ),
+    )
     .into()
 }
 
 /// Refuse an `orderBy.dimension` that names no `Recommendation` member.
 fn unknown_dimension(dimension: &str) -> ListRecommendationsError {
-    ListRecommendationsErrorModeled::ValidationException(crate::service::field_validation_exception(
-        vec![ValidationExceptionDetail {
-            field_name: "orderBy.dimension".to_string(),
-            message: format!("{dimension} is not a dimension recommendations can be sorted by"),
-        }],
-    ))
+    ListRecommendationsErrorModeled::ValidationException(
+        crate::service::stated_validation_exception(
+            format!(
+                "Invalid orderBy specified. Cannot order by {dimension} for this operation."
+            ),
+            vec![ValidationExceptionDetail {
+                field_name: "orderBy.dimension".to_string(),
+                message: format!(
+                    "{dimension} is not a dimension recommendations can be sorted by"
+                ),
+            }],
+        ),
+    )
     .into()
 }
 
