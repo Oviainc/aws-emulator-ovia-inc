@@ -91,11 +91,22 @@
 //!
 //! Two REST peers can also publish the same first path segment — the two SageMaker
 //! Runtime endpoints both bind `/endpoints/{EndpointName}/…` and even share an
-//! `endpointPrefix` — and then the first segment separates nothing either. The segment
-//! their modelled URIs actually differ at does, which is what [`nth_path_segment`] reads
-//! and what [`addresses_runtime_bidirectional_stream`] states once for that pair: the
-//! service that owns the narrower space claims it, its peer claims the complement, so a
-//! path inside the shared space always has exactly one claimant.
+//! `endpointPrefix` — and then the first segment separates nothing either. Where the
+//! overlap is one operation wide, the segment their modelled URIs actually differ at
+//! decides, which is what [`nth_path_segment`] reads and what
+//! [`addresses_runtime_bidirectional_stream`] states once for that pair: the service
+//! that owns the narrower space claims it, its peer claims the complement, so a path
+//! inside the shared space always has exactly one claimant.
+//!
+//! Where the overlap is the WHOLE first segment — the four Amazon Lex services all sign
+//! as `lex`, and three of them bind operations under `/bots/…` — no single segment
+//! separates them and [`lex::claims_request`] is the rule instead: on a segment a sibling
+//! publishes too, a service claims a request only when its own model binds a route for
+//! that request's HTTP method and URI ([`addresses_modeled_route`]), and where two models
+//! bind the IDENTICAL route the modelled shape of the path label decides. The route is
+//! the finest discriminator a REST model publishes, it names no service, and it is read
+//! through the service's OWN protocol (`routing_key`), so the claim and the later
+//! operation lookup cannot disagree.
 //!
 //! # Services still carrying their own copy
 //!
@@ -284,6 +295,41 @@ fn claims_rpc_path(parts: &http::request::Parts) -> bool {
     first_path_segment(path).is_none() || rpcv2_cbor_service_named(path).is_some()
 }
 
+/// The modeled OPERATION `definition` resolves for the request, or `None` when its model
+/// binds no route for the request's method and URI.
+///
+/// Both halves of the framework's own lookup, in the order and with the data the router
+/// uses (`MultiServiceRouter::dispatch`): the service's wire protocol reads the routing
+/// key, and the model-derived routing table must actually hold an operation under it. The
+/// second half is what makes this a sound claim test for EVERY protocol and not only the
+/// REST family: `awsJson`'s and `rpcv2Cbor`'s key readers merely PARSE
+/// `X-Amz-Target: <Service>.<Operation>` or `/service/<S>/operation/<O>` and succeed for
+/// any well-formed one whatever service owns it, so the key alone would claim a peer's
+/// traffic; the table lookup fails for an operation this model does not declare.
+///
+/// The request's parts are re-presented to the protocol as a BODILESS runtime-API
+/// request: a REST, `awsJson` or `rpcv2Cbor` routing key is read from the method, the URI
+/// and the headers, all of which `Service::can_handle` is handed, so nothing the decision
+/// rests on is missing. The `query` family reads its key from the BODY, which
+/// `can_handle` does not receive, so an `awsQuery` / `ec2Query` service uses
+/// [`claims_request`] instead.
+///
+/// Returning the operation NAME, rather than only "yes, a route": for the residue the
+/// path half of a claim cannot split — two peers sharing a signing name whose models bind
+/// the IDENTICAL method and URI, where no signal in the request tells them apart and the
+/// route must therefore be served by exactly one of them — the one that cedes can name the
+/// ceded OPERATIONS rather than restating their method and URI templates beside the model.
+/// The route is read off the model by the same protocol that will route the request, so a
+/// ceded route cannot drift from the one the model binds.
+pub fn modeled_operation(
+    parts: &http::request::Parts,
+    definition: &dyn ErasedServiceDefinition,
+) -> Option<String> {
+    let request = runtime_request_from(parts)?;
+    let key = definition.protocol().routing_key(&request).ok()?;
+    definition.routing_table().get(key).map(|_| key.to_string())
+}
+
 /// Whether the routing key the framework resolves for `parts` is `signing_name`.
 ///
 /// This is `emulator_server::can_handle_based_on_route_key`'s rule applied over
@@ -396,7 +442,8 @@ pub fn claims_modeled_path(parts: &http::request::Parts, path_segments: &[&str])
 /// agent-immutable crate: the URI, the method and every header value, `append`ed so a
 /// repeated header keeps all of its values. The two must stay in step — the ONE
 /// difference is deliberate, the empty body, since no routing key this is used for reads
-/// one.
+/// one. Every claim phrasing in this crate goes through that one rebuild, so the crate
+/// presents one request to one `routing_key`.
 pub fn addresses_modeled_route(
     parts: &http::request::Parts,
     definition: &dyn ErasedServiceDefinition,

@@ -48,21 +48,21 @@ use smithy_server_runtime::{MultiServiceRouter, Service};
 
 /// The two refusals the ROUTER itself produces, neither of which is an AWS error code: a
 /// request that reaches exactly one service can answer neither.
-const ROUTER_REFUSALS: &[&str] = &["AmbiguousService", "UnknownService"];
+pub(crate) const ROUTER_REFUSALS: &[&str] = &["AmbiguousService", "UnknownService"];
 
 /// The Smithy shape ids of the family members, as `identity().shape_id()` reports them.
-const MODELS_V2: &str = "com.amazonaws.lexmodelsv2#LexModelBuildingServiceV2";
-const RUNTIME_V2: &str = "com.amazonaws.lexruntimev2#AWSDeepSenseRunTimeServiceApi2_0";
+pub(crate) const MODELS_V2: &str = "com.amazonaws.lexmodelsv2#LexModelBuildingServiceV2";
+pub(crate) const RUNTIME_V2: &str = "com.amazonaws.lexruntimev2#AWSDeepSenseRunTimeServiceApi2_0";
 const MODELS_V1: &str = "com.amazonaws.lexmodelbuildingservice#AWSDeepSenseModelBuildingService";
 const RUNTIME_V1: &str = "com.amazonaws.lexruntimeservice#AWSDeepSenseRunTimeService";
 
 /// An IAM role ARN satisfying the V2 model's `RoleArn` shape
 /// (len 32..2048, pattern `^arn:aws:iam::[0-9]{12}:role/.*$`).
-const ROLE_ARN: &str = "arn:aws:iam::123456789012:role/lex-routing-check";
+pub(crate) const ROLE_ARN: &str = "arn:aws:iam::123456789012:role/lex-routing-check";
 
 /// A SigV4 `Authorization` header whose credential scope names `lex`. The signature is
 /// never checked: the router here runs with request authentication off.
-fn authorization() -> String {
+pub(crate) fn authorization() -> String {
     "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20260101/us-east-1/lex/aws4_request, \
      SignedHeaders=host, Signature=0000000000000000000000000000000000000000000000000000000000000000"
         .to_string()
@@ -70,7 +70,7 @@ fn authorization() -> String {
 
 /// Every emulated service whose SigV4 signing name is `lex`, over one engine, as
 /// `core/router/src/lib.rs` mounts them.
-fn lex_family(engine: &Arc<engine::InMemoryEngine>) -> Vec<Box<dyn Service>> {
+pub(crate) fn lex_family(engine: &Arc<engine::InMemoryEngine>) -> Vec<Box<dyn Service>> {
     vec![
         Box::new(
             service_com_amazonaws_lexmodelsv2_lexmodelbuildingservicev2::EmulatedService::new(
@@ -96,7 +96,7 @@ fn lex_family(engine: &Arc<engine::InMemoryEngine>) -> Vec<Box<dyn Service>> {
 }
 
 /// The whole family mounted in a router, over the engine the caller keeps a handle on.
-fn build_router(engine: &Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
+pub(crate) fn build_router(engine: &Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
     router.register_service(
@@ -127,7 +127,7 @@ fn build_router(engine: &Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
 /// The `Host` is the emulator's own, as a client configured with one local `endpoint_url`
 /// sends it: nothing in it names a Lex endpoint prefix, which is precisely why the claim
 /// cannot be made on the host.
-fn claimants(family: &[Box<dyn Service>], method: &str, path: &str) -> Vec<String> {
+pub(crate) fn claimants(family: &[Box<dyn Service>], method: &str, path: &str) -> Vec<String> {
     let request = http::Request::builder()
         .method(method)
         .uri(format!("https://emulator.local{path}"))
@@ -533,15 +533,20 @@ fn the_four_path_spaces_overlap_only_where_the_family_rule_splits_them() {
 }
 
 /// One answer from the whole router, reduced to what the rows assert on.
-struct Answer {
-    status: u16,
-    error_code: String,
-    body: Value,
-    raw_body: String,
+pub(crate) struct Answer {
+    pub(crate) status: u16,
+    pub(crate) error_code: String,
+    pub(crate) body: Value,
+    pub(crate) raw_body: String,
 }
 
 /// Dispatch one `lex`-signed request through the whole router.
-async fn dispatch(router: &MultiServiceRouter, method: &str, path: &str, body: &str) -> Answer {
+pub(crate) async fn dispatch(
+    router: &MultiServiceRouter,
+    method: &str,
+    path: &str,
+    body: &str,
+) -> Answer {
     let request = http::Request::builder()
         .method(method)
         .uri(format!("https://emulator.local{path}"))
