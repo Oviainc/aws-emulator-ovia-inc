@@ -22,7 +22,7 @@ use service_com_amazonaws_computeoptimizer_computeoptimizerservice::ops::types::
     IdleSavingsOpportunityAfterDiscounts, IdleUtilizationMetric, Tag,
 };
 use service_com_amazonaws_computeoptimizer_computeoptimizerservice::state::{
-    service_state, IDLE_MAX_PAGE_SIZE, IDLE_NO_RECOMMENDATION_CODE,
+    service_state, IDLE_MAX_PAGE_SIZE, NO_RECOMMENDATION_CODE,
 };
 
 use crate::harness::{call, emulator_with_engine, error_code, opt_in, ACCOUNT};
@@ -564,7 +564,7 @@ async fn a_requested_resource_with_no_recommendation_is_reported_in_errors() {
     // The wire value of the code every entry carries, pinned here as the literal a client
     // matches on.
     assert_eq!(
-        IDLE_NO_RECOMMENDATION_CODE, "ResourceNotFound",
+        NO_RECOMMENDATION_CODE, "ResourceNotFound",
         "the no-recommendation code is part of the wire contract"
     );
 
@@ -646,7 +646,7 @@ async fn a_requested_resource_with_no_recommendation_is_reported_in_errors() {
         );
         assert_eq!(
             reported["code"],
-            json!(IDLE_NO_RECOMMENDATION_CODE),
+            json!(NO_RECOMMENDATION_CODE),
             "case {case:?}: expected the no-recommendation code, got {reported}"
         );
         assert!(

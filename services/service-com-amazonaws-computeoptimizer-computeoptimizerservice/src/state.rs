@@ -12,9 +12,13 @@
 //!
 //! The analysis output this service REPORTS lives here too. The FINDINGS CATALOG holds one
 //! row per resource Compute Optimizer has analysed for the account (its finding, its reason
-//! codes, its performance risk, what it costs and what the recommendation would cost), part
-//! of the store's initial value so every findings reader aggregates the same rows without
-//! any of them writing to the store. Idle resource recommendations have their own store
+//! codes, its performance risk, what it costs and what the recommendation would cost, and —
+//! for a resource analysed as an Amazon Aurora or RDS database — the database configuration
+//! the analysis observed), part of the store's initial value so every findings reader
+//! aggregates the same rows without any of them writing to the store. A row records a
+//! resource's REGION-FREE identity, because Compute Optimizer is regional: the ARN a reader
+//! reports names the region of the endpoint the request addressed
+//! ([`AnalysedResource::arn_in`], [`request_region`]). Idle resource recommendations have their own store
 //! ([`IdleRecommendationStore`]): no operation of this API creates one — Compute Optimizer's
 //! own analysis of an observed workload does — so the store is what `GetIdleRecommendations`
 //! filters, orders and pages over, and the rules it applies to a stored recommendation (the
@@ -28,12 +32,16 @@ use ::aws_smithy_types::DateTime;
 use ::sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    AutoScalingGroupConfiguration, CustomizableMetricParameters, EffectivePreferredResource,
-    EffectiveRecommendationPreferences, ExternalMetricsPreference, IdleRecommendation,
-    IdleRecommendationFilter, InstanceSavingsEstimationMode, PreferredResource,
-    PutRecommendationPreferencesInput, RecommendationPreferencesDetail, Scope, UtilizationMetric,
+    AutoScalingGroupConfiguration, CustomizableMetricParameters, DBStorageConfiguration,
+    EffectivePreferredResource, EffectiveRecommendationPreferences, ExternalMetricsPreference,
+    IdleRecommendation, IdleRecommendationFilter, InstanceSavingsEstimationMode, PreferredResource,
+    PutRecommendationPreferencesInput, RDSDBRecommendation, RDSDBRecommendationFilter,
+    RDSDBUtilizationMetric, RecommendationPreferencesDetail, Scope, Tag, UtilizationMetric,
     UtilizationPreference, IDLE_FINDING_VALUES, IDLE_RECOMMENDATION_FILTER_NAME_VALUES,
-    IDLE_RECOMMENDATION_RESOURCE_TYPE_VALUES,
+    IDLE_RECOMMENDATION_RESOURCE_TYPE_VALUES, IDLE_VALUES,
+    R_D_S_D_B_RECOMMENDATION_FILTER_NAME_VALUES, R_D_S_INSTANCE_FINDING_REASON_CODE_VALUES,
+    R_D_S_INSTANCE_FINDING_VALUES, R_D_S_STORAGE_FINDING_REASON_CODE_VALUES,
+    R_D_S_STORAGE_FINDING_VALUES,
 };
 
 /// The look-back period in force when no preference sets one. From the model's own
@@ -410,6 +418,21 @@ pub fn parse_arn(arn: &str) -> Option<ParsedArn<'_>> {
 /// that takes an account id checks against.
 pub fn is_account_id(value: &str) -> bool {
     value.len() == 12 && value.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// The region an ARN names when the request carries no SigV4 credential scope to read one
+/// from: the region the emulator's own shared AWS config names, so an unsigned call and a
+/// default-configured client agree.
+pub const DEFAULT_REGION: &str = "us-east-1";
+
+/// The region this request was signed for, defaulting to [`DEFAULT_REGION`].
+///
+/// A resource ARN is region-scoped and Compute Optimizer is a regional service, so the
+/// region in a request's SigV4 credential scope is the region whose resources it is asking
+/// about — and the one the ARNs in its answer name.
+pub fn request_region(ctx: &smithy_server_runtime::OperationContext<'_>) -> String {
+    ::emulator_server::sigv4_credential_scope(&ctx.parts().headers)
+        .map_or_else(|| DEFAULT_REGION.to_string(), |scope| scope.region)
 }
 
 /// An EC2 instance or Auto Scaling group ARN, split into the parts the preference rules
@@ -857,10 +880,19 @@ impl AnalyzedAutoScalingGroup {
     /// reason codes (`AutoScalingGroupRecommendation` declares no such member), so the
     /// row carries none.
     pub fn to_analysed_resource(&self) -> AnalysedResource {
+        // The catalog records a resource's REGION-FREE identity
+        // ([`AnalysedResource::arn_in`]), so the group's own ARN is split back into the
+        // fields a reader rebuilds it from.
+        let parsed = parse_arn(&self.arn);
         AnalysedResource {
             account_id: self.account_id.clone(),
             resource_type: SOURCE_TYPE_AUTO_SCALING_GROUP.to_string(),
-            resource_arn: self.arn.clone(),
+            arn_service: parsed
+                .map(|arn| arn.service.to_string())
+                .unwrap_or_default(),
+            arn_resource: parsed
+                .map(|arn| arn.resource.to_string())
+                .unwrap_or_default(),
             finding: self.finding().to_string(),
             finding_reason_codes: Vec::new(),
             current_performance_risk: self.current_performance_risk.clone(),
@@ -871,6 +903,8 @@ impl AnalyzedAutoScalingGroup {
                 .unwrap_or(&self.current)
                 .monthly_cost(),
             inferred_workload_types: self.inferred_workload_types.clone(),
+            // A group is not a database, so there is no database configuration to record.
+            rds_database: None,
         }
     }
 }
@@ -1233,8 +1267,12 @@ pub struct AnalysedResource {
     pub account_id: String,
     /// The `RecommendationSourceType` the resource is analysed as.
     pub resource_type: String,
-    /// The resource's ARN.
-    pub resource_arn: String,
+    /// The service namespace the resource belongs to — the `ec2`, `rds`, … field of its ARN.
+    pub arn_service: String,
+    /// Everything after the account field of the resource's ARN (`db:orders-primary`),
+    /// separators included: the resource's identity WITHOUT the region, which
+    /// [`Self::arn_in`] builds the ARN for one regional endpoint from.
+    pub arn_resource: String,
     /// The `Finding` the analysis reached for it.
     pub finding: String,
     /// The `FindingReasonCode`s behind that finding; empty where the finding has none.
@@ -1249,9 +1287,34 @@ pub struct AnalysedResource {
     pub recommended_monthly_cost: f64,
     /// The `InferredWorkloadType`s running on the resource; empty where none was inferred.
     pub inferred_workload_types: Vec<String>,
+    /// What the analysis recorded about the resource AS A DATABASE, for a row analysed as an
+    /// Amazon Aurora or RDS database; `None` for every other resource type, and for a
+    /// database whose configuration the analysis did not record. See [`RdsDatabaseDetail`].
+    pub rds_database: Option<RdsDatabaseDetail>,
 }
 
 impl AnalysedResource {
+    /// This resource's ARN as the endpoint in `region` reports it.
+    ///
+    /// Compute Optimizer is a REGIONAL service: each regional endpoint analyses and reports
+    /// the resources of its own region, so a resource the catalog holds is a resource of the
+    /// region whose endpoint a request addressed, and the ARN reported for it names that
+    /// region. The catalog therefore records the resource's region-free identity and every
+    /// reader builds the ARN for the region its request was signed for
+    /// ([`request_region`]).
+    pub fn arn_in(&self, region: &str) -> String {
+        if self.account_id == ::engine::emulator_account_id() {
+            ::engine::emulator_arn(&self.arn_service, region, &self.arn_resource)
+        } else {
+            // `emulator_arn` always names the emulator's own account; a row recorded for
+            // another account keeps that account in its ARN.
+            format!(
+                "arn:aws:{}:{region}:{}:{}",
+                self.arn_service, self.account_id, self.arn_resource
+            )
+        }
+    }
+
     /// The monthly saving of adopting the recommendation for this resource: what it costs
     /// today less what the recommended configuration costs, and NOTHING where the
     /// recommendation does not cost less — an underprovisioned resource is recommended a
@@ -1294,13 +1357,14 @@ pub const DIMENSION_SAVINGS_VALUE_AFTER_DISCOUNT: &str = "SavingsValueAfterDisco
 /// `Asc | Desc`); see [`idle_sorts_descending`].
 pub const ORDER_DESC: &str = "Desc";
 
-/// The `IdleRecommendationError$code` this service reports for the one condition it can
-/// report: the request named a resource the service holds no idle recommendation for, which
-/// is exactly what `IdleRecommendationError` describes ("Returns of list of resources that
-/// doesn't have idle recommendations"). The model documents `code` only as "The error code"
-/// and names no vocabulary for it, so this is the emulator's own stable code; the
-/// requirement the entry carries is its `identifier`.
-pub const IDLE_NO_RECOMMENDATION_CODE: &str = "ResourceNotFound";
+/// The error `code` a findings reader reports for the one condition it can report: the
+/// request named a resource this service holds no recommendation for, which is exactly what
+/// `IdleRecommendationError` ("Returns of list of resources that doesn't have idle
+/// recommendations") and `GetRecommendationError` ("Describes an error experienced when
+/// getting recommendations") describe. The model documents `code` only as "The error code"
+/// and names no vocabulary for it, so this is the emulator's own stable code, stated once so
+/// every reader reports the same one; the requirement the entry carries is its `identifier`.
+pub const NO_RECOMMENDATION_CODE: &str = "ResourceNotFound";
 
 /// The idle resource recommendations this service holds, keyed by the resource ARN that
 /// identifies one, in the order they were recorded.
@@ -1486,7 +1550,7 @@ pub fn idle_sorts_descending(order: Option<&str>) -> bool {
 /// with a different selection is refused instead of answered with a page of another result
 /// set.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct IdlePageCursor {
+pub struct PageCursor {
     /// How many selected recommendations the previous pages already reported.
     pub offset: usize,
     /// The fingerprint of the request members that select and order the result set.
@@ -1501,21 +1565,228 @@ pub fn fingerprint<T: std::fmt::Debug>(value: &T) -> String {
     ::hex::encode(Sha256::digest(format!("{value:?}").as_bytes()))
 }
 
-/// The opaque `nextToken` `GetIdleRecommendations` hands out: the cursor itself,
-/// hex-encoded, so a page token needs no server-side entry and a read never writes.
-pub fn encode_idle_page_token(cursor: &IdlePageCursor) -> String {
+/// The opaque `nextToken` an offset-paged reader hands out: the cursor itself, hex-encoded,
+/// so a page token needs no server-side entry and a read never writes. Shared by every
+/// reader of this service that walks a selected sequence by offset, each of which binds its
+/// own operation name into the selection fingerprint, so one reader's token resumes no
+/// other's walk.
+pub fn encode_offset_page_token(cursor: &PageCursor) -> String {
     ::hex::encode(format!("{}:{}", cursor.offset, cursor.selection_fingerprint))
 }
 
 /// The cursor a `nextToken` this service issued stands for, or `None` for a token it did
 /// not issue. What a decoded cursor may resume is the caller's own check: it compares the
 /// cursor's fingerprint against the one it would issue for this request.
-pub fn decode_idle_page_token(token: &str) -> Option<IdlePageCursor> {
+pub fn decode_offset_page_token(token: &str) -> Option<PageCursor> {
     let decoded = String::from_utf8(::hex::decode(token).ok()?).ok()?;
     let (offset, selection_fingerprint) = decoded.split_once(':')?;
-    Some(IdlePageCursor {
+    Some(PageCursor {
         offset: offset.parse().ok()?,
         selection_fingerprint: selection_fingerprint.to_string(),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Amazon Aurora and RDS database recommendations
+//
+// `GetRDSDatabaseRecommendations` "Returns Amazon Aurora and RDS database
+// recommendations", which Compute Optimizer "generates ... for Amazon Aurora and RDS
+// databases that meet a specific set of requirements" from the utilization it OBSERVES.
+// So, like every other findings reader of this service, it REPORTS the rows the findings
+// catalog holds — here the ones analysed as `RdsDBInstance`, the source type the model's
+// `RDSDBRecommendation` describes — and writes nothing. The rules below are the ones that
+// turn a stored row into the modelled recommendation and select over it: the filter
+// vocabulary, which finding member a stored `Finding` is reported on, and how a look-back
+// preference reads as a number of days.
+// ---------------------------------------------------------------------------
+
+/// The `RDSDBRecommendationFilterName` values
+/// (`crate::ops::types::R_D_S_D_B_RECOMMENDATION_FILTER_NAME_VALUES`), named so the filter
+/// rules below read as the model's own vocabulary.
+pub const RDS_FILTER_INSTANCE_FINDING: &str = "InstanceFinding";
+/// See [`RDS_FILTER_INSTANCE_FINDING`].
+pub const RDS_FILTER_INSTANCE_FINDING_REASON_CODE: &str = "InstanceFindingReasonCode";
+/// See [`RDS_FILTER_INSTANCE_FINDING`].
+pub const RDS_FILTER_STORAGE_FINDING: &str = "StorageFinding";
+/// See [`RDS_FILTER_INSTANCE_FINDING`].
+pub const RDS_FILTER_STORAGE_FINDING_REASON_CODE: &str = "StorageFindingReasonCode";
+/// See [`RDS_FILTER_INSTANCE_FINDING`].
+pub const RDS_FILTER_IDLE: &str = "Idle";
+
+/// The `Idle` enum values (`crate::ops::types::IDLE_VALUES`), which `RDSDBRecommendation$idle`
+/// carries: whether the service also holds an IDLE recommendation for the database.
+pub const IDLE_TRUE: &str = "True";
+/// See [`IDLE_TRUE`].
+pub const IDLE_FALSE: &str = "False";
+
+/// What the findings catalog records about a resource it analysed as an Amazon Aurora or RDS
+/// DATABASE, beyond the finding, risk and costs every analysed resource carries: the
+/// database's configuration, the configuration the analysis would move it to, and the
+/// utilization it observed.
+///
+/// `None` on a row the analysis recorded no database configuration for, and every field is
+/// optional in its own right, so a reader reports exactly what was observed and omits the
+/// members nothing was recorded for rather than inventing a value for them.
+#[derive(Debug, Clone, Default)]
+pub struct RdsDatabaseDetail {
+    /// `RDSDBRecommendation$engine` — "The database engine of the DB instance".
+    pub engine: Option<String>,
+    /// `RDSDBRecommendation$engineVersion`.
+    pub engine_version: Option<String>,
+    /// `RDSDBRecommendation$promotionTier`, set only for an Aurora cluster member.
+    pub promotion_tier: Option<i32>,
+    /// `RDSDBRecommendation$dbClusterIdentifier`, set only for a cluster member.
+    pub db_cluster_identifier: Option<String>,
+    /// `RDSDBRecommendation$currentDBInstanceClass`.
+    pub current_db_instance_class: Option<String>,
+    /// The DB instance class the analysis would move the database to, which is what an
+    /// `RDSDBInstanceRecommendationOption` names. Absent where the analysis would keep the
+    /// current class.
+    pub recommended_db_instance_class: Option<String>,
+    /// `RDSDBRecommendation$currentStorageConfiguration`.
+    pub current_storage_configuration: Option<DBStorageConfiguration>,
+    /// The storage configuration the analysis would move the database to, which is what an
+    /// `RDSDBStorageRecommendationOption` names.
+    pub recommended_storage_configuration: Option<DBStorageConfiguration>,
+    /// The `RDSDBUtilizationMetric`s the analysis observed over its look-back period.
+    pub utilization_metrics: Vec<RDSDBUtilizationMetric>,
+    /// When the recommendation was last generated (`lastRefreshTimestamp`).
+    pub last_refresh_timestamp: Option<DateTime>,
+    /// The tags of the database.
+    pub tags: Vec<Tag>,
+}
+
+/// Which `RDSDBRecommendation` findings a stored `Finding` is reported as: the instance
+/// finding and the storage finding, in that order.
+///
+/// Compute Optimizer analyses a database's INSTANCE and its STORAGE, and reports a finding
+/// for each, in the vocabulary the model declares for that member: `RDSInstanceFinding` is
+/// `Optimized | Overprovisioned | Underprovisioned`, and `RDSStorageFinding` declares those
+/// three plus `NotOptimized`. The catalog records ONE finding per analysed resource, so that
+/// finding is reported on the side whose enum declares it — the instance side when both do,
+/// since `NotOptimized` is the one finding only storage can carry — and the other side
+/// reports `Optimized`, the value both vocabularies use for a configuration the analysis
+/// would not change, because the analysis recorded nothing against it. Every `Finding` the
+/// catalog can hold is declared by at least one of the two; a value outside both is reported
+/// on neither member.
+pub fn rds_finding_members(finding: &str) -> (Option<&str>, Option<&str>) {
+    // `FINDING_OPTIMIZED` is the `Finding` value `RDSInstanceFinding` and `RDSStorageFinding`
+    // both declare, so one constant names it for all three.
+    match (
+        R_D_S_INSTANCE_FINDING_VALUES.contains(&finding),
+        R_D_S_STORAGE_FINDING_VALUES.contains(&finding),
+    ) {
+        (true, _) => (Some(finding), Some(FINDING_OPTIMIZED)),
+        (false, true) => (Some(FINDING_OPTIMIZED), Some(finding)),
+        (false, false) => (None, None),
+    }
+}
+
+/// The stored reason codes `vocabulary` declares, in stored order.
+///
+/// A resource's reason codes are reported on the member whose enum declares them —
+/// `instanceFindingReasonCodes` targets `RDSInstanceFindingReasonCode` and
+/// `storageFindingReasonCodes` targets `RDSStorageFindingReasonCode` — so a stored code is
+/// reported on the member that can carry it and on no other.
+pub fn reason_codes_in(vocabulary: &[&str], codes: &[String]) -> Vec<String> {
+    codes
+        .iter()
+        .filter(|code| vocabulary.contains(&code.as_str()))
+        .cloned()
+        .collect()
+}
+
+/// Check an `RDSDBRecommendationFilters` list against the vocabulary the model declares for
+/// it, returning the reason it is not valid.
+///
+/// `name` is an `RDSDBRecommendationFilterName` and the values a filter carries are the value
+/// set of the member that name selects on. A name or a value outside those sets is refused
+/// rather than silently matching nothing — the same rule [`idle_filter_rejection`] applies to
+/// the other findings reader's filters.
+pub fn rds_filter_rejection(filters: &[RDSDBRecommendationFilter]) -> Option<String> {
+    for filter in filters {
+        let Some(name) = filter.name.as_deref() else {
+            return Some(format!(
+                "The value supplied for parameter filters is not valid: a filter name must be \
+                 supplied, one of [{}].",
+                R_D_S_D_B_RECOMMENDATION_FILTER_NAME_VALUES.join(", ")
+            ));
+        };
+        let Some(vocabulary) = rds_filter_vocabulary(name) else {
+            return Some(format!(
+                "The value supplied for parameter filters is not valid: {name} is not a filter \
+                 name, which must be one of [{}].",
+                R_D_S_D_B_RECOMMENDATION_FILTER_NAME_VALUES.join(", ")
+            ));
+        };
+        if let Some(value) = filter
+            .values
+            .iter()
+            .flatten()
+            .find(|value| !vocabulary.contains(&value.as_str()))
+        {
+            return Some(format!(
+                "The value supplied for parameter filters is not valid: {value} is not a value \
+                 of the {name} filter, which must be one of [{}].",
+                vocabulary.join(", ")
+            ));
+        }
+    }
+    None
+}
+
+/// The value set an `RDSDBRecommendationFilterName` selects on, or `None` for a name the
+/// model does not declare.
+fn rds_filter_vocabulary(name: &str) -> Option<&'static [&'static str]> {
+    match name {
+        RDS_FILTER_INSTANCE_FINDING => Some(R_D_S_INSTANCE_FINDING_VALUES),
+        RDS_FILTER_INSTANCE_FINDING_REASON_CODE => {
+            Some(R_D_S_INSTANCE_FINDING_REASON_CODE_VALUES)
+        }
+        RDS_FILTER_STORAGE_FINDING => Some(R_D_S_STORAGE_FINDING_VALUES),
+        RDS_FILTER_STORAGE_FINDING_REASON_CODE => Some(R_D_S_STORAGE_FINDING_REASON_CODE_VALUES),
+        RDS_FILTER_IDLE => Some(IDLE_VALUES),
+        _ => None,
+    }
+}
+
+/// Does `recommendation` satisfy every `GetRDSDatabaseRecommendations` filter?
+///
+/// A filter matches when the member its name selects on equals any of the filter's values —
+/// for a member that is a LIST of reason codes, when any stored code is among them. Several
+/// filters are ANDed, and a filter carrying no values constrains nothing. A member the
+/// recommendation does not carry matches nothing. An unrecognised name never reaches here:
+/// [`rds_filter_rejection`] refuses the request first.
+pub fn rds_recommendation_matches_filters(
+    recommendation: &RDSDBRecommendation,
+    filters: &[RDSDBRecommendationFilter],
+) -> bool {
+    filters.iter().all(|filter| {
+        let Some(values) = filter.values.as_ref().filter(|values| !values.is_empty()) else {
+            return true;
+        };
+        let matches_one = |member: Option<&str>| {
+            member.is_some_and(|member| values.iter().any(|value| value == member))
+        };
+        let matches_any = |members: Option<&Vec<String>>| {
+            members.is_some_and(|members| {
+                members
+                    .iter()
+                    .any(|member| values.iter().any(|value| value == member))
+            })
+        };
+        match filter.name.as_deref() {
+            Some(RDS_FILTER_INSTANCE_FINDING) => matches_one(recommendation.instance_finding.as_deref()),
+            Some(RDS_FILTER_STORAGE_FINDING) => matches_one(recommendation.storage_finding.as_deref()),
+            Some(RDS_FILTER_IDLE) => matches_one(recommendation.idle.as_deref()),
+            Some(RDS_FILTER_INSTANCE_FINDING_REASON_CODE) => {
+                matches_any(recommendation.instance_finding_reason_codes.as_ref())
+            }
+            Some(RDS_FILTER_STORAGE_FINDING_REASON_CODE) => {
+                matches_any(recommendation.storage_finding_reason_codes.as_ref())
+            }
+            _ => false,
+        }
     })
 }
 
@@ -1576,12 +1847,15 @@ impl Default for ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
 /// vocabularies of several resource types so an aggregate over it is not a single row
 /// restated: it holds a resource whose recommendation saves money, one the analysis would
 /// GROW (so it saves none), and one it leaves alone.
+///
+/// A row records a resource's REGION-FREE identity (its service namespace and resource
+/// part): Compute Optimizer is regional, so the region a reported ARN names is the region
+/// of the endpoint the request addressed ([`AnalysedResource::arn_in`]).
 fn seed_analysed_resources() -> Vec<AnalysedResource> {
     let account = ::engine::emulator_account_id();
-    let east = "us-east-1";
-    let west = "us-west-2";
     let row = |resource_type: &str,
-               resource_arn: String,
+               arn_service: &str,
+               arn_resource: &str,
                finding: &str,
                finding_reason_codes: &[&str],
                current_performance_risk: &str,
@@ -1590,7 +1864,8 @@ fn seed_analysed_resources() -> Vec<AnalysedResource> {
                inferred_workload_types: &[&str]| AnalysedResource {
         account_id: account.to_string(),
         resource_type: resource_type.to_string(),
-        resource_arn,
+        arn_service: arn_service.to_string(),
+        arn_resource: arn_resource.to_string(),
         finding: finding.to_string(),
         finding_reason_codes: finding_reason_codes
             .iter()
@@ -1603,13 +1878,17 @@ fn seed_analysed_resources() -> Vec<AnalysedResource> {
             .iter()
             .map(|workload| (*workload).to_string())
             .collect(),
+        // Set below for the rows analysed as a database; every other resource type has no
+        // database configuration to record.
+        rds_database: None,
     };
 
     vec![
         // An over-provisioned instance: the recommendation is smaller, so it saves.
         row(
             SOURCE_TYPE_EC2_INSTANCE,
-            ::engine::emulator_arn("ec2", east, "instance/i-0a1b2c3d4e5f60001"),
+            "ec2",
+            "instance/i-0a1b2c3d4e5f60001",
             FINDING_OVERPROVISIONED,
             &[METRIC_REASON_MEMORY_OVERPROVISIONED],
             PERFORMANCE_RISK_VERY_LOW,
@@ -1621,7 +1900,8 @@ fn seed_analysed_resources() -> Vec<AnalysedResource> {
         // nothing even though its configuration changes.
         row(
             SOURCE_TYPE_EC2_INSTANCE,
-            ::engine::emulator_arn("ec2", east, "instance/i-0a1b2c3d4e5f60002"),
+            "ec2",
+            "instance/i-0a1b2c3d4e5f60002",
             FINDING_UNDERPROVISIONED,
             &[METRIC_REASON_MEMORY_UNDERPROVISIONED],
             PERFORMANCE_RISK_HIGH,
@@ -1632,7 +1912,8 @@ fn seed_analysed_resources() -> Vec<AnalysedResource> {
         // An optimized instance: nothing to change, nothing to save.
         row(
             SOURCE_TYPE_EC2_INSTANCE,
-            ::engine::emulator_arn("ec2", west, "instance/i-0a1b2c3d4e5f60003"),
+            "ec2",
+            "instance/i-0a1b2c3d4e5f60003",
             FINDING_OPTIMIZED,
             &[],
             PERFORMANCE_RISK_VERY_LOW,
@@ -1642,7 +1923,8 @@ fn seed_analysed_resources() -> Vec<AnalysedResource> {
         ),
         row(
             SOURCE_TYPE_EBS_VOLUME,
-            ::engine::emulator_arn("ec2", east, "volume/vol-00112233445566001"),
+            "ec2",
+            "volume/vol-00112233445566001",
             FINDING_NOT_OPTIMIZED,
             &[],
             PERFORMANCE_RISK_VERY_LOW,
@@ -1654,7 +1936,8 @@ fn seed_analysed_resources() -> Vec<AnalysedResource> {
         // it, and the EbsVolume summary counts a resource at each of its two findings.
         row(
             SOURCE_TYPE_EBS_VOLUME,
-            ::engine::emulator_arn("ec2", east, "volume/vol-00112233445566002"),
+            "ec2",
+            "volume/vol-00112233445566002",
             FINDING_OPTIMIZED,
             &[],
             PERFORMANCE_RISK_VERY_LOW,
@@ -1664,7 +1947,8 @@ fn seed_analysed_resources() -> Vec<AnalysedResource> {
         ),
         row(
             SOURCE_TYPE_LAMBDA_FUNCTION,
-            ::engine::emulator_arn("lambda", west, "function:invoice-renderer"),
+            "lambda",
+            "function:invoice-renderer",
             FINDING_NOT_OPTIMIZED,
             &[METRIC_REASON_MEMORY_OVERPROVISIONED],
             PERFORMANCE_RISK_VERY_LOW,
@@ -1674,7 +1958,8 @@ fn seed_analysed_resources() -> Vec<AnalysedResource> {
         ),
         row(
             SOURCE_TYPE_ECS_SERVICE,
-            ::engine::emulator_arn("ecs", east, "service/payments/checkout"),
+            "ecs",
+            "service/payments/checkout",
             FINDING_OVERPROVISIONED,
             &[METRIC_REASON_MEMORY_OVERPROVISIONED],
             PERFORMANCE_RISK_VERY_LOW,
@@ -1682,16 +1967,65 @@ fn seed_analysed_resources() -> Vec<AnalysedResource> {
             80.0,
             &[],
         ),
-        row(
-            SOURCE_TYPE_RDS_DB_INSTANCE,
-            ::engine::emulator_arn("rds", east, "db:orders-primary"),
-            FINDING_OVERPROVISIONED,
-            &[],
-            PERFORMANCE_RISK_MEDIUM,
-            300.0,
-            225.0,
-            &[],
-        ),
+        // An over-provisioned Aurora/RDS database: the analysis recommends a smaller DB
+        // instance class, so it saves. The database's own configuration and the utilization
+        // observed on it are recorded too, which is what `GetRDSDatabaseRecommendations`
+        // reports beside the finding, the risk and the costs every analysed row carries.
+        AnalysedResource {
+            rds_database: Some(RdsDatabaseDetail {
+                // `Engine`/`EngineVersion` are free-form strings in the model; these are the
+                // engine name and version an RDS PostgreSQL instance reports.
+                engine: Some("postgres".to_string()),
+                engine_version: Some("15.4".to_string()),
+                // Not a cluster member, so no promotion tier and no cluster identifier.
+                promotion_tier: None,
+                db_cluster_identifier: None,
+                current_db_instance_class: Some("db.r6g.2xlarge".to_string()),
+                recommended_db_instance_class: Some("db.r6g.xlarge".to_string()),
+                current_storage_configuration: Some(DBStorageConfiguration {
+                    storage_type: Some("gp3".to_string()),
+                    allocated_storage: 500,
+                    iops: Some(3_000),
+                    max_allocated_storage: Some(1_000),
+                    storage_throughput: Some(125),
+                }),
+                // The analysis would keep the storage as it is: its finding is about the
+                // instance, so there is no storage configuration to move to.
+                recommended_storage_configuration: None,
+                // `RDSDBMetricName` / `RDSDBMetricStatistic` values
+                // (`crate::ops::types::R_D_S_D_B_METRIC_NAME_VALUES`).
+                utilization_metrics: vec![
+                    RDSDBUtilizationMetric {
+                        name: Some("CPU".to_string()),
+                        statistic: Some("Maximum".to_string()),
+                        value: 17.5,
+                    },
+                    RDSDBUtilizationMetric {
+                        name: Some("Memory".to_string()),
+                        statistic: Some("Maximum".to_string()),
+                        value: 24.0,
+                    },
+                    RDSDBUtilizationMetric {
+                        name: Some("DatabaseConnections".to_string()),
+                        statistic: Some("Maximum".to_string()),
+                        value: 12.0,
+                    },
+                ],
+                last_refresh_timestamp: None,
+                tags: Vec::new(),
+            }),
+            ..row(
+                SOURCE_TYPE_RDS_DB_INSTANCE,
+                "rds",
+                "db:orders-primary",
+                FINDING_OVERPROVISIONED,
+                &[],
+                PERFORMANCE_RISK_MEDIUM,
+                300.0,
+                225.0,
+                &[],
+            )
+        },
     ]
     .into_iter()
     // The Auto Scaling group rows are the SAME analysis
@@ -1748,12 +2082,28 @@ impl ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
         resource_arn: &str,
         arn: ParsedResourceArn<'_>,
     ) -> Vec<&PreferenceRecord> {
+        self.records_applying_to_resource(resource_arn, arn.resource_type, arn.account_id)
+    }
+
+    /// The stored records that apply to one resource of `resource_type` owned by
+    /// `account_id`, MOST SPECIFIC FIRST — the same precedence [`records_applying_to`]
+    /// resolves with, for a resource whose type and account a caller already knows (a
+    /// findings reader reporting the preferences in force for a row it holds, say) rather
+    /// than one it parses out of an ARN.
+    ///
+    /// [`records_applying_to`]: Self::records_applying_to
+    pub fn records_applying_to_resource(
+        &self,
+        resource_arn: &str,
+        resource_type: &str,
+        account_id: &str,
+    ) -> Vec<&PreferenceRecord> {
         let mut applicable: Vec<(u8, &PreferenceRecord)> = self
             .preferences
             .iter()
-            .filter(|(key, _)| key.resource_type == arn.resource_type)
+            .filter(|(key, _)| key.resource_type == resource_type)
             .filter_map(|(key, record)| {
-                scope_precedence(key, resource_arn, arn.account_id).map(|rank| (rank, record))
+                scope_precedence(key, resource_arn, account_id).map(|rank| (rank, record))
             })
             .collect();
         applicable.sort_by_key(|(rank, _)| *rank);
@@ -1774,7 +2124,23 @@ impl ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
         resource_arn: &str,
         arn: ParsedResourceArn<'_>,
     ) -> EffectivePreferences {
-        let applicable = self.records_applying_to(resource_arn, arn);
+        self.effective_preferences_for(resource_arn, arn.resource_type, arn.account_id)
+    }
+
+    /// The preferences in force for one resource of `resource_type` owned by `account_id` —
+    /// the same resolution [`effective_preferences`] performs, for a resource whose type and
+    /// account a caller already knows (a findings reader reporting the preferences a stored
+    /// row's recommendation was generated under, say) rather than one it parses out of an
+    /// ARN.
+    ///
+    /// [`effective_preferences`]: Self::effective_preferences
+    pub fn effective_preferences_for(
+        &self,
+        resource_arn: &str,
+        resource_type: &str,
+        account_id: &str,
+    ) -> EffectivePreferences {
+        let applicable = self.records_applying_to_resource(resource_arn, resource_type, account_id);
         let effective = |field: fn(&PreferenceRecord) -> bool| {
             applicable.iter().copied().find(|record| field(record))
         };
@@ -1799,7 +2165,7 @@ impl ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
             utilization_preferences: effective(|record| !record.utilization_preferences.is_empty())
                 .map(|record| record.utilization_preferences.clone())
                 .unwrap_or_else(|| {
-                    if arn.resource_type == RESOURCE_TYPE_EC2_INSTANCE {
+                    if resource_type == RESOURCE_TYPE_EC2_INSTANCE {
                         default_utilization_preferences()
                     } else {
                         Vec::new()

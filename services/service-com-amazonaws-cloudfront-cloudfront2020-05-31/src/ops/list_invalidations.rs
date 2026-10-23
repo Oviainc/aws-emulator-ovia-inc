@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListInvalidations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListInvalidations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListInvalidations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Enumerates the invalidations persisted under ONE distribution, one page at a time:
+//! the page is cut at `MaxItems` (bounded by this emulator's own ceiling), the order is
+//! the documented one - most recent first - and `Marker` names the invalidation the
+//! previous page ended at, so walking the pages enumerates every invalidation of that
+//! distribution exactly once.
+//!
+//! A reporting operation: it reads the stored records and writes nothing but the batch
+//! completion the clock already owes (`settle`).
 //!
 //! ## Shape of an operation
 //!
@@ -75,6 +75,8 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use std::time::SystemTime;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -146,18 +148,101 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListInvalidations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListInvalidationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListInvalidations"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::store_unavailable());
+        };
+        let _ = ctx;
+
+        // "MaxItems: the maximum number of invalidation batches that you want in the
+        // response body" - a page holds at least one item, so a non-positive size names
+        // no page at all, and the size served is bounded above by this emulator's own
+        // page ceiling. The refusal is the one sentence this service states the
+        // constraint in, wherever the unusable value was read (see
+        // `crate::service::envelope` for the same value refused at the request boundary).
+        let max_items = input.max_items.unwrap_or(crate::state::MAX_ITEMS);
+        let Some(page_size) = crate::state::page_size(input.max_items) else {
+            return Err(ListInvalidationsErrorModeled::InvalidArgument(
+                crate::state::invalid_max_items(),
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+        // Materialise the batch completions the clock already owes, so every summary
+        // reports the status its invalidation has at this instant.
+        store.settle(SystemTime::now());
+
+        let Some(stored) = store.distribution(&input.distribution_id) else {
+            return Err(ListInvalidationsErrorModeled::NoSuchDistribution(
+                crate::state::no_such_distribution(),
+            )
+            .into());
+        };
+
+        // "Because the results are returned in decreasing order from most recent to
+        // oldest, the most recent results are on the first page": the order is a property
+        // of the stored records, not of the request.
+        let ordered = stored.invalidations_most_recent_first();
+
+        // "To get the next page of results, set Marker to the value of the NextMarker
+        // from the current page's response. This value is the same as the ID of the last
+        // invalidation batch on that page." So the marker is a resume point this service
+        // handed out - the id of one of THIS distribution's invalidations - and this page
+        // starts after it. A value naming none of them was never such a resume point, and
+        // resuming at no position at all would silently serve the first page again.
+        let start = match input.marker.as_deref() {
+            Some(marker) => {
+                let Some(position) = ordered
+                    .iter()
+                    .position(|invalidation| invalidation.id == marker)
+                else {
+                    return Err(ListInvalidationsErrorModeled::InvalidArgument(
+                        InvalidArgument {
+                            message: Some(format!(
+                                "Marker {marker} is not the id of an invalidation of \
+                                 distribution {}",
+                                input.distribution_id
+                            )),
+                        },
+                    )
+                    .into());
+                };
+                position + 1
+            }
+            None => 0,
+        };
+
+        let remaining = &ordered[start..];
+        let served = remaining.len().min(page_size);
+        let items: Vec<InvalidationSummary> = remaining[..served]
+            .iter()
+            .map(|invalidation| invalidation.to_summary())
+            .collect();
+        // "A flag that indicates whether more invalidation batch requests remain to be
+        // listed": exactly when this page did not reach the end of the order.
+        let is_truncated = remaining.len() > served;
+
+        Ok(ListInvalidationsOutput {
+            invalidation_list: Some(InvalidationList {
+                // "The value that you provided for the Marker request parameter."
+                marker: input.marker.unwrap_or_default(),
+                // Present exactly when more invalidations remain, carrying the id of the
+                // last invalidation batch on this page.
+                next_marker: if is_truncated {
+                    items.last().map(|summary| summary.id.clone())
+                } else {
+                    None
+                },
+                // "The value that you provided for the MaxItems request parameter."
+                max_items,
+                is_truncated,
+                // The number of invalidation batches in this page: the length of `Items`.
+                quantity: i32::try_from(items.len()).unwrap_or(i32::MAX),
+                // A page that lists nothing carries no `Items` element at all, rather
+                // than an empty one.
+                items: if items.is_empty() { None } else { Some(items) },
+            }),
+        })
     }
 }
+

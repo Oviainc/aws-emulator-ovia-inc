@@ -26,6 +26,9 @@ mod batch_per_item_error_codes;
 #[path = "all/connection_alias_lifecycle.rs"]
 mod connection_alias_lifecycle;
 
+#[path = "all/create_workspaces_effective_properties.rs"]
+mod create_workspaces_effective_properties;
+
 #[path = "all/create_workspaces_validation.rs"]
 mod create_workspaces_validation;
 
