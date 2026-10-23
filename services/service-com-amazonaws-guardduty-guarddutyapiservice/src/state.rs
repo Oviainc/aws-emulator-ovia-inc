@@ -18,11 +18,19 @@ use std::collections::{BTreeMap, HashMap};
 pub struct ComAmazonawsGuarddutyGuarddutyapiserviceState {
     /// Every persisted detector, keyed by its minted `DetectorId`.
     pub detectors: HashMap<String, Detector>,
-    /// `ClientToken` -> `DetectorId`, so a replayed `CreateDetector` returns the
-    /// detector the first call minted instead of refusing or minting a second one.
-    /// Keyed by `(region, token)`: an idempotency token is scoped to the endpoint
-    /// it was replayed against.
-    pub client_tokens: HashMap<(String, String), String>,
+    /// `ClientToken` -> the detector a `CreateDetector` minted under it, so a
+    /// replayed create returns that detector instead of refusing or minting a second
+    /// one. Keyed by `(region, token)`: an idempotency token is scoped to the
+    /// endpoint it was replayed against.
+    ///
+    /// BOUNDED by [`MAX_CLIENT_TOKENS`]. The token is REQUEST-chosen, so a caller
+    /// replaying creates with fresh tokens could otherwise grow this map without
+    /// limit — the same hazard [`MAX_MEMBERS_PER_DETECTOR`] guards for
+    /// request-chosen account ids. Write it through
+    /// [`Self::record_client_token`], which drops the oldest mappings and the ones
+    /// whose detector is gone, and read it through
+    /// [`Self::detector_for_client_token`]; never insert into it directly.
+    pub client_tokens: HashMap<(String, String), ClientTokenRecord>,
     /// Last instant handed out by [`Self::tick_millis`], so two mutations in the
     /// same millisecond still get strictly increasing timestamps.
     last_millis: i64,
@@ -83,6 +91,69 @@ impl ComAmazonawsGuarddutyGuarddutyapiserviceState {
             .filter(|detector| detector.region == region)
     }
 
+    /// The detector `region`'s endpoint minted under `token`, if a create recorded
+    /// one and that detector is still held.
+    ///
+    /// A mapping whose detector was deleted resolves to nothing, so a replayed
+    /// create never answers with an id the store no longer holds.
+    pub fn detector_for_client_token(&self, region: &str, token: &str) -> Option<&Detector> {
+        let record = self
+            .client_tokens
+            .get(&(region.to_string(), token.to_string()))?;
+        self.detector_in(region, &record.detector_id)
+    }
+
+    /// Record that `token` minted `detector_id` for `region`, keeping the store
+    /// bounded by [`MAX_CLIENT_TOKENS`].
+    ///
+    /// Two kinds of mapping are dropped to make room, in this order: one whose
+    /// detector the store no longer holds (it can never resolve again), then the
+    /// OLDEST remaining mapping — the token a caller is least likely to replay.
+    /// Evicting a mapping costs a replay its idempotency, never a resource a caller
+    /// can still read: the detector itself stays exactly where it was.
+    pub fn record_client_token(
+        &mut self,
+        region: &str,
+        token: &str,
+        detector_id: &str,
+        now: i64,
+    ) {
+        // Taken out of `self` so the retain below can consult `self.detectors`.
+        let mut tokens = std::mem::take(&mut self.client_tokens);
+        tokens.retain(|(token_region, _), record| {
+            self.detector_in(token_region, &record.detector_id).is_some()
+        });
+        while tokens.len() >= MAX_CLIENT_TOKENS {
+            let oldest = tokens
+                .iter()
+                .min_by(|(left_key, left), (right_key, right)| {
+                    left.recorded_at_millis
+                        .cmp(&right.recorded_at_millis)
+                        // The instants are strictly increasing, so this only orders
+                        // mappings a coarser clock could tie.
+                        .then_with(|| left_key.cmp(right_key))
+                })
+                .map(|(key, _)| key.clone());
+            let Some(oldest) = oldest else { break };
+            tokens.remove(&oldest);
+        }
+        tokens.insert(
+            (region.to_string(), token.to_string()),
+            ClientTokenRecord {
+                detector_id: detector_id.to_string(),
+                recorded_at_millis: now,
+            },
+        );
+        self.client_tokens = tokens;
+    }
+
+    /// Drop every idempotency mapping naming `detector_id`, so a replayed create
+    /// stops resolving to a detector a delete removed.
+    pub fn forget_client_tokens_for(&mut self, detector_id: &str) {
+        self.client_tokens
+            .retain(|_, record| record.detector_id != detector_id);
+    }
+
     /// Mint an `InvestigationId`: the 32 hexadecimal characters [`Self::mint_id`]
     /// mints, grouped in the 8-4-4-4-12 form.
     ///
@@ -134,6 +205,30 @@ impl ComAmazonawsGuarddutyGuarddutyapiserviceState {
         ids.sort();
         ids
     }
+}
+
+/// The most `(region, ClientToken)` -> detector mappings the store retains.
+///
+/// A STORE GUARD, not a modelled quota: AWS publishes no limit on how many
+/// idempotency tokens an account may use, and nothing a caller can read reports this
+/// number. It exists because the key is request-chosen, so the map needs a ceiling
+/// the way [`MAX_MEMBERS_PER_DETECTOR`] gives the request-keyed member store one.
+/// Past it, [`ComAmazonawsGuarddutyGuarddutyapiserviceState::record_client_token`]
+/// evicts the oldest mapping.
+pub const MAX_CLIENT_TOKENS: usize = 1_024;
+
+/// One idempotency mapping: the detector a `ClientToken` minted, and when the create
+/// that minted it was recorded.
+///
+/// The instant is what makes eviction ORDERED rather than arbitrary: the oldest
+/// mapping goes first, so the token a caller just used is the last to be dropped.
+#[derive(Debug, Clone)]
+pub struct ClientTokenRecord {
+    /// The `DetectorId` the create minted.
+    pub detector_id: String,
+    /// When the mapping was recorded, in epoch milliseconds from
+    /// [`ComAmazonawsGuarddutyGuarddutyapiserviceState::tick_millis`].
+    pub recorded_at_millis: i64,
 }
 
 /// The 64-bit golden-ratio odd constant used to decorrelate the two hash inputs.
@@ -243,6 +338,58 @@ pub const FEATURE_DNS_LOGS: &str = "DNS_LOGS";
 /// The feature behind `DataSources.FlowLogs`.
 pub const FEATURE_FLOW_LOGS: &str = "FLOW_LOGS";
 
+/// The `EbsSnapshotPreservation` member that retains nothing: Malware Protection
+/// deletes the EBS volume snapshots it took for a scan once the scan finishes, which
+/// is the setting a detector has until a request asks for the other member
+/// (retention when the scan produced a malware finding).
+///
+/// Named, not taken by position out of the generated enum list: the const assertion
+/// below fails the BUILD if the model stops carrying this member, where
+/// `EBS_SNAPSHOT_PRESERVATION_VALUES[0]` would instead have silently made some other
+/// member the detector's default. That list is also what the request boundary
+/// refuses a value outside the enum against, before any handler runs.
+pub const NO_RETENTION: &str = "NO_RETENTION";
+
+const _: () = assert!(enum_carries(
+    crate::ops::types::shared_types::EBS_SNAPSHOT_PRESERVATION_VALUES,
+    NO_RETENTION
+));
+
+/// Does the generated enum list `values` carry `value`?
+///
+/// A `const fn` over bytes because `==` on `str` is not usable in a const assertion;
+/// it exists only for the compile-time check above.
+const fn enum_carries(values: &[&str], value: &str) -> bool {
+    let mut index = 0;
+    while index < values.len() {
+        if bytes_equal(values[index].as_bytes(), value.as_bytes()) {
+            return true;
+        }
+        index += 1;
+    }
+    false
+}
+
+/// Byte-wise equality, for [`enum_carries`]'s const context.
+const fn bytes_equal(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut index = 0;
+    while index < left.len() {
+        if left[index] != right[index] {
+            return false;
+        }
+        index += 1;
+    }
+    true
+}
+
+/// The reserved tag-key prefix no `ScanConditionPair.Key` may use, as the member's
+/// own pattern states it — `^(?!aws:)[a-zA-Z+-=._:/]+$`
+/// (`smithy_query(shape="ScanConditionPair")`).
+pub const RESERVED_TAG_PREFIX: &str = "aws:";
+
 /// The optional features a bare `CreateDetector` leaves DISABLED — the ones a
 /// detector reports only once a request asks for them.
 ///
@@ -307,6 +454,11 @@ pub const DETECTOR_ID_MEMBER: &str = "detectorId";
 /// The wire name of the `NextToken` member every paginated operation here carries
 /// (`smithy_query(operation="ListDetectors")`), for the same reason.
 pub const NEXT_TOKEN_MEMBER: &str = "nextToken";
+
+/// The wire name of the `ScanResourceCriteria` member of
+/// `UpdateMalwareScanSettings` (`jsonName` `scanResourceCriteria`), for the same
+/// reason.
+pub const SCAN_RESOURCE_CRITERIA_MEMBER: &str = "scanResourceCriteria";
 
 /// The wire name of the account-id member every members operation carries:
 /// `AccountIds`' entries target `AccountId`
@@ -689,6 +841,56 @@ pub struct AdditionalConfigRecord {
     pub updated_at_millis: i64,
 }
 
+/// One `ScanConditionPair`: a tag key and the value that condition matches.
+///
+/// `Value` is optional while `Key` is required
+/// (`smithy_query(shape="ScanConditionPair")`), so a pair that names only a key is
+/// stored as it arrived rather than being filled in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScanTagPair {
+    pub key: String,
+    pub value: Option<String>,
+}
+
+/// One `ScanCriterion`: each `ScanCriterionKey` mapped to the `MapEquals` pairs that
+/// criterion matches. A `BTreeMap` so a read reports the criteria in a total order
+/// whatever order the request listed them in.
+pub type ScanCriterionRecord = BTreeMap<String, Vec<ScanTagPair>>;
+
+/// A detector's Malware Protection scan settings: what
+/// `UpdateMalwareScanSettings` writes and `GetMalwareScanSettings` reports.
+///
+/// `Include` is the "condition that when matched will allow a malware scan for a
+/// certain resource" and `Exclude` the one that "will prevent" it
+/// (`smithy_query(shape="ScanResourceCriteria")`), so the two are kept apart rather
+/// than folded into one list.
+#[derive(Debug, Clone)]
+pub struct MalwareScanSettings {
+    /// One of the `EbsSnapshotPreservation` members the generated
+    /// [`crate::ops::types::shared_types::EBS_SNAPSHOT_PRESERVATION_VALUES`] lists;
+    /// [`NO_RETENTION`] until an update asks for the other one.
+    pub ebs_snapshot_preservation: String,
+    /// `ScanResourceCriteria.Include`, empty when the detector has no inclusion
+    /// criteria.
+    pub include: ScanCriterionRecord,
+    /// `ScanResourceCriteria.Exclude`, empty when the detector has no exclusion
+    /// criteria.
+    pub exclude: ScanCriterionRecord,
+}
+
+impl Default for MalwareScanSettings {
+    /// The settings a detector has before any `UpdateMalwareScanSettings`: no scan
+    /// criteria, so every eligible resource is in scope, and snapshots retained for
+    /// nothing.
+    fn default() -> Self {
+        Self {
+            ebs_snapshot_preservation: NO_RETENTION.to_string(),
+            include: BTreeMap::new(),
+            exclude: BTreeMap::new(),
+        }
+    }
+}
+
 /// A GuardDuty detector: the account/Region-level resource the whole service hangs
 /// off.
 #[derive(Debug, Clone)]
@@ -726,6 +928,8 @@ pub struct Detector {
     /// (`smithy_query(operation="GetIPSet")`) — so `DeleteDetector` drops them
     /// with it.
     pub ip_sets: BTreeMap<String, IpSetRecord>,
+    /// This detector's Malware Protection scan settings.
+    pub malware_scan_settings: MalwareScanSettings,
     /// The member accounts this detector's account administers, keyed by account
     /// id. `DeleteDetector` drops them with the detector, like the findings and
     /// filters above.
@@ -1834,6 +2038,95 @@ pub fn apply_data_sources(
     {
         detector.set_feature(FEATURE_EBS_MALWARE_PROTECTION, status(enable), now);
     }
+}
+
+/// Refuse a `ScanResourceCriteria` this service cannot accept, with the message the
+/// refusal carries.
+///
+/// Both rules come from the model: a criterion key must be a `ScanCriterionKey`
+/// member, which is the generated
+/// [`crate::ops::types::shared_types::SCAN_CRITERION_KEY_VALUES`] list, and a
+/// condition's tag key must not use the reserved `aws:` prefix, which
+/// `ScanConditionPair.Key`'s own pattern `^(?!aws:)[a-zA-Z+-=._:/]+$` excludes
+/// (`smithy_query(shape="ScanConditionPair")`).
+pub fn validate_scan_resource_criteria(
+    criteria: &crate::ops::types::ScanResourceCriteria,
+) -> Result<(), String> {
+    let supported = crate::ops::types::shared_types::SCAN_CRITERION_KEY_VALUES;
+    for (member, criterion) in [
+        ("include", criteria.include.as_ref()),
+        ("exclude", criteria.exclude.as_ref()),
+    ] {
+        let Some(criterion) = criterion else { continue };
+        for (key, condition) in criterion {
+            if !supported.contains(&key.as_str()) {
+                return Err(format!(
+                    "{SCAN_RESOURCE_CRITERIA_MEMBER}.{member}: '{key}' is not a supported scan criterion key. Supported keys are {}.",
+                    supported.join(", ")
+                ));
+            }
+            for pair in &condition.map_equals {
+                if pair.key.starts_with(RESERVED_TAG_PREFIX) {
+                    return Err(format!(
+                        "{SCAN_RESOURCE_CRITERIA_MEMBER}.{member}: a tag key must not begin with the reserved prefix '{RESERVED_TAG_PREFIX}'."
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Store one `ScanCriterion` as it arrived on the wire.
+pub fn scan_criterion_record(
+    criterion: Option<&std::collections::HashMap<String, crate::ops::types::ScanCondition>>,
+) -> ScanCriterionRecord {
+    criterion
+        .map(|criterion| {
+            criterion
+                .iter()
+                .map(|(key, condition)| {
+                    let pairs = condition
+                        .map_equals
+                        .iter()
+                        .map(|pair| ScanTagPair {
+                            key: pair.key.clone(),
+                            value: pair.value.clone(),
+                        })
+                        .collect();
+                    (key.clone(), pairs)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Project one stored `ScanCriterion` back onto the wire shape, or `None` when the
+/// detector carries no criterion of that kind: `Include` and `Exclude` are both
+/// optional, so an absent one is reported as absent rather than as an empty map.
+pub fn scan_criterion_shape(
+    record: &ScanCriterionRecord,
+) -> Option<std::collections::HashMap<String, crate::ops::types::ScanCondition>> {
+    if record.is_empty() {
+        return None;
+    }
+    Some(
+        record
+            .iter()
+            .map(|(key, pairs)| {
+                let condition = crate::ops::types::ScanCondition {
+                    map_equals: pairs
+                        .iter()
+                        .map(|pair| crate::ops::types::ScanConditionPair {
+                            key: pair.key.clone(),
+                            value: pair.value.clone(),
+                        })
+                        .collect(),
+                };
+                (key.clone(), condition)
+            })
+            .collect(),
+    )
 }
 
 /// The AWS Region a request was signed for, which is the Region the resources it

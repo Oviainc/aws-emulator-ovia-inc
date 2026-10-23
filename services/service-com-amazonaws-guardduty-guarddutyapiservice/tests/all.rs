@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/client_rejections.rs"]
 mod client_rejections;
+#[path = "all/client_token_store.rs"]
+mod client_token_store;
 #[path = "all/detector_data_sources_projection.rs"]
 mod detector_data_sources_projection;
 #[path = "all/detector_lifecycle.rs"]
@@ -25,6 +27,8 @@ mod findings_feedback;
 mod investigation_lifecycle;
 #[path = "all/ip_set_lifecycle.rs"]
 mod ip_set_lifecycle;
+#[path = "all/malware_scan_settings.rs"]
+mod malware_scan_settings;
 #[path = "all/member_accounts.rs"]
 mod member_accounts;
 #[path = "all/member_association.rs"]

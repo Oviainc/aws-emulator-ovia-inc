@@ -336,6 +336,36 @@ pub fn build_probe(
     region: &str,
     now: SystemTime,
 ) -> Result<Probe, String> {
+    let address_family = validate_probe_spec(&spec)?;
+    Ok(Probe {
+        probe_arn: probe_arn(region, &probe_id),
+        probe_id,
+        source_arn: spec.source_arn,
+        destination: spec.destination,
+        destination_port: spec.destination_port,
+        protocol: spec.protocol,
+        packet_size: spec.packet_size,
+        address_family: address_family.to_string(),
+        vpc_id: None,
+        state: PROBE_STATE_PENDING.to_string(),
+        activates_at: now
+            .checked_add(ACTIVATION_AFTER)
+            .unwrap_or(now),
+        tags: spec.tags,
+        created_at: now,
+        modified_at: now,
+    })
+}
+
+/// Check the rules every stored probe satisfies — the ones the model documents
+/// in prose but its constraints cannot express — and answer the
+/// `addressFamily` the spec's `destination` implies.
+///
+/// Shared by the operations that WRITE a probe record ([`build_probe`] for a
+/// create, and `UpdateProbe` on the record it has merged the request into), so a
+/// probe an update leaves behind satisfies exactly what a create would have
+/// refused. `Err` carries a message naming the offending member.
+pub fn validate_probe_spec(spec: &ProbeSpec) -> Result<&'static str, String> {
     if subnet_id_of(&spec.source_arn).is_none() {
         return Err(format!(
             "The specified subnet {} does not exist or could not be found.",
@@ -360,24 +390,7 @@ pub fn build_probe(
             ));
         }
     }
-    Ok(Probe {
-        probe_arn: probe_arn(region, &probe_id),
-        probe_id,
-        source_arn: spec.source_arn,
-        destination: spec.destination,
-        destination_port: spec.destination_port,
-        protocol: spec.protocol,
-        packet_size: spec.packet_size,
-        address_family: address_family.to_string(),
-        vpc_id: None,
-        state: PROBE_STATE_PENDING.to_string(),
-        activates_at: now
-            .checked_add(ACTIVATION_AFTER)
-            .unwrap_or(now),
-        tags: spec.tags,
-        created_at: now,
-        modified_at: now,
-    })
+    Ok(address_family)
 }
 
 /// A probe: one source-subnet-to-destination path inside a monitor.
@@ -404,6 +417,35 @@ pub struct Probe {
     pub tags: BTreeMap<String, String>,
     pub created_at: SystemTime,
     pub modified_at: SystemTime,
+}
+
+impl Probe {
+    /// What this probe asks for, as the shared [`ProbeSpec`] states it: the
+    /// starting point an update merges a request into, so a stored probe and a
+    /// requested one go through the same [`validate_probe_spec`].
+    pub fn spec(&self) -> ProbeSpec {
+        ProbeSpec {
+            source_arn: self.source_arn.clone(),
+            destination: self.destination.clone(),
+            destination_port: self.destination_port,
+            protocol: self.protocol.clone(),
+            packet_size: self.packet_size,
+            tags: self.tags.clone(),
+        }
+    }
+
+    /// Record that this probe is provisioning again: it is `PENDING` now and the
+    /// clock owes it [`PROBE_STATE_ACTIVE`] [`ACTIVATION_AFTER`] from `now`.
+    ///
+    /// Called by the mutating operation that puts a probe back into
+    /// [`PROBE_STATE_PENDING`], so the due instant moves with it rather than
+    /// staying in the past, where `settle_monitor` would settle the probe
+    /// straight back to `ACTIVE` and the caller would never observe the state it
+    /// asked for.
+    pub fn schedule_activation(&mut self, now: SystemTime) {
+        self.state = PROBE_STATE_PENDING.to_string();
+        self.activates_at = now.checked_add(ACTIVATION_AFTER).unwrap_or(now);
+    }
 }
 
 /// A monitor: the container `CreateMonitor` inserts, holding its own probes.

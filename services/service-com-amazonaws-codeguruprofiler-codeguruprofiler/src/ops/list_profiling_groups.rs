@@ -195,7 +195,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let end = start.saturating_add(limit).min(names.len());
         let page = names.get(start..end).unwrap_or_default();
 
-        let descriptions = if input.include_description.unwrap_or(false) {
+        let include_description = input.include_description.unwrap_or(false);
+        let descriptions = if include_description {
             Some(
                 page.iter()
                     .filter_map(|name| guard.groups.get(name))
@@ -207,7 +208,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         Ok(ListProfilingGroupsOutput {
-            profiling_group_names: page.to_vec(),
+            // `includeDescription` TOGGLES the body between the two forms the model
+            // documents: "If true, then a list of ProfilingGroupDescription objects ... is
+            // returned. If false, then a list of profiling group names is returned", and
+            // `profilingGroupNames` is "returned only if includeDescription is false". So
+            // exactly one of the two keys is present, and a client branching on which it
+            // got is never shown both.
+            profiling_group_names: (!include_description).then(|| page.to_vec()),
             profiling_groups: descriptions,
             next_token: (end < names.len()).then(|| end.to_string()),
         })

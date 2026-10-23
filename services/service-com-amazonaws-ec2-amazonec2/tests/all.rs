@@ -58,6 +58,8 @@ mod modify_subnet_attribute;
 mod security_group_filter_limits;
 #[path = "all/security_groups.rs"]
 mod security_groups;
+#[path = "all/snapshot_block_public_access.rs"]
+mod snapshot_block_public_access;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/volume_lifecycle.rs"]

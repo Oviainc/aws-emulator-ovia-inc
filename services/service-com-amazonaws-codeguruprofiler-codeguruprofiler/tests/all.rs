@@ -35,3 +35,5 @@ mod tag_resource;
 mod untag_resource;
 #[path = "all/update_profiling_group.rs"]
 mod update_profiling_group;
+#[path = "all/wire_response_shape.rs"]
+mod wire_response_shape;

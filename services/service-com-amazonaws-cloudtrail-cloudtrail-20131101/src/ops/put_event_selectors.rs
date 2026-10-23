@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutEventSelectors
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutEventSelectors`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutEventSelectors::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Configures the event selectors of one trail: it stores EITHER the basic
+//! `EventSelectors` or the `AdvancedEventSelectors` the request carries (never both,
+//! and whichever kind was there before is overwritten), then reports what is now
+//! configured. The trail is driven from its home Region only, and a selector set
+//! outside the documented limits is refused with `InvalidEventSelectorsException`.
 //!
 //! ## Shape of an operation
 //!
@@ -250,18 +247,252 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutEventSelectors` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutEventSelectorsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutEventSelectors"))
+        let region = crate::state::request_region(ctx.parts());
+
+        // The request's own contradictions are refused before the registry is
+        // consulted: which selectors a caller asked for does not depend on any trail.
+        let configuration = read_configuration(input.event_selectors, input.advanced_event_selectors)
+            .map_err(|message| {
+                PutEventSelectorsErrorModeled::InvalidEventSelectorsException(
+                    InvalidEventSelectorsException {
+                        message: Some(message),
+                    },
+                )
+            })?;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            PutEventSelectorsErrorModeled::UnsupportedOperationException(
+                UnsupportedOperationException {
+                    message: Some(
+                        "PutEventSelectors needs the CloudTrail trail registry, which this \
+                         engine does not carry"
+                            .to_string(),
+                    ),
+                },
+            )
+        })?;
+        let mut store = state.lock();
+
+        // "The PutEventSelectors operation must be called from the Region in which the
+        // trail was created; otherwise, an InvalidHomeRegionException exception is
+        // thrown."
+        let located = store
+            .resolve_for_mutation(&input.trail_name, &region)
+            .map_err(|rejection| match rejection {
+                crate::state::IdentifierRejection::InvalidArn(message) => {
+                    PutEventSelectorsErrorModeled::CloudTrailARNInvalidException(
+                        CloudTrailARNInvalidException {
+                            message: Some(message),
+                        },
+                    )
+                }
+                crate::state::IdentifierRejection::InvalidName(message) => {
+                    PutEventSelectorsErrorModeled::InvalidTrailNameException(
+                        InvalidTrailNameException {
+                            message: Some(message),
+                        },
+                    )
+                }
+            })?;
+
+        let record = match located {
+            crate::state::TrailForMutation::Found(record) => record,
+            crate::state::TrailForMutation::AddressedInAnotherRegion { name, addressed } => {
+                return Err(PutEventSelectorsErrorModeled::InvalidHomeRegionException(
+                    InvalidHomeRegionException {
+                        message: Some(format!(
+                            "Trail {name} was addressed in {addressed}, but this request was \
+                             made in {region}: event selectors are configured from the Region \
+                             the trail was created in"
+                        )),
+                    },
+                )
+                .into());
+            }
+            crate::state::TrailForMutation::HomedInAnotherRegion { name, home_region } => {
+                return Err(PutEventSelectorsErrorModeled::InvalidHomeRegionException(
+                    InvalidHomeRegionException {
+                        message: Some(format!(
+                            "Trail {name} was created in {home_region}, not in {region}: event \
+                             selectors are configured from the Region the trail was created in"
+                        )),
+                    },
+                )
+                .into());
+            }
+            crate::state::TrailForMutation::Absent => {
+                return Err(PutEventSelectorsErrorModeled::TrailNotFoundException(
+                    TrailNotFoundException {
+                        message: Some(format!("Unknown trail: {}", input.trail_name)),
+                    },
+                )
+                .into());
+            }
+        };
+
+        // One kind of selector replaces the other, so the stored configuration is
+        // REPLACED rather than merged.
+        record.event_selectors = Some(configuration);
+        let (event_selectors, advanced_event_selectors) = record.reported_event_selectors();
+        Ok(PutEventSelectorsOutput {
+            trail_arn: Some(record.trail_arn.clone()),
+            event_selectors,
+            advanced_event_selectors,
+        })
     }
+}
+
+/// Read the selector set a request asks for, refusing one the documented rules do not
+/// allow. `Err` carries the refusal text for `InvalidEventSelectorsException`.
+///
+/// "You can use either AdvancedEventSelectors or EventSelectors, but not both" — and a
+/// request naming neither configures nothing, so it is a contradiction too.
+fn read_configuration(
+    event_selectors: Option<Vec<EventSelector>>,
+    advanced_event_selectors: Option<Vec<AdvancedEventSelector>>,
+) -> Result<crate::state::EventSelectorConfig, String> {
+    match (event_selectors, advanced_event_selectors) {
+        (Some(_), Some(_)) => Err(
+            "A PutEventSelectors request carries either EventSelectors or \
+             AdvancedEventSelectors, not both"
+                .to_string(),
+        ),
+        (None, None) => Err(
+            "A PutEventSelectors request must carry either EventSelectors or \
+             AdvancedEventSelectors"
+                .to_string(),
+        ),
+        (Some(selectors), None) => Ok(crate::state::EventSelectorConfig::Basic(
+            normalize_event_selectors(selectors)?,
+        )),
+        (None, Some(selectors)) => {
+            validate_advanced_event_selectors(&selectors)?;
+            Ok(crate::state::EventSelectorConfig::Advanced(selectors))
+        }
+    }
+}
+
+/// Check a basic selector set against the documented limits and fill in each member's
+/// documented default, so what is stored is what every later read reports.
+///
+/// Only the UPPER bound on the selector count is enforced. An EMPTY list is a
+/// configuration in its own right — nothing is logged — and is kept as given: the
+/// recorded behaviour this emulator is measured against distinguishes an empty list from
+/// an absent member and preserves it (corpus check
+/// `cloudtrail.event-selectors-empty-list-vs-absent-field-preserved`), so the "1 to 5"
+/// phrasing in `InvalidEventSelectorsException`'s doc is read as the remedy for too
+/// MANY selectors rather than as a floor.
+fn normalize_event_selectors(selectors: Vec<EventSelector>) -> Result<Vec<EventSelector>, String> {
+    if selectors.len() > crate::state::EVENT_SELECTORS_PER_TRAIL_LIMIT {
+        return Err(format!(
+            "EventSelectors carries {} event selectors; a trail can have up to {}",
+            selectors.len(),
+            crate::state::EVENT_SELECTORS_PER_TRAIL_LIMIT
+        ));
+    }
+
+    let data_resources: usize = selectors
+        .iter()
+        .map(|selector| selector.data_resources.as_ref().map_or(0, Vec::len))
+        .sum();
+    if data_resources > crate::state::DATA_RESOURCES_PER_TRAIL_LIMIT {
+        return Err(format!(
+            "EventSelectors carries {data_resources} data resources across all event \
+             selectors; a trail is limited to {}",
+            crate::state::DATA_RESOURCES_PER_TRAIL_LIMIT
+        ));
+    }
+
+    selectors
+        .into_iter()
+        .map(|selector| {
+            // `ReadWriteType` is a modelled enum, so a value outside it is already
+            // refused at the boundary before this handler runs.
+            for resource in selector.data_resources.iter().flatten() {
+                // "You can specify the following basic event selector resource
+                // types"; anything else needs advanced event selectors.
+                let resource_type = resource.r#type.as_deref().unwrap_or_default();
+                if !crate::state::BASIC_DATA_RESOURCE_TYPES.contains(&resource_type) {
+                    return Err(format!(
+                        "DataResource Type must be one of {}, not {resource_type:?}; every \
+                         other resource type needs AdvancedEventSelectors",
+                        crate::state::BASIC_DATA_RESOURCE_TYPES.join(", ")
+                    ));
+                }
+            }
+            for source in selector.exclude_management_event_sources.iter().flatten() {
+                if !crate::state::EXCLUDABLE_MANAGEMENT_EVENT_SOURCES.contains(&source.as_str()) {
+                    return Err(format!(
+                        "ExcludeManagementEventSources may name only {}, not {source:?}",
+                        crate::state::EXCLUDABLE_MANAGEMENT_EVENT_SOURCES.join(" or ")
+                    ));
+                }
+            }
+            Ok(EventSelector {
+                // The documented defaults of a member the request leaves out, so a
+                // stored selector is complete and reads of it agree.
+                read_write_type: Some(selector.read_write_type.unwrap_or_else(|| {
+                    crate::state::DEFAULT_READ_WRITE_TYPE.to_string()
+                })),
+                include_management_events: Some(
+                    selector
+                        .include_management_events
+                        .unwrap_or(crate::state::DEFAULT_INCLUDE_MANAGEMENT_EVENTS),
+                ),
+                data_resources: Some(selector.data_resources.unwrap_or_default()),
+                exclude_management_event_sources: Some(
+                    selector.exclude_management_event_sources.unwrap_or_default(),
+                ),
+            })
+        })
+        .collect()
+}
+
+/// Check an advanced selector set against the documented limits.
+///
+/// Each field selector states a field and at least one condition on it, and a trail
+/// carries "up to a maximum of 500 values for all conditions and selectors".
+///
+/// `Field` itself is NOT checked against a catalog, unlike the basic selectors'
+/// `DataResource$Type` and `ExcludeManagementEventSources`: the model constrains
+/// `SelectorField` only by length and the pattern `^[\w|\d|\.|_]+$` and declares no
+/// enum, and which fields are legal depends on the selector's `eventCategory` and on
+/// prose in the user guide the model does not carry. Refusing against a catalog this
+/// emulator invented would reject requests the service accepts, so a well-formed field
+/// is stored as given.
+fn validate_advanced_event_selectors(selectors: &[AdvancedEventSelector]) -> Result<(), String> {
+    let mut values = 0usize;
+    for selector in selectors {
+        for field_selector in &selector.field_selectors {
+            let conditions = [
+                &field_selector.equals,
+                &field_selector.starts_with,
+                &field_selector.ends_with,
+                &field_selector.not_equals,
+                &field_selector.not_starts_with,
+                &field_selector.not_ends_with,
+            ];
+            let field_values: usize = conditions
+                .iter()
+                .map(|condition| condition.as_ref().map_or(0, Vec::len))
+                .sum();
+            if field_values == 0 {
+                return Err(format!(
+                    "The advanced field selector for {:?} states no condition; each field \
+                     selector needs one of Equals, StartsWith, EndsWith, NotEquals, \
+                     NotStartsWith or NotEndsWith",
+                    field_selector.field
+                ));
+            }
+            values += field_values;
+        }
+    }
+    if values > crate::state::ADVANCED_SELECTOR_VALUES_PER_TRAIL_LIMIT {
+        return Err(format!(
+            "AdvancedEventSelectors carries {values} condition values across all selectors; \
+             a trail is limited to {}",
+            crate::state::ADVANCED_SELECTOR_VALUES_PER_TRAIL_LIMIT
+        ));
+    }
+    Ok(())
 }

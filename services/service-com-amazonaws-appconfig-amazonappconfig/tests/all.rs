@@ -15,3 +15,5 @@
 mod appconfig_workflow;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/update_configuration_profile.rs"]
+mod update_configuration_profile;

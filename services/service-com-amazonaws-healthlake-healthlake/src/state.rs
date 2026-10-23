@@ -98,6 +98,34 @@ pub const MAX_DATASTORES: usize = 100;
 /// they name.
 pub const MAX_CLIENT_TOKENS: usize = MAX_DATASTORES;
 
+/// The most FHIR resources one data store holds at once.
+///
+/// A ceiling, not a claim about any AWS quota: it exists so a loop of FHIR
+/// creates against the data store's REST endpoint cannot grow the emulator's
+/// heap without bound. The data plane refuses past it rather than evicting, so
+/// a resource a caller created stays readable for as long as its data store
+/// lives.
+pub const MAX_FHIR_RESOURCES_PER_DATASTORE: usize = 500;
+
+/// The largest single FHIR resource the data plane stores.
+///
+/// A count ceiling alone does not bound the retained HEAP: the bytes held would
+/// be that count times whatever one request body the transport admits. So the
+/// SIZE of one resource is bounded here, the bytes one data store retains by
+/// [`MAX_FHIR_RESOURCE_BYTES_PER_DATASTORE`], and the bytes every data store
+/// retains together by [`MAX_FHIR_RESOURCE_BYTES_TOTAL`] — so no product of
+/// caller-chosen factors is the bound. Like the count, these are ceilings this
+/// emulator chooses, not claims about any AWS quota.
+pub const MAX_FHIR_RESOURCE_BYTES: usize = 1 << 20;
+
+/// The most bytes of FHIR resources one data store retains.
+pub const MAX_FHIR_RESOURCE_BYTES_PER_DATASTORE: usize = 16 << 20;
+
+/// The most bytes of FHIR resources EVERY data store retains together, so
+/// [`MAX_DATASTORES`] data stores at their own budget cannot multiply into an
+/// unbounded heap.
+pub const MAX_FHIR_RESOURCE_BYTES_TOTAL: usize = 64 << 20;
+
 /// The most tags one data store carries.
 ///
 /// The modelled `TagList` bound (0..200) caps ONE request; this caps the
@@ -105,6 +133,17 @@ pub const MAX_CLIENT_TOKENS: usize = MAX_DATASTORES;
 /// `CreateFHIRDatastore` and `TagResource` refuse past it with the
 /// `ValidationException` they model.
 pub const MAX_TAGS_PER_DATASTORE: usize = 50;
+
+/// The release-version segment a data store's FHIR endpoint publishes, and so
+/// the third segment of every path on that endpoint
+/// (`/datastore/{DatastoreId}/r4/...`).
+///
+/// The modelled `FHIRVersion` enum declares exactly one value (`R4`), which is
+/// what [`Datastore::type_version`] holds; the endpoint spells it lowercase.
+pub const FHIR_ENDPOINT_VERSION_SEGMENT: &str = "r4";
+
+/// The literal first segment of a data store FHIR endpoint path.
+const DATASTORE_PATH_SEGMENT: &str = "datastore";
 
 /// The `datastore` resource prefix of a HealthLake data store ARN, as the
 /// modelled `AmazonResourceName` pattern spells it
@@ -152,6 +191,32 @@ pub const MAX_PROFILE_MAPPING_KEY_LEN: usize = 500;
 /// The longest mapping value, from the modelled `ProfileMappingValue` length
 /// bound (0..102400).
 pub const MAX_PROFILE_MAPPING_VALUE_LEN: usize = 102_400;
+
+/// The most BYTES one profile version's mapping holds TOGETHER.
+///
+/// The modelled `ProfileMapping` bounds are all per entry (at most 500 entries, keys
+/// 1..500 characters, values 0..102400), so a mapping that satisfies every one of
+/// them can still carry ~51 MB — and a count ceiling alone would leave the retained
+/// heap a product of caller-chosen factors (the same reason the FHIR data plane
+/// budgets [`MAX_FHIR_RESOURCE_BYTES`]). This ceiling is this emulator's, not an AWS
+/// quota: it admits ten modelled-maximum files, or all 500 small ones, which is more
+/// than a profile needs, and it is what bounds the retained profile content —
+/// [`MAX_PROFILES`] profiles times this, because
+/// `CreateDataTransformationProfile` is the ONLY operation that writes profile
+/// content today (`UpdateDataTransformationProfile` and
+/// `PublishDataTransformationProfile` are still 501 scaffolds, so no profile can
+/// hold a second version).
+///
+/// WHOEVER IMPLEMENTS either of those must also charge a per-profile retained-byte
+/// budget, the way the FHIR data plane charges
+/// [`MAX_FHIR_RESOURCE_BYTES_PER_DATASTORE`] against
+/// [`Datastore::fhir_resource_bytes`]: a profile may then hold
+/// `1 + MAX_PROFILE_VERSION` versions, and this per-version ceiling alone would stop
+/// bounding what the store retains.
+///
+/// Measured in BYTES (`str::len`) rather than characters, so multi-byte content
+/// cannot pass the budget by a factor of four.
+pub const MAX_PROFILE_MAPPING_BYTES: usize = 1 << 20;
 
 /// The most data transformation profiles this emulator holds at once.
 ///
@@ -224,6 +289,42 @@ pub struct Datastore {
     /// Tags by key, so `TagResource` merges by key and the reported order is
     /// stable across reads. Seeded from `CreateFHIRDatastore`'s `Tags`.
     pub tags: BTreeMap<String, String>,
+    /// Every FHIR resource written through this data store's REST endpoint, by
+    /// `(resourceType, logical id)`. A `BTreeMap` so the held order is stable
+    /// across reads, and held HERE rather than in a map beside the registry so
+    /// a data store's resources are dropped with the data store itself.
+    /// Bounded by [`MAX_FHIR_RESOURCES_PER_DATASTORE`].
+    pub fhir_resources: BTreeMap<(String, String), FhirResource>,
+    /// How many BYTES the resources above hold together — the sum of their own
+    /// [`FhirResource::bytes`], maintained as they are stored so the data plane
+    /// can refuse past [`MAX_FHIR_RESOURCE_BYTES_PER_DATASTORE`] without
+    /// re-measuring every stored resource.
+    pub fhir_resource_bytes: usize,
+}
+
+/// One FHIR resource a data store holds, as the FHIR REST data plane stored it.
+///
+/// The resource is kept as the JSON a read answers VERBATIM, so two reads of one
+/// resource cannot differ and no read re-derives a server-owned value.
+#[derive(Debug, Clone)]
+pub struct FhirResource {
+    /// The `resourceType` the resource carries, which the FHIR create
+    /// interaction requires to equal the type segment of the URL it was posted
+    /// to.
+    pub resource_type: String,
+    /// The logical id the server assigned.
+    pub id: String,
+    /// `meta.versionId`: 1 for a resource that has only been created.
+    pub version: u64,
+    /// `meta.lastUpdated`, the instant the stored version was written.
+    pub last_updated: ::aws_smithy_types::DateTime,
+    /// The stored resource JSON: the submitted content with the server-owned
+    /// `id` and `meta` written onto it.
+    pub content: ::serde_json::Value,
+    /// How many bytes that JSON serializes to — what this record costs the
+    /// store, so a later delete can give the budget back exactly what the
+    /// create took.
+    pub bytes: usize,
 }
 
 impl Datastore {
@@ -261,6 +362,13 @@ impl Datastore {
                     scheduled_permanent_deletion_time: None,
                 }),
         }
+    }
+
+    /// The FHIR resource of `resource_type` with logical id `id`, or `None` when
+    /// this data store holds no such resource.
+    pub fn fhir_resource(&self, resource_type: &str, id: &str) -> Option<&FhirResource> {
+        self.fhir_resources
+            .get(&(resource_type.to_string(), id.to_string()))
     }
 
     /// Record `configuration` as this data store's backup configuration, taken
@@ -431,6 +539,18 @@ pub fn validate_profile_mapping(mapping: &BTreeMap<String, String>) -> Result<()
             ));
         }
     }
+    // Every entry can satisfy its own modelled bound and the mapping still be far
+    // larger than this emulator retains, so the bytes they hold TOGETHER are bounded
+    // too — see [`MAX_PROFILE_MAPPING_BYTES`].
+    let bytes = mapping.iter().fold(0usize, |total, (path, content)| {
+        total.saturating_add(path.len()).saturating_add(content.len())
+    });
+    if bytes > MAX_PROFILE_MAPPING_BYTES {
+        return Err(format!(
+            "ProfileMapping must hold at most {MAX_PROFILE_MAPPING_BYTES} bytes of keys and \
+             values together, got {bytes}"
+        ));
+    }
     Ok(())
 }
 
@@ -452,6 +572,9 @@ pub struct ComAmazonawsHealthlakeHealthlakeState {
     /// How many data stores have been minted, mixed into the next identifier so
     /// two creates in the same clock tick still get distinct ones.
     pub datastores_created: u64,
+    /// How many FHIR resources have been minted across every data store, mixed
+    /// into the next logical id for the same reason.
+    pub fhir_resources_created: u64,
     /// Every data transformation profile, by `ProfileId`. A `BTreeMap` so
     /// `ListDataTransformationProfiles` pages in a stable, resumable order.
     /// Bounded by [`MAX_PROFILES`].
@@ -470,6 +593,19 @@ pub struct ComAmazonawsHealthlakeHealthlakeState {
 }
 
 impl ComAmazonawsHealthlakeHealthlakeState {
+    /// How many BYTES of FHIR resources every data store retains together.
+    ///
+    /// Summed over the data stores' own counters rather than tracked as a second
+    /// total, so a reaped data store gives its bytes back by being dropped and
+    /// the two can never disagree. The walk is bounded by [`MAX_DATASTORES`].
+    pub fn fhir_resource_bytes_total(&self) -> usize {
+        self.datastores
+            .values()
+            .fold(0usize, |total, datastore| {
+                total.saturating_add(datastore.fhir_resource_bytes)
+            })
+    }
+
     /// Materialise every lifecycle transition the clock has ALREADY made due.
     ///
     /// Called by the operations that report a data store's status as well as by
@@ -588,6 +724,37 @@ impl ComAmazonawsHealthlakeHealthlakeState {
         }
     }
 
+    /// Mint the next FHIR logical id a create interaction assigns: a
+    /// UUID-shaped, 36-character identifier, which is the form HealthLake's FHIR
+    /// endpoint assigns and which satisfies the FHIR `id` type's own alphabet
+    /// (`[A-Za-z0-9\-\.]{1,64}`).
+    ///
+    /// Server-assigned, never derived from the submitted resource: two creates
+    /// of identical content get two resources, as FHIR requires. The mint
+    /// counter is ADVANCED on every call and mixed in by [`mint_hex_id`] beside
+    /// the clock — under this resource kind's own domain, so a FHIR resource and
+    /// a control-plane resource cannot collide on one hash — so two creates in
+    /// the same tick, and two successive calls with the same instant, still get
+    /// different ids. The CALLER checks the minted id against the data store it
+    /// is writing to, so a collision cannot overwrite a stored resource.
+    pub fn next_fhir_resource_id(&mut self, created_at: SystemTime) -> String {
+        self.fhir_resources_created += 1;
+        let mixed = mint_hex_id(
+            FHIR_RESOURCE_MINT_DOMAIN,
+            self.fhir_resources_created,
+            created_at,
+        );
+        // The 8-4-4-4-12 grouping a UUID is written in.
+        format!(
+            "{}-{}-{}-{}-{}",
+            &mixed[..8],
+            &mixed[8..12],
+            &mixed[12..16],
+            &mixed[16..20],
+            &mixed[20..32]
+        )
+    }
+
     /// Record `token` as having minted `profile_id` from a request with
     /// `fingerprint`, evicting the oldest token first if that would push the map
     /// past [`MAX_PROFILE_CLIENT_TOKENS`].
@@ -640,6 +807,13 @@ impl ComAmazonawsHealthlakeHealthlakeState {
     }
 }
 
+/// The mint domain a FHIR resource's logical id is derived under, so it cannot
+/// collide with a control-plane resource's id for the same counter and instant.
+/// Unlike the two ARN prefixes [`mint_hex_id`] is otherwise called with, a FHIR
+/// resource has no ARN — it is addressed by its data store's endpoint — so the
+/// domain is named here.
+const FHIR_RESOURCE_MINT_DOMAIN: &str = "fhir-resource/";
+
 /// One 32-lowercase-hex identifier, the form this service's resource ids and ARNs
 /// take, minted from the resource's own `domain` prefix, the mint counter and the
 /// creation instant — so an identifier leaks neither verbatim, two creates in the
@@ -657,6 +831,48 @@ fn mint_hex_id(domain: &str, counter: u64, created_at: SystemTime) -> String {
     hasher.update(counter.to_be_bytes());
     hasher.update(nanos.to_be_bytes());
     hex::encode(&hasher.finalize()[..16])
+}
+
+/// What a request path says about a data store's FHIR endpoint: the data store
+/// it addresses, and the FHIR interaction path on it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FhirEndpointPath {
+    /// The `DatastoreId` the path names. Whether a data store with that id
+    /// exists — and whether it is serving — is the handler's question, not this
+    /// reader's.
+    pub datastore_id: String,
+    /// The interaction path relative to the endpoint: the non-empty segments
+    /// after the release-version segment (`["Patient"]` for a type-level
+    /// interaction, `["Patient", "<id>"]` for an instance-level one).
+    pub interaction: Vec<String>,
+}
+
+/// Read the data store FHIR endpoint path a request addresses, or `None` when
+/// the request is not on such a path.
+///
+/// The path space is the one [`datastore_endpoint`] publishes —
+/// `/datastore/{DatastoreId}/r4/` — so the two are written from the same
+/// constants and cannot drift. Empty segments are skipped, so a client that
+/// joins an interaction onto an endpoint already ending in `/` (yielding `//`)
+/// addresses the same resource as one that does not. Segments are read RAW:
+/// every value this path space carries — a `DatastoreId`, a FHIR resource type,
+/// a FHIR logical id — is drawn from an alphabet no client percent-encodes.
+pub fn parse_datastore_fhir_path(path: &str) -> Option<FhirEndpointPath> {
+    let mut segments = path.split('/').filter(|segment| !segment.is_empty());
+    if segments.next()? != DATASTORE_PATH_SEGMENT {
+        return None;
+    }
+    let datastore_id = segments.next()?;
+    if !segments
+        .next()?
+        .eq_ignore_ascii_case(FHIR_ENDPOINT_VERSION_SEGMENT)
+    {
+        return None;
+    }
+    Some(FhirEndpointPath {
+        datastore_id: datastore_id.to_string(),
+        interaction: segments.map(str::to_string).collect(),
+    })
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
@@ -700,8 +916,14 @@ pub fn datastore_arn(region: &str, id: &str) -> String {
 }
 
 /// The FHIR endpoint of the data store `id` in `region`.
+///
+/// Written from the same two constants [`parse_datastore_fhir_path`] reads, so
+/// the endpoint this service advertises is exactly the path space its FHIR REST
+/// data plane serves.
 pub fn datastore_endpoint(region: &str, id: &str) -> String {
-    format!("https://healthlake.{region}.amazonaws.com/datastore/{id}/r4/")
+    format!(
+        "https://healthlake.{region}.amazonaws.com/{DATASTORE_PATH_SEGMENT}/{id}/{FHIR_ENDPOINT_VERSION_SEGMENT}/"
+    )
 }
 
 /// The ARN of the data transformation profile `id` in `region`, in the form the

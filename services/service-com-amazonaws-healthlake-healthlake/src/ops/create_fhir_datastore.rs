@@ -312,6 +312,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             backup_enabled_at: None,
             error_cause: None,
             tags,
+            // A new data store holds no FHIR resources; its REST endpoint fills
+            // this in as resources are written to it.
+            fhir_resources: ::std::collections::BTreeMap::new(),
+            fhir_resource_bytes: 0,
         };
         // Written through the record's own setter, so the reported
         // `BackupEnabledAt` is the instant backup became enabled rather than a
