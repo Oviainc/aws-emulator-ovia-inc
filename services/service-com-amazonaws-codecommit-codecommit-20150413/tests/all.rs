@@ -53,6 +53,8 @@ mod file_commit_history;
 mod folder_listing;
 #[path = "all/harness.rs"]
 mod harness;
+#[path = "all/repositories_for_approval_rule_template.rs"]
+mod repositories_for_approval_rule_template;
 #[path = "all/repository_description.rs"]
 mod repository_description;
 #[path = "all/repository_encryption_key.rs"]

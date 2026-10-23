@@ -245,6 +245,18 @@ pub fn repository_does_not_exist_message(name: &str) -> String {
     format!("{name} for {}", ::engine::emulator_account_id())
 }
 
+/// `ApprovalRuleTemplateDoesNotExistException`'s message, built from the requested
+/// template name — the one place this crate words that code, for the same reason
+/// [`repository_does_not_exist_message`] is the one place it words its own.
+///
+/// The wording is this emulator's own example text, not a message AWS documents or
+/// the model states: the requirement for this error is its code and its HTTP 400
+/// status, so what matters here is only that every operation raising the code words
+/// it identically and names the template the caller asked for.
+pub fn approval_rule_template_does_not_exist_message(name: &str) -> String {
+    format!("the approval rule template {name} does not exist")
+}
+
 /// `RepositoryNameExistsException`'s message: `Repository named <name> already
 /// exists`, built from the requested name.
 pub fn repository_name_exists_message(repository_name: &str) -> String {

@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListRepositoriesForApprovalRuleTemplate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListRepositoriesForApprovalRuleTemplate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListRepositoriesForApprovalRuleTemplate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the repositories one approval rule template is associated with: the
+//! other side of the association `AssociateApprovalRuleTemplateWithRepository`
+//! records on the repository, which
+//! `ListAssociatedApprovalRuleTemplatesForRepository` reads from the repository's
+//! end. The association is stored once, on each repository's
+//! `associated_templates`, so this listing is a scan of the repository map for the
+//! repositories whose set holds this template's name — never a second index that
+//! could disagree with it.
+//!
+//! A reporting operation: it writes nothing, and answers an unknown template name
+//! with the modelled `ApprovalRuleTemplateDoesNotExistException` rather than an
+//! empty page, because a template that does not exist has no associations to
+//! report. Paging is the service's single [`crate::state::page_of`] rule, scoped to
+//! this template's listing, so a token issued for another listing is not a token
+//! for this one.
 //!
 //! ## Shape of an operation
 //!
@@ -135,6 +142,32 @@ impl From<ListRepositoriesForApprovalRuleTemplateErrorModeled> for ListRepositor
     }
 }
 
+/// The pagination refusal this operation reports for a bad `maxResults` or
+/// `nextToken`: the two errors the model declares for it, one per problem, worded by
+/// [`crate::state::page_of`] so every paginated listing in this service refuses the
+/// same input the same way.
+fn page_refusal(
+    problem: crate::state::PageProblem,
+) -> ListRepositoriesForApprovalRuleTemplateError {
+    match problem {
+        crate::state::PageProblem::InvalidMaxResults(message) => {
+            ListRepositoriesForApprovalRuleTemplateErrorModeled::InvalidMaxResultsException(
+                InvalidMaxResultsException {
+                    message: Some(message),
+                },
+            )
+        }
+        crate::state::PageProblem::InvalidContinuationToken(message) => {
+            ListRepositoriesForApprovalRuleTemplateErrorModeled::InvalidContinuationTokenException(
+                InvalidContinuationTokenException {
+                    message: Some(message),
+                },
+            )
+        }
+    }
+    .into()
+}
+
 /// The `ListRepositoriesForApprovalRuleTemplate` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -171,18 +204,61 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListRepositoriesForApprovalRuleTemplate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListRepositoriesForApprovalRuleTemplateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListRepositoriesForApprovalRuleTemplate"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // An unreachable store is an internal mounting fault, not a modelled
+            // CodeCommit failure; every handler in this crate refuses it this way.
+            crate::scaffolded::Scaffolded::validation("the repository store is unavailable")
+        })?;
+        let store = state.lock();
+
+        // The template itself has to exist: a name no template holds is not an empty
+        // association set, it is a name the service cannot resolve. The message comes
+        // from `crate::state`, the one place this crate words this code.
+        if !store
+            .approval_rule_templates
+            .contains_key(&input.approval_rule_template_name)
+        {
+            return Err(
+                ListRepositoriesForApprovalRuleTemplateErrorModeled::ApprovalRuleTemplateDoesNotExistException(
+                    ApprovalRuleTemplateDoesNotExistException {
+                        message: Some(
+                            crate::state::approval_rule_template_does_not_exist_message(
+                                &input.approval_rule_template_name,
+                            ),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The repository map is keyed by `repositoryName`, so this scan yields the
+        // associated repositories in name order — the stable order paging needs.
+        let names: Vec<String> = store
+            .repositories
+            .iter()
+            .filter(|(_, repository)| {
+                repository
+                    .associated_templates
+                    .contains(&input.approval_rule_template_name)
+            })
+            .map(|(name, _)| name.clone())
+            .collect();
+
+        // The listing is per template, so a token belongs to this template's listing
+        // and not to another's.
+        let (page, next_token) = crate::state::page_of(
+            &format!("{}/{}", Self::NAME, input.approval_rule_template_name),
+            &names,
+            input.next_token.as_deref(),
+            input.max_results,
+        )
+        .map_err(page_refusal)?;
+
+        Ok(ListRepositoriesForApprovalRuleTemplateOutput {
+            repository_names: Some(page),
+            next_token,
+        })
     }
 }

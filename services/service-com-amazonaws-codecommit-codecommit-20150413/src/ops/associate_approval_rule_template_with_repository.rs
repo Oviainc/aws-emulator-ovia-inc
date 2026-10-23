@@ -208,10 +208,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 AssociateApprovalRuleTemplateWithRepositoryErrorModeled::ApprovalRuleTemplateDoesNotExistException(
                     ApprovalRuleTemplateDoesNotExistException {
-                        message: Some(format!(
-                            "the approval rule template {} does not exist",
-                            input.approval_rule_template_name
-                        )),
+                        message: Some(
+                            crate::state::approval_rule_template_does_not_exist_message(
+                                &input.approval_rule_template_name,
+                            ),
+                        ),
                     },
                 )
                 .into(),
