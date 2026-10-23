@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchAssociateApprovalRuleTemplateWithRepositories
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchAssociateApprovalRuleTemplateWithRepositories`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchAssociateApprovalRuleTemplateWithRepositories::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -94,6 +85,32 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// How many repository names one call may carry.
+///
+/// `MaximumRepositoryNamesExceededException` documents the limit itself: "The
+/// maximum number of allowed repository names was exceeded. Currently, this number
+/// is 100."
+/// (`smithy_query(query="shape",shape="MaximumRepositoryNamesExceededException")`).
+const MAX_REPOSITORY_NAMES: usize = 100;
+
+/// The `errorCode` this operation reports for a repository name the store holds no
+/// repository for.
+///
+/// `errorCode` is a plain string in this operation's error shape, but this model
+/// words the same per-entry codes of its sibling batch read as the EXCEPTION SHAPE
+/// NAME for the cause (`BatchGetRepositoriesErrorCodeEnum` declares
+/// `RepositoryDoesNotExistException` beside the encryption-key exceptions —
+/// `smithy_query(query="shape",shape="BatchGetRepositoriesErrorCodeEnum")`), so a
+/// per-entry code here is worded the same way.
+const ERROR_CODE_REPOSITORY_DOES_NOT_EXIST: &str = "RepositoryDoesNotExistException";
+
+/// The `errorCode` reported for a repository that already holds as many approval
+/// rule template associations as it may hold — the batch form of the error
+/// `AssociateApprovalRuleTemplateWithRepository` raises for the same cause, named
+/// after that exception shape for the reason above.
+const ERROR_CODE_MAXIMUM_RULE_TEMPLATES: &str =
+    "MaximumRuleTemplatesAssociatedWithRepositoryException";
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -171,18 +188,111 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchAssociateApprovalRuleTemplateWithRepositories` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchAssociateApprovalRuleTemplateWithRepositoriesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+
+        // Each name's length and pattern are modeled on `RepositoryNameList`'s
+        // member, so the boundary validator already refused anything outside them.
+        // The limit on the NUMBER of names is not modeled, and the service answers
+        // its own error for it — before any association is written, so an over-long
+        // request persists nothing.
+        if input.repository_names.len() > MAX_REPOSITORY_NAMES {
+            return Err(
+                BatchAssociateApprovalRuleTemplateWithRepositoriesErrorModeled::MaximumRepositoryNamesExceededException(
+                    MaximumRepositoryNamesExceededException {
+                        message: Some(format!(
+                            "the maximum number of allowed repository names was exceeded: {} names were specified and the maximum is {MAX_REPOSITORY_NAMES}",
+                            input.repository_names.len()
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // An unreachable store is an internal mounting fault, not a modelled
+            // CodeCommit failure; every handler in this crate refuses it this way.
+            crate::scaffolded::Scaffolded::validation("the repository store is unavailable")
+        })?;
+        let mut store = state.lock();
+
+        // The TEMPLATE is the one side of the association the whole call stands on:
+        // a template the store does not hold fails the request outright, so nothing
+        // is written for any of the names. A repository name, by contrast, fails only
+        // its own entry — which is what makes this a batch operation and why the
+        // output carries a per-entry `errors` list beside the names it associated.
+        if !store
+            .approval_rule_templates
+            .contains_key(&input.approval_rule_template_name)
+        {
+            return Err(
+                BatchAssociateApprovalRuleTemplateWithRepositoriesErrorModeled::ApprovalRuleTemplateDoesNotExistException(
+                    ApprovalRuleTemplateDoesNotExistException {
+                        message: Some(
+                            crate::state::approval_rule_template_does_not_exist_message(
+                                &input.approval_rule_template_name,
+                            ),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // One entry per name, in the order the request listed them. A repeated name
+        // names one repository, so it is associated — and reported — once.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchAssociateApprovalRuleTemplateWithRepositories"))
+        // An EMPTY list is served, not refused: `repositoryNames`'s own documentation
+        // says "The array itself can be empty", and the modeled
+        // `RepositoryNamesRequiredException` covers the `@required` member being
+        // absent, which the boundary validator refuses before this handler runs.
+        let mut associated_repository_names: Vec<String> = Vec::new();
+        let mut errors: Vec<BatchAssociateApprovalRuleTemplateWithRepositoriesError2> = Vec::new();
+        let mut seen: ::std::collections::HashSet<&str> = ::std::collections::HashSet::new();
+        for name in &input.repository_names {
+            if !seen.insert(name.as_str()) {
+                continue;
+            }
+            let Some(repository) = store.repositories.get_mut(name) else {
+                errors.push(BatchAssociateApprovalRuleTemplateWithRepositoriesError2 {
+                    repository_name: Some(name.clone()),
+                    error_code: Some(ERROR_CODE_REPOSITORY_DOES_NOT_EXIST.to_string()),
+                    error_message: Some(crate::state::repository_does_not_exist_message(name)),
+                });
+                continue;
+            };
+
+            // The same bound `AssociateApprovalRuleTemplateWithRepository` enforces,
+            // reported per entry here: associating a template the repository already
+            // holds is the no-op the set makes it, so it cannot push the count past
+            // the bound either.
+            if !repository
+                .associated_templates
+                .contains(&input.approval_rule_template_name)
+                && repository.associated_templates.len()
+                    >= crate::state::MAX_TEMPLATES_PER_REPOSITORY
+            {
+                errors.push(BatchAssociateApprovalRuleTemplateWithRepositoriesError2 {
+                    repository_name: Some(name.clone()),
+                    error_code: Some(ERROR_CODE_MAXIMUM_RULE_TEMPLATES.to_string()),
+                    error_message: Some(format!(
+                        "the repository {name} is already associated with the maximum of {} \
+                         approval rule templates",
+                        crate::state::MAX_TEMPLATES_PER_REPOSITORY
+                    )),
+                });
+                continue;
+            }
+
+            repository
+                .associated_templates
+                .insert(input.approval_rule_template_name.clone());
+            associated_repository_names.push(name.clone());
+        }
+
+        Ok(BatchAssociateApprovalRuleTemplateWithRepositoriesOutput {
+            associated_repository_names,
+            errors,
+        })
     }
 }
