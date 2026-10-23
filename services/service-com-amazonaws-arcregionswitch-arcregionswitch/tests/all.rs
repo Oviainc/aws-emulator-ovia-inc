@@ -13,5 +13,7 @@
 // points it into `tests/all/`.
 #[path = "all/plan_lifecycle.rs"]
 mod plan_lifecycle;
+#[path = "all/route53_health_checks.rs"]
+mod route53_health_checks;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
