@@ -28,7 +28,9 @@ use std::time::{Duration, Instant};
 
 use ::aws_smithy_types::DateTime;
 
-use crate::ops::types::{CodeArtifact, CpuConfiguration, Hooks, IdlePolicy, Logging, Resources};
+use crate::ops::types::{
+    CloudWatchLogging, CodeArtifact, CpuConfiguration, Hooks, IdlePolicy, Logging, Resources,
+};
 
 /// The region an ARN carries when the request is unsigned, matching the region
 /// the emulator's generated client config defaults to.
@@ -154,6 +156,191 @@ pub const FIRST_IMAGE_VERSION: &str = "1.0";
 /// `imageIdentifier` the request carried.
 pub fn image_not_found_message(identifier: &str) -> String {
     format!("MicroVMImage not found for MicroVMImageID: {identifier}")
+}
+
+/// The `message` of the 400 a MicroVM-image lookup answers for an `imageIdentifier`
+/// that is neither an id this account holds nor a well-formed ARN, built from the
+/// identifier the request carried.
+///
+/// `MicrovmImageIdentifier` is "The ARN or ID of the MicroVmImage", so a value that
+/// resolves as neither names nothing this API can ever address — a bad REQUEST, not a
+/// resource that happens to be missing.
+pub fn invalid_arn_format_message(identifier: &str) -> String {
+    format!("Invalid ARN format: {identifier}")
+}
+
+/// The `message` of the 400 `CreateMicrovmImage` answers when the `name` the request
+/// asks for is already taken, built from that name.
+///
+/// `name` "Must be unique within the AWS account", and the refusal is a VALIDATION of
+/// the request's own `name` member — recorded AWS behaviour: the service answers a
+/// duplicate name with `400 ValidationException` carrying this template rather than
+/// with the `ConflictException` its model also declares.
+pub fn image_name_conflict_message(name: &str) -> String {
+    format!("A MicroVM image with the name '{name}' already exists in this account")
+}
+
+/// The `message` of the 400 `CreateMicrovmImage` answers when the `baseImageArn` the
+/// request names cannot be resolved to a base image, built from that ARN.
+///
+/// `baseImageArn` is "The ARN of the Lambda-managed base MicroVM image to build upon",
+/// so the one refusal for an unresolvable base-image reference is worded for a managed
+/// image whatever namespace the ARN names.
+pub fn base_image_not_found_message(base_image_arn: &str) -> String {
+    format!("Managed VMI not found: {base_image_arn}")
+}
+
+/// The `message` of the 400 `CreateMicrovmImage` answers when `codeArtifact` carries a
+/// `uri` that is not an S3 object URI: it names the form the member requires.
+///
+/// `CodeArtifact$uri` is "The URI of the code artifact in Amazon S3", and the build
+/// resolves that location before anything is created, so a URI that addresses no S3
+/// object is refused rather than stored.
+pub const CODE_ARTIFACT_URI_REQUIREMENT: &str =
+    "CodeArtifact URI must be a valid S3 URI in the format: s3://<bucket>/<key>";
+
+/// The `(bucket, key)` the S3 object URI `uri` addresses, or `None` when `uri` is not
+/// one.
+///
+/// An S3 object URI is `s3://<bucket>/<key>`: the scheme is `s3`, and both the bucket
+/// and the key are non-empty — `s3://bucket` names a bucket and no object, and
+/// `s3:///key` names no bucket.
+pub fn s3_object_uri(uri: &str) -> Option<(&str, &str)> {
+    let (bucket, key) = uri.strip_prefix("s3://")?.split_once('/')?;
+    (!bucket.is_empty() && !key.is_empty()).then_some((bucket, key))
+}
+
+/// Whether `arn` names a MicroVM image in THIS account's own `microvm-image`
+/// namespace — the one namespace this emulator holds, and can therefore resolve a
+/// reference against.
+///
+/// Read through the one shared ARN parse (`service_common::arn`): the vendor is this
+/// service's `arnNamespace` (`lambda`), the account is the emulator's own, and the
+/// resource type is the one `MicrovmImageArn`'s pattern
+/// (`^arn:[a-z0-9-]+:lambda:[a-z0-9-]*:[a-z0-9]*:microvm-image:.+$`) names. An ARN of
+/// any other account — an AWS-MANAGED base image carries `aws` there — belongs to
+/// another namespace; see [`managed_microvm_image_id`].
+pub fn is_own_microvm_image_arn(arn: &str) -> bool {
+    ::service_common::arn::parse(arn).is_some_and(|parsed| {
+        parsed.vendor == "lambda"
+            && parsed.account == ::engine::emulator_account_id()
+            && parsed.resource_type() == "microvm-image"
+    })
+}
+
+/// The ids of the AWS-MANAGED MicroVM base images this service publishes — the
+/// catalogue `baseImageArn` is resolved against.
+///
+/// `CreateMicrovmImage$baseImageArn` is "The ARN of the Lambda-managed base MicroVM
+/// image to build upon. Use ListManagedMicrovmImages to discover available base
+/// images", so the set of base images is AWS's own published catalogue rather than
+/// anything this account creates: `al2023-1` is the Amazon Linux 2023 base image the
+/// service publishes (recorded as
+/// `arn:aws:lambda:<region>:aws:microvm-image:al2023-1`). `ListManagedMicrovmImages`
+/// is the operation that serves this catalogue; it is still a stub (its own gap
+/// issue, deferred by the bootstrap issue), so today the catalogue is reached only
+/// through the resolution below.
+pub const MANAGED_BASE_IMAGE_IDS: &[&str] = &["al2023-1"];
+
+/// The id an AWS-MANAGED MicroVM image ARN names, or `None` when `arn` names no
+/// managed MicroVM image.
+///
+/// An AWS-owned resource of this service carries `aws` in the ARN's account field
+/// (the same form [`managed_network_connector_arn`] builds), so that field is what
+/// says a reference is into AWS's catalogue rather than into an account's own images.
+pub fn managed_microvm_image_id(arn: &str) -> Option<&str> {
+    let parsed = ::service_common::arn::parse(arn)?;
+    if parsed.vendor != "lambda" || parsed.account != MANAGED_RESOURCE_ACCOUNT {
+        return None;
+    }
+    parsed.resource.strip_prefix("microvm-image:")
+}
+
+/// Whether the AWS-managed catalogue publishes a base image with id `image_id`.
+pub fn is_published_managed_base_image(image_id: &str) -> bool {
+    MANAGED_BASE_IMAGE_IDS.contains(&image_id)
+}
+
+/// The ARN of the AWS-managed MicroVM base image `image_id` in `region`.
+pub fn managed_base_image_arn(region: &str, image_id: &str) -> String {
+    format!("arn:aws:lambda:{region}:{MANAGED_RESOURCE_ACCOUNT}:microvm-image:{image_id}")
+}
+
+/// The ARN account field an AWS-OWNED resource of this service carries, as against an
+/// account's own resources, which carry that account's id.
+pub const MANAGED_RESOURCE_ACCOUNT: &str = "aws";
+
+/// What a `MicrovmImageIdentifier` resolves to.
+///
+/// The three outcomes are client-visible and mean different things: a resolved
+/// identifier is served, a well-formed ARN this account holds nothing under is a
+/// not-found (which a poll may legitimately retry), and anything else is a malformed
+/// request that can never succeed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImageReference {
+    /// The `name` key of the image the identifier names.
+    Resolved(String),
+    /// A well-formed ARN (or a bare id) that this account holds no image under.
+    Absent,
+    /// Neither an id this account holds nor a well-formed ARN.
+    Malformed,
+}
+
+/// The `DEFAULT_CPU_ARCHITECTURE` a MicroVM image is built for when the request names
+/// no `cpuConfigurations`.
+///
+/// `Architecture` is an enum whose only value is `ARM_64`
+/// (`smithy_query(query="shape",shape="Architecture")`), so the configuration the
+/// service normalizes an unspecified request to is the only one it can name.
+pub const DEFAULT_CPU_ARCHITECTURE: &str = "ARM_64";
+
+/// The `minimumMemoryInMiB` a MicroVM image gets when the request names no
+/// `resources`.
+///
+/// `Resources$minimumMemoryInMiB` is `@required` within the structure and
+/// `ResourcesList` is `@length(max: 1)`, so an accepted image carries exactly one
+/// resource floor; AWS publishes no figure for the default, so this one is recorded
+/// AWS behaviour rather than modelled.
+pub const DEFAULT_MINIMUM_MEMORY_IN_MIB: i32 = 2048;
+
+/// The prefix of the CloudWatch log group a MicroVM image's logs go to when the
+/// request names no `logging`.
+///
+/// `Logging` is a union of `cloudWatch` and `disabled` and declares no `@default`, so
+/// a request that names neither gets the service's own target: a log group under this
+/// service's own namespace, named for the image. The prefix is recorded AWS behaviour.
+pub const DEFAULT_LOG_GROUP_PREFIX: &str = "/aws/lambda-microvms";
+
+/// The `cpuConfigurations` an image gets when the request names none.
+pub fn default_cpu_configurations() -> Vec<CpuConfiguration> {
+    vec![CpuConfiguration {
+        architecture: DEFAULT_CPU_ARCHITECTURE.to_string(),
+    }]
+}
+
+/// The `resources` an image gets when the request names none.
+pub fn default_resources() -> Vec<Resources> {
+    vec![Resources {
+        minimum_memory_in_mi_b: DEFAULT_MINIMUM_MEMORY_IN_MIB,
+    }]
+}
+
+/// The `logging` an image named `name` gets when the request names none: its logs go
+/// to this service's own CloudWatch log group for that image.
+pub fn default_logging(name: &str) -> Logging {
+    Logging::cloudWatch(CloudWatchLogging {
+        log_group: Some(default_log_group(name)),
+        log_stream: None,
+    })
+}
+
+/// The CloudWatch log group an image named `name` logs to by default.
+///
+/// `CloudWatchLogging$logGroup` is `@length(1..512)` with pattern
+/// `^[a-zA-Z0-9_\-/.#]+$`, which `ImageName` (`^[a-zA-Z0-9-_]+$`, 1..64 characters)
+/// under this prefix always satisfies.
+pub fn default_log_group(name: &str) -> String {
+    format!("{DEFAULT_LOG_GROUP_PREFIX}/{name}")
 }
 
 /// The `message` of the 404 a MicroVM lookup answers, built from the
@@ -509,6 +696,24 @@ impl ComAmazonawsLambdamicrovmsLambdamicrovmsState {
             .then(|| identifier.to_string())
     }
 
+    /// What `identifier` resolves to, which is what says whether the caller gets the
+    /// image, a not-found or a refusal.
+    ///
+    /// `MicrovmImageIdentifier` is "The ARN or ID of the MicroVmImage", so the
+    /// identifier is resolved as an id this account holds FIRST and read as an ARN
+    /// only when it names no held image: a value that is neither — a bare string that
+    /// is no id of this account and no ARN — addresses nothing this API can name, so it
+    /// is [`ImageReference::Malformed`] rather than absent.
+    pub fn resolve_image_reference(&self, identifier: &str) -> ImageReference {
+        if let Some(name) = self.resolve_image_name(identifier) {
+            return ImageReference::Resolved(name);
+        }
+        if ::service_common::arn::parse(identifier).is_some() {
+            return ImageReference::Absent;
+        }
+        ImageReference::Malformed
+    }
+
     /// The image `identifier` names, by ARN or by name.
     pub fn image(&self, identifier: &str) -> Option<&MicrovmImage> {
         let name = self.resolve_image_name(identifier)?;
@@ -660,6 +865,19 @@ pub fn wire_map(map: &BTreeMap<String, String>) -> Option<HashMap<String, String
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect::<HashMap<_, _>>()
     })
+}
+
+/// A stored map as the wire shape, PRESENT even when empty.
+///
+/// `GetMicrovmImage` projects the image's whole stored record, and the `tags` of an
+/// image carrying none is an empty map rather than an absent member (recorded AWS
+/// behaviour): a client reading `tags` gets a map to iterate either way.
+pub fn wire_map_present(map: &BTreeMap<String, String>) -> Option<HashMap<String, String>> {
+    Some(
+        map.iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect::<HashMap<_, _>>(),
+    )
 }
 
 /// A stored list as the wire shape, omitted when empty.
