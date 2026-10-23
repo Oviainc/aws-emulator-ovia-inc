@@ -78,7 +78,7 @@ fn tag_map<'pair>(pairs: impl IntoIterator<Item = (&'pair str, &'pair str)>) -> 
 }
 
 /// `POST /tags/{ResourceArn}` with the pairs in `tags`.
-async fn tag(router: &MultiServiceRouter, resource_arn: &str, tags: &Value) -> Answer {
+pub(crate) async fn tag(router: &MultiServiceRouter, resource_arn: &str, tags: &Value) -> Answer {
     json_call(
         router,
         "POST",
