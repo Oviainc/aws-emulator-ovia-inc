@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifySubnetAttribute
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifySubnetAttribute`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifySubnetAttribute::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Sets ONE attribute of one subnet of this service's state
+//! ([`crate::state::ComAmazonawsEc2Amazonec2State::subnets`]), where `DescribeSubnets`
+//! reads it back — every attribute this operation names is a member of the modelled
+//! [`Subnet`] shape the store holds, so there is nothing to keep beside it.
 //!
 //! ## Shape of an operation
 //!
@@ -190,18 +186,343 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifySubnetAttribute` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifySubnetAttributeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifySubnetAttribute"))
+        use crate::state;
+
+        // `ctx` carries request metadata only; this operation reads none of it — the
+        // subnet it modifies is named by the request, and the store is reached through the
+        // engine held on `self`. This operation models no `DryRun` member.
+        let _ = ctx;
+
+        // Which attribute the request names, and the value to set it to. Every refusal a
+        // bad REQUEST earns is made here, before the store is touched at all.
+        let mut requested = requested_modifications(&input)?;
+        // "You can only modify one attribute at a time" (`ModifySubnetAttribute`).
+        if requested.len() > 1 {
+            let named = requested
+                .iter()
+                .map(|(name, _)| *name)
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(state::invalid_parameter_combination(format!(
+                "Only one attribute can be modified at a time, and this request names \
+                 {named}. Use separate requests for each attribute."
+            )));
+        }
+        let Some((_, modification)) = requested.pop() else {
+            return Err(state::missing_parameter(format!(
+                "The request must name an attribute to modify: {attributes}",
+                attributes = ATTRIBUTE_MEMBERS.join(", "),
+            )));
+        };
+
+        let store = state::require_service_state(&*self.engine)?;
+        let mut store = store.lock();
+        // The clock-owed transition every path that reads a subnet applies: a subnet
+        // `CreateSubnet` answered as `pending` is `available` once its due instant has
+        // passed, whether or not anybody called.
+        store.materialize_due_transitions();
+
+        // The subnet the request names, which is also the answer to "does this subnet
+        // exist?" — a modification of one the account does not hold writes nothing.
+        let Some(subnet) = store.subnets.get_mut(&input.subnet_id) else {
+            return Err(state::invalid_subnet_id_not_found(&input.subnet_id));
+        };
+        // One write, after every refusal: a request this operation refuses leaves the
+        // subnet exactly as it was.
+        modification.apply(subnet);
+        Ok(ModifySubnetAttributeOutput)
     }
+}
+
+/// Every member of `ModifySubnetAttributeRequest` that names an attribute to set, as the
+/// model spells it (`smithy_query(query="operation",operation="ModifySubnetAttribute")`).
+///
+/// `CustomerOwnedIpv4Pool` is not one of them: it is part of the
+/// `MapCustomerOwnedIpOnLaunch` attribute, because "to modify a subnet on an Outpost rack,
+/// set both MapCustomerOwnedIpOnLaunch and CustomerOwnedIpv4Pool. These two parameters act
+/// as a single attribute" (`ModifySubnetAttribute`). `SubnetId` names the subnet rather
+/// than an attribute of it.
+const ATTRIBUTE_MEMBERS: [&str; 9] = [
+    ASSIGN_IPV6_ADDRESS_ON_CREATION,
+    MAP_PUBLIC_IP_ON_LAUNCH,
+    ENABLE_DNS64,
+    ENABLE_RESOURCE_NAME_DNS_A_RECORD_ON_LAUNCH,
+    ENABLE_RESOURCE_NAME_DNS_AAAA_RECORD_ON_LAUNCH,
+    PRIVATE_DNS_HOSTNAME_TYPE_ON_LAUNCH,
+    MAP_CUSTOMER_OWNED_IP_ON_LAUNCH,
+    ENABLE_LNI_AT_DEVICE_INDEX,
+    DISABLE_LNI_AT_DEVICE_INDEX,
+];
+
+/// `AssignIpv6AddressOnCreation`.
+const ASSIGN_IPV6_ADDRESS_ON_CREATION: &str = "AssignIpv6AddressOnCreation";
+
+/// `MapPublicIpOnLaunch`.
+const MAP_PUBLIC_IP_ON_LAUNCH: &str = "MapPublicIpOnLaunch";
+
+/// `EnableDns64`.
+const ENABLE_DNS64: &str = "EnableDns64";
+
+/// `EnableResourceNameDnsARecordOnLaunch`.
+const ENABLE_RESOURCE_NAME_DNS_A_RECORD_ON_LAUNCH: &str = "EnableResourceNameDnsARecordOnLaunch";
+
+/// `EnableResourceNameDnsAAAARecordOnLaunch`.
+const ENABLE_RESOURCE_NAME_DNS_AAAA_RECORD_ON_LAUNCH: &str =
+    "EnableResourceNameDnsAAAARecordOnLaunch";
+
+/// `PrivateDnsHostnameTypeOnLaunch`.
+const PRIVATE_DNS_HOSTNAME_TYPE_ON_LAUNCH: &str = "PrivateDnsHostnameTypeOnLaunch";
+
+/// `MapCustomerOwnedIpOnLaunch`, which carries `CustomerOwnedIpv4Pool` with it.
+const MAP_CUSTOMER_OWNED_IP_ON_LAUNCH: &str = "MapCustomerOwnedIpOnLaunch";
+
+/// `CustomerOwnedIpv4Pool`, the other half of [`MAP_CUSTOMER_OWNED_IP_ON_LAUNCH`].
+const CUSTOMER_OWNED_IPV4_POOL: &str = "CustomerOwnedIpv4Pool";
+
+/// `EnableLniAtDeviceIndex`.
+const ENABLE_LNI_AT_DEVICE_INDEX: &str = "EnableLniAtDeviceIndex";
+
+/// `DisableLniAtDeviceIndex`.
+const DISABLE_LNI_AT_DEVICE_INDEX: &str = "DisableLniAtDeviceIndex";
+
+/// One attribute of a subnet, carrying the value a request asked for it.
+///
+/// Each variant is one member — or, for the Outpost rack pair, one documented member PAIR —
+/// of `ModifySubnetAttributeRequest`, and each writes exactly the members of the modelled
+/// [`Subnet`] shape that attribute is reported through, so `ModifySubnetAttribute` and
+/// `DescribeSubnets` cannot disagree about one subnet.
+#[derive(Debug, Clone)]
+enum Modification {
+    /// `Subnet$AssignIpv6AddressOnCreation`.
+    AssignIpv6AddressOnCreation(bool),
+    /// `Subnet$MapPublicIpOnLaunch`.
+    MapPublicIpOnLaunch(bool),
+    /// `Subnet$EnableDns64`.
+    EnableDns64(bool),
+    /// `PrivateDnsNameOptionsOnLaunch$EnableResourceNameDnsARecord`.
+    EnableResourceNameDnsARecordOnLaunch(bool),
+    /// `PrivateDnsNameOptionsOnLaunch$EnableResourceNameDnsAAAARecord`.
+    EnableResourceNameDnsAaaaRecordOnLaunch(bool),
+    /// `PrivateDnsNameOptionsOnLaunch$HostnameType`, one member of the `HostnameType`
+    /// enum.
+    PrivateDnsHostnameTypeOnLaunch(String),
+    /// `Subnet$MapCustomerOwnedIpOnLaunch` together with `Subnet$CustomerOwnedIpv4Pool`,
+    /// the two members the request's own pair sets as one attribute.
+    CustomerOwnedIp {
+        /// Whether network interfaces created in the subnet get a customer-owned IPv4
+        /// address.
+        on_launch: bool,
+        /// The pool those addresses are drawn from.
+        pool: Option<String>,
+    },
+    /// `Subnet$EnableLniAtDeviceIndex`, the device position local network interfaces sit
+    /// at.
+    EnableLniAtDeviceIndex(i32),
+    /// Local network interfaces "at the current position should be disabled"
+    /// (`ModifySubnetAttributeRequest$DisableLniAtDeviceIndex`), so the subnet reports no
+    /// device position at all.
+    ///
+    /// A request carrying `false` is a successful NO-OP, not a dropped write: the member
+    /// only ever asks for the disable ("specify true to indicate …"), so `false` names the
+    /// attribute without asking for anything, and the subnet keeps the position it had.
+    DisableLniAtDeviceIndex(bool),
+}
+
+impl Modification {
+    /// Write this attribute onto `subnet`, leaving every other member of it as it was.
+    fn apply(self, subnet: &mut Subnet) {
+        match self {
+            Self::AssignIpv6AddressOnCreation(value) => {
+                subnet.assign_ipv6_address_on_creation = Some(value);
+            }
+            Self::MapPublicIpOnLaunch(value) => subnet.map_public_ip_on_launch = Some(value),
+            Self::EnableDns64(value) => subnet.enable_dns64 = Some(value),
+            Self::EnableResourceNameDnsARecordOnLaunch(value) => {
+                let mut options = private_dns_options(subnet);
+                options.enable_resource_name_dns_a_record = Some(value);
+                subnet.private_dns_name_options_on_launch = Some(options);
+            }
+            Self::EnableResourceNameDnsAaaaRecordOnLaunch(value) => {
+                let mut options = private_dns_options(subnet);
+                options.enable_resource_name_dns_aaaa_record = Some(value);
+                subnet.private_dns_name_options_on_launch = Some(options);
+            }
+            Self::PrivateDnsHostnameTypeOnLaunch(hostname_type) => {
+                let mut options = private_dns_options(subnet);
+                options.hostname_type = Some(hostname_type);
+                subnet.private_dns_name_options_on_launch = Some(options);
+            }
+            // The pair is ONE attribute, so both members are written from this one
+            // request: a request that names no pool leaves the subnet with none.
+            Self::CustomerOwnedIp { on_launch, pool } => {
+                subnet.map_customer_owned_ip_on_launch = Some(on_launch);
+                subnet.customer_owned_ipv4_pool = pool;
+            }
+            Self::EnableLniAtDeviceIndex(index) => {
+                subnet.enable_lni_at_device_index = Some(index);
+            }
+            // "Specify true to indicate that local network interfaces at the current
+            // position should be disabled": `false` asks for nothing, so it leaves the
+            // position where it was.
+            Self::DisableLniAtDeviceIndex(disable) => {
+                if disable {
+                    subnet.enable_lni_at_device_index = None;
+                }
+            }
+        }
+    }
+}
+
+/// The subnet's launch-time private DNS options as a value to write back: a subnet that
+/// carries none starts from the modelled defaults, so one of the three members this
+/// structure holds can be set without inventing the other two.
+fn private_dns_options(subnet: &Subnet) -> PrivateDnsNameOptionsOnLaunch {
+    subnet
+        .private_dns_name_options_on_launch
+        .clone()
+        .unwrap_or_default()
+}
+
+/// The attributes `input` names, each with the member name a refusal quotes.
+///
+/// At most one entry per attribute, and every value this operation cannot accept is
+/// refused here — before the store is read — so a bad request can never be half applied.
+fn requested_modifications(
+    input: &ModifySubnetAttributeInput,
+) -> Result<Vec<(&'static str, Modification)>, ModifySubnetAttributeError> {
+    use crate::state;
+
+    /// One `AttributeBooleanValue` member of the request: its name, the member itself,
+    /// and the attribute a value in it sets.
+    type BooleanMember<'a> = (
+        &'static str,
+        Option<&'a AttributeBooleanValue>,
+        fn(bool) -> Modification,
+    );
+
+    let mut requested: Vec<(&'static str, Modification)> = Vec::new();
+
+    // Every `AttributeBooleanValue` member of the request. The structure carries one
+    // optional `Value` ("The attribute value. The valid values are true or false" —
+    // `AttributeBooleanValue$Value`), so an attribute named without one says nothing about
+    // what to set it to.
+    let boolean_members: [BooleanMember<'_>; 6] = [
+        (
+            ASSIGN_IPV6_ADDRESS_ON_CREATION,
+            input.assign_ipv6_address_on_creation.as_ref(),
+            Modification::AssignIpv6AddressOnCreation,
+        ),
+        (
+            MAP_PUBLIC_IP_ON_LAUNCH,
+            input.map_public_ip_on_launch.as_ref(),
+            Modification::MapPublicIpOnLaunch,
+        ),
+        (
+            ENABLE_DNS64,
+            input.enable_dns64.as_ref(),
+            Modification::EnableDns64,
+        ),
+        (
+            ENABLE_RESOURCE_NAME_DNS_A_RECORD_ON_LAUNCH,
+            input.enable_resource_name_dns_a_record_on_launch.as_ref(),
+            Modification::EnableResourceNameDnsARecordOnLaunch,
+        ),
+        (
+            ENABLE_RESOURCE_NAME_DNS_AAAA_RECORD_ON_LAUNCH,
+            input
+                .enable_resource_name_dns_aaaa_record_on_launch
+                .as_ref(),
+            Modification::EnableResourceNameDnsAaaaRecordOnLaunch,
+        ),
+        (
+            DISABLE_LNI_AT_DEVICE_INDEX,
+            input.disable_lni_at_device_index.as_ref(),
+            Modification::DisableLniAtDeviceIndex,
+        ),
+    ];
+    for (name, member, build) in boolean_members {
+        let Some(member) = member else {
+            continue;
+        };
+        let Some(value) = member.value else {
+            return Err(state::missing_parameter(format!(
+                "The parameter {name} must have a value"
+            )));
+        };
+        requested.push((name, build(value)));
+    }
+
+    // "The type of hostname to assign to instances in the subnet at launch"
+    // (`PrivateDnsHostnameTypeOnLaunch`), one member of the model's own `HostnameType`
+    // enum — which the boundary validator has already held the value to, refusing a
+    // non-member with HTTP 400 `ValidationError` before this handler runs, so anything
+    // that reaches here is a member.
+    if let Some(hostname_type) = input.private_dns_hostname_type_on_launch.as_deref() {
+        requested.push((
+            PRIVATE_DNS_HOSTNAME_TYPE_ON_LAUNCH,
+            Modification::PrivateDnsHostnameTypeOnLaunch(hostname_type.to_string()),
+        ));
+    }
+
+    // "Indicates the device position for local network interfaces in this subnet … A local
+    // network interface cannot be the primary network interface (eth0)"
+    // (`EnableLniAtDeviceIndex`), so position 0 and below name no local network interface.
+    if let Some(index) = input.enable_lni_at_device_index {
+        if index < state::MIN_LNI_DEVICE_INDEX {
+            return Err(state::invalid_parameter_value(format!(
+                "Invalid value '{index}' for {ENABLE_LNI_AT_DEVICE_INDEX}: a local network \
+                 interface cannot be the primary network interface (eth0), so the device \
+                 index must be {min} or greater",
+                min = state::MIN_LNI_DEVICE_INDEX,
+            )));
+        }
+        requested.push((
+            ENABLE_LNI_AT_DEVICE_INDEX,
+            Modification::EnableLniAtDeviceIndex(index),
+        ));
+    }
+
+    // The Outpost rack pair: "set both MapCustomerOwnedIpOnLaunch and
+    // CustomerOwnedIpv4Pool. These two parameters act as a single attribute"
+    // (`ModifySubnetAttribute`), so either member names that one attribute.
+    if input.map_customer_owned_ip_on_launch.is_some() || input.customer_owned_ipv4_pool.is_some() {
+        let Some(member) = input.map_customer_owned_ip_on_launch.as_ref() else {
+            return Err(state::invalid_parameter_combination(format!(
+                "{CUSTOMER_OWNED_IPV4_POOL} and {MAP_CUSTOMER_OWNED_IP_ON_LAUNCH} act as a \
+                 single attribute, so both must be set"
+            )));
+        };
+        let Some(on_launch) = member.value else {
+            return Err(state::missing_parameter(format!(
+                "The parameter {MAP_CUSTOMER_OWNED_IP_ON_LAUNCH} must have a value"
+            )));
+        };
+        let pool = input.customer_owned_ipv4_pool.as_deref();
+        // "You must specify the customer-owned IP pool using CustomerOwnedIpv4Pool"
+        // (`MapCustomerOwnedIpOnLaunch`) — "when this value is true". The other direction
+        // is NOT refused: only `true` is documented to require a pool, so `false` with a
+        // pool stays legal and stores the pool the request named, and `false` without one
+        // leaves the subnet with no pool. Either way the pair is written as it arrived,
+        // so no member of the request is silently dropped.
+        if on_launch && pool.is_none() {
+            return Err(state::invalid_parameter_combination(format!(
+                "{CUSTOMER_OWNED_IPV4_POOL} must be set when \
+                 {MAP_CUSTOMER_OWNED_IP_ON_LAUNCH} is true"
+            )));
+        }
+        if let Some(pool) = pool.filter(|pool| !state::coip_pool_id_is_well_formed(pool)) {
+            return Err(state::invalid_parameter_value(format!(
+                "Invalid value '{pool}' for {CUSTOMER_OWNED_IPV4_POOL}"
+            )));
+        }
+        requested.push((
+            MAP_CUSTOMER_OWNED_IP_ON_LAUNCH,
+            Modification::CustomerOwnedIp {
+                on_launch,
+                pool: pool.map(str::to_string),
+            },
+        ));
+    }
+
+    Ok(requested)
 }

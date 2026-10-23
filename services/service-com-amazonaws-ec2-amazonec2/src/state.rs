@@ -756,6 +756,34 @@ pub const DEFAULT_SUBNET_PREFIX_LENGTH: u32 = 20;
 /// (`PrivateDnsNameOptionsOnLaunch$HostnameType`).
 pub const HOSTNAME_TYPE_IP_NAME: &str = "ip-name";
 
+/// The smallest device position a subnet's local network interfaces may sit at.
+///
+/// "For example, 1 indicates local network interfaces in this subnet are the secondary
+/// network interface (eth1). A local network interface cannot be the primary network
+/// interface (eth0)" (`ModifySubnetAttributeRequest$EnableLniAtDeviceIndex`), so position 0
+/// — and anything below it — names the primary interface and is refused.
+pub const MIN_LNI_DEVICE_INDEX: i32 = 1;
+
+/// The prefix of a customer-owned IPv4 address pool id (`CoipPoolId`).
+pub const COIP_POOL_ID_PREFIX: &str = "ipv4pool-coip-";
+
+/// Whether `id` is a well-formed customer-owned IPv4 address pool id.
+///
+/// A COIP pool id is [`COIP_POOL_ID_PREFIX`] followed by 8 or 17 lowercase hexadecimal
+/// digits — the short and the long EC2 resource id forms, read the same way
+/// [`allocation_id_is_well_formed`] reads an allocation id. `CoipPoolId` is a bare string in
+/// the model, so this is also what BOUNDS the bytes a caller can park on a subnet through
+/// `ModifySubnetAttribute`: the pool id a subnet retains is at most this long.
+pub fn coip_pool_id_is_well_formed(id: &str) -> bool {
+    let Some(suffix) = id.strip_prefix(COIP_POOL_ID_PREFIX) else {
+        return false;
+    };
+    matches!(suffix.len(), 8 | 17)
+        && suffix
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
 /// The name of the default security group every VPC comes with: "the default security
 /// group is named `default`" (Amazon VPC User Guide, "Default security groups for your
 /// VPCs"). It is also the one group name a caller may name a group by.

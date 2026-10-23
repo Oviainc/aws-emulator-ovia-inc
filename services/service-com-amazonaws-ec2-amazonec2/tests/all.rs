@@ -50,6 +50,8 @@ mod instance_lifecycle;
 mod instance_type_offerings;
 #[path = "all/launch_templates.rs"]
 mod launch_templates;
+#[path = "all/modify_subnet_attribute.rs"]
+mod modify_subnet_attribute;
 #[path = "all/security_group_filter_limits.rs"]
 mod security_group_filter_limits;
 #[path = "all/security_groups.rs"]
