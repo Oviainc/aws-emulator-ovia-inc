@@ -177,6 +177,40 @@ pub const MESSAGE_DIRECTORY_NOT_FOUND: &str =
 pub const MESSAGE_BUNDLE_NOT_FOUND: &str =
     "The specified bundle could not be found in the specified region.";
 
+/// The `RunningMode` a WorkSpace is created with when the request names none.
+///
+/// `WorkspaceProperties$RunningMode` targets the model's `RunningMode` enum
+/// (`AUTO_STOP`, `ALWAYS_ON`, `MANUAL`) and is OPTIONAL, so a create request may
+/// omit it — but the created WorkSpace still runs in one mode, so the service
+/// resolves the omission to a default. `ALWAYS_ON` is the value a recorded AWS
+/// response reports for a request that carried no `WorkspaceProperties` at all,
+/// and it is the only one of the three that needs no further member (`AUTO_STOP`
+/// is paired with a timeout and `MANUAL` is allow-list gated per this
+/// operation's doc: "The MANUAL running mode value is only supported by Amazon
+/// WorkSpaces Core. Contact your account team to be allow-listed").
+pub const DEFAULT_RUNNING_MODE: &str = "ALWAYS_ON";
+
+/// The EFFECTIVE property set for a create request's `WorkspaceProperties`.
+///
+/// One resolution, used wherever this service reports a WorkSpace's properties:
+/// what it persists for an accepted request, and what it echoes back for a
+/// refused one. Resolving means filling in what the service decides for the
+/// caller — today only [`DEFAULT_RUNNING_MODE`] for an omitted `RunningMode`.
+/// Every other member is left exactly as submitted: a member the request did not
+/// carry stays absent rather than being invented, because nothing in this
+/// emulator derives a volume size, a compute type or a protocol for a WorkSpace.
+/// The result is never absent, so a client that resubmits an echoed
+/// `WorkspaceRequest` resubmits the properties the WorkSpace would have had.
+pub fn effective_workspace_properties(
+    requested: Option<&WorkspaceProperties>,
+) -> WorkspaceProperties {
+    let mut properties = requested.cloned().unwrap_or_default();
+    if properties.running_mode.is_none() {
+        properties.running_mode = Some(DEFAULT_RUNNING_MODE.to_string());
+    }
+    properties
+}
+
 /// The most WorkSpace directories this emulator keeps registered at once.
 ///
 /// AWS caps the directories an account registers with a service quota and
@@ -1480,6 +1514,16 @@ impl ComAmazonawsWorkspacesWorkspacesserviceState {
     /// names — the directory, then the bundle — then the directory slot it would
     /// occupy, then the store's own bound.
     ///
+    /// Each refusal names the resource that actually failed to resolve: an
+    /// unknown `BundleId` is reported as [`ERROR_CODE_BUNDLE_NOT_FOUND`] whatever
+    /// else the element carries, and [`ERROR_CODE_DIRECTORY_NOT_FOUND`] is
+    /// reported only for an unknown `DirectoryId`. An element whose directory AND
+    /// bundle are both unresolvable has two failures to report in one entry; it
+    /// is reported against the FIRST of them in the model's own member order
+    /// (`WorkspaceRequest` declares `DirectoryId` before `BundleId`), so which
+    /// one a client is told about does not depend on the order the lookups
+    /// happen to run in.
+    ///
     /// The returned record is a snapshot of what was persisted, so the caller can
     /// serialize it into `PendingRequests` without holding the map borrow.
     pub fn create_workspace(
@@ -1499,9 +1543,7 @@ impl ComAmazonawsWorkspacesWorkspacesserviceState {
         // points `WorkspaceRequest$DirectoryId` at "the Directory Service
         // directory for the WorkSpace. You can use DescribeWorkspaceDirectories
         // to list the available directories", so an id naming nothing registered
-        // names no directory this account can create in. The directory is
-        // resolved BEFORE the bundle because it is the resource the WorkSpace
-        // lives in: an element naming neither is reported against it.
+        // names no directory this account can create in.
         if !self.directories.contains_key(&request.directory_id) {
             return Err((
                 ERROR_CODE_DIRECTORY_NOT_FOUND,
@@ -1509,11 +1551,12 @@ impl ComAmazonawsWorkspacesWorkspacesserviceState {
             ));
         }
 
-        // ... and is created FROM a bundle: `WorkspaceRequest$BundleId` is "the
-        // identifier of the bundle for the WorkSpace. You can use
+        // ... and it is created FROM a bundle: `WorkspaceRequest$BundleId` is
+        // "the identifier of the bundle for the WorkSpace. You can use
         // DescribeWorkspaceBundles to list the available bundles", which is this
         // store's bundles — the Amazon-provided catalog plus the ones this
-        // account created.
+        // account created. An element whose directory resolved and whose bundle
+        // did not is reported against the BUNDLE.
         if !self.bundle_ids.contains_key(&request.bundle_id) {
             return Err((
                 ERROR_CODE_BUNDLE_NOT_FOUND,
@@ -1569,7 +1612,11 @@ impl ComAmazonawsWorkspacesWorkspacesserviceState {
             volume_encryption_key: request.volume_encryption_key.clone(),
             user_volume_encryption_enabled: request.user_volume_encryption_enabled,
             root_volume_encryption_enabled: request.root_volume_encryption_enabled,
-            workspace_properties: request.workspace_properties.clone(),
+            // The EFFECTIVE property set, resolved once here: every later read
+            // of this WorkSpace reports the same properties the create resolved.
+            workspace_properties: Some(effective_workspace_properties(
+                request.workspace_properties.as_ref(),
+            )),
             tags: request.tags.clone().unwrap_or_default(),
             error_code: None,
             error_message: None,

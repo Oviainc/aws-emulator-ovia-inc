@@ -19,6 +19,8 @@ mod enrollment_and_preferences;
 mod harness;
 #[path = "all/idle_recommendations.rs"]
 mod idle_recommendations;
+#[path = "all/rds_database_recommendations.rs"]
+mod rds_database_recommendations;
 #[path = "all/recommendation_summaries.rs"]
 mod recommendation_summaries;
 #[path = "all/reported_defaults_and_preference_validation.rs"]

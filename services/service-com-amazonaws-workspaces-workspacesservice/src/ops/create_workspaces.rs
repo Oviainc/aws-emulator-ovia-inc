@@ -6,8 +6,10 @@
 //! service's persisted state — the registered directory its `DirectoryId` names and the
 //! stored bundle its `BundleId` names — and an element that cannot be satisfied is
 //! reported, in the position it was submitted in, as a `FailedRequests` entry that
-//! echoes the submitted request verbatim and carries the per-item `ErrorType` code for
-//! what could not be resolved. Nothing is persisted for a refused element. An accepted
+//! echoes the submitted request — with its `WorkspaceProperties` resolved to the
+//! effective property set, so a retry of that entry asks for the same WorkSpace — and
+//! carries the per-item `ErrorType` code for the resource that actually failed to
+//! resolve. Nothing is persisted for a refused element. An accepted
 //! element is persisted with a freshly minted `WorkspaceId` and reported in
 //! `PendingRequests`. Either way the response is a 200: the operation models no
 //! missing-resource error.
@@ -179,11 +181,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 Err((error_code, error_message)) => {
                     // The refused element is echoed back as submitted: a client
                     // matches a failure to the request it sent by reading it
-                    // here. The one member not echoed as-is is `Tags`, which a
-                    // recorded AWS echo carries as a list even for a request
-                    // that sent none, so an absent `Tags` is reported as the
-                    // empty list rather than dropped.
+                    // here, and retries the batch by resubmitting exactly these
+                    // `WorkspaceRequest`s. Two members are reported RESOLVED
+                    // rather than as submitted, so that retry asks for the same
+                    // WorkSpace an accepted element would have got:
+                    //
+                    // * `WorkspaceProperties` is the EFFECTIVE property set
+                    //   (`crate::state::effective_workspace_properties`) — the
+                    //   submitted properties with the service's defaults filled
+                    //   in — so it is never absent and never drops a property
+                    //   the WorkSpace would have been created with;
+                    // * `Tags` is reported as a list even for a request that
+                    //   sent none, which is what a recorded AWS echo carries.
                     let mut echoed = request.clone();
+                    echoed.workspace_properties = Some(
+                        crate::state::effective_workspace_properties(
+                            echoed.workspace_properties.as_ref(),
+                        ),
+                    );
                     echoed.tags = Some(echoed.tags.unwrap_or_default());
                     failed_requests.push(FailedCreateWorkspaceRequest {
                         workspace_request: Some(echoed),

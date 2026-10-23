@@ -38,6 +38,11 @@
 //! [`instance_type_offerings`] derives them from the Region and the modelled
 //! `InstanceType` catalog, and `DescribeInstanceTypeOfferings` writes nothing either.
 //!
+//! The REGIONS themselves are facts of the account's partition in the same way — no EC2
+//! operation creates a Region, and opting one in or out is the Account API's job — so
+//! [`regions_for_request`] derives them from the Region catalog and the Region the request
+//! was signed for, and `DescribeRegions` writes nothing either.
+//!
 //! ## Resources callers create are stored
 //!
 //! [`ComAmazonawsEc2Amazonec2State::vpcs`] holds the account's VPCs as the modelled
@@ -464,7 +469,7 @@ use crate::ops::types::{
     PlacementGroup,
     PrivateDnsNameOptionsOnLaunch,
     DnsEntry, PayerResponsibilityEntry,
-    RequestLaunchTemplateData, RunInstancesOutput, SecondaryNetwork,
+    Region, RequestLaunchTemplateData, RunInstancesOutput, SecondaryNetwork,
     SecondaryNetworkIpv4CidrBlockAssociation, SecondarySubnet,
     SecondarySubnetIpv4CidrBlockAssociation, SecurityGroup, ServiceConfiguration,
     SpotPlacementScore, StateReason,
@@ -3428,43 +3433,251 @@ pub fn offering_page_cursor(offering: &InstanceTypeOfferingRecord) -> String {
 }
 
 // =============================================================================
-// Spot placement scores
+// Regions
 // =============================================================================
+
+/// Every AWS partition that is not the commercial one: the prefix every Region code of
+/// that partition starts with, and the DNS suffix its service endpoints carry.
+///
+/// The prefixes are AWS's own partition prefixes — AWS China, GovCloud and the isolated
+/// partitions — the same ones
+/// `service-com-amazonaws-observabilityadmin-observabilityadmin` partitions
+/// `KNOWN_REGIONS` by. The suffix of each is the `dnsSuffix` that partition publishes in
+/// the AWS SDK partition metadata (`endpoints.json`), which is what every regional
+/// endpoint of the partition is built from: `aws-cn` `amazonaws.com.cn`, `aws-us-gov`
+/// `amazonaws.com`, `aws-iso` `c2s.ic.gov`, `aws-iso-b` `sc2s.sgov.gov`, `aws-iso-e`
+/// `cloud.adc-e.uk`, `aws-iso-f` `csp.hci.ic.gov`.
+///
+/// Every prefix ends in a hyphen, so `us-iso-` cannot swallow `us-isob-` and the order of
+/// the entries carries no meaning.
+const NON_COMMERCIAL_PARTITIONS: [(&str, &str); 6] = [
+    ("cn-", "amazonaws.com.cn"),
+    ("us-gov-", "amazonaws.com"),
+    ("us-iso-", "c2s.ic.gov"),
+    ("us-isob-", "sc2s.sgov.gov"),
+    ("us-isof-", "csp.hci.ic.gov"),
+    ("eu-isoe-", "cloud.adc-e.uk"),
+];
+
+/// The DNS suffix the commercial (`aws`) partition's endpoints carry — the one
+/// `DescribeRegionsRequest$Filters` spells out for the `endpoint` filter
+/// (`ec2.us-east-1.amazonaws.com`).
+pub const COMMERCIAL_DNS_SUFFIX: &str = "amazonaws.com";
+
+/// This service's endpoint prefix: the `endpointPrefix` of its `aws.api#service` trait
+/// (`smithy_query(query="service_info")`), which is the first label of every regional
+/// endpoint the service is reached through.
+pub const EC2_ENDPOINT_PREFIX: &str = "ec2";
+
+/// The Regions of the commercial partition an account can use WITHOUT opting in: the
+/// "Regions that are enabled by default" table of the Amazon Web Services Account
+/// Management Reference Guide, "Specify which Amazon Web Services Regions your account can
+/// use" — the guide `DescribeRegions`'s own documentation links to.
+///
+/// The ENABLED set is the written list and the opt-in set is its complement, rather than
+/// the other way round, because that is the direction AWS's rule runs: a Region
+/// introduced after the guide's cut-off is disabled until the account opts in, so a Region
+/// this emulator's catalog gains later is an opt-in Region without this list being
+/// touched. Regions outside the commercial partition are not in it at all — an account of
+/// the China, GovCloud or an isolated partition reaches its own partition's Regions
+/// directly — which is why [`region_opt_in_status`] asks about the partition first.
+pub const REGIONS_ENABLED_BY_DEFAULT: [&str; 17] = [
+    "ap-northeast-1",
+    "ap-northeast-2",
+    "ap-northeast-3",
+    "ap-south-1",
+    "ap-southeast-1",
+    "ap-southeast-2",
+    "ca-central-1",
+    "eu-central-1",
+    "eu-north-1",
+    "eu-west-1",
+    "eu-west-2",
+    "eu-west-3",
+    "sa-east-1",
+    "us-east-1",
+    "us-east-2",
+    "us-west-1",
+    "us-west-2",
+];
+
+/// `Region$OptInStatus` for a Region the account has opted in to — one of the three
+/// values the member's own doc lists ("The possible values are `opt-in-not-required`,
+/// `opted-in`, and `not-opted-in`").
+pub const OPT_IN_STATUS_OPTED_IN: &str = "opted-in";
+
+/// `Region$OptInStatus` for a Region that requires an opt-in the account has not made.
+pub const OPT_IN_STATUS_NOT_OPTED_IN: &str = "not-opted-in";
+
+/// Every filter `DescribeRegions` documents, as its `Filters` member lists them
+/// (`smithy_query(query="doc",shape="DescribeRegionsRequest",member="Filters")`). A
+/// filter outside this set is refused; a filter inside it is answered by
+/// [`RegionRecord::filter_values`], which must cover every entry.
+pub const REGION_FILTERS: [&str; 3] = ["endpoint", "opt-in-status", "region-name"];
+
+/// The [`NON_COMMERCIAL_PARTITIONS`] entry `region` belongs to, or `None` when `region`
+/// belongs to the commercial partition, whose Region codes carry no partition prefix at
+/// all.
+///
+/// One lookup answers both the prefix and the DNS suffix, so [`partition_prefix_of`] and
+/// [`partition_dns_suffix`] can never disagree about which prefix wins.
+fn partition_of(region: &str) -> Option<&'static (&'static str, &'static str)> {
+    NON_COMMERCIAL_PARTITIONS
+        .iter()
+        .find(|(prefix, _)| region.starts_with(prefix))
+}
+
+/// The Region-code prefix of `region`'s partition, or `None` when `region` belongs to the
+/// commercial partition.
+fn partition_prefix_of(region: &str) -> Option<&'static str> {
+    partition_of(region).map(|(prefix, _)| *prefix)
+}
+
+/// The DNS suffix the endpoints of `region`'s partition carry.
+pub fn partition_dns_suffix(region: &str) -> &'static str {
+    partition_of(region).map_or(COMMERCIAL_DNS_SUFFIX, |(_, suffix)| *suffix)
+}
+
+/// `region`'s EC2 service endpoint: this service's endpoint prefix, the Region code, and
+/// the DNS suffix of the Region's partition — `ec2.us-east-1.amazonaws.com`, the form
+/// `DescribeRegions`'s `endpoint` filter doc gives.
+pub fn region_endpoint(region: &str) -> String {
+    format!(
+        "{EC2_ENDPOINT_PREFIX}.{region}.{}",
+        partition_dns_suffix(region)
+    )
+}
+
+/// Every Region of the partition `region` belongs to, in Region-code order.
+///
+/// Neither the Smithy model nor any operation of this emulator carries a Region catalog —
+/// the model's endpoint rule set resolves ONE Region name rather than enumerating them,
+/// and no operation creates a Region — so the catalog is
+/// `emulator_telemetry::policy::KNOWN_REGIONS` ("every AWS region the wire may carry",
+/// already sorted for binary search), the same source two other services derive their
+/// Region catalogs from, rather than a second hand-written list that would drift from it.
+///
+/// It is narrowed to ONE partition because a partition is what bounds the Regions an
+/// account can ever see: an account lives in exactly one, and its Region codes are what
+/// name it. The order the catalog inherits is Region-code order, which is what makes
+/// [`MAX_SCORED_REGIONS`] a prefix of [`commercial_regions`].
+pub fn regions_in_partition_of(region: &str) -> Vec<&'static str> {
+    let partition = partition_prefix_of(region);
+    ::emulator_telemetry::policy::KNOWN_REGIONS
+        .iter()
+        .copied()
+        .filter(|known| partition_prefix_of(known) == partition)
+        .collect()
+}
 
 /// The Regions of the commercial (`aws`) partition, in Region-code order: the ones a
 /// `GetSpotPlacementScores` request that narrows nothing is scored over.
 ///
 /// `RegionNames` holds "the Regions used to narrow down the list of Regions to be
 /// scored" (`GetSpotPlacementScoresRequest$RegionNames`), so the list it narrows has to
-/// exist, and neither the Smithy model nor any operation of this emulator carries one —
-/// the model's endpoint rule set resolves ONE Region name rather than enumerating them,
-/// and no operation creates a Region. The catalog is therefore
-/// `emulator_telemetry::policy::KNOWN_REGIONS` ("every AWS region the wire may carry",
-/// already sorted for binary search) with the other partitions' Regions filtered out by
-/// [`NON_COMMERCIAL_REGION_PREFIXES`] — the same source two other services derive their
-/// Region catalogs from, rather than a second hand-written list that would drift from it.
-/// The order it inherits is what makes [`MAX_SCORED_REGIONS`] a prefix of this list.
-///
-/// Nothing here is tied to one operation: `DescribeRegions` is still a scaffold stub and
-/// wants exactly this catalog.
+/// exist; it is [`regions_in_partition_of`] for the partition [`DEFAULT_REGION`] belongs
+/// to.
 pub fn commercial_regions() -> Vec<&'static str> {
-    ::emulator_telemetry::policy::KNOWN_REGIONS
-        .iter()
-        .copied()
-        .filter(|region| {
-            !NON_COMMERCIAL_REGION_PREFIXES
-                .iter()
-                .any(|prefix| region.starts_with(prefix))
+    regions_in_partition_of(DEFAULT_REGION)
+}
+
+/// `region`'s opt-in status for an account calling in `signed_region`.
+///
+/// A Region outside the commercial partition, and a commercial Region of
+/// [`REGIONS_ENABLED_BY_DEFAULT`], needs no opt-in at all. Of the rest — the ones an
+/// account must enable — the Region the request was SIGNED for is one the account has
+/// evidently enabled, since a regional endpoint of a disabled Region answers nothing;
+/// this emulator holds no account-level opt-in store and EC2 has no operation that opts a
+/// Region in or out (that is the Account API's `EnableRegion`), so that is the one opt-in
+/// a request itself evidences, and every other opt-in Region is reported
+/// `not-opted-in`.
+pub fn region_opt_in_status(region: &str, signed_region: &str) -> &'static str {
+    if partition_prefix_of(region).is_some() || REGIONS_ENABLED_BY_DEFAULT.contains(&region) {
+        OPT_IN_NOT_REQUIRED
+    } else if region == signed_region {
+        OPT_IN_STATUS_OPTED_IN
+    } else {
+        OPT_IN_STATUS_NOT_OPTED_IN
+    }
+}
+
+/// One Region of the account's partition, as the describe reads it.
+///
+/// `opt_in_status` is a `&'static str` because it is one of the three words
+/// `Region$OptInStatus` documents rather than text a request can carry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegionRecord {
+    /// `us-east-1` — the Region code.
+    pub region_name: String,
+    /// The Region's EC2 service endpoint, as [`region_endpoint`] builds it.
+    pub endpoint: String,
+    /// `opt-in-not-required`, `opted-in` or `not-opted-in`.
+    pub opt_in_status: &'static str,
+}
+
+impl RegionRecord {
+    /// This Region as the modelled `Region` shape.
+    ///
+    /// `Geography` is absent because the geography of a Region ("for example, `United
+    /// States of America`") is display data AWS publishes per Region that neither the
+    /// model nor the request yields — reported absent rather than invented, the same way
+    /// [`AvailabilityZoneRecord::to_availability_zone`] leaves a zone's geography out.
+    pub fn to_region(&self) -> Region {
+        Region {
+            region_name: Some(self.region_name.clone()),
+            endpoint: Some(self.endpoint.clone()),
+            opt_in_status: Some(self.opt_in_status.to_string()),
+            geography: None,
+        }
+    }
+
+    /// Whether this Region is enabled for the account: every Region but one carrying an
+    /// opt-in the account has not made.
+    pub fn is_enabled(&self) -> bool {
+        self.opt_in_status != OPT_IN_STATUS_NOT_OPTED_IN
+    }
+
+    /// The values the EC2 filter `name` compares against this Region, or `None` when
+    /// `name` is not one of [`REGION_FILTERS`].
+    pub fn filter_values(&self, name: &str) -> Option<Vec<&str>> {
+        let values = match name {
+            "endpoint" => vec![self.endpoint.as_str()],
+            "opt-in-status" => vec![self.opt_in_status],
+            "region-name" => vec![self.region_name.as_str()],
+            _ => return None,
+        };
+        Some(values)
+    }
+}
+
+/// The Regions a request signed for `signed_region` can see, in Region-code order:
+/// every Region of that Region's partition ([`regions_in_partition_of`]), each with its
+/// endpoint and its opt-in status.
+///
+/// A well-formed `signed_region` the catalog does not hold is reported beside them, so a
+/// caller is never told the Region it is calling in does not exist — the same allowance
+/// `GetSpotPlacementScores` makes for the Region a call was signed for. A credential
+/// scope is caller-controlled text, so one that is not shaped like a Region code
+/// ([`region_name_is_well_formed`]) adds nothing.
+pub fn regions_for_request(signed_region: &str) -> Vec<RegionRecord> {
+    let mut names: Vec<&str> = regions_in_partition_of(signed_region);
+    if region_name_is_well_formed(signed_region) && !names.contains(&signed_region) {
+        names.push(signed_region);
+        names.sort_unstable();
+    }
+    names
+        .into_iter()
+        .map(|name| RegionRecord {
+            region_name: name.to_string(),
+            endpoint: region_endpoint(name),
+            opt_in_status: region_opt_in_status(name, signed_region),
         })
         .collect()
 }
 
-/// The region-code prefixes of the partitions that are not the commercial one: AWS China,
-/// GovCloud and the isolated partitions (`us-iso`, `us-isob`, `us-isof`, `eu-isoe` — the
-/// shorter prefixes cover the longer ones). They are AWS's own partition prefixes, the
-/// same ones `service-com-amazonaws-observabilityadmin-observabilityadmin` partitions
-/// `KNOWN_REGIONS` by.
-const NON_COMMERCIAL_REGION_PREFIXES: [&str; 4] = ["cn-", "us-gov-", "us-iso", "eu-iso"];
+// =============================================================================
+// Spot placement scores
+// =============================================================================
 
 /// The most Regions one `GetSpotPlacementScores` response scores: "The Spot placement
 /// score for the top 10 Regions or Availability Zones"
