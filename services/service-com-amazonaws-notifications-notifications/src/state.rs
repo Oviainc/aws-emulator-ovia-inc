@@ -69,7 +69,9 @@ pub struct NotificationConfigurationRecord {
     pub subtype: Option<String>,
     /// `creationTime`, set once when the record is inserted and never rewritten.
     pub creation_time: ::aws_smithy_types::DateTime,
-    /// `tags`, as the create call supplied them (empty when it supplied none).
+    /// `tags`, as the create call supplied them (empty when it supplied none)
+    /// and as `TagResource` and `UntagResource` have since changed them. This
+    /// is the set `ListTagsForResource` reports.
     pub tags: BTreeMap<String, String>,
     /// The sources of the EventRules this configuration carries — what
     /// `ListNotificationConfigurations`'s `eventRuleSource` filter matches a
@@ -120,6 +122,19 @@ impl NotificationConfigurationRecord {
     pub fn merge_tags<I: IntoIterator<Item = (String, String)>>(&mut self, tags: I) {
         for (key, value) in tags {
             self.tags.insert(key, value);
+        }
+    }
+
+    /// Remove `keys` from this record's tag set, leaving every key they do not
+    /// name alone.
+    ///
+    /// A key this record does not carry is already in the state the request
+    /// asks for, so it is not an error and nothing else is removed in its
+    /// place: repeating the same removal is a no-op, which is what
+    /// `UntagResource`'s `@idempotent` trait requires.
+    pub fn remove_tags<'a, I: IntoIterator<Item = &'a str>>(&mut self, keys: I) {
+        for key in keys {
+            self.tags.remove(key);
         }
     }
 }
