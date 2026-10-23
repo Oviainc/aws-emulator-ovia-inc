@@ -206,8 +206,6 @@ fn refused(
             template_ids,
         } => DeleteEventBridgeRuleTemplateGroupErrorModeled::ConflictException(ConflictException {
             message: Some(crate::state::still_held_message(
-                "eventbridge rule template group",
-                identifier,
                 &signal_map_ids,
                 &template_ids,
             )),

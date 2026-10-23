@@ -31,7 +31,7 @@ use crate::harness::{
 };
 use serde_json::{json, Value};
 use service_com_amazonaws_elementalinference_elementalinference::state::{
-    DICTIONARY_BEING_DELETED_MESSAGE, DICTIONARY_REFERENCED_MESSAGE,
+    dictionary_referenced_message, DICTIONARY_BEING_DELETED_MESSAGE,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -777,8 +777,8 @@ async fn delete_dictionary_is_refused_while_a_feed_references_it() {
         );
         assert_eq!(
             message_of(&error),
-            DICTIONARY_REFERENCED_MESSAGE,
-            "case {removal:?}: the refusal is the rule's invariant sentence, got {:?}",
+            dictionary_referenced_message(1),
+            "case {removal:?}: the refusal reports the one feed that references it, got {:?}",
             error["message"]
         );
         assert!(
@@ -852,15 +852,14 @@ async fn delete_dictionary_is_refused_while_a_feed_references_it() {
 /// accelerates a transition the clock already owes.
 #[tokio::test]
 async fn update_feed_reports_the_status_the_feed_holds() {
-    // One row per status a feed can be in when the update arrives — the transient
-    // CREATING it is still waiting out, and each settled status — with rows differing
-    // in how many outputs the payload carries. `expected_now` is what the update and an
-    // immediate read report; `expected_later` is what the clock leaves once anything it
-    // owed has fallen due.
+    // One row per status a feed can be in when the update arrives — every settled
+    // status the service produces — with rows differing in how many outputs the payload
+    // carries. `expected_now` is what the update and an immediate read report;
+    // `expected_later` is what the clock leaves once anything it owed has fallen due.
     let rows: [(&str, &str, &str, Value); 4] = [
         (
-            "a feed still CREATING when the update arrives",
-            "CREATING",
+            "a feed read right after its creation",
+            "AVAILABLE",
             "AVAILABLE",
             json!([plain_output("crop1", "cropping")]),
         ),
@@ -896,9 +895,6 @@ async fn update_feed_reports_the_status_the_feed_holds() {
         )
         .await;
 
-        if expected_now != "CREATING" {
-            past_the_transition_span();
-        }
         if expected_now == "ACTIVE" || expected_now == "ARCHIVED" {
             let (status, _) = call(
                 &router,

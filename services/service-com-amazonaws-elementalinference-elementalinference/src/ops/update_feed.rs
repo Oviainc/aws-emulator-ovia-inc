@@ -262,9 +262,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // feed reports the status it HOLDS — AVAILABLE with no resource associated,
         // ACTIVE while one holds it. An update never parks the feed in a transient
         // status the caller would have to wait out, and it neither cancels nor
-        // accelerates a transition the clock already owes (a feed accepted moments ago
-        // is still CREATING until its creation falls due). AssociateFeed, also a 200,
-        // already works this way.
+        // accelerates a transition the clock already owes (a feed whose deletion has
+        // been accepted is still DELETING, and is refused above). AssociateFeed, also a
+        // 200, already works this way.
 
         let output = UpdateFeedOutput {
             arn: feed.arn.clone(),

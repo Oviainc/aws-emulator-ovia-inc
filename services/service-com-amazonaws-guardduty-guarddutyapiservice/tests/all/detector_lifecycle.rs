@@ -1403,15 +1403,18 @@ async fn a_detector_belongs_to_the_region_its_endpoint_created_it_in() {
 async fn an_operation_outside_this_slice_still_answers_501() {
     let router = new_router();
     let detector_id = enabled_detector(&router).await;
+    // `ListIPSets` is still a scaffold (`src/ops/list_ip_sets.rs` carries the
+    // SCAFFOLDED marker); `ListFilters` is implemented, and the `filter_listing`
+    // suite is what asserts its behaviour.
     let (status, body) = call(
         &router,
         "GET",
-        &format!("/detector/{detector_id}/filter"),
+        &format!("/detector/{detector_id}/ipset"),
         None,
     )
     .await;
     assert_eq!(
         status, 501,
-        "ListFilters is still scaffolded, so it must answer 501: got {status} {body:?}"
+        "ListIPSets is still scaffolded, so it must answer 501: got {status} {body:?}"
     );
 }

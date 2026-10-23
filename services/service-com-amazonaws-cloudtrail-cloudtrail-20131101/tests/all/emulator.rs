@@ -50,6 +50,17 @@ impl Reply {
             .unwrap_or_default()
     }
 
+    /// The refusal text a reply carries: the modelled error shapes spell the member
+    /// `Message`, and the framework's pre-dispatch refusals spell it `message`, so a
+    /// suite that asserts on wording reads both through here.
+    pub fn message(&self) -> &str {
+        self.body
+            .get("Message")
+            .or_else(|| self.body.get("message"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+    }
+
     /// Assert this reply is the modelled failure `code` with HTTP `status`.
     pub fn expect_error(&self, case: &str, status: u16, code: &str) {
         assert_eq!(

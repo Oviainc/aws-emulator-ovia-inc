@@ -170,9 +170,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => MAX_PAGE_SIZE,
             Some(requested) if (MIN_PAGE_SIZE..=MAX_PAGE_SIZE).contains(&requested) => requested,
             Some(requested) => {
-                return Err(crate::scaffolded::Scaffolded::validation(format!(
-                    "maxResults {requested} is outside {MIN_PAGE_SIZE}..{MAX_PAGE_SIZE}"
-                )))
+                // Worded as AWS words a constraint violation, and in the one place that
+                // sentence is written (`crate::service::error_detail`), so this refusal
+                // reads identically to the boundary validator's for the same violation.
+                return Err(crate::scaffolded::Scaffolded::validation(
+                    crate::service::error_detail::range_violation_message(
+                        "maxResults",
+                        requested,
+                        MIN_PAGE_SIZE,
+                        MAX_PAGE_SIZE,
+                    ),
+                ))
             }
         };
         let page_size = usize::try_from(page_size).unwrap_or(1);
