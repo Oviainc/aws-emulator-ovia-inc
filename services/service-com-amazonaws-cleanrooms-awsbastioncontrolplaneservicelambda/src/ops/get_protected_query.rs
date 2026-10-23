@@ -170,7 +170,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !store.memberships.contains_key(&membership_id) {
             return Err(GetProtectedQueryErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: format!("membership {membership_id} not found"),
+                    message: st::membership_not_found_message(
+                        &membership_id,
+                        st::caller_account_id(),
+                    ),
                     resource_id: membership_id,
                     resource_type: st::RESOURCE_TYPE_MEMBERSHIP.to_string(),
                 },

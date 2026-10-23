@@ -50,7 +50,7 @@ const RANGED_PROGRAM_SETTINGS: [(&str, (i64, i64)); 5] = [
 
 /// A `MultiplexProgramSettings` carrying only the member the structure requires
 /// (`ProgramNumber`): the row's own members are what each test adds.
-fn program_settings(program_number: i64) -> Value {
+pub(crate) fn program_settings(program_number: i64) -> Value {
     json!({ "programNumber": program_number })
 }
 
@@ -73,7 +73,7 @@ fn with_member(mut settings: Value, path: &str, value: i64) -> Value {
 
 /// A multiplex to create programs in, with the create asserted to have
 /// succeeded, as its minted id.
-async fn multiplex(router: &MultiServiceRouter, case: &str, name: &str) -> String {
+pub(crate) async fn multiplex(router: &MultiServiceRouter, case: &str, name: &str) -> String {
     let multiplex = created(
         router,
         case,
@@ -88,7 +88,7 @@ async fn multiplex(router: &MultiServiceRouter, case: &str, name: &str) -> Strin
 
 /// `CreateMultiplexProgram`: the status and, on success, the program it answers
 /// with (`POST /prod/multiplexes/{MultiplexId}/programs`).
-async fn create_program(
+pub(crate) async fn create_program(
     router: &MultiServiceRouter,
     multiplex_id: &str,
     program_name: &str,

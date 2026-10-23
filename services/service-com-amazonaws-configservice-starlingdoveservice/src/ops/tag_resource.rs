@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
+//!
 //! Adds the request's tags to the resource its `ResourceArn` identifies, in
 //! [`crate::state`]: a key the resource already carries is updated, a key it does not
 //! carry is added, and a key the request does not name is left alone. The tags live on

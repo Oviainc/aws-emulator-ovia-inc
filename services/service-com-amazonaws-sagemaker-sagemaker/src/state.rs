@@ -1472,6 +1472,29 @@ impl ComAmazonawsSagemakerSagemakerState {
             .find(|artifact| artifact.region == region && artifact.name.as_deref() == Some(name))
     }
 
+    /// The ARN of the artifact in `region` whose source URI is `source_uri`, if one is
+    /// stored — the OLDEST such artifact when several share the URI.
+    ///
+    /// `DeleteArtifact` accepts either an `ArtifactArn` or a `Source`, and `ListArtifacts`
+    /// filters artifacts by `SourceUri` alone: the URI is what identifies a source, so a
+    /// source-addressed request resolves on it rather than on the optional
+    /// `SourceTypes` beside it. Nothing stops two creates recording the same URI (the
+    /// store is keyed by ARN), so the match is made deterministic by creation time, with
+    /// the ARN breaking a tie. Same scan, and same reason, as [`Self::artifact_named`].
+    pub fn artifact_arn_for_source(&self, region: &str, source_uri: &str) -> Option<String> {
+        self.artifacts
+            .values()
+            .filter(|artifact| {
+                artifact.region == region && artifact.source.source_uri == source_uri
+            })
+            .min_by(|left, right| {
+                left.creation_time
+                    .cmp(&right.creation_time)
+                    .then_with(|| left.arn.cmp(&right.arn))
+            })
+            .map(|artifact| artifact.arn.clone())
+    }
+
     /// Whether another processing job fits, i.e. the store is below
     /// [`PROCESSING_JOB_QUOTA`].
     pub fn processing_jobs_below_quota(&self) -> bool {

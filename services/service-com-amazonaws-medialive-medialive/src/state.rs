@@ -144,7 +144,8 @@ pub mod multiplexes;
 
 pub use multiplexes::{
     multiplex_state, MultiplexProgramRecord, MultiplexProgramRefusal, MultiplexRecord,
-    MultiplexRefusal, MAX_MULTIPLEXES, MAX_MULTIPLEX_PROGRAMS, MAX_MULTIPLEX_PROGRAM_TOKENS,
+    MultiplexRefusal, MultiplexStartRefusal, MAX_MULTIPLEXES, MAX_MULTIPLEX_PROGRAMS,
+    MAX_MULTIPLEX_PROGRAM_TOKENS,
     MAX_MULTIPLEX_TOKENS, MAX_SERVICE_DESCRIPTOR_NAME_LEN, MULTIPLEX_AVAILABILITY_ZONES,
 };
 
