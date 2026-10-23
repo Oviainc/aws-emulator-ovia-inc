@@ -1,22 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DetectEntities
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DetectEntities`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DetectEntities::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED. The named-entity recognition runs in-process: the submitted document is
+//! tokenized, every span the recogniser's rules can type is typed from the evidence the
+//! document itself carries (a closed-form lexical pattern, a lexicon entry, or a
+//! structural cue beside the span), and nothing is ever matched out of a particular
+//! request. No maintained crates.io crate ships a statistical NER model that can be
+//! loaded in-process without an external runtime, so the engine here is rule- and
+//! lexicon-based — the same class of engine as the VADER analyser behind
+//! `DetectSentiment` — and the rules it applies are stated on each table below.
 //!
-//! ## Shape of an operation
-//!
-//! Each operation is a struct that owns the shared engine and implements
-//! [`smithy_server_runtime::Operation`]. The framework constructs one per service via
-//! `DetectEntities::new(engine)` and drives it through the centralized request walk:
-//! deserialize → validate → `handle` → serialize. You write ONLY the `handle` body.
+//! The operation holds NO state: the answer is a function of the submitted document
+//! alone, so repeating the call returns the same entities, and nothing a later caller
+//! reads is changed by calling it.
 //!
 //! ## Reaching this service's state
 //!
@@ -128,6 +125,1256 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::collections::HashSet;
+use std::ops::Range;
+use std::sync::OnceLock;
+use std::time::Duration;
+
+use regex::Regex;
+
+/// The largest document this operation accepts, in UTF-8 bytes.
+///
+/// This operation's OWN modelled member states its maximum, and it is not the one
+/// the other single-document inference calls carry: `DetectEntitiesRequest$Text`
+/// reads "A UTF-8 text string. The maximum string size is 100 KB" where
+/// `DetectSentimentRequest$Text` reads 5 KB
+/// (`crate::state::REALTIME_TEXT_QUOTA_BYTES`), so the quota lives beside the
+/// handler that enforces it. The prose is read the way every quota in this crate
+/// reads it — a count of BYTES, not a power-of-two multiple of 1024 — so a
+/// 100001-byte document is refused and a 100000-byte one is accepted. The refusal
+/// goes through the ONE shared size-report message
+/// [`crate::state::text_size_refusal`] builds, which is the part that must never
+/// drift between operations: the quota each member documents differs, the sentence
+/// reporting it does not.
+const MAX_TEXT_BYTES: usize = 100_000;
+
+/// The `LanguageCode` values the in-process recogniser has lexical resources for.
+///
+/// Every lexicon and cue below is English, so every other value Comprehend's
+/// `LanguageCode` enum names is answered with the modelled
+/// `UnsupportedLanguageException` rather than with an entity list no analysis of that
+/// language produced.
+const ANALYSABLE_LANGUAGES: &[&str] = &["en"];
+
+/// The most tokens one candidate span may cover.
+///
+/// The bound the in-process pass carries: classification inspects every contiguous
+/// token sub-sequence of a span, which is quadratic in its length, so a pathological
+/// run of thousands of capitalized tokens cannot hold the emulator. Named entities
+/// are a handful of tokens long, so a longer run is cut into spans of at most this
+/// many tokens.
+const MAX_SPAN_TOKENS: usize = 12;
+
+/// How long the CALLER waits for the recogniser before this operation answers its
+/// own modelled server error instead of being left waiting.
+///
+/// Orders of magnitude above what recognising a document at [`MAX_TEXT_BYTES`]
+/// costs, so it never fires for a request the recogniser is simply working through.
+/// The same budget the crate's sibling real-time recognisers bound their caller's
+/// wait with (`contains_pii_entities`, `detect_dominant_language`).
+///
+/// What it does and does not do: it bounds what the CALLER waits for. A blocking
+/// task cannot be cancelled from outside, so when the budget fires the pass runs to
+/// its natural end and releases its blocking-pool slot then. What bounds the POOL is
+/// the work itself being bounded — the byte quota refuses an oversized document
+/// before any analysis, the pattern automata are compiled once rather than per
+/// request, and [`MAX_SPAN_TOKENS`] caps the quadratic part of the pass.
+const RECOGNITION_TIME_BUDGET: Duration = Duration::from_secs(5);
+
+// The modelled `EntityType` values this recogniser can produce
+// (`super::types::ENTITY_TYPE_VALUES`), named once so a rule cannot invent a value
+// outside the enum.
+const TYPE_PERSON: &str = "PERSON";
+const TYPE_LOCATION: &str = "LOCATION";
+const TYPE_ORGANIZATION: &str = "ORGANIZATION";
+const TYPE_COMMERCIAL_ITEM: &str = "COMMERCIAL_ITEM";
+const TYPE_EVENT: &str = "EVENT";
+const TYPE_DATE: &str = "DATE";
+const TYPE_QUANTITY: &str = "QUANTITY";
+const TYPE_TITLE: &str = "TITLE";
+const TYPE_OTHER: &str = "OTHER";
+
+/// Confidence of a rule whose evidence is a closed-form lexical pattern — an
+/// ISO-8601 date, an email address, a percentage: the span's own characters are the
+/// whole of the evidence, so nothing but the form can be wrong.
+const WEIGHT_PATTERN: f32 = 0.99;
+
+/// Confidence of a rule whose evidence is a lexicon entry naming the span.
+const WEIGHT_GAZETTEER: f32 = 0.95;
+
+/// Confidence of a rule whose evidence is a cue token — a legal-form designator
+/// inside the span, an honorific in front of it.
+const WEIGHT_CUE: f32 = 0.90;
+
+/// Confidence of the fallback: the span is named (a capitalized phrase in running
+/// text) but no rule places it in a category, so it is reported with the modelled
+/// `OTHER` type, which is what that value means.
+const WEIGHT_UNPLACED: f32 = 0.50;
+
+/// The confidence a rule reports for one span.
+///
+/// A rule's weight is its precision class (above); the span then keeps the share of
+/// it that the evidence covers, so a lexicon entry naming the whole span scores the
+/// full weight and one naming a single token of a three-token span scores less.
+/// Formally `weight * (0.5 + 0.5 * evidence_tokens / span_tokens)`, which stays
+/// inside `(0, 1]` for every weight above.
+fn confidence(weight: f32, evidence_tokens: usize, span_tokens: usize) -> f32 {
+    let coverage = (evidence_tokens as f32 / span_tokens.max(1) as f32).clamp(0.0, 1.0);
+    weight * (0.5 + 0.5 * coverage)
+}
+
+/// English closed-class function words: they are never an entity on their own, they
+/// do not start a candidate span, and a leading one is trimmed off a span (so a
+/// phrase written with an article reports the name).
+///
+/// Source: the closed-class English determiners, pronouns, auxiliaries, prepositions
+/// and conjunctions, plus the sentence adverbs that open a sentence (and so appear
+/// capitalized in running text without naming anything).
+const FUNCTION_WORDS: &[&str] = &[
+    "a", "an", "the", "and", "or", "but", "if", "then", "than", "that", "this", "these", "those",
+    "i", "you", "he", "she", "it", "we", "they", "me", "him", "her", "us", "them", "my", "your",
+    "his", "its", "our", "their", "is", "are", "was", "were", "be", "been", "being", "am", "do",
+    "does", "did", "have", "has", "had", "will", "would", "can", "could", "shall", "should", "may",
+    "might", "must", "of", "in", "on", "at", "to", "for", "with", "by", "from", "about", "into",
+    "over", "under", "after", "before", "between", "during", "without", "within", "through", "as",
+    "so", "not", "no", "nor", "also", "very", "just", "more", "most", "some", "any", "all", "both",
+    "each", "few", "many", "much", "such", "only", "own", "same", "too", "there", "here", "when",
+    "where", "why", "how", "who", "whom", "whose", "which", "what", "while", "because", "although",
+    "though", "since", "until", "unless", "however", "meanwhile", "therefore", "moreover",
+    "furthermore", "nevertheless", "according", "despite", "besides", "finally", "overall",
+    "instead", "otherwise", "meanwhile", "afterwards", "yet", "still", "even", "again", "once",
+];
+
+/// Lowercase particles that are PART of a name and never divide it — the European
+/// name particles (`Ludwig van Beethoven`, `Leonardo da Vinci`).
+///
+/// Source: the nobiliary and patronymic particles of the European and Arabic naming
+/// traditions.
+const NAME_PARTICLES: &[&str] = &[
+    "de", "del", "della", "di", "da", "dos", "du", "la", "le", "van", "von", "der", "den",
+    "bin", "al", "ibn", "ter", "op", "y",
+];
+
+/// Lowercase words that JOIN two names into a longer one (`Bank of America`, `The
+/// Old Man and the Sea`).
+///
+/// A phrase connector keeps a candidate span running, but the span is divided at it
+/// again unless the whole span is a lexicon entry or the word in front of the
+/// connector is an institution or geographic head noun — which is what takes an `of`
+/// complement. So `University of Washington` stays one organization while `Jane Doe
+/// of Example Corp` is two entities.
+const PHRASE_CONNECTORS: &[&str] = &["of", "and", "the", "for", "a", "an"];
+
+/// Abbreviations whose trailing period does NOT end a sentence, so a name after one
+/// is not sentence-initial and stays in the same span ("Dr. Jane Doe", "Acme Inc.
+/// Holdings", "John F. Kennedy" — a single letter is an initial and counts too).
+///
+/// Source: the honorifics and legal-form abbreviations in [`PERSON_TITLES`] and
+/// [`ORGANIZATION_DESIGNATORS`], plus the general English abbreviations below.
+const ABBREVIATIONS: &[&str] = &[
+    "etc", "vs", "eg", "ie", "cf", "al", "approx", "dept", "univ", "est", "no", "nos", "fig",
+    "jr", "sr", "st", "mt", "ave", "blvd", "rd",
+];
+
+/// Honorifics and offices that mark the capitalized phrase after them as a person.
+///
+/// Source: English honorifics (`Mr.`, `Mrs.`, `Ms.`, `Dr.`, …) and the offices and
+/// ranks that are used the same way in front of a personal name.
+const PERSON_TITLES: &[&str] = &[
+    "mr", "mrs", "ms", "miss", "mx", "dr", "doctor", "prof", "professor", "sir", "madam", "dame",
+    "lord", "lady", "rev", "reverend", "fr", "father", "sister", "brother", "rabbi", "imam",
+    "president", "vice-president", "senator", "congressman", "congresswoman", "representative",
+    "governor", "mayor", "judge", "justice", "chancellor", "chairman", "chairwoman", "chair",
+    "ceo", "cfo", "cto", "coo", "founder", "captain", "colonel", "general", "major", "lieutenant",
+    "sergeant", "corporal", "admiral", "commander", "officer", "king", "queen", "prince",
+    "princess", "duke", "duchess", "pope", "cardinal", "bishop", "minister", "secretary",
+    "ambassador", "attorney", "coach", "detective", "inspector", "sheriff",
+];
+
+/// Legal-form and institution words: a capitalized phrase carrying one of these
+/// names an organization.
+///
+/// Source: the company legal-form designators of the major jurisdictions (US `Inc.`,
+/// `LLC`, `Corp.`; UK `Ltd`, `PLC`; German `GmbH`, `AG`; French/Spanish `SA`; Dutch
+/// `NV`, `BV`; Nordic `AB`, `AS`, `OY`; Japanese `KK`), plus the institution nouns
+/// that head the name of a body rather than a place.
+const ORGANIZATION_DESIGNATORS: &[&str] = &[
+    "inc", "incorporated", "corp", "corporation", "llc", "llp", "lp", "ltd", "limited", "company",
+    "co", "plc", "gmbh", "ag", "sa", "sas", "srl", "spa", "nv", "bv", "ab", "as", "oy", "kk",
+    "pty", "group", "holdings", "holding", "bank", "university", "college", "school", "academy",
+    "institute", "foundation", "association", "society", "agency", "ministry", "department",
+    "bureau", "commission", "committee", "council", "union", "federation", "league", "airlines",
+    "airways", "motors", "technologies", "technology", "systems", "solutions", "software", "labs",
+    "laboratory", "laboratories", "pharmaceuticals", "industries", "enterprises", "partners",
+    "capital", "ventures", "media", "networks", "communications", "telecom", "insurance",
+    "hospital", "clinic", "library", "museum", "press", "publishing", "studios", "records",
+    "securities", "consulting", "services", "works", "mills", "steel", "energy", "petroleum",
+    "trust", "fund", "cooperative", "collective", "guild", "orchestra", "charity", "trustees",
+    "bakery", "brewery", "winery", "cafe", "restaurant", "hotel", "inn", "store", "stores",
+    "shop", "market", "supermarket", "studio", "gallery", "theater", "theatre", "cinema",
+    "farms", "foods", "brands", "outfitters", "supplies", "supply", "hardware", "garage",
+    "pharmacy", "salon", "gym", "club", "team", "news", "times", "post", "herald", "journal",
+];
+
+/// Geographic nouns: a capitalized phrase carrying one of these names a place.
+///
+/// Source: the generic geographic feature terms of the US Board on Geographic Names
+/// feature classes (populated place, river, lake, island, mountain, …) together with
+/// the common thoroughfare types.
+const GEOGRAPHIC_DESIGNATORS: &[&str] = &[
+    "street", "st", "avenue", "ave", "road", "rd", "boulevard", "blvd", "lane", "drive",
+    "highway", "freeway", "square", "plaza", "bridge", "river", "creek", "mountain", "mountains",
+    "mount", "hill", "hills", "lake", "sea", "ocean", "bay", "gulf", "strait", "island",
+    "islands", "isle", "valley", "desert", "canyon", "falls", "beach", "coast", "peninsula",
+    "county", "province", "prefecture", "state", "city", "town", "township", "village",
+    "district", "borough", "region", "republic", "kingdom", "emirates", "territory", "forest",
+    "harbor", "harbour", "port", "peak", "plateau", "basin", "delta", "reef", "glacier", "fjord",
+    "tower", "monument", "cathedral", "palace", "castle", "temple", "mosque", "church",
+    "stadium", "arena", "airport", "station", "canal", "dam", "garden", "gardens", "park",
+];
+
+/// Words that name a happening rather than a thing: a capitalized phrase carrying one
+/// of these names an event.
+///
+/// Source: the event nouns Comprehend's own `EVENT` documentation gives as examples
+/// (festivals, concerts, elections, sporting events) generalised to the head noun of
+/// such a name.
+const EVENT_DESIGNATORS: &[&str] = &[
+    "olympics", "olympiad", "championship", "championships", "tournament", "cup", "series",
+    "bowl", "games", "marathon", "grand", "prix", "conference", "convention", "congress",
+    "summit", "festival", "expo", "exposition", "fair", "carnival", "parade", "concert",
+    "election", "elections", "referendum", "war", "revolution", "earthquake", "hurricane",
+    "pandemic", "regatta", "derby", "open", "masters", "hackathon", "symposium", "workshop",
+];
+
+/// Well-known organizations, so a name carrying no legal-form designator is still
+/// typed.
+///
+/// Source: the largest companies by revenue of the Fortune Global 500, the widely
+/// held technology companies, and the intergovernmental bodies and universities whose
+/// names appear in English news text. The list is a SUBSET — a name it does not carry
+/// falls through to the rules above and below, and ends as `OTHER` if nothing places
+/// it, rather than being guessed at.
+const WELL_KNOWN_ORGANIZATIONS: &[&str] = &[
+    "amazon", "apple", "microsoft", "google", "alphabet", "meta", "facebook", "netflix", "tesla",
+    "ibm", "intel", "oracle", "nvidia", "amd", "qualcomm", "cisco", "dell", "hp", "lenovo",
+    "huawei", "xiaomi", "samsung", "sony", "lg", "panasonic", "toshiba", "siemens", "philips",
+    "bosch", "walmart", "costco", "target", "kroger", "aldi", "tesco", "carrefour", "ikea",
+    "alibaba", "tencent", "baidu", "bytedance", "shopify", "ebay", "etsy", "stripe", "paypal",
+    "visa", "mastercard", "salesforce", "sap", "adobe", "vmware", "uber", "lyft", "airbnb",
+    "spotify", "twitter", "linkedin", "snap", "tiktok", "zoom", "slack", "dropbox", "reddit",
+    "toyota", "honda", "nissan", "hyundai", "kia", "volkswagen", "audi", "bmw", "mercedes-benz",
+    "porsche", "ferrari", "ford", "chevrolet", "chrysler", "stellantis", "renault", "peugeot",
+    "volvo", "boeing", "airbus", "lockheed martin", "northrop grumman", "raytheon", "rolls-royce",
+    "exxon mobil", "chevron", "shell", "bp", "totalenergies", "saudi aramco", "petrobras",
+    "gazprom", "nestle", "unilever", "procter & gamble", "coca-cola", "pepsico", "mcdonald's",
+    "starbucks", "kraft heinz", "danone", "mondelez", "nike", "adidas", "puma", "zara", "h&m",
+    "uniqlo", "levi's", "goldman sachs", "morgan stanley", "jpmorgan chase", "citigroup",
+    "wells fargo", "bank of america", "hsbc", "barclays", "deutsche bank", "ubs", "credit suisse",
+    "santander", "bnp paribas", "berkshire hathaway", "blackrock", "vanguard", "allianz", "axa",
+    "pfizer", "moderna", "johnson & johnson", "merck", "novartis", "roche", "astrazeneca",
+    "glaxosmithkline", "sanofi", "bayer", "eli lilly", "abbvie", "disney", "comcast", "warner",
+    "paramount", "universal", "verizon", "vodafone", "orange",
+    "telefonica", "deutsche telekom", "nokia", "ericsson", "ups", "fedex", "dhl", "maersk",
+    "delta air lines", "united airlines", "american airlines", "lufthansa", "emirates",
+    "ryanair", "easyjet", "marriott", "hilton", "accor", "booking.com", "expedia",
+    "united nations", "world health organization", "world bank", "european union",
+    "international monetary fund", "nato", "unesco", "unicef", "red cross", "greenpeace",
+    "amnesty international", "nasa", "esa", "cern", "fbi", "cia", "interpol", "europol",
+    "harvard", "yale", "princeton", "stanford", "berkeley", "cambridge", "oxford",
+    "massachusetts institute of technology", "caltech", "sorbonne",
+    "the new york times", "the washington post", "the wall street journal", "the guardian",
+    "financial times", "associated press", "reuters", "bloomberg", "bbc", "cnn", "npr",
+];
+
+/// Country, dependency and continent names.
+///
+/// Source: the ISO 3166-1 English short names, plus the continent and the common
+/// short-form names ("the United States", "Britain") that running English text uses
+/// instead of the ISO name. A SUBSET, for the same reason as
+/// [`WELL_KNOWN_ORGANIZATIONS`].
+const COUNTRIES_AND_REGIONS: &[&str] = &[
+    "afghanistan", "albania", "algeria", "andorra", "angola", "argentina", "armenia",
+    "australia", "austria", "azerbaijan", "bahamas", "bahrain", "bangladesh", "barbados",
+    "belarus", "belgium", "belize", "benin", "bhutan", "bolivia", "bosnia and herzegovina",
+    "botswana", "brazil", "brunei", "bulgaria", "burkina faso", "burundi", "cambodia",
+    "cameroon", "canada", "chad", "chile", "china", "colombia", "congo", "costa rica",
+    "croatia", "cuba", "cyprus", "czechia", "czech republic", "denmark", "dominican republic",
+    "ecuador", "egypt", "el salvador", "estonia", "eswatini", "ethiopia", "fiji", "finland",
+    "france", "gabon", "gambia", "georgia", "germany", "ghana", "greece", "greenland",
+    "guatemala", "guinea", "guyana", "haiti", "honduras", "hong kong", "hungary", "iceland",
+    "india", "indonesia", "iran", "iraq", "ireland", "israel", "italy", "jamaica", "japan",
+    "jordan", "kazakhstan", "kenya", "kuwait", "kyrgyzstan", "laos", "latvia", "lebanon",
+    "liberia", "libya", "liechtenstein", "lithuania", "luxembourg", "madagascar", "malawi",
+    "malaysia", "maldives", "mali", "malta", "mauritania", "mauritius", "mexico", "moldova",
+    "monaco", "mongolia", "montenegro", "morocco", "mozambique", "myanmar", "namibia", "nepal",
+    "netherlands", "new zealand", "nicaragua", "niger", "nigeria", "north korea",
+    "north macedonia", "norway", "oman", "pakistan", "panama", "papua new guinea", "paraguay",
+    "peru", "philippines", "poland", "portugal", "qatar", "romania", "russia",
+    "russian federation", "rwanda", "san marino", "saudi arabia", "senegal", "serbia",
+    "seychelles", "sierra leone", "singapore", "slovakia", "slovenia", "somalia",
+    "south africa", "south korea", "south sudan", "spain", "sri lanka", "sudan", "suriname",
+    "sweden", "switzerland", "syria", "taiwan", "tajikistan", "tanzania", "thailand", "togo",
+    "trinidad and tobago", "tunisia", "turkey", "turkmenistan", "uganda", "ukraine",
+    "united arab emirates", "united kingdom", "united states",
+    "united states of america", "britain", "great britain", "england", "scotland", "wales",
+    "northern ireland", "uruguay", "uzbekistan", "venezuela", "vietnam", "yemen", "zambia",
+    "zimbabwe", "africa", "antarctica", "asia", "europe", "north america", "south america",
+    "oceania", "middle east", "scandinavia", "caribbean", "balkans",
+];
+
+/// US state and federal-district names.
+///
+/// Source: the ISO 3166-2:US subdivision names (the fifty states and the District of
+/// Columbia).
+const US_STATES: &[&str] = &[
+    "alabama", "alaska", "arizona", "arkansas", "california", "colorado", "connecticut",
+    "delaware", "florida", "georgia", "hawaii", "idaho", "illinois", "indiana", "iowa", "kansas",
+    "kentucky", "louisiana", "maine", "maryland", "massachusetts", "michigan", "minnesota",
+    "mississippi", "missouri", "montana", "nebraska", "nevada", "new hampshire", "new jersey",
+    "new mexico", "new york", "north carolina", "north dakota", "ohio", "oklahoma", "oregon",
+    "pennsylvania", "rhode island", "south carolina", "south dakota", "tennessee", "texas",
+    "utah", "vermont", "virginia", "washington", "west virginia", "wisconsin", "wyoming",
+    "district of columbia",
+];
+
+/// Cities.
+///
+/// Source: the most populous urban agglomerations of the UN World Urbanization
+/// Prospects, plus the other national capitals that appear in English news text. A
+/// SUBSET, for the same reason as [`WELL_KNOWN_ORGANIZATIONS`].
+const MAJOR_CITIES: &[&str] = &[
+    "tokyo", "delhi", "shanghai", "sao paulo", "mexico city", "cairo", "mumbai", "beijing",
+    "dhaka", "osaka", "karachi", "istanbul", "kinshasa", "lagos", "buenos aires", "kolkata",
+    "manila", "guangzhou", "shenzhen", "moscow", "bangalore", "paris", "jakarta", "lima",
+    "bangkok", "london", "tehran", "ho chi minh city", "hanoi", "chengdu", "nagoya", "chennai",
+    "bogota", "hyderabad", "chicago", "los angeles", "new york city", "houston", "phoenix",
+    "philadelphia", "san antonio", "san diego", "dallas", "austin", "san jose", "san francisco",
+    "seattle", "denver", "boston", "atlanta", "miami", "detroit", "minneapolis", "portland",
+    "las vegas", "baltimore", "washington dc", "toronto", "montreal", "vancouver", "ottawa",
+    "calgary", "madrid", "barcelona", "rome", "milan", "naples", "berlin", "munich", "hamburg",
+    "frankfurt", "vienna", "zurich", "geneva", "amsterdam", "rotterdam", "brussels", "dublin",
+    "edinburgh", "manchester", "birmingham", "glasgow", "lisbon", "porto", "athens", "prague",
+    "budapest", "warsaw", "krakow", "bucharest", "sofia", "belgrade", "zagreb", "stockholm",
+    "oslo", "copenhagen", "helsinki", "reykjavik", "kyiv", "minsk", "riga", "tallinn",
+    "vilnius", "saint petersburg", "dubai", "abu dhabi", "doha", "riyadh", "jeddah", "kuwait city",
+    "amman", "beirut", "jerusalem", "tel aviv", "baghdad", "nairobi", "addis ababa", "accra",
+    "abuja", "dakar", "casablanca", "marrakesh", "tunis", "algiers", "johannesburg",
+    "cape town", "durban", "pretoria", "sydney", "melbourne", "brisbane", "perth", "adelaide",
+    "auckland", "wellington", "singapore", "kuala lumpur", "seoul", "busan", "kyoto",
+    "yokohama", "taipei", "hong kong", "macau", "santiago", "caracas", "quito", "montevideo",
+    "asuncion", "la paz", "havana", "panama city", "san juan", "kingston",
+    "albuquerque", "tucson", "sacramento", "fresno", "omaha", "milwaukee", "raleigh",
+    "charlotte", "nashville", "memphis", "louisville", "oklahoma city", "tulsa", "wichita",
+    "cleveland", "columbus", "cincinnati", "pittsburgh", "kansas city", "st louis",
+    "salt lake city", "boise", "anchorage", "honolulu", "buffalo", "rochester", "hartford",
+    "providence", "richmond", "norfolk", "jacksonville", "tampa", "orlando", "new orleans",
+    "sao paolo", "rio de janeiro", "brasilia", "medellin", "guadalajara", "monterrey",
+    "valencia", "seville", "bilbao", "marseille", "lyon", "toulouse", "nice", "bordeaux",
+    "cologne", "stuttgart", "dusseldorf", "leipzig", "dresden", "bremen", "hannover",
+    "turin", "florence", "venice", "bologna", "palermo", "bergen", "gothenburg", "malmo",
+    "aarhus", "tampere", "gdansk", "wroclaw", "brno", "bratislava", "ljubljana", "sarajevo",
+];
+
+/// Given names, so a personal name carrying no honorific is still typed.
+///
+/// Source: the most frequent given names of the US Social Security Administration's
+/// published baby-name data, plus the frequent given names of the other languages
+/// English text carries names from. A SUBSET, for the same reason as
+/// [`WELL_KNOWN_ORGANIZATIONS`].
+const GIVEN_NAMES: &[&str] = &[
+    "james", "john", "robert", "michael", "william", "david", "richard", "joseph", "thomas",
+    "charles", "christopher", "daniel", "matthew", "anthony", "mark", "donald", "steven", "paul",
+    "andrew", "joshua", "kenneth", "kevin", "brian", "george", "timothy", "ronald", "edward",
+    "jason", "jeffrey", "ryan", "jacob", "gary", "nicholas", "eric", "jonathan", "stephen",
+    "larry", "justin", "scott", "brandon", "benjamin", "samuel", "gregory", "alexander",
+    "patrick", "frank", "raymond", "jack", "dennis", "jerry", "tyler", "aaron", "jose", "adam",
+    "nathan", "henry", "zachary", "douglas", "peter", "kyle", "noah", "ethan", "jeremy",
+    "christian", "keith", "roger", "terry", "austin", "sean", "carl", "harold", "dylan",
+    "arthur", "lawrence", "jordan", "jesse", "bryan", "bruce", "gabriel", "logan", "alan",
+    "juan", "albert", "elijah", "wayne", "vincent", "mason", "roy", "ralph", "russell",
+    "bradley", "philip", "eugene", "oliver", "liam", "lucas", "caleb", "owen", "miles",
+    "mary", "patricia", "jennifer", "linda", "elizabeth", "barbara", "susan", "jessica",
+    "sarah", "karen", "lisa", "nancy", "betty", "margaret", "sandra", "ashley", "kimberly",
+    "emily", "donna", "michelle", "carol", "amanda", "dorothy", "melissa", "deborah",
+    "stephanie", "rebecca", "sharon", "laura", "cynthia", "kathleen", "amy", "angela", "anna",
+    "brenda", "pamela", "emma", "nicole", "helen", "samantha", "katherine", "christine",
+    "rachel", "carolyn", "janet", "catherine", "maria", "heather", "diane", "olivia", "julie",
+    "victoria", "ruth", "lauren", "kelly", "christina", "joan", "evelyn", "judith", "megan",
+    "andrea", "cheryl", "hannah", "jacqueline", "martha", "gloria", "teresa", "ann", "sara",
+    "frances", "kathryn", "janice", "jean", "abigail", "alice", "julia", "sophia", "grace",
+    "denise", "amber", "marilyn", "beverly", "danielle", "theresa", "marie", "diana",
+    "brittany", "natalie", "isabella", "charlotte", "rose", "jane", "zoe", "chloe", "lily",
+    "ahmed", "mohammed", "mohamed", "ali", "omar", "hassan", "fatima", "aisha", "layla",
+    "yusuf", "ibrahim", "khalid", "ivan", "dmitri", "sergei", "vladimir", "natasha", "olga",
+    "svetlana", "hans", "klaus", "jurgen", "greta", "ingrid", "pierre", "jacques", "francois",
+    "jean-pierre", "camille", "marco", "giuseppe", "giulia", "francesca", "paolo",
+    "carlos", "jorge", "luis", "javier", "miguel", "pedro", "ana", "sofia", "lucia",
+    "isabel", "raj", "priya", "arjun", "ananya", "vikram", "deepak", "sunita", "wei",
+    "ming", "jing", "xiao", "yuki", "haruto", "sakura", "hiroshi", "takeshi", "minjun",
+    "jisoo", "seojun", "kwame", "amara", "chidi", "ngozi", "thabo", "zanele",
+    // The familiar short forms (hypocorisms) of the names above, which running text
+    // uses as often as the full form.
+    "bill", "bob", "rob", "tom", "tim", "jim", "joe", "dave", "mike", "steve", "pete", "nick",
+    "rick", "ron", "don", "andy", "tony", "chris", "matt", "greg", "phil", "ken", "ted", "ed",
+    "sam", "max", "ben", "dan", "alex", "charlie", "harry", "jake", "josh", "zach", "kate",
+    "katie", "sue", "liz", "beth", "meg", "jen", "jenny", "becky", "maggie", "molly", "annie",
+    "peggy", "debbie", "cathy", "ellie", "tina", "vicky", "pam", "val",
+];
+
+/// The Gregorian calendar month names and their abbreviations, as a regex
+/// alternation: the lexical form of a date written with its month name.
+///
+/// Longer alternatives come first (`september` before `sept` before `sep`): the
+/// regex engine prefers the leftmost alternative, so a shorter prefix listed first
+/// would commit to itself and leave the rest of the month name unmatched.
+const MONTH_PATTERN: &str = "january|february|march|april|august|september|october|november|\
+     december|june|july|may|jan|feb|mar|apr|jun|jul|aug|sept|sep|oct|nov|dec";
+
+/// The ISO-8601 weekday names, as a regex alternation.
+const WEEKDAY_PATTERN: &str = "monday|tuesday|wednesday|thursday|friday|saturday|sunday";
+
+/// Units of measure, as a regex alternation: a number carrying one of them is a
+/// quantified amount.
+///
+/// Source: the SI base and derived unit symbols and their English names, the US
+/// customary units, the binary byte multiples, and the units of time. The
+/// one-letter symbols (`m`, `g`, `a`, `t`, `in`) are deliberately LEFT OUT: in
+/// running English text they collide with ordinary words ("1 in the morning",
+/// "3 a side"), so a number next to one is not evidence of a measurement. Longer
+/// alternatives come first, for the reason [`MONTH_PATTERN`] gives.
+const UNIT_PATTERN: &str = "kilograms?|kilogrammes?|kg|grams?|grammes?|milligrams?|mg|tonnes?|\
+     tons?|pounds?|lbs?|ounces?|oz|kilometres?|kilometers?|km|centimetres?|centimeters?|cm|\
+     millimetres?|millimeters?|mm|metres?|meters?|miles?|mi|feet|foot|ft|yards?|yd|inches?|\
+     litres?|liters?|millilitres?|milliliters?|ml|gallons?|gal|bytes?|kib|mib|gib|kb|mb|gb|tb|\
+     pb|khz|mhz|ghz|hz|kwh|mwh|wh|kw|mw|gw|volts?|amperes?|amps?|joules?|calories?|cal|\
+     degrees?|seconds?|secs?|minutes?|mins?|hours?|hrs?|days?|weeks?|months?|years?|\
+     decades?|centuries?|century";
+
+/// English number words, as a regex alternation.
+const NUMBER_WORD_PATTERN: &str = "one|two|three|four|five|six|seven|eight|nine|ten|eleven|\
+     twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty|\
+     fifty|sixty|seventy|eighty|ninety|hundred|thousand|million|billion|trillion";
+
+/// Scale words a number can carry.
+const SCALE_PATTERN: &str = "hundred|thousand|million|billion|trillion";
+
+/// Currency names and ISO 4217 codes a written amount can carry, as a regex
+/// alternation.
+const CURRENCY_PATTERN: &str = "usd|eur|gbp|jpy|chf|cad|aud|cny|inr|dollars?|euros?|\
+     pounds sterling|yen|yuan|rupees?|francs?";
+
+/// The currency signs an amount can be written with, as a regex character class.
+///
+/// Source: the currency signs of the major ISO 4217 currencies (USD, EUR, GBP, JPY).
+const CURRENCY_SIGNS: &str = r"[$€£¥]";
+
+/// Date expressions that name a day relative to the moment of writing, as a regex.
+const RELATIVE_DATE_PATTERN: &str = "(?i)\\b(?:yesterday|today|tomorrow|tonight|\
+     last\\s+(?:night|week|month|year)|next\\s+(?:week|month|year)|\
+     this\\s+(?:morning|afternoon|evening|week|month|year))\\b";
+
+/// A token of the submitted document, in BYTE offsets into it.
+#[derive(Debug)]
+struct Token {
+    start: usize,
+    end: usize,
+    /// The token as the lexicons hold it: see [`normalise`].
+    lower: String,
+    capitalized: bool,
+    /// Whether this token opens a sentence — the one place the fallback rule needs
+    /// to know, because a sentence's first word is capitalized by orthography rather
+    /// than because it names anything.
+    sentence_initial: bool,
+}
+
+/// A span the recogniser typed, in BYTE offsets into the submitted document.
+#[derive(Debug, Clone)]
+struct Recognised {
+    start: usize,
+    end: usize,
+    entity_type: &'static str,
+    score: f32,
+    /// Which rule class typed the span: the tie-break when two candidates cover
+    /// exactly the same characters, so a closed-form lexical pattern outranks a
+    /// capitalized-phrase reading of the same characters.
+    priority: u8,
+}
+
+/// One lexical pattern rule: a closed-form shape whose match IS the entity.
+struct PatternRule {
+    re: Regex,
+    entity_type: &'static str,
+    priority: u8,
+    /// Which capture group carries the entity; `0` is the whole match.
+    capture: usize,
+    /// Fewest digits the match must carry to count — the guard a telephone-number
+    /// shape needs, since its separators otherwise read onto any digit run.
+    min_digits: usize,
+    /// Fewest tokens the match must carry to count.
+    min_tokens: usize,
+    /// Whether the match must carry a capitalized token — the orthography a name
+    /// has, as against a quoted sentence of running text.
+    require_capitalized: bool,
+    /// Whether trailing sentence punctuation is trimmed off the match (a URL or an
+    /// email address at the end of a sentence absorbs the full stop otherwise).
+    trim_trailing_punctuation: bool,
+}
+
+impl PatternRule {
+    fn new(pattern: &str, entity_type: &'static str, priority: u8) -> Self {
+        Self {
+            re: Regex::new(pattern).expect("a valid entity pattern"),
+            entity_type,
+            priority,
+            capture: 0,
+            min_digits: 0,
+            min_tokens: 0,
+            require_capitalized: false,
+            trim_trailing_punctuation: false,
+        }
+    }
+
+    fn capture(mut self, capture: usize) -> Self {
+        self.capture = capture;
+        self
+    }
+
+    fn min_digits(mut self, min_digits: usize) -> Self {
+        self.min_digits = min_digits;
+        self
+    }
+
+    fn named_phrase(mut self, min_tokens: usize) -> Self {
+        self.min_tokens = min_tokens;
+        self.require_capitalized = true;
+        self
+    }
+
+    fn trimmed(mut self) -> Self {
+        self.trim_trailing_punctuation = true;
+        self
+    }
+}
+
+/// The lexical pattern rules, in no particular order: overlaps between them are
+/// resolved by span length and then by `priority` in [`resolve_overlaps`].
+///
+/// Built once — every `Regex` is compiled a single time and is immutable
+/// afterwards, so every request runs the same automata.
+fn pattern_rules() -> &'static [PatternRule] {
+    static RULES: OnceLock<Vec<PatternRule>> = OnceLock::new();
+    RULES.get_or_init(|| {
+        vec![
+            // Entities that do not fit any other category: the modelled `OTHER`.
+            PatternRule::new(
+                r"[\p{L}\p{N}._%+\-]+@[\p{L}\p{N}\-]+(?:\.[\p{L}\p{N}\-]+)+",
+                TYPE_OTHER,
+                6,
+            )
+            .trimmed(),
+            PatternRule::new(r#"(?i)\b(?:https?://|www\.)[^\s<>"']+"#, TYPE_OTHER, 6).trimmed(),
+            PatternRule::new(
+                r"\+?\d{1,3}[-.\s]\(?\d{2,4}\)?[-.\s]\d{3,4}(?:[-.\s]\d{2,4})?",
+                TYPE_OTHER,
+                4,
+            )
+            .min_digits(9)
+            .trimmed(),
+            // A branded product, marked as one by the trademark sign after its name.
+            PatternRule::new(
+                r"(\p{Lu}[\p{L}\p{N}\-]*(?:\s+\p{Lu}[\p{L}\p{N}\-]*)*)\s*[\u{2122}\u{00AE}]",
+                TYPE_COMMERCIAL_ITEM,
+                7,
+            )
+            .capture(1),
+            // A creative work's title, marked as one by the quotation marks around a
+            // capitalized phrase of more than one word. A single quoted word is left
+            // to the phrase rules, since one word in quotes is emphasis at least as
+            // often as a title.
+            PatternRule::new(r#""([^"\n]{2,200})""#, TYPE_TITLE, 7)
+                .capture(1)
+                .named_phrase(2),
+            PatternRule::new(
+                "\u{201C}([^\u{201D}\n]{2,200})\u{201D}",
+                TYPE_TITLE,
+                7,
+            )
+            .capture(1)
+            .named_phrase(2),
+            // Dates: calendar forms first, then the looser ones.
+            PatternRule::new(r"\b\d{4}-\d{2}-\d{2}\b", TYPE_DATE, 6),
+            PatternRule::new(r"\b\d{1,2}/\d{1,2}/\d{2,4}\b", TYPE_DATE, 6),
+            PatternRule::new(
+                &format!(
+                    r"(?i)\b(?:{MONTH_PATTERN})\.?\s+\d{{1,2}}(?:st|nd|rd|th)?(?:,?\s+\d{{4}})?\b"
+                ),
+                TYPE_DATE,
+                6,
+            ),
+            PatternRule::new(
+                &format!(
+                    r"(?i)\b\d{{1,2}}(?:st|nd|rd|th)?\s+(?:{MONTH_PATTERN})\.?(?:,?\s+\d{{4}})?\b"
+                ),
+                TYPE_DATE,
+                6,
+            ),
+            PatternRule::new(
+                &format!(r"(?i)\b(?:{MONTH_PATTERN})\s+\d{{4}}\b"),
+                TYPE_DATE,
+                5,
+            ),
+            PatternRule::new(&format!(r"(?i)\b(?:{WEEKDAY_PATTERN})\b"), TYPE_DATE, 3),
+            PatternRule::new(RELATIVE_DATE_PATTERN, TYPE_DATE, 3),
+            // A bare four-digit number in the Gregorian year range reads as a year.
+            PatternRule::new(r"\b[12]\d{3}\b", TYPE_DATE, 3),
+            // Quantified amounts: the modelled `QUANTITY`.
+            PatternRule::new(
+                r"(?i)\b\d+(?:[.,]\d+)?\s*(?:%|percent\b|per cent\b)",
+                TYPE_QUANTITY,
+                6,
+            ),
+            PatternRule::new(
+                &format!(
+                    r"(?i){CURRENCY_SIGNS}\s?\d[\d,]*(?:\.\d+)?(?:\s(?:{SCALE_PATTERN}))?"
+                ),
+                TYPE_QUANTITY,
+                6,
+            ),
+            PatternRule::new(
+                &format!(
+                    r"(?i)\b\d[\d,]*(?:\.\d+)?\s*(?:{SCALE_PATTERN})?\s*(?:{CURRENCY_PATTERN})\b"
+                ),
+                TYPE_QUANTITY,
+                6,
+            ),
+            PatternRule::new(
+                &format!(r"(?i)\b\d[\d,]*(?:\.\d+)?\s*(?:{UNIT_PATTERN})\b"),
+                TYPE_QUANTITY,
+                5,
+            ),
+            PatternRule::new(
+                &format!(r"(?i)\b\d[\d,]*(?:\.\d+)?\s+(?:{SCALE_PATTERN})\b"),
+                TYPE_QUANTITY,
+                5,
+            ),
+            PatternRule::new(
+                &format!(r"(?i)\b(?:{NUMBER_WORD_PATTERN})\s+(?:{SCALE_PATTERN})\b"),
+                TYPE_QUANTITY,
+                4,
+            ),
+            PatternRule::new(
+                &format!(r"(?i)\b(?:{NUMBER_WORD_PATTERN})\s+(?:{UNIT_PATTERN})\b"),
+                TYPE_QUANTITY,
+                4,
+            ),
+            PatternRule::new(r"\b\d[\d,]*(?:\.\d+)?\b", TYPE_QUANTITY, 2),
+        ]
+    })
+}
+
+/// The document formats a `Bytes` input document can carry, by their leading magic
+/// bytes, and the name each one goes by.
+///
+/// Source: the file signatures these formats define in their own specifications —
+/// PDF's `%PDF-` header, the ZIP local-file header an Office Open XML document is a
+/// container of, the OLE2 compound-file header of a legacy Word document, and the
+/// signatures of the PNG, JPEG, GIF and TIFF image formats.
+///
+/// A signature is checked even when the bytes happen to be valid UTF-8 — `%PDF-1.7`
+/// is — because such a document still needs text extraction, which this emulator
+/// does not perform, rather than being prose.
+const DOCUMENT_SIGNATURES: &[(&[u8], &str)] = &[
+    (b"%PDF-", "a PDF document"),
+    (b"PK\x03\x04", "an Office Open XML document"),
+    (b"\xD0\xCF\x11\xE0", "a legacy Microsoft Office document"),
+    (b"\x89PNG\r\n\x1A\n", "a PNG image"),
+    (b"\xFF\xD8\xFF", "a JPEG image"),
+    (b"GIF87a", "a GIF image"),
+    (b"GIF89a", "a GIF image"),
+    (b"II*\x00", "a TIFF image"),
+    (b"MM\x00*", "a TIFF image"),
+    (b"{\\rtf", "an RTF document"),
+];
+
+/// The document format `bytes` announces, when it announces one.
+fn document_signature(bytes: &[u8]) -> Option<&'static str> {
+    DOCUMENT_SIGNATURES
+        .iter()
+        .find(|(signature, _)| bytes.starts_with(signature))
+        .map(|(_, name)| *name)
+}
+
+/// A token as the lexicons hold it: lowercase, with the periods an abbreviation
+/// carries removed, so `U.S.` and `US` are one entry.
+fn normalise(token: &str) -> String {
+    token.to_lowercase().replace('.', "")
+}
+
+fn lexicon(entries: &'static [&'static str]) -> HashSet<&'static str> {
+    entries.iter().copied().collect()
+}
+
+fn function_words() -> &'static HashSet<&'static str> {
+    static SET: OnceLock<HashSet<&'static str>> = OnceLock::new();
+    SET.get_or_init(|| lexicon(FUNCTION_WORDS))
+}
+
+fn name_connectors() -> &'static HashSet<&'static str> {
+    static SET: OnceLock<HashSet<&'static str>> = OnceLock::new();
+    SET.get_or_init(|| {
+        NAME_PARTICLES
+            .iter()
+            .chain(PHRASE_CONNECTORS)
+            .copied()
+            .collect()
+    })
+}
+
+fn phrase_connectors() -> &'static HashSet<&'static str> {
+    static SET: OnceLock<HashSet<&'static str>> = OnceLock::new();
+    SET.get_or_init(|| lexicon(PHRASE_CONNECTORS))
+}
+
+/// Whether a word is a head noun that names an institution, a place or a happening,
+/// which is both what types a phrase carrying it and what may take an `of`
+/// complement.
+fn is_head_noun(word: &str) -> bool {
+    organization_designators().contains(word)
+        || geographic_designators().contains(word)
+        || event_designators().contains(word)
+}
+
+fn abbreviations() -> &'static HashSet<&'static str> {
+    static SET: OnceLock<HashSet<&'static str>> = OnceLock::new();
+    SET.get_or_init(|| {
+        ABBREVIATIONS
+            .iter()
+            .chain(PERSON_TITLES)
+            .chain(ORGANIZATION_DESIGNATORS)
+            .copied()
+            .collect()
+    })
+}
+
+fn person_titles() -> &'static HashSet<&'static str> {
+    static SET: OnceLock<HashSet<&'static str>> = OnceLock::new();
+    SET.get_or_init(|| lexicon(PERSON_TITLES))
+}
+
+fn organization_designators() -> &'static HashSet<&'static str> {
+    static SET: OnceLock<HashSet<&'static str>> = OnceLock::new();
+    SET.get_or_init(|| lexicon(ORGANIZATION_DESIGNATORS))
+}
+
+fn geographic_designators() -> &'static HashSet<&'static str> {
+    static SET: OnceLock<HashSet<&'static str>> = OnceLock::new();
+    SET.get_or_init(|| lexicon(GEOGRAPHIC_DESIGNATORS))
+}
+
+fn event_designators() -> &'static HashSet<&'static str> {
+    static SET: OnceLock<HashSet<&'static str>> = OnceLock::new();
+    SET.get_or_init(|| lexicon(EVENT_DESIGNATORS))
+}
+
+/// A multi-word name as the lexicons hold it: the token forms joined by single
+/// spaces, with the periods and ampersands a written name carries dropped, so
+/// `Johnson & Johnson` and `H&M` are one entry each however the document spaces
+/// them.
+fn canonical(phrase: &str) -> String {
+    phrase
+        .to_lowercase()
+        .split_whitespace()
+        .map(|word| word.replace(['.', '&'], ""))
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<String>>()
+        .join(" ")
+}
+
+fn organizations() -> &'static HashSet<String> {
+    static SET: OnceLock<HashSet<String>> = OnceLock::new();
+    SET.get_or_init(|| {
+        WELL_KNOWN_ORGANIZATIONS
+            .iter()
+            .map(|entry| canonical(entry))
+            .collect()
+    })
+}
+
+fn places() -> &'static HashSet<String> {
+    static SET: OnceLock<HashSet<String>> = OnceLock::new();
+    SET.get_or_init(|| {
+        COUNTRIES_AND_REGIONS
+            .iter()
+            .chain(US_STATES)
+            .chain(MAJOR_CITIES)
+            .map(|entry| canonical(entry))
+            .collect()
+    })
+}
+
+fn given_names() -> &'static HashSet<&'static str> {
+    static SET: OnceLock<HashSet<&'static str>> = OnceLock::new();
+    SET.get_or_init(|| lexicon(GIVEN_NAMES))
+}
+
+/// A word, a number or an abbreviation: a maximal run of letters and digits, with
+/// the internal period, ampersand, apostrophe or hyphen a name can carry.
+fn token_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"[\p{L}\p{N}]+(?:[.&'\u{2019}\-][\p{L}\p{N}]+)*").expect("a valid token pattern")
+    })
+}
+
+/// Whether the characters between two tokens end a sentence.
+///
+/// A period does only when the token in front of it is not an abbreviation or an
+/// initial, so `Dr. Jane` stays one sentence while `met. Jane` does not.
+fn ends_sentence(previous: &Token, gap: &str) -> bool {
+    if gap.contains('\n') || gap.contains('!') || gap.contains('?') {
+        return true;
+    }
+    gap.contains('.') && !is_abbreviation(previous)
+}
+
+fn is_abbreviation(token: &Token) -> bool {
+    token.lower.chars().count() == 1 || abbreviations().contains(token.lower.as_str())
+}
+
+/// Split the document into tokens, marking which ones are capitalized and which open
+/// a sentence.
+fn tokenize(text: &str) -> Vec<Token> {
+    let mut tokens: Vec<Token> = Vec::new();
+    for found in token_regex().find_iter(text) {
+        let sentence_initial = match tokens.last() {
+            None => true,
+            Some(previous) => ends_sentence(previous, &text[previous.end..found.start()]),
+        };
+        let raw = found.as_str();
+        tokens.push(Token {
+            start: found.start(),
+            end: found.end(),
+            lower: normalise(raw),
+            capitalized: raw.chars().next().is_some_and(char::is_uppercase),
+            sentence_initial,
+        });
+    }
+    tokens
+}
+
+/// Whether a candidate span may run across the characters between two of its tokens:
+/// whitespace, an ampersand (`Johnson & Johnson`) and the period of an abbreviation
+/// or an initial keep one name together; anything else ends it, as does a line break.
+fn continues_span(previous: &Token, gap: &str) -> bool {
+    if gap.contains('\n') {
+        return false;
+    }
+    if !gap
+        .chars()
+        .all(|c| c.is_whitespace() || c == '&' || c == '.')
+    {
+        return false;
+    }
+    !gap.contains('.') || is_abbreviation(previous)
+}
+
+/// Every entity a lexical pattern rule finds.
+fn pattern_entities(text: &str) -> Vec<Recognised> {
+    let mut found = Vec::new();
+    for rule in pattern_rules() {
+        for captures in rule.re.captures_iter(text) {
+            let Some(matched) = captures.get(rule.capture) else {
+                continue;
+            };
+            let mut start = matched.start();
+            let mut end = matched.end();
+            if rule.trim_trailing_punctuation {
+                while end > start
+                    && text[start..end]
+                        .chars()
+                        .next_back()
+                        .is_some_and(|c| matches!(c, '.' | ',' | ';' | ':' | '!' | '?' | ')'))
+                {
+                    end -= text[start..end]
+                        .chars()
+                        .next_back()
+                        .map_or(0, char::len_utf8);
+                }
+            }
+            // A span may also have leading whitespace when the pattern allowed one
+            // before a scale word; never report it as part of the entity.
+            while start < end && text[start..end].starts_with(char::is_whitespace) {
+                start += text[start..end]
+                    .chars()
+                    .next()
+                    .map_or(0, char::len_utf8);
+            }
+            if start >= end {
+                continue;
+            }
+            if rule.min_digits > 0
+                && text[start..end].chars().filter(char::is_ascii_digit).count() < rule.min_digits
+            {
+                continue;
+            }
+            let matched_tokens: Vec<&str> = token_regex()
+                .find_iter(&text[start..end])
+                .map(|token| token.as_str())
+                .collect();
+            if matched_tokens.len() < rule.min_tokens {
+                continue;
+            }
+            if rule.require_capitalized
+                && !matched_tokens
+                    .iter()
+                    .any(|token| token.chars().next().is_some_and(char::is_uppercase))
+            {
+                continue;
+            }
+            let span_tokens = matched_tokens.len().max(1);
+            found.push(Recognised {
+                start,
+                end,
+                entity_type: rule.entity_type,
+                // A pattern rule's evidence is the span's own characters, so its
+                // coverage is total by construction and the confidence is the rule
+                // class's weight: `confidence` is still what computes it, so every
+                // rule reports its score the one way.
+                score: confidence(WEIGHT_PATTERN, span_tokens, span_tokens),
+                priority: rule.priority,
+            });
+        }
+    }
+    found
+}
+
+/// Every entity a capitalized phrase in running text yields.
+fn phrase_entities(text: &str) -> Vec<Recognised> {
+    let tokens = tokenize(text);
+    let mut found = Vec::new();
+    let mut index = 0;
+    while index < tokens.len() {
+        if !tokens[index].capitalized {
+            index += 1;
+            continue;
+        }
+        if function_words().contains(tokens[index].lower.as_str()) {
+            // An article or a preposition opens a name only when a capitalized
+            // token follows it (`The New York Times`), and `classify_phrase` trims
+            // it back off unless a lexicon names the phrase as written.
+            let opens_a_name = tokens
+                .get(index + 1)
+                .is_some_and(|next| next.capitalized)
+                && continues_span(&tokens[index], &text[tokens[index].end..tokens[index + 1].start]);
+            if !opens_a_name {
+                index += 1;
+                continue;
+            }
+        }
+        let mut end = index + 1;
+        while end < tokens.len() && end - index < MAX_SPAN_TOKENS {
+            if !continues_span(&tokens[end - 1], &text[tokens[end - 1].end..tokens[end].start]) {
+                break;
+            }
+            if tokens[end].capitalized {
+                end += 1;
+                continue;
+            }
+            // A run of lowercase particles stays in the name only when a capitalized
+            // token follows it (`The Old Man and the Sea`, `Bank of America`).
+            let mut after_particles = end;
+            while after_particles < tokens.len()
+                && name_connectors().contains(tokens[after_particles].lower.as_str())
+                && continues_span(
+                    &tokens[after_particles - 1],
+                    &text[tokens[after_particles - 1].end..tokens[after_particles].start],
+                )
+            {
+                after_particles += 1;
+            }
+            let name_resumes = after_particles > end
+                && after_particles < tokens.len()
+                && tokens[after_particles].capitalized
+                && after_particles + 1 - index <= MAX_SPAN_TOKENS
+                && continues_span(
+                    &tokens[after_particles - 1],
+                    &text[tokens[after_particles - 1].end..tokens[after_particles].start],
+                );
+            if name_resumes {
+                end = after_particles + 1;
+                continue;
+            }
+            break;
+        }
+        for part in divide_phrase(&tokens, index..end) {
+            if let Some(entity) = classify_phrase(text, &tokens, part) {
+                found.push(entity);
+            }
+        }
+        index = end;
+    }
+    found
+}
+
+/// How many of a phrase's tokens are in `cues`, or `None` when none are.
+fn cue_tokens(normalised: &[String], cues: &HashSet<&'static str>) -> Option<usize> {
+    let count = normalised
+        .iter()
+        .filter(|token| cues.contains(token.as_str()))
+        .count();
+    (count > 0).then_some(count)
+}
+
+/// The longest contiguous run of a phrase's tokens that a lexicon names, with the
+/// type that lexicon gives it. Organizations are consulted before places at equal
+/// length, so a company named after a city reads as the company.
+fn lexicon_match(normalised: &[String]) -> Option<(usize, &'static str)> {
+    for length in (1..=normalised.len()).rev() {
+        for start in 0..=normalised.len() - length {
+            let phrase = canonical(&normalised[start..start + length].join(" "));
+            if organizations().contains(phrase.as_str()) {
+                return Some((length, TYPE_ORGANIZATION));
+            }
+            if places().contains(phrase.as_str()) {
+                return Some((length, TYPE_LOCATION));
+            }
+        }
+    }
+    None
+}
+
+/// The phrase's tokens as a lexicon holds a name: see [`canonical`].
+fn canonical_phrase(tokens: &[Token], phrase: Range<usize>) -> String {
+    canonical(
+        &tokens[phrase]
+            .iter()
+            .map(|token| token.lower.as_str())
+            .collect::<Vec<&str>>()
+            .join(" "),
+    )
+}
+
+/// Divide a candidate span back into the names it joined.
+///
+/// A span a lexicon names as a whole is one name (`Bank of America`). Otherwise it is
+/// divided at every run of phrase connectors, except where the word in front of the
+/// run is an institution, place or event head noun and so takes the connector's
+/// complement (`University of Washington`): `Jane Doe and Michael Brown` is two
+/// names, `Department of Justice` is one.
+fn divide_phrase(tokens: &[Token], phrase: Range<usize>) -> Vec<Range<usize>> {
+    let whole = canonical_phrase(tokens, phrase.clone());
+    if organizations().contains(whole.as_str()) || places().contains(whole.as_str()) {
+        return vec![phrase];
+    }
+    let mut parts = Vec::new();
+    let mut start = phrase.start;
+    let mut index = phrase.start;
+    while index < phrase.end {
+        if !phrase_connectors().contains(tokens[index].lower.as_str()) {
+            index += 1;
+            continue;
+        }
+        let run_start = index;
+        while index < phrase.end && phrase_connectors().contains(tokens[index].lower.as_str()) {
+            index += 1;
+        }
+        if run_start > start && is_head_noun(&tokens[run_start - 1].lower) {
+            continue;
+        }
+        if run_start > start {
+            parts.push(start..run_start);
+        }
+        start = index;
+    }
+    if start < phrase.end {
+        parts.push(start..phrase.end);
+    }
+    parts
+}
+
+/// Type one capitalized phrase from the evidence around and inside it, in order of
+/// the evidence's precision. A phrase no rule places is reported as `OTHER` — unless
+/// it is a lone word opening a sentence, where the capital is orthography rather than
+/// evidence of a name, and then nothing is reported.
+fn classify_phrase(text: &str, tokens: &[Token], phrase: Range<usize>) -> Option<Recognised> {
+    // The phrase as the document writes it, before an honorific or an article in
+    // front of the name is trimmed off.
+    let written_start = tokens[phrase.start].start;
+    let written_end = tokens[phrase.end - 1].end;
+    let written_tokens = phrase.len();
+    // A lexicon entry naming the phrase AS WRITTEN is the whole evidence, so the
+    // name keeps the article it is written with (`The New York Times`).
+    let whole = canonical_phrase(tokens, phrase.clone());
+    for (lexicon, entity_type) in [
+        (organizations(), TYPE_ORGANIZATION),
+        (places(), TYPE_LOCATION),
+    ] {
+        if lexicon.contains(whole.as_str()) {
+            return Some(Recognised {
+                start: written_start,
+                end: written_end,
+                entity_type,
+                score: confidence(WEIGHT_GAZETTEER, written_tokens, written_tokens),
+                priority: 1,
+            });
+        }
+    }
+    let mut phrase = phrase;
+    let mut title_cue = false;
+    // An honorific or an article in front of the name is not part of it.
+    while phrase.len() > 1 {
+        let leading = tokens[phrase.start].lower.as_str();
+        if person_titles().contains(leading) {
+            title_cue = true;
+            phrase.start += 1;
+            continue;
+        }
+        if function_words().contains(leading) {
+            phrase.start += 1;
+            continue;
+        }
+        break;
+    }
+    if !title_cue {
+        title_cue = phrase
+            .start
+            .checked_sub(1)
+            .and_then(|previous| tokens.get(previous))
+            .is_some_and(|previous| {
+                person_titles().contains(previous.lower.as_str())
+                    && text[previous.end..tokens[phrase.start].start]
+                        .chars()
+                        .all(|c| c.is_whitespace() || c == '.')
+            });
+    }
+
+    let start = tokens[phrase.start].start;
+    let end = tokens[phrase.end - 1].end;
+    let normalised: Vec<String> = tokens[phrase.clone()]
+        .iter()
+        .map(|token| token.lower.clone())
+        .collect();
+    let span_tokens = normalised.len();
+    let typed = |entity_type: &'static str, weight: f32, evidence: usize| {
+        Some(Recognised {
+            start,
+            end,
+            entity_type,
+            score: confidence(weight, evidence, span_tokens),
+            priority: 1,
+        })
+    };
+
+    if let Some(cues) = cue_tokens(&normalised, organization_designators()) {
+        return typed(TYPE_ORGANIZATION, WEIGHT_CUE, cues);
+    }
+    if title_cue {
+        return typed(TYPE_PERSON, WEIGHT_CUE, 1);
+    }
+    if let Some(cues) = cue_tokens(&normalised, geographic_designators()) {
+        return typed(TYPE_LOCATION, WEIGHT_CUE, cues);
+    }
+    if let Some(cues) = cue_tokens(&normalised, event_designators()) {
+        return typed(TYPE_EVENT, WEIGHT_CUE, cues);
+    }
+    let lexicon_hit = lexicon_match(&normalised);
+    // A lexicon entry naming the WHOLE phrase outranks the given-name rule, so a
+    // place that is also a given name reads as the place.
+    if let Some((length, entity_type)) = lexicon_hit {
+        if length == span_tokens {
+            return typed(entity_type, WEIGHT_GAZETTEER, length);
+        }
+    }
+    if given_names().contains(normalised[0].as_str()) {
+        return typed(TYPE_PERSON, WEIGHT_CUE, 1);
+    }
+    if let Some((length, entity_type)) = lexicon_hit {
+        return typed(entity_type, WEIGHT_GAZETTEER, length);
+    }
+    if span_tokens >= 2 || !tokens[phrase.start].sentence_initial {
+        return typed(TYPE_OTHER, WEIGHT_UNPLACED, span_tokens);
+    }
+    None
+}
+
+/// Keep one entity per stretch of characters: the earliest candidate first, the
+/// longest reading of the same start, and at equal length the rule class with the
+/// higher precision. Overlapping candidates behind the one kept are dropped, so the
+/// returned list is ordered by position and never double-reports a character.
+fn resolve_overlaps(mut found: Vec<Recognised>) -> Vec<Recognised> {
+    found.sort_by(|left, right| {
+        left.start
+            .cmp(&right.start)
+            .then((right.end - right.start).cmp(&(left.end - left.start)))
+            .then(right.priority.cmp(&left.priority))
+            .then(right.score.total_cmp(&left.score))
+    });
+    let mut kept: Vec<Recognised> = Vec::new();
+    for candidate in found {
+        if kept.last().is_none_or(|last| candidate.start >= last.end) {
+            kept.push(candidate);
+        }
+    }
+    kept
+}
+
+/// Every entity the recogniser finds in `text`, as the modelled `Entity` list:
+/// ordered by position, each carrying the characters it covers, the modelled type,
+/// the zero-based CHARACTER offsets of that stretch and the confidence of the rule
+/// that typed it.
+///
+/// The offsets are consistent with the text by construction: `BeginOffset` is the
+/// character index the entity starts at and `EndOffset` the index one past its last
+/// character, so the entity's `Text` is exactly the substring they delimit.
+pub fn detect_entities(text: &str) -> Vec<Entity> {
+    let char_starts: Vec<usize> = text.char_indices().map(|(index, _)| index).collect();
+    let char_offset = |byte: usize| char_starts.partition_point(|&start| start < byte) as i32;
+    let mut found = pattern_entities(text);
+    found.extend(phrase_entities(text));
+    resolve_overlaps(found)
+        .into_iter()
+        .map(|entity| Entity {
+            score: Some(entity.score),
+            r#type: Some(entity.entity_type.to_string()),
+            text: Some(text[entity.start..entity.end].to_string()),
+            begin_offset: Some(char_offset(entity.start)),
+            end_offset: Some(char_offset(entity.end)),
+            // Plain-text input has no blocks, so nothing to reference: the modelled
+            // member documents it as "empty for plain-text input".
+            block_references: None,
+        })
+        .collect()
+}
+
+/// [`detect_entities`] run OFF the async worker: the recogniser is synchronous,
+/// CPU-bound work with no await of its own, so it goes to the blocking pool and the
+/// worker serving this request is released while it runs. The
+/// `spawn_blocking(..).await` is a real await point, so a request waiting on a
+/// recognition can be cancelled or timed out, and a burst of concurrent documents
+/// cannot starve the operations sharing the runtime.
+///
+/// `Err` carries the sentence the caller puts in its OWN modelled server error: the
+/// pass either did not answer inside [`RECOGNITION_TIME_BUDGET`] — the budget bounds
+/// the caller's wait, not the blocking task, which runs to its natural end — or did
+/// not run at all, and in both cases nothing was analysed, so no entity may be
+/// fabricated for it.
+async fn recognize_entities(text: String) -> Result<Vec<Entity>, String> {
+    match ::tokio::time::timeout(
+        RECOGNITION_TIME_BUDGET,
+        ::tokio::task::spawn_blocking(move || detect_entities(&text)),
+    )
+    .await
+    {
+        Ok(Ok(entities)) => Ok(entities),
+        Ok(Err(error)) => Err(format!("the entity recognition did not complete: {error}")),
+        Err(_) => Err(format!(
+            "the entity recognition did not complete within {} seconds",
+            RECOGNITION_TIME_BUDGET.as_secs()
+        )),
+    }
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -162,6 +1409,31 @@ impl From<DetectEntitiesErrorModeled> for DetectEntitiesError {
     fn from(modeled: DetectEntitiesErrorModeled) -> Self {
         crate::scaffolded::Scaffolded::Modeled(modeled)
     }
+}
+
+/// Refuse the request as invalid, with the modelled 400 the operation declares.
+fn invalid_request(message: String) -> DetectEntitiesError {
+    DetectEntitiesErrorModeled::InvalidRequestException(InvalidRequestException {
+        message: Some(message),
+        reason: None,
+        detail: None,
+    })
+    .into()
+}
+
+/// Refuse an input DOCUMENT this emulator cannot read, as the operation's
+/// documentation prescribes for a document-level error: the same 400, carrying the
+/// modelled `InvalidRequestReason` and the `InvalidRequestDetailReason` that says the
+/// document's type is not one it can extract text from.
+fn invalid_document(message: String) -> DetectEntitiesError {
+    DetectEntitiesErrorModeled::InvalidRequestException(InvalidRequestException {
+        message: Some(message),
+        reason: Some("INVALID_DOCUMENT".to_string()),
+        detail: Some(InvalidRequestDetail {
+            reason: Some("UNSUPPORTED_DOC_TYPE".to_string()),
+        }),
+    })
+    .into()
 }
 
 /// The `DetectEntities` operation.
@@ -200,18 +1472,168 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DetectEntities` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DetectEntitiesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // Synchronous inference holds no state: the answer is a function of the
+        // submitted document alone, so repeating a call returns the same entities and
+        // calling it changes nothing a later caller reads.
+        let _ = (ctx, &self.engine);
+
+        // A custom entity recognizer is reached through an endpoint this service
+        // persists, and no operation in this crate persists one yet
+        // (`CreateEndpoint` is still a scaffold), so every endpoint a caller can name
+        // is a resource that does not exist. That is the modelled 404, not a 501:
+        // the operation is implemented, the resource is absent.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DetectEntities"))
+        // PRECEDENCE: the endpoint is resolved FIRST, before the document and
+        // language preconditions below, because an endpoint names the model that
+        // would analyse the document — and it also supplies the language, so
+        // `LanguageCode` is only required once no endpoint was given. A request
+        // naming an absent endpoint is answered for the endpoint whatever else it
+        // carries.
+        if let Some(endpoint_arn) = input.endpoint_arn.as_deref() {
+            return Err(DetectEntitiesErrorModeled::ResourceUnavailableException(
+                ResourceUnavailableException {
+                    message: Some(format!(
+                        "Endpoint {endpoint_arn} does not exist. Check the endpoint and try your \
+                         request again."
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Exactly one of `Text` and `Bytes` carries the document: the modelled
+        // `Text` member documents "If you enter text using this parameter, do not use
+        // the Bytes parameter", and a request carrying neither names no document at
+        // all.
+        let submitted = match (input.text.as_deref(), input.bytes.as_deref()) {
+            (Some(_), Some(_)) => {
+                return Err(invalid_request(
+                    "Specify either Text or Bytes, not both: the Bytes parameter carries the \
+                     input document when Text is not used."
+                        .to_string(),
+                ))
+            }
+            (None, None) => {
+                return Err(invalid_request(
+                    "Either Text or Bytes must be specified: the request carries no input \
+                     document."
+                        .to_string(),
+                ))
+            }
+            (Some(text), None) => DocumentInput::Text(text.to_string()),
+            (None, Some(bytes)) => {
+                // A plain-text input document is "equivelent to using the Text
+                // parameter", as the modelled `Bytes` member documents. A PDF, Word
+                // or image document needs text extraction, which this emulator does
+                // not perform, and the operation's documentation makes a
+                // document-level error an `InvalidRequestException`.
+                let signature = document_signature(bytes);
+                let plain_text = std::str::from_utf8(bytes)
+                    .ok()
+                    .filter(|_| signature.is_none());
+                let Some(decoded) = plain_text else {
+                    return Err(invalid_document(format!(
+                        "The input document is {} and could not be read as plain text: this \
+                         emulator extracts text only from a plain-text input document, not from \
+                         a PDF, Word or image document.",
+                        signature.unwrap_or("not valid UTF-8 text")
+                    )));
+                };
+                DocumentInput::PlainTextDocument(decoded.to_string())
+            }
+        };
+
+        // `LanguageCode` is what names the model to analyse with; it is optional in
+        // the model only because an `EndpointArn` supplies the language of a custom
+        // model instead, and no endpoint was given here.
+        let Some(language_code) = input.language_code.as_deref() else {
+            return Err(invalid_request(
+                "LanguageCode must be specified when EndpointArn is not provided.".to_string(),
+            ));
+        };
+        if !ANALYSABLE_LANGUAGES.contains(&language_code) {
+            return Err(DetectEntitiesErrorModeled::UnsupportedLanguageException(
+                UnsupportedLanguageException {
+                    message: Some(format!(
+                        "Amazon Comprehend can't process the language {language_code}: this \
+                         emulator's entity recognizer has lexical resources for {} only.",
+                        ANALYSABLE_LANGUAGES.join(", ")
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The same ceiling for both input members: a plain-text file in `Bytes` is
+        // "equivelent to using the Text parameter", as that member documents, and
+        // the larger maximum it mentions for the other document types belongs to the
+        // text extraction this emulator refuses as an invalid document above.
+        let document = submitted.document();
+        if let Some(message) = crate::state::text_size_refusal(document, MAX_TEXT_BYTES) {
+            return Err(
+                DetectEntitiesErrorModeled::TextSizeLimitExceededException(
+                    TextSizeLimitExceededException {
+                        message: Some(message),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let entities = recognize_entities(document.to_string())
+            .await
+            .map_err(|message| {
+                DetectEntitiesErrorModeled::InternalServerException(InternalServerException {
+                    message: Some(message),
+                })
+            })?;
+        Ok(match submitted {
+            // `DocumentMetadata` and `DocumentType` are "present in the response only
+            // if your request used the Byte parameter", and `Blocks` "is not present
+            // in the response for plain-text inputs" — which a plain-text input
+            // document is.
+            DocumentInput::Text(_) => DetectEntitiesOutput {
+                entities: Some(entities),
+                ..DetectEntitiesOutput::default()
+            },
+            DocumentInput::PlainTextDocument(ref document) => DetectEntitiesOutput {
+                entities: Some(entities),
+                document_metadata: Some(DocumentMetadata {
+                    // A plain-text document is a single page, and every character of
+                    // it was extracted.
+                    pages: Some(1),
+                    extracted_characters: Some(vec![ExtractedCharactersListItem {
+                        page: Some(1),
+                        count: Some(i32::try_from(document.chars().count()).unwrap_or(i32::MAX)),
+                    }]),
+                }),
+                document_type: Some(vec![DocumentTypeListItem {
+                    page: Some(1),
+                    r#type: Some("PLAIN_TEXT".to_string()),
+                }]),
+                // No page-level error: the one page was read in full. The modelled
+                // member documents the field as empty when the system encountered no
+                // errors.
+                errors: Some(Vec::new()),
+                blocks: None,
+            },
+        })
+    }
+}
+
+/// Which input member carried the document, which is what decides whether the
+/// response reports the document-extraction members.
+enum DocumentInput {
+    /// The `Text` member: a UTF-8 string, no document extraction.
+    Text(String),
+    /// The `Bytes` member holding a plain-text input document.
+    PlainTextDocument(String),
+}
+
+impl DocumentInput {
+    fn document(&self) -> &str {
+        match self {
+            Self::Text(text) | Self::PlainTextDocument(text) => text,
+        }
     }
 }
