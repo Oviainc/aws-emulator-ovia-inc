@@ -36,7 +36,11 @@ const TARGET_MEMBERS: &[(&str, &str)] = &[
 ];
 
 /// An on-premises selector every instance tagged `Fleet=deployable` satisfies.
-fn deployable() -> Value {
+///
+/// `pub(crate)` because the `get_deployment_target` suite drives the same fleet
+/// through the single-target reader; there is one selector helper for the target
+/// suites, not one per suite.
+pub(crate) fn deployable() -> Value {
     json!({
         "onPremisesInstanceTagFilters": [
             {"Key": "Fleet", "Value": "deployable", "Type": "KEY_AND_VALUE"},
@@ -71,7 +75,11 @@ async fn get_one(emulator: &Emulator, deployment_id: &str, target_id: &str) -> V
 /// The one per-type member a `DeploymentTarget` carries, and the type it says it
 /// is: every other per-type member must be absent, so a target is reported in
 /// exactly one of them.
-fn carried(case: &str, target: &Value) -> (String, Value) {
+///
+/// `pub(crate)` because the `get_deployment_target` suite reads targets of
+/// several platforms too, and which member carries a target is checked once,
+/// here.
+pub(crate) fn carried(case: &str, target: &Value) -> (String, Value) {
     let reported = target["deploymentTargetType"]
         .as_str()
         .unwrap_or_default()

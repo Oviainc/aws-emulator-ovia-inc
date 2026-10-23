@@ -112,6 +112,16 @@ pub const MAX_LOG_GROUPS: usize = 1_000_000;
 /// exactly one.
 pub const MAX_ACCOUNT_RESOURCE_POLICIES: usize = 10;
 
+/// AWS's documented per-resource tag quota, from `TagResource`: "You can associate as many
+/// as 50 tags with a CloudWatch Logs resource" — the quota `TooManyTagsException` states
+/// ("A resource can have no more than 50 tags").
+///
+/// The modelled `Tags` map is `@length(max: 50)`, so the boundary validator already refuses
+/// a single request carrying more than this; the quota this constant holds a resource to is
+/// on the tag set the resource ends up with, which a request inside that length can still
+/// push past when the resource already carries tags.
+pub const MAX_TAGS_PER_RESOURCE: usize = 50;
+
 /// The longest `policyDocument` `PutDataProtectionPolicy` admits, from that member's own
 /// documentation: "The JSON specified in policyDocument can be up to 30,720 characters."
 /// The model puts no `@length` on `DataProtectionPolicyDocument`, so nothing refuses an
@@ -382,6 +392,41 @@ impl ComAmazonawsCloudwatchlogsLogs20140328State {
         let seq = self.next_policy_revision;
         self.next_policy_revision = self.next_policy_revision.saturating_add(1);
         seq
+    }
+
+    /// The tags assigned to the resource a tagging operation named, or `None` when the
+    /// account holds no such resource.
+    ///
+    /// One resource holds ONE tag set, on the resource's own record, so every operation
+    /// that reads or writes tags — and every reporter of the resource itself, such as
+    /// `ListLogGroups`'s `logGroupTags` filter — sees the same map.
+    pub fn resource_tags(&self, resource: &TaggedResource) -> Option<&BTreeMap<String, String>> {
+        match resource {
+            TaggedResource::LogGroup(name) => self.log_groups.get(name).map(|group| &group.tags),
+            TaggedResource::Delivery(id) => self.deliveries.get(id).map(|delivery| &delivery.tags),
+            // A logical destination carries tags too, but `PutDestination` is still a
+            // scaffold stub, so the account holds no destination at all: an ARN naming one
+            // names a resource that does not exist. Implementing that operation is what
+            // gives this arm a store to look in.
+            TaggedResource::Destination(_) => None,
+        }
+    }
+
+    /// The same tag set, to write. See [`Self::resource_tags`].
+    pub fn resource_tags_mut(
+        &mut self,
+        resource: &TaggedResource,
+    ) -> Option<&mut BTreeMap<String, String>> {
+        match resource {
+            TaggedResource::LogGroup(name) => {
+                self.log_groups.get_mut(name).map(|group| &mut group.tags)
+            }
+            TaggedResource::Delivery(id) => self
+                .deliveries
+                .get_mut(id)
+                .map(|delivery| &mut delivery.tags),
+            TaggedResource::Destination(_) => None,
+        }
     }
 
     /// Materialise every import-task status change the clock has ALREADY made due, as of
@@ -1694,6 +1739,81 @@ pub fn is_log_group_arn(arn: &str) -> bool {
             && !resource.contains(":log-stream:")
     })
 }
+
+/// The CloudWatch Logs resource one tagging operation's `resourceArn` names, resolved to
+/// the key this service's store holds that resource under.
+///
+/// `TagResource` names the kinds that carry tags — "Currently, the only CloudWatch Logs
+/// resources that can be tagged are log groups and destinations" — and `resourceArn`'s own
+/// documentation gives both ARN forms: "The ARN format of a log group is
+/// arn:aws:logs:Region:account-id:log-group:log-group-name The ARN format of a destination is
+/// arn:aws:logs:Region:account-id:destination:destination-name". A delivery is here as well,
+/// because the model gives that resource its own tag member (`Delivery$tags`: "The tags that
+/// have been assigned to this delivery") and this service stores it
+/// ([`DeliveryRecord::tags`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaggedResource {
+    /// One log group, by the name the store is keyed by.
+    LogGroup(String),
+    /// One logical destination, by the `Destination$destinationName` it is created under.
+    Destination(String),
+    /// One delivery, by the `Delivery$id` the store is keyed by.
+    Delivery(String),
+}
+
+impl TaggedResource {
+    /// The resource kind a refusal names, in the words this service uses for it — what
+    /// [`resource_not_found_message`] states when the ARN names no stored resource.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::LogGroup(_) => "log group",
+            Self::Destination(_) => "destination",
+            Self::Delivery(_) => "delivery",
+        }
+    }
+}
+
+/// The ARN resource-segment prefix of a logical destination, from the ARN format
+/// `TagResource$resourceArn` documents for one.
+const DESTINATION_ARN_PREFIX: &str = "destination:";
+
+/// The ARN resource-segment prefix of a delivery, as [`delivery_arn`] builds one.
+const DELIVERY_ARN_PREFIX: &str = "delivery:";
+
+/// The resource a tagging operation's `resourceArn` names ([`TaggedResource`]), or `None`
+/// for an ARN that names no CloudWatch Logs resource carrying tags — another service's
+/// resource, or a CloudWatch Logs resource kind that holds no tag set (a log stream, say).
+/// Whether the named resource EXISTS is a separate question, answered by
+/// [`ComAmazonawsCloudwatchlogsLogs20140328State::resource_tags`].
+pub fn tagged_resource(arn: &str) -> Option<TaggedResource> {
+    let (service, resource) = arn_service_and_resource(arn)?;
+    if service != "logs" {
+        return None;
+    }
+    // Either log-group ARN form, with or without the trailing `:*` the `LogGroup$arn`
+    // member carries, names the same group.
+    if is_log_group_arn(arn) {
+        return Some(TaggedResource::LogGroup(
+            log_group_name_from_identifier(arn).to_string(),
+        ));
+    }
+    if let Some(name) = resource.strip_prefix(DESTINATION_ARN_PREFIX) {
+        return (!name.is_empty()).then(|| TaggedResource::Destination(name.to_string()));
+    }
+    if let Some(id) = resource.strip_prefix(DELIVERY_ARN_PREFIX) {
+        return (!id.is_empty()).then(|| TaggedResource::Delivery(id.to_string()));
+    }
+    None
+}
+
+/// The refusal for a `resourceArn` that is a well-formed ARN but names no resource this
+/// service can tag, stated as `TagResource` states the rule: "Currently, the only CloudWatch
+/// Logs resources that can be tagged are log groups and destinations." A value that is not
+/// an ARN at all is a different refusal ([`unparsable_arn_message`]), and a taggable kind
+/// the account holds no instance of is a third (`ResourceNotFoundException`).
+pub const UNTAGGABLE_RESOURCE_ARN: &str =
+    "resourceArn must name a resource that supports tagging. Currently, the only CloudWatch \
+     Logs resources that can be tagged are log groups and destinations.";
 
 /// Whether an ARN names the account's stored query-insights results — the non-log-group
 /// target `AssociateKmsKey` / `DisassociateKmsKey` document: "Specify the following ARN

@@ -1,15 +1,35 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateIdentitySource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateIdentitySource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Records a new identity source in [`crate::state`] and reports the record it wrote.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateIdentitySource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! An identity source is the association with the IAM Identity Center instance that
+//! authenticates approvers: the request's `IdentitySourceParameters` name that instance,
+//! and this handler mints the source's own ARN in the caller's region
+//! ([`crate::state::identity_source_arn`]), stores it `CREATING`, and answers out of the
+//! stored record. The source becomes `ACTIVE` when the clock owes its activation
+//! ([`crate::state::IDENTITY_SOURCE_ACTIVATION_DELAY`]), which
+//! [`crate::state::ComAmazonawsMpaAwsfluffycoreserviceState::materialize_due`]
+//! materialises for every later reader (`ListIdentitySources`).
+//!
+//! `ClientToken` is `@idempotencyToken`: a replay with a token this account already used
+//! answers with the source that call minted instead of minting a second one.
+//!
+//! Setting an organization's identity source up is restricted to its MANAGEMENT
+//! account, the same rule `create_approval_team.rs` enforces for an approval team: a
+//! caller that is not it earns `AccessDeniedException` (403) before any state is
+//! written, and the store records who that account is (none, until something records
+//! one — this emulator runs no Organizations control plane), so the gate reads state
+//! rather than deciding per request. Recorded AWS behaviour refuses
+//! `CreateIdentitySource` from an account outside the organization's management account
+//! with exactly this error. AWS decides it BEFORE it validates the request body, which
+//! this framework cannot yet do — modelled constraints are refused ahead of every
+//! handler — so a request that is BOTH unauthorized and malformed is still answered
+//! with `ValidationException` (400) here; that ordering is the subject of its own open
+//! issue (`mpa-createapprovalteam-returns-400-validationexception-instead-of-the`),
+//! which owns the seam both creates would share.
+//!
+//! The cross-account ARN gate does not apply: this request names no resource ARN.
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +184,154 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateIdentitySource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateIdentitySourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateIdentitySource"))
+        let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateIdentitySourceError::Modeled(
+                CreateIdentitySourceErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the identity-source store is unavailable".to_string(),
+                    },
+                ),
+            )
+        })?;
+        let mut state = store.lock();
+        let now = ::std::time::SystemTime::now();
+        state.materialize_due(now);
+
+        // Setting an organization's identity source up is restricted to its MANAGEMENT
+        // account: a call from any other account is refused before state is touched, so
+        // a caller that is not entitled to create one never records one. This emulator
+        // runs no Organizations control plane and so records no management account (see
+        // `state::ComAmazonawsMpaAwsfluffycoreserviceState::
+        // organization_management_account_id`), which makes every caller a standalone
+        // account and this the answer to every call until one is recorded.
+        if !state.is_management_account(crate::state::caller_account_id()) {
+            return Err(CreateIdentitySourceErrorModeled::AccessDeniedException(
+                crate::state::not_management_account(),
+            )
+            .into());
+        }
+
+        // `@idempotencyToken` replay: the same token answers with the identity source the
+        // first call minted, rather than minting a second one. The token is recorded under
+        // its RESOURCE KIND (`crate::state::idempotency_key`), so a token the caller also
+        // used on another create resolves to that create's resource, not to this one.
+        let client_token = input
+            .client_token
+            .as_deref()
+            .filter(|token| !token.is_empty())
+            .map(|token| {
+                crate::state::idempotency_key(crate::state::IDENTITY_SOURCE_RESOURCE, token)
+            });
+        if let Some(token) = client_token.as_deref() {
+            if let Some(arn) = state.idempotency_tokens.get(token).cloned() {
+                if let Some(source) = state.identity_source(&arn) {
+                    return Ok(created(source));
+                }
+            }
+        }
+
+        // `IdentitySourceParameters` is required, but which parameters it carries is not:
+        // the request has to name the resource that provides the identities, and
+        // `IamIdentityCenter` is the only one `IdentitySourceParameters` declares.
+        let Some(parameters) = input.identity_source_parameters.iam_identity_center.as_ref() else {
+            return Err(CreateIdentitySourceErrorModeled::ValidationException(
+                ValidationException {
+                    message: "IdentitySourceParameters must name the resource that provides \
+                              identities to the identity source; IamIdentityCenter is the only \
+                              member it declares."
+                        .to_string(),
+                },
+            )
+            .into());
+        };
+        let source_type = crate::state::IdentitySourceType::IamIdentityCenter;
+
+        // The store is bounded, so a caller looping on create cannot grow this process's
+        // memory without end. The model declares `ServiceQuotaExceededException` for
+        // exactly this.
+        if state.identity_sources.len() >= crate::state::MAX_IDENTITY_SOURCES {
+            return Err(CreateIdentitySourceErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "The account has reached its quota of {} identity sources. Delete an \
+                         identity source or request a quota increase.",
+                        crate::state::MAX_IDENTITY_SOURCES
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // One resource carries at most `MAX_TAGS_PER_RESOURCE` tags, the ceiling
+        // `TagResource` reports with `TooManyTagsException`. Create is the other path that
+        // writes tags, so it holds the same ceiling and no resource is stored already past
+        // it; `CreateIdentitySource` does not declare `TooManyTagsException`, so the
+        // request is refused with the `ValidationException` (400) it does declare.
+        let tag_count = input
+            .tags
+            .as_ref()
+            .map_or(0, ::std::collections::HashMap::len);
+        if tag_count > crate::state::MAX_TAGS_PER_RESOURCE {
+            return Err(CreateIdentitySourceErrorModeled::ValidationException(
+                ValidationException {
+                    message: format!(
+                        "Tags names {tag_count} tags, more than the maximum of {} tags allowed \
+                         per resource.",
+                        crate::state::MAX_TAGS_PER_RESOURCE
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // The identity source is a regional resource of the caller's account, so its ARN
+        // carries the region this request was signed for — not the `Region` of the IAM
+        // Identity Center instance, which is the instance's own and is stored as such.
+        let region = crate::state::request_region(ctx.parts());
+        let seq = state.next_identity_source_seq();
+        let arn = crate::state::identity_source_arn(&region, seq);
+        let source = crate::state::IdentitySource::creating(
+            arn.clone(),
+            source_type,
+            parameters.instance_arn.clone(),
+            parameters.region.clone(),
+            input
+                .tags
+                .as_ref()
+                .map(|tags| {
+                    tags.iter()
+                        .map(|(key, value)| (key.clone(), value.clone()))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            now,
+            seq,
+        );
+        state.insert_identity_source(source);
+        if let Some(token) = client_token {
+            state.idempotency_tokens.insert(token, arn.clone());
+        }
+
+        // Read the answer back out of the store, so the response can only ever describe
+        // an identity source that was really recorded.
+        let Some(source) = state.identity_source(&arn) else {
+            return Err(CreateIdentitySourceErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the identity source could not be read back after being stored"
+                        .to_string(),
+                },
+            )
+            .into());
+        };
+        Ok(created(source))
+    }
+}
+
+/// The `CreateIdentitySource` response for a stored identity source.
+fn created(source: &crate::state::IdentitySource) -> CreateIdentitySourceOutput {
+    CreateIdentitySourceOutput {
+        identity_source_type: Some(source.source_type.as_wire().to_string()),
+        identity_source_arn: Some(source.arn.clone()),
+        creation_time: Some(::aws_smithy_types::DateTime::from(source.creation_time)),
     }
 }

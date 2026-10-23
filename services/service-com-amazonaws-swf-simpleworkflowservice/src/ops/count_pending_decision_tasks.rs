@@ -4,9 +4,11 @@
 //!
 //! Answers with how many decision tasks are WAITING in the named domain's task list:
 //! one per `DecisionTaskScheduled` event of an OPEN run of that domain that named this
-//! list and that nothing has since taken out of it. A reporting operation — it reads
-//! state and writes nothing — and a list no decision task was ever scheduled in
-//! answers 0, as the operation's own doc states.
+//! list and that nothing has since taken out of it. A reporting operation — it hands out
+//! no task and decides nothing; the one thing it writes is what the CLOCK already made
+//! due, timing out a decision task whose own `startToCloseTimeout` ran out (and
+//! scheduling its replacement in the same list) before counting. A list no decision task
+//! was ever scheduled in answers 0, as the operation's own doc states.
 //!
 //! ## Shape of an operation
 //!
@@ -167,7 +169,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         crate::state::validate_name("taskList.name", &input.task_list.name)
             .map_err(crate::scaffolded::Scaffolded::validation)?;
 
-        let guard = state.lock();
+        let now = crate::state::now();
+        let mut guard = state.lock();
         // A task list lives inside a domain, so an unregistered domain name addresses
         // no task list at all: that is the modelled `UnknownResourceFault` ("Returned
         // when the named resource cannot be found with in the scope of this operation
@@ -178,11 +181,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         //
         // A deprecated domain is still a known one: deprecation stops new registrations
         // and starts, while the runs already in it keep their tasks.
-        let domain = guard.domains.get(&input.domain).ok_or_else(|| {
+        let domain = guard.domains.get_mut(&input.domain).ok_or_else(|| {
             CountPendingDecisionTasksErrorModeled::UnknownResourceFault(UnknownResourceFault {
                 message: Some(format!("Unknown domain: {}", input.domain)),
             })
         })?;
+
+        // A decision task handed to a decider and not completed within its own
+        // `startToCloseTimeout` is timed out — and a replacement scheduled in the same
+        // list — at the instant that duration ran out, whether or not anybody calls.
+        // Counting materialises what the clock already made due, so the count reports
+        // the tasks waiting NOW rather than a view that expires unread; it decides
+        // nothing itself and takes no task out of any list.
+        domain.expire_due_decision_tasks(now);
 
         let pending = domain.pending_decision_tasks_on(&input.task_list.name);
 

@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetChannel
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetChannel`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetChannel::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports a CloudTrail Lake channel from the shared channel registry
+//! (`crate::state`).
 //!
 //! ## Shape of an operation
 //!
@@ -128,6 +121,21 @@ impl From<GetChannelErrorModeled> for GetChannelError {
     }
 }
 
+/// Refuse the request because the identifier named no stored channel.
+///
+/// The status is the registry's shared one
+/// ([`crate::state::channels::CHANNEL_NOT_FOUND_HTTP_STATUS`]) so this operation and
+/// `DeleteChannel` cannot drift; only the lift into this operation's error channel is
+/// local.
+fn channel_not_found(identifier: &str) -> GetChannelError {
+    crate::scaffolded::Scaffolded::modeled_with_status(
+        GetChannelErrorModeled::ChannelNotFoundException(ChannelNotFoundException {
+            message: Some(crate::state::channels::channel_not_found_message(identifier)),
+        }),
+        crate::state::channels::CHANNEL_NOT_FOUND_HTTP_STATUS,
+    )
+}
+
 /// The `GetChannel` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -164,18 +172,65 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetChannel` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetChannelErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetChannel"))
+        let region = crate::state::request_region(ctx.parts());
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetChannelErrorModeled::UnsupportedOperationException(UnsupportedOperationException {
+                message: Some(
+                    "GetChannel needs the CloudTrail channel registry, which this engine \
+                     does not carry"
+                        .to_string(),
+                ),
+            })
+        })?;
+        let store = state.lock();
+
+        // `Channel` is documented as "The ARN or UUID value of the channel", so both
+        // forms name the same channel; an `arn:`-prefixed value that is not a channel
+        // ARN cannot name one, so it is refused as a malformed ARN rather than
+        // reported absent. The reading is the registry's own
+        // (`crate::state::channels`), so every channel operation resolves an
+        // identifier the same way.
+        let address = store
+            .addressed_channel(&input.channel, &region)
+            .ok_or_else(|| {
+                GetChannelErrorModeled::ChannelARNInvalidException(ChannelARNInvalidException {
+                    message: Some(crate::state::channels::channel_arn_invalid_message(
+                        &input.channel,
+                    )),
+                })
+            })?;
+
+        // A channel is a Regional resource of one account, so only the channel the
+        // identifier addresses is readable here; an identifier naming another
+        // account addresses no record in this registry.
+        let channel = match address {
+            crate::state::channels::ChannelAddress::Key(key) => store.channels.get(&key),
+            crate::state::channels::ChannelAddress::AnotherAccount => None,
+        };
+        let channel = channel.ok_or_else(|| channel_not_found(&input.channel))?;
+
+        Ok(GetChannelOutput {
+            channel_arn: Some(channel.channel_arn.clone()),
+            name: Some(channel.name.clone()),
+            source: Some(channel.source.clone()),
+            // `SourceConfig` reports how the channel's source is configured. The
+            // registry keys a channel to the ONE Region it lives in, so
+            // `ApplyToAllRegions` is false for every channel this emulator holds,
+            // and no operation it serves configures a channel's advanced event
+            // selectors (`CreateChannel` models no selector member and
+            // `UpdateChannel` is still a stub), so there are none to report.
+            source_config: Some(SourceConfig {
+                apply_to_all_regions: Some(false),
+                advanced_event_selectors: Some(Vec::new()),
+            }),
+            destinations: Some(channel.destinations.clone()),
+            // `IngestionStatus` reports the most recent ingestion attempts, and
+            // ingestion happens in the CloudTrail Lake data plane
+            // (`PutAuditEvents`, a different service). Until this channel's ingest
+            // log is reported here there is nothing to claim, and a synthesised
+            // timestamp would be a claim that events arrived.
+            ingestion_status: None,
+        })
     }
 }

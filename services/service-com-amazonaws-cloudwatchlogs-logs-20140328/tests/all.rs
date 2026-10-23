@@ -41,6 +41,8 @@ mod refusal_error_codes;
 mod refusal_messages;
 #[path = "all/resource_policies.rs"]
 mod resource_policies;
+#[path = "all/resource_tags.rs"]
+mod resource_tags;
 #[path = "all/retention_policy.rs"]
 mod retention_policy;
 #[path = "all/state_roundtrip.rs"]

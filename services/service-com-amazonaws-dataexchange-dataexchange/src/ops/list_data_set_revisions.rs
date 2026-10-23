@@ -2,8 +2,10 @@
 
 //! @op ListDataSetRevisions
 //! IMPLEMENTED: enumerates the revisions attached to a data set, newest first,
-//! bounded by `maxResults` and resumable through the opaque `NextToken`. Reporting
-//! only: it never writes. This is the ONLY file to touch for this operation.
+//! bounded by `maxResults` and resumable through the opaque `NextToken`. A request
+//! that omits `maxResults` asks for no particular page size and is served the
+//! largest page the model admits. Reporting only: it never writes. This is the ONLY
+//! file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -142,12 +144,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ListDataSetRevisionsErrorModeled::InternalServerException(
                 crate::state::store_unavailable(),
             )
             .into());
+        };
+
+        // The page size the request asked for; `MaxResults` carries
+        // `skip_validation` on this input, so its modelled `@range` is checked here
+        // against the value the request actually carried. See
+        // `crate::state::requested_max_results`.
+        let max_results = match crate::state::requested_max_results(ctx, input.max_results) {
+            Ok(max_results) => max_results,
+            Err(refusal) => {
+                return Err(ListDataSetRevisionsErrorModeled::ValidationException(refusal).into())
+            }
         };
 
         let store = state.lock();
@@ -163,7 +175,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let ordered: Vec<String> = data_set.revision_order.iter().rev().cloned().collect();
 
         let Some((start, end)) =
-            crate::state::page_window(&ordered, input.next_token.as_deref(), input.max_results)
+            crate::state::page_window(&ordered, input.next_token.as_deref(), max_results)
         else {
             return Err(ListDataSetRevisionsErrorModeled::ValidationException(
                 crate::state::invalid_next_token(),

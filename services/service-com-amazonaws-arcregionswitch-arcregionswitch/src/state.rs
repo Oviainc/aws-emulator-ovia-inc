@@ -219,6 +219,17 @@ pub fn plan_not_found_message(arn: &str) -> String {
     format!("Plan not found for ARN: {arn}")
 }
 
+/// The `ResourceNotFoundException` message for a plan this emulator holds, read through a
+/// Region-scoped operation from a Region the plan is not available in. It names the
+/// Region the request reached and the Regions the plan does cover, so a caller that
+/// pointed the SDK at the wrong endpoint is told which one holds it.
+pub fn plan_not_in_region_message(arn: &str, region: &str, plan_regions: &[String]) -> String {
+    format!(
+        "Plan not found for ARN: {arn} in Region {region}; the plan is available in {}",
+        plan_regions.join(", ")
+    )
+}
+
 /// The page size a paginated operation of this service serves.
 ///
 /// `ListPlans`, `GetPlanExecution`, `ListPlanExecutionEvents` and `ListPlanExecutions`
@@ -277,6 +288,17 @@ impl StoredPlan {
             active_plan_execution: self.active_execution.clone(),
             recovery_time_objective_minutes: self.plan.recovery_time_objective_minutes,
         }
+    }
+
+    /// Whether this plan is available in `region`.
+    ///
+    /// A plan's `regions` are the Amazon Web Services Regions it covers (`RegionList`,
+    /// len 2..2), and `ListPlansInRegion` is documented to list the plans "available in
+    /// the current Amazon Web Services Region" — so a plan is available in exactly the
+    /// Regions its own `regions` names. The Region-scoped reads (`GetPlanInRegion`, and
+    /// `ListPlansInRegion` once it is written) decide with this.
+    pub fn is_available_in_region(&self, region: &str) -> bool {
+        self.plan.regions.iter().any(|r| r == region)
     }
 
     /// The plan's other Region: a plan carries exactly two (`RegionList`, len 2..2), so

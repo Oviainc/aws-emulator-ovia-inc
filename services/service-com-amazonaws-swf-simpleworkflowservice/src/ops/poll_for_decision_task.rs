@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PollForDecisionTask
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PollForDecisionTask`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PollForDecisionTask::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Hands a decider the next decision task WAITING in the named domain's decision task
+//! list, and records that hand-over in the run's history as a `DecisionTaskStarted`
+//! event carrying the caller's `identity` — the operation's own doc says that is where
+//! the identity is recorded, so this is a mutating operation by specification. The
+//! answer is computed from the stored history: the task's run and workflow type, the
+//! `startedEventId` of the event just recorded, the `previousStartedEventId` of the
+//! last decision task a decider completed, and a page of the run's history events.
+//!
+//! When the list holds no waiting task the documented EMPTY result is returned
+//! immediately — "An empty result, in this context, means that a DecisionTask is
+//! returned, but that the value of taskToken is an empty string". The real service
+//! holds the connection open for up to 60 seconds first; this emulator never sleeps for
+//! a timeout, so it answers at once.
 //!
 //! ## Shape of an operation
 //!
@@ -211,20 +216,247 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PollForDecisionTask` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PollForDecisionTaskErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PollForDecisionTask"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            PollForDecisionTaskErrorModeled::OperationNotPermittedFault(
+                OperationNotPermittedFault {
+                    message: Some("the SWF domain store is unavailable".to_string()),
+                },
+            )
+        })?;
+
+        // A task list name obeys SWF's naming rule, which the model cannot express, so
+        // the boundary validator passes it and it is refused here as a bad request.
+        crate::state::validate_name("taskList.name", &input.task_list.name)
+            .map_err(crate::scaffolded::Scaffolded::validation)?;
+
+        // `maximumPageSize` defaults to 0 ("not specified"), which means as much of the
+        // history as one answer carries. The modelled `PageSize` range (0..1000) is
+        // enforced by the boundary validator, so a larger value never reaches here; the
+        // clamp is the internal bound that keeps one response bounded regardless.
+        let page_size = match usize::try_from(input.maximum_page_size) {
+            Ok(size) if size > 0 => size.min(crate::state::MAX_HISTORY_PAGE_SIZE),
+            _ => crate::state::MAX_HISTORY_PAGE_SIZE,
+        };
+
+        let resumed = match crate::state::non_empty(&input.next_page_token) {
+            Some(token) => Some(
+                crate::state::decode_decision_task_page_token(&token, input.reverse_order)
+                    .map_err(crate::scaffolded::Scaffolded::validation)?,
+            ),
+            None => None,
+        };
+
+        let now = crate::state::now();
+        let mut guard = state.lock();
+        // A task list lives inside a domain, so an unregistered domain name addresses no
+        // task list at all: the modelled `UnknownResourceFault`, the same answer every
+        // other domain-scoped operation of this service gives it. A DEPRECATED domain is
+        // still a known one — deprecation stops new starts, while the runs already in it
+        // keep handing out their decision tasks.
+        let Some(domain) = guard.domains.get_mut(&input.domain) else {
+            return Err(PollForDecisionTaskErrorModeled::UnknownResourceFault(
+                UnknownResourceFault {
+                    message: Some(format!("Unknown domain: {}", input.domain)),
+                },
+            )
+            .into());
+        };
+
+        // The decision-task start-to-close timeout is the server's: a task handed over
+        // and not completed within its own `startToCloseTimeout` is timed out and a
+        // replacement is scheduled at the instant that duration ran out, whether or not
+        // anybody polls. Materialising it before answering is what lets this poll hand
+        // out the replacement task of a decider that lost its own.
+        domain.expire_due_decision_tasks(now);
+
+        // Two different requests arrive here. A poll carrying a `nextPageToken` asks for
+        // a further page of the history of the task that token was minted for — "To
+        // retrieve subsequent pages, make additional calls to PollForDecisionTask using
+        // the nextPageToken returned by the initial call" — so it hands out no new task
+        // and records nothing. A poll without one takes the next task waiting in the
+        // list and records the hand-over.
+        let (workflow_id, run_id, started_event_id, resume_after) = match &resumed {
+            Some(page) => {
+                let execution = domain
+                    .executions
+                    .get(&(page.workflow_id.clone(), page.run_id.clone()))
+                    .ok_or_else(|| {
+                        PollForDecisionTaskErrorModeled::UnknownResourceFault(
+                            UnknownResourceFault {
+                                message: Some(crate::state::unknown_execution_message(
+                                    &page.workflow_id,
+                                    &page.run_id,
+                                )),
+                            },
+                        )
+                    })?;
+                // A token whose task has since been completed or timed out addresses no
+                // task: there are no further pages of a task that is over, so it is a
+                // bad request rather than a silent re-dispatch of a new task.
+                if !execution.decision_task_is_outstanding(page.started_event_id) {
+                    return Err(crate::scaffolded::Scaffolded::validation(format!(
+                        "nextPageToken pages the decision task started by event {} of \
+                         WorkflowExecution=[workflowId={}, runId={}], which is no longer \
+                         outstanding",
+                        page.started_event_id, page.workflow_id, page.run_id
+                    )));
+                }
+                (
+                    page.workflow_id.clone(),
+                    page.run_id.clone(),
+                    page.started_event_id,
+                    Some(page.resume_after_event_id),
+                )
+            }
+            None => {
+                let Some(waiting) = domain.next_decision_task_on(&input.task_list.name) else {
+                    return Ok(empty_decision_task());
+                };
+                let Some(execution) = domain
+                    .executions
+                    .get_mut(&(waiting.workflow_id.clone(), waiting.run_id.clone()))
+                else {
+                    return Err(PollForDecisionTaskErrorModeled::UnknownResourceFault(
+                        UnknownResourceFault {
+                            message: Some(crate::state::unknown_execution_message(
+                                &waiting.workflow_id,
+                                &waiting.run_id,
+                            )),
+                        },
+                    )
+                    .into());
+                };
+                // Handing the task over IS the `DecisionTaskStarted` event: it names the
+                // task it started and carries the decider's identity, and its own id is
+                // the `startedEventId` this answer reports. Recording it takes the task
+                // out of the list, so a second poll of the same list cannot be handed
+                // the same task.
+                let started_event_id = execution.append_event(
+                    now,
+                    crate::state::EventAttributes::DecisionTaskStarted(
+                        DecisionTaskStartedEventAttributes {
+                            identity: crate::state::non_empty(&input.identity),
+                            scheduled_event_id: waiting.scheduled_event_id,
+                        },
+                    ),
+                );
+                (
+                    waiting.workflow_id,
+                    waiting.run_id,
+                    started_event_id,
+                    None,
+                )
+            }
+        };
+
+        let Some(execution) = domain.executions.get(&(workflow_id, run_id)) else {
+            return Err(PollForDecisionTaskErrorModeled::OperationNotPermittedFault(
+                OperationNotPermittedFault {
+                    message: Some("the decision task's workflow execution is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // `startAtPreviousStartedEvent` "returns the events with eventTimestamp greater
+        // than or equal to eventTimestamp of the most recent DecisionTaskStarted event".
+        // The most recent one at the moment the poll arrived is the PREVIOUS decision
+        // task's started event — the one this call recorded is the current task's — so
+        // that is the instant the history begins at, and a run whose first decision task
+        // this is has no earlier started event and so keeps its whole history.
+        let begin_at = input
+            .start_at_previous_started_event
+            .then(|| {
+                execution
+                    .previous_decision_task_started(started_event_id)
+                    .map(|event| crate::state::instant_key(event.event_timestamp))
+            })
+            .flatten();
+        let selected: Vec<&crate::state::HistoryEventRecord> = execution
+            .history
+            .iter()
+            .filter(|event| {
+                begin_at.is_none_or(|from| crate::state::instant_key(event.event_timestamp) >= from)
+            })
+            .collect();
+
+        // `reverseOrder` reverses the stored (oldest-first) log, so paging walks the same
+        // events in the opposite direction — never a different set.
+        let ordered: Vec<&crate::state::HistoryEventRecord> = if input.reverse_order {
+            selected.into_iter().rev().collect()
+        } else {
+            selected
+        };
+        let total = ordered.len();
+        // The token names the EVENT the previous page ended on, so the next page starts
+        // at the one after it in THIS ordering; the position is searched for rather than
+        // computed, so a history that grew between pages cannot shift what it addresses.
+        let start = match resume_after {
+            Some(event_id) => ordered
+                .iter()
+                .position(|record| record.event_id == event_id)
+                .map(|position| position + 1)
+                .ok_or_else(|| {
+                    crate::scaffolded::Scaffolded::validation(format!(
+                        "nextPageToken resumes after event {event_id}, which this execution's \
+                         history does not hold"
+                    ))
+                })?,
+            None => 0,
+        };
+        let end = (start + page_size).min(total);
+        let page = &ordered[start..end];
+
+        Ok(PollForDecisionTaskOutput {
+            // The handle on THIS task: derived from the run and the started event, so it
+            // names the task the decider was just given and nothing else.
+            task_token: crate::state::decision_task_token(
+                &input.domain,
+                &execution.workflow_id,
+                &execution.run_id,
+                started_event_id,
+            ),
+            started_event_id,
+            previous_started_event_id: execution.previous_started_event_id(started_event_id),
+            workflow_execution: execution.execution(),
+            workflow_type: WorkflowType {
+                name: execution.workflow_type.0.clone(),
+                version: execution.workflow_type.1.clone(),
+            },
+            events: page.iter().map(|record| record.event()).collect(),
+            next_page_token: page.last().filter(|_| end < total).map(|last| {
+                crate::state::encode_decision_task_page_token(
+                    input.reverse_order,
+                    &crate::state::DecisionTaskPage {
+                        workflow_id: execution.workflow_id.clone(),
+                        run_id: execution.run_id.clone(),
+                        started_event_id,
+                        resume_after_event_id: last.event_id,
+                    },
+                )
+            }),
+        })
+    }
+}
+
+/// The documented EMPTY result of a poll that found no waiting decision task: "a
+/// DecisionTask is returned, but ... the value of taskToken is an empty string".
+///
+/// Every other member of `DecisionTask` is modelled required, so each takes the value
+/// that says "no task": the two event ids their own modelled default of `0`, no history
+/// events, no page token, and an unset workflow execution and type. Nothing here comes
+/// from the request — an empty answer identifies no run, because no run was polled out
+/// of the list.
+fn empty_decision_task() -> PollForDecisionTaskOutput {
+    PollForDecisionTaskOutput {
+        task_token: String::new(),
+        started_event_id: 0,
+        previous_started_event_id: 0,
+        workflow_execution: WorkflowExecution::default(),
+        workflow_type: WorkflowType::default(),
+        events: Vec::new(),
+        next_page_token: None,
     }
 }

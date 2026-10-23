@@ -37,3 +37,5 @@ mod ssoadmin_permission_sets;
 mod state_roundtrip;
 #[path = "all/trusted_token_issuers.rs"]
 mod trusted_token_issuers;
+#[path = "all/validation_message_wording.rs"]
+mod validation_message_wording;

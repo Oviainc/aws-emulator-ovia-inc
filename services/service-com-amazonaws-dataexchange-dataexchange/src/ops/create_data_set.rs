@@ -232,6 +232,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 updated_at: created_at,
                 revisions: ::std::collections::HashMap::new(),
                 revision_order: ::std::vec::Vec::new(),
+                // Nothing has been notified about a data set this call just minted.
+                notifications: ::std::vec::Vec::new(),
             };
             let stored = record.clone();
             store.data_set_order.push(id.clone());

@@ -8,8 +8,9 @@
 //! missing parent a `ResourceNotFoundException` instead of an orphan record.
 //!
 //! Besides the store itself this module holds the handful of helpers every handler of
-//! this service needs (request region, ARN construction, idempotent-create bookkeeping,
-//! and completing a deletion the clock has made due), so the per-operation files share
+//! this service needs (request region, ARN construction, the one place a
+//! `ResourceNotFoundException` is filled in, idempotent-create bookkeeping, and
+//! completing a deletion the clock has made due), so the per-operation files share
 //! one implementation of each instead of seven copies.
 //!
 //! ONE PARTITION. The model scopes a workflow definition's name to an account AND a
@@ -27,7 +28,9 @@ use std::time::{Duration, SystemTime};
 
 use sha2::{Digest, Sha256};
 
-use crate::ops::types::{ActError, ClientInfo, ToolSpec, WorkflowExportConfig};
+use crate::ops::types::{
+    ActError, ClientInfo, ResourceNotFoundException, ToolSpec, WorkflowExportConfig,
+};
 
 /// The region an ARN carries when the request's SigV4 credential scope does not name a
 /// usable one (an unsigned in-process call, say). The `@pattern` on every ARN shape in
@@ -152,21 +155,64 @@ impl Quota {
 
 /// A resource the request named that this store does not hold.
 ///
-/// Carries the three members `ResourceNotFoundException` requires, so each handler can
-/// turn one into its own modeled error without re-deriving the wording.
+/// Carries what `ResourceNotFoundException` needs, so each handler can turn one into its
+/// own modeled error through [`Self::not_found`] without re-deriving any of it.
+///
+/// `resourceId` is "the identifier of the resource that wasn't found", and the identifier
+/// a resource of this service HAS is its ARN — the one its own `arn` / `workflowRunArn`
+/// member reports — not the path segment that names it under its parent. A missing
+/// resource has no stored record to read a region from (that is what makes it missing),
+/// so its ARN is qualified with the requesting credential scope's region, exactly as the
+/// ARN of a resource this request created would be; hence the `region` argument rather
+/// than a stored string.
 #[derive(Debug, Clone)]
 pub struct MissingResource {
-    pub message: String,
-    pub resource_id: String,
+    /// The kind of resource, as `resourceType` reports it.
     pub resource_type: String,
+    /// The resource part of this resource's ARN (everything after the account segment),
+    /// nested under its parents the way the model nests them. Its last segment is the
+    /// path identifier the request named the resource by.
+    resource_path: String,
 }
 
 impl MissingResource {
-    fn new(resource_type: &str, resource_id: &str) -> Self {
+    fn new(resource_type: &str, resource_path: String) -> Self {
         Self {
-            message: format!("{resource_type} {resource_id} was not found"),
-            resource_id: resource_id.to_string(),
             resource_type: resource_type.to_string(),
+            resource_path,
+        }
+    }
+
+    /// This resource's ARN in `region`, which is what `resourceId` carries.
+    pub fn resource_id(&self, region: &str) -> String {
+        resource_arn(region, &self.resource_path)
+    }
+
+    /// Why the lookup failed: the KIND of resource that was not found, as a sentence.
+    ///
+    /// It interpolates nothing from the request: the identifier the caller asked for is
+    /// what `resourceId` carries, parseable, and a client reading `message` gets the one
+    /// thing the prose adds — which kind of resource in the chain was missing. Derived
+    /// from `resourceType` for every kind rather than written out per operation.
+    pub fn message(&self) -> String {
+        let kind = self.resource_type.replace('-', " ");
+        let mut sentence = String::with_capacity(kind.len() + " not found".len());
+        let mut characters = kind.chars();
+        if let Some(first) = characters.next() {
+            sentence.extend(first.to_uppercase());
+            sentence.push_str(characters.as_str());
+        }
+        sentence.push_str(" not found");
+        sentence
+    }
+
+    /// The modeled `ResourceNotFoundException` for a request signed in `region`: the ONE
+    /// place this service fills that error's members in.
+    pub fn not_found(&self, region: &str) -> ResourceNotFoundException {
+        ResourceNotFoundException {
+            message: self.message(),
+            resource_id: self.resource_id(region),
+            resource_type: self.resource_type.clone(),
         }
     }
 }
@@ -264,16 +310,20 @@ pub struct WorkflowDefinition {
 impl WorkflowDefinition {
     /// The run `run_id` names, or the description of what was missing.
     pub fn run(&self, run_id: &str) -> Result<&WorkflowRun, MissingResource> {
-        self.runs
-            .get(run_id)
-            .ok_or_else(|| MissingResource::new("workflow-run", run_id))
+        self.runs.get(run_id).ok_or_else(|| {
+            MissingResource::new("workflow-run", workflow_run_path(&self.name, run_id))
+        })
     }
 
     /// The run `run_id` names, mutably.
     pub fn run_mut(&mut self, run_id: &str) -> Result<&mut WorkflowRun, MissingResource> {
-        self.runs
-            .get_mut(run_id)
-            .ok_or_else(|| MissingResource::new("workflow-run", run_id))
+        let definition_name = self.name.clone();
+        self.runs.get_mut(run_id).ok_or_else(|| {
+            MissingResource::new(
+                "workflow-run",
+                workflow_run_path(&definition_name, run_id),
+            )
+        })
     }
 }
 
@@ -281,6 +331,9 @@ impl WorkflowDefinition {
 #[derive(Debug)]
 pub struct WorkflowRun {
     pub run_id: String,
+    /// The definition this run belongs to, so the run can name its own place in the
+    /// resource chain (its children's ARNs nest under it).
+    pub definition_name: String,
     pub arn: String,
     pub status: WorkflowRunStatus,
     pub started_at: SystemTime,
@@ -296,16 +349,20 @@ pub struct WorkflowRun {
 impl WorkflowRun {
     /// The session `session_id` names.
     pub fn session(&self, session_id: &str) -> Result<&Session, MissingResource> {
-        self.sessions
-            .get(session_id)
-            .ok_or_else(|| MissingResource::new("session", session_id))
+        self.sessions.get(session_id).ok_or_else(|| {
+            MissingResource::new(
+                "session",
+                session_path(&self.definition_name, &self.run_id, session_id),
+            )
+        })
     }
 
     /// The session `session_id` names, mutably.
     pub fn session_mut(&mut self, session_id: &str) -> Result<&mut Session, MissingResource> {
+        let path = session_path(&self.definition_name, &self.run_id, session_id);
         self.sessions
             .get_mut(session_id)
-            .ok_or_else(|| MissingResource::new("session", session_id))
+            .ok_or_else(|| MissingResource::new("session", path))
     }
 }
 
@@ -574,9 +631,9 @@ impl ComAmazonawsNovaactAmazonnovaagentsdataplaneState {
 
     /// The definition `name` names.
     pub fn definition(&self, name: &str) -> Result<&WorkflowDefinition, MissingResource> {
-        self.workflow_definitions
-            .get(name)
-            .ok_or_else(|| MissingResource::new("workflow-definition", name))
+        self.workflow_definitions.get(name).ok_or_else(|| {
+            MissingResource::new("workflow-definition", workflow_definition_path(name))
+        })
     }
 
     /// The definition `name` names, mutably.
@@ -584,9 +641,9 @@ impl ComAmazonawsNovaactAmazonnovaagentsdataplaneState {
         &mut self,
         name: &str,
     ) -> Result<&mut WorkflowDefinition, MissingResource> {
-        self.workflow_definitions
-            .get_mut(name)
-            .ok_or_else(|| MissingResource::new("workflow-definition", name))
+        self.workflow_definitions.get_mut(name).ok_or_else(|| {
+            MissingResource::new("workflow-definition", workflow_definition_path(name))
+        })
     }
 
     /// What `token` already created for `operation`, if anything.
@@ -680,18 +737,48 @@ pub fn request_region(parts: &http::request::Parts) -> String {
         .unwrap_or_else(|| DEFAULT_REGION.to_string())
 }
 
+/// The resource part of a workflow definition's ARN: `workflow-definition/<name>`, as
+/// `WorkflowDefinitionArn`'s pattern spells it.
+pub fn workflow_definition_path(name: &str) -> String {
+    format!("workflow-definition/{name}")
+}
+
+/// The resource part of a workflow run's ARN. `WorkflowRunArn`'s pattern nests the run
+/// under its definition's path, which is the nesting every resource below follows too.
+pub fn workflow_run_path(definition_name: &str, run_id: &str) -> String {
+    format!(
+        "{}/workflow-run/{run_id}",
+        workflow_definition_path(definition_name)
+    )
+}
+
+/// The resource part of a session's ARN.
+///
+/// The model declares no `SessionArn` shape — no operation returns a session ARN — so the
+/// form here extends the run's modelled path with the session's own segment, exactly as
+/// `WorkflowRunArn` extends `WorkflowDefinitionArn`. It is what names a session in this
+/// service's resource chain, which is what an error reporting a missing session needs.
+pub fn session_path(definition_name: &str, run_id: &str, session_id: &str) -> String {
+    format!(
+        "{}/session/{session_id}",
+        workflow_run_path(definition_name, run_id)
+    )
+}
+
+/// `arn:aws:nova-act:<region>:<account>:<resource_path>` — this service's ARN for one of
+/// its resources, from the path helpers above.
+pub fn resource_arn(region: &str, resource_path: &str) -> String {
+    ::emulator_server::emulator_arn(ARN_NAMESPACE, region, resource_path)
+}
+
 /// `arn:aws:nova-act:<region>:<account>:workflow-definition/<name>`.
 pub fn workflow_definition_arn(region: &str, name: &str) -> String {
-    ::emulator_server::emulator_arn(ARN_NAMESPACE, region, &format!("workflow-definition/{name}"))
+    resource_arn(region, &workflow_definition_path(name))
 }
 
 /// `arn:aws:nova-act:<region>:<account>:workflow-definition/<name>/workflow-run/<id>`.
 pub fn workflow_run_arn(region: &str, name: &str, run_id: &str) -> String {
-    ::emulator_server::emulator_arn(
-        ARN_NAMESPACE,
-        region,
-        &format!("workflow-definition/{name}/workflow-run/{run_id}"),
-    )
+    resource_arn(region, &workflow_run_path(name, run_id))
 }
 
 /// Nanoseconds since the Unix epoch, saturating at 0 if the host clock predates it.
