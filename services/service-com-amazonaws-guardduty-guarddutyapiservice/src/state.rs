@@ -326,13 +326,20 @@ pub const EMAIL_MEMBER: &str = "email";
 /// handler at all instead of being refused at the boundary.
 pub const DETECTOR_ID_LEN: usize = 32;
 
-/// Is `id` a syntactically well-formed `DetectorId`?
+/// Is `id` a syntactically well-formed id of the kind this service MINTS — the 32
+/// hexadecimal characters
+/// [`ComAmazonawsGuarddutyGuarddutyapiserviceState::mint_id`] hands out?
 ///
 /// Form only: a well-formed id need not exist. Case is not significant, so an id
 /// a caller upper-cased is still well formed — and is then refused as not owned,
 /// which is the ownership failure and not a parameter one.
-pub fn is_detector_id(id: &str) -> bool {
+pub fn is_minted_id(id: &str) -> bool {
     id.len() == DETECTOR_ID_LEN && id.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Is `id` a syntactically well-formed `DetectorId`? See [`is_minted_id`].
+pub fn is_detector_id(id: &str) -> bool {
+    is_minted_id(id)
 }
 
 /// The message for a member whose VALUE cannot be a value of that member at all.
@@ -713,6 +720,12 @@ pub struct Detector {
     /// detector like its findings and filters, so `DeleteDetector` drops them with
     /// it.
     pub investigations: BTreeMap<String, InvestigationRecord>,
+    /// This detector's IPSets (trusted IP lists), keyed by the minted `IpSetId`.
+    /// They are sub-resources of the detector — every IPSet operation is bound
+    /// under `/detector/{DetectorId}/ipset`
+    /// (`smithy_query(operation="GetIPSet")`) — so `DeleteDetector` drops them
+    /// with it.
+    pub ip_sets: BTreeMap<String, IpSetRecord>,
     /// The member accounts this detector's account administers, keyed by account
     /// id. `DeleteDetector` drops them with the detector, like the findings and
     /// filters above.
@@ -840,6 +853,190 @@ impl Detector {
             .values()
             .filter(|investigation| investigation.started_at_millis >= since)
             .count()
+    }
+
+    /// The IPSet a create already minted for `token`, if any — the seam that makes
+    /// `CreateIPSet` idempotent under a replayed `ClientToken`.
+    pub fn ip_set_for_token(&self, token: &str) -> Option<&IpSetRecord> {
+        self.ip_sets
+            .values()
+            .find(|ip_set| ip_set.client_token.as_deref() == Some(token))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// IPSets (trusted IP lists)
+// ---------------------------------------------------------------------------
+
+/// `IpSetStatus`: the list is being activated, so GuardDuty is not using it yet.
+/// One of `INACTIVE | ACTIVATING | ACTIVE | DEACTIVATING | ERROR | DELETE_PENDING
+/// | DELETED` (`smithy_query(shape="IpSetStatus")`).
+pub const IP_SET_ACTIVATING: &str = "ACTIVATING";
+
+/// `IpSetStatus`: the list is uploaded and in use. See [`IP_SET_ACTIVATING`] for
+/// the enum.
+pub const IP_SET_ACTIVE: &str = "ACTIVE";
+
+/// `IpSetStatus`: the list is being taken out of use.
+pub const IP_SET_DEACTIVATING: &str = "DEACTIVATING";
+
+/// `IpSetStatus`: the list is stored but GuardDuty is not using it.
+pub const IP_SET_INACTIVE: &str = "INACTIVE";
+
+/// How long an IPSet stays in a transitional [`IP_SET_ACTIVATING`] /
+/// [`IP_SET_DEACTIVATING`] status before the CLOCK owes it the settled status.
+///
+/// GuardDuty documents no duration for activating a trusted IP list, so this
+/// emulator CHOOSES one. It is deliberately non-zero: a caller that reads the
+/// IPSet back immediately after creating it still observes the transient status.
+pub const IP_SET_TRANSITION_MILLIS: i64 = 500;
+
+/// How many IPSets one detector may hold.
+///
+/// `ListIPSets` reports a detector's IPSets in a single page: `IpSetIds` is
+/// `len 0..50` and `MaxResults` is `range 1..50`
+/// (`smithy_query(operation="ListIPSets")`), so a detector's whole collection
+/// fits in one page of at most 50 ids. The same number BOUNDS the store: an IPSet
+/// is retained until its detector is deleted and has no expiry of its own, so
+/// without this maximum a caller could make the service retain records without
+/// limit.
+pub const IP_SETS_PER_DETECTOR: usize = 50;
+
+/// The message a create past [`IP_SETS_PER_DETECTOR`] is refused with. Like every
+/// other rejection here it names the resource class and the limit, never the
+/// caller's values.
+pub fn ip_set_limit_message() -> String {
+    format!(
+        "The request is rejected because the detector has reached the limit of {IP_SETS_PER_DETECTOR} IPSets."
+    )
+}
+
+/// The wire name of the `IpSetId` member, as the request carries it
+/// (`smithy_query(operation="GetIPSet")` binds it as the URI label `IpSetId`,
+/// rendered `ipSetId` in the JSON body of the sibling operations). It is what a
+/// rejection names.
+pub const IP_SET_ID_MEMBER: &str = "ipSetId";
+
+/// Classify an `IpSetId` the detector does not hold: a value that is not an id
+/// this service mints at all is a parameter failure, a well-formed one the
+/// detector does not hold is an ownership failure. Same split as
+/// [`detector_id_rejection`], for the same reason — the class comes from the
+/// REQUEST, not from the store.
+pub fn ip_set_id_rejection(ip_set_id: &str) -> String {
+    if is_minted_id(ip_set_id) {
+        not_owned_message(IP_SET_ID_MEMBER)
+    } else {
+        invalid_parameter_message(IP_SET_ID_MEMBER)
+    }
+}
+
+/// One stored IPSet (trusted IP list). Timestamps are epoch milliseconds, the
+/// single source for the instants anything reports.
+#[derive(Debug, Clone)]
+pub struct IpSetRecord {
+    /// The minted `IpSetId`.
+    pub id: String,
+    /// `Name`: "The user-friendly name for the IPSet"
+    /// (`smithy_query(operation="GetIPSet")`), stored verbatim.
+    pub name: String,
+    /// `IpSetFormat`: the format of the file that contains the IPSet.
+    pub format: String,
+    /// `Location`: the URI of the file that contains the IPSet.
+    pub location: String,
+    /// `ExpectedBucketOwner`, which a read reports "only if it was provided
+    /// during IPSet creation or update" (`smithy_query(operation="GetIPSet")`).
+    pub expected_bucket_owner: Option<String>,
+    /// The tags of the IPSet resource.
+    pub tags: BTreeMap<String, String>,
+    /// `IpSetStatus`, the status of the uploaded file.
+    pub status: String,
+    /// When the clock owes [`Self::status`] its settled value, while the current
+    /// one is transitional. Absent once nothing is owed.
+    pub status_due_millis: Option<i64>,
+    /// The `ClientToken` the create carried, so a replay returns this same IPSet
+    /// instead of minting a second one.
+    pub client_token: Option<String>,
+    pub created_at_millis: i64,
+    pub updated_at_millis: i64,
+}
+
+impl IpSetRecord {
+    /// An IPSet created at `now`.
+    ///
+    /// `Activate` is "a Boolean value that indicates whether GuardDuty is to start
+    /// using the uploaded IPSet" (`smithy_query(operation="CreateIPSet")`): a list
+    /// the caller asked to be used starts in the transitional
+    /// [`IP_SET_ACTIVATING`] and the clock owes it [`IP_SET_ACTIVE`], while one the
+    /// caller did not ask to be used is stored unused — [`IP_SET_INACTIVE`], which
+    /// is settled, so nothing is owed on it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn created(
+        id: String,
+        name: String,
+        format: String,
+        location: String,
+        expected_bucket_owner: Option<String>,
+        tags: BTreeMap<String, String>,
+        activate: bool,
+        client_token: Option<String>,
+        now: i64,
+    ) -> Self {
+        let mut record = Self {
+            id,
+            name,
+            format,
+            location,
+            expected_bucket_owner,
+            tags,
+            status: IP_SET_INACTIVE.to_string(),
+            status_due_millis: None,
+            client_token,
+            created_at_millis: now,
+            updated_at_millis: now,
+        };
+        record.set_activation(activate, now);
+        record
+    }
+
+    /// Start the transition the caller's `Activate` asks for, from whatever status
+    /// this IPSet currently has.
+    ///
+    /// Asking for the status it already has owes nothing, so a repeated request
+    /// leaves the settled status alone instead of re-opening a transition.
+    pub fn set_activation(&mut self, activate: bool, now: i64) {
+        let (settled, transitional) = if activate {
+            (IP_SET_ACTIVE, IP_SET_ACTIVATING)
+        } else {
+            (IP_SET_INACTIVE, IP_SET_DEACTIVATING)
+        };
+        if self.status == settled || self.status == transitional {
+            return;
+        }
+        self.status = transitional.to_string();
+        self.status_due_millis = Some(now.saturating_add(IP_SET_TRANSITION_MILLIS));
+        self.updated_at_millis = now;
+    }
+
+    /// Apply the status change the CLOCK already made due, if any.
+    ///
+    /// The move out of a transitional status was owed at
+    /// [`Self::status_due_millis`] whether or not anybody called, which is why a
+    /// reporting operation may apply it. It is applied exactly once: a settled
+    /// status never moves on its own again.
+    pub fn settle(&mut self, now: i64) {
+        let Some(due) = self.status_due_millis else {
+            return;
+        };
+        if now < due {
+            return;
+        }
+        self.status = match self.status.as_str() {
+            IP_SET_ACTIVATING => IP_SET_ACTIVE.to_string(),
+            IP_SET_DEACTIVATING => IP_SET_INACTIVE.to_string(),
+            // Nothing else is transitional, so nothing else is owed a move.
+            other => other.to_string(),
+        };
+        self.status_due_millis = None;
     }
 }
 
