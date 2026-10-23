@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateAcmeDomainValidation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateAcmeDomainValidation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: mints a domain-validation ARN under the ACME endpoint the request
+//! names, persists the validation record (status `VALIDATING`) with the prevalidation
+//! scope and hosted zone the request configured, the resource tags it carries and the
+//! server-managed DNS record the caller publishes to prove ownership, and returns the
+//! ARN. An endpoint ARN with no record behind it is `ResourceNotFoundException`; a
+//! second validation of a domain the endpoint already validates is a conflict; an
+//! `IdempotencyToken` re-sent (against the same endpoint) with the same parameters
+//! resolves to the validation it already created, and re-sent with different parameters
+//! it is refused as a conflict.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateAcmeDomainValidation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `VALIDATING` is not where the validation stays: ACM prevalidates on its own, so the
+//! call records the `VALID` transition the clock owes it
+//! ([`crate::state::PendingAcmeDomainValidationStatus`]) and the instant it falls due,
+//! which whichever call next touches the store materialises.
 //!
 //! ## Shape of an operation
 //!
@@ -166,18 +171,268 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateAcmeDomainValidation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateAcmeDomainValidationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateAcmeDomainValidation"))
+        // No request metadata is needed: the `AcmeEndpointArn` the request names carries
+        // the Region and the account the validation's own ARN is minted under, so the
+        // ARN is a path under the one the caller addressed rather than one built from
+        // the caller's credential scope.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in the assembled emulator (the engine IS the shared store);
+            // this operation models a server fault, so that is the honest answer.
+            return Err(
+                CreateAcmeDomainValidationErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some("the acm acme domain validation store is unavailable".into()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let tags = crate::state::tag_map(input.tags.as_deref().unwrap_or_default())
+            .map_err(validation_exception)?;
+
+        // The prevalidation configuration, read off whichever `PrevalidationOptions`
+        // member the request carried. The union models one today (`DnsPrevalidation`),
+        // and `PrevalidationType` correspondingly declares one value, so the variant IS
+        // the type the record reports.
+        let PrevalidationOptions::DnsPrevalidation(options) = &input.prevalidation_options;
+        let prevalidation_type = crate::state::PREVALIDATION_TYPE_DNS;
+
+        let fingerprint = request_fingerprint(&input, prevalidation_type, options, &tags);
+        // A domain validation is created UNDER one endpoint, so a token names one create
+        // against that endpoint: the index is keyed by the pair, and the endpoint ARN
+        // already carries the Region the request was signed for.
+        let idempotency = input
+            .idempotency_token
+            .as_deref()
+            .map(|token| (input.acme_endpoint_arn.clone(), token.to_string()));
+
+        // ONE instant answers the whole request: it materialises the transitions the
+        // clock already owes and dates the validation this call creates.
+        let now = std::time::SystemTime::now();
+
+        let mut store = state.lock();
+        store.materialize_due(now);
+
+        // What this request's `IdempotencyToken` has already created against this
+        // endpoint, if anything.
+        let replayed = idempotency
+            .as_ref()
+            .and_then(|key| store.acme_domain_validation_idempotency.get(key))
+            .cloned();
+        if let Some(seen) = replayed {
+            // The token identifies ONE create. Re-sent with the same parameters it
+            // answers with the validation it already created and makes no second one;
+            // re-sent with different parameters it is a different request wearing an
+            // identifier that is already taken, so it is refused rather than silently
+            // discarding the change — which is what `ConflictException` ("you are trying
+            // to update a resource or configuration that is already being created or
+            // updated") names.
+            if seen.fingerprint != fingerprint {
+                return Err(CreateAcmeDomainValidationErrorModeled::ConflictException(
+                    ConflictException {
+                        message: Some(format!(
+                            "the idempotency token of this request already created ACME domain validation {}, with different parameters",
+                            seen.acme_domain_validation_arn
+                        )),
+                    },
+                )
+                .into());
+            }
+            // An entry whose validation has since been deleted is stale, so it is not
+            // reused: a minted ARN must always have a record behind it.
+            if store
+                .acme_domain_validations
+                .contains_key(&seen.acme_domain_validation_arn)
+            {
+                return Ok(CreateAcmeDomainValidationOutput {
+                    acme_domain_validation_arn: seen.acme_domain_validation_arn,
+                });
+            }
+        }
+
+        // A domain validation exists only on the ACME endpoint it authorizes, and its
+        // ARN is a path under that endpoint's, so an endpoint this account does not hold
+        // has nothing to create a validation under.
+        let Some(endpoint) = store.acme_endpoints.get(&input.acme_endpoint_arn) else {
+            return Err(
+                CreateAcmeDomainValidationErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::acme_endpoint_not_found_message(
+                            &input.acme_endpoint_arn,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+        let acme_endpoint_arn = endpoint.arn.clone();
+
+        // One endpoint authorizes one domain through ONE validation: a second create for
+        // a domain it already validates would leave two records authorizing the same
+        // name, so it is refused rather than silently shadowing the first. DNS labels are
+        // case-insensitive, so the two names are compared as domains.
+        if let Some(existing) =
+            store.acme_domain_validation_for(&acme_endpoint_arn, &input.domain_name)
+        {
+            return Err(CreateAcmeDomainValidationErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(format!(
+                        "ACME endpoint {acme_endpoint_arn} already has domain validation {} for domain {}",
+                        existing.arn, existing.domain_name
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The cap on the WHOLE map, checked first because it is the one bound nothing in
+        // the request can partition: the per-endpoint quota below is counted over a
+        // parent the caller can create more of. The token index gains an entry only
+        // beside a new validation, so it is bounded with the map; it is checked here as
+        // well so neither can pass the cap.
+        let stored = store.acme_domain_validations.len();
+        let tokens = store.acme_domain_validation_idempotency.len();
+        if stored >= crate::state::ACME_DOMAIN_VALIDATION_STORE_LIMIT
+            || tokens >= crate::state::ACME_DOMAIN_VALIDATION_STORE_LIMIT
+        {
+            // Name whichever count reached the cap, so the refusal says what is full.
+            let (full, held) = if stored >= crate::state::ACME_DOMAIN_VALIDATION_STORE_LIMIT {
+                ("ACME domain validations", stored)
+            } else {
+                ("ACME domain validation idempotency tokens", tokens)
+            };
+            return Err(
+                CreateAcmeDomainValidationErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(format!(
+                            "this emulator already holds {held} {full}, the most it stores ({})",
+                            crate::state::ACME_DOMAIN_VALIDATION_STORE_LIMIT
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The per-endpoint quota, refused BEFORE the record is inserted, so the store
+        // cannot grow past it however many times the call is repeated.
+        let held = store.acme_domain_validations_of(&acme_endpoint_arn).count();
+        if held >= crate::state::ACME_DOMAIN_VALIDATION_LIMIT {
+            return Err(
+                CreateAcmeDomainValidationErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(format!(
+                            "ACME endpoint {acme_endpoint_arn} already holds {held} domain validations, the quota of {}",
+                            crate::state::ACME_DOMAIN_VALIDATION_LIMIT
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let validation_id = uuid::Uuid::new_v4().to_string();
+        let arn = crate::state::acme_domain_validation_arn(&acme_endpoint_arn, &validation_id);
+
+        let validation = crate::state::AcmeDomainValidationRecord {
+            arn: arn.clone(),
+            acme_endpoint_arn,
+            domain_name: input.domain_name.clone(),
+            prevalidation_type: prevalidation_type.to_string(),
+            domain_scope: options.domain_scope.clone(),
+            hosted_zone_id: options.hosted_zone_id.clone(),
+            // Server-managed: derived from this validation's own id and the domain being
+            // validated, never from anything the caller sent.
+            resource_record: Some(crate::state::acme_prevalidation_resource_record(
+                &validation_id,
+                &input.domain_name,
+            )),
+            status: crate::state::ACME_DOMAIN_VALIDATION_STATUS_VALIDATING.to_string(),
+            // Nothing has failed: `FailureDetails` carries "details about the failure, if
+            // the validation failed" (`AcmeDomainValidation$FailureDetails` doc).
+            failure_details: None,
+            tags,
+            // ACM prevalidates the domain on its own, so the `VALID` transition is owed
+            // from here on; the instant it falls due is fixed now and materialised by
+            // whichever call next touches the store.
+            pending_status: Some(crate::state::PendingAcmeDomainValidationStatus::validating_at(
+                now,
+            )),
+            created_at: now,
+            updated_at: now,
+        };
+
+        store.acme_domain_validations.insert(arn.clone(), validation);
+        if let Some(key) = idempotency {
+            store.acme_domain_validation_idempotency.insert(
+                key,
+                crate::state::AcmeDomainValidationIdempotency {
+                    fingerprint,
+                    acme_domain_validation_arn: arn.clone(),
+                },
+            );
+        }
+
+        Ok(CreateAcmeDomainValidationOutput {
+            acme_domain_validation_arn: arn,
+        })
     }
+}
+
+/// A refusal of the request as invalid, as this operation's own modelled
+/// `ValidationException` ("the supplied input failed to satisfy constraints").
+fn validation_exception(message: String) -> CreateAcmeDomainValidationError {
+    CreateAcmeDomainValidationErrorModeled::ValidationException(ValidationException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// A fingerprint of EVERY parameter the validation is created from: the endpoint it
+/// authorizes, the domain name, the prevalidation type and the options under it, and
+/// the resource tags.
+///
+/// Rendered by [`crate::state::fingerprint_groups`], which frames each group behind its
+/// own part count, so no value can move between groups, or run into its neighbour, and
+/// leave the fingerprint unchanged — which matters because every tag key and value, and
+/// the domain name itself, is arbitrary caller-controlled text. The tag map is rendered
+/// in key order, so the same request with its tags listed in another order fingerprints
+/// identically.
+fn request_fingerprint(
+    input: &CreateAcmeDomainValidationInput,
+    prevalidation_type: &str,
+    options: &DnsPrevalidationOptions,
+    tags: &std::collections::BTreeMap<String, String>,
+) -> String {
+    let scope = options.domain_scope.clone().unwrap_or_default();
+    // Each optional member renders as the empty string when absent, which no modelled
+    // value of it can be (`DomainScopeOption` is an enum and `HostedZoneId` has a
+    // minimum length of 1), so "absent" and "present" cannot fingerprint alike. The
+    // `DomainScope` structure needs its own presence part for the same reason: a request
+    // that carries an EMPTY scope stores `Some(..)` and reports a scope, so it is not
+    // the same request as one that carries none.
+    let scope_present = if options.domain_scope.is_some() {
+        "scope"
+    } else {
+        ""
+    };
+    let configuration: Vec<&str> = vec![
+        &input.acme_endpoint_arn,
+        &input.domain_name,
+        prevalidation_type,
+        options.hosted_zone_id.as_deref().unwrap_or_default(),
+        scope_present,
+        scope.exact_domain.as_deref().unwrap_or_default(),
+        scope.subdomains.as_deref().unwrap_or_default(),
+        scope.wildcards.as_deref().unwrap_or_default(),
+    ];
+
+    let tags: Vec<&str> = tags
+        .iter()
+        .flat_map(|(key, value)| [key.as_str(), value.as_str()])
+        .collect();
+
+    crate::state::fingerprint_groups(&[configuration.as_slice(), tags.as_slice()])
 }

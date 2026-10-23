@@ -17,7 +17,7 @@
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::wire::{call, emulator, ok, REGION, REGISTRY_ID};
+use crate::wire::{call, emulator, given_layer, ok, REGION, REGISTRY_ID};
 
 /// The only value `SigningRepositoryFilterType` admits
 /// (`smithy_query(query="shape",shape="SigningRepositoryFilterType")` → `["WILDCARD_MATCH"]`).
@@ -201,9 +201,6 @@ async fn a_put_after_a_delete_restores_the_registrys_configuration() {
 #[tokio::test]
 async fn deleting_the_configuration_leaves_the_repositories_and_images_alone() {
     let router = emulator();
-    let manifest = "{\"schemaVersion\":2,\
-         \"mediaType\":\"application/vnd.docker.distribution.manifest.v2+json\",\
-         \"config\":{\"size\":7023,\"digest\":\"sha256:b5b2\"}}";
     let case = "a registry with repositories and an image";
 
     for name in ["signed-app", "other/app"] {
@@ -215,6 +212,14 @@ async fn deleting_the_configuration_leaves_the_repositories_and_images_alone() {
         )
         .await;
     }
+    // The config blob the manifest names, uploaded before the manifest that references
+    // it is pushed: a manifest cannot be pushed before its blobs are in the repository.
+    let config_digest = given_layer(&router, case, "signed-app", b"signed-app config").await;
+    let manifest = format!(
+        "{{\"schemaVersion\":2,\
+         \"mediaType\":\"application/vnd.docker.distribution.manifest.v2+json\",\
+         \"config\":{{\"size\":7023,\"digest\":\"{config_digest}\"}}}}"
+    );
     let pushed = ok(
         &router,
         case,

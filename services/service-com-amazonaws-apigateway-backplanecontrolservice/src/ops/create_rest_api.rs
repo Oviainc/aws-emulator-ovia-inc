@@ -172,8 +172,8 @@ pub const ROOT_RESOURCE_PATH: &str = "/";
 /// service publishes none, this emulator's own resource guard — see `crate::state`.
 fn bound_input(input: &CreateRestApiInput) -> Result<(), String> {
     use crate::state::{
-        bound_chars, bound_entries, MAX_COLLECTION_ENTRIES, MAX_POLICY_CHARS, MAX_STRING_CHARS,
-        MAX_TAGS, MAX_TAG_KEY_CHARS, MAX_TAG_VALUE_CHARS,
+        bound_chars, bound_entries, bound_tag, MAX_COLLECTION_ENTRIES, MAX_POLICY_CHARS,
+        MAX_STRING_CHARS, MAX_TAGS,
     };
 
     bound_chars("name", &input.name, MAX_STRING_CHARS)?;
@@ -198,11 +198,12 @@ fn bound_input(input: &CreateRestApiInput) -> Result<(), String> {
             bound_chars("binaryMediaTypes", value, MAX_STRING_CHARS)?;
         }
     }
+    // The tags a create carries are checked by the SAME rule `TagResource` applies, so
+    // a tag this service refuses on one path cannot be stored through the other.
     if let Some(tags) = &input.tags {
         bound_entries("tags", tags.len(), MAX_TAGS)?;
         for (key, value) in tags {
-            bound_chars("a tag key", key, MAX_TAG_KEY_CHARS)?;
-            bound_chars("a tag value", value, MAX_TAG_VALUE_CHARS)?;
+            bound_tag(key, value)?;
         }
     }
     if let Some(configuration) = &input.endpoint_configuration {

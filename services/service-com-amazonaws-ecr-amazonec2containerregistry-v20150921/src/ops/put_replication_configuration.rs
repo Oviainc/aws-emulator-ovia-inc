@@ -109,6 +109,29 @@ impl From<PutReplicationConfigurationErrorModeled> for PutReplicationConfigurati
     }
 }
 
+/// The first destination of `configuration` whose `region` is not a Region AWS has, with
+/// the index of the rule carrying it.
+///
+/// A replication destination is a registry in a Region, and AWS resolves that Region at
+/// write time — a destination in a Region that does not exist could never replicate — so
+/// the Region must be one of the published AWS Region codes. The catalog is
+/// `emulator_telemetry::policy::KNOWN_REGIONS` ("every AWS region the wire may carry"),
+/// the one list of Region codes this emulator carries; the model's own
+/// `ReplicationDestination$region` `@pattern("^[0-9a-z-]{2,25}$")` admits any lower-case
+/// label, so it cannot decide this and the boundary does not.
+fn unknown_region(
+    configuration: &ReplicationConfiguration,
+) -> Option<(usize, &ReplicationDestination)> {
+    configuration
+        .rules
+        .iter()
+        .enumerate()
+        .flat_map(|(index, rule)| rule.destinations.iter().map(move |dest| (index, dest)))
+        .find(|(_, destination)| {
+            !::emulator_telemetry::policy::KNOWN_REGIONS.contains(&destination.region.as_str())
+        })
+}
+
 /// The first destination of `configuration` that names the source registry itself —
 /// this account's registry in `region` — with the index of the rule carrying it.
 ///
@@ -180,6 +203,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // request was signed for, and that Region is what makes a destination "the source".
         let region = crate::state::request_region(ctx.parts());
         let configuration = input.replication_configuration;
+
+        // Every destination names a registry in a Region, so the Region has to be one:
+        // a destination in a Region AWS does not have is refused before the
+        // configuration is stored, naming the parameter and the Region that failed it.
+        if let Some((_, destination)) = unknown_region(&configuration) {
+            return Err(
+                PutReplicationConfigurationErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(format!(
+                            "Invalid parameter at 'replicationConfiguration' failed to \
+                             satisfy constraint: 'Invalid region '{}''",
+                            destination.region
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
 
         // Replication from a registry to itself is not a destination: see
         // [`source_destination`].

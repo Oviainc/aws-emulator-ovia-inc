@@ -518,6 +518,43 @@ pub fn reported_resource_type(reference: &ResourceRef) -> Option<String> {
     }
 }
 
+/// The `resourceId` a modelled error reports for a resolved resource: the IDENTIFIER of
+/// the resource, never the ARN the caller addressed it by.
+///
+/// `ResourceNotFoundException$resourceId` is documented as "The ID of the resource", and a
+/// client feeds it back into a name-scoped call (or matches it against a name), so an ARN
+/// there is unusable. Each kind reports what this store keys it by: a domain its name, a
+/// repository its own name inside its domain, a package group its pattern.
+#[must_use]
+pub fn reported_resource_id(reference: &ResourceRef) -> String {
+    match reference {
+        ResourceRef::Domain { name, .. } => name.clone(),
+        ResourceRef::Repository { repository, .. } => repository.clone(),
+        ResourceRef::PackageGroup { pattern, .. } => pattern.clone(),
+    }
+}
+
+/// The `ResourceNotFoundException` message for an ARN-addressed resource this store does
+/// not hold: the sentence the resource's OWN kind is refused with everywhere else in this
+/// service ([`domain_not_found_message`] and friends), so a caller that addressed a domain
+/// by ARN reads the same refusal as one that named it.
+#[must_use]
+pub fn tagged_resource_not_found_message(reference: &ResourceRef) -> String {
+    match reference {
+        ResourceRef::Domain { owner, name } => domain_not_found_message(name, owner.as_deref()),
+        ResourceRef::Repository {
+            owner,
+            domain,
+            repository,
+        } => repository_not_found_message(domain, owner.as_deref(), repository),
+        ResourceRef::PackageGroup {
+            owner,
+            domain,
+            pattern,
+        } => package_group_not_found_message(domain, owner.as_deref(), pattern),
+    }
+}
+
 /// `held` with `incoming` applied, the way CodeArtifact's `TagResource` documents it
 /// ("Adds or updates tags for a resource"): a key the resource already holds keeps its
 /// position and takes the new value, and a key it does not hold is appended.
@@ -1636,6 +1673,55 @@ pub fn package_group_not_found_message(
     )
 }
 
+/// The `ResourceNotFoundException` message `DescribePackageVersion` states for a
+/// COORDINATE the addressed repository holds no version of.
+///
+/// A package version is addressed by its whole `(format, namespace, package, version)`
+/// coordinate and a package exists in a repository only through its versions, so this is
+/// the sentence for "nothing is published at this coordinate": it names the format, the
+/// package, its namespace and the repository the version was looked for in. The namespace
+/// clause appears only where the request carried one, since a format whose versions carry
+/// no namespace component has none to name. Distinct from
+/// [`package_not_found_message`], which is the sentence the PACKAGE-scoped operations
+/// state for a package name the repository does not hold at all.
+pub fn package_coordinate_not_found_message(
+    format: &str,
+    namespace: Option<&str>,
+    package: &str,
+    repository: &str,
+) -> String {
+    match namespace {
+        Some(namespace) => format!(
+            "The {format} package '{package}' with namespace '{namespace}' does not exist in \
+             repository '{repository}'."
+        ),
+        None => format!(
+            "The {format} package '{package}' does not exist in repository '{repository}'."
+        ),
+    }
+}
+
+/// The `resourceId` an error reports for a PACKAGE VERSION: its fully-qualified identity
+/// inside the repository, `<namespace>/<package>/<version>`.
+///
+/// A version string alone does not identify anything — two conflicts on different packages
+/// would report the same `1.0.0` — so the id carries the whole coordinate a client would
+/// have to feed back to address this version. The namespace segment is present exactly
+/// when the request carried one; no component can contain `/` (`PackageNamespace`,
+/// `PackageName` and `PackageVersion` are all modelled `^[^#/\s]+$`), so the identity
+/// parses back unambiguously.
+#[must_use]
+pub fn package_version_resource_id(
+    namespace: Option<&str>,
+    package: &str,
+    version: &str,
+) -> String {
+    match namespace {
+        Some(namespace) => format!("{namespace}/{package}/{version}"),
+        None => format!("{package}/{version}"),
+    }
+}
+
 /// The `ResourceNotFoundException` message for a package the addressed repository does not
 /// hold. A package is addressed by its whole `(format, namespace, name)` triple, so the
 /// sentence quotes the name the request asked for and the repository it asked in.
@@ -1657,6 +1743,58 @@ pub fn package_group_already_exists_message(
     package_group: &str,
 ) -> String {
     format!("Package group '{package_group}' in domain '{domain}' owned by '{owner}' already exists.")
+}
+
+/// The `ValidationExceptionReason` a refused member carries: the request reached the
+/// service and one of its fields failed a rule the model cannot express.
+pub const VALIDATION_REASON_FIELD_FAILED: &str = "FIELD_VALIDATION_FAILED";
+
+/// The `ValidationException` message for ONE input member that failed a constraint this
+/// service enforces itself.
+///
+/// AWS states every member-level constraint failure in one envelope — `N validation
+/// error(s) detected: Value '<value>' at '<member path>' failed to satisfy constraint:
+/// <requirement>` — and does not change envelope because the constraint happens to be one
+/// the Smithy model cannot express: clients and operators parse that form to attribute a
+/// failure to a specific member. The framework renders exactly this envelope for a
+/// MODELLED constraint (`aws_smithy_schema_server::envelope` over its own `Violation`s,
+/// which this service's `override_refusal` delegates to), but its `ViolationKind` is
+/// `#[non_exhaustive]` and spells only the modelled requirements, so a service-enforced
+/// requirement is composed here instead — in the one place every handler reaches for it,
+/// so the two cannot word the same refusal differently.
+pub fn constraint_violation_message(member: &str, value: &str, requirement: &str) -> String {
+    format!(
+        "1 validation error detected: Value '{value}' at '{member}' failed to satisfy \
+         constraint: {requirement}"
+    )
+}
+
+/// The requirement a `PackageGroupPattern` that is not a path from the domain root failed.
+///
+/// `PackageGroupPattern` is modelled with length bounds only (len 2..520), so the boundary
+/// validator admits any string of that length; a package group's identifier is a PATH from
+/// the domain root, which is what makes `/*` the ancestor of `/npm/*`, so the leading `/`
+/// is a constraint this service enforces.
+const PACKAGE_GROUP_PATTERN_REQUIREMENT: &str = "Pattern must start with '/'.";
+
+/// The refusal a caller-supplied `packageGroup` owes when it is not a path from the domain
+/// root, or `None` when it is one.
+///
+/// Decided here rather than per handler: every operation that takes a `packageGroup`
+/// accepts the same identifier, so a value no package group can ever have is the same bad
+/// REQUEST at each of them — never a lookup that happens to miss.
+pub fn package_group_pattern_refusal(pattern: &str) -> Option<ValidationException> {
+    if pattern.starts_with('/') {
+        return None;
+    }
+    Some(ValidationException {
+        message: constraint_violation_message(
+            "packageGroup",
+            pattern,
+            PACKAGE_GROUP_PATTERN_REQUIREMENT,
+        ),
+        reason: Some(VALIDATION_REASON_FIELD_FAILED.to_string()),
+    })
 }
 
 /// The ARN of a package group:

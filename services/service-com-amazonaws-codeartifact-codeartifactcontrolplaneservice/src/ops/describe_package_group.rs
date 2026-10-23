@@ -160,6 +160,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // A `packageGroup` that is not a path from the domain root is not an identifier
+        // any package group can have, so it is refused on the INPUT — the same
+        // constraint-violation envelope `CreatePackageGroup` refuses it with — rather than
+        // resolved to a lookup that is bound to miss. Checked before the store is read, so
+        // a bad request never depends on which domain was addressed.
+        if let Some(refusal) = crate::state::package_group_pattern_refusal(&input.package_group) {
+            return Err(DescribePackageGroupErrorModeled::ValidationException(refusal).into());
+        }
+
         let store = state.lock();
         let Some(domain) = store.domain(&input.domain, input.domain_owner.as_deref()) else {
             return Err(DescribePackageGroupErrorModeled::ResourceNotFoundException(

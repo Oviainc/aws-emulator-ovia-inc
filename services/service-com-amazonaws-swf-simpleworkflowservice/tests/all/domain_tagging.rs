@@ -30,23 +30,26 @@ const MAX_TAGS_PER_DOMAIN: usize = 50;
 
 /// The modelled maximum length of `ResourceTag$key`
 /// (`smithy_query(query="shape",shape="ResourceTag")`: key `ResourceTagKey`, len
-/// 1..128).
-const MAX_TAG_KEY_LEN: usize = 128;
+/// 1..128). `pub(crate)` so a sibling suite checks the same published bound.
+pub(crate) const MAX_TAG_KEY_LEN: usize = 128;
 
 /// The modelled maximum length of `ResourceTag$value` (same query: value
-/// `ResourceTagValue`, len 0..256).
-const MAX_TAG_VALUE_LEN: usize = 256;
+/// `ResourceTagValue`, len 0..256). `pub(crate)` for the same reason.
+pub(crate) const MAX_TAG_VALUE_LEN: usize = 256;
 
 /// One tag exactly as the wire carries it: a required key, and a `value` that may be
 /// present, present and empty, or absent entirely (the member is optional).
+///
+/// `pub(crate)` so a sibling suite compares tags with the same exact-presence
+/// semantics rather than keeping a second notion of what a tag is.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct Tag {
-    key: String,
-    value: Option<String>,
+pub(crate) struct Tag {
+    pub(crate) key: String,
+    pub(crate) value: Option<String>,
 }
 
 impl Tag {
-    fn new(key: &str, value: Option<&str>) -> Self {
+    pub(crate) fn new(key: &str, value: Option<&str>) -> Self {
         Self {
             key: key.to_string(),
             value: value.map(str::to_string),
@@ -54,7 +57,7 @@ impl Tag {
     }
 
     /// The JSON member for a `ResourceTagList` entry, omitting `value` when absent.
-    fn to_json(&self) -> Value {
+    pub(crate) fn to_json(&self) -> Value {
         match &self.value {
             Some(value) => json!({ "key": self.key, "value": value }),
             None => json!({ "key": self.key }),
@@ -64,7 +67,7 @@ impl Tag {
 
 /// The tags a response reports, as a set: AWS documents no ordering for a tag list, so
 /// the assertion is on membership and count, never on position.
-fn reported_tags(case: &str, body: &Value) -> BTreeSet<Tag> {
+pub(crate) fn reported_tags(case: &str, body: &Value) -> BTreeSet<Tag> {
     let reported = body
         .get("tags")
         .and_then(Value::as_array)
@@ -91,7 +94,7 @@ fn reported_tags(case: &str, body: &Value) -> BTreeSet<Tag> {
 
 /// Register `domain` carrying `tags` and return the ARN the service minted for it,
 /// read back through `DescribeDomain` — the way a client learns a resource ARN.
-async fn registered_with_tags(
+pub(crate) async fn registered_with_tags(
     emulator: &Emulator,
     case: &str,
     domain: &str,
@@ -117,7 +120,7 @@ async fn registered_with_tags(
 }
 
 /// Call `ListTagsForResource` and return the parsed body, requiring a 200.
-async fn list_tags(emulator: &Emulator, case: &str, resource_arn: &str) -> Value {
+pub(crate) async fn list_tags(emulator: &Emulator, case: &str, resource_arn: &str) -> Value {
     emulator
         .ok(
             case,

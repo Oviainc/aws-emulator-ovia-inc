@@ -45,6 +45,147 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+/// The path segment every modeled operation of this service is bound under:
+/// `GetConnection`/`PostToConnection`/`DeleteConnection` all bind
+/// `/@connections/{ConnectionId}`
+/// (`smithy_query(query="operation", operation="GetConnection,PostToConnection,DeleteConnection")`).
+const CONNECTIONS_SEGMENT: &str = "/@connections/";
+
+/// Rewrite `uri` so its path starts at the modeled `/@connections/{ConnectionId}`
+/// binding, dropping the invoke-path prefix in front of it. `None` when the path
+/// carries no `@connections` segment, or already begins with it (nothing to strip).
+///
+/// WHY a prefix is there at all: a caller of this API addresses it through the owning
+/// API's own invoke endpoint, and "the stage name is typically appended to the API
+/// endpoint" (the `Api$ApiEndpoint` doc in the API Gateway V2 model), so AWS serves
+/// these operations at `https://{api-id}.execute-api.{region}.amazonaws.com/{stage}/@connections/{id}`.
+/// An SDK client is configured with that whole URL — stage path included — as its
+/// endpoint and appends the modeled URI to it, so the path that arrives here carries
+/// the stage (and, through a custom domain's base-path mapping, whatever segments that
+/// mapping adds) in front of the modeled binding.
+///
+/// Everything before the segment is dropped rather than parsed: the modeled operations
+/// take no api or stage member, the `ConnectionId` label is the only path value any of
+/// them binds, and a `ConnectionId` is one path segment (a `/` inside it is
+/// percent-encoded), so the `@connections` segment occurs exactly once.
+fn modeled_uri(uri: &str) -> Option<String> {
+    // Parsed with the `http::Uri` parser the crate already depends on, rather than
+    // split by hand: the authority (userinfo, port), an absent path and a non-origin
+    // target are its rules to know, not this seam's.
+    let addressed: http::Uri = uri.parse().ok()?;
+    let path_and_query = addressed.path_and_query()?;
+    let path = path_and_query.path();
+    let segment_at = path.find(CONNECTIONS_SEGMENT)?;
+    if segment_at == 0 {
+        // Already the modeled path: the generated routing table resolves it.
+        return None;
+    }
+    let query = path_and_query
+        .query()
+        .map_or_else(String::new, |query| format!("?{query}"));
+    let modeled = format!("{}{query}", &path[segment_at..]);
+
+    let mut rewritten = http::Uri::builder();
+    // Scheme and authority survive the rewrite; an origin-form target carries neither,
+    // and the builder then takes the path alone.
+    if let Some(scheme) = addressed.scheme() {
+        rewritten = rewritten.scheme(scheme.clone());
+    }
+    if let Some(authority) = addressed.authority() {
+        rewritten = rewritten.authority(authority.clone());
+    }
+    rewritten
+        .path_and_query(modeled)
+        .build()
+        .ok()
+        .map(|uri| uri.to_string())
+}
+
+/// The same request addressed at the modeled `/@connections/{ConnectionId}` path,
+/// carrying `body`: method and headers verbatim, with the invoke-path prefix dropped
+/// from the URI. `None` when there is no prefix to drop.
+fn at_modeled_path_with(
+    req: &aws_smithy_runtime_api::http::Request,
+    body: aws_smithy_types::body::SdkBody,
+) -> Option<aws_smithy_runtime_api::http::Request> {
+    let uri = modeled_uri(req.uri())?;
+    let mut rewritten = aws_smithy_runtime_api::http::Request::new(body);
+    rewritten.set_uri(uri.as_str()).ok()?;
+    rewritten.set_method(req.method()).ok()?;
+    for (name, value) in req.headers().iter() {
+        // `append`, not `insert`: `iter` yields one entry per value, so a repeated
+        // header keeps every value it arrived with.
+        rewritten
+            .headers_mut()
+            .append(name.to_string(), value.to_string());
+    }
+    Some(rewritten)
+}
+
+/// The request addressed at its modeled path for a ROUTING decision only, with an empty
+/// body: resolving a restJson1 routing key reads the method, the path and which headers
+/// are present, never the body, so the payload is not copied to decide where a request
+/// goes. `None` when there is no invoke-path prefix to drop.
+fn routing_view_at_modeled_path(
+    req: &aws_smithy_runtime_api::http::Request,
+) -> Option<aws_smithy_runtime_api::http::Request> {
+    at_modeled_path_with(req, aws_smithy_types::body::SdkBody::empty())
+}
+
+/// The request addressed at its modeled path for the SERVE: the body copied verbatim, so
+/// the modeled operation deserializes exactly the payload that arrived. `None` when there
+/// is no prefix to drop, or when the body is not buffered (it cannot be copied without
+/// consuming it).
+fn request_at_modeled_path(
+    req: &aws_smithy_runtime_api::http::Request,
+) -> Option<aws_smithy_runtime_api::http::Request> {
+    let body = req.body().bytes()?.to_vec();
+    at_modeled_path_with(req, aws_smithy_types::body::SdkBody::from(body))
+}
+
+/// Whether this service serves the request these `parts` came from.
+///
+/// This service signs as `execute-api` — a signing name it SHARES with the Amazon
+/// Connect Participant Service
+/// (`services/service-com-amazonaws-connectparticipant-amazonconnectparticipantservicelambda`,
+/// `aws.auth#sigv4` name `execute-api`), whose participant endpoint is itself served
+/// through API Gateway. The router resolves a request's routing key from the SigV4
+/// credential scope FIRST, so both services see the same key: claiming on the signing
+/// name alone makes each claim its peer's traffic, the router finds two claimants and
+/// answers `500 AmbiguousService` — a code no AWS model declares — which made BOTH
+/// services unreachable. Every `@connections` call answered a retryable server fault
+/// instead of its modelled 2xx or 4xx.
+///
+/// Their modelled URI path spaces are disjoint: this service's three operations are all
+/// bound under `/@connections/…` (`ROUTE_PATH_SEGMENTS` is `["@connections"]`), the
+/// participant service's under `/participant/…`. So the claim adds the framework's
+/// path-segment conjunct over this service's own generated, model-derived segments.
+///
+/// `emulator_server::can_handle_based_on_route_key_and_path` is the agent-immutable owner
+/// of that rule and is CALLED here rather than re-implemented. It takes a whole
+/// `http::Request` while [`Service::can_handle`] is handed only the request's parts, so
+/// the two things it reads — the URI and the headers — are re-presented to it as a
+/// bodiless request. It reads neither the body nor the method, so nothing it decides on
+/// is missing.
+///
+/// The path it judges is the one the request is addressed at MODELLED ([`modeled_uri`]):
+/// a caller reaches these operations through the owning API's invoke URL, so the arriving
+/// path carries that URL's prefix in front of the modelled binding and its FIRST segment
+/// is the stage, not `@connections`.
+fn can_handle_parts(parts: &http::request::Parts) -> bool {
+    let addressed = parts.uri.to_string();
+    let uri = modeled_uri(&addressed).unwrap_or(addressed);
+    let Ok(mut request) = http::Request::builder().uri(uri).body(bytes::Bytes::new()) else {
+        return false;
+    };
+    *request.headers_mut() = parts.headers.clone();
+    emulator_server::can_handle_based_on_route_key_and_path(
+        &request,
+        crate::ROUTE_KEY,
+        crate::ROUTE_PATH_SEGMENTS,
+    )
+}
+
 /// The `com-amazonaws-apigatewaymanagementapi-apigatewaymanagementapi` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -54,6 +195,53 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
     /// Answers an over-limit `PostToConnection`; see [`OversizedPayload`].
     oversized_payload: OversizedPayload,
+    /// Serves a request addressed through the owning API's invoke path; see
+    /// [`InvokePathPrefixed`].
+    invoke_path_prefixed: InvokePathPrefixed,
+}
+
+/// Serves a request whose path carries the owning API's invoke-path prefix in front of
+/// the modeled `/@connections/{ConnectionId}` binding — `…/{stage}/@connections/{id}`,
+/// which is the URL AWS documents for these operations and the one an SDK client built
+/// from a stage endpoint sends.
+///
+/// WHY this is a seam and not a line in a handler: the prefix defeats the model's own
+/// routing key. The generated routing table matches a request's method and path against
+/// each operation's modeled URI pattern, so a path with an extra leading segment names
+/// NO operation and the request never reaches a handler at all — it is answered with the
+/// protocol's routing failure. [`Service::override_operation`] is exactly the seam for
+/// "the model's routing key cannot name this request correctly": this routes it by
+/// resolving the SAME model-derived routing table against the request addressed at its
+/// modeled path, so the prefix changes nothing about which operation runs or what it
+/// answers.
+struct InvokePathPrefixed;
+
+impl ErasedOperation for InvokePathPrefixed {
+    fn run<'r>(
+        &'r self,
+        svc: &'r dyn Service,
+        req: &'r aws_smithy_runtime_api::http::Request,
+        ctx: &'r smithy_server_runtime::OperationContext<'r>,
+    ) -> BoxFuture<'r, aws_smithy_runtime_api::http::Response> {
+        Box::pin(async move {
+            // `override_operation` only routes here for a request this rewrite already
+            // succeeded on, so each `else` below is unreachable in the served path and
+            // falls back to the protocol's own routing failure rather than guessing an
+            // operation.
+            let Some(rewritten) = request_at_modeled_path(req) else {
+                return svc.definition().routing_error_response(req);
+            };
+            let Ok(routing_key) = svc.definition().protocol().routing_key(&rewritten) else {
+                return svc.definition().routing_error_response(&rewritten);
+            };
+            let Some(operation) = svc.definition().routing_table().get(routing_key) else {
+                return svc.definition().routing_error_response(&rewritten);
+            };
+            // The modeled operation deserializes the rewritten request, so its
+            // `ConnectionId` label is read off the modeled path binding.
+            operation.run(svc, &rewritten, ctx).await
+        })
+    }
 }
 
 /// Answers a `PostToConnection` whose `Data` payload is larger than the model allows
@@ -112,6 +300,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
         Self {
             entry: crate::ServiceDefinition::new(engine),
             oversized_payload: OversizedPayload,
+            invoke_path_prefixed: InvokePathPrefixed,
         }
     }
 }
@@ -125,13 +314,10 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn can_handle(&self, parts: &http::request::Parts) -> bool {
-        // Claim a request whose resolved route key is this service's signing
-        // name. Edit this for anything the model does not express — a signing
-        // name shared by several services, or access-key-id-based routing.
-        match smithy_server_runtime::resolve_route_key(parts) {
-            Some(key) => key == self.entry.identity().signing_name(),
-            None => false,
-        }
+        // The signing name `execute-api` is SHARED with the Amazon Connect Participant
+        // Service, so the claim is the signing name AND this service's own modelled
+        // path space. See [`can_handle_parts`] for why, and for who owns the rule.
+        can_handle_parts(parts)
     }
 
     fn override_operation(
@@ -143,26 +329,45 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // it. `req` is the whole request, so a decision that depends on the body —
         // the `Action` form field on a query protocol, say — is reachable here.
         //
-        // One case needs it: a `PostToConnection` whose `Data` payload is past the
-        // modeled `@length` maximum. See [`OversizedPayload`] for why the modeled
+        // Two cases need it.
+        //
+        // The first is the invoke-path prefix every caller of this API sends in front
+        // of the modeled binding (`…/{stage}/@connections/{id}`), which the model's
+        // routing key cannot match. Which operation the request names is read off the
+        // request addressed at its modeled path; the serve rewrites it again, with the
+        // body, in [`InvokePathPrefixed`].
+        let routing_view = routing_view_at_modeled_path(req);
+        let prefixed = routing_view.is_some();
+        let addressed = routing_view.as_ref().unwrap_or(req);
+
+        // The second is a `PostToConnection` whose `Data` payload is past the modeled
+        // `@length` maximum. See [`OversizedPayload`] for why the modeled
         // `PayloadTooLargeException` (413) cannot be answered from the handler. Both
         // the operation name and the bound are read from the model, not spelled out.
-        let routing_key = self.definition().protocol().routing_key(req).ok()?;
+        let routing_key = self.definition().protocol().routing_key(addressed).ok()?;
         if routing_key
-            != <crate::ops::post_to_connection::PostToConnection<Eng> as smithy_server_runtime::Operation>::NAME
+            == <crate::ops::post_to_connection::PostToConnection<Eng> as smithy_server_runtime::Operation>::NAME
         {
-            return None;
+            // `Data` is the `@httpPayload` member, so the body length IS the payload
+            // length. `aws-chunked` framing is already stripped by this point, and this
+            // dispatch path always hands over a fully buffered body (the router builds
+            // the runtime-API request from the buffered bytes before any lookup), so
+            // `bytes()` is `Some`. A body that is NOT buffered cannot be sized without
+            // consuming it, so it is left to the framework's own constraint boundary
+            // rather than guessed at — it does not decide the routing below.
+            let over_limit = req
+                .body()
+                .bytes()
+                .is_some_and(|body| body.len() > crate::ops::post_to_connection::MAX_DATA_BYTES);
+            if over_limit {
+                // The payload is judged before the path: an over-limit post answers the
+                // same modeled 413 whether or not it carried an invoke-path prefix.
+                return Some(&self.oversized_payload as &dyn ErasedOperation);
+            }
         }
-        // `Data` is the `@httpPayload` member, so the body length IS the payload
-        // length. `aws-chunked` framing is already stripped by this point, and this
-        // dispatch path always hands over a fully buffered body (the router builds the
-        // runtime-API request from the buffered bytes before any lookup), so `bytes()`
-        // is `Some`. A body that is NOT buffered cannot be sized without consuming it,
-        // so decline the override and let the framework's own constraint boundary judge
-        // it rather than guessing a length of zero.
-        let payload_len = req.body().bytes()?.len();
-        (payload_len > crate::ops::post_to_connection::MAX_DATA_BYTES)
-            .then_some(&self.oversized_payload as &dyn ErasedOperation)
+        // Every other operation under an invoke-path prefix is served by the rewriting
+        // seam; an unprefixed one needs no override at all.
+        prefixed.then_some(&self.invoke_path_prefixed as &dyn ErasedOperation)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {

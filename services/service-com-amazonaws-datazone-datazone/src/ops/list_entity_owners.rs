@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListEntityOwners
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListEntityOwners`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListEntityOwners::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the owners of one entity of one domain, read from `crate::state`: the owner
+//! the entity's create recorded, plus every owner `AddEntityOwner` added and none
+//! `RemoveEntityOwner` took away, in one stable (owner key) order, one
+//! `maxResults`-sized page at a time.
 //!
 //! ## Shape of an operation
 //!
@@ -125,6 +121,13 @@ impl From<ListEntityOwnersErrorModeled> for ListEntityOwnersError {
     }
 }
 
+/// The `maxResults` range the model declares for this operation (`@range` min 1, max 25
+/// on `MaxResultsForListDomains`, smithy_query operation="ListEntityOwners"). A request
+/// naming no `maxResults` gets the top of the range, and a value is clamped into it
+/// rather than trusted, the way `ListPolicyGrants` and `ListDomainUnitsForParent` do.
+const MIN_MAX_RESULTS: usize = 1;
+const MAX_MAX_RESULTS: usize = 25;
+
 /// The `ListEntityOwners` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -161,18 +164,110 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListEntityOwners` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListEntityOwnersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListEntityOwners"))
+        let _ = ctx;
+        use crate::state::{
+            decode_page_token, encode_page_token, entity_owner_output, now_ms, owner_key,
+            DomainUnitOwner,
+        };
+
+        // `entityType` targets an enum SHAPE, whose member set the request walk does
+        // not check, so the members the model declares are checked here rather than
+        // taken: a type this service has no entity of is bad input, not an entity with
+        // no owners.
+        if !DATA_ZONE_ENTITY_TYPE_VALUES.contains(&input.entity_type.as_str()) {
+            return Err(ListEntityOwnersErrorModeled::ValidationException(ValidationException {
+                message: format!(
+                    "entityType must be one of {}",
+                    DATA_ZONE_ENTITY_TYPE_VALUES.join(", ")
+                ),
+            })
+            .into());
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListEntityOwnersErrorModeled::InternalServerException(InternalServerException {
+                message: "the DataZone store is unavailable".to_string(),
+            })
+        })?;
+        let mut store = state.lock();
+        // The only write a reporting operation makes: materialise the domain lifecycle
+        // steps the clock already owed at this instant.
+        store.settle_clock(now_ms());
+
+        let resume_after = match input.next_token.as_deref() {
+            Some(token) => Some(decode_page_token(token).ok_or_else(|| {
+                ListEntityOwnersErrorModeled::ValidationException(ValidationException {
+                    message: "nextToken is not a token this service issued".to_string(),
+                })
+            })?),
+            None => None,
+        };
+        let page_size = input
+            .max_results
+            .and_then(|n| usize::try_from(n).ok())
+            .unwrap_or(MAX_MAX_RESULTS)
+            .clamp(MIN_MAX_RESULTS, MAX_MAX_RESULTS);
+
+        // This operation models no `ResourceNotFoundException`, so neither identifier
+        // can be reported as missing: an unknown domain, and an unknown entity within a
+        // stored domain, are both refused as invalid input naming the member to fix —
+        // the treatment `ListDomainUnitsForParent` gives those same two members. A
+        // domain that is still being deleted is reached here deliberately: it still
+        // holds its units and `GetDomainUnit` still reports their owners, so this
+        // listing agrees with that reader until the clock removes the domain.
+        if !store.domains.contains_key(&input.domain_identifier) {
+            return Err(ListEntityOwnersErrorModeled::ValidationException(ValidationException {
+                message: "domainIdentifier does not name a domain in this account".to_string(),
+            })
+            .into());
+        }
+        let entity = store
+            .owned_entity(
+                &input.domain_identifier,
+                &input.entity_type,
+                &input.entity_identifier,
+            )
+            .ok_or_else(|| {
+                ListEntityOwnersErrorModeled::ValidationException(ValidationException {
+                    message:
+                        "entityIdentifier does not name an entity of that entityType in this domain"
+                            .to_string(),
+                })
+            })?;
+
+        // One stable TOTAL order over the entity's owners — their keys — so a page
+        // resumes exactly after the key the previous page ended on however the owner
+        // set changed in between, which an order depending on when each owner was added
+        // could not promise.
+        let mut owners: Vec<(String, &DomainUnitOwner)> = entity
+            .owners
+            .iter()
+            .map(|owner| (owner_key(owner), owner))
+            .collect();
+        owners.sort_by(|left, right| left.0.cmp(&right.0));
+
+        let mut page: Vec<OwnerPropertiesOutput> = Vec::new();
+        let mut last_reported: Option<&str> = None;
+        let mut next_token = None;
+        let remaining = owners.iter().filter(|(key, _)| {
+            resume_after
+                .as_deref()
+                .is_none_or(|after| key.as_str() > after)
+        });
+        for (key, owner) in remaining {
+            if page.len() == page_size {
+                // Another owner is waiting, so the caller gets the token that resumes
+                // after the last owner this page reported.
+                next_token = last_reported.map(encode_page_token);
+                break;
+            }
+            page.push(entity_owner_output(owner));
+            last_reported = Some(key.as_str());
+        }
+
+        Ok(ListEntityOwnersOutput {
+            owners: page,
+            next_token,
+        })
     }
 }
