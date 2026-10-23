@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetMembers
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetMembers`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports the persisted member accounts of the administrator that
+//! owns `DetectorId`, one `Member` per requested account id the administrator holds
+//! a record for — including a member a disassociation moved to `Removed`, whose
+//! record is retained until `DeleteMembers` drops it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetMembers::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! An account id with no member record is reported in `UnprocessedAccounts` with
+//! the reason it was not processed, so the two output lists together account for
+//! every requested id exactly once. A pure report: nothing here writes to the
+//! store.
+//!
+//! `Member.DetectorId` is left absent on purpose: it is "the detector ID of the
+//! member account" (the modelled contract below), a resource in another account that
+//! this emulator does not hold, and the member is optional in the model. Likewise
+//! `InvitedAt` is absent until `InviteMembers` is implemented and there is an
+//! invitation instant to report.
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -145,18 +153,83 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetMembers` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetMembersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetMembers"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetMembersErrorModeled::InternalServerErrorException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+        let region = crate::state::request_region(ctx);
+        let administrator = crate::state::administrator_account_id();
+
+        // Parameter failures first: a value that cannot be an account id at all is
+        // refused whatever the store holds. `UnprocessedAccounts` reports accounts
+        // that were not PROCESSED, never a request that was not understood.
+        if !crate::state::is_detector_id(&input.detector_id) {
+            return Err(crate::scaffolded::Scaffolded::invalid_input(
+                crate::state::invalid_parameter_message(crate::state::DETECTOR_ID_MEMBER),
+            ));
+        }
+        if input
+            .account_ids
+            .iter()
+            .any(|account_id| !crate::state::is_account_id(account_id))
+        {
+            return Err(crate::scaffolded::Scaffolded::invalid_input(
+                crate::state::invalid_parameter_message(crate::state::ACCOUNT_ID_MEMBER),
+            ));
+        }
+
+        // A pure report: nothing below writes to the store.
+        let state = state.lock();
+        let Some(detector) = state.detector_in(&region, &input.detector_id) else {
+            return Err(crate::scaffolded::Scaffolded::invalid_input(
+                crate::state::detector_id_rejection(&input.detector_id),
+            ));
+        };
+
+        let mut members = Vec::new();
+        let mut unprocessed = Vec::new();
+        let mut seen = ::std::collections::BTreeSet::new();
+        for account_id in &input.account_ids {
+            // `AccountIds` names a SET of accounts: a repeated id is reported once.
+            if !seen.insert(account_id.as_str()) {
+                continue;
+            }
+            match detector.members.get(account_id) {
+                Some(member) => members.push(member_view(member, &administrator)),
+                None => unprocessed.push(UnprocessedAccount {
+                    account_id: account_id.clone(),
+                    result: crate::state::not_a_member_message(&administrator),
+                }),
+            }
+        }
+
+        Ok(GetMembersOutput {
+            members,
+            unprocessed_accounts: unprocessed,
+        })
+    }
+}
+
+/// Project one stored member onto the modelled `Member`.
+///
+/// `MasterId` and `AdministratorId` are both "the administrator account ID"
+/// (`smithy_query(shape="Member")`) — the same fact under the old and the current
+/// name — so both carry the account that owns the detector this member hangs off.
+fn member_view(member: &crate::state::MemberRecord, administrator: &str) -> Member {
+    Member {
+        account_id: member.account_id.clone(),
+        // The member account's own detector is not a resource this emulator holds;
+        // the member is optional, so it is absent rather than invented.
+        detector_id: None,
+        master_id: administrator.to_string(),
+        administrator_id: Some(administrator.to_string()),
+        email: member.email.clone(),
+        relationship_status: member.relationship_status.clone(),
+        // No invitation is modelled yet (`InviteMembers` is still a scaffold), so
+        // there is no instant at which one was sent.
+        invited_at: None,
+        updated_at: crate::state::iso8601(member.updated_at_millis),
     }
 }
