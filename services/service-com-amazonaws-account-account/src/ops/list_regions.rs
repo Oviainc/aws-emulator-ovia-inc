@@ -221,6 +221,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let account_id = crate::state::resolve_account_id(input.account_id.as_deref());
+        let now = ::std::time::SystemTime::now();
         let page_size = usize::try_from(input.max_results.unwrap_or(MAX_PAGE_SIZE))
             .unwrap_or(MAX_PAGE_SIZE as usize);
         let resume_after = match input.next_token.as_deref() {
@@ -255,7 +256,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // matching Region follows the last one on this page, so the final page carries
         // none.
         let mut page: Vec<(&str, &str)> = account
-            .reported_regions()
+            // As of `now`: a Region whose opt-in or opt-out has come due since
+            // it was recorded reports its terminal status here too, so the list
+            // and `GetRegionOptStatus` cannot disagree.
+            .reported_regions(now)
             .into_iter()
             .filter(|(region_name, _)| {
                 resume_after

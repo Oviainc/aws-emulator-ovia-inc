@@ -32,6 +32,11 @@ emulator-core-build-support = { workspace = true }
 [dev-dependencies]
 sha2 = { workspace = true }
 hex = { workspace = true }
+# Parses the default scraper configuration this service serves, so the test asserts the
+# blob really is a YAML document with the structure a Prometheus scraper reads, rather
+# than comparing bytes or re-deriving a reader. Same pinned version the cloudformation
+# and greengrassv2 crates use; yaml-rust2 is a pure-Rust YAML 1.2 implementation.
+yaml-rust2 = { version = "0.10", default-features = false }
 
 [lints]
 workspace = true

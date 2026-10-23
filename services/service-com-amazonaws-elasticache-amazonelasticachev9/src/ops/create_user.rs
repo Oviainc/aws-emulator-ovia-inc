@@ -1,10 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateUser
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateUser`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
 //! broken". Replace the `Err(..)` in [`CreateUser::handle`] with real behaviour and
 //! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
@@ -176,18 +172,176 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateUser` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateUserErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateUser"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+
+        // `UserId`: "This value is stored as a lowercase string", so that is the
+        // identity the store is keyed by and every later lookup resolves against.
+        // Its `@length`/`@pattern` are modelled, so the boundary validator has
+        // already refused an id that cannot name a user.
+        let user_id = input.user_id.to_ascii_lowercase();
+
+        // "The options are valkey or redis": RBAC is a Valkey / Redis OSS feature,
+        // so a cluster engine that has no ACLs is not a user engine.
+        let engine = match crate::state::normalize_user_engine(&input.engine) {
+            Ok(engine) => engine,
+            Err(message) => {
+                return Err(CreateUserErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(message),
+                    },
+                )
+                .into())
+            }
+        };
+
+        // The access string is the engine's own ACL rule list; one that names
+        // something that is not a rule is refused rather than stored as a
+        // permission set no engine could apply.
+        if let Some(message) =
+            crate::state::access_string_rejection("AccessString", &input.access_string)
+        {
+            return Err(CreateUserErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        // How the user authenticates, from the three mutually exclusive members
+        // that can say so. Resolved before the store is locked, so a refused
+        // request leaves no trace; the helper is shared with `ModifyUser`, which
+        // takes the same members.
+        let authentication = match crate::state::authentication_from_request(
+            input.passwords.as_deref(),
+            input.no_password_required,
+            input.authentication_mode.as_ref(),
+        ) {
+            Ok(authentication) => authentication,
+            Err(crate::state::AuthRefusal::Value(message)) => {
+                return Err(CreateUserErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(message),
+                    },
+                )
+                .into())
+            }
+            Err(crate::state::AuthRefusal::Combination(message)) => {
+                return Err(
+                    CreateUserErrorModeled::InvalidParameterCombinationException(
+                        InvalidParameterCombinationException {
+                            message: Some(message),
+                        },
+                    )
+                    .into(),
+                )
+            }
+        };
+
+        let tags = match crate::state::tag_pairs(input.tags) {
+            Ok(tags) => tags,
+            Err(crate::state::TagRefusal::TooMany(count)) => {
+                return Err(CreateUserErrorModeled::TagQuotaPerResourceExceeded(
+                    TagQuotaPerResourceExceeded {
+                        message: Some(format!(
+                            "{count} tags were supplied; the maximum number of tags permitted \
+                             on a resource is {}.",
+                            crate::state::MAX_TAGS_PER_RESOURCE
+                        )),
+                    },
+                )
+                .into())
+            }
+            Err(crate::state::TagRefusal::MissingKey) => {
+                // `Tag$Key` "may not be null" — only the VALUE may be. This
+                // operation models `InvalidParameterValueException`, so the
+                // refusal goes through the modelled channel rather than the
+                // synthetic one.
+                return Err(CreateUserErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(
+                            "Invalid value for Tags: a tag's Key may not be null.".to_string(),
+                        ),
+                    },
+                )
+                .into())
+            }
+        };
+
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+        // The built-in `default` user the account already had is in the store
+        // from the moment it is built, so a create naming it collides with it
+        // instead of replacing it, and the quota below counts it.
+
+        // The id is the resource's identity: the check and the insert happen
+        // under the one lock, so of any number of concurrent creates of the same
+        // id exactly one stores a user and the rest are refused.
+        if store.users.contains_key(&user_id) {
+            return Err(CreateUserErrorModeled::UserAlreadyExistsFault(
+                UserAlreadyExistsFault {
+                    message: Some(format!("User {user_id} already exists.")),
+                },
+            )
+            .into());
+        }
+        // `DuplicateUserNameFault`: "A user with this username already exists."
+        // The username is what the engine's ACL names the user by, so two users
+        // cannot share one.
+        if let Some(existing) = store
+            .users
+            .values()
+            .find(|user| user.user_name == input.user_name)
+        {
+            return Err(CreateUserErrorModeled::DuplicateUserNameFault(
+                DuplicateUserNameFault {
+                    message: Some(format!(
+                        "User {} already has the username {}.",
+                        existing.user_id, existing.user_name
+                    )),
+                },
+            )
+            .into());
+        }
+        // The store is bounded; see `crate::state::USER_QUOTA`.
+        if store.users.len() >= crate::state::USER_QUOTA {
+            return Err(CreateUserErrorModeled::UserQuotaExceededFault(
+                UserQuotaExceededFault {
+                    message: Some(format!(
+                        "This account already holds the maximum of {} users.",
+                        crate::state::USER_QUOTA
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let record = crate::state::UserRecord {
+            arn: crate::state::user_arn(&region, &user_id),
+            user_id: user_id.clone(),
+            user_name: input.user_name,
+            engine,
+            access_string: crate::state::canonical_access_string(&input.access_string),
+            authentication,
+            // A user ElastiCache has accepted is usable at once, so there is no
+            // transition for the clock to owe it.
+            status: crate::state::USER_STATUS_ACTIVE.to_string(),
+            tags,
+        };
+        store.users.insert(user_id.clone(), record);
+
+        // Read back out of the store, so the response is the persisted user
+        // rather than the request echoed.
+        let Some(stored) = store.users.get(&user_id) else {
+            // Unreachable: the insert above holds the same lock as this read.
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+        Ok(stored.to_modeled())
     }
 }

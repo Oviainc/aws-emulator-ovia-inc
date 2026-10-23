@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AssociateKmsKey
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AssociateKmsKey`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Implemented: records the KMS key on the target the request names — one log group, or
+//! the account's stored query-insights results — in the shared store, where
+//! `DescribeLogGroups` projects a log group's as `LogGroup$kmsKeyId`. This is the ONLY
+//! file to touch for this operation.
 //!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
 //! broken". Replace the `Err(..)` in [`AssociateKmsKey::handle`] with real behaviour and
@@ -199,18 +200,67 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AssociateKmsKey` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AssociateKmsKeyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AssociateKmsKey"))
+        // `ctx` carries only request metadata; this operation needs none of it.
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            AssociateKmsKeyError::from(AssociateKmsKeyErrorModeled::ServiceUnavailableException(
+                ServiceUnavailableException {
+                    message: Some("the log store is unavailable".to_string()),
+                },
+            ))
+        })?;
+        let mut store = state.lock();
+
+        let invalid = |message: String| {
+            AssociateKmsKeyError::from(AssociateKmsKeyErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message),
+                },
+            ))
+        };
+
+        // "The Amazon Resource Name (ARN) of the KMS key to use when encrypting log
+        // data." A value that names no key cannot be associated with anything.
+        if !crate::state::is_kms_key_id(&input.kms_key_id) {
+            return Err(invalid(format!(
+                "kmsKeyId must be the ARN of a KMS key, got '{}'",
+                input.kms_key_id
+            )));
+        }
+
+        // "you specify either the logGroupName parameter or the resourceIdentifier
+        // parameter. You can't specify both of those parameters in the same operation."
+        let target = crate::state::resolve_kms_key_target(
+            input.log_group_name.as_deref(),
+            input.resource_identifier.as_deref(),
+        )
+        .map_err(invalid)?;
+
+        match target {
+            // "Specify the logGroupName parameter to cause log events ingested into that
+            // log group to be encrypted with that key [...] Associating a KMS key with a
+            // log group overrides any existing associations between the log group and a
+            // KMS key."
+            crate::state::KmsKeyTarget::LogGroup(name) => {
+                let Some(group) = store.log_groups.get_mut(&name) else {
+                    return Err(AssociateKmsKeyErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: Some("The specified log group does not exist".to_string()),
+                        },
+                    )
+                    .into());
+                };
+                group.kms_key_id = Some(input.kms_key_id.clone());
+            }
+            // "Specify the resourceIdentifier parameter with a query-result resource, to
+            // use that key to encrypt the stored results of all future StartQuery
+            // operations in the account."
+            crate::state::KmsKeyTarget::QueryResults => {
+                store.query_results_kms_key_id = Some(input.kms_key_id.clone());
+            }
+        }
+
+        Ok(AssociateKmsKeyOutput)
     }
 }
