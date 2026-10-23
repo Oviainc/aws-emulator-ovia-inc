@@ -53,14 +53,33 @@ pub(crate) fn router() -> MultiServiceRouter {
 
 /// Call one operation and return its HTTP status and JSON body.
 pub(crate) async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16, Value) {
+    call_uri(router, "POST", &format!("/{operation}"), Some(body)).await
+}
+
+/// Call one operation by the HTTP method and URI its `@http` binding declares,
+/// which is how an operation that does not bind `POST /<OperationName>` is
+/// reached: the tagging operations all bind `/tags/{resourceArn}`, on `POST`
+/// (TagResource), `GET` (ListTagsForResource) and `DELETE` (UntagResource).
+pub(crate) async fn call_uri(
+    router: &MultiServiceRouter,
+    method: &str,
+    path_and_query: &str,
+    body: Option<&Value>,
+) -> (u16, Value) {
+    let payload = match body {
+        Some(body) => {
+            bytes::Bytes::from(serde_json::to_vec(body).expect("the request body serializes"))
+        }
+        None => bytes::Bytes::new(),
+    };
     let request = http::Request::builder()
-        .method("POST")
-        .uri(format!("https://s3vectors.{REGION}.amazonaws.com/{operation}"))
+        .method(method)
+        .uri(format!(
+            "https://s3vectors.{REGION}.amazonaws.com{path_and_query}"
+        ))
         .header("authorization", AUTHORIZATION)
         .header("content-type", "application/json")
-        .body(bytes::Bytes::from(
-            serde_json::to_vec(body).expect("the request body serializes"),
-        ))
+        .body(payload)
         .expect("a well-formed request");
     let response = router.dispatch(request).await;
     let status = response.status().as_u16();
@@ -79,6 +98,115 @@ pub(crate) fn error_code(body: &Value) -> String {
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string()
+}
+
+// ---------------------------------------------------------------------------
+// The tag surface's shared harness
+//
+// `TagResource`, `UntagResource` and `ListTagsForResource` all bind
+// `/tags/{resourceArn}` (on POST, DELETE and GET), so ONE set of request and
+// assertion helpers serves every suite that drives them — `resource_tagging.rs`,
+// `resource_tags.rs` and `reserved_tag_keys.rs` all call these rather than
+// keeping a harness each.
+// ---------------------------------------------------------------------------
+
+/// Percent-encode one value for use as a single URI path segment or query value,
+/// as an AWS SDK does for a non-greedy `@httpLabel` or an `@httpQuery` entry:
+/// every byte outside RFC 3986's unreserved set is escaped, so an ARN's own `:`
+/// and `/` travel as ONE path segment instead of being read as path structure.
+///
+/// Spelled out here rather than pulled from a crate so the tag suites add no
+/// dependency edge to `Cargo.lock`, which every landing fix touches; this is the
+/// crate's single copy.
+pub(crate) fn encode_label(value: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(value.len());
+    for byte in value.as_bytes() {
+        let ch = *byte as char;
+        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '~') {
+            out.push(ch);
+        } else {
+            out.push('%');
+            out.push(HEX[usize::from(byte >> 4)] as char);
+            out.push(HEX[usize::from(byte & 0x0f)] as char);
+        }
+    }
+    out
+}
+
+/// `POST /tags/{resourceArn}` with a `tags` body — `TagResource`.
+pub(crate) async fn tag(router: &MultiServiceRouter, arn: &str, tags: &Value) -> (u16, Value) {
+    call_uri(
+        router,
+        "POST",
+        &format!("/tags/{}", encode_label(arn)),
+        Some(&json!({ "tags": tags })),
+    )
+    .await
+}
+
+/// `DELETE /tags/{resourceArn}?tagKeys=…` — `UntagResource`. `tagKeys` is a
+/// required `@httpQuery` list, so it travels as one query entry per key.
+pub(crate) async fn untag(
+    router: &MultiServiceRouter,
+    arn: &str,
+    tag_keys: &[String],
+) -> (u16, Value) {
+    let query = tag_keys
+        .iter()
+        .map(|key| format!("tagKeys={}", encode_label(key)))
+        .collect::<Vec<String>>()
+        .join("&");
+    call_uri(
+        router,
+        "DELETE",
+        &format!("/tags/{}?{query}", encode_label(arn)),
+        None,
+    )
+    .await
+}
+
+/// `GET /tags/{resourceArn}` — `ListTagsForResource`.
+pub(crate) async fn list_tags(router: &MultiServiceRouter, arn: &str) -> (u16, Value) {
+    call_uri(router, "GET", &format!("/tags/{}", encode_label(arn)), None).await
+}
+
+/// The tag map `ListTagsForResource` reports for `arn`, which must succeed.
+pub(crate) async fn reported_tags(
+    router: &MultiServiceRouter,
+    case: &str,
+    arn: &str,
+) -> Value {
+    let (status, body) = list_tags(router, arn).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: ListTagsForResource({arn}) must succeed, got {status} {body}"
+    );
+    body.get("tags").cloned().unwrap_or(Value::Null)
+}
+
+/// A JSON object from key/value pairs, for comparing a reported tag map whole.
+pub(crate) fn tag_object(pairs: &[(String, String)]) -> Value {
+    Value::Object(
+        pairs
+            .iter()
+            .map(|(key, value)| (key.clone(), Value::String(value.clone())))
+            .collect(),
+    )
+}
+
+/// Owned key/value pairs from literals, so a table row can mix literal and
+/// generated keys.
+pub(crate) fn pairs(literal: &[(&str, &str)]) -> Vec<(String, String)> {
+    literal
+        .iter()
+        .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+        .collect()
+}
+
+/// Owned tag keys from literals.
+pub(crate) fn keys(literal: &[&str]) -> Vec<String> {
+    literal.iter().map(|key| (*key).to_string()).collect()
 }
 
 /// Call an operation that must succeed, returning its body.

@@ -66,7 +66,8 @@ pub const MAX_VECTORS_PER_INDEX: usize = 10_000;
 /// See [`MAX_VECTOR_BUCKETS`]: 2,000,000 `f32` is 8 MiB of vector data per index,
 /// so the stored data is bounded by bytes as well as by vector count.
 pub const MAX_VECTOR_VALUES_PER_INDEX: usize = 2_000_000;
-/// See [`MAX_VECTOR_BUCKETS`]: the standard AWS limit of 50 tags per resource.
+/// See [`MAX_VECTOR_BUCKETS`]: the standard AWS limit of 50 tags per resource,
+/// which TagResource states as "you can add up to 50 tags for each resource".
 pub const MAX_TAGS_PER_RESOURCE: usize = 50;
 /// See [`MAX_VECTOR_BUCKETS`]: how many elements one vector's `metadata`
 /// document may hold, counted over the whole document.
@@ -79,6 +80,15 @@ pub const MAX_METADATA_DEPTH: u32 = 32;
 /// Amazon S3 User Guide's bucket policy limit — "bucket policies are limited to
 /// 20 KB in size" — is the bound a policy document is held to here.
 pub const MAX_POLICY_BYTES: usize = 20 * 1024;
+
+/// The tag-key namespace AWS reserves for its own tags.
+///
+/// The AWS tagging reference states that "the `aws:` prefix is reserved for AWS
+/// use" and that a user cannot create, edit or delete a tag whose key carries
+/// it, so a caller-supplied key in that namespace is refused rather than stored.
+/// The model's `TagKey` pattern allows `:`, so this is a rule the model cannot
+/// express and the handlers enforce (see [`validate_tag_keys`]).
+pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
 
 /// The two `Effect` values the IAM policy grammar allows in a statement.
 pub const POLICY_EFFECT_ALLOW: &str = "Allow";
@@ -504,6 +514,33 @@ pub fn resolve_index_name(
             "either both `vectorBucketName` and `indexName`, or `indexArn`, is required",
         )),
     }
+}
+
+/// Refuse a caller-supplied tag key that lies in the reserved `aws:` namespace.
+///
+/// `member` is the input member the keys came from, so one implementation serves
+/// every operation that takes caller-supplied tag keys — a create request's
+/// `tags`, TagResource's `tags`, UntagResource's `tagKeys` — because the
+/// namespace belongs to AWS whichever member names it. The prefix is matched
+/// case-insensitively, as AWS documents it.
+pub fn validate_tag_keys<'a>(
+    member: &str,
+    keys: impl IntoIterator<Item = &'a str>,
+) -> Result<(), LookupError> {
+    let prefix = RESERVED_TAG_KEY_PREFIX.as_bytes();
+    for key in keys {
+        let bytes = key.as_bytes();
+        if bytes.len() >= prefix.len() && bytes[..prefix.len()].eq_ignore_ascii_case(prefix) {
+            return Err(LookupError::invalid(
+                member,
+                format!(
+                    "`{member}` must not name a tag key in the reserved \
+                     `{RESERVED_TAG_KEY_PREFIX}` namespace: {key}"
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 impl ComAmazonawsS3vectorsS3vectorsState {
