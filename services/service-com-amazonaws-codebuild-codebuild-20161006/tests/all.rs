@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/batch_delete_builds.rs"]
 mod batch_delete_builds;
+#[path = "all/command_execution_lifecycle.rs"]
+mod command_execution_lifecycle;
 #[path = "all/fleet_lifecycle.rs"]
 mod fleet_lifecycle;
 #[path = "all/list_builds.rs"]

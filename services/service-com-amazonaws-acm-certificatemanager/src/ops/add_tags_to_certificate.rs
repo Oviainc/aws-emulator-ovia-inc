@@ -229,12 +229,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `TagList` tops out at 50 entries, which is the per-certificate tag quota
         // `TooManyTagsException` reports. Refused before the record is touched, so a
         // rejected request leaves the certificate's tags as they were.
-        if merged.len() > TAG_LIMIT {
+        if merged.len() > crate::state::TAG_LIMIT {
             let over = merged.len();
             return Err(AddTagsToCertificateErrorModeled::TooManyTagsException(
                 TooManyTagsException {
                     message: Some(format!(
-                        "a certificate may carry at most {TAG_LIMIT} tags; this request would leave {over}"
+                        "a certificate may carry at most {} tags; this request would leave {over}",
+                        crate::state::TAG_LIMIT
                     )),
                 },
             )
@@ -245,7 +246,3 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(AddTagsToCertificateOutput)
     }
 }
-
-/// The number of tags one certificate may carry, from the `TagList` length bound the
-/// model declares (`len 1..50`).
-const TAG_LIMIT: usize = 50;

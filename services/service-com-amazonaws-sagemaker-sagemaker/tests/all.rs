@@ -29,6 +29,8 @@ mod code_repositories;
 mod custom_images;
 #[path = "all/endpoint_config_deletion.rs"]
 mod endpoint_config_deletion;
+#[path = "all/experiment_lifecycle.rs"]
+mod experiment_lifecycle;
 #[path = "all/feature_group_lifecycle.rs"]
 mod feature_group_lifecycle;
 #[path = "all/hub_contents_listing.rs"]

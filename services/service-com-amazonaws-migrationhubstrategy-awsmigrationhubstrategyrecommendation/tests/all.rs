@@ -20,6 +20,9 @@ mod import_and_assess;
 #[path = "all/import_file_task_listing.rs"]
 mod import_file_task_listing;
 
+#[path = "all/portfolio_preferences.rs"]
+mod portfolio_preferences;
+
 #[path = "all/refusal_messages.rs"]
 mod refusal_messages;
 

@@ -1216,7 +1216,7 @@ async fn the_remaining_operations_are_still_honest_501s() {
     let arn = create_ok(&router, &json!({ "name": "tagged", "roleArn": ROLE_ARN })).await;
     let resource = label(&arn);
 
-    // These four have their own gap issues; until then they must answer 501, never
+    // These three have their own gap issues; until then they must answer 501, never
     // an empty 200 a client cannot tell from a real implementation.
     for (method, uri, body) in [
         ("GET", format!("/tags/{resource}"), None),
@@ -1226,11 +1226,6 @@ async fn the_remaining_operations_are_still_honest_501s() {
             Some(json!({ "tags": { "Team": "ops" } })),
         ),
         ("DELETE", format!("/tags/{resource}?tagKeys=Team"), None),
-        (
-            "DELETE",
-            format!("/investigationGroups/{resource}/policy"),
-            None,
-        ),
     ] {
         let (status, answer) = call(&router, method, &uri, body.as_ref()).await;
         assert_eq!(

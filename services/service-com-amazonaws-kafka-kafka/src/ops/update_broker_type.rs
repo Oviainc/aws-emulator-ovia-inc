@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateBrokerType
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateBrokerType`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Moves every broker of a provisioned cluster to one EC2 instance type.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateBrokerType::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The change does not land where the call stands: it is recorded as a cluster
+//! operation whose ARN this response reports, the cluster goes `UPDATING`, and
+//! [`crate::state::Cluster::settle`] applies it (and the new `CurrentVersion` the
+//! documentation promises) once the clock owes the operation its completion — so a
+//! caller reading the cluster straight afterwards still sees `UPDATING` and its
+//! `ActiveOperationArn`.
+//!
+//! Authentication and authorization are NOT this handler's business: the emulator
+//! verifies every request signature centrally (see `AGENTS.md`), so the modelled
+//! `UnauthorizedException`/`ForbiddenException` are raised by that path and never
+//! constructed here.
+//!
+//! The scaffold notes below describe the framework; they are kept because they
+//! document the seams this handler uses.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +160,129 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateBrokerType` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateBrokerTypeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateBrokerType"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                UpdateBrokerTypeErrorModeled::InternalServerErrorException(
+                    InternalServerErrorException {
+                        invalid_parameter: None,
+                        message: Some("the kafka service state is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let region = crate::state::request_region(ctx.parts());
+
+        // Request-only checks run first, before the registry lock is taken: none
+        // of them depends on stored state.
+        if !crate::state::is_cluster_arn(&input.cluster_arn) {
+            return Err(bad_request(
+                "ClusterArn",
+                format!(
+                    "{} is not a valid Amazon MSK cluster ARN.",
+                    input.cluster_arn
+                ),
+            ));
+        }
+        // `TargetInstanceType` is a plain `__string` on the wire, so the boundary
+        // validator passes any value through; it becomes the cluster's
+        // `BrokerNodeGroupInfo$InstanceType`, which the model DOES constrain, so a
+        // value that could not be a broker type is refused rather than stored.
+        if !crate::state::is_broker_instance_type(&input.target_instance_type) {
+            return Err(bad_request(
+                "TargetInstanceType",
+                format!(
+                    "'{}' is not an Amazon MSK broker type: a broker type is \
+                     <prefix>.<family>.<size>, between {} and {} characters long.",
+                    input.target_instance_type,
+                    crate::state::INSTANCE_TYPE_MIN_LEN,
+                    crate::state::INSTANCE_TYPE_MAX_LEN
+                ),
+            ));
+        }
+
+        let now = std::time::SystemTime::now();
+        let mut state = state.lock();
+        // Resolved through the settling lookup every other operation uses, so the
+        // transitions the clock already owed this cluster — its own provisioning,
+        // and an earlier update of its own whose completion has come due — are
+        // materialised before this call judges its state and version.
+        let Some(cluster) = state.settled_cluster_in(&region, &input.cluster_arn, now) else {
+            return Err(
+                UpdateBrokerTypeErrorModeled::NotFoundException(NotFoundException {
+                    invalid_parameter: Some("ClusterArn".to_string()),
+                    message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
+                })
+                .into(),
+            );
+        };
+        // Copied out of the record: the checks below are followed by a write, so
+        // the borrow of the registry has to end here.
+        let cluster_state = cluster.state.clone();
+        let current_version = cluster.current_version.clone();
+
+        // A cluster reconfigures one change at a time, and one that is still being
+        // provisioned, deleted or updated has no settled configuration to update
+        // from. Worded as the sibling update operations word the same check, so the
+        // service says one thing about one condition.
+        if cluster_state != crate::state::CLUSTER_STATE_ACTIVE {
+            return Err(bad_request(
+                "ClusterArn",
+                format!(
+                    "The cluster is in the {cluster_state} state; it must be {} to be updated.",
+                    crate::state::CLUSTER_STATE_ACTIVE
+                ),
+            ));
+        }
+        // The optimistic-concurrency check: the version the caller updates from must
+        // be the one the cluster is actually at, so a stale version means the caller
+        // has not seen the cluster's latest state.
+        if input.current_version != current_version {
+            return Err(bad_request(
+                "currentVersion",
+                format!(
+                    "The cluster's current version is {current_version}, not {}.",
+                    input.current_version
+                ),
+            ));
+        }
+
+        // The registry starts the operation: it records what changes, moves the
+        // cluster to UPDATING and stores the instant the change comes due — the
+        // same path the sibling update operations start their own through, so one
+        // cluster holds one in-flight update whatever began it.
+        let Some(operation_arn) = state.start_broker_type_update(
+            &region,
+            &input.cluster_arn,
+            now,
+            input.target_instance_type,
+        ) else {
+            return Err(
+                UpdateBrokerTypeErrorModeled::InternalServerErrorException(
+                    InternalServerErrorException {
+                        invalid_parameter: None,
+                        message: Some(
+                            "the cluster vanished while its update was starting".to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+        Ok(UpdateBrokerTypeOutput {
+            cluster_arn: Some(input.cluster_arn),
+            cluster_operation_arn: Some(operation_arn),
+        })
     }
+}
+
+/// Refuse the request with the modeled `BadRequestException`, naming the member at
+/// fault and what was wrong with it — the caller has to fix the request from this
+/// text alone.
+fn bad_request(parameter: &str, message: String) -> UpdateBrokerTypeError {
+    UpdateBrokerTypeErrorModeled::BadRequestException(BadRequestException {
+        invalid_parameter: Some(parameter.to_string()),
+        message: Some(message),
+    })
+    .into()
 }

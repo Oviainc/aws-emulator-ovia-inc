@@ -389,8 +389,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A created snapshot is NOT ready: it answers `creating`, and the clock
         // owes it `available` once the transition span has passed. The response
         // is read back out of the store, so it reports the persisted record.
+        let stored = store.insert_snapshot(record);
+        let snapshot_name = stored.snapshot_name.clone();
+        let snapshot = stored.to_modeled(true);
+        // Taking a snapshot is one of the events this service records, under
+        // the cluster it was taken from; see `crate::state::EventRecord`.
+        store.record_event(
+            crate::state::SOURCE_TYPE_CACHE_CLUSTER,
+            &cache_cluster_id,
+            format!("Snapshot {snapshot_name} created"),
+            now,
+        );
         Ok(CreateSnapshotOutput {
-            snapshot: Some(store.insert_snapshot(record).to_modeled(true)),
+            snapshot: Some(snapshot),
         })
     }
 }

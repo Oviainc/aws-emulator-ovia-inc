@@ -704,6 +704,28 @@ impl ComAmazonawsAcmCertificatemanagerState {
         }
     }
 
+    /// The tag map of the non-certificate ACM resource `arn` names, or `None` when
+    /// this account holds no such resource.
+    ///
+    /// The generic tagging operations (`TagResource`, `UntagResource`,
+    /// `ListTagsForResource`) apply to "all ACM resource types except the certificate
+    /// resource type", so resolution walks the non-certificate resources this service
+    /// persists — today the ACME endpoints, keyed by the same ARN the request names —
+    /// and a well-formed ARN naming anything else has no record behind it (the caller
+    /// answers `ResourceNotFoundException`). A resource type added to this struct
+    /// later becomes taggable by being resolved here, not by another copy of the
+    /// tagging rules.
+    pub fn resource_tags(&self, arn: &str) -> Option<&BTreeMap<String, String>> {
+        self.acme_endpoints.get(arn).map(|endpoint| &endpoint.tags)
+    }
+
+    /// [`Self::resource_tags`] for a caller that writes the map.
+    pub fn resource_tags_mut(&mut self, arn: &str) -> Option<&mut BTreeMap<String, String>> {
+        self.acme_endpoints
+            .get_mut(arn)
+            .map(|endpoint| &mut endpoint.tags)
+    }
+
     /// Drop `arn`'s ACME endpoint record and every idempotency token that resolves to
     /// it, so a replayed `CreateAcmeEndpoint` can never answer with an ARN that has no
     /// record behind it.
@@ -842,6 +864,38 @@ pub fn invalid_arn_message(certificate_arn: &str) -> String {
 /// template cannot drift between the lookup paths.
 pub fn certificate_not_found_message(certificate_arn: &str) -> String {
     format!("Could not find certificate {certificate_arn}.")
+}
+
+/// The `ResourceNotFoundException` message for an ACM resource ARN that names no
+/// resource this account holds, built from the ARN the request asked for.
+///
+/// Rendered by the operations that address an ACM resource by type-agnostic ARN
+/// (`TagResource`, `UntagResource`, `ListTagsForResource`), which is why it names a
+/// "resource" rather than one type. `ResourceNotFoundException` carries one modelled
+/// member (`message: String`) and the model documents no text for it, so the sentence
+/// follows the template every other lookup in this service renders
+/// ([`certificate_not_found_message`]): one complete sentence naming the requested ARN
+/// and terminated by a period.
+pub fn resource_not_found_message(resource_arn: &str) -> String {
+    format!("Could not find resource {resource_arn}.")
+}
+
+/// The `ValidationException` message for a CERTIFICATE ARN handed to one of the
+/// generic resource-tagging operations, naming the certificate-specific operation to
+/// use instead.
+///
+/// Those operations are documented for "all ACM resource types except the certificate
+/// resource type", each pointing at its certificate counterpart
+/// (`TagResource` -> `AddTagsToCertificate`, `UntagResource` ->
+/// `RemoveTagsFromCertificate`, `ListTagsForResource` -> `ListTagsForCertificate`), so
+/// a certificate ARN is input the operation's own constraints do not admit — which is
+/// what `ValidationException` ("the supplied input failed to satisfy constraints")
+/// names. Rendered here so all three refusals read the same.
+pub fn certificate_resource_message(resource_arn: &str, certificate_operation: &str) -> String {
+    format!(
+        "{resource_arn} names a certificate, which this operation does not apply to; \
+         use {certificate_operation} instead"
+    )
 }
 
 /// The `InvalidStateException` message for a request that needs an issued, valid
@@ -1060,6 +1114,17 @@ pub fn domain_validation_record(
     record
 }
 
+/// The tag-key prefix Amazon Web Services reserves for its own tags: neither half of
+/// a pair a caller names may begin with it (`InvalidTagException`: "you cannot specify
+/// a tag value that begins with aws:").
+pub const RESERVED_TAG_PREFIX: &str = "aws:";
+
+/// The number of tags one ACM resource may carry, from the `TagList` length bound the
+/// model declares (`len 1..50`): it is both the most pairs one request may name and
+/// the most a resource holds, since `ListTagsForResource` and
+/// `ListTagsForCertificate` report the stored map through that same list.
+pub const TAG_LIMIT: usize = 50;
+
 /// The request's tags as the key -> value map the certificate record stores, or the
 /// message explaining why a tag was refused.
 ///
@@ -1083,13 +1148,33 @@ pub fn tag_map(tags: &[Tag]) -> Result<BTreeMap<String, String>, String> {
 /// aws:"). Shared by every operation that takes tags from a request, so the tagging
 /// and the untagging paths refuse the same pairs with the same sentence.
 pub fn check_tag_not_reserved(tag: &Tag) -> Result<(), String> {
-    if tag.key.starts_with("aws:") || tag.value.as_deref().is_some_and(|v| v.starts_with("aws:")) {
-        return Err(format!(
-            "tag {} is reserved: neither a tag key nor its value may begin with aws:",
-            tag.key
-        ));
+    check_tag_key_not_reserved(&tag.key)?;
+    if tag
+        .value
+        .as_deref()
+        .is_some_and(|value| value.starts_with(RESERVED_TAG_PREFIX))
+    {
+        return Err(reserved_tag_message(&tag.key));
     }
     Ok(())
+}
+
+/// `Ok(())` for a tag key any caller may name, or the reserved-tag message for one it
+/// may not.
+///
+/// The operation that removes tags BY KEY (`UntagResource`) carries no value to check,
+/// so the key half of the rule is reachable on its own; it is the same rule and the
+/// same sentence either way.
+pub fn check_tag_key_not_reserved(key: &str) -> Result<(), String> {
+    if key.starts_with(RESERVED_TAG_PREFIX) {
+        return Err(reserved_tag_message(key));
+    }
+    Ok(())
+}
+
+/// The message a refused reserved tag reports, naming the key of the offending pair.
+fn reserved_tag_message(key: &str) -> String {
+    format!("tag {key} is reserved: neither a tag key nor its value may begin with {RESERVED_TAG_PREFIX}")
 }
 
 /// Drop the requested tags from a stored tag map, as ACM's untagging operations
@@ -1113,6 +1198,16 @@ pub fn remove_tags(stored: &mut BTreeMap<String, String>, requested: &[Tag]) {
         if matches {
             stored.remove(&tag.key);
         }
+    }
+}
+
+/// Drop the requested KEYS from a stored tag map, as ACM's key-addressed untagging
+/// operation (`UntagResource`, whose `TagKeys` carries keys alone) defines it: a named
+/// key is removed whatever value it holds, and a key the map does not hold leaves the
+/// map as it was — so removing is idempotent.
+pub fn remove_tag_keys(stored: &mut BTreeMap<String, String>, keys: &[String]) {
+    for key in keys {
+        stored.remove(key);
     }
 }
 

@@ -19,6 +19,8 @@ mod cache_engine_versions;
 mod cache_parameter_groups;
 #[path = "all/engine_default_parameters.rs"]
 mod engine_default_parameters;
+#[path = "all/events.rs"]
+mod events;
 #[path = "all/rbac_users.rs"]
 mod rbac_users;
 #[path = "all/replication_group_lifecycle.rs"]

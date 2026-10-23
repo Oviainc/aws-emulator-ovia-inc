@@ -58,6 +58,23 @@ pub const MAX_RESULTS_LIMIT: i32 = 100;
 /// [`MAX_RESULTS_LIMIT`], so each listing passes its own to [`page_of`].
 pub const MAX_RESULTS_LIMIT_ACCESS_POINTS: i32 = 1_000;
 
+/// `maxResults` ceiling for `ListTagsForResource`, whose
+/// `ListTagsForResourceRequest$maxResults` is `@range(1, 50)`.
+pub const MAX_RESULTS_LIMIT_TAGS: i32 = 50;
+
+/// How many tags one resource holds.
+///
+/// `TagList` is `@length(1, 50)`, and it is the shape BOTH the tag write's input and
+/// every read's output use, so a resource carrying more than 50 tags could not be
+/// reported at all. The ceiling is therefore the model's own, not a chosen number.
+pub const MAX_TAGS_PER_RESOURCE: usize = 50;
+
+/// The key prefix a caller may not tag a resource with.
+///
+/// From the model doc on `Tag$key`: "The tag key. The key can't start with `aws:`." —
+/// that namespace belongs to the service's own tags.
+pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
+
 /// How many file systems this emulator will hold.
 ///
 /// `CreateFileSystem` models `ServiceQuotaExceededException` (HTTP 402) for exceeding a
@@ -422,6 +439,51 @@ impl ComAmazonawsS3filesS3filesState {
             .map(|access_point| access_point.access_point_id.clone())
             .collect()
     }
+
+    /// The tags `resource` carries, or `None` when this store does not hold it.
+    ///
+    /// Both taggable resources keep their tags on their own record, so one lookup
+    /// answers for either and no second copy of a resource's tags exists.
+    pub fn tags_of(&self, resource: &TaggedResource) -> Option<&[Tag]> {
+        match resource {
+            TaggedResource::FileSystem(id) => self
+                .file_systems
+                .get(id)
+                .map(|file_system| file_system.tags.as_slice()),
+            TaggedResource::AccessPoint(id) => self
+                .access_points
+                .get(id)
+                .map(|access_point| access_point.tags.as_slice()),
+        }
+    }
+
+    /// Replace the tags `resource` carries, answering `false` when this store does not
+    /// hold it.
+    ///
+    /// The record's `name` is re-derived from the new tag set: the model documents it as
+    /// "derived from the Name tag if present", so a write that adds, changes or removes
+    /// that tag moves the name with it rather than leaving a name no tag backs.
+    pub fn set_tags(&mut self, resource: &TaggedResource, tags: Vec<Tag>) -> bool {
+        let name = name_from_tags(&tags);
+        match resource {
+            TaggedResource::FileSystem(id) => match self.file_systems.get_mut(id) {
+                Some(file_system) => {
+                    file_system.name = name;
+                    file_system.tags = tags;
+                    true
+                }
+                None => false,
+            },
+            TaggedResource::AccessPoint(id) => match self.access_points.get_mut(id) {
+                Some(access_point) => {
+                    access_point.name = name;
+                    access_point.tags = tags;
+                    true
+                }
+                None => false,
+            },
+        }
+    }
 }
 
 fn token_key(scope: &str, client_token: &str) -> String {
@@ -442,6 +504,85 @@ pub fn tag_value(tags: &[Tag], key: &str) -> Option<String> {
 /// supply to either create in this slice, so both resources read it the same way.
 pub fn name_from_tags(tags: &[Tag]) -> Option<String> {
     tag_value(tags, "Name")
+}
+
+/// Which taggable resource a `ResourceId` names.
+///
+/// `ResourceId` is one pattern covering BOTH resources this service holds, in either
+/// form — an access point (`fsap-<hex>` or `…:file-system/fs-<hex>/access-point/fsap-<hex>`)
+/// and a file system (`fs-<hex>` or `…:file-system/fs-<hex>`) — so the tagging
+/// operations resolve it once, here, and every one of them reaches the same records the
+/// creates wrote.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaggedResource {
+    FileSystem(String),
+    AccessPoint(String),
+}
+
+impl TaggedResource {
+    /// The resource named the way a `ResourceNotFoundException` message names it: the
+    /// kind of resource, then its canonical id.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::FileSystem(id) => format!("file system {id}"),
+            Self::AccessPoint(id) => format!("access point {id}"),
+        }
+    }
+}
+
+/// The resource a `ResourceId` names, or `None` when the value is neither form of
+/// either resource — which a handler answers as a `ValidationException`.
+///
+/// The access-point forms are tried first: an access point's ARN also carries the
+/// `file-system/fs-<hex>` segment, so only the longer match identifies it.
+pub fn tagged_resource_of(value: &str) -> Option<TaggedResource> {
+    if let Some(access_point_id) = access_point_id_of(value) {
+        return Some(TaggedResource::AccessPoint(access_point_id.to_string()));
+    }
+    file_system_id_of(value).map(|id| TaggedResource::FileSystem(id.to_string()))
+}
+
+/// Merge `incoming` into `current` the way a tag write does.
+///
+/// Tags are "key-value pairs" (`Tag`'s own doc), so a key identifies at most one tag on
+/// a resource: an incoming key the resource already carries takes the new value IN
+/// PLACE, keeping the position it had, and a key it does not carry is appended. Within
+/// one write the last entry for a key is the one that lands, for the same reason.
+pub fn merged_tags(current: &[Tag], incoming: &[Tag]) -> Vec<Tag> {
+    let mut merged = current.to_vec();
+    for tag in incoming {
+        match merged.iter_mut().find(|held| held.key == tag.key) {
+            Some(held) => held.value = tag.value.clone(),
+            None => merged.push(tag.clone()),
+        }
+    }
+    merged
+}
+
+/// Why `incoming` is not a set of tags a tag write can add to a resource already
+/// carrying `current`, or `None` when it is.
+///
+/// Two rules beyond the modelled constraints the boundary validator already applied:
+/// the `aws:` namespace is reserved ([`RESERVED_TAG_KEY_PREFIX`]), and a resource holds
+/// at most [`MAX_TAGS_PER_RESOURCE`] tags.
+pub fn tag_write_rejection(current: &[Tag], incoming: &[Tag]) -> Option<String> {
+    if let Some(reserved) = incoming
+        .iter()
+        .find(|tag| tag.key.starts_with(RESERVED_TAG_KEY_PREFIX))
+    {
+        return Some(format!(
+            "a tag key must not start with {RESERVED_TAG_KEY_PREFIX:?}, got {:?}",
+            reserved.key
+        ));
+    }
+    let merged = merged_tags(current, incoming).len();
+    if merged > MAX_TAGS_PER_RESOURCE {
+        return Some(format!(
+            "a resource holds at most {MAX_TAGS_PER_RESOURCE} tags; this request would \
+             leave it with {merged}"
+        ));
+    }
+    None
 }
 
 /// The region this request was signed for, read from its SigV4 credential scope.

@@ -759,8 +759,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A created cluster is NOT ready: it answers `creating`, and the clock
         // owes it `available` once the transition span has passed.
+        let cache_cluster_id = new.cache_cluster_id.clone();
+        let cache_cluster = store.insert_cluster(new).to_modeled(true);
+        // Creating a cluster is one of the events this service records; see
+        // `crate::state::EventRecord`. It is dated at the instant the cluster
+        // was created, which is also the instant its transition span starts.
+        store.record_event(
+            crate::state::SOURCE_TYPE_CACHE_CLUSTER,
+            &cache_cluster_id,
+            "Cache cluster created",
+            now,
+        );
         Ok(CreateCacheClusterOutput {
-            cache_cluster: Some(store.insert_cluster(new).to_modeled(true)),
+            cache_cluster: Some(cache_cluster),
         })
     }
 }

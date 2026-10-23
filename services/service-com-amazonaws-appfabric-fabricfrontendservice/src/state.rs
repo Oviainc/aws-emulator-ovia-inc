@@ -44,6 +44,14 @@ pub const MAX_APP_BUNDLES: usize = 1_000;
 /// The same guard for the ingestions one app bundle may hold.
 pub const MAX_INGESTIONS_PER_APP_BUNDLE: usize = 1_000;
 
+/// The number of tags ONE resource may hold.
+///
+/// Not a resource guard but the model's own bound: a `TagList` is
+/// `@length(min: 0, max: 50)`, and `ListTagsForResource` reports a resource's
+/// whole tag set as one `TagList` — a resource holding more could not be
+/// reported, so `TagResource` refuses a merge that would take it past this.
+pub const MAX_TAGS_PER_RESOURCE: usize = 50;
+
 /// The same guard for remembered idempotency tokens. A token is caller-chosen, so
 /// this map would otherwise grow for the life of the process with one entry per
 /// distinct token; past the ceiling [`ComAmazonawsAppfabricFabricfrontendserviceState::remember_client_token`]
@@ -260,6 +268,158 @@ impl ComAmazonawsAppfabricFabricfrontendserviceState {
         bundles.sort_by_key(|bundle| bundle.sequence);
         bundles
     }
+
+    /// Where the resource an `Arn` names lives in the store, or `None` when no
+    /// record carries that ARN.
+    ///
+    /// The resource-tagging operations take an ARN rather than a typed
+    /// identifier, so this is the one place that decides which record a
+    /// `resourceArn` denotes: every record this service persists carries its own
+    /// ARN, and the walk is over the ownership chain (bundle → ingestion →
+    /// ingestion destination), so a resource becomes taggable exactly when the
+    /// operation that mints it starts persisting it.
+    pub fn locate_tagged(&self, arn: &str) -> Option<TagTarget> {
+        for bundle in self.app_bundles.values() {
+            if bundle.arn == arn {
+                return Some(TagTarget::AppBundle {
+                    bundle: bundle.id.clone(),
+                });
+            }
+            for ingestion in bundle.ingestions.values() {
+                if ingestion.arn == arn {
+                    return Some(TagTarget::Ingestion {
+                        bundle: bundle.id.clone(),
+                        ingestion: ingestion.id.clone(),
+                    });
+                }
+                for destination in ingestion.destinations.values() {
+                    if destination.arn == arn {
+                        return Some(TagTarget::IngestionDestination {
+                            bundle: bundle.id.clone(),
+                            ingestion: ingestion.id.clone(),
+                            destination: destination.id.clone(),
+                        });
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// The tags a located resource holds, as the holding record stores them.
+    pub fn tags_of(&self, target: &TagTarget) -> Option<&Vec<Tag>> {
+        match target {
+            TagTarget::AppBundle { bundle } => {
+                self.app_bundles.get(bundle).map(|bundle| &bundle.tags)
+            }
+            TagTarget::Ingestion { bundle, ingestion } => self
+                .app_bundles
+                .get(bundle)?
+                .ingestions
+                .get(ingestion)
+                .map(|ingestion| &ingestion.tags),
+            TagTarget::IngestionDestination {
+                bundle,
+                ingestion,
+                destination,
+            } => self
+                .app_bundles
+                .get(bundle)?
+                .ingestions
+                .get(ingestion)?
+                .destinations
+                .get(destination)
+                .map(|destination| &destination.tags),
+        }
+    }
+
+    /// The same tag set, for mutation by `TagResource` / `UntagResource`.
+    pub fn tags_of_mut(&mut self, target: &TagTarget) -> Option<&mut Vec<Tag>> {
+        match target {
+            TagTarget::AppBundle { bundle } => self
+                .app_bundles
+                .get_mut(bundle)
+                .map(|bundle| &mut bundle.tags),
+            TagTarget::Ingestion { bundle, ingestion } => self
+                .app_bundles
+                .get_mut(bundle)?
+                .ingestions
+                .get_mut(ingestion)
+                .map(|ingestion| &mut ingestion.tags),
+            TagTarget::IngestionDestination {
+                bundle,
+                ingestion,
+                destination,
+            } => self
+                .app_bundles
+                .get_mut(bundle)?
+                .ingestions
+                .get_mut(ingestion)?
+                .destinations
+                .get_mut(destination)
+                .map(|destination| &mut destination.tags),
+        }
+    }
+}
+
+/// The resource a tagging call's `resourceArn` names: the chain of store keys
+/// leading to the record that holds its tags.
+///
+/// Keys rather than a reference, so one immutable walk
+/// ([`ComAmazonawsAppfabricFabricfrontendserviceState::locate_tagged`]) serves
+/// both the reporting and the mutating tagging operations.
+#[derive(Debug, Clone)]
+pub enum TagTarget {
+    AppBundle {
+        bundle: String,
+    },
+    Ingestion {
+        bundle: String,
+        ingestion: String,
+    },
+    IngestionDestination {
+        bundle: String,
+        ingestion: String,
+        destination: String,
+    },
+}
+
+impl TagTarget {
+    /// The resource's kind, as a modelled error and an audit record name it.
+    pub fn resource_type(&self) -> &'static str {
+        match self {
+            Self::AppBundle { .. } => "AppBundle",
+            Self::Ingestion { .. } => "Ingestion",
+            Self::IngestionDestination { .. } => "IngestionDestination",
+        }
+    }
+
+    /// The resource's own bare id — the last key in the chain.
+    pub fn id(&self) -> &str {
+        match self {
+            Self::AppBundle { bundle } => bundle,
+            Self::Ingestion { ingestion, .. } => ingestion,
+            Self::IngestionDestination { destination, .. } => destination,
+        }
+    }
+}
+
+/// Merge `incoming` into `tags` the way `TagResource` does: a tag list is a map
+/// of key-value pairs, so a key already present takes the new value in place
+/// (keeping the position it was first assigned at) and a new key is appended.
+///
+/// Returns the merged set rather than mutating, so a caller can refuse a merge
+/// that would take the resource past [`MAX_TAGS_PER_RESOURCE`] without having
+/// changed anything.
+pub fn merge_tags(tags: &[Tag], incoming: &[Tag]) -> Vec<Tag> {
+    let mut merged = tags.to_vec();
+    for tag in incoming {
+        match merged.iter_mut().find(|held| held.key == tag.key) {
+            Some(held) => held.value = tag.value.clone(),
+            None => merged.push(tag.clone()),
+        }
+    }
+    merged
 }
 
 /// The store key of the ingestion `identifier` names inside `bundle`, by ARN or
@@ -532,6 +692,43 @@ pub fn ingestion_not_found(identifier: &str) -> ResourceNotFoundException {
         resource_id: identifier.to_string(),
         resource_type: "Ingestion".to_string(),
     }
+}
+
+/// A modelled `ResourceNotFoundException` for a tagging call whose `resourceArn`
+/// names no resource this store holds.
+///
+/// The ARN is the only identifier the caller gave, so it is also the
+/// `resourceId`; the `resourceType` is read out of the ARN itself (see
+/// [`arn_resource_type`]) because an ARN naming nothing has no record to read a
+/// kind from.
+pub fn tagged_resource_not_found(arn: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: format!("Resource {arn} was not found."),
+        resource_id: arn.to_string(),
+        resource_type: arn_resource_type(arn).to_string(),
+    }
+}
+
+/// The kind of resource an ARN names, from the LAST type segment of its
+/// resource part: `…:appbundle/<id>/ingestion/<id>` names an ingestion.
+///
+/// The segment names are the ones this service's own ARNs are built from (see
+/// `CreateAppBundle` and `CreateIngestion`); any other ARN — another service's,
+/// or a malformed one — is reported as the generic `Resource`.
+pub fn arn_resource_type(arn: &str) -> &'static str {
+    let mut kind = "Resource";
+    for segment in arn.split('/') {
+        // The first segment carries the ARN head, whose last `:`-separated
+        // piece is the resource type (`…:000000000000:appbundle`).
+        match segment.split(':').next_back().unwrap_or(segment) {
+            "appbundle" => kind = "AppBundle",
+            "ingestion" => kind = "Ingestion",
+            "ingestiondestination" => kind = "IngestionDestination",
+            "appauthorization" => kind = "AppAuthorization",
+            _ => {}
+        }
+    }
+    kind
 }
 
 /// A modelled `ServiceQuotaExceededException` for a create call that would take

@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateInstanceAccessControlAttributeConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateInstanceAccessControlAttributeConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateInstanceAccessControlAttributeConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! REPLACES the attribute mapping of an instance's existing ABAC configuration, so a
+//! later `DescribeInstanceAccessControlAttributeConfiguration` reports exactly the
+//! attributes this call sent. ABAC is a feature of the ORGANIZATION instance, so on an
+//! ACCOUNT instance the whole surface is refused with the modelled `ValidationException`.
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +156,97 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateInstanceAccessControlAttributeConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateInstanceAccessControlAttributeConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateInstanceAccessControlAttributeConfiguration"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateInstanceAccessControlAttributeConfigurationErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the SSO Admin state store is unavailable".to_string()),
+                },
+            )
+        })?;
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // What the CLOCK already owes every instance, so this update resolves the same
+        // instance a read at this instant would resolve.
+        store.materialize_due(now);
+
+        // The ACCOUNT-INSTANCE restriction, asked BEFORE any resource lookup: ABAC is a
+        // feature of the organization instance, so on an account instance there is never
+        // an attribute configuration to update. An ARN this account holds no instance for
+        // is NOT this refusal — it falls through to the 404 below.
+        if store.abac_surface_withdrawn(&input.instance_arn) {
+            return Err(
+                UpdateInstanceAccessControlAttributeConfigurationErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(
+                            crate::state::ACCOUNT_INSTANCE_UNSUPPORTED_MESSAGE.to_string(),
+                        ),
+                        // The model's `ValidationExceptionReason` enum carries only KMS
+                        // key states, none of which this refusal is.
+                        reason: None,
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The request's own consistency, as the create checks it: a mapping cannot give
+        // one key two values.
+        let attributes = input
+            .instance_access_control_attribute_configuration
+            .access_control_attributes;
+        if let Some(duplicate) = crate::state::duplicate_attribute_key(&attributes) {
+            return Err(
+                UpdateInstanceAccessControlAttributeConfigurationErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(crate::state::duplicate_attribute_key_message(duplicate)),
+                        reason: None,
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let Some(instance) = store.instance_mut(&input.instance_arn) else {
+            return Err(
+                UpdateInstanceAccessControlAttributeConfigurationErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "No instance found with the ARN {}",
+                            input.instance_arn
+                        )),
+                        reason: None,
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // An UPDATE of the configuration a create stored: with ABAC not enabled there is
+        // nothing to update, and enabling it is the create's job, so this is a missing
+        // resource rather than an implicit create.
+        let Some(configuration) = instance.access_control_attributes.as_mut() else {
+            return Err(
+                UpdateInstanceAccessControlAttributeConfigurationErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "No access control attribute configuration exists for the instance {}",
+                            input.instance_arn
+                        )),
+                        reason: None,
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // "Updates the attributes for your ABAC configuration": the sent list REPLACES
+        // the stored one — an attribute the caller leaves out is no longer mapped. The
+        // enabling instant is untouched: the model declares no in-progress status for an
+        // update, so an update neither re-starts nor finishes the create's enabling.
+        configuration.attributes = attributes;
+        // The model's `UpdateInstanceAccessControlAttributeConfigurationResponse` is
+        // empty; the stored mapping is read back through the describe.
+        Ok(UpdateInstanceAccessControlAttributeConfigurationOutput {})
     }
 }

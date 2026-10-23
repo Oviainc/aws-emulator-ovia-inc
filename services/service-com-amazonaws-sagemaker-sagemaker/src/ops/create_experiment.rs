@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateExperiment
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateExperiment`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateExperiment::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints an experiment in [`crate::state::ComAmazonawsSagemakerSagemakerState::experiments`]
+//! and answers its ARN. The name is unique per account and NOT case-sensitive, so the
+//! record is keyed by [`crate::state::entity_key`]; a second create under a name
+//! that differs only in case is refused rather than overwriting the first.
 //!
 //! ## Shape of an operation
 //!
@@ -163,18 +159,68 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateExperiment` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateExperimentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateExperiment"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        let region = crate::state::request_region(ctx);
+        let arn = crate::state::resource_arn(&region, crate::state::EXPERIMENT_KIND, &input.experiment_name);
+        let key = crate::state::entity_key(&input.experiment_name);
+
+        let mut store = state.lock();
+        // A name already in use is refused, never overwritten: otherwise the caller reads
+        // a 200 for an experiment it did not create, and the one it did create is gone.
+        // The comparison folds case, because the name's uniqueness does. It runs before
+        // the quota check so a duplicate is answered as a duplicate even when the store
+        // is full.
+        if store.experiments.contains_key(&key) {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "Experiment with name \"{}\" already exists.",
+                input.experiment_name
+            )));
+        }
+        // The store is bounded, so a caller varying `ExperimentName` cannot grow it
+        // without end. `ResourceLimitExceeded` is the limit failure this operation models.
+        if !store.experiments_below_quota() {
+            return Err(CreateExperimentErrorModeled::ResourceLimitExceeded(
+                ResourceLimitExceeded {
+                    message: Some(format!(
+                        "The account-level service limit for experiments is {}, with current \
+                         utilization of {} and a request delta of 1.",
+                        crate::state::EXPERIMENT_QUOTA,
+                        store.experiments.len()
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let now = ::std::time::SystemTime::now();
+        store.experiments.insert(
+            key,
+            crate::state::Experiment {
+                name: input.experiment_name.clone(),
+                arn: arn.clone(),
+                // The model documents that `ExperimentName` is what gets displayed when
+                // the request names no `DisplayName`.
+                display_name: input
+                    .display_name
+                    .unwrap_or_else(|| input.experiment_name.clone()),
+                description: input.description,
+                // The identity the request signed with, recorded once at creation so
+                // every later read reports the one that actually created it.
+                created_by: crate::state::caller_user_context(ctx),
+                tags: input.tags.unwrap_or_default(),
+                creation_time: now,
+                // Nothing has modified it yet, so the two instants coincide until an
+                // update moves this one.
+                last_modified_time: now,
+            },
+        );
+        drop(store);
+
+        crate::state::record_state_change(Self::NAME, &arn, ctx);
+        Ok(CreateExperimentOutput {
+            experiment_arn: Some(arn),
+        })
     }
 }

@@ -31,19 +31,19 @@ const REGION: &str = "us-east-1";
 const ACCOUNT: &str = "000000000000";
 
 /// One emulator: the shared engine plus this service mounted on a router.
-struct Emulator {
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
 }
 
 /// A response, reduced to what these tests assert on.
-struct Answer {
-    status: u16,
-    body: Value,
+pub(crate) struct Answer {
+    pub(crate) status: u16,
+    pub(crate) body: Value,
 }
 
 impl Answer {
     /// The wire error code (`__type`) of an error envelope, or `""`.
-    fn error_code(&self) -> &str {
+    pub(crate) fn error_code(&self) -> &str {
         self.body
             .get("__type")
             .and_then(Value::as_str)
@@ -52,14 +52,14 @@ impl Answer {
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.register_service(EmulatedService::new(engine));
         Self { router }
     }
 
-    async fn call(&self, method: &str, uri: &str, body: Option<Value>) -> Answer {
+    pub(crate) async fn call(&self, method: &str, uri: &str, body: Option<Value>) -> Answer {
         let payload = body.map_or_else(Vec::new, |value| {
             serde_json::to_vec(&value).expect("a serializable request body")
         });
@@ -81,7 +81,7 @@ impl Emulator {
         Answer { status, body }
     }
 
-    async fn create_app_bundle(&self, body: Value) -> Answer {
+    pub(crate) async fn create_app_bundle(&self, body: Value) -> Answer {
         self.call("POST", "/appbundles", Some(body)).await
     }
 
@@ -103,7 +103,7 @@ impl Emulator {
         self.call("GET", &format!("/appbundles{query}"), None).await
     }
 
-    async fn create_ingestion(&self, bundle: &str, body: Value) -> Answer {
+    pub(crate) async fn create_ingestion(&self, bundle: &str, body: Value) -> Answer {
         self.call(
             "POST",
             &format!("/appbundles/{}/ingestions", encode(bundle)),
@@ -139,7 +139,7 @@ impl Emulator {
 /// byte outside RFC 3986's unreserved set (`ALPHA / DIGIT / "-" / "." / "_" /
 /// "~"`) becomes `%XX`. An identifier in its ARN form carries `:` and `/`, and
 /// `/` would otherwise split a non-greedy label across two path segments.
-fn encode(label: &str) -> String {
+pub(crate) fn encode(label: &str) -> String {
     use std::fmt::Write as _;
 
     let mut encoded = String::with_capacity(label.len());
@@ -166,7 +166,7 @@ fn unknown_uuid() -> String {
     "ffffffff-ffff-4fff-8fff-ffffffffffff".to_string()
 }
 
-fn arn_of(body: &Value, resource: &str) -> String {
+pub(crate) fn arn_of(body: &Value, resource: &str) -> String {
     body.get(resource)
         .and_then(|r| r.get("arn"))
         .and_then(Value::as_str)
