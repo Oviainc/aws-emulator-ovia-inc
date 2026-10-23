@@ -150,6 +150,22 @@ const DOCUMENT_REQUEST_ID_KEY: &str = "RequestID";
 /// document belongs on.
 const FIRST_ERROR_STATUS: u16 = 400;
 
+/// The status whose response carries NO content, whatever a renderer wrote for it, and
+/// the length such an answer states.
+///
+/// The two operations that answer it (`TagResource` and `UntagResource` — see
+/// [`crate::state::NO_CONTENT_SUCCESS_STATUS`]) declare an output STRUCTURE with no
+/// members rather than `smithy.api#Unit`, and the protocol serializes that as the empty
+/// JSON object `{}`. The recorded responses carry no body at all, so the body is dropped
+/// here — at the one place every response of this service passes through, rather than per
+/// operation — and the answer still states its length, which is what the recorded
+/// empty-bodied AWS responses do (the sibling `schemas` emulator records the same
+/// behaviour for its own empty 204s). An answer served over HTTP/1.1 reaches the client
+/// without the header: the HTTP writer the vendored transport uses removes
+/// `content-length` from a 204, which is below anything this crate decides.
+const NO_CONTENT_STATUS: u16 = 204;
+const NO_CONTENT_LENGTH: &str = "0";
+
 /// Mint the id ONE response names the request it answers with.
 ///
 /// 8-4-4-4-12 lowercase hex, the form an AWS request id takes. The VALUE is per-response
@@ -274,6 +290,14 @@ struct RestatedError {
 /// replace a modelled 4xx with a 500 an SDK retries.
 fn with_response_envelope(mut resp: RtResponse) -> RtResponse {
     let request_id = new_request_id();
+    if resp.status().as_u16() == NO_CONTENT_STATUS {
+        // See `NO_CONTENT_STATUS`: the body the serializer rendered for an empty output
+        // structure goes no further, and the answer states the length it does have.
+        *resp.body_mut() = aws_smithy_types::body::SdkBody::empty();
+        let _ = resp
+            .headers_mut()
+            .try_insert("content-length", NO_CONTENT_LENGTH);
+    }
     if let Some(restated) = error_document(&resp, &request_id) {
         // Only a renderer that advertised a length needs it corrected; the framework's
         // error renderers set `content-type` alone and leave framing to the transport.
