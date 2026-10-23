@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListAcmeEndpoints
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListAcmeEndpoints`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: enumerates the ACME endpoint records this account holds as
+//! `AcmeEndpointSummary` values in ARN order, bounded by `MaxResults` with a
+//! `NextToken` that resumes strictly after the last endpoint the previous page emitted.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListAcmeEndpoints::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reporting, not mutating: the only write it makes is
+//! [`crate::state::ComAmazonawsAcmCertificatemanagerState::materialize_due`], which
+//! applies the status transitions the clock already owed at this instant, so a listed
+//! endpoint's `Status` is the one `DescribeAcmeEndpoint` reports for it.
 //!
 //! ## Shape of an operation
 //!
@@ -146,18 +145,113 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListAcmeEndpoints` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListAcmeEndpointsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListAcmeEndpoints"))
+        // No request metadata is needed: this operation lists the endpoints this
+        // account holds, and each record already carries the ARN it was minted with.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in the assembled emulator (the engine IS the shared store);
+            // this operation models a server fault, so that is the honest answer.
+            return Err(ListAcmeEndpointsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the acm acme endpoint store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        // Decoded before the store is locked, so a token this service did not issue is
+        // refused without reading anything.
+        let resume_after = input
+            .next_token
+            .as_deref()
+            .map(decode_next_token)
+            .transpose()?;
+
+        let mut store = state.lock();
+        // The statuses this page reports are the ones the clock has already made due,
+        // so a listed endpoint and a `DescribeAcmeEndpoint` of the same endpoint cannot
+        // disagree.
+        store.materialize_due(::std::time::SystemTime::now());
+
+        // Page size: the caller's `MaxResults`, else the server-side default. The
+        // model's own `range 1..100` on that member is already enforced before this
+        // handler runs (a value outside it is refused with `ValidationException`), so
+        // the clamp here only bounds the DEFAULT path and cannot admit a page the model
+        // forbids: one request can never serialise the whole store however large it has
+        // grown.
+        let limit = input
+            .max_results
+            .and_then(|max| usize::try_from(max).ok())
+            .unwrap_or(MAX_PAGE_SIZE)
+            .clamp(1, MAX_PAGE_SIZE);
+
+        // The store keys endpoints by ARN in a `BTreeMap`, so its own order is the one
+        // deterministic order every page and every resumption walks. A `NextToken` names
+        // the last endpoint the previous page emitted, and this page starts at the first
+        // ARN strictly after it — whether or not that endpoint is still there, so a
+        // caller paging while endpoints are deleted keeps the tail instead of losing it.
+        let start = match resume_after.as_ref() {
+            Some(arn) => ::std::ops::Bound::Excluded(arn),
+            None => ::std::ops::Bound::Unbounded,
+        };
+        let mut remaining = store
+            .acme_endpoints
+            .range::<String, _>((start, ::std::ops::Bound::Unbounded));
+
+        // The page's summaries, beside the store KEY each was projected from — the ARN
+        // the map is keyed by, which is never absent, so the token a page issues cannot
+        // depend on a projected member being present.
+        let mut last_key: Option<&String> = None;
+        let mut summaries: Vec<AcmeEndpointSummary> = Vec::new();
+        for (arn, endpoint) in remaining.by_ref().take(limit) {
+            summaries.push(crate::state::acme_endpoint_summary(endpoint));
+            last_key = Some(arn);
+        }
+        // A token is issued only when an endpoint is left beyond this page, and it names
+        // the last endpoint the page emitted.
+        let next_token = remaining
+            .next()
+            .and(last_key)
+            .map(|arn| encode_next_token(arn));
+
+        Ok(ListAcmeEndpointsOutput {
+            acme_endpoints: Some(summaries),
+            next_token,
+        })
     }
+}
+
+/// The most summaries one `ListAcmeEndpoints` response carries, which is also the page
+/// size used when the caller names no `MaxResults`: the maximum the model allows for
+/// that member (`ListAcmeEndpointsRequest$MaxResults`, `range 1..100`).
+const MAX_PAGE_SIZE: usize = 100;
+
+/// The opaque `NextToken` for the last ACME endpoint a page emitted.
+///
+/// Hex-encoded so the token is opaque to the caller and carries no character the
+/// `String` it travels in could not hold, whatever the ARN contains.
+fn encode_next_token(acme_endpoint_arn: &str) -> String {
+    hex::encode(acme_endpoint_arn)
+}
+
+/// The ACME endpoint ARN inside a `NextToken`, or `ValidationException` when the token
+/// did not come from [`encode_next_token`].
+///
+/// Every step is fallible on purpose: the token is caller-supplied, so no value read out
+/// of it may panic the handler, and a forged-but-well-encoded token is refused rather
+/// than silently answering some other page. The refusal renders the one sentence every
+/// paginated read in this service answers this class with
+/// ([`crate::state::INVALID_NEXT_TOKEN_MESSAGE`]).
+fn decode_next_token(token: &str) -> Result<String, ListAcmeEndpointsError> {
+    let invalid = || {
+        ListAcmeEndpointsErrorModeled::ValidationException(ValidationException {
+            message: Some(crate::state::INVALID_NEXT_TOKEN_MESSAGE.to_string()),
+        })
+    };
+    let bytes = hex::decode(token).map_err(|_| invalid())?;
+    let decoded = String::from_utf8(bytes).map_err(|_| invalid())?;
+    if crate::state::acme_endpoint_id_from_arn(&decoded).is_none() {
+        return Err(invalid().into());
+    }
+    Ok(decoded)
 }
