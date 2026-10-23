@@ -34,11 +34,32 @@
 //!   failure the orchestrator detects up front (e.g. a malformed `aws-chunked`
 //!   body). The default returns `None`, keeping the entry's protocol-correct
 //!   rendering. Return `Some(resp)` to reword it if desired.
+//! - `override_protocol` — the codec this service's own responses are serialized in.
+//!   The default returns `None`, keeping the model-derived protocol; this service
+//!   overrides it (see below).
 //!
 //! The model-derived half of this service — its identity, wire protocol, routing
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
+//!
+//! Four of those seams are taken here, all for the one reason named in
+//! [`response_media_type`]: every response this service answers announces the media type
+//! the real service stamps (`application/x-amz-json-1.1`) rather than the one the model's
+//! `awsJson1_0` protocol trait implies.
+//!
+//! - `override_protocol` serves the awsJson `1.1` codec, which is the one place the media
+//!   type of a response this SERVICE produces — a success, and any error its handler
+//!   raises — is decided. The JSON framing is byte-identical to `1.0`, so the request side
+//!   is unchanged.
+//! - `override_operation`, `override_routing_error` and `override_framework_error`
+//!   re-announce the responses the FRAMEWORK renders in front of the service, which
+//!   `override_protocol` does not reach: a refusal of a modelled constraint, an unroutable
+//!   request, and a transport-level failure.
+//!
+//! Routing, status, codes, messages and bodies all stay with the framework.
+
+pub mod response_media_type;
 
 use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service,
@@ -52,6 +73,15 @@ use std::sync::Arc;
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// The codec this service answers in (awsJson `1.1`; see [`response_media_type`]).
+    /// Built once here because [`Service::override_protocol`] hands back a borrow of it.
+    protocol: aws_smithy_schema_server::rpc::HttpRpcServerProtocol<
+        aws_smithy_schema_server::json::JsonCodec,
+    >,
+    /// The wrapper every routable request is served through, which re-announces the one
+    /// response `override_protocol` cannot reach. Held in a field, built once, because
+    /// `override_operation` hands back a reference to it.
+    media_type: response_media_type::ResponseMediaTypeOperation,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -61,6 +91,8 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
             entry: crate::ServiceDefinition::new(engine),
+            protocol: aws_smithy_schema_server::rpc::AwsJson11(),
+            media_type: response_media_type::ResponseMediaTypeOperation,
         }
     }
 }
@@ -87,12 +119,23 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // Return `Some(op)` to serve a request the model's routing key cannot name
-        // correctly; `None` (the default) lets the generated routing table resolve
-        // it. `req` is the whole request, so a decision that depends on the body —
-        // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
-        None
+        // Every request the generated routing table can serve is served through the
+        // media-type wrapper, which delegates to that same table entry and then
+        // re-announces whatever came back (see [`response_media_type`]). It is there for
+        // the ONE response `override_protocol` below cannot reach: the refusal of a
+        // modelled constraint, rendered inside the centralized walk. The routing stays the
+        // model's: a request the table cannot serve is declined here, so the framework
+        // answers it as the unroutable request it is — through `override_routing_error`.
+        response_media_type::routes(&self.entry, req).then_some(&self.media_type as _)
+    }
+
+    fn override_protocol(&self) -> Option<&dyn smithy_server_runtime::ServerHttpProtocol> {
+        // The codec the centralized walk serializes this service's own responses with —
+        // every success and every error a handler raises. This is the one place the media
+        // type such a response announces is decided, and `AwsJson11()` is the same
+        // `JsonCodec` over the same `X-Amz-Target` routing key and the same empty body as
+        // the `awsJson1_0` the model declares, so only the announced media type changes.
+        Some(&self.protocol)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
@@ -115,12 +158,13 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     ) -> Option<aws_smithy_runtime_api::http::Response> {
         // The router calls this when a request reached this service but named no
         // modeled operation — neither `override_operation` nor the generated
-        // routing table resolved it. Returning `None` renders the protocol-correct
-        // default for this service's envelope (query -> 400 InvalidAction text/xml,
-        // awsJson -> 404, rpcv2Cbor -> 404, rest -> 501). Return `Some(resp)` to
-        // word that routing failure in your own envelope instead.
-        let _ = req;
-        None
+        // routing table resolved it. The framework's protocol-correct default is kept word
+        // for word, status, code and body alike; only the media type is re-announced, so an
+        // unroutable request is answered under the same media type as a routed one (see
+        // [`response_media_type`]).
+        Some(response_media_type::with_response_media_type(
+            self.entry.routing_error_response(req),
+        ))
     }
 
     fn override_framework_error(
@@ -129,11 +173,23 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     ) -> Option<aws_smithy_runtime_api::http::Response> {
         // The router calls this on a transport-level failure it detects up front —
         // before (or instead of) naming an operation — such as a malformed
-        // `aws-chunked` body. Returning `None` keeps the entry's protocol-correct
-        // rendering. Return `Some(resp)` to reword that failure in your own
-        // envelope. The error is borrowed, so the default renderer can still
-        // consume it on `None`.
-        let _ = error;
-        None
+        // `aws-chunked` body. The entry's protocol-correct rendering is kept word for
+        // word; only the media type is re-announced (see [`response_media_type`]).
+        //
+        // The error is borrowed and `ProtocolError` is neither `Clone` nor reconstructable
+        // in general, so the default renderer is reached by rebuilding the one variant this
+        // seam is ever handed: the router raises `Malformed` here, from the `aws-chunked`
+        // decode it runs before naming an operation. Anything else declines to `None` and
+        // keeps the framework's rendering unchanged rather than losing what the error said.
+        match error {
+            aws_smithy_schema_server::ProtocolError::Malformed(message) => {
+                let rebuilt =
+                    aws_smithy_schema_server::ProtocolError::Malformed(message.clone());
+                Some(response_media_type::with_response_media_type(
+                    self.entry.framework_error_response(rebuilt),
+                ))
+            }
+            _ => None,
+        }
     }
 }

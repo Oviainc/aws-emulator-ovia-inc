@@ -210,7 +210,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             UpdateInstanceErrorModeled::InternalServerException(InternalServerException {
                 message: Some("the SSO Admin state store is unavailable".to_string()),
@@ -271,7 +270,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
+        // What the CLOCK already owes every instance, plus the account's ambient instance
+        // if nothing has enabled one yet, so this update resolves the same instance a read
+        // at this instant would resolve.
+        store.on_request(&region, ::std::time::SystemTime::now());
         // A syntactically valid ARN for an instance this account does not hold is a
         // MISSING RESOURCE, which this operation (unlike `DescribeInstance`) models.
         let instance = store.instance_mut(&input.instance_arn).ok_or_else(|| {

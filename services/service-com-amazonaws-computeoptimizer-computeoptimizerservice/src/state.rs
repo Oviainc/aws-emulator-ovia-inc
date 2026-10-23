@@ -9,15 +9,25 @@
 //! scope precedence `GetEffectiveRecommendationPreferences` resolves with, and the opaque
 //! page token `GetRecommendationPreferences` round-trips — so no two handlers can drift
 //! from each other's view of the same record.
+//!
+//! The analysis output this service REPORTS lives here too, in its own store
+//! ([`IdleRecommendationStore`]): no operation of this API creates an idle resource
+//! recommendation — Compute Optimizer's own analysis of an observed workload does — so the
+//! store is what `GetIdleRecommendations` filters, orders and pages over, and the rules it
+//! applies to a stored recommendation (the filter vocabulary, the sort dimensions, the ARN
+//! -> resource-type catalog) are stated once, here.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use ::aws_smithy_types::DateTime;
+use ::sha2::{Digest, Sha256};
 
 use crate::ops::types::{
     CustomizableMetricParameters, EffectivePreferredResource, ExternalMetricsPreference,
-    PreferredResource, PutRecommendationPreferencesInput, RecommendationPreferencesDetail, Scope,
-    UtilizationPreference,
+    IdleRecommendation, IdleRecommendationFilter, PreferredResource,
+    PutRecommendationPreferencesInput, RecommendationPreferencesDetail, Scope, UtilizationPreference,
+    IDLE_FINDING_VALUES, IDLE_RECOMMENDATION_FILTER_NAME_VALUES,
+    IDLE_RECOMMENDATION_RESOURCE_TYPE_VALUES,
 };
 
 /// The look-back period in force when no preference sets one. From the model's own
@@ -331,6 +341,58 @@ pub fn default_preferred_resources() -> Vec<EffectivePreferredResource> {
     })]
 }
 
+/// An ARN split into the fields the ARN grammar defines:
+/// `arn:<partition>:<service>:<region>:<account-id>:<resource>`. The resource part keeps
+/// its own `:` and `/` separators, because every service words it its own way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParsedArn<'a> {
+    /// The partition field (`aws`, `aws-cn`, …).
+    pub partition: &'a str,
+    /// The service namespace the resource belongs to (`ec2`, `rds`, …).
+    pub service: &'a str,
+    /// The region field, empty for a global resource.
+    pub region: &'a str,
+    /// The account that owns the resource.
+    pub account_id: &'a str,
+    /// Everything after the account field, separators included.
+    pub resource: &'a str,
+}
+
+impl<'a> ParsedArn<'a> {
+    /// The leading segment of the resource part — the resource KIND (`instance`,
+    /// `volume`, `autoScalingGroup`, …), which is what names the resource's type.
+    pub fn resource_kind(&self) -> &'a str {
+        self.resource.split(['/', ':']).next().unwrap_or_default()
+    }
+}
+
+/// Split `arn` into its six ARN fields, or `None` when it is not an ARN at all. The one
+/// place this service decides what an ARN looks like, so every operation that takes one
+/// accepts and refuses the same strings.
+pub fn parse_arn(arn: &str) -> Option<ParsedArn<'_>> {
+    let fields: Vec<&str> = arn.splitn(6, ':').collect();
+    let [prefix, partition, service, region, account_id, resource] = fields.as_slice() else {
+        return None;
+    };
+    if *prefix != "arn" || partition.is_empty() || service.is_empty() || resource.is_empty() {
+        return None;
+    }
+    Some(ParsedArn {
+        partition,
+        service,
+        region,
+        account_id,
+        resource,
+    })
+}
+
+/// Whether `value` is "a 12-digit Amazon Web Services account ID" — the account-id shape
+/// the service documents on `Scope$value`, and the one every operation of this service
+/// that takes an account id checks against.
+pub fn is_account_id(value: &str) -> bool {
+    value.len() == 12 && value.bytes().all(|b| b.is_ascii_digit())
+}
+
 /// An EC2 instance or Auto Scaling group ARN, split into the parts the preference rules
 /// read: the account that owns the resource and the `ResourceType` it is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -345,23 +407,14 @@ pub struct ParsedResourceArn<'a> {
 /// instance and Auto Scaling group ARNs are currently supported" (`Scope$value`,
 /// `GetEffectiveRecommendationPreferences$resourceArn`).
 pub fn parse_resource_arn(arn: &str) -> Option<ParsedResourceArn<'_>> {
-    // `arn:<partition>:<service>:<region>:<account>:<resource>`; the resource part keeps
-    // its own `:` separators (an Auto Scaling group ARN has several).
-    let fields: Vec<&str> = arn.splitn(6, ':').collect();
-    let [prefix, _partition, service, _region, account_id, resource] = fields.as_slice() else {
-        return None;
-    };
-    if *prefix != "arn" {
-        return None;
-    }
-    let resource_kind = resource.split(['/', ':']).next()?;
-    let resource_type = match (*service, resource_kind) {
+    let parsed = parse_arn(arn)?;
+    let resource_type = match (parsed.service, parsed.resource_kind()) {
         ("ec2", "instance") => RESOURCE_TYPE_EC2_INSTANCE,
         ("autoscaling", "autoScalingGroup") => RESOURCE_TYPE_AUTO_SCALING_GROUP,
         _ => return None,
     };
     Some(ParsedResourceArn {
-        account_id,
+        account_id: parsed.account_id,
         resource_type,
     })
 }
@@ -393,15 +446,11 @@ pub fn scope_rejection(scope: Option<&Scope>) -> Option<String> {
                  {SCOPE_ORGANIZATION} scope must be {ORGANIZATION_SCOPE_VALUE}, not {value}."
             ))
         }
-        (Some(SCOPE_ACCOUNT_ID), Some(value))
-            if value.len() != 12 || !value.bytes().all(|b| b.is_ascii_digit()) =>
-        {
-            Some(format!(
-                "The value supplied for parameter scope is not valid: the value of an \
-                 {SCOPE_ACCOUNT_ID} scope must be a 12-digit Amazon Web Services account ID, \
-                 not {value}."
-            ))
-        }
+        (Some(SCOPE_ACCOUNT_ID), Some(value)) if !is_account_id(value) => Some(format!(
+            "The value supplied for parameter scope is not valid: the value of an \
+             {SCOPE_ACCOUNT_ID} scope must be a 12-digit Amazon Web Services account ID, \
+             not {value}."
+        )),
         (Some(SCOPE_RESOURCE_ARN), Some(value)) if parse_resource_arn(value).is_none() => {
             Some(format!(
                 "The value supplied for parameter scope is not valid: the value of a \
@@ -450,6 +499,264 @@ pub fn decode_page_token(token: &str) -> Option<PreferenceKey> {
     })
 }
 
+// ---------------------------------------------------------------------------
+// Idle resource recommendations
+//
+// Compute Optimizer "generates recommendations for idle resources that meet a
+// specific set of requirements" from the utilization it OBSERVES, so no request to
+// this API produces one: `GetIdleRecommendations` only reports what the analysis
+// recorded. Everything below is therefore about reading that record — the filter
+// vocabulary, the sort dimensions, the ARN -> resource-type catalog and the page
+// cursor — and nothing below writes a recommendation.
+// ---------------------------------------------------------------------------
+
+/// The largest page `GetIdleRecommendations` will build, whatever `maxResults` asks for,
+/// and the size it uses when a request names none: the ceiling the model itself puts on
+/// `maxResults` (`IdleMaxResults` range 0..100). Applied in the handler, so no number a
+/// request carries can size a response or the allocation that builds it.
+pub const IDLE_MAX_PAGE_SIZE: usize = 100;
+
+/// The `IdleRecommendationFilterName` values
+/// (`crate::ops::types::IDLE_RECOMMENDATION_FILTER_NAME_VALUES`), named so the filter rule
+/// below reads as the model's own vocabulary.
+pub const IDLE_FILTER_FINDING: &str = "Finding";
+/// See [`IDLE_FILTER_FINDING`].
+pub const IDLE_FILTER_RESOURCE_TYPE: &str = "ResourceType";
+
+/// The `Dimension` values `OrderBy$dimension` sorts on (`crate::ops::types::DIMENSION_VALUES`).
+pub const DIMENSION_SAVINGS_VALUE: &str = "SavingsValue";
+/// See [`DIMENSION_SAVINGS_VALUE`].
+pub const DIMENSION_SAVINGS_VALUE_AFTER_DISCOUNT: &str = "SavingsValueAfterDiscount";
+
+/// The `Order` value that sorts descending (`crate::ops::types::ORDER_VALUES` is
+/// `Asc | Desc`); see [`idle_sorts_descending`].
+pub const ORDER_DESC: &str = "Desc";
+
+/// The `IdleRecommendationError$code` this service reports for the one condition it can
+/// report: the request named a resource the service holds no idle recommendation for, which
+/// is exactly what `IdleRecommendationError` describes ("Returns of list of resources that
+/// doesn't have idle recommendations"). The model documents `code` only as "The error code"
+/// and names no vocabulary for it, so this is the emulator's own stable code; the
+/// requirement the entry carries is its `identifier`.
+pub const IDLE_NO_RECOMMENDATION_CODE: &str = "ResourceNotFound";
+
+/// The idle resource recommendations this service holds, keyed by the resource ARN that
+/// identifies one, in the order they were recorded.
+///
+/// Compute Optimizer's own analysis of an observed workload is what produces an idle
+/// resource recommendation, so NO operation of this API creates one: the store holds the
+/// modelled `IdleRecommendation` as recorded, and `GetIdleRecommendations` reports entries
+/// straight out of it, never from the request. `insert` is the only writer, so the record
+/// order a page walks and the by-ARN index a lookup uses cannot drift apart.
+#[derive(Debug, Default)]
+pub struct IdleRecommendationStore {
+    /// Resource ARNs in record order, so a page walks a stable sequence.
+    order: Vec<String>,
+    by_arn: HashMap<String, IdleRecommendation>,
+}
+
+impl IdleRecommendationStore {
+    /// Record `recommendation` under `resource_arn`. Re-recording the same ARN replaces the
+    /// stored recommendation in place, keeping its position in the order — a refreshed
+    /// analysis of one resource does not reorder the rest.
+    pub fn insert(&mut self, resource_arn: String, recommendation: IdleRecommendation) {
+        if !self.by_arn.contains_key(&resource_arn) {
+            self.order.push(resource_arn.clone());
+        }
+        self.by_arn.insert(resource_arn, recommendation);
+    }
+
+    /// The recommendation held for `resource_arn`, or `None` when the service holds none —
+    /// which is what puts that ARN in a response's `errors` list.
+    pub fn get(&self, resource_arn: &str) -> Option<&IdleRecommendation> {
+        self.by_arn.get(resource_arn)
+    }
+
+    /// Every recorded recommendation, in record order.
+    pub fn iter_in_order(&self) -> impl Iterator<Item = &IdleRecommendation> {
+        self.order.iter().filter_map(|arn| self.by_arn.get(arn))
+    }
+
+    /// How many recommendations are recorded.
+    pub fn len(&self) -> usize {
+        self.by_arn.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.by_arn.is_empty()
+    }
+}
+
+/// The `IdleRecommendationResourceType` an ARN names, or `None` when the ARN names no
+/// resource kind idle recommendations cover.
+///
+/// The catalog is the model's own `IdleRecommendationResourceType` value set
+/// (`crate::ops::types::IDLE_RECOMMENDATION_RESOURCE_TYPE_VALUES`), each value paired with
+/// the `<service>:<resource-kind>` ARN fields AWS gives that resource. A DocumentDB cluster
+/// carries the `rds` namespace, and the value set declares no other cluster of that
+/// namespace — no Aurora or RDS DB cluster value — so `rds:cluster` maps to
+/// `DocumentDBCluster`, the one cluster type idle recommendations cover.
+pub fn idle_resource_type_of_arn(arn: &str) -> Option<&'static str> {
+    let parsed = parse_arn(arn)?;
+    let resource_type = match (parsed.service, parsed.resource_kind()) {
+        ("ec2", "instance") => "EC2Instance",
+        ("ec2", "volume") => "EBSVolume",
+        ("ec2", "natgateway") => "NatGateway",
+        ("autoscaling", "autoScalingGroup") => "AutoScalingGroup",
+        ("ecs", "service") => "ECSService",
+        ("rds", "db") => "RDSDBInstance",
+        ("rds", "cluster") => "DocumentDBCluster",
+        ("dynamodb", "table") => "DynamoDBTable",
+        ("elasticache", "cluster") => "ElastiCacheCluster",
+        ("memorydb", "cluster") => "MemoryDBCluster",
+        ("workspaces", "workspace") => "WorkSpaces",
+        ("sagemaker", "endpoint") => "SageMakerEndpoint",
+        _ => return None,
+    };
+    debug_assert!(
+        IDLE_RECOMMENDATION_RESOURCE_TYPE_VALUES.contains(&resource_type),
+        "the catalog may only name modelled IdleRecommendationResourceType values"
+    );
+    Some(resource_type)
+}
+
+/// Check an `IdleRecommendationFilters` list against the vocabulary the model declares for
+/// it, returning the reason it is not valid.
+///
+/// `name` is an `IdleRecommendationFilterName` and the values a filter carries are the
+/// value set of the member that name selects on: `Finding` selects on `IdleFinding` and
+/// `ResourceType` on `IdleRecommendationResourceType`. A name or a value outside those sets
+/// is refused rather than silently matching nothing.
+pub fn idle_filter_rejection(filters: &[IdleRecommendationFilter]) -> Option<String> {
+    for filter in filters {
+        let Some(name) = filter.name.as_deref() else {
+            return Some(format!(
+                "The value supplied for parameter filters is not valid: a filter name must be \
+                 supplied, one of [{}].",
+                IDLE_RECOMMENDATION_FILTER_NAME_VALUES.join(", ")
+            ));
+        };
+        let vocabulary: &[&str] = match name {
+            IDLE_FILTER_FINDING => IDLE_FINDING_VALUES,
+            IDLE_FILTER_RESOURCE_TYPE => IDLE_RECOMMENDATION_RESOURCE_TYPE_VALUES,
+            _ => {
+                return Some(format!(
+                    "The value supplied for parameter filters is not valid: {name} is not a \
+                     filter name, which must be one of [{}].",
+                    IDLE_RECOMMENDATION_FILTER_NAME_VALUES.join(", ")
+                ))
+            }
+        };
+        if let Some(value) = filter
+            .values
+            .iter()
+            .flatten()
+            .find(|value| !vocabulary.contains(&value.as_str()))
+        {
+            return Some(format!(
+                "The value supplied for parameter filters is not valid: {value} is not a value \
+                 of the {name} filter, which must be one of [{}].",
+                vocabulary.join(", ")
+            ));
+        }
+    }
+    None
+}
+
+/// Does `recommendation` satisfy every `GetIdleRecommendations` filter?
+///
+/// A filter matches when the member its name selects on equals any of the filter's values;
+/// several filters are ANDed, and a filter carrying no values constrains nothing. A member
+/// the stored recommendation does not carry matches nothing. An unrecognised name never
+/// reaches here — [`idle_filter_rejection`] refuses the request first.
+pub fn idle_recommendation_matches_filters(
+    recommendation: &IdleRecommendation,
+    filters: &[IdleRecommendationFilter],
+) -> bool {
+    filters.iter().all(|filter| {
+        let Some(values) = filter.values.as_ref().filter(|values| !values.is_empty()) else {
+            return true;
+        };
+        let member = match filter.name.as_deref() {
+            Some(IDLE_FILTER_FINDING) => recommendation.finding.as_deref(),
+            Some(IDLE_FILTER_RESOURCE_TYPE) => recommendation.resource_type.as_deref(),
+            _ => None,
+        };
+        member.is_some_and(|member| values.iter().any(|value| value == member))
+    })
+}
+
+/// The figure `OrderBy$dimension` sorts a recommendation on: the estimated monthly savings
+/// of the dimension's savings opportunity — `SavingsValue` reads the opportunity before
+/// discounts, `SavingsValueAfterDiscount` the one after them. A recommendation that carries
+/// no estimate for that dimension sorts as the modelled default of the member it lacks
+/// (`IdleEstimatedMonthlySavings$value` defaults to `0`).
+pub fn idle_savings_value(recommendation: &IdleRecommendation, dimension: &str) -> f64 {
+    // The two dimensions the model declares, each reading its own savings opportunity. A
+    // dimension outside them is refused by the modelled `@enum` on `OrderBy$dimension` at
+    // the request boundary; the before-discount figure is the conservative reading of one
+    // this model does not yet declare.
+    let after_discounts = dimension == DIMENSION_SAVINGS_VALUE_AFTER_DISCOUNT;
+    let estimate = if after_discounts {
+        recommendation
+            .savings_opportunity_after_discounts
+            .as_ref()
+            .and_then(|opportunity| opportunity.estimated_monthly_savings.as_ref())
+    } else {
+        recommendation
+            .savings_opportunity
+            .as_ref()
+            .and_then(|opportunity| opportunity.estimated_monthly_savings.as_ref())
+    };
+    estimate.map_or(0.0, |savings| savings.value)
+}
+
+/// Whether an `OrderBy$order` sorts descending. `Desc` does; `Asc`, an absent order and a
+/// value the modelled `@enum` on `OrderBy$order` would refuse at the request boundary all
+/// sort ascending, because the model documents no default direction and ascending is this
+/// emulator's documented choice.
+pub fn idle_sorts_descending(order: Option<&str>) -> bool {
+    order == Some(ORDER_DESC)
+}
+
+/// Where a page of a paginated read resumed from: how far into the selected sequence the
+/// previous page stopped, and a fingerprint of the selection it was taken with, so resuming
+/// with a different selection is refused instead of answered with a page of another result
+/// set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdlePageCursor {
+    /// How many selected recommendations the previous pages already reported.
+    pub offset: usize,
+    /// The fingerprint of the request members that select and order the result set.
+    pub selection_fingerprint: String,
+}
+
+/// A stable digest of `value`'s debug rendering, used as the selection fingerprint bound
+/// into a page token. The derived `Debug` of a generated input shape renders its members in
+/// declaration order, so the same selection always digests to the same string and a
+/// different one almost never does.
+pub fn fingerprint<T: std::fmt::Debug>(value: &T) -> String {
+    ::hex::encode(Sha256::digest(format!("{value:?}").as_bytes()))
+}
+
+/// The opaque `nextToken` `GetIdleRecommendations` hands out: the cursor itself,
+/// hex-encoded, so a page token needs no server-side entry and a read never writes.
+pub fn encode_idle_page_token(cursor: &IdlePageCursor) -> String {
+    ::hex::encode(format!("{}:{}", cursor.offset, cursor.selection_fingerprint))
+}
+
+/// The cursor a `nextToken` this service issued stands for, or `None` for a token it did
+/// not issue. What a decoded cursor may resume is the caller's own check: it compares the
+/// cursor's fingerprint against the one it would issue for this request.
+pub fn decode_idle_page_token(token: &str) -> Option<IdlePageCursor> {
+    let decoded = String::from_utf8(::hex::decode(token).ok()?).ok()?;
+    let (offset, selection_fingerprint) = decoded.split_once(':')?;
+    Some(IdlePageCursor {
+        offset: offset.parse().ok()?,
+        selection_fingerprint: selection_fingerprint.to_string(),
+    })
+}
+
 /// Per-service state for com-amazonaws-computeoptimizer-computeoptimizerservice. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
@@ -459,6 +766,10 @@ pub struct ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
     /// Every stored recommendation preference, ordered by key so a page boundary is
     /// stable across calls.
     pub preferences: BTreeMap<PreferenceKey, PreferenceRecord>,
+    /// The idle resource recommendations this service holds, which
+    /// `GetIdleRecommendations` reports. See [`IdleRecommendationStore`]: no operation of
+    /// this API writes one.
+    pub idle_recommendations: IdleRecommendationStore,
 }
 
 impl ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
