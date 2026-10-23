@@ -193,9 +193,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A read: it looks the store up rather than vivifying one, so resolving a
         // membership id can never change what a later caller sees.
         let state = state.lock();
+        // The identity store the request names must exist; one that does not is the
+        // missing resource, reported as `IDENTITY_STORE` rather than as a missing
+        // membership of a store that is not there either.
         let store = state
-            .store(&input.identity_store_id)
-            .ok_or_else(membership_not_found)?;
+            .resolve_store(&input.identity_store_id)
+            .map_err(GetGroupMembershipIdErrorModeled::ResourceNotFoundException)?;
 
         // The membership is named by the pair that identifies it, not by an id: the
         // modelled `MemberId` union declares exactly one variant, `UserId`

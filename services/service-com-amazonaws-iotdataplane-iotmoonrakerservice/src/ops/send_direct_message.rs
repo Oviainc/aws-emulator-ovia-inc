@@ -1,15 +1,26 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SendDirectMessage
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SendDirectMessage`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Delivers one MQTT message to the session the broker holds for a single client id, and
+//! answers in the data plane's `{message, traceId}` envelope — the acknowledgement that
+//! tells a caller the broker took the message.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SendDirectMessage::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A client id the broker holds no session for has nothing to deliver to, so it is a 404
+//! `ResourceNotFoundException` — the same condition every operation of this family
+//! answers for a client that has never connected. Answering such a call 200 would be
+//! undetected message loss, which is why the not-found case is the first thing decided.
+//!
+//! Where the message goes is the session's state: a message to an OFFLINE client is
+//! queued on its persistent session (bounded by
+//! `crate::state::MAX_QUEUED_SESSION_MESSAGES`), and a message to a connected client is
+//! handed to its connection and queues nothing — exactly as a publish to a live
+//! subscriber leaves no trace.
+//!
+//! `confirmation=true` asks the service to answer only once the RECEIVING CLIENT has
+//! acknowledged the delivery (PUBACK). This emulator serves no MQTT transport, so no
+//! client process can send one: that request is answered with the modelled
+//! `GatewayTimeoutException` (504) rather than a 200 claiming a confirmation nothing
+//! produced.
 //!
 //! ## Shape of an operation
 //!
@@ -184,6 +195,15 @@ impl<Eng> SendDirectMessage<Eng> {
     }
 }
 
+/// The status message the data plane returns for a message the broker took.
+const SEND_ACCEPTED_MESSAGE: &str = "OK";
+
+/// The QoS a delivery uses: 1 when the sender asked for delivery confirmation, else 0 —
+/// what `SendDirectMessageRequest$confirmation` documents.
+fn delivery_qos(confirmation: bool) -> i32 {
+    i32::from(confirmation)
+}
+
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for SendDirectMessage<Eng>
 {
@@ -201,18 +221,73 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SendDirectMessage` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SendDirectMessageErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SendDirectMessage"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            SendDirectMessageErrorModeled::InternalFailureException(InternalFailureException::new(
+                "An unexpected error has occurred.",
+            ))
+        })?;
+
+        // The outbound message's topic is a topic NAME, so it is weighed against the
+        // same rules a publish topic is — see `crate::state::topic_name_refusal`, the one
+        // place that rule lives.
+        if let Some(refusal) = crate::state::topic_name_refusal(&input.topic) {
+            return Err(SendDirectMessageErrorModeled::InvalidRequestException(
+                InvalidRequestException::new(refusal),
+            )
+            .into());
+        }
+
+        let payload = input.payload.unwrap_or_default();
+        if payload.len() > crate::state::MAX_PUBLISH_PAYLOAD_BYTES {
+            return Err(SendDirectMessageErrorModeled::RequestEntityTooLargeException(
+                RequestEntityTooLargeException::new(crate::state::payload_too_large(
+                    payload.len(),
+                    crate::state::MAX_PUBLISH_PAYLOAD_BYTES,
+                )),
+            )
+            .into());
+        }
+
+        let now_millis = crate::state::now_millis();
+        let mut guard = state.lock();
+        let session = guard.session(&input.client_id, now_millis).ok_or_else(|| {
+            SendDirectMessageErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException::new(crate::state::CLIENT_NOT_FOUND),
+            )
+        })?;
+
+        let message = crate::state::DirectMessage {
+            topic: input.topic.clone(),
+            payload,
+            qos: delivery_qos(input.confirmation),
+            content_type: input.content_type.clone(),
+            response_topic: input.response_topic.clone(),
+            user_properties: input.user_properties.clone(),
+            payload_format_indicator: input.payload_format_indicator.clone(),
+            correlation_data: input.correlation_data.clone(),
+            delivered_at_millis: now_millis,
+        };
+        // A connected client is handed the message over its connection, so nothing is
+        // queued; an offline client's persistent session holds it until the client
+        // returns.
+        if !session.connected {
+            session.queue(message);
+        }
+        drop(guard);
+
+        if input.confirmation {
+            // The message was delivered as far as this emulator can deliver it, but no
+            // client can acknowledge it — which is the condition this 504 states.
+            return Err(SendDirectMessageErrorModeled::GatewayTimeoutException(
+                GatewayTimeoutException::new(crate::state::NO_DELIVERY_CONFIRMATION),
+            )
+            .into());
+        }
+
+        Ok(SendDirectMessageOutput {
+            message: Some(SEND_ACCEPTED_MESSAGE.to_string()),
+            trace_id: Some(crate::state::new_trace_id()),
+        })
     }
 }

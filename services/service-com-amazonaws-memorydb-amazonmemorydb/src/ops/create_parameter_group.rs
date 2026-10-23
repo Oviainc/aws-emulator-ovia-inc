@@ -170,9 +170,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A parameter-group name is the same case-insensitive identifier a user or ACL
         // name is, bounded by the same rule, so it is checked and folded before
         // anything is persisted.
-        if let Some(message) =
-            crate::state::resource_name_rejection("ParameterGroupName", &input.parameter_group_name)
-        {
+        if let Some(message) = crate::state::resource_name_rejection(
+            crate::state::ResourceKind::ParameterGroup,
+            &input.parameter_group_name,
+        ) {
             return Err(
                 CreateParameterGroupErrorModeled::InvalidParameterValueException(
                     InvalidParameterValueException {
@@ -208,8 +209,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 CreateParameterGroupErrorModeled::ParameterGroupAlreadyExistsFault(
                     ParameterGroupAlreadyExistsFault {
-                        message: Some(format!(
-                            "Parameter group with name {parameter_group_name} already exists."
+                        message: Some(crate::state::already_exists_message(
+                            crate::state::ResourceKind::ParameterGroup,
+                            &parameter_group_name,
                         )),
                     },
                 )

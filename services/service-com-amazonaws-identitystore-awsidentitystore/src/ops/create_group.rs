@@ -170,8 +170,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // Who is creating this group: recorded on the record as its `CreatedBy`, which a
+        // later `DescribeGroup` reports.
+        let created_by = crate::state::caller_principal(ctx);
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             CreateGroupErrorModeled::InternalServerException(InternalServerException {
                 message: Some("the identity store is unavailable".to_string()),
@@ -179,20 +182,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
         let mut state = state.lock();
-        // A create may bring an identity store into being (this API models no
-        // operation that creates one), but only while fewer than
-        // `MAX_IDENTITY_STORES` are held: `IdentityStoreId` is caller-chosen, so the
-        // vivification is capped rather than unbounded.
+        // The identity store must EXIST: `IdentityStoreId` is caller-chosen, and a
+        // well-formed id that names no store is refused with the modelled
+        // `ResourceNotFoundException` rather than answered — nothing is created, and no
+        // store springs into being because a request named one.
         let store = state
-            .try_store_mut(&input.identity_store_id)
-            .ok_or_else(|| {
-                CreateGroupErrorModeled::ServiceQuotaExceededException(
-                    crate::state::quota_exceeded(format!(
-                        "{} identity stores",
-                        crate::state::MAX_IDENTITY_STORES
-                    )),
-                )
-            })?;
+            .resolve_store_mut(&input.identity_store_id)
+            .map_err(CreateGroupErrorModeled::ResourceNotFoundException)?;
 
         // The store holds a bounded number of groups. The operation models
         // `ServiceQuotaExceededException` for "the request would cause the number of
@@ -239,7 +235,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             external_ids: Vec::new(),
             created_at: now,
             updated_at: now,
-            created_by: None,
+            created_by: Some(created_by),
+            // Nothing has updated this group yet, so it carries no `UpdatedBy`.
             updated_by: None,
         };
 

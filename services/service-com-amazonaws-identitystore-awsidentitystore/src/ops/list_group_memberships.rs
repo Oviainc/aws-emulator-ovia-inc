@@ -184,7 +184,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &input.group_id,
             ))
         };
-        let store = state.store(&input.identity_store_id).ok_or_else(not_found)?;
+        // The identity store the request names must exist; one that does not is the
+        // missing resource, reported as `IDENTITY_STORE`.
+        let store = state
+            .resolve_store(&input.identity_store_id)
+            .map_err(ListGroupMembershipsErrorModeled::ResourceNotFoundException)?;
         let group_key = crate::state::resource_key(&input.group_id);
         if !store.groups.contains_key(&group_key) {
             return Err(not_found().into());
