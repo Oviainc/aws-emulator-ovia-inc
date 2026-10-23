@@ -25,3 +25,5 @@ mod resource_not_found_message;
 mod resource_tagging;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/unknown_parent_reference.rs"]
+mod unknown_parent_reference;

@@ -101,6 +101,54 @@ pub fn resource_not_found(kind: &str, id: &str) -> ResourceNotFoundException {
     }
 }
 
+/// The field names this service reports in `ValidationException$Fields[].Name` for the
+/// parent reference a create carries.
+///
+/// Network Manager names the offending REQUEST MEMBER in its own lowerCamelCase field
+/// naming, not in the wire (PascalCase) spelling: a recording of `CreateSite` under an
+/// unknown global network answers `globalNetworkId` and one of `CreateLink` with an
+/// unknown site answers `siteId`. Both are `<kind>Id` for the kind the member references.
+pub const FIELD_GLOBAL_NETWORK_ID: &str = "globalNetworkId";
+/// See [`FIELD_GLOBAL_NETWORK_ID`].
+pub const FIELD_SITE_ID: &str = "siteId";
+
+/// How a resource kind of this service reads in prose: the ARN resource type
+/// ([`GLOBAL_NETWORK_KIND`] and friends) with its hyphens as spaces and a leading
+/// capital, so `global-network` reads "Global network" and `site` reads "Site".
+fn kind_label(kind: &str) -> String {
+    let spaced = kind.replace('-', " ");
+    let mut characters = spaced.chars();
+    match characters.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + characters.as_str(),
+        None => spaced,
+    }
+}
+
+/// The modelled `ValidationException` (HTTP 400) a create answers when one of the
+/// references its input carries — the parent the new resource must hang off — names no
+/// stored resource.
+///
+/// A create validates its input before anything is minted, so a reference that resolves
+/// to nothing is a FIELD failure on the member that carried it rather than a missing
+/// resource: `Reason` is `FieldValidationFailed` and `Fields` carries one entry naming
+/// that member (see [`FIELD_GLOBAL_NETWORK_ID`]). The prose is the one the recordings
+/// show — "<Kind> not found." for the kind the member references, from [`kind_label`] —
+/// and is repeated as the field's own message, exactly as recorded.
+///
+/// `member` is the field name the refusal reports; `kind` is the resource kind the
+/// member references ([`GLOBAL_NETWORK_KIND`], [`SITE_KIND`], [`CORE_NETWORK_KIND`]).
+pub fn unknown_reference(member: &str, kind: &str) -> ValidationException {
+    let message = format!("{} not found.", kind_label(kind));
+    ValidationException {
+        message: message.clone(),
+        reason: Some("FieldValidationFailed".to_string()),
+        fields: Some(vec![ValidationExceptionField {
+            name: member.to_string(),
+            message,
+        }]),
+    }
+}
+
 /// Every value a `ResourceType` member of this service's network-resource operations
 /// accepts, in lexicographic order so a paginated listing of them is stable.
 ///

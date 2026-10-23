@@ -188,23 +188,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // A core network is part of a global network, so an unknown parent is refused
-        // rather than stored with a dangling back-reference. This operation models no
-        // `ResourceNotFoundException` (`smithy_query operation=CreateCoreNetwork`), so the
-        // refusal is the `ValidationException` naming the input member that carries it.
+        // rather than stored with a dangling back-reference. Like every create of this
+        // service, the refusal is the field-validation failure on the member that carried
+        // the reference (and this operation models no `ResourceNotFoundException` at all:
+        // `smithy_query operation=CreateCoreNetwork`).
         if !store.global_networks.contains_key(&input.global_network_id) {
-            let message = format!(
-                "no global network {} exists in this account",
-                input.global_network_id
-            );
             return Err(CreateCoreNetworkErrorModeled::ValidationException(
-                ValidationException {
-                    message: message.clone(),
-                    reason: Some("FieldValidationFailed".to_string()),
-                    fields: Some(vec![ValidationExceptionField {
-                        name: "GlobalNetworkId".to_string(),
-                        message,
-                    }]),
-                },
+                crate::state::unknown_reference(
+                    crate::state::FIELD_GLOBAL_NETWORK_ID,
+                    crate::state::GLOBAL_NETWORK_KIND,
+                ),
             )
             .into());
         }
