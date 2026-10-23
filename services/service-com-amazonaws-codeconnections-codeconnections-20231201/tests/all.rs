@@ -19,7 +19,13 @@ mod git_sync;
 mod host_association;
 #[path = "all/modeled_input_refusals.rs"]
 mod modeled_input_refusals;
+#[path = "all/resource_sync_status.rs"]
+mod resource_sync_status;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/sync_blocker_summary.rs"]
 mod sync_blocker_summary;
+#[path = "all/target_probe.rs"]
+mod target_probe;
+#[path = "all/wire_target_routing.rs"]
+mod wire_target_routing;

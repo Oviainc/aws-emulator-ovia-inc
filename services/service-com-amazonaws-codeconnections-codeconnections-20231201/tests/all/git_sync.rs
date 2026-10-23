@@ -205,7 +205,7 @@ async fn create_link(
 }
 
 /// The error code a response body carries (`__type` on awsJson), or the empty string.
-fn error_code(body: &serde_json::Value) -> &str {
+pub(crate) fn error_code(body: &serde_json::Value) -> &str {
     body["__type"]
         .as_str()
         .map(|kind| kind.rsplit('#').next().unwrap_or(kind))
