@@ -17,6 +17,11 @@
 //! is a bare name or a dashboard ARN, the refresh-schedule and widget rules are
 //! the ones the model documents, and both are applied by every dashboard
 //! operation rather than copied into each.
+//!
+//! The **tagging** rules live here for the same reason: a tagging call addresses its
+//! resource by ARN, and how that ARN resolves to a stored resource's tag set — plus
+//! how a malformed one and one naming nothing are refused — is shared by every
+//! tagging operation.
 
 use std::collections::BTreeMap;
 use std::net::Ipv4Addr;
@@ -831,6 +836,8 @@ pub struct EventDataStoreRecord {
     /// them. Empty for a store nobody has configured; the model bounds
     /// `ContextKeySelectors` to 0..=2 entries.
     pub context_key_selectors: Vec<ContextKeySelector>,
+    /// The store's tag set, as `CreateEventDataStore` seeds it, `RemoveTags` drops
+    /// keys from it and `ListTags` reports it.
     pub tags: Vec<Tag>,
 }
 
@@ -1743,6 +1750,276 @@ impl ComAmazonawsCloudtrailCloudtrail20131101State {
         let record = self.dashboards.get_mut(&key)?;
         record.settle(now);
         Some(record)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tagging: the resource a tagging call addresses by ARN
+// ---------------------------------------------------------------------------
+
+/// The HTTP status CloudTrail answers a tagging refusal with.
+///
+/// Every tagging refusal in the recorded corpus is HTTP 400, including the
+/// `*NotFoundException` shapes the model marks `@httpError(404)`:
+/// `cloudtrail-channel-notfound-error-paths#task#5` records `RemoveTags` answering a
+/// channel ARN that names no channel with HTTP 400 and the error code
+/// `ChannelNotFoundException`. A client branches on the status it is SENT, so the
+/// emulator sends the one the service sends; the `*NotFoundException` shapes of the
+/// tagging operations are the only place the model's status and the wire's disagree.
+pub const TAGGING_REFUSAL_STATUS: u16 = 400;
+
+/// How many ARNs one `ListTags` call may name, from the model doc for
+/// `ListTagsRequest$ResourceIdList`: "The list has a limit of 20 ARNs."
+pub const LIST_TAGS_RESOURCE_LIMIT: usize = 20;
+
+/// The resource prefix of a channel ARN:
+/// `arn:aws:cloudtrail:<region>:<account>:channel/<channel-id>`.
+const CHANNEL_RESOURCE_PREFIX: &str = "channel/";
+
+/// A well-formed tagging ARN: which kind of resource it names, the Region that
+/// resource lives in, and its name or id.
+///
+/// The four kinds are the ones the model doc for `AddTagsRequest$ResourceId` /
+/// `RemoveTagsRequest$ResourceId` lists — "the ARN of the trail, event data store,
+/// dashboard, or channel" — each with its own example ARN format.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaggableArn {
+    Trail { region: String, name: String },
+    Dashboard { region: String, name: String },
+    Channel { region: String, id: String },
+    EventDataStore { region: String, id: String },
+}
+
+impl TaggableArn {
+    /// The noun CloudTrail names this kind of resource by in a refusal, as the
+    /// recorded `ChannelNotFoundException` message words it ("The channel `<arn>` was
+    /// not found.").
+    pub fn noun(&self) -> &'static str {
+        match self {
+            Self::Trail { .. } => "trail",
+            Self::Dashboard { .. } => "dashboard",
+            Self::Channel { .. } => "channel",
+            Self::EventDataStore { .. } => "event data store",
+        }
+    }
+
+    /// The refusal text for an ARN that is well formed but names no stored resource,
+    /// as a tag WRITE (`AddTags` / `RemoveTags`) words it.
+    ///
+    /// CloudTrail words each kind its own way, and the recorded corpus pins three of
+    /// the four: a trail by its NAME and the account the call is made for ("Unknown
+    /// trail: `<name>` for the user: `<account>`"), a channel by the ARN the caller
+    /// passed ("The channel `<arn>` was not found."), and a dashboard by one sentence
+    /// naming nothing at all ("No matching dashboard found."). An event data store,
+    /// which the corpus does not pin, follows the channel's wording — the kind it
+    /// shares its ARN-addressed not-found shape with.
+    pub fn not_found_message(&self, resource_id: &str) -> String {
+        match self {
+            Self::Trail { name, .. } => self.not_found_message_naming(name),
+            _ => self.not_found_message_naming(resource_id),
+        }
+    }
+
+    /// The same refusal as [`Self::not_found_message`], as `ListTags` words it.
+    ///
+    /// The ONE difference the corpus records between the two paths is the subject of
+    /// a trail's wording: a tag write names the trail's name, `ListTags` the whole
+    /// ARN the request passed.
+    pub fn listed_not_found_message(&self, resource_id: &str) -> String {
+        self.not_found_message_naming(resource_id)
+    }
+
+    /// The per-kind wording, naming `subject`.
+    fn not_found_message_naming(&self, subject: &str) -> String {
+        match self {
+            // The one wording every operation that cannot find a trail answers with,
+            // and likewise for a dashboard and an event data store.
+            Self::Trail { .. } => unknown_trail_message(subject),
+            Self::Dashboard { .. } => DASHBOARD_NOT_FOUND_MESSAGE.to_string(),
+            Self::EventDataStore { .. } => event_data_store_not_found_message(subject),
+            // A channel has no shared helper yet: `RemoveTags` is the first operation
+            // to answer `ChannelNotFoundException`, and the recorded text is this one.
+            Self::Channel { .. } => format!("The {} {subject} was not found.", self.noun()),
+        }
+    }
+}
+
+/// Why a tagging `ResourceId` can name no taggable resource.
+///
+/// Each variant names the modelled error the handler answers with, so every tagging
+/// operation refuses the same malformed ARN the same way. The kind-specific ARN
+/// errors exist because the model declares them: a channel ARN is refused as a
+/// channel ARN, an event data store ARN as an event data store ARN.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaggableArnRejection {
+    /// Written as a channel ARN but not a well-formed one ⇒
+    /// `ChannelARNInvalidException`.
+    ChannelArn(String),
+    /// Written as an event data store ARN but not a well-formed one ⇒
+    /// `EventDataStoreARNInvalidException`.
+    EventDataStoreArn(String),
+    /// Not a CloudTrail resource ARN at all ⇒ `CloudTrailARNInvalidException`.
+    CloudTrailArn(String),
+    /// A CloudTrail ARN naming a resource type that carries no tags ⇒
+    /// `ResourceTypeNotSupportedException`.
+    UnsupportedResourceType { resource_id: String, kind: String },
+}
+
+impl TaggableArnRejection {
+    /// The refusal text: built from the request, naming the ARN it refused, as the
+    /// recorded corpus words it — `RemoveTags` answers an ARN whose resource segment
+    /// names no taggable resource with "The ARN `<value>` is invalid." The
+    /// kind-specific shapes word it the same way, naming their kind, and an
+    /// unsupported resource type names the type it read.
+    pub fn message(&self) -> String {
+        match self {
+            Self::ChannelArn(resource_id) => format!("The channel ARN {resource_id} is invalid."),
+            Self::EventDataStoreArn(resource_id) => {
+                format!("The event data store ARN {resource_id} is invalid.")
+            }
+            Self::CloudTrailArn(resource_id) => format!("The ARN {resource_id} is invalid."),
+            Self::UnsupportedResourceType { resource_id, kind } => format!(
+                "The resource type {kind} in the ARN {resource_id} is not supported by \
+                 CloudTrail: tags are carried by a trail, an event data store, a dashboard \
+                 or a channel."
+            ),
+        }
+    }
+}
+
+/// Read a tagging `ResourceId` as the ARN of one of the four taggable resources.
+///
+/// The member is documented as "the ARN of the trail, event data store, dashboard, or
+/// channel", so a value that is not such an ARN names no resource and is refused
+/// rather than read as a bare name. The refusal names the kind of ARN the caller
+/// MEANT — the resource type written in the value — which stays readable even when
+/// the rest of the ARN is not.
+///
+/// The ARN itself is read through [`::service_common::arn`], the one parse of a
+/// caller-supplied resource ARN in this tree, so the resource field keeps the colons
+/// the model's `ChannelArn` / `EventDataStoreArn` pattern (`^[a-zA-Z0-9._/\-:]+$`)
+/// admits and the `<type>/<id>` and `<type>:<id>` forms are read the same way. What
+/// this function adds is this service's own part: WHICH of the four kinds the ARN
+/// names, and that kind's naming rules.
+///
+/// It is also why a tagging call does not read its identifier through
+/// [`parse_trail_identifier`] or [`parse_event_data_store_identifier`]: those accept
+/// the bare name / bare id form their OWN operations document, and each already knows
+/// which kind of resource it is looking for, while a tagging `ResourceId` has to be
+/// classified by kind before it can be read at all.
+pub fn parse_taggable_arn(value: &str) -> Result<TaggableArn, TaggableArnRejection> {
+    let reject = || {
+        if value.contains(CHANNEL_RESOURCE_PREFIX) {
+            TaggableArnRejection::ChannelArn(value.to_string())
+        } else if value.contains(EVENT_DATA_STORE_RESOURCE_PREFIX) {
+            TaggableArnRejection::EventDataStoreArn(value.to_string())
+        } else {
+            TaggableArnRejection::CloudTrailArn(value.to_string())
+        }
+    };
+
+    let Some(arn) = ::service_common::arn::parse_of(value, SERVICE_NAMESPACE) else {
+        return Err(reject());
+    };
+    // Every taggable CloudTrail resource lives in a Region and belongs to an account,
+    // so an ARN leaving either field empty names none of them — unlike the
+    // partition-global ARNs the shared parse deliberately admits.
+    if arn.region.is_empty() || arn.account.is_empty() {
+        return Err(reject());
+    }
+    let resource_type = arn.resource_type();
+    let Some(id) = ::service_common::arn::resource_id_of_type(value, resource_type) else {
+        return Err(reject());
+    };
+    if id.is_empty() {
+        return Err(reject());
+    }
+
+    let region = arn.region.to_string();
+    // The resource type is the segment the four example ARN formats differ in; each
+    // one's id has to satisfy that resource's own naming rules.
+    match resource_type {
+        "trail" => {
+            validate_trail_name(id).map_err(|_| reject())?;
+            Ok(TaggableArn::Trail {
+                region,
+                name: id.to_string(),
+            })
+        }
+        "dashboard" => {
+            if !is_valid_dashboard_name(id) {
+                return Err(reject());
+            }
+            Ok(TaggableArn::Dashboard {
+                region,
+                name: id.to_string(),
+            })
+        }
+        // A channel id and an event data store id are opaque to this service: the
+        // model constrains the WHOLE ARN (`ChannelArn` / `EventDataStoreArn`, length
+        // 3..256 of `^[a-zA-Z0-9._/\-:]+$`), which the boundary validator has already
+        // applied, and says nothing further about the id itself.
+        "channel" => Ok(TaggableArn::Channel {
+            region,
+            id: id.to_string(),
+        }),
+        "eventdatastore" => Ok(TaggableArn::EventDataStore {
+            region,
+            id: id.to_string(),
+        }),
+        kind => Err(TaggableArnRejection::UnsupportedResourceType {
+            resource_id: value.to_string(),
+            kind: kind.to_string(),
+        }),
+    }
+}
+
+impl ComAmazonawsCloudtrailCloudtrail20131101State {
+    /// The tag set stored for the resource `arn` names, or `None` when no stored
+    /// resource answers to it.
+    ///
+    /// An event data store is reachable only from the Region it lives in, which is the
+    /// Region its ARN pins — the same rule [`Self::event_data_store`] applies. A
+    /// channel answers `None` whatever its id: `CreateChannel` is not implemented, so
+    /// the registry holds no channel and an ARN naming one names nothing.
+    pub fn resource_tags(&self, arn: &TaggableArn) -> Option<&[Tag]> {
+        match arn {
+            TaggableArn::Trail { region, name } => self
+                .trails
+                .get(&(name.clone(), region.clone()))
+                .map(|record| record.tags.as_slice()),
+            TaggableArn::Dashboard { region, name } => self
+                .dashboards
+                .get(&(name.clone(), region.clone()))
+                .map(|record| record.tags.as_slice()),
+            TaggableArn::EventDataStore { region, id } => self
+                .event_data_stores
+                .get(id)
+                .filter(|record| record.region == *region)
+                .map(|record| record.tags.as_slice()),
+            TaggableArn::Channel { .. } => None,
+        }
+    }
+
+    /// The tag set of the resource `arn` names, to change in place. See
+    /// [`Self::resource_tags`] for what `None` means.
+    pub fn resource_tags_mut(&mut self, arn: &TaggableArn) -> Option<&mut Vec<Tag>> {
+        match arn {
+            TaggableArn::Trail { region, name } => self
+                .trails
+                .get_mut(&(name.clone(), region.clone()))
+                .map(|record| &mut record.tags),
+            TaggableArn::Dashboard { region, name } => self
+                .dashboards
+                .get_mut(&(name.clone(), region.clone()))
+                .map(|record| &mut record.tags),
+            TaggableArn::EventDataStore { region, id } => self
+                .event_data_stores
+                .get_mut(id)
+                .filter(|record| record.region == *region)
+                .map(|record| &mut record.tags),
+            TaggableArn::Channel { .. } => None,
+        }
     }
 }
 
