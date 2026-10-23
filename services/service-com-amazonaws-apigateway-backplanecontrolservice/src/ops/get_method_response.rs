@@ -169,7 +169,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let api = store
             .rest_apis
             .get(&input.rest_api_id)
-            .ok_or_else(|| not_found(crate::state::NO_SUCH_REST_API))?;
+            .ok_or_else(|| not_found(&crate::state::no_such_rest_api(&input.rest_api_id)))?;
         let resource = api
             .resources
             .get(&input.resource_id)

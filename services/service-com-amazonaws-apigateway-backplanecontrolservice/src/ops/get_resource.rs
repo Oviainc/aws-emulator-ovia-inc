@@ -151,7 +151,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = state.lock();
         let api = store.rest_apis.get(&input.rest_api_id).ok_or_else(|| {
             GetResourceErrorModeled::NotFoundException(NotFoundException {
-                message: Some(crate::state::NO_SUCH_REST_API.to_string()),
+                message: Some(crate::state::no_such_rest_api(&input.rest_api_id)),
             })
         })?;
         let resource = api.resources.get(&input.resource_id).ok_or_else(|| {

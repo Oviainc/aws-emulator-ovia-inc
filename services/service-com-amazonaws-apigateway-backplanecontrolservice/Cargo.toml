@@ -19,8 +19,19 @@ aws-smithy-types = { workspace = true }
 tokio = { workspace = true }
 bytes = { workspace = true }
 http = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Parses the OpenAPI/Swagger definition `PutRestApi` imports. Read through its event
+# stream (not `YamlLoader`) so an alias cannot expand the document, which is what lets the
+# YAML spelling of a definition be read under a bound; the JSON spelling goes through
+# `serde_json`. Its mappings keep the document's own key order, which is the order the
+# paths are imported in. `default-features = false` as the crate's other two dependents
+# declare it (cloudformation, greengrassv2): the default `encoding` feature pulls in
+# hand-written unsafe SIMD decoders this import has no use for — a definition body is
+# already required to be UTF-8 before the parser sees it — and dropping it keeps
+# SR-MEM-001 true of the whole request path.
+yaml-rust2 = { version = "0.10", default-features = false }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

@@ -29,6 +29,10 @@ mod patch_updates;
 mod query_value_coercion;
 #[path = "all/rest_api_defaults.rs"]
 mod rest_api_defaults;
+#[path = "all/rest_api_identifier_refusals.rs"]
+mod rest_api_identifier_refusals;
+#[path = "all/rest_api_import.rs"]
+mod rest_api_import;
 #[path = "all/rest_api_lifecycle.rs"]
 mod rest_api_lifecycle;
 #[path = "all/service_claim.rs"]

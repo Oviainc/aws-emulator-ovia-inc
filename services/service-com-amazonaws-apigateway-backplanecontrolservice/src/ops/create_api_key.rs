@@ -356,7 +356,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         for (rest_api_id, stage_name) in requested_stages {
             let api = store.rest_apis.get(&rest_api_id).ok_or_else(|| {
                 CreateApiKeyErrorModeled::NotFoundException(NotFoundException {
-                    message: Some(crate::state::NO_SUCH_REST_API.to_string()),
+                    message: Some(crate::state::no_such_rest_api(&rest_api_id)),
                 })
             })?;
             if !api.stages.contains_key(&stage_name) {

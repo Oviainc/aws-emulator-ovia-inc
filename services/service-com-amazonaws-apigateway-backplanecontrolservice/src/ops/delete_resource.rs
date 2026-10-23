@@ -171,7 +171,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // found.
         let api = store.rest_apis.get_mut(&input.rest_api_id).ok_or_else(|| {
             DeleteResourceErrorModeled::NotFoundException(NotFoundException {
-                message: Some(crate::state::NO_SUCH_REST_API.to_string()),
+                message: Some(crate::state::no_such_rest_api(&input.rest_api_id)),
             })
         })?;
         if !api.resources.contains_key(&input.resource_id) {

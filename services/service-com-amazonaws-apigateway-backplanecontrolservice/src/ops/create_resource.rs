@@ -267,7 +267,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let parent_path = {
             let api = store.rest_apis.get(&input.rest_api_id).ok_or_else(|| {
                 CreateResourceErrorModeled::NotFoundException(NotFoundException {
-                    message: Some(crate::state::NO_SUCH_REST_API.to_string()),
+                    message: Some(crate::state::no_such_rest_api(&input.rest_api_id)),
                 })
             })?;
             // One resource per request, and at most this many per API: the store cannot
@@ -320,7 +320,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let api = store.rest_apis.get_mut(&input.rest_api_id).ok_or_else(|| {
             CreateResourceErrorModeled::NotFoundException(NotFoundException {
-                message: Some(crate::state::NO_SUCH_REST_API.to_string()),
+                message: Some(crate::state::no_such_rest_api(&input.rest_api_id)),
             })
         })?;
         api.resources.insert(

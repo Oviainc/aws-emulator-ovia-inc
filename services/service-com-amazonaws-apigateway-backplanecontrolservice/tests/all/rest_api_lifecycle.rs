@@ -52,6 +52,14 @@ impl Gateway {
 
     pub(crate) async fn call(&self, method: &str, uri: &str, body: Option<Value>) -> Answer {
         let payload = body.map(|value| value.to_string()).unwrap_or_default();
+        self.call_raw(method, uri, &payload).await
+    }
+
+    /// The same request with the body sent VERBATIM, for an operation whose payload is a
+    /// blob rather than a JSON structure (`PutRestApi`'s OpenAPI definition, which AWS
+    /// documents as a JSON *or* YAML file).
+    pub(crate) async fn call_raw(&self, method: &str, uri: &str, payload: &str) -> Answer {
+        let payload = payload.to_owned();
         let request = http::Request::builder()
             .method(method)
             .uri(uri)
@@ -1111,7 +1119,7 @@ async fn clone_from_copies_the_source_resource_tree_under_fresh_identifiers() {
 }
 
 /// The paths of an API's resources, in the order the listing reports them.
-async fn resource_paths(gateway: &Gateway, api: &str) -> Vec<String> {
+pub(crate) async fn resource_paths(gateway: &Gateway, api: &str) -> Vec<String> {
     let answer = gateway
         .call("GET", &format!("/restapis/{api}/resources"), None)
         .await;
