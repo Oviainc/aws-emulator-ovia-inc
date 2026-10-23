@@ -19,6 +19,10 @@ mod body_boundary_refusal;
 mod body_validation_refusals;
 #[path = "all/list_setting_order.rs"]
 mod list_setting_order;
+#[path = "all/pattern_refusal_rendering.rs"]
+mod pattern_refusal_rendering;
+#[path = "all/service_catalog.rs"]
+mod service_catalog;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/support.rs"]

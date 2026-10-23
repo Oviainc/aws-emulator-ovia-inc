@@ -86,3 +86,42 @@ Supporting source: services/service-com-amazonaws-uxc-awsaccountuxsetting/src/st
 2. Causes 1-5: replay uxc-catalog-list-services#task#1, uxc-baseline-read-and-list-services#task#3, uxc-configure-visible-services-roundtrip#setup#1, uxc-error-list-services-invalid-token-pattern#task#2 and uxc-list-services-pagination#task#1/#task#2 - i.e. GET /v1/services (optionally with maxResults/nextToken) against the uxc endpoint - and compare $.services element by element with the recorded body: the emulator returns 45 endpoint prefixes where the recording returns the 224+ identifier catalog, so index 0 is 'access-analyzer' instead of 'account-access'.
 3. Cause 6: replay uxc-error-list-services-invalid-token-pattern#task#1 - GET /v1/services?nextToken=!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! (40 characters that satisfy NextToken @length but violate its @pattern). The emulator answers 400 ValidationException whose $.message echoes '^[-A-Za-z0-9+/_]+=*$'; the recording echoes '[-A-Za-z0-9+/_]+=*' with no anchors.
 4. After a fix, re-replay all six bindings listed in Issue-Trace/Issue-Step and trace_ids.
+
+## Resolution
+
+Fixed in the uxc crate:
+
+* Causes 1-5 (one defect): `SEED_SERVICE_CATALOG` in
+  `services/service-com-amazonaws-uxc-awsaccountuxsetting/src/state.rs` was 45 SigV4
+  endpoint prefixes - the namespace a client SIGNS with - where `ListServices`
+  enumerates the namespace `visibleServices` keys on, the Management Console's service
+  identifiers (`smithy_query(query="doc", shape="ListServices")`). It is now a 226-entry
+  catalog of that namespace, still sorted and de-duplicated at construction, so paging
+  is coherent and spans several pages. `src/ops/list_services.rs` was already correct
+  and is untouched. Causes 2, 3, 4 and 5 replay clean; cause 1's fixture (the only one
+  that compares a whole 224-entry page) now agrees element-for-element through
+  `$.services[99]`, having diverged from `$.services[0]` before.
+* Cause 6: `Service::override_refusal` in `src/service.rs` returned `None`, so the
+  framework echoed the model's ANCHORED `@pattern`. It now delegates to
+  `service_common::aws_validation_refusal`, the one shared renderer of AWS's wording,
+  which quotes the expression without the `^`/`$` the model wraps it in and leaves the
+  status, the error code, the envelope, the member paths and every other requirement
+  with the framework.
+
+DECLINED, and recorded here so a later reader does not re-file it: the exact MEMBERSHIP
+of the recorded catalog past `$.services[99]` (the residue of cause 1, Issue-Key
+`uxc|ListServices|2xx->2xx|$.services[*]`). The operation's own doc says "the available
+services vary by Amazon Web Services partition", and the catalog grows with every AWS
+launch, so one partition's membership on one recording day is environment data no rule
+produces; matching it would mean fitting a recorded page into the code. The two
+recordings quoted above do not even agree on it (cause 2 reports `$.services[1]` as
+'account', cause 5 as 'acm' - the measured recordings match 'acm', which is what the
+catalog now serves). The emulator therefore serves ONE fixed, deterministic catalog of
+the right namespace, inside the modelled `ServiceList` max of 500.
+
+Covered by `tests/all/service_catalog.rs` (the namespace rule over the services whose
+console identifier and endpoint prefix differ, identifier form over entries this issue
+never cited, and the catalog's pattern/length/ordering invariants) and
+`tests/all/pattern_refusal_rendering.rs` (the unanchored rendering over 192 generated
+pattern violations, with control rows pinning that `@length` and `@range` requirements
+keep the framework's wording).
