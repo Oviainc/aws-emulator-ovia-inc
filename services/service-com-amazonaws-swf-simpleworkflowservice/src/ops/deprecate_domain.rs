@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeprecateDomain
-//! Implemented: the stored domain record's `RegistrationStatus` moves to `DEPRECATED`,
-//! cascading to every type registered in that domain, and the call is refused when the
-//! domain is unknown (`UnknownResourceFault`) or already deprecated
+//! Implemented: the stored domain record's own `RegistrationStatus` moves to
+//! `DEPRECATED` and nothing else in the domain changes — the types registered in it
+//! keep their own status — and the call is refused when the domain is unknown
+//! (`UnknownResourceFault`) or already deprecated
 //! (`DomainDeprecatedFault`). This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
@@ -204,13 +205,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // The whole effect of the call: this domain's `RegistrationStatus` becomes
-        // DEPRECATED, and with it every activity and workflow type registered in it
-        // (this operation's doc: "Deprecating a domain also deprecates all activity and
-        // workflow types registered in the domain"). Executions are untouched —
+        // The whole effect of the call: this ONE domain record's own
+        // `RegistrationStatus` becomes DEPRECATED. The types registered in it keep their
+        // own status — Amazon SWF still reports a type registered before the call as
+        // REGISTERED afterwards — and the executions are untouched as well:
         // "Executions that were started before the domain was deprecated continues to
         // run."
-        domain.deprecate(crate::state::now());
+        domain.deprecate();
 
         Ok(DeprecateDomainOutput)
     }
