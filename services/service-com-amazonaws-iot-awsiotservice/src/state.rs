@@ -27,12 +27,20 @@
 //! created. All subsequent calls to DescribeEndpoint return the same endpoint", so the
 //! identifier is recorded here on the call that creates it and read back by every
 //! later call.
+//!
+//! It also holds the account's TOPIC RULES, keyed by `ruleName` for the same reason
+//! the thing registry is keyed by `thingName`: the name is the rule's identity and
+//! the `@httpLabel` of `/rules/{ruleName}`. One record carries everything a reader
+//! hands back, so `GetTopicRule` after `CreateTopicRule` returns the created rule
+//! member-for-member.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::SystemTime;
 
 use service_common::iot_job_executions::{is_modeled_thing_name, JobExecutionStore};
 use sha2::{Digest, Sha256};
+
+use crate::ops::types::{Action, TopicRule, TopicRulePayload};
 
 /// The configuration of a thing: the members of a `CreateThing` request that
 /// describe the thing rather than name it.
@@ -310,6 +318,17 @@ pub struct ComAmazonawsIotAwsiotserviceState {
     /// call in that region answers from the record, which is what makes all of an
     /// account's endpoint addresses share one prefix.
     pub endpoint_identifiers: HashMap<String, String>,
+    /// Every topic rule that exists, keyed by `ruleName`.
+    ///
+    /// The name is the rule's identity — the model binds it as the `@httpLabel` of
+    /// `/rules/{ruleName}` on every single-rule operation — so a `BTreeMap` keyed by
+    /// name is the rules store itself. `BTreeMap` (not `HashMap`) because
+    /// `ListTopicRules` pages over it and a page boundary is only meaningful over a
+    /// stable order.
+    ///
+    /// A caller grows this store, so it is bounded: [`MAX_TOPIC_RULES`] is the
+    /// ceiling `CreateTopicRule` refuses past.
+    pub topic_rules: BTreeMap<String, RegisteredTopicRule>,
 }
 
 impl ComAmazonawsIotAwsiotserviceState {
@@ -562,6 +581,120 @@ pub struct RegisteredJob {
 /// same ones [`thing_arn`] documents.
 pub fn thing_group_arn(region: &str, thing_group_name: &str) -> String {
     ::emulator_server::emulator_arn("iot", region, &format!("thinggroup/{thing_group_name}"))
+}
+
+/// The ARN of a topic rule: `arn:aws:iot:<region>:<account>:rule/<ruleName>`.
+///
+/// `rule/` is the resource type AWS IoT's rule ARNs use — it is what
+/// `GetTopicRule$ruleArn` reports and what an `iot:GetTopicRule` policy statement
+/// names; the namespace and account segments are the ones [`thing_arn`] documents.
+pub fn topic_rule_arn(region: &str, rule_name: &str) -> String {
+    ::emulator_server::emulator_arn("iot", region, &format!("rule/{rule_name}"))
+}
+
+/// How many topic rules this emulator keeps for the account.
+///
+/// AWS publishes a rules-engine service quota on an account's rules; the exact figure
+/// is not in the model, so this is the emulator's own ceiling on a store a caller can
+/// grow — the same reason [`MAX_JOBS`] exists — and `CreateTopicRule` past it refuses
+/// with a modelled error rather than growing without bound.
+pub const MAX_TOPIC_RULES: usize = 1_000;
+
+/// The `awsIotSqlVersion` a rule created without one carries.
+///
+/// The AWS IoT SQL reference's "SQL versions" section lists `2015-10-08`,
+/// `2016-03-23` and `beta`, and states that `2015-10-08` is the original version and
+/// the one used when a rule does not name a version — so a rule whose payload omits
+/// the member is recorded at this version rather than at none, and every later read
+/// of that rule reports it.
+pub const DEFAULT_AWS_IOT_SQL_VERSION: &str = "2015-10-08";
+
+/// One topic rule in the rules store, as this service persists it.
+///
+/// The record holds the rule payload member-for-member rather than the
+/// `TopicRulePayload` the create request carried, because the two are not the same
+/// value over the rule's lifetime: `ruleDisabled` is what `DisableTopicRule` /
+/// `EnableTopicRule` flip without touching anything else, and the create-time
+/// defaults (`ruleDisabled` absent means an enabled rule, `awsIotSqlVersion` absent
+/// means [`DEFAULT_AWS_IOT_SQL_VERSION`]) are resolved ONCE, on the write, so every
+/// reader of the rule reports the same thing.
+#[derive(Debug, Clone)]
+pub struct RegisteredTopicRule {
+    /// The name the rule was created under; also its key in the store.
+    pub rule_name: String,
+    /// `arn:aws:iot:<region>:<account>:rule/<ruleName>`, minted on create.
+    pub rule_arn: String,
+    /// When the rule was created — `TopicRule$createdAt`, "The date and time the
+    /// rule was created".
+    pub created_at: SystemTime,
+    /// `TopicRulePayload$sql`, the `@required` SQL statement the rule queries with.
+    pub sql: String,
+    /// The description the rule was created with, when it has one.
+    pub description: Option<String>,
+    /// The `@required` actions the rule runs for a matching message, in the order
+    /// the payload listed them.
+    pub actions: Vec<Action>,
+    /// Whether the rule is disabled. `TopicRulePayload$ruleDisabled` is optional, and
+    /// a rule created without it is not disabled.
+    pub rule_disabled: bool,
+    /// The SQL rules-engine version the rule is evaluated under; see
+    /// [`DEFAULT_AWS_IOT_SQL_VERSION`].
+    pub aws_iot_sql_version: String,
+    /// The action to run when an action fails, when the rule has one.
+    pub error_action: Option<Action>,
+    /// The `x-amz-tagging` query string the create request carried, verbatim.
+    ///
+    /// `CreateTopicRule$tags` is a raw `key1=value1&key2=value2` string rather than a
+    /// tag list, and no implemented operation reads a rule's tags yet
+    /// (`ListTagsForResource` is its own issue), so it is kept exactly as supplied
+    /// instead of being parsed into a shape nothing consumes.
+    pub tags: Option<String>,
+}
+
+impl RegisteredTopicRule {
+    /// A newly created rule: the minted identity and creation instant plus the
+    /// payload the request carried, with its optional members resolved to what the
+    /// rule then has.
+    pub fn new(
+        rule_name: String,
+        rule_arn: String,
+        created_at: SystemTime,
+        payload: TopicRulePayload,
+        tags: Option<String>,
+    ) -> Self {
+        Self {
+            rule_name,
+            rule_arn,
+            created_at,
+            sql: payload.sql,
+            description: payload.description,
+            actions: payload.actions,
+            rule_disabled: payload.rule_disabled.unwrap_or(false),
+            aws_iot_sql_version: payload
+                .aws_iot_sql_version
+                .unwrap_or_else(|| DEFAULT_AWS_IOT_SQL_VERSION.to_string()),
+            error_action: payload.error_action,
+            tags,
+        }
+    }
+
+    /// The rule as the modelled `TopicRule` a reader hands back.
+    ///
+    /// A reader clones what the writer stored, so `GetTopicRule` after
+    /// `CreateTopicRule` reports the created rule member-for-member and the two
+    /// cannot drift.
+    pub fn view(&self) -> TopicRule {
+        TopicRule {
+            rule_name: Some(self.rule_name.clone()),
+            sql: Some(self.sql.clone()),
+            description: self.description.clone(),
+            created_at: Some(::aws_smithy_types::DateTime::from(self.created_at)),
+            actions: Some(self.actions.clone()),
+            rule_disabled: Some(self.rule_disabled),
+            aws_iot_sql_version: Some(self.aws_iot_sql_version.clone()),
+            error_action: self.error_action.clone(),
+        }
+    }
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

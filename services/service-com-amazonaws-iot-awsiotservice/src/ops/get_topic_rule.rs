@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetTopicRule
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetTopicRule`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetTopicRule::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the rule recorded under `ruleName` — its ARN and the `TopicRule` the
+//! writer persisted, member-for-member. A reporting operation: it only reads the
+//! rules store.
 //!
 //! ## Shape of an operation
 //!
@@ -142,18 +137,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetTopicRule` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetTopicRuleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetTopicRule"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetTopicRuleErrorModeled::InternalException(InternalException {
+                message: Some("the IoT emulator has no state store attached".to_string()),
+            })
+        })?;
+
+        let store = state.lock();
+        let rule = store.topic_rules.get(&input.rule_name).ok_or_else(|| {
+            // `GetTopicRule` models NO not-found error
+            // (`smithy_query(query="operation",operation="GetTopicRule")` lists only
+            // `InternalException`, `InvalidRequestException`,
+            // `ServiceUnavailableException` and `UnauthorizedException`), because AWS
+            // authorizes `iot:GetTopicRule` against the rule's own ARN: a name that
+            // names no rule cannot be authorized, so the refusal is the modelled
+            // `UnauthorizedException` (HTTP 401). Answering 200 with no `rule` would
+            // tell a caller the rule exists and is empty, which is a different and
+            // false claim.
+            //
+            // The message names the action and the rule ARN the request asked for, in
+            // the form an authorization refusal takes, and does NOT state that the
+            // rule is absent: AWS collapses "no such rule" and "not permitted" into
+            // one indistinguishable 401, so a caller cannot use this reply to confirm
+            // that a rule exists.
+            let region = crate::state::request_region(ctx.parts());
+            GetTopicRuleErrorModeled::UnauthorizedException(UnauthorizedException {
+                message: Some(format!(
+                    "Not authorized to perform: iot:GetTopicRule on resource: {}",
+                    crate::state::topic_rule_arn(&region, &input.rule_name)
+                )),
+            })
+        })?;
+
+        // Both members come from the one stored record, so the ARN this reports and
+        // the rule it reports can never disagree.
+        Ok(GetTopicRuleOutput {
+            rule_arn: Some(rule.rule_arn.clone()),
+            rule: Some(rule.view()),
+        })
     }
 }
