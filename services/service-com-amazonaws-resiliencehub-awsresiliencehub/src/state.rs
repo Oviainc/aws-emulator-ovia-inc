@@ -2,12 +2,18 @@
 
 //! Engine state for the com-amazonaws-resiliencehub-awsresiliencehub service.
 
-use crate::ops::types::{App, ResiliencyPolicy};
-use std::collections::{HashMap, VecDeque};
+use crate::ops::types::{App, AppComponent, ResiliencyPolicy};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 
 /// The region every minted ARN falls back to when the request carries no usable
 /// SigV4 credential scope (an unsigned, in-process call, say).
 pub const DEFAULT_REGION: &str = "us-east-1";
+
+/// The `appVersion` of an application's DRAFT version — the one version every
+/// application has, and the only one the `CreateAppVersion*` / `UpdateAppVersion*`
+/// operations write to (`PublishAppVersion` is what mints a numbered, frozen
+/// version from it).
+pub const DRAFT_APP_VERSION: &str = "draft";
 
 /// The most applications this emulator stores.
 ///
@@ -24,6 +30,25 @@ pub const MAX_APPS: usize = 200;
 /// past it.
 pub const MAX_RESILIENCY_POLICIES: usize = 200;
 
+/// The most Application Components this emulator stores in ONE app version.
+///
+/// A MEMORY BOUND, not an AWS quota, for the same reason as [`MAX_APPS`]:
+/// `CreateAppVersionAppComponent` is reachable by any caller and stores a
+/// caller-sized record per call. Past it the operation answers its own modelled
+/// `ServiceQuotaExceededException` (HTTP 402) — the channel AWS uses when a
+/// resource cannot be created because a limit is reached.
+pub const MAX_APP_COMPONENTS_PER_APP_VERSION: usize = 200;
+
+/// The modelled `@length` of `AdditionalInfoValueList` — the value list of every
+/// `AdditionalInfoMap` entry — transcribed from the model (`smithy_query
+/// query="shape" shape="AdditionalInfoMap"`: `value` targets
+/// `AdditionalInfoValueList`, `length` 1..10). Enforced by
+/// [`additional_info_violation`].
+const ADDITIONAL_INFO_VALUES_MIN: usize = 1;
+
+/// The upper half of that bound; see [`ADDITIONAL_INFO_VALUES_MIN`].
+const ADDITIONAL_INFO_VALUES_MAX: usize = 10;
+
 /// Hard ceiling on remembered idempotency tokens, oldest evicted first.
 ///
 /// A BACKSTOP. One token is recorded per successfully created resource and
@@ -35,6 +60,20 @@ pub const MAX_RESILIENCY_POLICIES: usize = 200;
 /// the only writer.
 pub const MAX_IDEMPOTENCY_TOKENS: usize = MAX_APPS + MAX_RESILIENCY_POLICIES;
 
+/// What one app version of one application holds.
+///
+/// The modelled shapes ARE the stored records, exactly as for `App` and
+/// `ResiliencyPolicy`: a Describe is a clone of the stored value, so a read can
+/// never disagree with what the last write persisted.
+#[derive(Debug, Default, Clone)]
+pub struct AppVersionContents {
+    /// The version's Application Components, keyed by their `id`. A `BTreeMap`
+    /// because a reader (`ListAppVersionAppComponents`, and any paginated read
+    /// built on it) needs one stable order across calls. At most
+    /// [`MAX_APP_COMPONENTS_PER_APP_VERSION`] entries.
+    pub app_components: BTreeMap<String, AppComponent>,
+}
+
 /// Per-service state for com-amazonaws-resiliencehub-awsresiliencehub. A handler reaches it through [`service_state`].
 ///
 /// The modelled `App` and `ResiliencyPolicy` shapes ARE the stored records: a
@@ -43,8 +82,10 @@ pub const MAX_IDEMPOTENCY_TOKENS: usize = MAX_APPS + MAX_RESILIENCY_POLICIES;
 ///
 /// Every map here is caller-driven, so every one is bounded: `apps` by
 /// [`MAX_APPS`], `app_name_index` by `apps` (one entry per stored app),
-/// `policies` by [`MAX_RESILIENCY_POLICIES`], and the idempotency store by
-/// [`MAX_IDEMPOTENCY_TOKENS`].
+/// `policies` by [`MAX_RESILIENCY_POLICIES`], `app_versions` by `apps` (an entry
+/// exists only for a stored application, and `DeleteApp` drops it) times
+/// [`MAX_APP_COMPONENTS_PER_APP_VERSION`] per version, and the idempotency store
+/// by [`MAX_IDEMPOTENCY_TOKENS`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsResiliencehubAwsresiliencehubState {
     /// Every stored application, keyed by its minted `appArn`. At most
@@ -57,6 +98,15 @@ pub struct ComAmazonawsResiliencehubAwsresiliencehubState {
     /// Every stored resiliency policy, keyed by its minted `policyArn`. At most
     /// [`MAX_RESILIENCY_POLICIES`] entries.
     pub policies: HashMap<String, ResiliencyPolicy>,
+    /// What each app version of each application holds: `appArn` ->
+    /// `appVersion` -> the version's contents. An entry is created only for a
+    /// stored application and dropped by `DeleteApp`, so this map never outlives
+    /// `apps`.
+    ///
+    /// The DRAFT version of a stored application exists whether or not it has an
+    /// entry here — [`Self::app_version_exists`] is what answers that — so an
+    /// application nobody has added anything to costs nothing.
+    pub app_versions: HashMap<String, HashMap<String, AppVersionContents>>,
     /// `<operation>/<clientToken>` -> the ARN that token's FIRST call created, so a
     /// replayed `@idempotencyToken` returns the first result instead of creating a
     /// second resource. Keyed by operation as well as token because the same token
@@ -72,6 +122,47 @@ pub struct ComAmazonawsResiliencehubAwsresiliencehubState {
 }
 
 impl ComAmazonawsResiliencehubAwsresiliencehubState {
+    /// Whether `app_version` of `app_arn` exists.
+    ///
+    /// The draft version exists for every stored application — it is created with
+    /// the application and cannot be removed — while any other version exists only
+    /// once something recorded it.
+    pub fn app_version_exists(&self, app_arn: &str, app_version: &str) -> bool {
+        if app_version == DRAFT_APP_VERSION {
+            return self.apps.contains_key(app_arn);
+        }
+        self.app_versions
+            .get(app_arn)
+            .is_some_and(|versions| versions.contains_key(app_version))
+    }
+
+    /// What `app_version` of `app_arn` holds, when anything has been stored in it.
+    ///
+    /// `None` covers both "no such version" and "an empty draft": a reader that has
+    /// to tell them apart asks [`Self::app_version_exists`] first.
+    pub fn app_version(&self, app_arn: &str, app_version: &str) -> Option<&AppVersionContents> {
+        self.app_versions
+            .get(app_arn)
+            .and_then(|versions| versions.get(app_version))
+    }
+
+    /// The draft version of `app_arn`, for writing — materialised empty on the
+    /// first write to it. The caller has already established that `app_arn` names
+    /// a stored application.
+    pub fn draft_app_version_mut(&mut self, app_arn: &str) -> &mut AppVersionContents {
+        self.app_versions
+            .entry(app_arn.to_string())
+            .or_default()
+            .entry(DRAFT_APP_VERSION.to_string())
+            .or_default()
+    }
+
+    /// Forget every app version of `app_arn`, so deleting an application releases
+    /// what its versions allocated.
+    pub fn forget_app_versions(&mut self, app_arn: &str) {
+        self.app_versions.remove(app_arn);
+    }
+
     /// The ARN `operation`'s `client_token` created on its first call, if it is
     /// still remembered.
     pub fn created_by_token(&self, operation: &str, client_token: &str) -> Option<&String> {
@@ -100,10 +191,13 @@ impl ComAmazonawsResiliencehubAwsresiliencehubState {
         }
     }
 
-    /// Forget every token that created `arn`, so deleting a resource releases what
-    /// creating it allocated.
+    /// Forget every token that created `arn` or anything UNDER it (a sub-resource,
+    /// recorded as `<arn>/<kind>/<id>`), so deleting a resource releases what
+    /// creating it and its children allocated.
     pub fn forget_idempotency_tokens_for(&mut self, arn: &str) {
-        self.idempotency_tokens.retain(|_, created| created != arn);
+        let sub_resource_prefix = format!("{arn}/");
+        self.idempotency_tokens
+            .retain(|_, created| created != arn && !created.starts_with(&sub_resource_prefix));
         self.idempotency_order
             .retain(|key| self.idempotency_tokens.contains_key(key));
     }
@@ -222,6 +316,58 @@ fn mint_resource_id() -> String {
     )
 }
 
+/// The refusal message for an `additionalInfo` map whose `member` holds a value
+/// list outside `AdditionalInfoValueList`'s modelled `@length` — `None` when every
+/// entry is within it.
+///
+/// A collection's own `@length` is checked against the COLLECTION MEMBER's schema,
+/// and a `map<string, list<string>>` member such as `AdditionalInfoMap` has no
+/// separate schema for the inner list (the framework's own
+/// `outer_element_count_bound_is_not_applied_to_a_nested_map` pins that), so the
+/// boundary validator cannot reach this bound and a handler taking an
+/// `AdditionalInfoMap` is where it is enforced.
+///
+/// The sentence is NOT written here: it is built from the framework's own
+/// [`::smithy_server_runtime::Violation`] and rendered by
+/// `aws_smithy_schema_server::constraints::envelope`, exactly as for
+/// [`enum_violation`], so a handler refusal and a boundary refusal read
+/// identically — including the `<n> items` form the framework displays a
+/// collection's length with.
+pub fn additional_info_violation(
+    member: &str,
+    additional_info: &HashMap<String, Vec<String>>,
+) -> Option<String> {
+    // Sorted, because a `HashMap` iterates in an arbitrary order and the same
+    // request must be refused with the same sentence every time.
+    let mut entries: Vec<(&String, &Vec<String>)> = additional_info.iter().collect();
+    entries.sort_by(|left, right| left.0.cmp(right.0));
+
+    let violations: Vec<::smithy_server_runtime::Violation> = entries
+        .into_iter()
+        .filter_map(|(key, values)| {
+            let kind = if values.len() < ADDITIONAL_INFO_VALUES_MIN {
+                ::smithy_server_runtime::ViolationKind::MinLength(ADDITIONAL_INFO_VALUES_MIN as i64)
+            } else if values.len() > ADDITIONAL_INFO_VALUES_MAX {
+                ::smithy_server_runtime::ViolationKind::MaxLength(ADDITIONAL_INFO_VALUES_MAX as i64)
+            } else {
+                return None;
+            };
+            Some(::smithy_server_runtime::Violation {
+                // A map ENTRY's path embeds the caller's key, so it is elided for
+                // the same reason the value is.
+                path: elided(&format!(
+                    "{member}.{}",
+                    ::aws_smithy_schema_server::constraints::path::entry(key)
+                )),
+                kind,
+                value: Some(format!("{} items", values.len())),
+            })
+        })
+        .collect();
+
+    ::aws_smithy_schema_server::constraints::envelope(&violations)
+}
+
 /// Mint a fresh `appArn`: `arn:aws:resiliencehub:<region>:<account>:app/<id>`.
 pub fn mint_app_arn(region: &str) -> String {
     ::engine::emulator_arn(
@@ -229,6 +375,17 @@ pub fn mint_app_arn(region: &str) -> String {
         region,
         &format!("app/{}", mint_resource_id()),
     )
+}
+
+/// Mint a fresh Application Component `id`, for a `CreateAppVersionAppComponent`
+/// that named none.
+///
+/// Server-generated and never derived from the request, and shaped to satisfy the
+/// `EntityName255` pattern `AppComponent$id` targets
+/// (`^[A-Za-z0-9][A-Za-z0-9_\-]{0,254}$`, from `smithy_query query="shape"
+/// shape="AppComponent"`): an alphanumeric head, then hyphens and hex digits.
+pub fn mint_app_component_id() -> String {
+    format!("appcomponent-{}", mint_resource_id())
 }
 
 /// Mint a fresh `policyArn`:

@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeAppVersionAppComponent
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeAppVersionAppComponent`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeAppVersionAppComponent::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: a pure read of the Application Component stored in
+//! [`crate::state::ComAmazonawsResiliencehubAwsresiliencehubState::app_versions`]
+//! by `CreateAppVersionAppComponent` — it writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -169,18 +164,88 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeAppVersionAppComponent` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeAppVersionAppComponentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeAppVersionAppComponent"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_failure());
+        };
+
+        let store = state.lock();
+
+        // A component is addressed through its application and app version, so
+        // each link of that path has to resolve before the component is looked up.
+        if !store.apps.contains_key(&input.app_arn) {
+            return Err(app_not_found(&input.app_arn));
+        }
+        if !store.app_version_exists(&input.app_arn, &input.app_version) {
+            return Err(app_version_not_found(&input.app_arn, &input.app_version));
+        }
+        let app_component = store
+            .app_version(&input.app_arn, &input.app_version)
+            .and_then(|version| version.app_components.get(&input.id));
+        let Some(app_component) = app_component else {
+            return Err(app_component_not_found(&input.id, &input.app_version));
+        };
+
+        Ok(DescribeAppVersionAppComponentOutput {
+            app_arn: input.app_arn,
+            app_version: input.app_version,
+            app_component: Some(app_component.clone()),
+        })
     }
+}
+
+/// The 500 for a service mounted on an engine that holds no state for it.
+fn internal_failure() -> DescribeAppVersionAppComponentError {
+    DescribeAppVersionAppComponentErrorModeled::InternalServerException(InternalServerException {
+        message: Some("resiliencehub state is unavailable on this engine".to_string()),
+    })
+    .into()
+}
+
+/// A 404 `ResourceNotFoundException` for an `appArn` that was never created, or was
+/// deleted.
+fn app_not_found(app_arn: &str) -> DescribeAppVersionAppComponentError {
+    DescribeAppVersionAppComponentErrorModeled::ResourceNotFoundException(
+        ResourceNotFoundException {
+            message: Some(format!("application {app_arn} does not exist")),
+            resource_id: Some(app_arn.to_string()),
+            resource_type: Some("App".to_string()),
+        },
+    )
+    .into()
+}
+
+/// A 404 for an `appVersion` the application does not have.
+fn app_version_not_found(
+    app_arn: &str,
+    app_version: &str,
+) -> DescribeAppVersionAppComponentError {
+    DescribeAppVersionAppComponentErrorModeled::ResourceNotFoundException(
+        ResourceNotFoundException {
+            message: Some(format!(
+                "application {app_arn} has no version {app_version}"
+            )),
+            resource_id: Some(app_version.to_string()),
+            resource_type: Some("AppVersion".to_string()),
+        },
+    )
+    .into()
+}
+
+/// A 404 for an `id` that version holds no component for — never a 200 carrying a
+/// synthesised component.
+fn app_component_not_found(
+    id: &str,
+    app_version: &str,
+) -> DescribeAppVersionAppComponentError {
+    DescribeAppVersionAppComponentErrorModeled::ResourceNotFoundException(
+        ResourceNotFoundException {
+            message: Some(format!(
+                "no Application Component with id {id} in app version {app_version}"
+            )),
+            resource_id: Some(id.to_string()),
+            resource_type: Some("AppComponent".to_string()),
+        },
+    )
+    .into()
 }
