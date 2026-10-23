@@ -18,4 +18,8 @@ union can be declared as `{Op}Output`. A `@required` union member and a
 `@required`-member reference cycle are NOT decline reasons — a scaffolded
 handler returns an error, so it never has to construct a value.
 
-// SKIPPED: CreateMicrovmAuthToken — shape missing from model: smithy.api#Unit
+// HAND-AUTHORED since: CreateMicrovmAuthToken — see `ops/create_microvm_auth_token.rs`
+// and `ops/types/create_microvm_auth_token_types.rs`. The decline reason stands (the
+// model does not carry `smithy.api#Unit`, which `PortSpecification$allPorts` targets),
+// so the union's schema and serde impls are written out there; the operation is routed
+// and implemented, not skipped.

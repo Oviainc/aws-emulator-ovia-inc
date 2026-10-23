@@ -14,6 +14,7 @@
 //! here named after an operation would make that operation's own module name
 //! ambiguous inside `ops` (`E0659`).
 
+pub mod create_microvm_auth_token_types;
 pub mod create_microvm_image_types;
 pub mod create_microvm_shell_auth_token_types;
 pub mod delete_microvm_image_types;
@@ -39,6 +40,8 @@ pub mod untag_resource_types;
 pub mod update_microvm_image_types;
 pub mod update_microvm_image_version_types;
 
+#[allow(ambiguous_glob_reexports, unused_imports)]
+pub use create_microvm_auth_token_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use create_microvm_image_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]

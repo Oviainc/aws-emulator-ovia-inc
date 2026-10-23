@@ -3,9 +3,9 @@
 //! Engine state for the com-amazonaws-apigatewayv2-apigatewayv2 service.
 //!
 //! A single store, [`ComAmazonawsApigatewayv2Apigatewayv2State::apis`], keyed by
-//! `ApiId`. An [`Api`] OWNS its child [`Route`]s (and the [`Stage`]s a later slice
-//! will fill), so deleting an api cascades to its children in one `remove` and no
-//! second map can drift out of step with it.
+//! `ApiId`. An [`Api`] OWNS its child [`Route`]s and [`Integration`]s (and the
+//! [`Stage`]s a later slice will fill), so deleting an api cascades to its children in
+//! one `remove` and no second map can drift out of step with it.
 //!
 //! The records here are the service's own, not the wire shapes: a record keeps a
 //! value the api always has (its id, its name, its creation instant) as a plain
@@ -74,6 +74,25 @@ pub const MAX_APIS: usize = 600;
 /// published quota is 300 routes per API.
 pub const MAX_ROUTES_PER_API: usize = 300;
 
+/// The most integrations one api may hold, after which CreateIntegration is refused.
+/// AWS's published API Gateway quota is 300 integrations per API.
+pub const MAX_INTEGRATIONS_PER_API: usize = 300;
+
+/// The `ConnectionType` an integration gets when the request names none. From
+/// `Integration$ConnectionType`: "Specify INTERNET for connections through the public
+/// routable internet … The default value is INTERNET."
+pub const DEFAULT_CONNECTION_TYPE: &str = "INTERNET";
+
+/// The `TimeoutInMillis` an integration of an HTTP API gets when the request names
+/// none: "The default timeout is … 30 seconds for HTTP APIs"
+/// (`CreateIntegration$TimeoutInMillis`).
+pub const DEFAULT_HTTP_TIMEOUT_MILLIS: i32 = 30_000;
+
+/// The `TimeoutInMillis` an integration of a WebSocket API gets when the request names
+/// none: "The default timeout is 29 seconds for WebSocket APIs"
+/// (`CreateIntegration$TimeoutInMillis`).
+pub const DEFAULT_WEBSOCKET_TIMEOUT_MILLIS: i32 = 29_000;
+
 /// The largest page either paginated operation serves, and the page size it uses when
 /// the request names no `MaxResults`.
 ///
@@ -126,6 +145,11 @@ pub struct Api {
     /// Drives [`Api::mint_route_id`]. Per-api, because a `RouteId` only has to be
     /// unique within the api that owns the route.
     pub route_id_seed: u64,
+    /// This api's integrations, keyed by `IntegrationId`.
+    pub integrations: BTreeMap<String, Integration>,
+    /// Drives [`Api::mint_integration_id`]. Per-api, for the same reason as
+    /// [`Api::route_id_seed`]: an `IntegrationId` is unique within its api.
+    pub integration_id_seed: u64,
     /// This api's stages, keyed by `StageName`. Reserved for the stage slice.
     pub stages: BTreeMap<String, Stage>,
 }
@@ -136,6 +160,13 @@ impl Api {
     pub fn mint_route_id(&mut self) -> String {
         self.route_id_seed = self.route_id_seed.wrapping_add(1);
         mint_id(self.route_id_seed)
+    }
+
+    /// Mint a fresh `IntegrationId` for this api: ten lowercase alphanumerics, never
+    /// one this api already minted.
+    pub fn mint_integration_id(&mut self) -> String {
+        self.integration_id_seed = self.integration_id_seed.wrapping_add(1);
+        mint_id(self.integration_id_seed)
     }
 }
 
@@ -217,6 +248,97 @@ impl Route {
             route_key: self.route_key.clone(),
             route_response_selection_expression: self.route_response_selection_expression.clone(),
             target: self.target.clone(),
+        }
+    }
+}
+
+/// A persisted `Integration` resource, owned by its parent [`Api`].
+///
+/// The record keeps what the create resolved — the id it minted, the connection type and
+/// the timeout the request left to their documented defaults — so every reader of the
+/// integration reports one value, and [`Integration::to_wire`] projects it onto the
+/// modelled shape the handlers serialize.
+#[derive(Debug, Clone, Default)]
+pub struct Integration {
+    pub integration_id: String,
+    /// One of `INTEGRATION_TYPE_VALUES` (`AWS | AWS_PROXY | HTTP | HTTP_PROXY | MOCK`).
+    pub integration_type: String,
+    pub integration_uri: Option<String>,
+    pub integration_method: Option<String>,
+    pub integration_subtype: Option<String>,
+    /// One of `CONNECTION_TYPE_VALUES`; [`DEFAULT_CONNECTION_TYPE`] when the request
+    /// named none.
+    pub connection_type: String,
+    pub connection_id: Option<String>,
+    pub content_handling_strategy: Option<String>,
+    pub credentials_arn: Option<String>,
+    pub description: Option<String>,
+    pub passthrough_behavior: Option<String>,
+    pub payload_format_version: Option<String>,
+    pub request_parameters: BTreeMap<String, String>,
+    pub request_templates: BTreeMap<String, String>,
+    pub response_parameters: BTreeMap<String, BTreeMap<String, String>>,
+    pub template_selection_expression: Option<String>,
+    /// The documented default for the parent api's protocol when the request named no
+    /// timeout.
+    pub timeout_in_millis: i32,
+    pub tls_config: Option<wire::TlsConfig>,
+    /// True only for an integration another operation created on the caller's behalf:
+    /// "If you created an API using quick create, the resulting integration is managed
+    /// by API Gateway" (`Integration$ApiGatewayManaged`).
+    pub api_gateway_managed: bool,
+}
+
+impl Integration {
+    /// Project the record onto the modelled `Integration` shape.
+    pub fn to_wire(&self) -> wire::Integration {
+        wire::Integration {
+            api_gateway_managed: Some(self.api_gateway_managed),
+            connection_id: self.connection_id.clone(),
+            connection_type: Some(self.connection_type.clone()),
+            content_handling_strategy: self.content_handling_strategy.clone(),
+            credentials_arn: self.credentials_arn.clone(),
+            description: self.description.clone(),
+            integration_id: Some(self.integration_id.clone()),
+            integration_method: self.integration_method.clone(),
+            // The integration response selection expression is a WebSocket-only value
+            // the service computes from the integration's own responses; nothing here
+            // has any, so there is none to report.
+            integration_response_selection_expression: None,
+            integration_subtype: self.integration_subtype.clone(),
+            integration_type: Some(self.integration_type.clone()),
+            integration_uri: self.integration_uri.clone(),
+            passthrough_behavior: self.passthrough_behavior.clone(),
+            payload_format_version: self.payload_format_version.clone(),
+            request_parameters: Some(
+                self.request_parameters
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+            ),
+            request_templates: Some(
+                self.request_templates
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+            ),
+            response_parameters: Some(
+                self.response_parameters
+                    .iter()
+                    .map(|(selection, parameters)| {
+                        (
+                            selection.clone(),
+                            parameters
+                                .iter()
+                                .map(|(k, v)| (k.clone(), v.clone()))
+                                .collect(),
+                        )
+                    })
+                    .collect(),
+            ),
+            template_selection_expression: self.template_selection_expression.clone(),
+            timeout_in_millis: Some(self.timeout_in_millis),
+            tls_config: self.tls_config.clone(),
         }
     }
 }

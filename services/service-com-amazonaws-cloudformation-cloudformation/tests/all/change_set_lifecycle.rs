@@ -200,11 +200,11 @@ fn change_set_cases() -> Vec<ChangeSetCase> {
             case: "three resources of three types, with properties and metadata",
             stack_name: "cs-three",
             change_set_name: "cs-three-set",
-            template: r#"{"Description":"three","Resources":{"Topic":{"Type":"AWS::SNS::Topic","Properties":{"DisplayName":"t"}},"Queue":{"Type":"AWS::SQS::Queue","Metadata":{"m":1}},"Handle":{"Type":"AWS::CloudFormation::WaitConditionHandle"}}}"#
+            template: r#"{"Description":"three","Resources":{"Topic":{"Type":"AWS::SNS::Topic","Properties":{"DisplayName":"t"}},"Group":{"Type":"AWS::Logs::LogGroup","Metadata":{"m":1}},"Handle":{"Type":"AWS::CloudFormation::WaitConditionHandle"}}}"#
                 .to_string(),
             added: vec![
+                ("Group", "AWS::Logs::LogGroup"),
                 ("Handle", "AWS::CloudFormation::WaitConditionHandle"),
-                ("Queue", "AWS::SQS::Queue"),
                 ("Topic", "AWS::SNS::Topic"),
             ],
         },
@@ -230,9 +230,9 @@ fn change_set_cases() -> Vec<ChangeSetCase> {
             case: "a YAML template body, the other spelling CloudFormation accepts",
             stack_name: "cs-yaml",
             change_set_name: "cs-yaml-set",
-            template: "Resources:\n  Queue:\n    Type: AWS::SQS::Queue\n  Topic:\n    Type: AWS::SNS::Topic\n    Properties:\n      DisplayName: yaml\n"
+            template: "Resources:\n  Group:\n    Type: AWS::Logs::LogGroup\n  Topic:\n    Type: AWS::SNS::Topic\n    Properties:\n      DisplayName: yaml\n"
                 .to_string(),
-            added: vec![("Queue", "AWS::SQS::Queue"), ("Topic", "AWS::SNS::Topic")],
+            added: vec![("Group", "AWS::Logs::LogGroup"), ("Topic", "AWS::SNS::Topic")],
         },
     ]
 }
@@ -473,13 +473,13 @@ fn diff_cases() -> Vec<DiffCase> {
         DiffCase {
             case: "a resource added beside an unchanged one",
             previous: r#"{"Resources":{"A":{"Type":"AWS::SNS::Topic"}}}"#,
-            next: r#"{"Resources":{"A":{"Type":"AWS::SNS::Topic"},"B":{"Type":"AWS::SQS::Queue"}}}"#,
+            next: r#"{"Resources":{"A":{"Type":"AWS::SNS::Topic"},"B":{"Type":"AWS::Logs::LogGroup"}}}"#,
             changes: vec![(change_action::ADD, "B")],
             scope: vec![],
         },
         DiffCase {
             case: "a resource removed",
-            previous: r#"{"Resources":{"A":{"Type":"AWS::SNS::Topic"},"B":{"Type":"AWS::SQS::Queue"}}}"#,
+            previous: r#"{"Resources":{"A":{"Type":"AWS::SNS::Topic"},"B":{"Type":"AWS::Logs::LogGroup"}}}"#,
             next: r#"{"Resources":{"A":{"Type":"AWS::SNS::Topic"}}}"#,
             changes: vec![(change_action::REMOVE, "B")],
             scope: vec![],
@@ -502,14 +502,14 @@ fn diff_cases() -> Vec<DiffCase> {
         DiffCase {
             case: "a resource's Type changed, which cannot be modified in place",
             previous: r#"{"Resources":{"A":{"Type":"AWS::SNS::Topic"}}}"#,
-            next: r#"{"Resources":{"A":{"Type":"AWS::SQS::Queue"}}}"#,
+            next: r#"{"Resources":{"A":{"Type":"AWS::Logs::LogGroup"}}}"#,
             changes: vec![(change_action::REMOVE, "A"), (change_action::ADD, "A")],
             scope: vec![],
         },
         DiffCase {
             case: "three resources added, removed and modified at once",
-            previous: r#"{"Resources":{"Keep":{"Type":"AWS::SNS::Topic"},"Change":{"Type":"AWS::SQS::Queue","Properties":{"DelaySeconds":1}},"Drop":{"Type":"AWS::CloudFormation::WaitConditionHandle"}}}"#,
-            next: r#"{"Resources":{"Keep":{"Type":"AWS::SNS::Topic"},"Change":{"Type":"AWS::SQS::Queue","Properties":{"DelaySeconds":2}},"New":{"Type":"AWS::SNS::Topic"}}}"#,
+            previous: r#"{"Resources":{"Keep":{"Type":"AWS::SNS::Topic"},"Change":{"Type":"AWS::Logs::LogGroup","Properties":{"RetentionInDays":1}},"Drop":{"Type":"AWS::CloudFormation::WaitConditionHandle"}}}"#,
+            next: r#"{"Resources":{"Keep":{"Type":"AWS::SNS::Topic"},"Change":{"Type":"AWS::Logs::LogGroup","Properties":{"RetentionInDays":3}},"New":{"Type":"AWS::SNS::Topic"}}}"#,
             changes: vec![
                 (change_action::MODIFY, "Change"),
                 (change_action::ADD, "New"),
@@ -1089,7 +1089,7 @@ async fn a_change_set_is_deleted_by_request_by_execution_and_with_its_stack() {
             member("ChangeSetType", "CREATE"),
             member(
                 "TemplateBody",
-                r#"{"Resources":{"B":{"Type":"AWS::SQS::Queue"}}}"#,
+                r#"{"Resources":{"B":{"Type":"AWS::Logs::LogGroup"}}}"#,
             ),
         ],
     )

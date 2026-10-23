@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListImports
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListImports`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListImports::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the import registry this service's state owns: every import the caller's
+//! Region holds, or the subset a `Destination` / `ImportStatus` filter selects, paged
+//! by `MaxResults` and resumed by `NextToken`. It only READS — an import is created by
+//! `StartImport` and moved by `StopImport`.
 //!
 //! ## Shape of an operation
 //!
@@ -89,6 +85,95 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// How many imports one page carries when the caller names no `MaxResults`.
+///
+/// The model documents no default for `ListImports$MaxResults` — only the range
+/// 1..1000 — so the page size for a call that leaves it out is the service's to
+/// choose, on the terms [`crate::state::LIST_TRAILS_PAGE_SIZE`] states: the
+/// remainder is reached through `NextToken`.
+const DEFAULT_MAX_RESULTS: i32 = 100;
+
+/// The field separator inside a page token.
+///
+/// `|` appears in none of the four values the token joins: an import id is a `UUID`
+/// (pattern `^[a-f0-9\-]+$`), a destination is an `EventDataStoreArn` (pattern
+/// `^[a-zA-Z0-9._/\-:]+$`), an `ImportStatus` is one of the model's enum values
+/// (`super::types::IMPORT_STATUS_VALUES`) and a Region is a Region code — so a token
+/// splits back into exactly the four fields it was built from.
+const TOKEN_SEPARATOR: char = '|';
+
+/// The length the model pins an `ImportId` to (`UUID`, length 36..36, from
+/// `smithy_query(query="operation",operation="StartImport")`), so the only value a
+/// token can name an import by.
+const IMPORT_ID_LEN: usize = 36;
+
+/// Whether `value` can be an import id at all: the modelled `UUID` shape — length 36,
+/// pattern `^[a-f0-9\-]+$`. A token resuming at anything else names no import this
+/// service could have issued it for.
+fn is_import_id(value: &str) -> bool {
+    value.len() == IMPORT_ID_LEN && value.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f' | '-'))
+}
+
+/// The token that resumes this listing at `resume_at`, in `region`, under the filters
+/// the page was issued for.
+///
+/// The Region and the filters travel INSIDE the token because the model's
+/// `InvalidNextTokenException` covers "a token that was previously used in a request
+/// with different parameters": a token is only meaningful for the listing that produced
+/// it, so it has to carry which listing that was. The import id it leads with is a
+/// `UUID`, so a token always satisfies `PaginationToken`'s own minimum length of 4.
+fn page_token(
+    resume_at: &str,
+    region: &str,
+    status: Option<&str>,
+    destination: Option<&str>,
+) -> String {
+    format!(
+        "{resume_at}{TOKEN_SEPARATOR}{region}{TOKEN_SEPARATOR}{}{TOKEN_SEPARATOR}{}",
+        status.unwrap_or_default(),
+        destination.unwrap_or_default()
+    )
+}
+
+/// The import id `token` resumes at, or `None` for a token this service did not issue
+/// for exactly this listing — the two cases the model's `InvalidNextTokenException`
+/// names ("a token that is not valid, or a token that was previously used in a request
+/// with different parameters").
+///
+/// Whether the id still names a stored import is NOT asked: a listing resumes at the
+/// next key at or after it, so a page survives the record it stopped on being stopped
+/// or removed between the two calls. What is checked is that the id could be an import
+/// id at all, and that the Region and filters are the ones the token was issued for.
+fn resume_at(
+    token: &str,
+    region: &str,
+    status: Option<&str>,
+    destination: Option<&str>,
+) -> Option<String> {
+    let mut fields = token.split(TOKEN_SEPARATOR);
+    let id = fields.next().filter(|id| is_import_id(id))?;
+    let token_region = fields.next()?;
+    let token_status = fields.next()?;
+    let token_destination = fields.next()?;
+    if fields.next().is_some() {
+        return None;
+    }
+    (token_region == region
+        && token_status == status.unwrap_or_default()
+        && token_destination == destination.unwrap_or_default())
+    .then(|| id.to_string())
+}
+
+/// The refusal text for a `NextToken` this listing cannot resume from: built from the
+/// request, naming the member and the rule it broke, so a caller can fix the call from
+/// it alone.
+fn invalid_next_token_message(token: &str) -> String {
+    format!(
+        "NextToken `{token}` was not issued by this service for these ListImports \
+         parameters."
+    )
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -161,18 +246,116 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListImports` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListImportsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let region = crate::state::request_region(ctx.parts());
+
+        // "a select set of imports by ImportStatus or Destination": `Destination` is
+        // "The ARN of the destination event data store", read the way every event data
+        // store operation reads one — so the bare id suffix of an ARN selects the same
+        // imports the whole ARN does, and a value readable as neither names no store
+        // at all.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListImports"))
+        // Whether a READABLE ARN names a store that exists is not asked here: this
+        // operation reports the import registry, and a destination no import was
+        // started against simply selects none of them rather than refusing the call.
+        let destination = match input.destination.as_deref() {
+            None => None,
+            Some(value) => Some(
+                crate::state::parse_event_data_store_identifier(value)
+                    .map_err(|rejection| {
+                        ListImportsErrorModeled::EventDataStoreARNInvalidException(
+                            EventDataStoreARNInvalidException {
+                                message: Some(rejection.message(&region)),
+                            },
+                        )
+                    })?
+                    .arn(&region),
+            ),
+        };
+        // "The status of the import" — one of the model's `ImportStatus` values, which
+        // the boundary validator has already refused anything outside of.
+        let status = input.import_status.clone();
+
+        // "The maximum number of imports to display on a single page", which the model
+        // bounds to 1..1000 before this handler runs. The floor of 1 is stated here
+        // anyway because this is the value the page loop terminates on: a page size of
+        // zero would answer an empty page with a token resuming at the same import,
+        // which no caller can page past.
+        let page_size = usize::try_from(input.max_results.unwrap_or(DEFAULT_MAX_RESULTS))
+            .unwrap_or(DEFAULT_MAX_RESULTS as usize)
+            .max(1);
+
+        // A token names the import the next page resumes at, in the Region and under
+        // the filters it was issued for; anything else never came from this listing.
+        let resume = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(
+                resume_at(token, &region, status.as_deref(), destination.as_deref()).ok_or_else(
+                    || {
+                        ListImportsErrorModeled::InvalidNextTokenException(
+                            InvalidNextTokenException {
+                                message: Some(invalid_next_token_message(token)),
+                            },
+                        )
+                    },
+                )?,
+            ),
+        };
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListImportsErrorModeled::UnsupportedOperationException(UnsupportedOperationException {
+                message: Some(
+                    "ListImports needs the CloudTrail import registry, which this engine \
+                     does not carry"
+                        .to_string(),
+                ),
+            })
+        })?;
+        let store = state.lock();
+
+        // The registry is keyed `(import id, Region)` and so iterates id-ordered,
+        // which is the order the pages walk: a page resumes AT the key the previous
+        // one stopped on, which the ordered map seeks to directly.
+        let remaining: Box<
+            dyn Iterator<Item = (&crate::state::ImportKey, &crate::state::ImportRecord)>,
+        > = match resume {
+            Some(id) => Box::new(store.imports.range((id, region.clone())..)),
+            None => Box::new(store.imports.iter()),
+        };
+
+        let mut imports: Vec<ImportsListItem> = Vec::new();
+        let mut next_token = None;
+        for ((import_id, import_region), record) in remaining {
+            // An import belongs to the Region it was created in, so only that
+            // Region's imports are reported here.
+            if import_region != &region {
+                continue;
+            }
+            if status.as_deref().is_some_and(|status| record.status != status) {
+                continue;
+            }
+            if destination
+                .as_deref()
+                .is_some_and(|arn| !record.destinations.iter().any(|held| held == arn))
+            {
+                continue;
+            }
+            if imports.len() == page_size {
+                // One import past a full page: report where to resume rather than
+                // carrying it.
+                next_token = Some(page_token(
+                    import_id,
+                    &region,
+                    status.as_deref(),
+                    destination.as_deref(),
+                ));
+                break;
+            }
+            imports.push(record.to_imports_list_item());
+        }
+
+        Ok(ListImportsOutput {
+            imports: Some(imports),
+            next_token,
+        })
     }
 }

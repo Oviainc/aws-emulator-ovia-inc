@@ -323,6 +323,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .collect(),
             routes: ::std::collections::BTreeMap::new(),
             route_id_seed: 0,
+            integrations: ::std::collections::BTreeMap::new(),
+            integration_id_seed: 0,
             stages: ::std::collections::BTreeMap::new(),
         };
 

@@ -178,7 +178,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = (ctx, &self.engine);
+        // IAM evaluates the caller's identity-based policies in FRONT of the
+        // service, so this is the first question and its answer depends on
+        // nothing the request names existing.
+        if let Some(denial) = crate::state::identity_based_denial(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::state::metrics_resource(ctx.parts(), &input.service_type, &input.identifier),
+        ) {
+            return Err(crate::scaffolded::Scaffolded::access_denied(denial));
+        }
 
         // Nothing about the data source is answered until the request is
         // authorized for it: a caller asking which dimensions a data source this

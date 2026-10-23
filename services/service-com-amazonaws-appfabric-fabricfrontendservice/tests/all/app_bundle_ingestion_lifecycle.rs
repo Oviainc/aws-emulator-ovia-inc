@@ -1446,8 +1446,9 @@ fn audit_capture() -> &'static AuditCapture {
 
 /// RULE: every state-changing operation writes ONE structured audit record
 /// naming the operation, the presented access key id, the server-minted resource
-/// and the outcome; a reporting operation writes none, and no record carries
-/// caller-supplied content (a tag value, a customer-managed key).
+/// and the outcome — including the ingestion-destination create and delete; a
+/// reporting operation writes none, and no record carries caller-supplied content
+/// (a tag value, a customer-managed key).
 #[tokio::test]
 async fn state_changing_operations_write_an_audit_record() {
     let captured = audit_capture();
@@ -1475,10 +1476,40 @@ async fn state_changing_operations_write_an_audit_record() {
     );
     let ingestion_id = ingestion.rsplit('/').next().unwrap_or_default().to_string();
 
+    // One ingestion destination under that ingestion, so this test also covers
+    // the ingestion-destination create and delete. It has to be deleted before
+    // the ingestion is, which is the order AppFabric documents.
+    let destinations_uri = format!(
+        "/appbundles/{}/ingestions/{}/ingestiondestinations",
+        encode(&bundle),
+        encode(&ingestion)
+    );
+    let destination = arn_of(
+        &emulator
+            .call(
+                "POST",
+                &destinations_uri,
+                Some(json!({
+                    "processingConfiguration": {"auditLog": {"schema": "ocsf", "format": "json"}},
+                    "destinationConfiguration": {"auditLog": {"destination":
+                        {"s3Bucket": {"bucketName": "audit-logs-bucket"}}}},
+                })),
+            )
+            .await
+            .body,
+        "ingestionDestination",
+    );
+    let destination_id = uuid_of(&destination);
+    let destination_uri = format!("{destinations_uri}/{}", encode(&destination));
+
     // Reporting operations, which must add no audit record of their own.
     emulator.get_app_bundle(&bundle).await;
     emulator.list_app_bundles("").await;
     emulator.list_ingestions(&bundle, "").await;
+
+    emulator.call("DELETE", &destination_uri, None).await;
+    // Deleting what is already gone is a success, and is recorded as such.
+    emulator.call("DELETE", &destination_uri, None).await;
 
     emulator.delete_ingestion(&bundle, &ingestion).await;
     // Deleting what is already gone is a success, and is recorded as such.
@@ -1493,7 +1524,11 @@ async fn state_changing_operations_write_an_audit_record() {
         .into_iter()
         // Scoped to the resources THIS test minted, so records other tests write
         // into the same process-wide capture are none of its business.
-        .filter(|rendered| rendered.contains(&bundle_id) || rendered.contains(&ingestion_id))
+        .filter(|rendered| {
+            rendered.contains(&bundle_id)
+                || rendered.contains(&ingestion_id)
+                || rendered.contains(&destination_id)
+        })
         .collect();
 
     // (case, the operation, the resource type, the resource id, the outcome)
@@ -1511,6 +1546,27 @@ async fn state_changing_operations_write_an_audit_record() {
             "Ingestion",
             ingestion_id.clone(),
             "created",
+        ),
+        (
+            "a created ingestion destination",
+            "CreateIngestionDestination",
+            "IngestionDestination",
+            destination_id.clone(),
+            "created",
+        ),
+        (
+            "a deleted ingestion destination",
+            "DeleteIngestionDestination",
+            "IngestionDestination",
+            destination_id.clone(),
+            "deleted",
+        ),
+        (
+            "a delete of an absent ingestion destination",
+            "DeleteIngestionDestination",
+            "IngestionDestination",
+            destination.clone(),
+            "already absent",
         ),
         (
             "a deleted ingestion",

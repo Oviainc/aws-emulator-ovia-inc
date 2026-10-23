@@ -9,13 +9,18 @@
 //! `DeletePerformanceAnalysisReport`) answers is computed from the store below.
 //!
 //! Resource metrics are NOT stored: `GetResourceMetrics` derives its aligned
-//! window, its effective period and its metric keys from the request, and
-//! reports no data points at all, so reading metrics never writes.
+//! window, its effective period, its metric keys and the one data point it
+//! reports per period from the request, so reading metrics never writes.
 //!
 //! The data sources themselves are not stored here either — no Performance
 //! Insights operation registers one, they are the DB resources other services
-//! own. Two questions are asked about them, and they have different answers:
+//! own. Three questions are asked about a request, and they have different
+//! answers:
 //!
+//! * whether the CALLER may perform the action at all is decided first, from
+//!   the identity-based policies the IAM store holds for the identity the
+//!   request's signing key belongs to ([`identity_based_denial`]), read through
+//!   the shared [`::service_common::iam_authorization`] evaluator;
 //! * whether a request addresses a data source this account may see at all is
 //!   decided by [`is_data_source_identifier`], the authorization gate every
 //!   operation in this crate applies before it answers; and
@@ -29,6 +34,8 @@ use std::time::{Duration, Instant};
 
 use ::aws_smithy_types::DateTime;
 use ::service_common::db_data_sources::DataSourceDirectory;
+use service_com_amazonaws_iam_awsidentitymanagementv20100508::state as iam_state;
+use service_com_amazonaws_sts_awssecuritytokenservicev20110615::state as sts_state;
 
 use crate::ops::types::{Insight, Tag};
 
@@ -608,6 +615,597 @@ pub fn service_state<Eng: Send + Sync + 'static>(
     (engine as &dyn ::std::any::Any)
         .downcast_ref::<::engine::InMemoryEngine>()
         .map(::engine::InMemoryEngine::state::<ComAmazonawsPiPerformanceinsightsv20180227State>)
+}
+
+// ---------------------------------------------------------------------------
+// Metric names
+// ---------------------------------------------------------------------------
+
+/// The aggregate functions a Performance Insights metric name carries, from
+/// `GetResourceMetrics$MetricQueries`' own documentation: "You must append the
+/// aggregate function to the metric. For example, to find the average for the
+/// metric db.load you must use db.load.avg. Valid values for aggregate
+/// functions include .avg, .min, .max, and .sum."
+pub const AGGREGATE_FUNCTION_SUFFIXES: [&str; 4] = [".avg", ".min", ".max", ".sum"];
+
+/// The ONE aggregate function `DescribeDimensionKeys$AdditionalMetrics`
+/// documents: "The only supported statistic function is .avg."
+pub const ADDITIONAL_METRIC_SUFFIX: &str = ".avg";
+
+/// The sentence Performance Insights answers a metric name whose aggregate
+/// function it does not know with.
+///
+/// ONE service-wide constant carrying nothing from the request: the same
+/// sentence answers a metric with no aggregate function at all and one whose
+/// suffix is not an aggregate function. The requirement is the status (400) and
+/// the error code (`InvalidArgumentException`); this is the text the corpus
+/// records for the condition.
+pub const UNKNOWN_STATISTIC_MESSAGE: &str = "The specified statistic is not a known statistic";
+
+/// Whether `metric` names a metric AND an aggregate function, which is what
+/// every metric member of this model asks a caller for.
+///
+/// The check is on the SUFFIX only: Performance Insights publishes a metric
+/// catalogue per DB engine (`ListAvailableResourceMetrics` is what enumerates
+/// it) which this emulator does not hold, so the metric itself is not resolved
+/// here — the aggregate function is, because the model states its value set.
+/// A name that is nothing but the suffix (`".avg"`) names no metric to
+/// aggregate, so it does not satisfy this either.
+pub fn names_an_aggregate_function(metric: &str) -> bool {
+    AGGREGATE_FUNCTION_SUFFIXES
+        .iter()
+        .any(|suffix| metric.len() > suffix.len() && metric.ends_with(suffix))
+}
+
+/// The same question for an `AdditionalMetrics` entry, whose documentation
+/// narrows the set to `.avg` alone.
+pub fn names_the_additional_metric_function(metric: &str) -> bool {
+    metric.len() > ADDITIONAL_METRIC_SUFFIX.len() && metric.ends_with(ADDITIONAL_METRIC_SUFFIX)
+}
+
+// ---------------------------------------------------------------------------
+// The aligned window every time-series operation reports
+// ---------------------------------------------------------------------------
+
+/// The granularities `PeriodInSeconds` accepts, from that member's own
+/// documentation: 1 (one second), 60 (one minute), 300 (five minutes), 3600 (one
+/// hour) and 86400 (twenty-four hours).
+pub const VALID_PERIODS_IN_SECONDS: &[i64] = &[1, 60, 300, 3600, 86400];
+
+/// How far from the epoch a window's timestamps may lie, in either direction.
+///
+/// NOT a guess at what AWS accepts: it is the magnitude that keeps every step of
+/// the window arithmetic total. With both ends inside `±i64::MAX / 4`, the span
+/// (`end - start`), the end's round-up (`end + 1`, then up to one period more)
+/// and the aligned window (`aligned_end - aligned_start`) all stay inside i64,
+/// so a caller-chosen `ISOTimestamp` cannot overflow them. A value past it is
+/// answered with the modelled 400 instead.
+pub const MAX_TIMESTAMP_MAGNITUDE: i64 = i64::MAX / 4;
+
+/// The data-point budget the service aims at when the caller specifies no
+/// period. `PeriodInSeconds`' documentation: "If you don't specify
+/// PeriodInSeconds, then Performance Insights will choose a value for you, with
+/// a goal of returning roughly 100-200 data points in the response."
+const PERIOD_CHOICE_MAX_POINTS: i64 = 200;
+
+/// How many data points one response may carry, counting every series in it.
+///
+/// An EMULATOR ceiling, not an AWS quota: `GetResourceMetrics` materialises one
+/// data point per period of the aligned window FOR EVERY metric key it answers,
+/// and both the window and the period come from the request, so without a
+/// budget a single request would decide how much memory this process allocates
+/// and how large a body it serialises (a two-year window at the one-second
+/// granularity is 6.3 × 10^7 periods, times up to the fifteen metric queries
+/// `MetricQueryList` admits). The budget is taken over the WHOLE response
+/// rather than per series, because the per-key series are what multiply, and it
+/// is asked by the operation that ALLOCATES per period — an operation reporting
+/// no series over a window is not refused for the window's width.
+///
+/// It is set far above any ordinary query — a full day at the finest documented
+/// granularity is 86 400 points, and the service's own goal when it picks the
+/// period is 100-200 — so a client charting a series never meets it. A request
+/// past it is refused with the operation's modelled `InvalidArgumentException`,
+/// never answered with a truncated grid a client could not tell from a complete
+/// one, and the refusal names the two request members that bring it back inside
+/// the budget (`MaxResults`, which pages the keys, and `PeriodInSeconds`).
+pub const MAX_DATA_POINTS_PER_RESPONSE: i64 = 100_000;
+
+/// The window a time-series request reports back: the effective period and the
+/// granular boundaries the requested window was widened to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AlignedWindow {
+    /// The effective `PeriodInSeconds`: the caller's, or the one the service
+    /// chose from the span.
+    pub period: i64,
+    /// `AlignedStartTime` as epoch seconds, on a period boundary at or before
+    /// the requested `StartTime`.
+    pub start: i64,
+    /// `AlignedEndTime` as epoch seconds, on a period boundary at or after the
+    /// requested `EndTime`.
+    pub end: i64,
+}
+
+impl AlignedWindow {
+    /// How many whole periods the window holds — the number of data points a
+    /// series over it carries.
+    pub fn period_count(&self) -> i64 {
+        (self.end - self.start) / self.period
+    }
+
+    /// The timestamp of period `index`, stamped as `alignment` asks: the
+    /// period's START for `START_TIME`, its END otherwise.
+    ///
+    /// `PeriodAlignment`'s documentation: "The returned timestamp which is the
+    /// start or end time of the time periods. The default value is END_TIME."
+    pub fn period_timestamp(&self, index: i64, alignment: Option<&str>) -> i64 {
+        let offset = if alignment == Some(PERIOD_ALIGNMENT_START_TIME) {
+            index
+        } else {
+            index + 1
+        };
+        self.start + offset * self.period
+    }
+}
+
+/// The `PeriodAlignment` value that stamps a point with its period's start; any
+/// other value (including the absent default) stamps it with the period's end.
+pub const PERIOD_ALIGNMENT_START_TIME: &str = "START_TIME";
+
+/// Resolve the window a request's `StartTime`, `EndTime` and `PeriodInSeconds`
+/// describe, or say why no window can be computed for them.
+///
+/// `Err` is the sentence for the operation's modelled `InvalidArgumentException`.
+/// The ordering rule (`StartTime` before `EndTime`) is NOT checked here: it is
+/// the service-wide refusal every handler answers first (see
+/// [`crate::service::TIME_RANGE_ORDERING_MESSAGE`]), so a window that is merely
+/// inverted is never reported as an arithmetic problem.
+pub fn aligned_window(
+    start_time: DateTime,
+    end_time: DateTime,
+    period_in_seconds: Option<i32>,
+) -> Result<AlignedWindow, String> {
+    // Both timestamps are caller-chosen and a `timestamp` shape carries no
+    // `@range`, so the model cannot bound them and this must, before any
+    // arithmetic reads them.
+    for (member, value) in [("StartTime", start_time), ("EndTime", end_time)] {
+        let seconds = value.secs();
+        if !(-MAX_TIMESTAMP_MAGNITUDE..=MAX_TIMESTAMP_MAGNITUDE).contains(&seconds) {
+            return Err(format!(
+                "{member} must be within {MAX_TIMESTAMP_MAGNITUDE} seconds of the epoch \
+                 for its window to be computable; got {seconds}."
+            ));
+        }
+    }
+
+    let span_seconds = (end_time.secs() - start_time.secs()).max(1);
+    let period = match period_in_seconds {
+        None => choose_period(span_seconds),
+        Some(requested) => {
+            let requested = i64::from(requested);
+            if !VALID_PERIODS_IN_SECONDS.contains(&requested) {
+                return Err(format!(
+                    "PeriodInSeconds must be one of {}; got {requested}.",
+                    VALID_PERIODS_IN_SECONDS
+                        .iter()
+                        .map(i64::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+            requested
+        }
+    };
+
+    // `AlignedStartTime` is documented to be less than or equal to the
+    // requested `StartTime`, and `AlignedEndTime` greater than or equal to the
+    // requested `EndTime`, each on a boundary of the effective period.
+    let start = align_floor(start_time.secs(), period);
+    let end_seconds = end_time.secs() + i64::from(end_time.subsec_nanos() > 0);
+    let end = align_ceil(end_seconds, period);
+
+    // An operation that MATERIALISES something per period bounds the count
+    // itself ([`data_point_budget_refusal`]); the window arithmetic here is
+    // total for every value this far, so a window is not refused for its width
+    // by an operation that reports no series over it.
+    Ok(AlignedWindow { period, start, end })
+}
+
+/// Why a response carrying `series` series over `window` cannot be
+/// materialised, or `None` when it fits [`MAX_DATA_POINTS_PER_RESPONSE`].
+///
+/// Asked BEFORE any point is built, so a request past the budget allocates
+/// nothing: the grid is the one thing in this service whose size a caller
+/// chooses, and `MaxResults` bounds the number of metric KEYS rather than the
+/// points under each of them.
+///
+/// The budget is taken against AT LEAST ONE series, whatever `series` says,
+/// because that is what makes it total: a page carrying no key at all still
+/// computes the window, and `periods × 0` would be inside any budget however
+/// wide the window a caller asked for. So this answers `Some` for every window
+/// whose own period count is past the budget, and a caller that proceeds on
+/// `None` knows `window.period_count()` fits it.
+pub fn data_point_budget_refusal(window: AlignedWindow, series: usize) -> Option<String> {
+    let series = series.max(1);
+    let periods = window.period_count();
+    let points = periods.saturating_mul(i64::try_from(series).unwrap_or(i64::MAX));
+    (points > MAX_DATA_POINTS_PER_RESPONSE).then(|| {
+        format!(
+            "this request asks for {series} series of {periods} data points each, {points} in \
+             all; this emulator materialises at most {MAX_DATA_POINTS_PER_RESPONSE} data points \
+             per response, so page the metric queries with MaxResults, ask for a shorter window, \
+             or ask for a coarser PeriodInSeconds."
+        )
+    })
+}
+
+/// Align `seconds` DOWN to the nearest multiple of `period` — the granular
+/// boundary at or before the requested start.
+fn align_floor(seconds: i64, period: i64) -> i64 {
+    seconds - seconds.rem_euclid(period)
+}
+
+/// Align `seconds` UP to the nearest multiple of `period` — the granular
+/// boundary at or after the requested end.
+fn align_ceil(seconds: i64, period: i64) -> i64 {
+    let remainder = seconds.rem_euclid(period);
+    if remainder == 0 {
+        seconds
+    } else {
+        seconds + (period - remainder)
+    }
+}
+
+/// The period the service picks for a window of `span_seconds` when the caller
+/// specified none: the finest documented granularity that keeps the response
+/// inside [`PERIOD_CHOICE_MAX_POINTS`] data points, and the coarsest one for a
+/// window too long for any of them.
+fn choose_period(span_seconds: i64) -> i64 {
+    let coarsest = *VALID_PERIODS_IN_SECONDS
+        .last()
+        .expect("the documented period set is not empty");
+    VALID_PERIODS_IN_SECONDS
+        .iter()
+        .copied()
+        .find(|period| {
+            let points = span_seconds / period + i64::from(span_seconds % period != 0);
+            points <= PERIOD_CHOICE_MAX_POINTS
+        })
+        .unwrap_or(coarsest)
+}
+
+// ---------------------------------------------------------------------------
+// Identity-based authorization
+// ---------------------------------------------------------------------------
+
+/// The IAM action namespace of this service: the model's `arnNamespace`, which
+/// is also the prefix every `pi:` action and every `pi` ARN carries.
+pub const SERVICE_ACTION_PREFIX: &str = "pi";
+
+/// The resource ONE request addresses, as the authorization decision needs it.
+#[derive(Debug, Clone)]
+pub struct RequestedResource {
+    /// The `pi` ARN a policy statement's `Resource` is matched against.
+    /// Performance Insights documents two resource types — `metrics` and
+    /// `perf-reports` — and an operation addresses whichever of them it names.
+    pub arn: String,
+    /// What a refusal names the resource as: the `Identifier` the request
+    /// carries, which is how the recorded `pi` denial names it.
+    pub named: String,
+}
+
+/// The `AnalysisReportId` segment that stands for every report of a data
+/// source, for an operation that addresses the whole collection: IAM's own
+/// wildcard, so a policy scoped to one report does not authorize a listing of
+/// them all.
+pub const ANY_REPORT: &str = "*";
+
+/// The `metrics` resource a time-series request addresses:
+/// `arn:aws:pi:<region>:<account>:metrics/<ServiceType>/<Identifier>`.
+pub fn metrics_resource(
+    parts: &::http::request::Parts,
+    service_type: &str,
+    identifier: &str,
+) -> RequestedResource {
+    RequestedResource {
+        arn: ::emulator_server::emulator_arn(
+            SERVICE_ACTION_PREFIX,
+            &request_region(parts),
+            &format!("metrics/{service_type}/{identifier}"),
+        ),
+        named: identifier.to_string(),
+    }
+}
+
+/// The `perf-reports` resource a report request addresses. `analysis_report_id`
+/// is [`ANY_REPORT`] for an operation that addresses the whole collection
+/// rather than one report.
+pub fn report_resource(
+    parts: &::http::request::Parts,
+    service_type: &str,
+    identifier: &str,
+    analysis_report_id: &str,
+) -> RequestedResource {
+    RequestedResource {
+        arn: report_arn(
+            &request_region(parts),
+            service_type,
+            identifier,
+            analysis_report_id,
+        ),
+        named: identifier.to_string(),
+    }
+}
+
+/// The resource a TAG request addresses: the `ResourceARN` it carries.
+///
+/// A tag operation names its resource by ARN rather than by the
+/// `(ServiceType, Identifier, AnalysisReportId)` triple, so the ARN a policy
+/// statement's `Resource` is matched against is that same ARN — and it is also
+/// what a refusal names the resource as, because it is how the request named it.
+pub fn tagged_resource(resource_arn: &str) -> RequestedResource {
+    RequestedResource {
+        arn: resource_arn.to_string(),
+        named: resource_arn.to_string(),
+    }
+}
+
+/// Why the caller may not perform `action` on `resource`, or `None` when its
+/// identity-based policies allow it.
+///
+/// AWS evaluates the caller's identity-based policies in FRONT of the service,
+/// so this is the first thing an operation asks and the answer does not depend
+/// on anything the request names existing: the refusal is built from the
+/// request's own principal, action and resource.
+///
+/// What is evaluated is the identity the REQUEST's signing key belongs to:
+///
+/// * an access key `iam:CreateAccessKey` minted for an IAM user — that user's
+///   inline policies;
+/// * a session `sts:AssumeRole` minted from a role — that role's inline
+///   policies and the customer-managed policies attached to it;
+/// * anything else (the emulator's own long-term credentials, a federated or
+///   session token naming no role) is the ambient account identity, which no
+///   identity-based policy constrains, so it is served.
+///
+/// The DECISION itself is not made here: the documents are collected here and
+/// evaluated by [`::service_common::iam_authorization`], the tree's one reading
+/// of an IAM policy document, so this service cannot answer a document
+/// differently from any other service asked about it. What is local is which
+/// documents are in force on this caller and how the refusal reads.
+///
+/// A policy this account does not hold the document of — an AWS-managed policy,
+/// whose catalogue this emulator deliberately does not carry — leaves the
+/// decision UNKNOWN rather than a denial: refusing a caller because the
+/// emulator cannot read a document AWS owns would invent a denial exactly as
+/// inventing the grant would invent one. So a caller holding such an attachment
+/// is served when nothing else about the request is stated, while an explicit
+/// `Deny` the shared evaluator DID read still refuses.
+///
+/// A denial is recorded as an audit event — the principal, the action, the
+/// resource and the decision, none of them a secret — because an authorization
+/// decision is the kind of outcome a caller has to be able to attribute to the
+/// request that caused it.
+pub fn identity_based_denial<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    action: &str,
+    resource: &RequestedResource,
+) -> Option<String> {
+    use ::service_common::iam_authorization as iam_authz;
+
+    let caller = caller_identity(engine, ctx)?;
+    let full_action = format!("{SERVICE_ACTION_PREFIX}:{action}");
+    // Identity-based statements name no `Principal`, so the principal list is
+    // the caller's own ARN and is consulted by nothing here; it is what the
+    // shared request carries for a resource-based policy.
+    let principals = [caller.arn.clone()];
+    let request = iam_authz::Request::new(&full_action, &resource.arn, &principals);
+    let (outcome, message) = match iam_authz::identity_decision(&caller.documents, &request) {
+        iam_authz::Decision::Allowed => return None,
+        // Nothing the emulator can read grants it, but a document AWS owns may:
+        // served rather than refused on a document this emulator cannot hold.
+        iam_authz::Decision::NotStated if caller.unreadable_attachment => return None,
+        iam_authz::Decision::NotStated => (
+            "implicit-deny",
+            format!(
+                "User: {} is not authorized to perform: {full_action} on \
+                 resource: {} because no identity-based policy allows the \
+                 {full_action} action",
+                caller.arn, resource.named
+            ),
+        ),
+        iam_authz::Decision::Denied => (
+            "explicit-deny",
+            format!(
+                "User: {} is not authorized to perform: {full_action} on \
+                 resource: {} with an explicit deny in an identity-based policy",
+                caller.arn, resource.named
+            ),
+        ),
+    };
+    ::tracing::info!(
+        audit = true,
+        operation = %action,
+        outcome = %outcome,
+        principal = %caller.arn,
+        resource = %resource.arn,
+        "request refused: no identity-based policy allows it"
+    );
+    Some(message)
+}
+
+/// An IAM identity a request's signing key belongs to, with the identity-based
+/// policy documents attached to it.
+struct CallerIdentity {
+    /// The principal ARN a refusal names.
+    arn: String,
+    /// The documents in force on this identity, for the shared evaluator.
+    documents: Vec<String>,
+    /// Whether the identity carries an attachment whose document AWS owns, so a
+    /// grant this emulator cannot read may exist.
+    unreadable_attachment: bool,
+}
+
+/// The IAM identity this request's signing key belongs to, or `None` for the
+/// ambient account identity (which no identity-based policy constrains).
+///
+/// The session identity a key speaks for is resolved by STS's own
+/// [`sts_state::resolve_caller`], so this service reads a credential exactly as
+/// the service that minted it does — including materialising the expiries the
+/// clock has already made due.
+fn caller_identity<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+) -> Option<CallerIdentity> {
+    let access_key_id = ::engine::extract_akid(&ctx.parts().headers);
+    // Without an IAM store there is no identity this account minted, so there
+    // is nothing to evaluate and nothing to refuse.
+    let iam = iam_state::service_state(engine)?;
+    // Taken and RELEASED before the IAM store is locked, so no handler holds
+    // both at once.
+    let session = sts_state::service_state(engine).map(|sts| {
+        sts_state::resolve_caller(
+            &mut sts.lock(),
+            &access_key_id,
+            ::std::time::SystemTime::now(),
+            ctx.credential_store(),
+        )
+    });
+    let iam = iam.lock();
+
+    let session_arn = match session {
+        // A credential past its promised lifetime is evaluated as an identity
+        // with NO policy: the role may well allow the action, but this
+        // credential no longer speaks for the role.
+        Some(Err(expired)) => {
+            return Some(CallerIdentity {
+                arn: format!("an expired session credential ({})", expired.access_key_id),
+                documents: Vec::new(),
+                unreadable_attachment: false,
+            })
+        }
+        Some(Ok(identity)) => Some(identity.arn),
+        // No STS store on this engine: the key names no session.
+        None => None,
+    };
+
+    // An assumed-role session is decided by its ROLE's policies. Any other
+    // session identity STS resolves (the ambient one, a federated user) names
+    // no role, so it falls through to the access-key binding below.
+    let assumed = session_arn.and_then(|arn| {
+        let role_name = assumed_role_name(&arn)?.to_string();
+        Some((arn, role_name))
+    });
+    if let Some((session_arn, role_name)) = assumed {
+        let role_key = iam_state::name_key(&role_name);
+        let mut documents: Vec<String> = iam
+            .role_inline_policies
+            .get(&role_key)
+            .map(|named| {
+                named
+                    .values()
+                    .map(|policy| policy.policy_document.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut unreadable_attachment = false;
+        for arn in iam
+            .role_attached_policies
+            .get(&role_key)
+            .into_iter()
+            .flatten()
+        {
+            match managed_policy_document(&iam, arn) {
+                Some(document) => documents.push(document),
+                // Only an AWS-MANAGED policy is a grant this emulator cannot
+                // read: an attachment naming a customer-managed policy the
+                // account does not hold grants nothing.
+                None if is_aws_managed_policy(arn) => unreadable_attachment = true,
+                None => {}
+            }
+        }
+        // The principal a refusal names is the SESSION's own ARN, the identity
+        // `sts:GetCallerIdentity` answers for this credential.
+        return Some(CallerIdentity {
+            arn: session_arn,
+            documents,
+            unreadable_attachment,
+        });
+    }
+
+    let record = iam.access_keys.get(&access_key_id)?;
+    // A key whose user record is gone names an identity that no longer holds
+    // any policy, so it is evaluated as an identity with none rather than
+    // falling through to the ambient account identity: a dangling binding must
+    // not widen what a key may do.
+    let arn = match iam.users.get(&record.user_key) {
+        Some(user) => user.arn.clone(),
+        None => user_arn_of_key(&record.user_key),
+    };
+    // `AttachUserPolicy` is not implemented in this emulator, so a user's
+    // identity-based policies are exactly its inline ones.
+    let documents = iam
+        .user_inline_policies
+        .get(&record.user_key)
+        .map(|named| {
+            named
+                .values()
+                .map(|policy| policy.policy_document.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(CallerIdentity {
+        arn,
+        documents,
+        unreadable_attachment: false,
+    })
+}
+
+/// Whether `arn` names an AWS-MANAGED policy: one whose account segment is
+/// IAM's `aws`, so it belongs to AWS rather than to this account and the IAM
+/// store holds no document for it. Read through IAM's own ARN parser, so this
+/// service and IAM agree on what an AWS-managed policy ARN is.
+fn is_aws_managed_policy(arn: &str) -> bool {
+    iam_state::parse_policy_arn(arn)
+        .is_some_and(|policy| policy.account == iam_state::AWS_MANAGED_POLICY_ACCOUNT)
+}
+
+/// The ARN of the IAM user an access-key binding names, for a binding whose
+/// user record the account no longer holds.
+///
+/// Built the way IAM builds a user's ARN at the root path
+/// (`arn:aws:iam::<account>:user/<name>`), from the only thing the binding
+/// keeps: the case-folded user name. It names the principal in a refusal and
+/// authorizes nothing.
+fn user_arn_of_key(user_key: &str) -> String {
+    ::emulator_server::emulator_arn("iam", "", &format!("user/{user_key}"))
+}
+
+/// The role name an STS assumed-role session ARN names.
+///
+/// `sts:AssumeRole` reports the session as
+/// `arn:aws:sts::<account>:assumed-role/<RoleName>/<SessionName>`
+/// ([`sts_state::sts_arn`]), so the role is the first segment after
+/// `assumed-role/`. `None` for any other ARN form — a federated user, say,
+/// which no role's policies decide.
+fn assumed_role_name(arn: &str) -> Option<&str> {
+    let resource = arn.splitn(6, ':').nth(5)?;
+    let name = resource.strip_prefix("assumed-role/")?.split('/').next()?;
+    (!name.is_empty()).then_some(name)
+}
+
+/// The document of the managed policy `arn` names, or `None` when this account
+/// does not hold one (an AWS-managed policy, which belongs to AWS).
+fn managed_policy_document(
+    iam: &iam_state::ComAmazonawsIamAwsidentitymanagementv20100508State,
+    arn: &str,
+) -> Option<String> {
+    let held = iam.policy_by_arn(arn)?;
+    let default_version = held.policy.default_version_id.as_deref()?;
+    held.versions
+        .get(default_version)?
+        .document
+        .clone()
 }
 
 /// The SHARED data-source directory in the shared engine: call it with a

@@ -1,15 +1,30 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteIngestionDestination
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteIngestionDestination`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! REMOVES one stored ingestion destination from the ingestion that owns it, which is
+//! the only association this call breaks: the ingestion, its other destinations and the
+//! app bundle above them are left exactly as they were (see
+//! [`crate::state::IngestionRecord::destinations`]).
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteIngestionDestination::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The APP BUNDLE is a resource of its own and the entry point of every path under
+//! `/appbundles/{appBundleIdentifier}`: an identifier naming no stored bundle is the
+//! HTTP 404 `ResourceNotFoundException` this operation models, the same answer
+//! `GetIngestionDestination`, `CreateIngestionDestination` and the sibling
+//! `DeleteIngestion` give for an absent bundle.
+//!
+//! Below it the call is `@idempotent`: a destination the bundle's ingestion does not
+//! hold — and a destination whose owning INGESTION is itself already gone, which is a
+//! store that cannot hold it either — already leaves the store in exactly the state the
+//! request asks for, so nothing is written and the call succeeds with the modelled empty
+//! 204. The recorded unit `appfabric.create-ingestion-destination-s3-active` is where
+//! the ingestion level comes from: it deletes a destination, then the ingestion that
+//! owned it, and AWS answers this call 204 rather than a not-found. Only the reporting
+//! path (`GetIngestionDestination`) turns an absent destination into HTTP 404.
+//!
+//! AWS documents that deleting a destination under an ENABLED ingestion eventually
+//! disables that ingestion. No ingestion in this emulator can be enabled yet
+//! (`CreateIngestion` stores `disabled` and `StartIngestion` is still a scaffold), so
+//! the clock owes no ingestion-state transition on this path and none is written.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +169,82 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteIngestionDestination` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteIngestionDestinationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteIngestionDestination"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                DeleteIngestionDestinationErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the AppFabric emulator could not reach its state store"
+                            .to_string(),
+                        retry_after_seconds: None,
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let mut store = state.lock();
+        // The bundle is the outer parent of this path and a resource of its own:
+        // an identifier naming no stored bundle is the not-found this operation
+        // models, the same answer `GetIngestionDestination` and `DeleteIngestion`
+        // give.
+        let Some(bundle) = store.resolve_bundle_mut(&input.app_bundle_identifier) else {
+            return Err(
+                DeleteIngestionDestinationErrorModeled::ResourceNotFoundException(
+                    crate::state::app_bundle_not_found(&input.app_bundle_identifier),
+                )
+                .into(),
+            );
+        };
+        // The same lookup for the ingestion. @idempotent reaches this level too:
+        // a destination cannot exist under an ingestion the bundle no longer
+        // holds, so the request's postcondition is already satisfied and nothing
+        // is written. This is what the recorded unit
+        // `appfabric.create-ingestion-destination-s3-active` shows: after it
+        // deletes a destination and then the ingestion that owned it, AWS answers
+        // this call HTTP 204 rather than a not-found.
+        let Some(ingestion) = bundle.resolve_ingestion_mut(&input.ingestion_identifier) else {
+            crate::state::audit_resource_change(
+                ctx.parts(),
+                Self::NAME,
+                "IngestionDestination",
+                &input.ingestion_destination_identifier,
+                "already absent",
+            );
+            return Ok(DeleteIngestionDestinationOutput {});
+        };
+
+        // ONE lookup of the target, by either modelled `Identifier` form (ARN or
+        // bare UUID) and only among the destinations this ingestion owns, so an
+        // identifier belonging to another ingestion resolves to nothing here.
+        // @idempotent: a target this ingestion does not hold leaves the store in
+        // exactly the state the request asks for, so nothing is written and the
+        // call succeeds.
+        let Some(destination_key) =
+            crate::state::destination_key(ingestion, &input.ingestion_destination_identifier)
+        else {
+            crate::state::audit_resource_change(
+                ctx.parts(),
+                Self::NAME,
+                "IngestionDestination",
+                &input.ingestion_destination_identifier,
+                "already absent",
+            );
+            return Ok(DeleteIngestionDestinationOutput {});
+        };
+
+        // Removing the record is the whole effect: it breaks the association
+        // between the ingestion and its destination and touches no other record —
+        // its siblings, the ingestion itself and the bundle above it are left as
+        // they were. Previously ingested data and the storage destination itself
+        // live outside this service, so there is nothing else to drop.
+        ingestion.destinations.remove(&destination_key);
+        crate::state::audit_resource_change(
+            ctx.parts(),
+            Self::NAME,
+            "IngestionDestination",
+            &destination_key,
+            "deleted",
+        );
+        Ok(DeleteIngestionDestinationOutput {})
     }
 }

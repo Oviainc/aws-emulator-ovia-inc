@@ -43,6 +43,13 @@
 //! [`provisioner_for`](super::provisioner::provisioner_for), so adding a resource type
 //! never touches the algorithm here.
 //!
+//! A type whose properties are not the create's own members is mapped the one way its
+//! owning API takes them, and no further: an `AWS::SQS::Queue`'s properties are the
+//! queue's ATTRIBUTES, named identically on both sides, so they are passed through as the
+//! `CreateQueue` `Attributes` map ([`queue_attributes`]) rather than as request members.
+//! Either way the mapping is the documented correspondence between the type's property
+//! names and the API's, never a per-member translation table.
+//!
 //! ## What a resource type needs before a stack can create it
 //!
 //! [`provisioner_for`](super::provisioner::provisioner_for) maps a template resource type
@@ -122,6 +129,13 @@ use serde_json::Value;
 
 use super::provisioner::provisioner_for;
 use super::StoredResource;
+
+/// The awsJson media types the services this module calls speak, named once here because
+/// [`call_json_rpc`] takes the one the called service's own model declares: an answer is
+/// rendered in it, and a call written in the other version is not the wire that service
+/// publishes.
+pub(super) const AWS_JSON_1_0: &str = "application/x-amz-json-1.0";
+pub(super) const AWS_JSON_1_1: &str = "application/x-amz-json-1.1";
 
 // The stack whose resources are being created or deleted is identified by its Region
 // alone — what the credential scope of every call this module makes names.
@@ -374,9 +388,12 @@ impl ::std::fmt::Display for Refusal {
     }
 }
 
-/// Call one `awsJson1_1` operation of another emulated service in-process and read its
+/// Call one awsJson operation of another emulated service in-process and read its
 /// answer document. `Err(refusal)` is the service's own refusal: its code, and the message
 /// it worded.
+///
+/// `content_type` is the awsJson version that service's model declares
+/// ([`AWS_JSON_1_0`] / [`AWS_JSON_1_1`]), which is what its answers are rendered in.
 ///
 /// A 501 — the owning operation is still one of this emulator's stubs — is a refusal like
 /// any other, so a resource of a type this emulator DOES provision is never passed off as
@@ -387,6 +404,7 @@ pub(super) async fn call_json_rpc(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     signing_name: &str,
     region: &str,
+    content_type: &str,
     target: &str,
     request: &Value,
 ) -> Result<Value, Refusal> {
@@ -395,7 +413,7 @@ pub(super) async fn call_json_rpc(
         message: error.to_string(),
     })?;
     let headers = vec![
-        ("content-type", "application/x-amz-json-1.1".to_string()),
+        ("content-type", content_type.to_string()),
         ("x-amz-target", target.to_string()),
     ];
     let (status, payload) = dispatch(ctx, signing_name, region, headers, body)

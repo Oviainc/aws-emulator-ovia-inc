@@ -1,15 +1,44 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeDimensionKeys
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeDimensionKeys`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: computes the aligned window of a request from the REQUEST
+//! itself, and reports the dimension keys the window holds — so this read
+//! persists nothing and repeating it answers identically.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeDimensionKeys::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A dimension key is one group of DB SESSIONS sampled on a running engine (the
+//! top N SQL digests, hosts, users or wait events of a window, each with the
+//! load they accounted for). The data sources this emulator serves run no
+//! engine and hold no sessions, so a window over them holds NO dimension keys
+//! and `Keys` is empty — the honest report of that absence, not a 501 ("nobody
+//! wrote this yet") and not a top-N list of invented sessions. `PartitionKeys`
+//! is the same empty breakdown when `PartitionBy` asks for one.
+//!
+//! The window arithmetic, the aggregate-function rule on `Metric` and
+//! `AdditionalMetrics`, the `StartTime`-before-`EndTime` ordering refusal and
+//! the data-source authorization gate are the service-wide ones this crate
+//! keeps in [`crate::state`], so `GetResourceMetrics` and this operation cannot
+//! answer the same request two ways.
+//!
+//! What is deliberately NOT checked here, and is documented rather than
+//! silently omitted:
+//!
+//! * whether `GroupBy.Group` names a dimension group the engine publishes —
+//!   that catalogue is what `ListAvailableResourceDimensions` enumerates, which
+//!   this emulator does not hold, so a well-formed group name is answered with
+//!   the empty key list rather than refused on a guess at the catalogue;
+//! * the `Filter` restrictions the member documents (one filter per dimension
+//!   outside the `GroupBy`/`PartitionBy` group, and `db.sql.db_id` being
+//!   unavailable on RDS for SQL Server) — a filter selects among DB sessions,
+//!   and over the empty session set every filter selects the same empty key
+//!   list, so refusing a filter combination would change no answer this
+//!   emulator can give;
+//! * the documented recency bound on `StartTime` ("You must specify a StartTime
+//!   within the past 7 days"), for the reason `GetResourceMetrics` documents for
+//!   the same bound: this emulator monitors no resource that has been retaining
+//!   anything, so there is no retention horizon to measure a window against.
+//!   The window arithmetic is bounded regardless by [`crate::state::MAX_TIMESTAMP_MAGNITUDE`],
+//!   and this operation materialises nothing per period, so a wide window costs
+//!   it nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -209,18 +238,96 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeDimensionKeys` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeDimensionKeysErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeDimensionKeys"))
+        // IAM evaluates the caller's identity-based policies in FRONT of the
+        // service, so this is the first question and its answer depends on
+        // nothing the request names existing.
+        if let Some(denial) = crate::state::identity_based_denial(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::state::metrics_resource(ctx.parts(), &input.service_type, &input.identifier),
+        ) {
+            return Err(crate::scaffolded::Scaffolded::access_denied(denial));
+        }
+
+        // Documented on `StartTime`: "The value for StartTime must be earlier
+        // than the value for EndTime." The RULE is the model's; the sentence is
+        // the service-wide one every handler enforcing it shares (see
+        // [`crate::service::TIME_RANGE_ORDERING_MESSAGE`]).
+        if crate::state::timestamp_key(input.start_time)
+            >= crate::state::timestamp_key(input.end_time)
+        {
+            return Err(invalid_argument(crate::service::TIME_RANGE_ORDERING_MESSAGE));
+        }
+
+        // `Metric` documents its valid values as metric names carrying an
+        // aggregate function (`db.load.avg`, `db.sampledload.avg`), and
+        // `AdditionalMetrics` narrows the set to `.avg` alone ("The only
+        // supported statistic function is .avg"). A name that carries no
+        // aggregate function names no series, so it is refused rather than
+        // answered.
+        if !crate::state::names_an_aggregate_function(&input.metric) {
+            return Err(invalid_argument(crate::state::UNKNOWN_STATISTIC_MESSAGE));
+        }
+        for metric in input.additional_metrics.iter().flatten() {
+            if !crate::state::names_the_additional_metric_function(metric) {
+                return Err(invalid_argument(crate::state::UNKNOWN_STATISTIC_MESSAGE));
+            }
+        }
+
+        // Nothing about the data source is answered until the request is
+        // authorized for it. The argument checks above run FIRST, so a request
+        // whose values do not hold together is still answered as the argument
+        // error it is rather than disappearing behind this gate.
+        if !crate::state::is_data_source_identifier(&input.identifier) {
+            return Err(not_authorized());
+        }
+
+        let window =
+            crate::state::aligned_window(input.start_time, input.end_time, input.period_in_seconds)
+                .map_err(invalid_argument)?;
+
+        // The key list is empty for every window (there are no DB sessions to
+        // group), so no page can ever be partial and this operation hands out
+        // no `NextToken`. A token presented here is therefore not one it
+        // issued, which is what it is told — rather than being ignored, which
+        // would answer the first page again under a cursor that claimed to
+        // resume.
+        if input.next_token.is_some() {
+            return Err(invalid_argument(
+                "The NextToken was not issued for this request's resource, window, period, \
+                 metric and dimension group.",
+            ));
+        }
+
+        Ok(DescribeDimensionKeysOutput {
+            aligned_start_time: Some(::aws_smithy_types::DateTime::from_secs(window.start)),
+            aligned_end_time: Some(::aws_smithy_types::DateTime::from_secs(window.end)),
+            // "If PartitionBy was present in the request, PartitionKeys
+            // contains the breakdown of dimension keys by the specified
+            // partitions" — a breakdown of no keys, and absent altogether when
+            // the request asked for none.
+            partition_keys: input.partition_by.as_ref().map(|_| Vec::new()),
+            keys: Some(Vec::new()),
+            next_token: None,
+        })
     }
+}
+
+/// `InvalidArgumentException` (HTTP 400), this operation's modelled refusal for
+/// a request whose values do not hold together.
+fn invalid_argument(message: impl Into<String>) -> DescribeDimensionKeysError {
+    DescribeDimensionKeysErrorModeled::InvalidArgumentException(InvalidArgumentException {
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// `NotAuthorizedException` (HTTP 400), the uniform refusal for a request that
+/// addresses a data source this account may not read.
+fn not_authorized() -> DescribeDimensionKeysError {
+    DescribeDimensionKeysErrorModeled::NotAuthorizedException(NotAuthorizedException {
+        message: Some(crate::state::NOT_AUTHORIZED_MESSAGE.to_string()),
+    })
+    .into()
 }

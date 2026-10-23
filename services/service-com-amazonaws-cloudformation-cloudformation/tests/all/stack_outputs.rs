@@ -257,10 +257,6 @@ fn sns_arn(name: &str) -> String {
     format!("arn:aws:sns:{REGION}:{ACCOUNT_ID}:{name}")
 }
 
-fn queue_url(name: &str) -> String {
-    format!("https://sqs.{REGION}.amazonaws.com/{ACCOUNT_ID}/{name}")
-}
-
 /// The ARN `Fn::GetAtt <function>.Arn` reports for a Lambda function, per the "Return
 /// values" section of the `AWS::Lambda::Function` resource-type reference.
 fn lambda_function_arn(name: &str) -> String {
@@ -411,29 +407,37 @@ fn output_cases() -> Vec<OutputCase> {
             ]),
         },
         OutputCase {
-            // A queue's Ref is documented as the queue URL, not its ARN: the rule is the
-            // resource type's documented return value, not "an ARN".
-            case: "a queue, whose Ref is the queue url and whose Arn is an attribute",
-            stack_name: "queue",
-            template: r#"{"Resources":{"Q":{"Type":"AWS::SQS::Queue",
-                   "Properties":{"QueueName":"probe-queue"}}},
-                 "Outputs":{"QueueUrl":{"Value":{"Ref":"Q"}},
-                   "QueueArn":{"Value":{"Fn::GetAtt":["Q","Arn"]}},
-                   "QueueName":{"Value":{"Fn::GetAtt":["Q","QueueName"]}}}}"#
+            // A log group's Ref is documented as its NAME while the ARN it publishes ends
+            // in `:*`: the rule is the resource type's documented return value, not "an
+            // ARN".
+            case: "a log group, whose Ref is the name and whose Arn ends in a wildcard",
+            stack_name: "logs-conventional",
+            template: r#"{"Resources":{"G":{"Type":"AWS::Logs::LogGroup",
+                   "Properties":{"LogGroupName":"probe-logs"}}},
+                 "Outputs":{"GroupName":{"Value":{"Ref":"G"}},
+                   "GroupArn":{"Value":{"Fn::GetAtt":["G","Arn"]}},
+                   "GroupConventionalName":{"Value":{"Fn::GetAtt":["G","LogGroupName"]}}}}"#
                 .to_string(),
             parameters: vec![],
             expected: expect(&[
-                ("QueueUrl", queue_url("probe-queue")),
+                ("GroupName", "probe-logs".to_string()),
                 (
-                    "QueueArn",
-                    format!("arn:aws:sqs:{REGION}:{ACCOUNT_ID}:probe-queue"),
+                    "GroupArn",
+                    format!("arn:aws:logs:{REGION}:{ACCOUNT_ID}:log-group:probe-logs:*"),
                 ),
-                ("QueueName", "probe-queue".to_string()),
+                ("GroupConventionalName", "probe-logs".to_string()),
             ]),
         },
         OutputCase {
             // Two more catalogued types the issue never cited, with the two shapes a
             // documented return value takes: a bare name and a service ARN.
+            //
+            // The catalogued type whose `Ref` is a URL rather than a name — an
+            // `AWS::SQS::Queue`, whose documented `Ref` is the queue url — is asserted
+            // where the queue is really created, in
+            // `core/router/tests/all/cloudformation_provisions_sqs_queues.rs`: this
+            // emulator PROVISIONS that type, so with CloudFormation alone mounted such a
+            // stack fails rather than publishing a url nothing answers to.
             case: "a bucket and a table: Ref is the name, Arn is the attribute",
             stack_name: "storage",
             template: r#"{"Resources":{"B":{"Type":"AWS::S3::Bucket",

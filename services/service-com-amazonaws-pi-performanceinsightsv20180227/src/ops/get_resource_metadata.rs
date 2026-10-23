@@ -158,7 +158,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // IAM evaluates the caller's identity-based policies in FRONT of the
+        // service, so this is the first question and its answer depends on
+        // nothing the request names existing.
+        if let Some(denial) = crate::state::identity_based_denial(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::state::metrics_resource(ctx.parts(), &input.service_type, &input.identifier),
+        ) {
+            return Err(crate::scaffolded::Scaffolded::access_denied(denial));
+        }
 
         // The `ServiceType` must be the service that OWNS the data source this
         // `Identifier` names: a resource id of one service's namespace, queried

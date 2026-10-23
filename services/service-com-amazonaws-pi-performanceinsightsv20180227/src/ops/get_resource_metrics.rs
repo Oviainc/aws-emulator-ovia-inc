@@ -1,24 +1,47 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetResourceMetrics
-//! IMPLEMENTED: computes the aligned window, the effective period and the metric
-//! keys of a request from the REQUEST itself — so this read persists nothing and
-//! repeating it answers identically.
+//! IMPLEMENTED: computes the aligned window, the effective period, the metric
+//! keys and the data-point grid of a request from the REQUEST itself — so this
+//! read persists nothing and repeating it answers identically.
 //!
-//! What it does NOT do is invent telemetry. Performance Insights reports counters
-//! measured on a running DB engine; this emulator monitors none, so every series
-//! it returns is EMPTY rather than a plausible-looking number per period, and a
-//! query that asks for dimension-grouped or filtered data
-//! (`MetricQuery.GroupBy` / `MetricQuery.Filter`) is answered with the scaffold's
-//! 501, because there are no DB sessions to group or filter.
+//! The series it returns is the GRID the window holds: one `DataPoint` per
+//! period across `[AlignedStartTime, AlignedEndTime)`, stamped at that period's
+//! start or end as `PeriodAlignment` asks. `DataPoint$Value` is `@required` in
+//! the model, so a point cannot omit it, and the value every point carries here
+//! is zero: Performance Insights reports the activity a running DB engine had
+//! in each period, and the data sources this emulator serves run none, so there
+//! was no activity in any period of the window. That is a report of absence,
+//! not a magnitude invented to look measured — which is also why a query that
+//! asks for dimension-grouped or filtered data (`MetricQuery.GroupBy` /
+//! `MetricQuery.Filter`) is answered with the scaffold's 501: there are no DB
+//! sessions to group or filter, and the ungrouped series under a grouped key
+//! would be a different claim.
+//!
+//! A metric a query names must carry its aggregate function (`.avg`, `.min`,
+//! `.max` or `.sum`), as `MetricQueries` documents; one that does not is
+//! refused with the modelled `InvalidArgumentException` before any window
+//! arithmetic runs.
 //!
 //! A request that addresses no data source this account may see is refused with
 //! the modelled `NotAuthorizedException`, the uniform answer the real service
 //! gives for an absent, another account's or a wrong-`ServiceType` data source
-//! (see [`crate::state::is_data_source_identifier`]). One divergence is
-//! deliberate and documented rather than invented: the documented
-//! 7-day-to-2-year `StartTime` retention bound is not enforced, because this
-//! emulator monitors no resource that has been retaining anything.
+//! (see [`crate::state::is_data_source_identifier`]); a CALLER whose
+//! identity-based policies do not allow `pi:GetResourceMetrics` is refused
+//! before any of that, with `AccessDeniedException`
+//! ([`crate::state::identity_based_denial`]).
+//!
+//! Two bounds are this emulator's own rather than AWS's, and both are checked
+//! before anything is allocated for the answer. The grid's SIZE is the one part
+//! of a response a caller chooses — the window, the period and the number of
+//! metric queries are all request members — so the whole response is held to
+//! [`crate::state::MAX_DATA_POINTS_PER_RESPONSE`] data points and a request past
+//! it is refused with the modelled `InvalidArgumentException` naming the members
+//! that bring it back inside. The documented 7-day-to-2-year `StartTime`
+//! retention bound, by contrast, is deliberately NOT enforced, because this
+//! emulator monitors no resource that has been retaining anything; the
+//! data-point budget is what keeps an unbounded-looking window from costing an
+//! unbounded answer.
 //!
 //! ## Shape of an operation
 //!
@@ -205,7 +228,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = (ctx, &self.engine);
+        // IAM evaluates the caller's identity-based policies in FRONT of the
+        // service, so this is the first question and its answer depends on
+        // nothing the request names existing.
+        if let Some(denial) = crate::state::identity_based_denial(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::state::metrics_resource(ctx.parts(), &input.service_type, &input.identifier),
+        ) {
+            return Err(crate::scaffolded::Scaffolded::access_denied(denial));
+        }
 
         // Documented on `StartTime`: "The value for StartTime must be earlier than
         // the value for EndTime." The RULE is the model's; the sentence is the
@@ -217,11 +250,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(invalid_argument(crate::service::TIME_RANGE_ORDERING_MESSAGE));
         }
 
+        // Documented on `MetricQueries`: "Each query must specify a Performance
+        // Insights metric and specify an aggregate function... You must append
+        // the aggregate function to the metric." A metric name that names no
+        // aggregate function asks for a series the service does not define, so
+        // it is refused here rather than answered under a key the real service
+        // would never return.
+        for query in &input.metric_queries {
+            if !crate::state::names_an_aggregate_function(&query.metric) {
+                return Err(invalid_argument(crate::state::UNKNOWN_STATISTIC_MESSAGE));
+            }
+        }
+
         // Nothing about the data source is answered until the request is
         // authorized for it: a caller reading metrics for a data source this
         // account does not monitor gets the modelled refusal, not an
-        // authoritative-looking success with an empty series. The cross-member
-        // window check above runs FIRST, so a request whose values do not hold
+        // authoritative-looking success with an empty series. The argument
+        // checks above run FIRST, so a request whose values do not hold
         // together is still answered as the argument error it is rather than
         // disappearing behind this gate.
         // The `ServiceType` must be the service that OWNS the addressed data
@@ -255,50 +300,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // Both timestamps are caller-chosen and a `timestamp` shape carries no
-        // `@range`, so the model cannot bound them and this handler must, before
-        // any arithmetic reads them. The bound is exactly what keeps the window
-        // arithmetic below TOTAL rather than a guess at what AWS accepts: it
-        // refuses no window the rest of this handler could have answered.
-        for (member, value) in [
-            ("StartTime", input.start_time),
-            ("EndTime", input.end_time),
-        ] {
-            let seconds = value.secs();
-            if !(-MAX_TIMESTAMP_MAGNITUDE..=MAX_TIMESTAMP_MAGNITUDE).contains(&seconds) {
-                return Err(invalid_argument(format!(
-                    "{member} must be within {MAX_TIMESTAMP_MAGNITUDE} seconds of the epoch \
-                     for its window to be computable; got {seconds}."
-                )));
-            }
-        }
-
-        let span_seconds = (input.end_time.secs() - input.start_time.secs()).max(1);
-        let period = match input.period_in_seconds {
-            None => choose_period(span_seconds),
-            Some(requested) => {
-                let requested = i64::from(requested);
-                if !VALID_PERIODS_IN_SECONDS.contains(&requested) {
-                    return Err(invalid_argument(format!(
-                        "PeriodInSeconds must be one of {}; got {requested}.",
-                        VALID_PERIODS_IN_SECONDS
-                            .iter()
-                            .map(i64::to_string)
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    )));
-                }
-                requested
-            }
-        };
-
-        // `AlignedStartTime` is documented to be less than or equal to the
-        // requested `StartTime`, and `AlignedEndTime` greater than or equal to the
-        // requested `EndTime`, each on a boundary of the effective period.
-        let aligned_start = align_floor(input.start_time.secs(), period);
-        let end_seconds =
-            input.end_time.secs() + i64::from(input.end_time.subsec_nanos() > 0);
-        let aligned_end = align_ceil(end_seconds, period);
+        // The window, the effective period and the point count all come from
+        // the request. `aligned_window` is what bounds them: it refuses a
+        // timestamp the arithmetic could not hold and a `PeriodInSeconds`
+        // outside the documented set {1, 60, 300, 3600, 86400}, each with the
+        // modelled 400. How many points the window holds is this handler's own
+        // question, because this handler is what allocates them.
+        let window =
+            crate::state::aligned_window(input.start_time, input.end_time, input.period_in_seconds)
+                .map_err(invalid_argument)?;
 
         // `MaxResults` pages the metric keys. A page size of zero could never
         // advance a cursor, so 0 reads as "no caller-imposed page size".
@@ -309,9 +319,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The result set a cursor is handed out for: the resource, the effective
         // period, the aligned window and the metric queries, through the
         // service's one cursor-scope digest.
-        let period_text = period.to_string();
-        let aligned_start_text = aligned_start.to_string();
-        let aligned_end_text = aligned_end.to_string();
+        let period_text = window.period.to_string();
+        let aligned_start_text = window.start.to_string();
+        let aligned_end_text = window.end.to_string();
         let mut scope_parts: Vec<&str> = vec![
             &input.service_type,
             &input.identifier,
@@ -329,8 +339,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let offset = match input.next_token.as_deref() {
             None => 0,
             Some(token) => match crate::state::decode_page_token(token, &scope) {
-                Some(offset) => offset,
-                None => {
+                // A cursor this operation issued always resumes INSIDE the
+                // metric-query list (it is handed out only for a page that
+                // stopped short of the end), so an offset at or past the list's
+                // length is not one it issued either — told so, rather than
+                // answered as an empty page that claimed to resume something.
+                Some(offset) if offset < input.metric_queries.len() => offset,
+                _ => {
                     return Err(invalid_argument(
                         "The NextToken was not issued for this request's resource, window, \
                          period and metric queries.",
@@ -339,20 +354,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             },
         };
 
-        // One entry per requested metric, keyed by that query's metric, with NO
-        // data points.
-        //
-        // The window, the effective period and the key list above are all
-        // computed from the request, and are what a client needs to page and to
-        // interpret a series. The MAGNITUDES are not: Performance Insights
-        // reports counters measured on a running DB engine, and this emulator
-        // monitors none, so it has nothing to report for the periods the aligned
-        // window holds. An empty `DataPoints` says exactly that; a
-        // plausible-looking number per period would be invented telemetry a
-        // client could not tell from a real counter — the same reason
-        // `MetricQuery.GroupBy`/`Filter` answer 501 above. `PeriodAlignment`
-        // chooses whether a point is stamped with its period's start or its end,
-        // so with no points it has nothing to change.
+        // How many series this page answers — one per metric key on it. The
+        // grid is the one part of a response whose SIZE the caller chooses, so
+        // the whole response's data-point budget is checked here, before a
+        // single point is allocated. The check is total: it refuses every
+        // window whose own period count is past the budget, whatever the key
+        // count (see [`crate::state::data_point_budget_refusal`]).
+        let keys_on_page = input
+            .metric_queries
+            .len()
+            .saturating_sub(offset)
+            .min(page_size);
+        if let Some(refusal) = crate::state::data_point_budget_refusal(window, keys_on_page) {
+            return Err(invalid_argument(refusal));
+        }
+
+        // One entry per requested metric, keyed by that query's metric, each
+        // carrying the whole grid the aligned window holds: one point per
+        // period, stamped as `PeriodAlignment` asks. The grid is what a client
+        // charts, aggregates or waits on, and it is computed from the request,
+        // so a repeated call answers identically.
+        let series = data_point_grid(window, input.period_alignment.as_deref())?;
         let metric_list: Vec<MetricKeyDataPoints> = input
             .metric_queries
             .iter()
@@ -363,7 +385,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     metric: query.metric.clone(),
                     dimensions: None,
                 }),
-                data_points: Some(Vec::new()),
+                data_points: Some(series.clone()),
             })
             .collect();
 
@@ -372,8 +394,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .then(|| crate::state::encode_page_token(&scope, resumed_at));
 
         Ok(GetResourceMetricsOutput {
-            aligned_start_time: Some(::aws_smithy_types::DateTime::from_secs(aligned_start)),
-            aligned_end_time: Some(::aws_smithy_types::DateTime::from_secs(aligned_end)),
+            aligned_start_time: Some(::aws_smithy_types::DateTime::from_secs(window.start)),
+            aligned_end_time: Some(::aws_smithy_types::DateTime::from_secs(window.end)),
             identifier: Some(input.identifier.clone()),
             metric_list: Some(metric_list),
             next_token,
@@ -381,26 +403,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// The granularities `PeriodInSeconds` accepts, from that member's own
-/// documentation: 1 (one second), 60 (one minute), 300 (five minutes), 3600 (one
-/// hour) and 86400 (twenty-four hours).
-const VALID_PERIODS_IN_SECONDS: &[i64] = &[1, 60, 300, 3600, 86400];
-
-/// How far from the epoch a window's timestamps may lie, in either direction.
+/// The value every data point of a series carries.
 ///
-/// NOT a guess at what AWS accepts: it is the magnitude that keeps every step of
-/// the window arithmetic total. With both ends inside `±i64::MAX / 4`, the span
-/// (`end - start`), the end's round-up (`end + 1`, then up to one period more)
-/// and the aligned window (`aligned_end - aligned_start`) all stay inside i64,
-/// so a caller-chosen `ISOTimestamp` cannot overflow them. A value past it is
-/// answered with the modelled 400 instead.
-const MAX_TIMESTAMP_MAGNITUDE: i64 = i64::MAX / 4;
+/// Performance Insights reports the activity a running DB engine had in each
+/// period. The data sources this emulator serves run no engine, so no period of
+/// any window holds activity, and the measurement of "how much happened" over a
+/// period in which nothing ran is zero. The model makes `DataPoint$Value`
+/// `@required`, so a point cannot leave it out: this is the report of that
+/// absence, and deliberately NOT a plausible-looking magnitude a client could
+/// not tell from a counter something measured.
+const UNMONITORED_PERIOD_VALUE: f64 = 0.0;
 
-/// The data-point budget the service aims at when the caller specifies no
-/// period. `PeriodInSeconds`' documentation: "If you don't specify
-/// PeriodInSeconds, then Performance Insights will choose a value for you, with a
-/// goal of returning roughly 100-200 data points in the response."
-const PERIOD_CHOICE_MAX_POINTS: i64 = 200;
+/// The series an aligned window holds: one point per period of
+/// `[AlignedStartTime, AlignedEndTime)`, in time order.
+///
+/// Built once per request and shared by every metric key in the answer, because
+/// the grid depends on the window and the alignment only — never on which
+/// metric was asked for.
+///
+/// SELF-BOUNDING: it asks the response budget itself before it allocates, so
+/// the number of points it reserves capacity for is at most
+/// [`crate::state::MAX_DATA_POINTS_PER_RESPONSE`] whatever its caller checked.
+/// The caller's own check is the multiplicative one (points × keys); this one
+/// makes the allocation independent of it, so no request-derived count can
+/// reach `Vec::with_capacity` unchecked.
+fn data_point_grid(
+    window: crate::state::AlignedWindow,
+    alignment: Option<&str>,
+) -> Result<Vec<DataPoint>, GetResourceMetricsError> {
+    if let Some(refusal) = crate::state::data_point_budget_refusal(window, 1) {
+        return Err(invalid_argument(refusal));
+    }
+    let periods = window.period_count();
+    let mut grid = Vec::with_capacity(usize::try_from(periods).unwrap_or(0));
+    grid.extend((0..periods).map(|index| DataPoint {
+        timestamp: ::aws_smithy_types::DateTime::from_secs(
+            window.period_timestamp(index, alignment),
+        ),
+        value: UNMONITORED_PERIOD_VALUE,
+    }));
+    Ok(grid)
+}
 
 /// `InvalidArgumentException` (HTTP 400), this operation's modelled refusal for a
 /// request whose values do not hold together.
@@ -418,39 +461,4 @@ fn not_authorized() -> GetResourceMetricsError {
         message: Some(crate::state::NOT_AUTHORIZED_MESSAGE.to_string()),
     })
     .into()
-}
-
-/// Align `seconds` DOWN to the nearest multiple of `period` — the granular
-/// boundary at or before the requested start.
-fn align_floor(seconds: i64, period: i64) -> i64 {
-    seconds - seconds.rem_euclid(period)
-}
-
-/// Align `seconds` UP to the nearest multiple of `period` — the granular
-/// boundary at or after the requested end.
-fn align_ceil(seconds: i64, period: i64) -> i64 {
-    let remainder = seconds.rem_euclid(period);
-    if remainder == 0 {
-        seconds
-    } else {
-        seconds + (period - remainder)
-    }
-}
-
-/// The period the service picks for a window of `span_seconds` when the caller
-/// specified none: the finest documented granularity that keeps the response
-/// inside [`PERIOD_CHOICE_MAX_POINTS`] data points, and the coarsest one for a
-/// window too long for any of them.
-fn choose_period(span_seconds: i64) -> i64 {
-    let coarsest = *VALID_PERIODS_IN_SECONDS
-        .last()
-        .expect("the documented period set is not empty");
-    VALID_PERIODS_IN_SECONDS
-        .iter()
-        .copied()
-        .find(|period| {
-            let points = span_seconds / period + i64::from(span_seconds % period != 0);
-            points <= PERIOD_CHOICE_MAX_POINTS
-        })
-        .unwrap_or(coarsest)
 }

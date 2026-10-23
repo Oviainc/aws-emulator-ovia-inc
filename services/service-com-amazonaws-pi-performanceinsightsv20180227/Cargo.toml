@@ -27,6 +27,13 @@ sha2 = { workspace = true }
 # Hex for the report-id suffix and for the opaque, self-describing `NextToken`
 # (hex stays inside the modelled `^[a-zA-Z0-9_=-]+$` pattern).
 hex = { workspace = true }
+# The IAM store, for the identity-based policies of the identity a request's
+# signing key belongs to: authorization is decided from the account's own IAM
+# records, never from a second copy of them kept here.
+service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
+# The STS session registry, which is what tells whether a signing key is an
+# assumed-role session and which role it was minted from.
+service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
 # `db_data_sources`: the shared directory the database control planes record a
 # minted DB resource id in, which is how this service decides whether a request's
 # `ServiceType` is the service that owns the addressed data source.

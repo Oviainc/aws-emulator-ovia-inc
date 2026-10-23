@@ -17,7 +17,9 @@
 //!   `Json document too large.  Size is <size>, max allowed: <max>`, whose `<size>` is
 //!   the STATE the document carries — its `desired` and `reported` nodes as canonical
 //!   JSON — so the framing the client wrapped that state in, and the whitespace it
-//!   spaced the request out with, change neither the size reported nor the verdict.
+//!   spaced the request out with, change neither the size reported nor the verdict. The
+//!   verdict on a document's size is the SERVICE's at every size: no ceiling of the
+//!   emulator's own answers it first, however far past the quota the entity is.
 //!
 //! Each table row varies what the rule generalises over — operation, status, condition,
 //! shadow naming, topic form, payload form, document size, whitespace — and no row is
@@ -31,10 +33,12 @@ use crate::shadow_and_retained_message::{Answer, Harness};
 /// document" (8 KB).
 const MAX_DOCUMENT_BYTES: usize = 8 * 1024;
 
-/// This emulator's own ceiling on the request entity it will read as a state document,
-/// as `state::MAX_SHADOW_REQUEST_ENTITY_BYTES` declares it: eight times the state
-/// quota, so the document can be parsed before its state is weighed.
-const MAX_REQUEST_ENTITY_BYTES: usize = 8 * MAX_DOCUMENT_BYTES;
+/// This emulator reads a state document of ANY size the transport delivers: there is no
+/// emulator-chosen ceiling in front of the service's own quota, so a document far past
+/// the quota still gets the service's `Json document too large.  …` verdict rather than
+/// a cap of the emulator's. This is the size the OLD ceiling sat at, kept as a row of the
+/// table so the rule is asserted across it.
+const PAST_ANY_EMULATOR_CEILING: usize = 8 * MAX_DOCUMENT_BYTES;
 
 /// Whether `value` has the 8-4-4-4-12 hexadecimal shape a `traceId` carries.
 fn is_uuid_shaped(value: &str) -> bool {
@@ -736,6 +740,10 @@ async fn the_reported_document_size_is_the_state_the_document_carries() {
             (MAX_DOCUMENT_BYTES, true),
             (MAX_DOCUMENT_BYTES + 1, false),
             (MAX_DOCUMENT_BYTES + 4_096, false),
+            // Past where an emulator-chosen read ceiling used to sit: the verdict and
+            // the message are still the SERVICE's, built from the measured state.
+            (PAST_ANY_EMULATOR_CEILING + 1, false),
+            (2 * PAST_ANY_EMULATOR_CEILING, false),
         ]
         .into_iter()
         .enumerate()
@@ -793,34 +801,30 @@ async fn the_reported_document_size_is_the_state_the_document_carries() {
     }
 
     // A payload the service cannot read as a document is not weighed against the
-    // state quota at all: it has no state. One past the quota but within the
-    // emulator's read ceiling is therefore the invalid-json rejection.
-    let not_json = vec![b'q'; MAX_DOCUMENT_BYTES + 11];
-    let answer = harness.update("sized-not-json", None, not_json).await;
-    assert_failure_envelope(
-        "a payload past the quota that is not JSON",
-        &answer,
-        400,
-        "InvalidRequestException",
-        "Payload contains invalid json",
-    );
-
-    // Above the emulator's OWN ceiling on the entity it will read, the request is
-    // refused before it is parsed — and the refusal names the cap as the emulator's
-    // rather than borrowing the service's quota template.
-    let past_ceiling = vec![b'q'; MAX_REQUEST_ENTITY_BYTES + 1];
-    let answer = harness.update("sized-past-ceiling", None, past_ceiling).await;
-    assert_failure_envelope(
-        "an entity past the emulator's read ceiling",
-        &answer,
-        413,
-        "RequestEntityTooLargeException",
-        &format!(
-            "this emulator reads a state document of at most {MAX_REQUEST_ENTITY_BYTES} bytes, \
-             and this request would need {}",
-            MAX_REQUEST_ENTITY_BYTES + 1
+    // state quota at all: it has no state. That holds at any size — one past the quota,
+    // and one past where an emulator read ceiling used to refuse unparsed entities — so
+    // both are the invalid-json rejection.
+    for (case, length) in [
+        (
+            "a payload past the quota that is not JSON",
+            MAX_DOCUMENT_BYTES + 11,
         ),
-    );
+        (
+            "a payload past any emulator ceiling that is not JSON",
+            PAST_ANY_EMULATOR_CEILING + 1,
+        ),
+    ] {
+        let not_json = vec![b'q'; length];
+        let thing = format!("sized-not-json-{length}");
+        let answer = harness.update(&thing, None, not_json).await;
+        assert_failure_envelope(
+            case,
+            &answer,
+            400,
+            "InvalidRequestException",
+            "Payload contains invalid json",
+        );
+    }
 
     // An update whose MERGED state would exceed the limit is refused the same way,
     // reporting the state that merge would leave stored, and leaves the stored

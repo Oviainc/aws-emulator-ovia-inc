@@ -117,6 +117,17 @@ fn requests(service_type: &str, identifier: &str, report_id: &str) -> Vec<(&'sta
             }),
         ),
         (
+            "DescribeDimensionKeys",
+            json!({
+                "ServiceType": service_type,
+                "Identifier": identifier,
+                "StartTime": T0,
+                "EndTime": T0 + 3_600.0,
+                "Metric": "db.load.avg",
+                "GroupBy": {"Group": "db.sql"},
+            }),
+        ),
+        (
             "CreatePerformanceAnalysisReport",
             json!({
                 "ServiceType": service_type,

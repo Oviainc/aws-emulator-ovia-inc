@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetIntegration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetIntegration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetIntegration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the [`crate::state::Integration`] record its api holds under the
+//! requested `IntegrationId`. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -235,18 +228,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetIntegration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetIntegrationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetIntegration"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in the assembled emulator — see the note in `create_api`.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "GetIntegration",
+            ));
+        };
+        let store = state.lock();
+
+        // An integration is addressed by the api that owns it AND its own id, so an id
+        // that names an integration of ANOTHER api is not found here either.
+        let stored = store
+            .apis
+            .get(&input.api_id)
+            .and_then(|api| api.integrations.get(&input.integration_id));
+        let Some(stored) = stored.map(crate::state::Integration::to_wire) else {
+            return Err(GetIntegrationErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(format!(
+                        "Invalid Integration identifier specified {}:{}",
+                        ::engine::emulator_account_id(),
+                        input.integration_id
+                    )),
+                    resource_type: ::std::option::Option::None,
+                },
+            )
+            .into());
+        };
+
+        Ok(GetIntegrationOutput {
+            api_gateway_managed: stored.api_gateway_managed,
+            connection_id: stored.connection_id,
+            connection_type: stored.connection_type,
+            content_handling_strategy: stored.content_handling_strategy,
+            credentials_arn: stored.credentials_arn,
+            description: stored.description,
+            integration_id: stored.integration_id,
+            integration_method: stored.integration_method,
+            integration_response_selection_expression: stored
+                .integration_response_selection_expression,
+            integration_subtype: stored.integration_subtype,
+            integration_type: stored.integration_type,
+            integration_uri: stored.integration_uri,
+            passthrough_behavior: stored.passthrough_behavior,
+            payload_format_version: stored.payload_format_version,
+            request_parameters: stored.request_parameters,
+            request_templates: stored.request_templates,
+            response_parameters: stored.response_parameters,
+            template_selection_expression: stored.template_selection_expression,
+            timeout_in_millis: stored.timeout_in_millis,
+            tls_config: stored.tls_config,
+        })
     }
 }
