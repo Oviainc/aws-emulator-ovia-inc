@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UntagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UntagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UntagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the tag keys of the request from the resource the `Resource` ARN names, in
+//! the single record the store holds for that resource.
+//!
+//! The rule: a Lambda tag set belongs to the resource its ARN names, and
+//! `UntagResource` removes from it exactly the keys the request lists — a key the
+//! resource carries is dropped with its value, a key it does not carry is a NO-OP
+//! rather than a refusal (nothing is left to remove), and every key the request does
+//! not list is left exactly as it was. The resources it can name are the ones
+//! `ListTags` reports on (see [`crate::state::resolve_resource_tags`]): an ARN that
+//! qualifies a function with a version or an alias names no tag set (`Resource`'s own
+//! documentation: "Lambda does not support adding tags to function aliases or
+//! versions"), and an ARN naming a resource this account does not hold is refused as
+//! not found.
 //!
 //! ## Shape of an operation
 //!
@@ -169,18 +174,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UntagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UntagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UntagResource"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UntagResourceErrorModeled::ServiceException(ServiceException {
+                r#type: None,
+                message: Some("Lambda state is not reachable on this engine".to_string()),
+            })
+            .into());
+        };
+        let region = crate::state::request_region(ctx);
+
+        let mut store = state.lock();
+        // The one tag map the store holds for the named resource — the same map
+        // `TagResource` writes and `ListTags` reports, never a second copy.
+        let tags = crate::state::resolve_resource_tags(
+            &mut store,
+            &input.resource,
+            &region,
+            ::std::time::SystemTime::now(),
+        )
+        .map_err(refusal)?;
+
+        // Remove exactly the keys the request lists. A key the resource does not carry
+        // leaves the set as it is: there is nothing to remove, and the request asked for
+        // nothing else.
+        for key in &input.tag_keys {
+            tags.remove(key);
+        }
+
+        Ok(UntagResourceOutput)
+    }
+}
+
+/// The modelled error a `Resource` that names no tag set is refused with.
+///
+/// The two failures are the two answers AWS gives for this path label: a value carrying
+/// no tag set at all is a 400 `InvalidParameterValueException`, and a well-formed ARN for
+/// a resource this account does not hold is a 404 `ResourceNotFoundException`.
+fn refusal(failure: crate::state::TagResolveFailure) -> UntagResourceErrorModeled {
+    match failure {
+        crate::state::TagResolveFailure::Invalid(message) => {
+            UntagResourceErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    r#type: None,
+                    message: Some(message),
+                },
+            )
+        }
+        crate::state::TagResolveFailure::NotFound(message) => {
+            UntagResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                r#type: None,
+                message: Some(message),
+            })
+        }
     }
 }

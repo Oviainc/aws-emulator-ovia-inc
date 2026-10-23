@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Adds the tags of the request to the resource the `Resource` ARN names, in the single
+//! record the store holds for that resource.
+//!
+//! The rule: a Lambda tag set belongs to the resource its ARN names, and `TagResource`
+//! MERGES into it — a key the request names is stored with the value the request gives
+//! it, replacing whatever that key held before, and a key the request does not name is
+//! left exactly as it was, so two callers tagging one resource with different keys both
+//! keep their tags. The resources it can name are the ones `ListTags` reports on (see
+//! [`crate::state::resolve_resource_tags`]): an ARN that qualifies a function with a
+//! version or an alias names no tag set (`Resource`'s own documentation: "Lambda does
+//! not support adding tags to function aliases or versions"), and an ARN naming a
+//! resource this account does not hold is refused as not found.
+//!
+//! A resource carries at most [`crate::state::MAX_TAGS_PER_RESOURCE`] tags, so a request
+//! that would leave it holding more is refused WHOLE — the resource keeps the tag set it
+//! had, rather than the prefix of the request that still fitted.
 //!
 //! ## Shape of an operation
 //!
@@ -169,18 +177,80 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(TagResourceErrorModeled::ServiceException(ServiceException {
+                r#type: None,
+                message: Some("Lambda state is not reachable on this engine".to_string()),
+            })
+            .into());
+        };
+        let region = crate::state::request_region(ctx);
+
+        let mut store = state.lock();
+        // The one tag map the store holds for the named resource — the same map
+        // `ListTags` reports and `CreateFunction` filled in, never a second copy.
+        let tags = crate::state::resolve_resource_tags(
+            &mut store,
+            &input.resource,
+            &region,
+            ::std::time::SystemTime::now(),
+        )
+        .map_err(refusal)?;
+
+        // The resource's own tag count is what the published limit bounds, so what counts
+        // is the set the merge would LEAVE behind: a key the resource already carries is
+        // replaced rather than added.
+        let added = input
+            .tags
+            .keys()
+            .filter(|key| !tags.contains_key(key.as_str()))
+            .count();
+        let merged = tags.len().saturating_add(added);
+        if merged > crate::state::MAX_TAGS_PER_RESOURCE {
+            return Err(TagResourceErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    r#type: None,
+                    message: Some(format!(
+                        "Tags may not exceed {limit} per resource. The request would leave \
+                         '{resource}' with {merged} tags.",
+                        limit = crate::state::MAX_TAGS_PER_RESOURCE,
+                        resource = input.resource,
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Merge: every key the request names takes the value the request gives it, and
+        // every other key the resource carries is left alone.
+        for (key, value) in &input.tags {
+            tags.insert(key.clone(), value.clone());
+        }
+
+        Ok(TagResourceOutput)
+    }
+}
+
+/// The modelled error a `Resource` that names no tag set is refused with.
+///
+/// The two failures are the two answers AWS gives for this path label: a value carrying
+/// no tag set at all is a 400 `InvalidParameterValueException`, and a well-formed ARN for
+/// a resource this account does not hold is a 404 `ResourceNotFoundException`.
+fn refusal(failure: crate::state::TagResolveFailure) -> TagResourceErrorModeled {
+    match failure {
+        crate::state::TagResolveFailure::Invalid(message) => {
+            TagResourceErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    r#type: None,
+                    message: Some(message),
+                },
+            )
+        }
+        crate::state::TagResolveFailure::NotFound(message) => {
+            TagResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                r#type: None,
+                message: Some(message),
+            })
+        }
     }
 }

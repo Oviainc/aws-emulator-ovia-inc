@@ -590,8 +590,12 @@ async fn every_lambda_signed_request_is_dispatched_instead_of_refused_as_ambiguo
             "",
         ),
         (
-            // The shared tagging path, control-plane side: its own `TagResource` is still
-            // scaffolded, so the owner's answer is the scaffold's 501.
+            // The shared tagging path, control-plane side: this change implements the
+            // control plane's own `TagResource` (see
+            // `services/service-com-amazonaws-lambda-awsgirapiservice/src/ops/tag_resource.rs`),
+            // so the owner of this path now answers its own modelled 204 for the function
+            // the first row created, rather than the scaffold's 501 — still a response
+            // only the control plane can produce.
             "tags: TagResource on a function",
             "POST",
             format!(
@@ -599,8 +603,8 @@ async fn every_lambda_signed_request_is_dispatched_instead_of_refused_as_ambiguo
                 label("arn:aws:lambda:us-east-1:000000000000:function:routing-check")
             ),
             json!({"Tags": {"team": "routing"}}),
-            501,
-            "NotImplemented",
+            204,
+            "",
         ),
         (
             // The shared tagging path, MicroVMs side. This row is what distinguishes the

@@ -12,8 +12,8 @@
 //! does not support adding tags to function aliases or versions"), and an ARN naming a
 //! resource the account does not have is refused as not found. It is a `@readonly`
 //! report, so the only write it performs is through
-//! [`crate::state::resolve_function`], which materialises the lifecycle transition the
-//! clock already owed.
+//! [`crate::state::resolve_resource_tags`], which materialises the lifecycle transition
+//! the clock already owed.
 //!
 //! Tags are held per resource on the record the store keeps for it —
 //! [`crate::state::FunctionRecord::tags`] for a function, which is where
@@ -161,151 +161,52 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let region = crate::state::request_region(ctx);
 
-        // The `Resource` pattern has already been enforced at the boundary, so the value
-        // here is one of the resource ARNs it admits; the parse says WHICH.
-        let named = crate::state::parse_taggable_resource(&input.resource).ok_or_else(|| {
-            ListTagsErrorModeled::InvalidParameterValueException(InvalidParameterValueException {
-                r#type: None,
-                message: Some(format!(
-                    "1 validation error detected: Value '{}' at 'resource' failed to satisfy \
-                     constraint: Member must be the Amazon Resource Name of a Lambda resource",
-                    input.resource
-                )),
-            })
-        })?;
-
-        let name = match named {
-            crate::state::TaggableResourceRef::Function(name) => name,
-            // "Lambda does not support adding tags to function aliases or versions", so a
-            // qualified function ARN names no tag set to report, however the qualifier is
-            // spelled.
-            crate::state::TaggableResourceRef::FunctionQualifier { qualifier, .. } => {
-                return Err(ListTagsErrorModeled::InvalidParameterValueException(
-                    InvalidParameterValueException {
-                        r#type: None,
-                        message: Some(format!(
-                            "Tags are not supported for a function version or alias. The resource \
-                             '{}' qualifies the function with '{qualifier}'; specify the \
-                             unqualified function ARN instead.",
-                            input.resource
-                        )),
-                    },
-                )
-                .into())
-            }
-            // A capacity provider is the other taggable resource this store holds, so
-            // its tag set is reported out of its own record exactly as a function's is.
-            crate::state::TaggableResourceRef::CapacityProvider(provider) => {
-                let store = state.lock();
-                let Some(record) = store.capacity_providers.get(&provider) else {
-                    return Err(ListTagsErrorModeled::ResourceNotFoundException(
-                        ResourceNotFoundException {
-                            r#type: None,
-                            message: Some(format!(
-                                "The resource you requested does not exist: no capacity \
-                                 provider is held for '{}'",
-                                input.resource
-                            )),
-                        },
-                    )
-                    .into());
-                };
-                return Ok(ListTagsOutput {
-                    tags: Some(
-                        record
-                            .tags
-                            .iter()
-                            .map(|(key, value)| (key.clone(), value.clone()))
-                            .collect(),
-                    ),
-                });
-            }
-            // An event source mapping is the other taggable resource this store holds —
-            // `CreateEventSourceMapping` persists "a list of tags to apply to the event
-            // source mapping" — so its tag set is reported out of its own record too.
-            crate::state::TaggableResourceRef::EventSourceMapping(uuid) => {
-                let store = state.lock();
-                let Some(record) = store.event_source_mappings.get(&uuid) else {
-                    return Err(ListTagsErrorModeled::ResourceNotFoundException(
-                        ResourceNotFoundException {
-                            r#type: None,
-                            message: Some(format!(
-                                "The resource you requested does not exist: no event source \
-                                 mapping is held for '{}'",
-                                input.resource
-                            )),
-                        },
-                    )
-                    .into());
-                };
-                return Ok(ListTagsOutput {
-                    tags: Some(
-                        record
-                            .tags
-                            .iter()
-                            .map(|(key, value)| (key.clone(), value.clone()))
-                            .collect(),
-                    ),
-                });
-            }
-            // A taggable Lambda resource of another type. This store holds records of
-            // functions, capacity providers and event source mappings only — every
-            // operation that would mint a code-signing configuration or a network
-            // connector is still a scaffold — so no resource of that type exists to
-            // report tags for, which is what the modelled not-found answers. See
-            // [`crate::state::parse_taggable_resource`]: whoever implements one of
-            // those creates turns this branch into a lookup against its records.
-            crate::state::TaggableResourceRef::Other(resource_type) => {
-                return Err(ListTagsErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        r#type: None,
-                        message: Some(format!(
-                            "The resource you requested does not exist: no {resource_type} is \
-                             held for '{}'",
-                            input.resource
-                        )),
-                    },
-                )
-                .into())
-            }
-        };
-
         let mut store = state.lock();
-        let (record, _version) = crate::state::resolve_function(
+        // The one tag map the store holds for the named resource — the same map
+        // `TagResource` writes and `CreateFunction` filled in, never a second copy. The
+        // borrow is mutable because that is what the shared resolver hands out; nothing
+        // here writes through it, so two reads in a row report the same tag set.
+        let tags = crate::state::resolve_resource_tags(
             &mut store,
-            &name,
-            None,
+            &input.resource,
             &region,
             ::std::time::SystemTime::now(),
         )
-        .map_err(|failure| match failure {
-            crate::state::ResolveFailure::Malformed(message) => {
-                ListTagsErrorModeled::InvalidParameterValueException(
-                    InvalidParameterValueException {
-                        r#type: None,
-                        message: Some(message),
-                    },
-                )
-            }
-            crate::state::ResolveFailure::NotFound(message) => {
-                ListTagsErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                    r#type: None,
-                    message: Some(message),
-                })
-            }
-        })?;
+        .map_err(refusal)?;
 
-        // Tags are function-level, so what is reported is the one tag set the record
-        // holds — empty when the function carries none, which is a value the operation
-        // reports rather than a member it omits: "Returns a function['s] ... tags".
+        // Tags belong to the resource, so what is reported is the one tag set its record
+        // holds — empty when it carries none, which is a value the operation reports
+        // rather than a member it omits: "Returns a function['s] ... tags".
         Ok(ListTagsOutput {
             tags: Some(
-                record
-                    .tags
-                    .iter()
+                tags.iter()
                     .map(|(key, value)| (key.clone(), value.clone()))
                     .collect(),
             ),
         })
+    }
+}
+
+/// The modelled error a `Resource` that names no tag set is refused with.
+///
+/// The two failures are the two answers AWS gives for this path label: a value carrying
+/// no tag set at all is a 400 `InvalidParameterValueException`, and a well-formed ARN for
+/// a resource this account does not hold is a 404 `ResourceNotFoundException`.
+fn refusal(failure: crate::state::TagResolveFailure) -> ListTagsErrorModeled {
+    match failure {
+        crate::state::TagResolveFailure::Invalid(message) => {
+            ListTagsErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    r#type: None,
+                    message: Some(message),
+                },
+            )
+        }
+        crate::state::TagResolveFailure::NotFound(message) => {
+            ListTagsErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                r#type: None,
+                message: Some(message),
+            })
+        }
     }
 }
