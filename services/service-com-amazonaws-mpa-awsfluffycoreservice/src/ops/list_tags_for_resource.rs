@@ -4,8 +4,12 @@
 //! Reports the tags a stored resource carries, read out of [`crate::state`] — the same
 //! map `TagResource` writes, so the tags this returns are exactly the ones recorded.
 //!
-//! Two rules this handler enforces beyond the modelled constraints:
+//! Three rules this handler enforces beyond the modelled constraints, in this order:
 //!
+//! * `ResourceArn` is modelled as a bare `String` (`@length(max: 1000)`, NO pattern), so
+//!   the boundary validator passes a value that is not an ARN at all. Such a value names
+//!   no resource, so it earns the modelled `ValidationException` (400) before anything
+//!   else is decided — see [`crate::state::invalid_arn`].
 //! * An ARN outside the caller's own account earns `AccessDeniedException` (403),
 //!   decided before the resource is resolved — see [`crate::state::authorize_resource_arn`].
 //! * An ARN no stored resource carries earns the modelled `ResourceNotFoundException`

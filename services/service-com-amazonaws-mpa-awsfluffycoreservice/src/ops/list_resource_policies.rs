@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListResourcePolicies
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListResourcePolicies`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListResourcePolicies::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the policies attached to the resource `ResourceArn` names, out of this
+//! service's store — for an approval team, the `Policies` its record holds, in
+//! attachment order, each resolved through the policy catalog by the same resolver
+//! `GetResourcePolicy` uses, so the two reads cannot disagree.
+//!
+//! `ResourceArn` is modelled as a bare `String` (`@length(max: 1000)`, no pattern), so
+//! the boundary validator passes ANY string. The outcomes, decided in this order:
+//!
+//! * not a well-formed ARN — the modelled `ValidationException` (400) with the one
+//!   message this service states for the malformed-ARN class
+//!   ([`crate::state::invalid_arn`]), refused before anything is looked up;
+//! * well formed but outside the caller's account — `AccessDeniedException` (403),
+//!   whatever is stored under it ([`crate::state::authorize_resource_arn`]);
+//! * well formed, in the caller's account, naming no stored resource —
+//!   `ResourceNotFoundException` (404).
+//!
+//! A read: it reports what the store holds and changes nothing a later caller sees,
+//! beyond the clock-owed changes `materialize_due` materialises for every handler.
 //!
 //! ## Shape of an operation
 //!
@@ -161,18 +171,95 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListResourcePolicies` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListResourcePoliciesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListResourcePolicies"))
+        // Nothing in this answer depends on request metadata: the resource is named by
+        // the ARN itself.
+        let _ = ctx;
+
+        // `ResourceArn` is a plain `String` with `length(max: 1000)` and NO modelled
+        // pattern, so the boundary validator passes a value that is not an ARN at all:
+        // this service's own ARN rule refuses it here, with the one message it states
+        // for the malformed-ARN class (`crate::state::invalid_arn`, 400). It is decided
+        // BEFORE the account boundary and before any lookup, so a client can tell "the
+        // ARN is not an ARN" (400) from "not permitted" (403) and "does not exist" (404).
+        if !crate::state::is_well_formed_arn(&input.resource_arn) {
+            return Err(ListResourcePoliciesErrorModeled::ValidationException(
+                crate::state::invalid_arn(),
+            )
+            .into());
+        }
+        crate::state::authorize_resource_arn(Self::NAME, &input.resource_arn)
+            .map_err(ListResourcePoliciesErrorModeled::AccessDeniedException)?;
+
+        // The token is this service's own: how many of the resource's policies the
+        // previous pages already reported. Anything else never came from here.
+        let already_reported = match input.next_token.as_deref().filter(|t| !t.is_empty()) {
+            None => 0usize,
+            Some(token) => token.parse::<usize>().map_err(|_| {
+                ListResourcePoliciesError::Modeled(
+                    ListResourcePoliciesErrorModeled::ValidationException(ValidationException {
+                        message: "NextToken is not a token this service issued.".to_string(),
+                    }),
+                )
+            })?,
+        };
+        // `MaxResults` is modelled `range(1..20)` with `default: 20`, so the boundary
+        // validator has already closed it; the clamp only keeps the slice width sane.
+        let page_size =
+            usize::try_from(input.max_results.clamp(1, crate::state::MAX_LIST_PAGE)).unwrap_or(1);
+
+        let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListResourcePoliciesError::Modeled(
+                ListResourcePoliciesErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the approval-team store is unavailable".to_string(),
+                    },
+                ),
+            )
+        })?;
+        let mut state = store.lock();
+        state.materialize_due(::std::time::SystemTime::now());
+
+        // The attachments of the resource, resolved through the catalog by the one
+        // resolver the resource-policy reads share, so this page and `GetResourcePolicy`
+        // report the same policy for the same attachment.
+        let Some(attached) = state.resource_policies(&input.resource_arn) else {
+            // The one sentence every ARN-addressed lookup of this service answers with
+            // (`crate::state::resource_not_found`); the tag family's verbatim-ARN
+            // message is that family's, not this read's.
+            return Err(ListResourcePoliciesErrorModeled::ResourceNotFoundException(
+                crate::state::resource_not_found(),
+            )
+            .into());
+        };
+
+        let remaining = attached.len().saturating_sub(already_reported);
+        let reported = remaining.min(page_size);
+        let page: Vec<ListResourcePoliciesResponseResourcePolicy> = attached
+            .iter()
+            .skip(already_reported)
+            .take(reported)
+            .map(entry)
+            .collect();
+        let next_token = (remaining > reported).then(|| (already_reported + reported).to_string());
+
+        Ok(ListResourcePoliciesOutput {
+            resource_policies: Some(page),
+            next_token,
+        })
+    }
+}
+
+/// One `ListResourcePolicies` entry for a policy attached to the resource.
+///
+/// Every member is the attachment's own, as [`crate::state::ResourcePolicy`] resolved it
+/// out of the catalog: `PolicyArn` is the policy's `UnqualifiedPolicyArn` (the ARN "for
+/// policy", not for the version the attachment pins), and the name and type are the
+/// catalog entry's, so a listed entry cannot disagree with the policy the catalog holds
+/// or with what `GetResourcePolicy` answers for the same attachment.
+fn entry(policy: &crate::state::ResourcePolicy) -> ListResourcePoliciesResponseResourcePolicy {
+    ListResourcePoliciesResponseResourcePolicy {
+        policy_arn: Some(policy.policy_arn.clone()),
+        policy_type: Some(policy.policy_type.as_wire().to_string()),
+        policy_name: Some(policy.policy_name.clone()),
     }
 }

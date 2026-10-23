@@ -6,8 +6,12 @@
 //! that key, and every key the resource carries that the request does not name is left
 //! alone. A following `ListTagsForResource` reports exactly the merged set.
 //!
-//! Three rules this handler enforces beyond the modelled constraints:
+//! Four rules this handler enforces beyond the modelled constraints:
 //!
+//! * `ResourceArn` is a bare `String` with no modelled pattern, so a value that is not
+//!   an ARN at all reaches the handler; it names no resource and earns the modelled
+//!   `ValidationException` (400) before anything else is decided — see
+//!   [`crate::state::invalid_arn`].
 //! * The resource must exist: an ARN no stored resource carries earns the modelled
 //!   `ResourceNotFoundException` (404), and existence is decided BEFORE the tag count
 //!   is, so a resource that does not exist is never reported as over its tag limit.

@@ -228,8 +228,9 @@ impl Harness {
         team.deletion_completion_time = Some(SystemTime::now() - Duration::from_secs(1));
     }
 
-    /// The tags recorded for a stored team. `ListTagsForResource` is still a stub (its
-    /// own gap issue), so the store is the only reader.
+    /// The tags recorded for a stored team, read straight out of the store. The wire
+    /// reader (`ListTagsForResource`) is exercised in `resource_arn_reads.rs`; these
+    /// tables assert what `CreateApprovalTeam` recorded.
     fn stored_tags(&self, arn: &str) -> Vec<(String, String)> {
         let store = state::service_state(&*self.engine).expect("the service store");
         let guard = store.lock();

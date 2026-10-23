@@ -25,6 +25,8 @@ mod policy_version_detail;
 mod policy_versions;
 #[path = "all/rejection_wording.rs"]
 mod rejection_wording;
+#[path = "all/resource_arn_reads.rs"]
+mod resource_arn_reads;
 #[path = "all/resource_policies.rs"]
 mod resource_policies;
 #[path = "all/resource_tags.rs"]
