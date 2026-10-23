@@ -37,10 +37,10 @@ use crate::ops::types::{
     MetricsConfig, ModelCardSecurityConfig, ModelClientConfig, ModelLifeCycle, ModelMetrics,
     ModelPackageModelCard, ModelPackageSecurityConfig, ModelPackageStatusDetails,
     ModelPackageStatusItem, ModelPackageValidationSpecification, NetworkConfig,
-    ParallelismConfiguration, ProcessingInput, ProcessingOutputConfig, ProcessingResources,
-    ProcessingStoppingCondition, ProductionVariant, ProductionVariantSummary, ResourceSpec,
-    SourceAlgorithmSpecification, Tag, TransformInput, TransformOutput, TransformResources,
-    UserContext, VpcConfig,
+    ParallelismConfiguration, Parameter, ProcessingInput, ProcessingOutputConfig,
+    ProcessingResources, ProcessingStoppingCondition, ProductionVariant, ProductionVariantSummary,
+    ResourceSpec, SelectiveExecutionConfig, SourceAlgorithmSpecification, Tag, TransformInput,
+    TransformOutput, TransformResources, UserContext, VpcConfig,
 };
 
 /// The ARN service namespace (`arnNamespace` in the model's `aws.api#service` trait,
@@ -193,6 +193,56 @@ const PIPELINE_CONDITION_STEP_TYPE: &str = "Condition";
 /// The version id a pipeline carries from the moment it is created. `UpdatePipeline`
 /// mints later ones; nothing here does yet, so a created pipeline has exactly this one.
 pub const PIPELINE_INITIAL_VERSION: i64 = 1;
+
+/// `PipelineExecutionStatus`'s members (`smithy_query(query="shape",
+/// shape="PipelineExecutionStatus")` answers `Executing`, `Stopping`, `Stopped`,
+/// `Failed`, `Succeeded` and `CompletedWithFailures`). Named here so no handler compares
+/// a bare string literal; the two an execution this emulator starts ever reports are
+/// the non-terminal one it begins in and the terminal one [`PIPELINE_EXECUTION_NOT_RUN`]
+/// explains.
+pub const PIPELINE_EXECUTION_STATUS_EXECUTING: &str = "Executing";
+/// See [`PIPELINE_EXECUTION_STATUS_EXECUTING`].
+pub const PIPELINE_EXECUTION_STATUS_FAILED: &str = "Failed";
+
+/// The most steps one selective run may name, and the least.
+///
+/// `SelectedStepList` is modelled `len 1..50`
+/// (`smithy_query(query="shape",shape="SelectiveExecutionConfig")`), so a longer or an
+/// empty list is outside the model. The bound is restated here because it is what keeps
+/// the step-membership check, and the size of the record the run persists, proportional
+/// to the model rather than to the request's own length.
+pub const MIN_SELECTED_STEPS: usize = 1;
+/// See [`MIN_SELECTED_STEPS`].
+pub const MAX_SELECTED_STEPS: usize = 50;
+
+/// How long after `StartPipelineExecution` the clock owes the execution's terminal
+/// status.
+///
+/// Same contract as [`PROCESSING_JOB_ENDS_AFTER`]: a caller that describes the execution
+/// straight after starting it still observes `Executing`, one that waits observes the
+/// terminal status. The span is the emulator's own, compressed and never zero, and the
+/// due instant is stored rather than slept on.
+pub const PIPELINE_EXECUTION_ENDS_AFTER: Duration = Duration::from_millis(400);
+
+/// Why an execution this emulator started ends [`PIPELINE_EXECUTION_STATUS_FAILED`].
+///
+/// A pipeline's steps are training, processing, transform, Lambda and callback work run
+/// outside SageMaker's control plane, and this emulator has no runtime that performs any
+/// of it. So an accepted execution is never reported `Succeeded`: nothing ran its steps,
+/// and a success status, a step list or an output artifact for work nothing performed
+/// would be fabricated. The execution instead ends in the modelled failure state with
+/// this reason, which says exactly that. Within the modelled
+/// `PipelineExecutionFailureReason` length (0..1300).
+pub const PIPELINE_EXECUTION_NOT_RUN: &str =
+    "The pipeline execution was accepted but no step of it ran: this emulator has no \
+     runtime that performs a pipeline step's work (training, processing, transform, \
+     Lambda or callback), so the execution ended Failed rather than reporting work that \
+     did not happen.";
+
+/// See [`MODEL_QUOTA`]. Bounds the pipeline-execution store, so a caller starting
+/// executions cannot grow it without end; `StartPipelineExecution` refuses past it with
+/// the modelled `ResourceLimitExceeded`.
+pub const PIPELINE_EXECUTION_QUOTA: usize = 1_000;
 
 /// How deeply a pipeline definition's steps may nest (a condition step's branches hold
 /// steps, which may themselves be condition steps). A bound, so a definition cannot
@@ -621,10 +671,74 @@ pub struct Pipeline {
     pub client_request_token: String,
     pub creation_time: SystemTime,
     pub last_modified_time: SystemTime,
-    /// When an execution of this pipeline last started. `None` until one has, which is
-    /// every pipeline here: this slice of the emulator runs no executions.
+    /// When an execution of this pipeline last started, which is what
+    /// `StartPipelineExecution` stamps; `None` until one has.
     pub last_run_time: Option<SystemTime>,
     pub removal_due_at: Option<SystemTime>,
+}
+
+/// One execution of a pipeline, started by `StartPipelineExecution` and replayed by
+/// `DescribePipelineExecution`.
+///
+/// Keyed in the store by its own ARN (`<pipeline arn>/execution/<id>`), the only
+/// identifier `DescribePipelineExecution` resolves one by, the way the lineage stores
+/// here are keyed by the ARN their create mints.
+///
+/// `ends_at` is the instant the clock owes the execution's terminal status; it is
+/// stored, never slept on, and materialised by [`PipelineExecution::settle_status`].
+#[derive(Debug, Clone)]
+pub struct PipelineExecution {
+    pub arn: String,
+    /// The `PipelineName` this execution belongs to — the pipeline store's key, so the
+    /// record is found again when the pipeline is deleted or the pipeline's executions
+    /// are enumerated.
+    pub pipeline_name: String,
+    pub pipeline_arn: String,
+    pub display_name: Option<String>,
+    pub description: Option<String>,
+    pub status: String,
+    pub failure_reason: Option<String>,
+    /// The parameter values the start call supplied, each naming a parameter the stored
+    /// definition declares.
+    pub parameters: Vec<Parameter>,
+    pub parallelism_configuration: Option<ParallelismConfiguration>,
+    pub selective_execution_config: Option<SelectiveExecutionConfig>,
+    pub pipeline_version_id: i64,
+    /// The `MlflowExperimentName` the start call supplied, which is the only member of
+    /// the reported `MLflowConfig` this emulator knows: it serves no MLflow tracking
+    /// server, so no resource ARN is invented beside it.
+    pub mlflow_experiment_name: Option<String>,
+    /// The `ClientRequestToken` the starting call presented, so a retry of that very
+    /// call completes "no more than one time" as the member documents.
+    pub client_request_token: String,
+    pub created_by: UserContext,
+    pub creation_time: SystemTime,
+    pub last_modified_time: SystemTime,
+    pub ends_at: SystemTime,
+}
+
+impl PipelineExecution {
+    /// Materialise the move out of `Executing` the clock already owes.
+    ///
+    /// This is the one write a reporting operation may make: the move was due at
+    /// `ends_at` whether or not anybody described the execution, so the observer makes
+    /// no difference to the result. `LastModifiedTime` takes the instant the move was
+    /// due, not "now", so it is stable across later reads.
+    ///
+    /// The terminal status is [`PIPELINE_EXECUTION_STATUS_FAILED`] with
+    /// [`PIPELINE_EXECUTION_NOT_RUN`]: see that constant for why an execution this
+    /// emulator accepted cannot end `Succeeded`.
+    ///
+    /// Answers whether the transition happened on this call, so the caller can record it.
+    pub fn settle_status(&mut self, now: SystemTime) -> bool {
+        if self.status == PIPELINE_EXECUTION_STATUS_EXECUTING && now >= self.ends_at {
+            self.status = PIPELINE_EXECUTION_STATUS_FAILED.to_string();
+            self.failure_reason = Some(PIPELINE_EXECUTION_NOT_RUN.to_string());
+            self.last_modified_time = self.ends_at;
+            return true;
+        }
+        false
+    }
 }
 
 /// A batch transform job created by `CreateTransformJob`, as `DescribeTransformJob`
@@ -1115,6 +1229,10 @@ pub struct ComAmazonawsSagemakerSagemakerState {
     pub endpoints: BTreeMap<String, Endpoint>,
     /// Keyed by `PipelineName`.
     pub pipelines: BTreeMap<String, Pipeline>,
+    /// Pipeline executions, keyed by `PipelineExecutionArn` — the one identifier
+    /// `DescribePipelineExecution` resolves an execution by, and the one
+    /// `StartPipelineExecution` mints.
+    pub pipeline_executions: BTreeMap<String, PipelineExecution>,
     /// Keyed by `TransformJobName`.
     pub transform_jobs: BTreeMap<String, TransformJob>,
     /// Keyed by `MlflowAppArn` — the app's ARN is its identity, since the model
@@ -1198,6 +1316,29 @@ impl ComAmazonawsSagemakerSagemakerState {
         self.pipelines.len() < PIPELINE_QUOTA
     }
 
+    /// Whether another pipeline execution fits, i.e. the store is below
+    /// [`PIPELINE_EXECUTION_QUOTA`].
+    pub fn pipeline_executions_below_quota(&self) -> bool {
+        self.pipeline_executions.len() < PIPELINE_EXECUTION_QUOTA
+    }
+
+    /// The execution of `pipeline_name` the `ClientRequestToken` `token` started, if one
+    /// is still stored.
+    ///
+    /// How `StartPipelineExecution` completes "no more than one time": a retry of a
+    /// start call answers the execution that call started rather than starting a second
+    /// one. The token is scoped to the pipeline, so the same token under another
+    /// pipeline's name starts that pipeline's own execution.
+    pub fn pipeline_execution_by_token(
+        &self,
+        pipeline_name: &str,
+        token: &str,
+    ) -> Option<&PipelineExecution> {
+        self.pipeline_executions.values().find(|execution| {
+            execution.pipeline_name == pipeline_name && execution.client_request_token == token
+        })
+    }
+
     /// Drop every pipeline whose removal the clock already owes.
     ///
     /// `DeletePipeline` starts an asynchronous removal: the pipeline reports
@@ -1209,9 +1350,23 @@ impl ComAmazonawsSagemakerSagemakerState {
     ///
     /// Keeps whatever the clock does not owe yet, dropping the rest in one pass — no
     /// caller needs the names it removed, so none is collected.
+    /// A pipeline's executions go with it: an execution belongs to the pipeline that ran
+    /// it, so once the pipeline is gone its executions are no longer resolvable either —
+    /// and leaving them would let a pipeline recreated under the freed name inherit the
+    /// executions of the one deleted before it.
     pub fn settle_pipeline_deletions(&mut self, now: SystemTime) {
-        self.pipelines
-            .retain(|_, pipeline| pipeline.removal_due_at.is_none_or(|at| now < at));
+        let mut removed: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        self.pipelines.retain(|name, pipeline| {
+            let keep = pipeline.removal_due_at.is_none_or(|at| now < at);
+            if !keep {
+                removed.insert(name.clone());
+            }
+            keep
+        });
+        if !removed.is_empty() {
+            self.pipeline_executions
+                .retain(|_, execution| !removed.contains(&execution.pipeline_name));
+        }
     }
 
     /// Whether another transform job fits, i.e. the store is below
@@ -1497,6 +1652,61 @@ fn too_many_steps(declared: usize) -> String {
         "PipelineDefinition declares {declared} steps, more than the {PIPELINE_MAX_STEPS} \
          steps one pipeline definition may hold"
     )
+}
+
+/// `<pipeline arn>/execution/<id>` — the one `PipelineExecutionArn` form this service
+/// mints, and the form the modelled pattern
+/// `^arn:aws[a-z\-]*:sagemaker:[a-z0-9\-]*:[0-9]{12}:pipeline\/.*\/execution\/.*$`
+/// describes: an execution's ARN extends the ARN of the pipeline it runs.
+pub fn pipeline_execution_arn(pipeline_arn: &str, execution_id: &str) -> String {
+    format!("{pipeline_arn}/execution/{execution_id}")
+}
+
+/// Every step name a pipeline definition declares, in declaration order, counting the
+/// steps nested in a condition step's branches — the one namespace a step name lives in.
+///
+/// Reads the SAME walk `pipeline_definition_violation` validates with, so what a stored
+/// definition declares is never computed twice from two readings of the schema. A
+/// definition the walk cannot resolve declares nothing addressable, so the answer is
+/// then whatever it resolved before the violation; a definition that reached the store
+/// was accepted by that validator, so this walk reports none.
+pub fn pipeline_definition_step_names(definition: &str) -> Vec<String> {
+    let Ok(parsed) = ::serde_json::from_str::<::serde_json::Value>(definition) else {
+        return Vec::new();
+    };
+    let Some(steps) = parsed.get("Steps").and_then(::serde_json::Value::as_array) else {
+        return Vec::new();
+    };
+    let mut declared = DeclaredSteps::default();
+    let _ = collect_pipeline_steps(steps, 1, &mut declared);
+    declared
+        .steps
+        .iter()
+        .map(|step| step.name.to_string())
+        .collect()
+}
+
+/// Every parameter name a pipeline definition declares, in declaration order.
+///
+/// A definition's optional top-level `Parameters` list is what names the parameters an
+/// execution may assign values to — `Parameter$Name`'s model doc: "This parameter name
+/// must match a named parameter in the pipeline definition." A definition declaring no
+/// `Parameters` names none, so every value a start call supplies for it is unmatched.
+pub fn pipeline_definition_parameter_names(definition: &str) -> Vec<String> {
+    let Ok(parsed) = ::serde_json::from_str::<::serde_json::Value>(definition) else {
+        return Vec::new();
+    };
+    parsed
+        .get("Parameters")
+        .and_then(::serde_json::Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| entry.get("Name").and_then(::serde_json::Value::as_str))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// One step of a pipeline definition, reduced to what the dependency graph is built
