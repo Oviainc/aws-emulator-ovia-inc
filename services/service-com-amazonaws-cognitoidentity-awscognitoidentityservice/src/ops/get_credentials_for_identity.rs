@@ -4,16 +4,18 @@
 //! Issues session credentials for a stored identity, from the emulator's own credential
 //! store, and holds them for the identity until they expire.
 //!
-//! ## What this slice does not resolve yet: roles
+//! ## Which role the session stands for
 //!
 //! The credentials a real identity pool vends are the pool's authenticated or
 //! unauthenticated ROLE, chosen through `SetIdentityPoolRoles` and its role mappings,
-//! and `CustomRoleArn` picks one of those mapped roles. `Set`/`GetIdentityPoolRoles`
-//! are still scaffolded (HTTP 501), so this service holds no roles to resolve: a request
-//! naming a `CustomRoleArn` is answered with the modelled
-//! `InvalidIdentityPoolConfigurationException` (HTTP 400) — the error the real service
-//! raises when the pool has no role for the request — rather than silently vending a
-//! session the caller did not ask for.
+//! and `CustomRoleArn` picks one of those mapped roles. This emulator calls no STS and
+//! vends no role-scoped session: the session it issues is the identity's own and does
+//! not stand for one role rather than another. What it does enforce is the pool's stored
+//! configuration — a `CustomRoleArn` the pool names, as one of its two roles or as a role
+//! a mapping rule resolves to, is accepted, and one the pool does not name is answered
+//! with the modelled `InvalidIdentityPoolConfigurationException` (HTTP 400), the error
+//! the real service raises when it has no role for the request, rather than with a
+//! session that ignores the member.
 //!
 //! `Logins` selects WHICH provider token is exchanged for the session. This emulator
 //! verifies no provider token (it issues none), so the session it vends is the
@@ -203,32 +205,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
 
-        if !store.identities.contains_key(&input.identity_id) {
+        let Some(identity) = store.identities.get(&input.identity_id) else {
             return Err(GetCredentialsForIdentityErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(format!("Identity '{}' not found.", input.identity_id)),
                 },
             )
             .into());
-        }
+        };
+        let identity_pool_id = identity.identity_pool_id.clone();
 
-        // A custom role can only be honoured against the pool's role mappings, and this
-        // slice stores none (`SetIdentityPoolRoles` is not implemented), so the request is
-        // refused with the error the real service raises for a pool that has no role for
-        // it rather than answered with a session that ignores the member.
-        if input.custom_role_arn.is_some() {
-            return Err(
-                GetCredentialsForIdentityErrorModeled::InvalidIdentityPoolConfigurationException(
-                    InvalidIdentityPoolConfigurationException {
-                        message: Some(
-                            "A CustomRoleArn cannot be resolved: the identity pool has no role \
-                             mappings configured."
-                                .to_string(),
-                        ),
-                    },
-                )
-                .into(),
-            );
+        // A custom role can only be honoured against the roles the pool has stored, so a
+        // role the pool does not name is refused with the error the real service raises
+        // for a pool that has no role for the request, rather than answered with a session
+        // that ignores the member.
+        if let Some(custom_role_arn) = &input.custom_role_arn {
+            let names_the_role = store
+                .identity_pool_roles
+                .get(&identity_pool_id)
+                .is_some_and(|configured| configured.names_role_arn(custom_role_arn));
+            if !names_the_role {
+                return Err(
+                    GetCredentialsForIdentityErrorModeled::InvalidIdentityPoolConfigurationException(
+                        InvalidIdentityPoolConfigurationException {
+                            message: Some(format!(
+                                "The CustomRoleArn '{custom_role_arn}' is not a role of identity \
+                                 pool '{identity_pool_id}'."
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
         }
 
         // Every session whose window the clock has closed is forgotten here — by this

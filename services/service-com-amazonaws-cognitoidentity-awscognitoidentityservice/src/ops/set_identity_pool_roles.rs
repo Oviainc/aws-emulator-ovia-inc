@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SetIdentityPoolRoles
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SetIdentityPoolRoles`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! REPLACES the role configuration of a stored identity pool — its `authenticated` /
+//! `unauthenticated` role ARNs and its per-provider role mappings — so
+//! `GetIdentityPoolRoles` reports back exactly what was set, and the pool's previous
+//! configuration is gone rather than merged into.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SetIdentityPoolRoles::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A role is refused unless it is an IAM role ARN, and a role mapping unless it carries
+//! what the model documents as required for its `Type`; both are
+//! `InvalidParameterException` (HTTP 400), the modelled error for a bad input parameter.
 //!
 //! ## Shape of an operation
 //!
@@ -83,6 +82,11 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// The keys `RolesMap` admits, from the modelled `RoleType`'s own pattern
+/// `^(un)?authenticated$` (`smithy_query(query="shape",shape="RolesMap")`), which the
+/// `Roles` doc states as "either \"authenticated\" or \"unauthenticated\"".
+const ROLE_TYPES: &[&str] = &["authenticated", "unauthenticated"];
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -175,20 +179,150 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SetIdentityPoolRoles` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SetIdentityPoolRolesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SetIdentityPoolRoles"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(SetIdentityPoolRolesErrorModeled::InternalErrorException(
+                InternalErrorException {
+                    message: Some("the identity-pool store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+        if !store.identity_pools.contains_key(&input.identity_pool_id) {
+            return Err(SetIdentityPoolRolesErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "IdentityPool '{}' not found.",
+                        input.identity_pool_id
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Every refusal below is decided BEFORE anything is written, so a rejected call
+        // leaves the pool's previous configuration exactly as it was.
+        let roles = validated_roles(&input.roles)?;
+        let role_mappings = match &input.role_mappings {
+            Some(role_mappings) => Some(validated_role_mappings(role_mappings)?),
+            None => None,
+        };
+
+        // The whole configuration is replaced: the roles and the mappings this call did
+        // not carry are no longer configured for the pool.
+        store.identity_pool_roles.insert(
+            input.identity_pool_id,
+            crate::state::IdentityPoolRoles {
+                roles,
+                role_mappings,
+            },
+        );
+        Ok(SetIdentityPoolRolesOutput)
     }
+}
+
+/// The `Roles` map as it will be stored, or the modelled refusal for the first entry that
+/// does not name an IAM role.
+fn validated_roles(
+    roles: &::std::collections::HashMap<String, String>,
+) -> Result<::std::collections::BTreeMap<String, String>, SetIdentityPoolRolesError> {
+    let mut validated = ::std::collections::BTreeMap::new();
+    // Ordered, so which entry a multi-entry map is refused for does not depend on the
+    // iteration order of the request's map.
+    let mut entries: Vec<(&String, &String)> = roles.iter().collect();
+    entries.sort_by_key(|(role_type, _)| *role_type);
+    for (role_type, role_arn) in entries {
+        if !ROLE_TYPES.contains(&role_type.as_str()) {
+            return Err(invalid_parameter(format!(
+                "Roles key '{role_type}' is not valid: the key must be one of {}.",
+                ROLE_TYPES.join(", ")
+            )));
+        }
+        if !crate::state::is_iam_role_arn(role_arn) {
+            return Err(invalid_parameter(format!(
+                "Roles['{role_type}'] value '{role_arn}' is not a valid IAM role ARN."
+            )));
+        }
+        validated.insert(role_type.clone(), role_arn.clone());
+    }
+    Ok(validated)
+}
+
+/// The `RoleMappings` map as it will be stored, or the modelled refusal for the first
+/// mapping that is not complete for its `Type`.
+fn validated_role_mappings(
+    role_mappings: &::std::collections::HashMap<String, RoleMapping>,
+) -> Result<::std::collections::BTreeMap<String, RoleMapping>, SetIdentityPoolRolesError> {
+    let mut validated = ::std::collections::BTreeMap::new();
+    let mut entries: Vec<(&String, &RoleMapping)> = role_mappings.iter().collect();
+    entries.sort_by_key(|(provider, _)| *provider);
+    for (provider, mapping) in entries {
+        if !ROLE_MAPPING_TYPE_VALUES.contains(&mapping.r#type.as_str()) {
+            return Err(invalid_parameter(format!(
+                "RoleMappings['{provider}'].Type '{}' is not valid: the type must be one of {}.",
+                mapping.r#type,
+                ROLE_MAPPING_TYPE_VALUES.join(", ")
+            )));
+        }
+        // `RoleMapping$AmbiguousRoleResolution`, from the model: "If you specify Token or
+        // Rules as the Type, AmbiguousRoleResolution is required." `RoleMappingType` is
+        // exactly those two values, so it is required for every mapping.
+        match mapping.ambiguous_role_resolution.as_deref() {
+            None => {
+                return Err(invalid_parameter(format!(
+                    "RoleMappings['{provider}'].AmbiguousRoleResolution is required when Type \
+                     is '{}'.",
+                    mapping.r#type
+                )));
+            }
+            Some(resolution) if !AMBIGUOUS_ROLE_RESOLUTION_TYPE_VALUES.contains(&resolution) => {
+                return Err(invalid_parameter(format!(
+                    "RoleMappings['{provider}'].AmbiguousRoleResolution '{resolution}' is not \
+                     valid: it must be one of {}.",
+                    AMBIGUOUS_ROLE_RESOLUTION_TYPE_VALUES.join(", ")
+                )));
+            }
+            Some(_) => {}
+        }
+        // `RoleMapping$RulesConfiguration`, from the model: "If you specify Rules as the
+        // role mapping type, RulesConfiguration is required."
+        if mapping.r#type == "Rules" && mapping.rules_configuration.is_none() {
+            return Err(invalid_parameter(format!(
+                "RoleMappings['{provider}'].RulesConfiguration is required when Type is 'Rules'."
+            )));
+        }
+        if let Some(configuration) = &mapping.rules_configuration {
+            if configuration.rules.len() > crate::state::MAX_RULES_PER_IDENTITY_PROVIDER {
+                return Err(invalid_parameter(format!(
+                    "RoleMappings['{provider}'].RulesConfiguration.Rules carries {} rules: at \
+                     most {} rules can be specified per identity provider.",
+                    configuration.rules.len(),
+                    crate::state::MAX_RULES_PER_IDENTITY_PROVIDER
+                )));
+            }
+            for (position, rule) in configuration.rules.iter().enumerate() {
+                if !crate::state::is_iam_role_arn(&rule.role_arn) {
+                    return Err(invalid_parameter(format!(
+                        "RoleMappings['{provider}'].RulesConfiguration.Rules[{position}].RoleARN \
+                         '{}' is not a valid IAM role ARN.",
+                        rule.role_arn
+                    )));
+                }
+            }
+        }
+        validated.insert(provider.clone(), mapping.clone());
+    }
+    Ok(validated)
+}
+
+/// The modelled refusal for a bad input parameter (HTTP 400), carrying what was wrong
+/// with the request.
+fn invalid_parameter(message: String) -> SetIdentityPoolRolesError {
+    SetIdentityPoolRolesErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(message),
+    })
+    .into()
 }

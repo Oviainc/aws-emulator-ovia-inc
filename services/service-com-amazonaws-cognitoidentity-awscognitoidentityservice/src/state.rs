@@ -8,7 +8,7 @@
 //! wire shapes live in `crate::ops::types` and each handler builds its own output from
 //! the record it read.
 
-use crate::ops::types::CognitoIdentityProvider;
+use crate::ops::types::{CognitoIdentityProvider, RoleMapping};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
@@ -61,6 +61,44 @@ pub struct IdentityPool {
     pub identity_pool_tags: Option<BTreeMap<String, String>>,
 }
 
+/// The most mapping rules one identity provider may carry, from the model's own doc for
+/// `RulesConfigurationType$Rules`: "An array of rules. You can specify up to 25 rules per
+/// identity provider." (`smithy_query(query="shape",shape="RulesConfigurationType")`).
+/// The modelled `length 1..400` on the list is wider, so the documented per-provider
+/// ceiling is the service's own rule and is enforced where the rules are written.
+pub const MAX_RULES_PER_IDENTITY_PROVIDER: usize = 25;
+
+/// The role configuration of one identity pool, as `SetIdentityPoolRoles` wrote it and
+/// `GetIdentityPoolRoles` reports it. `SetIdentityPoolRoles` replaces the whole
+/// configuration, so one record holds everything a pool's roles consist of.
+#[derive(Debug, Clone, Default)]
+pub struct IdentityPoolRoles {
+    /// `authenticated` / `unauthenticated` -> role ARN, keyed by the modelled `RoleType`.
+    /// Ordered, so a read reports the same map twice.
+    pub roles: BTreeMap<String, String>,
+    /// Identity-provider name -> its role mapping. `None` when the call that wrote this
+    /// record carried no `RoleMappings`, so a read reports exactly what was stored rather
+    /// than an empty map the caller never sent.
+    pub role_mappings: Option<BTreeMap<String, RoleMapping>>,
+}
+
+impl IdentityPoolRoles {
+    /// Whether this configuration names `role_arn` — as one of the pool's two roles, or
+    /// as the role a mapping rule resolves to. This is the set of roles the pool can vend
+    /// credentials for, which is what a `CustomRoleArn` has to be drawn from.
+    pub fn names_role_arn(&self, role_arn: &str) -> bool {
+        self.roles.values().any(|arn| arn == role_arn)
+            || self.role_mappings.iter().flatten().any(|(_, mapping)| {
+                mapping.rules_configuration.iter().any(|configuration| {
+                    configuration
+                        .rules
+                        .iter()
+                        .any(|rule| rule.role_arn == role_arn)
+                })
+            })
+    }
+}
+
 /// A stored identity, as `GetId` minted it. `logins` holds the PROVIDER NAMES the
 /// identity is linked to, which is what the modelled `IdentityDescription$Logins` list
 /// carries.
@@ -88,6 +126,10 @@ pub struct IssuedCredentials {
 pub struct ComAmazonawsCognitoidentityAwscognitoidentityserviceState {
     /// Pools by `IdentityPoolId`.
     pub identity_pools: HashMap<String, IdentityPool>,
+    /// The roles of a pool, by `IdentityPoolId`, as `SetIdentityPoolRoles` wrote them. A
+    /// pool with no entry has had no `SetIdentityPoolRoles` call, which is an EMPTY role
+    /// configuration, not a missing pool.
+    pub identity_pool_roles: HashMap<String, IdentityPoolRoles>,
     /// Identities by `IdentityId`.
     pub identities: HashMap<String, Identity>,
     /// The identities of one pool, in the order `GetId` minted them, so a paginated
@@ -227,6 +269,7 @@ impl ComAmazonawsCognitoidentityAwscognitoidentityserviceState {
     /// whose credentials the caller must now forget. `None` when no such pool is stored.
     pub fn delete_identity_pool(&mut self, identity_pool_id: &str) -> Option<Vec<String>> {
         self.identity_pools.remove(identity_pool_id)?;
+        self.identity_pool_roles.remove(identity_pool_id);
         let identity_ids = self
             .identities_by_pool
             .remove(identity_pool_id)
@@ -325,6 +368,36 @@ fn is_region_like(region: &str) -> bool {
         && region
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+/// Whether `arn` is an IAM ROLE ARN —
+/// `arn:<partition>:iam::<12-digit-account-id>:role/<path and name>` — which is what the
+/// modelled `ARNString` carries wherever this service names a role (`RolesMap`'s value
+/// and `MappingRule$RoleARN`, both documented "the Role ARN"). `ARNString` constrains
+/// only the length (20..2048), so the ARN's own form is the service's rule and is checked
+/// where a role is written.
+pub fn is_iam_role_arn(arn: &str) -> bool {
+    let mut fields = arn.splitn(6, ':');
+    let (Some("arn"), Some(partition), Some("iam"), Some(""), Some(account), Some(resource)) = (
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+    ) else {
+        return false;
+    };
+    let partition_is_named = !partition.is_empty()
+        && partition
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-');
+    // An AWS account id is twelve digits.
+    let account_is_an_id = account.len() == 12 && account.bytes().all(|b| b.is_ascii_digit());
+    let names_a_role = resource
+        .strip_prefix("role/")
+        .is_some_and(|path_and_name| !path_and_name.is_empty() && !path_and_name.ends_with('/'));
+    partition_is_named && account_is_an_id && names_a_role
 }
 
 /// An opaque pagination token naming the pool it was minted for and the item a page
