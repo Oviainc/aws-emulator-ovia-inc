@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetLambdaFunctionRecommendations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetLambdaFunctionRecommendations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetLambdaFunctionRecommendations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the Lambda function recommendations Compute Optimizer holds for an
+//! account — for every observed function version the request selects, the recommendation
+//! [`crate::state::ObservedFunction::to_recommendation`] derives from that function's stored
+//! configuration and metric samples, one page at a time. REPORTING only: Compute Optimizer
+//! has no API that creates a recommendation, so this call writes nothing.
+//!
+//! A request narrows the answer three ways, each applied before the page is cut:
+//! `accountIds` (one account, the caller's own), `functionArns` (the function VERSIONS it
+//! names — unqualified is `$LATEST`, qualified is the version its suffix carries) and
+//! `filters` (the derived `Finding` and `FindingReasonCode`). Functions the analysis reached
+//! no finding for are withheld unless a `Finding` filter names `Unavailable`, as the model's
+//! own `finding` documentation states.
 //!
 //! ## Shape of an operation
 //!
@@ -176,18 +180,266 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetLambdaFunctionRecommendations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetLambdaFunctionRecommendationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetLambdaFunctionRecommendations"))
+        // Compute Optimizer is a REGIONAL service, so the request addresses ONE region's
+        // endpoint: the functions it asks about are that region's, and the ARNs its answer
+        // names carry that region.
+        let region = crate::state::request_region(ctx);
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                GetLambdaFunctionRecommendationsErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(
+                            "The Compute Optimizer recommendation store is unavailable."
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // Every malformed request is refused before the store is read, so
+        // InvalidParameterValueException takes precedence over the opt-in gate below, as it
+        // does in this service's other readers; so is every request that asks about an
+        // account this service cannot answer for (see [`foreign_account`]).
+        let account_id = requested_account_id(input.account_ids.as_deref())?;
+        let requested_functions =
+            requested_functions(input.function_arns.as_deref(), &account_id, &region)?;
+        let filters = input.filters.clone().unwrap_or_default();
+        if let Some(reason) = crate::state::lambda_filter_rejection(&filters) {
+            return Err(invalid_parameter(reason));
+        }
+        let include_unavailable = crate::state::lambda_filters_ask_for_unavailable(&filters);
+        let resume_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match crate::state::decode_resource_page_token(token) {
+                Some(function_arn) => Some(function_arn),
+                None => {
+                    return Err(invalid_parameter(
+                        "The value supplied for parameter nextToken is not valid.".to_string(),
+                    ))
+                }
+            },
+        };
+        // `maxResults` is modelled 0..1000 (the boundary refuses anything outside that).
+        // Whatever it asks for, the page is capped at `MAX_PAGE_SIZE` so no number a request
+        // carries can size the response or the allocation that builds it; and a request
+        // naming no size (or naming the range's lower bound `0`, which the service documents
+        // no meaning for) gets `DEFAULT_PAGE_SIZE` plus a `nextToken` to walk the rest, the
+        // same rule this service's other 0..1000-paged readers follow.
+        let page_size = input
+            .max_results
+            .and_then(|requested| usize::try_from(requested).ok())
+            .filter(|requested| *requested > 0)
+            .unwrap_or(crate::state::DEFAULT_PAGE_SIZE)
+            .min(crate::state::MAX_PAGE_SIZE);
+
+        let guard = state.lock();
+        // "The account is not opted in to Compute Optimizer": the service analyses an
+        // account's resources only once it has opted in, so an account that never did — or
+        // that opted back out — reads no recommendations at all.
+        if !guard.enrollment.is_opted_in() {
+            return Err(
+                GetLambdaFunctionRecommendationsErrorModeled::OptInRequiredException(
+                    OptInRequiredException {
+                        message: Some(
+                            "The account is not opted in to Compute Optimizer.".to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The look-back period in force for this account's Lambda functions decides which
+        // samples each recommendation analyses, so it is resolved once per request through
+        // this service's ONE resolution. Compute Optimizer does not let a `lookBackPeriod`
+        // preference be set for the `LambdaFunction` resource type (see
+        // `PutRecommendationPreferences`), so no stored record can move it off the service
+        // default — resolving it here rather than naming the default is what keeps that a
+        // property of the preference rules instead of a second rule stated here.
+        let look_back_period = guard
+            .effective_look_back_period(crate::state::SOURCE_TYPE_LAMBDA_FUNCTION, &account_id);
+
+        // When these recommendations were last generated: the analysis the account's
+        // enrollment started, which came due one analysis span after the enrollment record
+        // was written. Derived from the store, so every read reports the same instant — the
+        // same rule this service's other recommendation readers report their refresh with.
+        let last_refresh_timestamp = guard.enrollment.last_updated_timestamp.map(|written| {
+            ::aws_smithy_types::DateTime::from_secs_f64(
+                written.as_secs_f64() + crate::state::ANALYSIS_DELAY.as_secs_f64(),
+            )
+        });
+
+        // The functions this request asks about: the account's whole observed inventory in
+        // this Region — which a caller sees only once the analysis its enrollment started is
+        // due — or exactly the ones the named ARNs pick out of it. A well-formed function
+        // ARN this service observes no function for selects nothing: this operation models
+        // no per-resource error list, so an ARN it holds no recommendation for is simply
+        // ABSENT from the answer.
+        let selected: Vec<&crate::state::ObservedFunction> = guard
+            .visible_functions()
+            .filter(|function| function.account_id == account_id)
+            .filter(|function| {
+                requested_functions
+                    .as_ref()
+                    .is_none_or(|wanted| wanted.contains(&function.arn_resource()))
+            })
+            .collect();
+
+        // The recommendation is computed first and filtered second: `Finding` and
+        // `FindingReasonCode` filter on what this service DERIVED, not on anything the
+        // request supplied — and both depend on the look-back period, so neither can be
+        // known earlier.
+        let matching: Vec<LambdaFunctionRecommendation> = selected
+            .into_iter()
+            .map(|function| {
+                function.to_recommendation(&region, &look_back_period, last_refresh_timestamp)
+            })
+            .filter(|recommendation| {
+                recommendation
+                    .function_arn
+                    .as_deref()
+                    .is_some_and(|arn| resume_at.as_deref().is_none_or(|start| arn >= start))
+            })
+            // "Functions with a finding of unavailable are not returned unless you specify
+            // the filter parameter with a value of Unavailable in your
+            // GetLambdaFunctionRecommendations request."
+            .filter(|recommendation| {
+                include_unavailable
+                    || recommendation.finding.as_deref()
+                        != Some(crate::state::LAMBDA_FINDING_UNAVAILABLE)
+            })
+            .filter(|recommendation| {
+                crate::state::lambda_recommendation_matches_filters(recommendation, &filters)
+            })
+            .collect();
+
+        // One page, plus the function the next page starts at when recommendations remain.
+        let next_token = matching.get(page_size).and_then(|recommendation| {
+            recommendation
+                .function_arn
+                .as_deref()
+                .map(crate::state::encode_resource_page_token)
+        });
+        let lambda_function_recommendations = matching.into_iter().take(page_size).collect();
+
+        Ok(GetLambdaFunctionRecommendationsOutput {
+            next_token,
+            lambda_function_recommendations: Some(lambda_function_recommendations),
+        })
     }
+}
+
+/// What this operation answers when a `functionArns` entry is not a Lambda function ARN: a
+/// constant refusal naming the parameter's subject, as the real service words it — it states
+/// the member that is wrong, not the value the request carried, the same way
+/// `GetEBSVolumeRecommendations` refuses a value that is not a volume ARN.
+const INVALID_FUNCTION_ARN_MESSAGE: &str = "Invalid Lambda function ARN.";
+
+/// A 400 `InvalidParameterValueException` — "The value supplied for the input parameter is
+/// out of range or not valid" — carrying why this request's value is not.
+fn invalid_parameter(message: String) -> GetLambdaFunctionRecommendationsError {
+    GetLambdaFunctionRecommendationsErrorModeled::InvalidParameterValueException(
+        InvalidParameterValueException {
+            message: Some(message),
+        },
+    )
+    .into()
+}
+
+/// What this operation answers when a request asks about an account other than the one this
+/// service answers for: the real service's constant refusal, which names neither the member
+/// nor the account — it states the permission that is missing and how an organization
+/// account gets it. Worded exactly as this service's other findings readers word it, so one
+/// cannot drift from another.
+fn foreign_account() -> GetLambdaFunctionRecommendationsError {
+    invalid_parameter(
+        "Invalid permission to access another account. If this is an organization account, \
+         request the management account to enable service access."
+            .to_string(),
+    )
+}
+
+/// The account whose recommendations this request asks for: the one id `accountIds` carries,
+/// or the caller's own account when it carries none.
+///
+/// "Only one account ID can be specified per request"
+/// (`GetLambdaFunctionRecommendations$accountIds`), and an `AccountId` is a 12-digit Amazon
+/// Web Services account id (`Scope$value`), so anything else is refused rather than silently
+/// answered for the caller. An id that is well-formed but names another account is refused
+/// by [`foreign_account`]: this emulator presents one standalone account
+/// (`::engine::emulator_account_id`) and records no organization, so no other account is a
+/// member account it can be asked about.
+fn requested_account_id(
+    account_ids: Option<&[String]>,
+) -> Result<String, GetLambdaFunctionRecommendationsError> {
+    let account_ids = account_ids.unwrap_or_default();
+    if account_ids.len() > 1 {
+        return Err(invalid_parameter(format!(
+            "The value supplied for parameter accountIds is not valid: only one account ID can \
+             be specified per request, not {}.",
+            account_ids.len(),
+        )));
+    }
+    match account_ids.first() {
+        None => Ok(::engine::emulator_account_id().to_string()),
+        Some(account_id) => {
+            if !crate::state::is_account_id(account_id) {
+                return Err(invalid_parameter(format!(
+                    "The value supplied for parameter accountIds is not valid: {account_id} is \
+                     not a 12-digit Amazon Web Services account ID."
+                )));
+            }
+            if account_id != ::engine::emulator_account_id() {
+                return Err(foreign_account());
+            }
+            Ok(account_id.clone())
+        }
+    }
+}
+
+/// The function VERSIONS this request asks about, by the resource part of their ARN, or
+/// `None` when it names none and so asks about the account's whole inventory in this Region.
+///
+/// Every entry has to be a Lambda function ARN — `functionArns` is "the Amazon Resource Name
+/// (ARN) of the functions for which to return recommendations" — so anything else is
+/// refused with [`INVALID_FUNCTION_ARN_MESSAGE`], and one that names another account's
+/// function with [`foreign_account`]. An
+/// unqualified ARN names the `$LATEST` version and a qualified one the version its suffix
+/// carries, which is why the selection is by ARN RESOURCE part
+/// ([`crate::state::ObservedFunction::arn_resource`]) rather than by function name. An ARN of
+/// ANOTHER Region names a function this regional endpoint does not observe, so it selects
+/// nothing, exactly as an unknown function of this Region does.
+fn requested_functions(
+    function_arns: Option<&[String]>,
+    account_id: &str,
+    region: &str,
+) -> Result<Option<Vec<String>>, GetLambdaFunctionRecommendationsError> {
+    let Some(function_arns) = function_arns else {
+        return Ok(None);
+    };
+    let mut selected = Vec::new();
+    for arn in function_arns {
+        let Some(function) = crate::state::parse_function_arn(arn) else {
+            return Err(invalid_parameter(INVALID_FUNCTION_ARN_MESSAGE.to_string()));
+        };
+        if function.account_id != account_id {
+            return Err(foreign_account());
+        }
+        if function.region != region {
+            continue;
+        }
+        selected.push(
+            if function.function_version == crate::state::LATEST_FUNCTION_VERSION {
+                format!("function:{}", function.function_name)
+            } else {
+                format!(
+                    "function:{}:{}",
+                    function.function_name, function.function_version
+                )
+            },
+        );
+    }
+    Ok(Some(selected))
 }
