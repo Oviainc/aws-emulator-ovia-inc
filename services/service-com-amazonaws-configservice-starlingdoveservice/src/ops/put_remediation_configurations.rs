@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutRemediationConfigurations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutRemediationConfigurations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Adds or updates the remediation configuration of each Config rule the request
+//! carries in [`crate::state`], minting the configuration's ARN on the first write
+//! for a rule and keeping it across later ones. `DescribeRemediationConfigurations`
+//! reads them back.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutRemediationConfigurations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Two failure classes, deliberately answered through different channels:
+//!
+//! * a configuration that is not a usable remediation AS ASKED FOR — a parameter that
+//!   selects neither or both of its two value kinds, or no value for the role the
+//!   remediation runs as — refuses the WHOLE request with the modelled
+//!   `InvalidParameterValueException`, because nothing about the account's state could
+//!   have made that item succeed and a caller has to resend it either way;
+//! * a configuration that is well formed but names a Config rule this account does not
+//!   hold is a FAILED ITEM of the batch, reported in `FailedBatches` with its reason
+//!   and persisted nowhere, because it depends on state the caller can fix for that one
+//!   item (create the rule) and its siblings' writes are unaffected.
 //!
 //! ## Shape of an operation
 //!
@@ -169,18 +176,90 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutRemediationConfigurations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutRemediationConfigurationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutRemediationConfigurations"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE)
+        })?;
+
+        // Every remediation configuration needs the role the remediation runs as, and
+        // a parameter Config cannot resolve at remediation time is no parameter at
+        // all. Both refuse the whole request: this is the configuration being unusable
+        // as asked for, not one item of the batch failing against the account's state.
+        for requested in &input.remediation_configurations {
+            if let Some((parameter, wrong)) = crate::state::ill_formed_parameter(requested) {
+                return Err(
+                    PutRemediationConfigurationsErrorModeled::InvalidParameterValueException(
+                        InvalidParameterValueException {
+                            message: Some(format!(
+                                "RemediationConfiguration for Config rule '{}' carries \
+                                 parameter '{parameter}' with {wrong}; a \
+                                 RemediationParameterValue selects either a static value or a \
+                                 dynamic (resource) value",
+                                requested.config_rule_name.trim(),
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            if !crate::state::has_assume_role(requested) {
+                let accepted = crate::state::assume_role_parameter_names(requested.automatic);
+                return Err(
+                    PutRemediationConfigurationsErrorModeled::InvalidParameterValueException(
+                        InvalidParameterValueException {
+                            message: Some(format!(
+                                "RemediationConfiguration for Config rule '{}' must provide the \
+                                 role the remediation runs as: Parameters carries no value for \
+                                 {}",
+                                requested.config_rule_name.trim(),
+                                accepted.join(" or "),
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        let region = crate::state::request_region(ctx);
+        let mut store = state.lock();
+
+        // Each configuration is written on its own, so one failed item does not cost
+        // the others their write; the failures come back as the batch's
+        // `FailedBatches`, each with the reason that item failed.
+        let mut failed_batches: Vec<FailedRemediationBatch> = Vec::new();
+        for requested in &input.remediation_configurations {
+            let name = requested.config_rule_name.trim();
+
+            // "The Config rule must already exist for you to add a remediation
+            // configuration."
+            if !store.config_rules.contains_key(name) {
+                failed_batches.push(FailedRemediationBatch {
+                    failure_message: Some(crate::state::no_such_config_rule_message(name)),
+                    failed_items: Some(vec![requested.clone()]),
+                });
+                continue;
+            }
+
+            if let Some(existing) = store.remediation_configurations.get_mut(name) {
+                // An update keeps the id and ARN the configuration was created with.
+                existing.update_from(requested);
+            } else {
+                let sequence = store.next_remediation_configuration_seq;
+                // A u64 counter cannot be exhausted by API calls, so it never reissues
+                // an id; saturating rather than wrapping keeps that true by
+                // construction.
+                store.next_remediation_configuration_seq = sequence.saturating_add(1);
+                let id = crate::state::mint_remediation_configuration_id(sequence);
+                let arn = crate::state::remediation_configuration_arn(&region, name, &id);
+                store.remediation_configurations.insert(
+                    name.to_string(),
+                    crate::state::RemediationConfigurationEntry::new(id, arn, requested),
+                );
+            }
+        }
+
+        Ok(PutRemediationConfigurationsOutput {
+            failed_batches: Some(failed_batches),
+        })
     }
 }

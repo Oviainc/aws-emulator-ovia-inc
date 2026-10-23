@@ -2,7 +2,8 @@
 
 //! @op DeleteConfigRule
 //! Removes a Config rule from [`crate::state`], so the next `DescribeConfigRules` no
-//! longer returns it.
+//! longer returns it, and refuses the delete while a remediation action is still
+//! associated with the rule.
 //!
 //! ## Shape of an operation
 //!
@@ -174,10 +175,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE)
         })?;
 
-        let name = input.config_rule_name;
+        // Keyed on the TRIMMED name, the way every other handler of this service
+        // keys a rule, so the two maps are looked up under the same key the write
+        // stored the rule under.
+        let name = input.config_rule_name.trim().to_string();
         let mut store = state.lock();
 
-        if store.config_rules.remove(&name).is_none() {
+        if !store.config_rules.contains_key(&name) {
             return Err(DeleteConfigRuleErrorModeled::NoSuchConfigRuleException(
                 NoSuchConfigRuleException {
                     message: Some(crate::state::no_such_config_rule_message(&name)),
@@ -185,6 +189,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+
+        // "For DeleteConfigRule, a remediation action is associated with the rule and
+        // Config cannot delete this rule. Delete the remediation action associated
+        // with the rule before deleting the rule" (`ResourceInUseException`). The rule
+        // therefore outlives the delete, and its remediation configuration is never
+        // orphaned by one.
+        if store.remediation_configurations.contains_key(&name) {
+            return Err(DeleteConfigRuleErrorModeled::ResourceInUseException(
+                ResourceInUseException {
+                    message: Some(format!(
+                        "A remediation action is associated with the Config rule '{name}' and \
+                         Config cannot delete this rule. Delete the remediation action \
+                         associated with the rule before deleting the rule and try your request \
+                         again later."
+                    )),
+                },
+            )
+            .into());
+        }
+
+        store.config_rules.remove(&name);
 
         Ok(DeleteConfigRuleOutput)
     }
