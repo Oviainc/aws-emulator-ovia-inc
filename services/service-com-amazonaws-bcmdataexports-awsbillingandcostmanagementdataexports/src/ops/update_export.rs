@@ -160,14 +160,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // request is checked against. The lock is released before the submitted
         // definition is read, so no caller-supplied SQL is ever parsed while the store is
         // held and one caller's statement cannot stall another's request.
+        //
+        // The miss goes through `crate::state::export_not_found_error`, the one place that
+        // states the status this service answers the not-found condition with.
         let stored_name = {
             let store = state.lock();
             store
                 .exports
                 .get(&input.export_arn)
                 .ok_or_else(|| {
-                    UpdateExportErrorModeled::ResourceNotFoundException(
-                        crate::state::export_not_found(&input.export_arn),
+                    crate::state::export_not_found_error(
+                        &input.export_arn,
+                        UpdateExportErrorModeled::ResourceNotFoundException,
                     )
                 })?
                 .export
@@ -210,20 +214,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             },
         )?;
 
+        // The definition is stored with the table configuration IN FORCE, the same way a
+        // create's is, so the stored query carries each published property of the tables
+        // it names and a definition read back through `GetExport` and handed straight to
+        // this operation keeps them.
+        let table_configurations =
+            crate::state::effective_table_configurations(&input.export.data_query).map_err(
+                |refusal| match refusal {
+                    crate::state::QueryRefusal::Invalid(invalid) => {
+                        UpdateExportErrorModeled::ValidationException(invalid)
+                    }
+                    crate::state::QueryRefusal::Internal(fault) => {
+                        UpdateExportErrorModeled::InternalServerException(fault)
+                    }
+                },
+            )?;
+
         // SECOND critical section: the mutation. The export is resolved again, because a
         // `DeleteExport` may have removed it while the definition above was being read.
         let mut store = state.lock();
         let stored = store.exports.get_mut(&input.export_arn).ok_or_else(|| {
-            UpdateExportErrorModeled::ResourceNotFoundException(crate::state::export_not_found(
+            crate::state::export_not_found_error(
                 &input.export_arn,
-            ))
+                UpdateExportErrorModeled::ResourceNotFoundException,
+            )
         })?;
 
         // "Updates an existing data export by overwriting all export parameters": every
         // settable parameter takes the submitted value, including an absent Description,
         // which clears the stored one.
         stored.export.description = input.export.description;
-        stored.export.data_query = input.export.data_query;
+        stored.export.data_query = DataQuery {
+            table_configurations,
+            ..input.export.data_query
+        };
         stored.export.destination_configurations = input.export.destination_configurations;
         stored.export.refresh_cadence = input.export.refresh_cadence;
         stored.status.last_updated_at = Some(updated_at);

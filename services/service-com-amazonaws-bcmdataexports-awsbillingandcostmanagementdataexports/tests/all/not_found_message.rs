@@ -3,8 +3,10 @@
 //! The `ResourceNotFoundException` body every ARN-addressed operation of this service
 //! answers an export ARN that resolves to nothing with.
 //!
-//! The rule under test: the not-found `Message` is ONE fixed, request-independent string.
-//! It does not restate — and does not vary with — the requested ARN, its partition, its
+//! The rule under test: the not-found `Message` is a FIXED, request-independent string
+//! — one per operation family, the export-definition operations wording the condition as
+//! a missing definition and the resource-tagging operations as a missing resource. It
+//! does not restate — and does not vary with — the requested ARN, its partition, its
 //! region, its account id or its resource name, so the reply to "this export does not
 //! exist in your account" carries the same message as the reply to "this ARN names a
 //! different account", and nothing in the message confirms anything about the ARN the
@@ -24,16 +26,18 @@
 //!
 //! The ARNs all satisfy the modelled `Arn` constraints (`@length 20..2048`, pattern
 //! `^arn:aws[-a-z0-9]*:(bcm-data-exports):[-a-z0-9]*:[0-9]{12}:[-a-zA-Z0-9/:_]+$` —
-//! smithy_query shape `Arn`), so each 404 comes from the handler's lookup and not from
-//! boundary validation.
+//! smithy_query shape `Arn`), so each refusal comes from the handler's lookup and not
+//! from boundary validation.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{json, Value};
 
-use service_com_amazonaws_bcmdataexports_awsbillingandcostmanagementdataexports::state::EXPORT_NOT_FOUND_MESSAGE;
+use service_com_amazonaws_bcmdataexports_awsbillingandcostmanagementdataexports::state::{
+    EXPORT_NOT_FOUND_MESSAGE, RESOURCE_NOT_FOUND_MESSAGE,
+};
 
-use crate::export_lifecycle::{cases, error_code, Client};
+use crate::export_lifecycle::{cases, error_code, Client, NOT_FOUND_STATUS};
 
 /// `GenericString`'s ceiling, which `ResourceNotFoundException.Message` targets:
 /// `@length 0..1024` (smithy_query shape `ResourceNotFoundException`, member `Message`).
@@ -117,27 +121,72 @@ fn rows() -> Vec<Row> {
     rows
 }
 
-/// Every request that hands an ARN to this service, for the ARN in `row`.
+/// Every request that hands an ARN to this service, with the message its operation
+/// family words the not-found condition with.
 ///
-/// `ListTagsForResource` is included only for an ARN in the caller's OWN account: the
-/// tagging path validates the ARN's account BEFORE any lookup and refuses an ARN of
-/// another account with the modelled `ValidationException` instead of looking it up at
-/// all (`tests/all/tagging_arn_validation.rs` is where that rule is asserted), so a
-/// foreign-account ARN never reaches the lookup THIS rule is about.
-fn requests(row: &Row, export: &Value) -> Vec<(&'static str, Value)> {
+/// Each export-definition request is also one the service would refuse for its own
+/// reasons if the ARN DID resolve — `UpdateExport` carries a query naming a table outside
+/// the catalog — because the not-found condition is owed whatever else the request
+/// carries: a resource that does not exist is resolved before the submitted definition is
+/// judged.
+///
+/// The RESOURCE-TAGGING requests are included only for an ARN in the caller's OWN
+/// account: that path validates the ARN's account BEFORE any lookup and refuses an ARN of
+/// another account with the modelled `ValidationException` instead of looking it up at all
+/// (`tests/all/tagging_arn_validation.rs` asserts that rule), so a foreign-account ARN
+/// never reaches the lookup THIS rule is about.
+fn requests(row: &Row, export: &Value) -> Vec<(&'static str, Value, &'static str)> {
+    let mut unpublished_table = export.clone();
+    unpublished_table
+        .as_object_mut()
+        .expect("the Export structure is a JSON object")
+        .insert(
+            "DataQuery".to_string(),
+            json!({ "QueryStatement": "SELECT x FROM NOT_A_PUBLISHED_TABLE" }),
+        );
     let mut requests = vec![
-        ("GetExport", json!({ "ExportArn": row.arn })),
-        ("DeleteExport", json!({ "ExportArn": row.arn })),
+        (
+            "GetExport",
+            json!({ "ExportArn": row.arn }),
+            EXPORT_NOT_FOUND_MESSAGE,
+        ),
+        (
+            "DeleteExport",
+            json!({ "ExportArn": row.arn }),
+            EXPORT_NOT_FOUND_MESSAGE,
+        ),
         (
             "UpdateExport",
             json!({ "ExportArn": row.arn, "Export": export }),
+            EXPORT_NOT_FOUND_MESSAGE,
+        ),
+        (
+            "UpdateExport",
+            json!({ "ExportArn": row.arn, "Export": unpublished_table }),
+            EXPORT_NOT_FOUND_MESSAGE,
         ),
     ];
     if names_own_account(&row.arn) {
-        requests.push((
-            "ListTagsForResource",
-            json!({ "ResourceArn": row.arn }),
-        ));
+        requests.extend([
+            (
+                "ListTagsForResource",
+                json!({ "ResourceArn": row.arn }),
+                RESOURCE_NOT_FOUND_MESSAGE,
+            ),
+            (
+                "TagResource",
+                json!({
+                    "ResourceArn": row.arn,
+                    "ResourceTags": [{ "Key": "env", "Value": "test" }],
+                }),
+                RESOURCE_NOT_FOUND_MESSAGE,
+            ),
+            (
+                "UntagResource",
+                json!({ "ResourceArn": row.arn, "ResourceTagKeys": ["env"] }),
+                RESOURCE_NOT_FOUND_MESSAGE,
+            ),
+        ]);
     }
     requests
 }
@@ -147,20 +196,26 @@ fn names_own_account(arn: &str) -> bool {
     arn.split(':').nth(4) == Some(::engine::emulator_account_id())
 }
 
-/// Assert the 404 for `row`/`operation` and return the message it carried.
-fn check_not_found(label: &str, arn: &str, body: &Value, status: u16) -> String {
+/// Assert the not-found refusal for `row`/`operation` and return the message it carried.
+fn check_not_found(
+    label: &str,
+    arn: &str,
+    body: &Value,
+    status: u16,
+    expected: &str,
+) -> String {
     assert_eq!(
         (status, error_code(body).as_str()),
-        (404, "ResourceNotFoundException"),
-        "case {label:?}: expected HTTP 404 ResourceNotFoundException, got {status} with {body}"
+        (NOT_FOUND_STATUS, "ResourceNotFoundException"),
+        "case {label:?}: expected HTTP {NOT_FOUND_STATUS} ResourceNotFoundException, got {status} with {body}"
     );
     let message = body["Message"]
         .as_str()
-        .unwrap_or_else(|| panic!("case {label:?}: the 404 must carry a Message, got {body}"))
+        .unwrap_or_else(|| panic!("case {label:?}: the refusal must carry a Message, got {body}"))
         .to_string();
     assert_eq!(
-        message, EXPORT_NOT_FOUND_MESSAGE,
-        "case {label:?}: expected the fixed not-found message {EXPORT_NOT_FOUND_MESSAGE:?}, got {message:?}"
+        message, expected,
+        "case {label:?}: expected the fixed not-found message {expected:?}, got {message:?}"
     );
     assert!(
         message.len() <= MESSAGE_MAX_LEN,
@@ -184,37 +239,54 @@ fn check_not_found(label: &str, arn: &str, body: &Value, status: u16) -> String 
     assert_eq!(
         body["ResourceId"],
         json!(arn),
-        "case {label:?}: the 404 must report the ARN it could not find in ResourceId, got {body}"
+        "case {label:?}: the refusal must report the ARN it could not find in ResourceId, got {body}"
     );
     message
 }
 
-/// Over the whole table, and for every ARN-addressed operation, the not-found message is
-/// the same fixed string.
+/// Over the whole table, the message an operation answers with is the same fixed string
+/// for every absent ARN — and the whole service words the condition in just the two ways
+/// its two operation families do.
 #[tokio::test]
 async fn not_found_message_is_a_fixed_constant_for_every_absent_arn() {
     let client = Client::new();
     let export = cases().remove(0).create_request()["Export"].clone();
 
     let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut per_operation: BTreeMap<&'static str, BTreeSet<String>> = BTreeMap::new();
     for row in rows() {
-        for (operation, request) in requests(&row, &export) {
+        for (operation, request, expected) in requests(&row, &export) {
             let label = format!("{} / {operation}", row.label);
             let (status, body) = client
                 .call_in_region(row.signing_region, operation, &request)
                 .await;
-            seen.insert(check_not_found(&label, &row.arn, &body, status));
+            let message = check_not_found(&label, &row.arn, &body, status, expected);
+            per_operation
+                .entry(operation)
+                .or_default()
+                .insert(message.clone());
+            seen.insert(message);
         }
     }
 
+    for (operation, messages) in &per_operation {
+        assert_eq!(
+            messages.len(),
+            1,
+            "case {operation:?}: every absent ARN must get the SAME message, but the table produced {messages:?}"
+        );
+    }
     assert_eq!(
-        seen.len(),
-        1,
-        "every absent ARN must get the SAME message, but the table produced {seen:?}"
+        seen,
+        BTreeSet::from([
+            EXPORT_NOT_FOUND_MESSAGE.to_string(),
+            RESOURCE_NOT_FOUND_MESSAGE.to_string(),
+        ]),
+        "the service words the not-found condition in exactly its two families' ways, got {seen:?}"
     );
 }
 
-/// The constant is the answer for a genuine absence too, not a blanket 404: an export
+/// The constant is the answer for a genuine absence too, not a blanket refusal: an export
 /// that exists is read back, and the same ARN answers the fixed message once deleted.
 #[tokio::test]
 async fn an_existing_export_is_found_and_answers_the_constant_once_deleted() {
@@ -245,13 +317,38 @@ async fn an_existing_export_is_found_and_answers_the_constant_once_deleted() {
 
     // And now the very ARN the service minted itself gets the same fixed message as a
     // never-created or foreign-account one.
-    for (operation, request) in [
-        ("GetExport", json!({ "ExportArn": arn })),
-        ("DeleteExport", json!({ "ExportArn": arn })),
-        ("ListTagsForResource", json!({ "ResourceArn": arn })),
+    for (operation, request, expected) in [
+        (
+            "GetExport",
+            json!({ "ExportArn": arn }),
+            EXPORT_NOT_FOUND_MESSAGE,
+        ),
+        (
+            "DeleteExport",
+            json!({ "ExportArn": arn }),
+            EXPORT_NOT_FOUND_MESSAGE,
+        ),
+        (
+            "ListTagsForResource",
+            json!({ "ResourceArn": arn }),
+            RESOURCE_NOT_FOUND_MESSAGE,
+        ),
+        (
+            "TagResource",
+            json!({
+                "ResourceArn": arn,
+                "ResourceTags": [{ "Key": "env", "Value": "test" }],
+            }),
+            RESOURCE_NOT_FOUND_MESSAGE,
+        ),
+        (
+            "UntagResource",
+            json!({ "ResourceArn": arn, "ResourceTagKeys": ["env"] }),
+            RESOURCE_NOT_FOUND_MESSAGE,
+        ),
     ] {
         let (status, body) = client.call(operation, &request).await;
         let label = format!("deleted export / {operation}");
-        check_not_found(&label, &arn, &body, status);
+        check_not_found(&label, &arn, &body, status, expected);
     }
 }
