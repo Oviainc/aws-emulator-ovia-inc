@@ -116,7 +116,10 @@ fn seed(engine: &engine::InMemoryEngine, ranges: &[(&str, &str)]) {
     let store = engine.state::<Ec2State>();
     let mut guard = store.lock();
     for (cidr, state) in ranges {
-        guard.insert_byoip_cidr(ByoipCidrRecord::in_state(cidr, state));
+        assert!(
+            guard.insert_byoip_cidr(ByoipCidrRecord::in_state(cidr, state)),
+            "the store has room for the seeded range {cidr}, so it must have been stored"
+        );
     }
 }
 

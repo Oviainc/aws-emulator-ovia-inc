@@ -152,7 +152,11 @@
 //! clock and the same [`TRANSITION_DELAY`] as a `pending` VPC's `available` move). Keyed by
 //! the range itself in its canonical form ([`canonical_byoip_cidr`]), because the range IS
 //! the name the API takes — every BYOIP operation is addressed by `Cidr`, not by a minted id
-//! — which also gives the describe path one stable order.
+//! — which also gives the describe path one stable order. That key comes from a REQUEST, so
+//! the store is bounded like every other one here: a new range has to fit inside the record
+//! ceiling ([`ComAmazonawsEc2Amazonec2State::has_byoip_cidr_capacity`]) and the byte budget,
+//! and [`byoip_cidr_payload_bytes`] is the one definition of what a range is charged, given
+//! back when the clock's release drops it.
 //!
 //! ## Elastic IP addresses
 //!
@@ -165,6 +169,15 @@
 //! [`ComAmazonawsEc2Amazonec2State::allocation_id_for_public_ip`] because the API lets a
 //! caller name either. An Elastic IP address AWS hands back is usable at once — it has no
 //! non-terminal status — so no entry beside it records a clock-owed transition.
+//!
+//! An address's ASSOCIATION with one of the account's resources lives on that same record
+//! — `Address$AssociationId`, `Address$InstanceId` and `Address$PrivateIpAddress` — rather
+//! than in a map beside it, so `AssociateAddress` and `DescribeAddresses` cannot disagree
+//! about what an address is attached to. The instance reports the same address through
+//! `Instance$PublicIpAddress`, so the ONE primitive that ends an association
+//! ([`ComAmazonawsEc2Amazonec2State::detach_elastic_ip`]) clears both sides, and
+//! [`ComAmazonawsEc2Amazonec2State::allocation_id_associated_with_instance`] answers which
+//! address an instance holds.
 //!
 //! ## Dedicated Hosts
 //!
@@ -2475,8 +2488,12 @@ impl ComAmazonawsEc2Amazonec2State {
         for cidr in due {
             let held = self.addresses_in_byoip_cidr(&cidr);
             if held.is_empty() {
-                // The release succeeded: the range is not one of the account's any more.
-                self.byoip_cidrs.remove(&cidr);
+                // The release succeeded: the range is not one of the account's any more, so
+                // the bytes its record held go back to the budget — exactly what
+                // [`Self::insert_byoip_cidr`] charged for it.
+                if let Some(record) = self.byoip_cidrs.remove(&cidr) {
+                    self.release_stored_bytes(byoip_cidr_payload_bytes(&record));
+                }
                 continue;
             }
             // "failed-deprovision: The request to deprovision the address range was
@@ -7355,9 +7372,58 @@ impl ByoipCidrRecord {
     }
 }
 
+/// The bytes one stored BYOIP address range holds.
+///
+/// The ONE definition of that charge, the way [`volume_recycle_bin_entry_payload_bytes`] is
+/// for an entry of the Recycle Bin: the fixed [`STORED_RECORD_OVERHEAD_BYTES`] every stored
+/// record costs — so a range carrying no optional text is NOT free against
+/// [`MAX_STORED_BYTES`] — plus the caller-chosen text the record carries, which is what a
+/// request can make large. [`ComAmazonawsEc2Amazonec2State::insert_byoip_cidr`] charges
+/// exactly this and every path that drops a range gives back exactly this.
+pub fn byoip_cidr_payload_bytes(record: &ByoipCidrRecord) -> usize {
+    let range = &record.byoip_cidr;
+    let asn_bytes = range
+        .asn_associations
+        .iter()
+        .flatten()
+        .map(|association| {
+            association
+                .asn
+                .as_deref()
+                .map_or(0, str::len)
+                .saturating_add(association.cidr.as_deref().map_or(0, str::len))
+                .saturating_add(association.status_message.as_deref().map_or(0, str::len))
+                .saturating_add(association.state.as_deref().map_or(0, str::len))
+        })
+        .fold(0usize, usize::saturating_add);
+    STORED_RECORD_OVERHEAD_BYTES
+        .saturating_add(range.cidr.as_deref().map_or(0, str::len))
+        .saturating_add(range.description.as_deref().map_or(0, str::len))
+        .saturating_add(range.status_message.as_deref().map_or(0, str::len))
+        .saturating_add(range.network_border_group.as_deref().map_or(0, str::len))
+        .saturating_add(range.advertisement_type.as_deref().map_or(0, str::len))
+        .saturating_add(range.pool_id.as_deref().map_or(0, str::len))
+        .saturating_add(range.ipam_pool_id.as_deref().map_or(0, str::len))
+        .saturating_add(asn_bytes)
+}
+
 impl ComAmazonawsEc2Amazonec2State {
+    /// Whether another BYOIP address range fits inside the store's ceiling
+    /// ([`MAX_STORED_RECORDS_PER_STORE`]).
+    ///
+    /// The same contract as [`Self::has_volume_recycle_bin_capacity`]: a writer asks this
+    /// BEFORE provisioning anything and refuses the request with EC2's own quota code when
+    /// it answers `false`, and [`Self::insert_byoip_cidr`] asks it again for itself, so no
+    /// path can get past the ceiling by forgetting to. The ceiling is needed because the
+    /// key is the range a REQUEST names, so without it a client could provision distinct
+    /// ranges without end and grow this process's memory without bound — nothing in this
+    /// module reclaims a stored range except the release the clock applies.
+    pub fn has_byoip_cidr_capacity(&self) -> bool {
+        self.byoip_cidrs.len() < MAX_STORED_RECORDS_PER_STORE
+    }
+
     /// Store `record` as the account's range for the `Cidr` it carries, replacing whatever
-    /// range that CIDR named before.
+    /// range that CIDR named before, and answer whether it was stored.
     ///
     /// The key is the range in the CANONICAL form the store documents
     /// ([`canonical_byoip_cidr`]), taken here rather than trusted from the caller, so a
@@ -7365,16 +7431,37 @@ impl ComAmazonawsEc2Amazonec2State {
     /// carrying no `Cidr`, or one that is not an address range at all, names no range the
     /// API can address — every BYOIP operation is addressed by `Cidr` — so there is no key
     /// to file it under and it is not stored.
-    pub fn insert_byoip_cidr(&mut self, record: ByoipCidrRecord) {
+    ///
+    /// `false`, with NOTHING written, when there is no key to file it under, or when the
+    /// range is a new one and the store is at [`MAX_STORED_RECORDS_PER_STORE`] or the bytes
+    /// it would hold would cross [`MAX_STORED_BYTES`]. Both ceilings are asked before the
+    /// first write, so a refused provision leaves the store exactly as it was.
+    pub fn insert_byoip_cidr(&mut self, record: ByoipCidrRecord) -> bool {
         let Some(cidr) = record
             .byoip_cidr
             .cidr
             .as_deref()
             .and_then(|cidr| canonical_byoip_cidr(cidr).ok())
         else {
-            return;
+            return false;
         };
+        let charge = byoip_cidr_payload_bytes(&record);
+        // A range the store does not already hold is a NEW record, so it is the one that
+        // has to fit inside both ceilings. Replacing a range held under the same key stores
+        // no further record and gives back what the record it replaces was charged, so the
+        // byte budget stays the sum of what the store actually holds.
+        let refund = self.byoip_cidrs.get(&cidr).map(byoip_cidr_payload_bytes);
+        if refund.is_none()
+            && (!self.has_byoip_cidr_capacity() || self.would_exceed_stored_bytes(charge))
+        {
+            return false;
+        }
+        if let Some(refund) = refund {
+            self.release_stored_bytes(refund);
+        }
+        self.add_stored_bytes(charge);
         self.byoip_cidrs.insert(cidr, record);
+        true
     }
 
     /// Start releasing the range `cidr`: move it to `pending-deprovision` and record when
@@ -8221,6 +8308,24 @@ pub const INVALID_ALLOCATION_ID_NOT_FOUND: &str = "InvalidAllocationID.NotFound"
 /// allocation id at all, so there is nothing to look up.
 pub const INVALID_ALLOCATION_ID_MALFORMED: &str = "InvalidAllocationID.Malformed";
 
+/// `Resource.AlreadyAssociated` (HTTP 400): the request asked for an association the
+/// resource already has with something else, and did not allow that one to be replaced
+/// ("you can specify false to ensure the operation fails if the Elastic IP address is
+/// already associated with another resource" — `AssociateAddressRequest$AllowReassociation`).
+pub const RESOURCE_ALREADY_ASSOCIATED: &str = "Resource.AlreadyAssociated";
+
+/// `InvalidNetworkInterfaceID.NotFound` (HTTP 400): the request named a network interface
+/// id this account holds no network interface for.
+pub const INVALID_NETWORK_INTERFACE_ID_NOT_FOUND: &str = "InvalidNetworkInterfaceID.NotFound";
+
+/// `InvalidNetworkInterfaceID.Malformed` (HTTP 400): the request named something that is
+/// not a network interface id at all, so there is nothing to look up.
+pub const INVALID_NETWORK_INTERFACE_ID_MALFORMED: &str = "InvalidNetworkInterfaceID.Malformed";
+
+/// The id prefix of the association between an Elastic IP address and a resource, which
+/// is what `ElasticIpAssociationId` names and `AssociateAddress` mints.
+pub const ELASTIC_IP_ASSOCIATION_ID_PREFIX: &str = "eipassoc";
+
 impl ComAmazonawsEc2Amazonec2State {
     /// The next unused Elastic IP address, or `None` when the search is exhausted.
     ///
@@ -8261,6 +8366,57 @@ impl ComAmazonawsEc2Amazonec2State {
             .iter()
             .find(|(_, address)| address.public_ip.as_deref() == Some(public_ip))
             .map(|(allocation_id, _)| allocation_id.clone())
+    }
+
+    /// The allocation id of the address currently associated with `instance_id`, or `None`
+    /// when no address of the account is.
+    ///
+    /// Scanned off the address records themselves, like
+    /// [`Self::allocation_id_for_public_ip`] and for the same reason: `Address$InstanceId`
+    /// is where an association is stored, so there is no second copy of it to fall out of
+    /// step. An instance holds at most one Elastic IP address — "if you associate an
+    /// Elastic IP address with an instance that has an existing Elastic IP address, the
+    /// existing address is disassociated from the instance" (`AssociateAddress`) — so the
+    /// first match is the only one.
+    pub fn allocation_id_associated_with_instance(&self, instance_id: &str) -> Option<String> {
+        self.addresses
+            .iter()
+            .find(|(_, address)| address.instance_id.as_deref() == Some(instance_id))
+            .map(|(allocation_id, _)| allocation_id.clone())
+    }
+
+    /// End `allocation_id`'s association, leaving the address ALLOCATED to the account:
+    /// "the existing address is disassociated from the instance, but remains allocated to
+    /// your account" (`AssociateAddress`).
+    ///
+    /// Shared because every path that ends an association does exactly this — the remap
+    /// `AssociateAddress` performs, and `DisassociateAddress` and `ReleaseAddress` once
+    /// they are implemented. The instance the address was associated with also gives up
+    /// the public address it was reporting through it (`Instance$PublicIpAddress`), so the
+    /// instance store and the address store cannot disagree about one address. Storing
+    /// nothing new, it makes no byte charge.
+    ///
+    /// A no-op for an allocation id the account holds no address for, so a caller does not
+    /// have to look one up first.
+    pub fn detach_elastic_ip(&mut self, allocation_id: &str) {
+        let Some(address) = self.addresses.get_mut(allocation_id) else {
+            return;
+        };
+        let public_ip = address.public_ip.clone();
+        let was_on = address.instance_id.take();
+        address.association_id = None;
+        address.network_interface_id = None;
+        address.network_interface_owner_id = None;
+        address.private_ip_address = None;
+        let Some(instance) = was_on.and_then(|instance_id| self.instances.get_mut(&instance_id))
+        else {
+            return;
+        };
+        // Only the address this association carried: an instance reporting some other
+        // public address keeps it.
+        if instance.public_ip == public_ip {
+            instance.public_ip = None;
+        }
     }
 
     /// Store a newly allocated Elastic IP address, charging the caller-chosen bytes it
@@ -8436,6 +8592,49 @@ pub fn invalid_address_not_found<E>(public_ip: &str) -> Scaffolded<E> {
         400,
         format!("Address '{public_ip}' not found"),
     )
+}
+
+/// Whether `id` is a well-formed network interface id.
+///
+/// `eni-` followed by 8 or 17 lowercase hexadecimal digits — the short and the long EC2
+/// resource id form, read the way [`allocation_id_is_well_formed`] reads an allocation id.
+/// The all-zero suffix is WELL FORMED here, unlike an instance id's: AWS answers
+/// `eni-00000000000000000` with `InvalidNetworkInterfaceID.NotFound` rather than
+/// `.Malformed`, which is the counter-example [`instance_id_is_well_formed`] records.
+pub fn network_interface_id_is_well_formed(id: &str) -> bool {
+    let Some(suffix) = id.strip_prefix("eni-") else {
+        return false;
+    };
+    matches!(suffix.len(), 8 | 17)
+        && suffix
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Refuse a request that named something that is not a network interface id: HTTP 400
+/// `InvalidNetworkInterfaceID.Malformed`.
+pub fn invalid_network_interface_id_malformed<E>(network_interface_id: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_NETWORK_INTERFACE_ID_MALFORMED,
+        400,
+        format!("Invalid id: '{network_interface_id}'"),
+    )
+}
+
+/// Refuse a request that named a network interface id no interface of the account has:
+/// HTTP 400 `InvalidNetworkInterfaceID.NotFound`.
+pub fn invalid_network_interface_id_not_found<E>(network_interface_id: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_NETWORK_INTERFACE_ID_NOT_FOUND,
+        400,
+        format!("The networkInterface ID '{network_interface_id}' does not exist"),
+    )
+}
+
+/// Refuse an association the resource already has with something else, which the request
+/// did not allow to be replaced: HTTP 400 `Resource.AlreadyAssociated`.
+pub fn resource_already_associated<E>(message: impl Into<String>) -> Scaffolded<E> {
+    Scaffolded::service_error(RESOURCE_ALREADY_ASSOCIATED, 400, message)
 }
 
 /// Refuse an allocation that would take the store past [`MAX_STORED_ADDRESSES`]: HTTP 400

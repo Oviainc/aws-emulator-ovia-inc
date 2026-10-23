@@ -566,7 +566,7 @@ const ASSOCIATED_ASN: &str = "64512";
 
 /// Seed one BYOIP range in `state`, of either address family, and answer its canonical CIDR.
 fn seed_byoip_cidr(engine: &engine::InMemoryEngine, cidr: &str, state: &str) -> String {
-    engine
+    let stored = engine
         .state::<Ec2State>()
         .lock()
         .insert_byoip_cidr(ByoipCidrRecord {
@@ -587,6 +587,10 @@ fn seed_byoip_cidr(engine: &engine::InMemoryEngine, cidr: &str, state: &str) -> 
             released_at: None,
             pending: None,
         });
+    assert!(
+        stored,
+        "the store has room for the seeded range {cidr}, so it must have been stored"
+    );
     canonical_byoip_cidr(cidr)
         .unwrap_or_else(|problem| panic!("{cidr} is an address range this store takes: {problem:?}"))
 }
