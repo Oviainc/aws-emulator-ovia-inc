@@ -2,8 +2,10 @@
 
 //! @op ListExports
 //! Enumerates the persisted export records, newest page last, filtered by
-//! `domainName` when the request names one. `exportSummaries` is built from the stored
-//! records; `nextToken` appears only while records remain.
+//! `domainName` when the request names one — a `domainName` the account's domain
+//! registry does not hold is the modelled `NoSuchDomainException`, not an empty page.
+//! `exportSummaries` is built from the stored records; `nextToken` appears only while
+//! records remain.
 //!
 //! ## Shape of an operation
 //!
@@ -169,10 +171,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.settle_all(::std::time::SystemTime::now());
 
         // `domainName` filters the enumeration; absent, every domain's exports are
-        // listed. A domain with no exports yields an empty list rather than an error:
-        // see `start_domain_export.rs` on why `NoSuchDomainException` is unreachable
-        // in this emulator.
+        // listed.
         let domain_filter = input.domain_name.as_deref();
+
+        // A filter names a domain, so it is RESOLVED against the account's domain
+        // registry before anything is enumerated: a name no domain of this account
+        // carries is the modelled `NoSuchDomainException`, not an empty page that would
+        // read as "that domain has no exports". The registry holds the domains the
+        // operator declared plus the domain of every stored export (see
+        // `crate::state::EXISTING_DOMAINS_ENV`), so a domain this service ever exported
+        // is always resolvable, while a domain that exists with no exports still
+        // answers the empty list the required member needs.
+        if let Some(domain) = domain_filter {
+            if !store.has_domain(domain) {
+                access(ctx, "refused-no-such-domain", 0);
+                return Err(ListExportsErrorModeled::NoSuchDomainException(
+                    NoSuchDomainException {
+                        message: crate::state::NO_SUCH_DOMAIN_MESSAGE.to_string(),
+                    },
+                )
+                .into());
+            }
+        }
 
         // The token names how far into the creation order the previous page got, and
         // which filter it got there under. A token this service did not issue — one

@@ -208,6 +208,36 @@ pub(crate) async fn create_profile(
         .unwrap_or_else(|| panic!("case {name:?}: CreateConfigurationProfile answered no Id"))
 }
 
+/// Create a configuration profile under `application_id` from `body` and answer what
+/// `CreateConfigurationProfile` reported, so a suite can assert against the created
+/// record rather than only against its id.
+///
+/// `case` names the row the call belongs to, the way every assertion in this target
+/// does. [`create_profile`] is the shorthand for the hosted, name-only profile most
+/// suites need.
+pub(crate) async fn create_profile_from(
+    router: &MultiServiceRouter,
+    application_id: &str,
+    case: &str,
+    body: &serde_json::Value,
+) -> Answer {
+    let answer = json_call(
+        router,
+        "POST",
+        &format!("/applications/{application_id}/configurationprofiles"),
+        body,
+    )
+    .await;
+    assert_eq!(
+        answer.status,
+        201,
+        "case {case:?}: CreateConfigurationProfile must answer 201, got {} / {}",
+        answer.status,
+        String::from_utf8_lossy(&answer.body)
+    );
+    answer
+}
+
 /// Whether `id` satisfies the model's `Id` shape, `^[a-z0-9]{4,7}$`.
 pub(crate) fn is_modelled_id(id: &str) -> bool {
     (4..=7).contains(&id.chars().count())

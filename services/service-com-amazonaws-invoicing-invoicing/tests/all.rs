@@ -17,6 +17,8 @@ mod invoice_profiles;
 mod invoice_summaries;
 #[path = "all/invoice_unit_lifecycle.rs"]
 mod invoice_unit_lifecycle;
+#[path = "all/procurement_portal_preference_lifecycle.rs"]
+mod procurement_portal_preference_lifecycle;
 #[path = "all/procurement_portal_preference_reads.rs"]
 mod procurement_portal_preference_reads;
 #[path = "all/procurement_portal_preferences.rs"]

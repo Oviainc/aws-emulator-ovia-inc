@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetVpnConnectionDeviceTypes
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetVpnConnectionDeviceTypes`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetVpnConnectionDeviceTypes::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the customer gateway devices a Site-to-Site VPN sample configuration file is
+//! published for. Those devices are facts of the SERVICE — nothing in the EC2 API
+//! creates, renames or withdraws one, the way nothing creates an Availability Zone — so
+//! the catalog lives at the bottom of this file beside the handler that reports it, and
+//! the operation writes nothing: `DryRun`, `MaxResults` and `NextToken` are the whole of
+//! its behaviour. It reuses this service's shared pagination cursor codec
+//! ([`crate::state::encode_page_token`]) and error channel, so a device page is minted
+//! and refused exactly the way every other paginating EC2 read does it.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +152,312 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetVpnConnectionDeviceTypes` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetVpnConnectionDeviceTypesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // "Obtain a list of customer gateway devices for which sample configuration
+        // files can be provided. The request has no additional parameters." Nothing in
+        // the EC2 API creates, renames or withdraws one of those devices, so this
+        // operation reports facts of the service and persists nothing: it reaches
+        // neither the engine on `self` nor the Region in `ctx`.
+        let _ = (&self.engine, ctx);
+
+        // "Checks whether you have the required permissions for the action, without
+        // actually making the request... If you have the required permissions, the
+        // error response is DryRunOperation." Every caller of this emulator holds
+        // them, so nothing below runs at all.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetVpnConnectionDeviceTypes"))
+        // A dry run therefore answers BEFORE any other member is looked at, which is the
+        // order every other `DryRun` read in this crate uses (`DescribeVpcs`,
+        // `DescribeInstanceTypeOfferings`) — an implementation choice, not a modelled
+        // rule: neither the model nor the member's doc says whether a dry run that also
+        // carries a malformed parameter reports the dry run or the parameter. Keeping one
+        // order across the service is what makes the answer predictable.
+        if input.dry_run.unwrap_or(false) {
+            return Err(crate::state::dry_run_operation());
+        }
+
+        // "The NextToken value returned from a previous paginated
+        // GetVpnConnectionDeviceTypes request" — a token this operation did not mint is
+        // refused rather than read as a cursor, including one the same service minted
+        // for another paginating operation ([`decode_device_page_token`] checks the kind
+        // of cursor the token carries, not just that this service minted it). A dry run
+        // above answers first: it performs nothing, so it reads no parameter either.
+        let start_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(
+                decode_device_page_token(token)
+                    .ok_or_else(|| crate::state::invalid_pagination_token_for(token))?,
+            ),
+        };
+
+        let devices = vpn_connection_device_types();
+
+        // The cursor names the device the next page starts at, so a token always
+        // advances in the order `vpn_connection_device_types` reports in.
+        let from = device_page_start(&devices, start_at.as_deref());
+        let page = devices.get(from..).unwrap_or_default();
+
+        // "If this parameter is not used, then GetVpnConnectionDeviceTypes returns all
+        // results" (`GetVpnConnectionDeviceTypesRequest$MaxResults`) — so an ABSENT page
+        // size is `None` here, and the "all results" rule is read off that rather than
+        // off a saturating sentinel. A value the model's `range 200..1000` has already
+        // refused cannot reach here; one that still does not convert to a page size is
+        // refused rather than read as "all results", so the permissive reading is never
+        // the fallback.
+        let limit = match input.max_results {
+            None => None,
+            Some(max_results) => Some(usize::try_from(max_results).map_err(|_| {
+                crate::state::invalid_parameter_value(format!(
+                    "Invalid value '{max_results}' for MaxResults"
+                ))
+            })?),
+        };
+
+        // A page size of zero reports no device while still naming one in `NextToken`, so
+        // a walk would never advance. UNREACHABLE as the model stands — `GVCDMaxResults`'s
+        // `range 200..1000` is enforced before this handler runs, so the boundary
+        // validator refuses a zero first — and kept as defensive code so the invariant
+        // does not rest on that range trait alone.
+        if limit == Some(0) {
+            return Err(crate::state::invalid_parameter_value(
+                "Invalid value '0' for MaxResults",
+            ));
+        }
+
+        // "This value to include in a future GetVpnConnectionDeviceTypes request... This
+        // value is null when there are no more results to return"
+        // (`GetVpnConnectionDeviceTypesResult$NextToken`): a token only when a device
+        // follows this page.
+        let next_token = device_page_token(page, limit);
+
+        Ok(GetVpnConnectionDeviceTypesOutput {
+            vpn_connection_device_types: Some(
+                page.iter()
+                    .take(limit.unwrap_or(page.len()))
+                    .map(VpnConnectionDeviceTypeRecord::to_vpn_connection_device_type)
+                    .collect(),
+            ),
+            next_token,
+        })
     }
+}
+
+// ---------------------------------------------------------------------------
+// The customer gateway devices a sample configuration file is published for
+// ---------------------------------------------------------------------------
+//
+// NOT resources of the account: no EC2 operation creates, renames or withdraws one, so
+// AWS reports the devices it publishes a sample configuration file FOR, the same way it
+// reports the Availability Zones a Region has (`crate::state`'s
+// `availability_zones_in_region`). The catalog is therefore a constant of this operation
+// rather than a field of `ComAmazonawsEc2Amazonec2State`, and the operation writes
+// nothing at all. It lives here because this is the only operation that reports it; the
+// one other operation that reads a device type id,
+// `GetVpnConnectionDeviceSampleConfiguration`, resolves it through
+// [`vpn_connection_device_types`] when it is implemented rather than keeping a second
+// copy.
+
+/// The customer gateway devices this emulator reports a sample configuration file for,
+/// as `(vendor, platform, software)`.
+///
+/// The source is the list of example configuration files in "Your customer gateway
+/// device" (<https://docs.aws.amazon.com/vpn/latest/s2svpn/your-cgw.html>) — the page the
+/// modelled `VpnConnectionDeviceType` shape's own doc links to for "the list of device
+/// types with sample configuration files available". Each row is one entry of that list,
+/// split into the three members the shape carries: the vendor, the platform it names, and
+/// the software release the file is written for. A device AWS publishes no example
+/// configuration for is not in the list, because this operation reports exactly the
+/// devices a sample configuration can be produced for; a row is added when the guide
+/// publishes one, never because a request asked for it.
+const VPN_CONNECTION_DEVICE_CATALOG: &[(&str, &str, &str)] = &[
+    ("Check Point", "Security Gateway", "R77.10+"),
+    ("Cisco", "ASA", "ASA 8.2+"),
+    ("Cisco", "ISR", "IOS 12.4+"),
+    ("Fortinet", "Fortigate 40+ Series", "FortiOS 4.0+"),
+    ("Juniper", "J-Series", "JunOS 9.5+"),
+    ("Juniper", "SRX", "JunOS 11.0+"),
+    ("Mikrotik", "RouterOS", "6.44.3"),
+    ("Netgate", "pfSense", "OS 2.2.5+"),
+    ("Palo Alto Networks", "PAN-OS", "PAN-OS 4.1.2+"),
+    ("SonicWALL", "NSA/TZ", "SonicOS 5.9"),
+    ("SonicWALL", "NSA/TZ", "SonicOS 6.2"),
+    ("Sophos", "XG Next-Gen Firewall", "Sophos XG 17.5+"),
+    ("Strongswan", "Ubuntu", "Ubuntu 16.04"),
+    ("Yamaha", "RT Series", "Rev.14.01.21+"),
+];
+
+/// The separator a device's page cursor joins its parts with.
+///
+/// A control character, because every member of the catalog carries printable text
+/// (spaces, `+`, `/` and `.` all occur): no member can contain it, so no two different
+/// devices join to the same cursor, and it sorts ahead of every character a member can
+/// hold, so one vendor or platform being a prefix of another cannot reorder two devices.
+/// A cursor only ever travels inside a hex-encoded [`crate::state::encode_page_token`],
+/// so it is never seen by a caller.
+const DEVICE_PART_SEPARATOR: char = '\u{1}';
+
+/// The leading part every device page cursor carries.
+///
+/// [`crate::state::encode_page_token`] is the whole service's cursor codec, so a token
+/// minted by another paginating operation decodes here too. Naming the kind of cursor
+/// inside it is what makes `DescribeVpcs`'s token detectable as not-a-device-cursor — it
+/// would otherwise be read as a position in this catalog and silently skip devices — and
+/// [`decode_device_page_token`] is where that check lives.
+const DEVICE_CURSOR_KIND: &str = "vpn-connection-device-type";
+
+/// How many hex characters a `VpnConnectionDeviceTypeId` carries: eight, as AWS reports
+/// one — the low 32 bits of the device digest.
+const DEVICE_TYPE_ID_HEX_CHARS: usize = 8;
+
+/// The domain a device id is hashed under, so the id of a device cannot collide with
+/// another kind of derived value even if both hashed the same members.
+///
+/// Its own constant rather than [`DEVICE_CURSOR_KIND`]: the cursor format and the id are
+/// unrelated concerns, and changing the cursor's leading part must not silently change
+/// every id this operation reports.
+const DEVICE_ID_DOMAIN: &str = "vpn-connection-device-type-id";
+
+/// One customer gateway device type the service reports.
+///
+/// The vendor, platform and software are the catalog's own; the device type id is DERIVED
+/// from them by [`Self::device_type_id`] rather than written down, so every reader of the
+/// catalog reports the same id for a device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VpnConnectionDeviceTypeRecord {
+    /// "Customer gateway device vendor" (`VpnConnectionDeviceType$Vendor`).
+    pub vendor: &'static str,
+    /// "Customer gateway device platform" (`VpnConnectionDeviceType$Platform`).
+    pub platform: &'static str,
+    /// "Customer gateway device software version" (`VpnConnectionDeviceType$Software`).
+    pub software: &'static str,
+}
+
+impl VpnConnectionDeviceTypeRecord {
+    /// This device's `VpnConnectionDeviceTypeId`.
+    ///
+    /// The model documents the member only as a "Customer gateway device identifier", so
+    /// it is opaque: AWS reports eight lowercase hex characters, and this derives them
+    /// from the device's own three members. Deriving the id rather than writing one per
+    /// row means it is a function of the device — identical on every call, which is what
+    /// lets a caller pass an id straight from `GetVpnConnectionDeviceTypes` into
+    /// `GetVpnConnectionDeviceSampleConfiguration`.
+    ///
+    /// Each member is hashed separately (`str`'s own `Hash` delimits them) rather than
+    /// concatenated, so no two devices hash the same bytes; the id itself is the low 32
+    /// bits of the digest, so two devices sharing one is improbable rather than
+    /// impossible — the suite asserts the catalog's ids are all distinct, so a row added
+    /// later that collided would fail loudly.
+    ///
+    /// The hash is the standard library's, for the same reason
+    /// [`crate::state::encode_page_token`]'s checksum is: the id is opaque, not a secret,
+    /// and nothing depends on it being unforgeable — it names a device of a published
+    /// catalog that every caller can list, and no test pins a literal id. It is hashed
+    /// under [`DEVICE_ID_DOMAIN`] so the id of a device cannot collide with another kind
+    /// of derived value.
+    pub fn device_type_id(&self) -> String {
+        use ::std::hash::{Hash, Hasher};
+
+        let mut hasher = ::std::hash::DefaultHasher::new();
+        DEVICE_ID_DOMAIN.hash(&mut hasher);
+        self.vendor.hash(&mut hasher);
+        self.platform.hash(&mut hasher);
+        self.software.hash(&mut hasher);
+        // The low 32 bits, which is exactly what eight hex characters carry. Masking
+        // rather than shifting by `4 * DEVICE_TYPE_ID_HEX_CHARS`, so a wider id cannot
+        // make the shift overflow.
+        let width = DEVICE_TYPE_ID_HEX_CHARS;
+        format!("{:0width$x}", hasher.finish() & u64::from(u32::MAX))
+    }
+
+    /// The pagination cursor naming this device: [`DEVICE_CURSOR_KIND`] and the device's
+    /// three members, joined by [`DEVICE_PART_SEPARATOR`].
+    ///
+    /// Paging is by cursor rather than by index, the way `DescribeInstanceTypeOfferings`
+    /// and `DescribeVpcs` do it, so a token names the device the next page starts at
+    /// instead of a position. Every cursor carries the same leading part, so cursors sort
+    /// by vendor, then platform, then software — the order
+    /// [`vpn_connection_device_types`] reports the devices in.
+    pub fn page_cursor(&self) -> String {
+        let sep = DEVICE_PART_SEPARATOR;
+        format!(
+            "{DEVICE_CURSOR_KIND}{sep}{}{sep}{}{sep}{}",
+            self.vendor, self.platform, self.software
+        )
+    }
+
+    /// This device as the modelled shape every operation that reports one answers with.
+    pub fn to_vpn_connection_device_type(&self) -> VpnConnectionDeviceType {
+        VpnConnectionDeviceType {
+            vpn_connection_device_type_id: Some(self.device_type_id()),
+            vendor: Some(self.vendor.to_string()),
+            platform: Some(self.platform.to_string()),
+            software: Some(self.software.to_string()),
+        }
+    }
+}
+
+/// Every customer gateway device type the service reports, in cursor order.
+///
+/// Sorted by [`VpnConnectionDeviceTypeRecord::page_cursor`] — vendor, then platform, then
+/// software — because that is the order a `NextToken` walk resumes in, so it is imposed
+/// here rather than inherited from the order the catalog happens to be written in.
+pub fn vpn_connection_device_types() -> Vec<VpnConnectionDeviceTypeRecord> {
+    let mut devices: Vec<VpnConnectionDeviceTypeRecord> = VPN_CONNECTION_DEVICE_CATALOG
+        .iter()
+        .map(|(vendor, platform, software)| VpnConnectionDeviceTypeRecord {
+            vendor,
+            platform,
+            software,
+        })
+        .collect();
+    devices.sort_by_cached_key(VpnConnectionDeviceTypeRecord::page_cursor);
+    devices
+}
+
+/// The device cursor a `NextToken` carries, or `None` when the token is not one this
+/// operation minted.
+///
+/// [`crate::state::decode_page_token`] on its own only proves the token came from this
+/// SERVICE, and the codec is shared with every paginating describe — so a `DescribeVpcs`
+/// token would decode into a VPC id and then be used as a position in the device catalog.
+/// The cursor must also name [`DEVICE_CURSOR_KIND`], which is what makes another
+/// operation's token a refusal (`InvalidPaginationToken`) rather than a page that quietly
+/// skips devices.
+pub fn decode_device_page_token(token: &str) -> Option<String> {
+    let cursor = crate::state::decode_page_token(token)?;
+    cursor
+        .starts_with(&format!("{DEVICE_CURSOR_KIND}{DEVICE_PART_SEPARATOR}"))
+        .then_some(cursor)
+}
+
+/// Where the page starting at `cursor` begins in `devices`, which is in cursor order.
+///
+/// A cursor names the device the page starts AT, so resuming is a search for the first
+/// device whose cursor does not sort before it: a device the catalog no longer holds
+/// resumes at the next one rather than at the start, and a cursor past the last device
+/// resumes past the end — an empty page, not a repeat of the first one. `None` is the
+/// first page.
+pub fn device_page_start(
+    devices: &[VpnConnectionDeviceTypeRecord],
+    cursor: Option<&str>,
+) -> usize {
+    match cursor {
+        None => 0,
+        Some(cursor) => devices.partition_point(|device| device.page_cursor().as_str() < cursor),
+    }
+}
+
+/// The `NextToken` a page of the first `limit` devices of `page` answers with, or `None`
+/// when no device follows it — "this value is null when there are no more results to
+/// return" (`GetVpnConnectionDeviceTypesResult$NextToken`). A `limit` of `None` is a
+/// request that named no `MaxResults`, which "returns all results", so it is never
+/// followed by another page.
+///
+/// The token names the device the NEXT page starts at, so [`device_page_start`] resumes
+/// exactly there. This is the handler's own mint step, named so a test can drive it with
+/// the page sizes the modelled `MaxResults` floor of 200 keeps off the wire.
+pub fn device_page_token(
+    page: &[VpnConnectionDeviceTypeRecord],
+    limit: Option<usize>,
+) -> Option<String> {
+    page.get(limit?)
+        .map(|device| crate::state::encode_page_token(&device.page_cursor()))
 }

@@ -21,11 +21,14 @@
 //!   for anything the model does not express: a signing name shared by several
 //!   services, or routing that keys on the access-key id.
 //! - `override_operation` — serve a request the model's routing key cannot name
-//!   correctly. EDITED HERE: a `DELETE /tags/{ResourceArn}` that binds no `tagKeys`
-//!   value — the empty key list `UntagResource` models — is served by `UntagResource`,
-//!   which the framework's required-query-binding rule leaves unmatched (see
-//!   [`UNTAG_RESOURCE_ROUTE`]). Every other request resolves through the generated
-//!   routing table.
+//!   correctly. EDITED HERE, for two reasons that compose: every request this service
+//!   serves goes through [`AnnouncedMediaType`], which runs the operation unchanged and
+//!   announces this service's media type on the response (see "The media type this
+//!   service announces" below), and a `DELETE /tags/{ResourceArn}` that binds no
+//!   `tagKeys` value — the empty key list `UntagResource` models — is served by
+//!   `UntagResource`, which the framework's required-query-binding rule leaves unmatched
+//!   (see [`UNTAG_RESOURCE_ROUTE`]). Which operation serves a request is still the
+//!   model's routing table's answer in every other case.
 //! - `override_refusal` — how this service words a request the framework refused
 //!   before any handler ran. The default returns `None`, keeping the framework's
 //!   wording. See the inline note on that method for how to reword.
@@ -42,10 +45,35 @@
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
+//!
+//! ## The media type this service announces
+//!
+//! The model declares `restJson1`, whose serializer announces
+//! [`crate::state::JSON_CONTENT_TYPE`] on every JSON body, but every recorded RUM
+//! response — every operation, a 200 and a 404 alike — carries
+//! [`crate::state::RESPONSE_CONTENT_TYPE`], and the announced media type is what a
+//! client selecting a parser or validating the response's type reads. The value is a
+//! property of the SERVICE, uniform across operations and across success and error
+//! paths, so it is applied once here rather than in twenty handlers:
+//! [`AnnouncedMediaType`] fronts every request this service serves, runs the operation
+//! the model names unchanged, and re-announces that one header on the way out
+//! ([`announced`]). A response whose body is not the JSON envelope keeps the type its own
+//! target shape maps to.
+//!
+//! `override_protocol` is not the seam for it: the codec is right, and swapping in
+//! another protocol would swap away the URI-based routing this REST service needs.
+//!
+//! Two things the gate deliberately does not touch: authentication, which the router
+//! settles before any operation runs and reads off the MODELLED operation the routing
+//! key names (so a gate cannot weaken an operation's auth schemes), and the refusals
+//! that happen in FRONT of the service — a request naming no modelled operation, an
+//! unverifiable signature, a malformed `aws-chunked` body. Those are not responses this
+//! service produced, so they keep the framework's protocol-correct rendering.
 
+use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
 use aws_smithy_schema_server::constraints::{Violation, ViolationKind};
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, BoxFuture, ErasedOperation, OperationContext, Refusal, Refused, Service,
 };
 use std::sync::Arc;
 
@@ -161,6 +189,10 @@ fn is_untag_resource_route(req: &aws_smithy_runtime_api::http::Request) -> bool 
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// The one gate every request this service serves is run through: it announces this
+    /// service's media type on the response. Held on the service because
+    /// [`Service::override_operation`] hands back a borrow of it.
+    announced_media_type: AnnouncedMediaType<Eng>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -169,9 +201,95 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
-            entry: crate::ServiceDefinition::new(engine),
+            entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
+            announced_media_type: AnnouncedMediaType::new(engine),
         }
     }
+}
+
+/// This service's response envelope in front of one request: the media type every RUM
+/// response announces, and nothing else. See the module docs.
+///
+/// It owns no behaviour of its own: the operation that serves the request is the one the
+/// model's routing table names, reached through its own `run`, so that operation stays
+/// the single owner of the request — its telemetry included. The one exception is
+/// [`UNTAG_RESOURCE_ROUTE`], the route the protocol's routing key cannot name, which the
+/// gate serves from the `UntagResource` it holds.
+struct AnnouncedMediaType<Eng> {
+    /// `UntagResource`, built from the SAME shared engine the generated entry threads
+    /// into every operation, so this gate and the rest of the service read one store.
+    /// Held rather than looked up because [`ErasedOperation::auth_schemes`] is asked
+    /// without a request in hand, and the schemes this gate reports for the route the
+    /// routing key cannot name must be that operation's MODELLED ones.
+    untag_resource: crate::ops::untag_resource::UntagResource<Eng>,
+}
+
+impl<Eng: Send + Sync + 'static> AnnouncedMediaType<Eng> {
+    fn new(engine: Arc<Eng>) -> Self {
+        Self {
+            untag_resource: crate::ops::untag_resource::UntagResource::new(engine),
+        }
+    }
+}
+
+impl<Eng: Send + Sync + 'static> ErasedOperation for AnnouncedMediaType<Eng> {
+    fn run<'r>(
+        &'r self,
+        svc: &'r dyn Service,
+        req: &'r RtRequest,
+        ctx: &'r OperationContext<'r>,
+    ) -> BoxFuture<'r, RtResponse> {
+        Box::pin(async move {
+            // The generated operation serves the request through the framework's own
+            // deserialize -> validate -> handle -> serialize sequence, so a modelled
+            // success, a handler's modelled error and a boundary refusal all pass back
+            // out through here. Reached through the routing table rather than through
+            // `override_operation`, which would route straight back to this gate.
+            let response = match modeled_operation(svc, req) {
+                Some(op) => op.run(svc, req, ctx).await,
+                // The one route the protocol's routing key cannot name, served by the
+                // operation the model binds to it (see [`UNTAG_RESOURCE_ROUTE`]).
+                None if is_untag_resource_route(req) => {
+                    self.untag_resource.run(svc, req, ctx).await
+                }
+                // Unreachable: this gate is served only for a request that is one of the
+                // two cases above.
+                None => svc.definition().routing_error_response(req),
+            };
+            announced(response)
+        })
+    }
+
+    fn auth_schemes(&self) -> Option<&'static [&'static str]> {
+        // Consulted only when the modelled routing key names NO operation — the untag
+        // route above — because the router prefers the modelled operation's schemes for
+        // every request whose key it can resolve. So the schemes reported here are that
+        // operation's own modelled ones, read off it rather than written out: a gate
+        // must not be able to weaken what the model requires.
+        self.untag_resource.auth_schemes()
+    }
+}
+
+/// The response as this service announces it: one media type for every JSON body it
+/// produces, successes and failures alike.
+///
+/// Only the `restJson1` JSON envelope is re-announced
+/// ([`crate::state::JSON_CONTENT_TYPE`] -> [`crate::state::RESPONSE_CONTENT_TYPE`]); a
+/// body that is not that envelope carries the type its own target shape maps to and is
+/// left exactly as the serializer produced it.
+fn announced(mut response: RtResponse) -> RtResponse {
+    if response.headers().get("content-type") == Some(crate::state::JSON_CONTENT_TYPE) {
+        response
+            .headers_mut()
+            .insert("content-type", crate::state::RESPONSE_CONTENT_TYPE);
+    }
+    response
+}
+
+/// The operation the model's routing table names for this request.
+fn modeled_operation<'s>(svc: &'s dyn Service, req: &RtRequest) -> Option<&'s dyn ErasedOperation> {
+    let key = svc.definition().protocol().routing_key(req).ok()?;
+    svc.definition().routing_table().get(key)
 }
 
 impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
@@ -192,27 +310,26 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         }
     }
 
-    /// Serve a request whose method and path name this service's `DELETE
-    /// /tags/{ResourceArn}` route even when the `@required` `tagKeys` query parameter is
+    /// Serve every request this service answers through [`AnnouncedMediaType`], the gate
+    /// that announces this service's media type on the response (see the module docs),
+    /// including the one request whose operation the protocol's routing key cannot name:
+    /// a `DELETE /tags/{ResourceArn}` whose `@required` `tagKeys` query parameter is
     /// ABSENT — the empty key list `TagKeyList`'s `@length(min: 0)` admits.
     ///
-    /// Reached only when the protocol can name NO operation at all: the generated table
-    /// resolves every other request exactly as it does for an unedited service, including
-    /// a `DELETE /tags/{ResourceArn}?tagKeys=…` that carries keys. See
-    /// [`UNTAG_RESOURCE_ROUTE`] for why the framework's required-binding rule leaves this
-    /// one route unmatched, and `crate::ops::untag_resource`'s own input reader for how
-    /// the absent member is then read as the empty list.
-    fn override_operation(
-        &self,
-        req: &aws_smithy_runtime_api::http::Request,
-    ) -> Option<&dyn ErasedOperation> {
-        if self.entry.protocol().routing_key(req).is_ok() {
-            return None;
+    /// WHICH operation serves a request is still decided by the model: the gate resolves
+    /// it from the generated routing table, exactly as the router would have, and the one
+    /// route the table cannot name is matched by method and path alone (see
+    /// [`UNTAG_RESOURCE_ROUTE`] for why the framework's required-binding rule leaves it
+    /// unmatched, and `crate::ops::untag_resource`'s own input reader for how the absent
+    /// member is then read as the empty list). A request that names no modelled operation
+    /// and is not that route is left to the framework, which refuses it in front of this
+    /// service in its own protocol-correct envelope.
+    fn override_operation(&self, req: &RtRequest) -> Option<&dyn ErasedOperation> {
+        let gate = &self.announced_media_type as &dyn ErasedOperation;
+        if modeled_operation(self, req).is_some() || is_untag_resource_route(req) {
+            return Some(gate);
         }
-        if !is_untag_resource_route(req) {
-            return None;
-        }
-        self.entry.routing_table().get(UNTAG_RESOURCE_ROUTE.2)
+        None
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {

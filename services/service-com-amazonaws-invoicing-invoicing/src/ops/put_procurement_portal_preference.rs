@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutProcurementPortalPreference
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutProcurementPortalPreference`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutProcurementPortalPreference::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Updates the procurement portal preference [`crate::state`] holds for the ARN the
+//! request names: the configuration members this operation states replace what the last
+//! write left, `Version` advances to the next version of that configuration and
+//! `LastUpdateDate` becomes the instant it changed at, so the existing
+//! `GetProcurementPortalPreference` reports the update. An optional member the request
+//! omits leaves that part of the configuration as it was — the same rule
+//! `UpdateInvoiceUnit` follows — except `MarketplacePunchOutEnabled`, which the model
+//! documents as defaulting to false when it is not provided.
+//!
+//! The identity members (the portal and the buyer/supplier pair), the account, the ARN
+//! and `CreateDate` are not members of this operation's input, so they stay exactly what
+//! the create left. An ARN this service does not hold is the modelled
+//! `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -189,18 +194,132 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutProcurementPortalPreference` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutProcurementPortalPreferenceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutProcurementPortalPreference"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            PutProcurementPortalPreferenceErrorModeled::InternalServerException(
+                crate::state::state_unavailable(),
+            )
+        })?;
+        let mut store = state.lock();
+
+        // `@idempotent`, and nothing is suppressed for a `ClientToken`: this request
+        // STATES the configuration it wants (every configuration member a caller sets is
+        // a member of this input), so applying it twice leaves the resource with exactly
+        // the configuration it states — which is what makes the operation idempotent. The
+        // token is what lets a client retry a write it did not see the answer to; it is
+        // not a record of a resource a retry must not create a second time, as it is for
+        // `CreateProcurementPortalPreference`.
+        let updated_at = crate::state::now();
+        // The write is one scope, so the borrow of the stored preference ends before this
+        // handler answers.
+        {
+            // An update acts on the resource as it is NOW: an ARN this service does not
+            // hold is the modelled 404, and nothing is written for it.
+            let stored = store
+                .procurement_portal_preferences
+                .get_mut(&input.procurement_portal_preference_arn)
+                .ok_or_else(|| {
+                    PutProcurementPortalPreferenceErrorModeled::ResourceNotFoundException(
+                        crate::state::no_such_resource(&input.procurement_portal_preference_arn),
+                    )
+                })?;
+
+            // `MarketplacePunchOutEnabled` "defaults to false if not provided", so an
+            // omitted member takes that default here rather than the stored value.
+            let marketplace_punch_out_enabled = input.marketplace_punch_out_enabled.unwrap_or(false);
+            // The same Marketplace PunchOut rule the create applies, read against the
+            // portal the STORED preference routes to: this operation's input does not
+            // carry `ProcurementPortalName`, because a preference's portal is not
+            // something an update can change.
+            if marketplace_punch_out_enabled
+                && stored.preference.procurement_portal_name == crate::state::PORTAL_COUPA
+                && input.marketplace_punch_out_preference.is_none()
+            {
+                return Err(PutProcurementPortalPreferenceErrorModeled::ValidationException(
+                    crate::state::marketplace_punch_out_preference_required(
+                        &stored.preference.procurement_portal_name,
+                    ),
+                )
+                .into());
+            }
+
+            let preference = &mut stored.preference;
+
+            // The members this operation marks required are stated by every request, so
+            // each one replaces what was stored.
+            preference.contacts = Some(input.contacts);
+            preference.einvoice_delivery_enabled = input.einvoice_delivery_enabled;
+            preference.purchase_order_retrieval_enabled = input.purchase_order_retrieval_enabled;
+            preference.marketplace_punch_out_enabled = Some(marketplace_punch_out_enabled);
+
+            // An optional member the request states replaces that part of the
+            // configuration; one it omits leaves it as it was.
+            if let Some(selector) = input.selector {
+                preference.selector = Some(selector);
+            }
+            if let Some(secret) = input.procurement_portal_shared_secret {
+                preference.procurement_portal_shared_secret = Some(secret);
+            }
+            if let Some(endpoint) = input.procurement_portal_instance_endpoint {
+                preference.procurement_portal_instance_endpoint = Some(endpoint);
+            }
+            if let Some(delivery) = input.einvoice_delivery_preference {
+                preference.einvoice_delivery_preference = Some(delivery);
+            }
+            if let Some(punch_out) = input.marketplace_punch_out_preference {
+                preference.marketplace_punch_out_preference = Some(punch_out);
+            }
+            if let Some(test) = input.test_env_preference {
+                // `TestEnvPreference$PurchaseOrderRetrievalEndpoint` is a member of the
+                // STORED structure that `TestEnvPreferenceInput` does not carry
+                // (`smithy_query(query="operation",
+                // operation="PutProcurementPortalPreference")`), so it keeps its stored
+                // value rather than being dropped by a write that could not state it.
+                let purchase_order_retrieval_endpoint = preference
+                    .test_env_preference
+                    .as_ref()
+                    .and_then(|stored| stored.purchase_order_retrieval_endpoint.clone());
+                preference.test_env_preference = Some(TestEnvPreference {
+                    buyer_domain: test.buyer_domain,
+                    buyer_identifier: test.buyer_identifier,
+                    supplier_domain: test.supplier_domain,
+                    supplier_identifier: test.supplier_identifier,
+                    procurement_portal_shared_secret: test.procurement_portal_shared_secret,
+                    procurement_portal_instance_endpoint: test.procurement_portal_instance_endpoint,
+                    purchase_order_retrieval_endpoint,
+                });
+            }
+
+            // A plane this update ENABLES that carries no verification status yet starts
+            // at `PENDING_VERIFICATION`, the status a create gives an enabled plane. A
+            // status that already exists is left alone: the service models the validation
+            // calls (and `UpdateProcurementPortalPreferenceStatus`) as what moves a
+            // plane's status, so a configuration write is not one of them.
+            if preference.einvoice_delivery_enabled
+                && preference.einvoice_delivery_preference_status.is_none()
+            {
+                preference.einvoice_delivery_preference_status =
+                    Some(crate::state::STATUS_PENDING_VERIFICATION.to_string());
+            }
+            if preference.purchase_order_retrieval_enabled
+                && preference.purchase_order_retrieval_preference_status.is_none()
+            {
+                preference.purchase_order_retrieval_preference_status =
+                    Some(crate::state::STATUS_PENDING_VERIFICATION.to_string());
+            }
+
+            // `Version` is "the version number of the procurement portal preference
+            // configuration" (`smithy_query(query="doc",
+            // shape="ProcurementPortalPreference", member="Version")`), so a write of that
+            // configuration reports the next one, and `LastUpdateDate` is the instant it
+            // changed at. `CreateDate` is not touched: when a resource was created does
+            // not change because it was updated.
+            preference.version = preference.version.saturating_add(1);
+            preference.last_update_date = updated_at;
+        }
+
+        Ok(PutProcurementPortalPreferenceOutput {
+            procurement_portal_preference_arn: input.procurement_portal_preference_arn,
+        })
     }
 }

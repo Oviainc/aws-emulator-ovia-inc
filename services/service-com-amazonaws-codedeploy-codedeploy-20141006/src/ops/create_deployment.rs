@@ -282,6 +282,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
+        // How long a comment this service accepts is not modelled on `Description`, so
+        // it is refused here — with the `DescriptionTooLongException` this operation
+        // models for exactly that, the same bound every operation carrying a
+        // `description` applies.
+        if let Some(description) = input
+            .description
+            .as_deref()
+            .filter(|description| crate::state::description_too_long(description))
+        {
+            return Err(CreateDeploymentErrorModeled::DescriptionTooLongException(
+                DescriptionTooLongException {
+                    message: Some(crate::state::description_too_long_message(description)),
+                },
+            )
+            .into());
+        }
         // `deploymentGroupName` is modelled optional, but a deployment is always to a
         // deployment group, so an absent one is refused here rather than at the
         // boundary. An empty or malformed one never reaches the handler: the member

@@ -11,7 +11,9 @@
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::appconfig_workflow::{create_application, is_modelled_id, json_call, router, Answer};
+use super::appconfig_workflow::{
+    create_application, create_profile_from, is_modelled_id, json_call, router, Answer,
+};
 
 /// A retrieval role of the shape the model's `RoleArn` pattern demands
 /// (`^((arn):(aws|…):(iam)::\d{12}:role[/].*)$`).
@@ -42,30 +44,6 @@ fn baseline_body(name: &str) -> Value {
         "KmsKeyIdentifier": "alias/baseline-key",
         "Validators": [json_schema_validator("{\"type\":\"object\"}")],
     })
-}
-
-/// Create a profile from `body` under `application` and answer the created record.
-async fn create_profile_from(
-    router: &MultiServiceRouter,
-    application: &str,
-    case: &str,
-    body: &Value,
-) -> Answer {
-    let created = json_call(
-        router,
-        "POST",
-        &format!("/applications/{application}/configurationprofiles"),
-        body,
-    )
-    .await;
-    assert_eq!(
-        created.status,
-        201,
-        "case {case:?}: CreateConfigurationProfile expected 201, got {} / {}",
-        created.status,
-        String::from_utf8_lossy(&created.body)
-    );
-    created
 }
 
 /// `PATCH` a profile.

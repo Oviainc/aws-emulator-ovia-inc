@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchDetectSyntax
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchDetectSyntax`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchDetectSyntax::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED. Every document of `TextList` is segmented and tagged by the SAME
+//! in-process part-of-speech tagger `DetectSyntax` uses
+//! ([`crate::ops::detect_syntax::syntax_tokens`]), so the tokens, their offsets, their
+//! tags and their confidences are computed from the submitted text rather than matched
+//! out of the request, and a document cannot be analysed differently for having
+//! travelled in a batch. Batching changes only how many documents one request carries:
+//! the documented document-count and per-document byte quotas are refused with this
+//! operation's own modelled errors, and a `LanguageCode` the tagger has no lexicon for
+//! with the modelled `UnsupportedLanguageException`.
 //!
 //! ## Shape of an operation
 //!
@@ -91,6 +92,38 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+// Batching changes how many documents one request carries, never how a document is
+// segmented or tagged: the per-document analysis and the set of languages the tagger
+// has a lexicon for live with `DetectSyntax`, and the per-document byte quota lives
+// with the state module, so the two operations cannot drift apart.
+use super::detect_syntax::{syntax_tokens, TAGGABLE_LANGUAGES};
+
+/// The most documents one batch may carry: the ONE ceiling the whole `BatchDetect*`
+/// family shares, [`crate::state::MAX_BATCH_DOCUMENTS`], documented twice in this
+/// operation's own model (`BatchDetectSyntaxRequest$TextList` says "The list can
+/// contain a maximum of 25 documents", and `BatchSizeLimitExceededException` says
+/// "The number of documents in the request exceeds the limit of 25"). The model's
+/// `@length` trait states only the floor of 1, so the ceiling is enforced here, with
+/// the error the operation declares for it.
+const MAX_BATCH_DOCUMENTS: usize = crate::state::MAX_BATCH_DOCUMENTS;
+
+/// The largest single document in the batch, in UTF-8 bytes.
+///
+/// The same per-document real-time quota a single-document inference call enforces,
+/// [`crate::state::REALTIME_TEXT_QUOTA_BYTES`] — one document's quota cannot depend
+/// on whether it was submitted alone or in a batch. The member documentation rounds
+/// it to "5 KB"; the enforced quota is a count of BYTES, so it is that constant and
+/// not a multiple of 1024.
+///
+/// The quota is measured per document and enforced over the REQUEST: a batch
+/// carrying any document past it is refused in its entirety with the modelled
+/// `TextSizeLimitExceededException`, through
+/// [`crate::state::batch_text_size_refusal`], rather than answered with a per-index
+/// `BatchItemError`. The modelled `ErrorList` describes documents a call that was
+/// ACCEPTED could not analyse; a document the quota refuses was never accepted, so
+/// no result for the batch exists to align against.
+const MAX_DOCUMENT_BYTES: usize = crate::state::REALTIME_TEXT_QUOTA_BYTES;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -163,18 +196,83 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchDetectSyntax` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchDetectSyntaxErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchDetectSyntax"))
+        // Synchronous inference holds no state: the token lists are a function of
+        // `TextList` and `LanguageCode` alone, so repeating a call returns the same
+        // tokens in the same order and nothing a later caller reads is changed.
+        let _ = (ctx, &self.engine);
+
+        // The model's `@length` floor of 1 on `TextList` is enforced at the
+        // boundary; the ceiling of 25 it documents in prose is not.
+        if input.text_list.len() > MAX_BATCH_DOCUMENTS {
+            return Err(
+                BatchDetectSyntaxErrorModeled::BatchSizeLimitExceededException(
+                    BatchSizeLimitExceededException {
+                        message: Some(crate::state::batch_size_limit_refusal()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The per-document byte quota, applied to the WHOLE request: a batch
+        // carrying an oversized document is refused before anything is tagged, so
+        // no partial `ResultList` travels with the refusal. Checked after the
+        // document count, which is the quota the service reads first, and before the
+        // language, which is this emulator's own restriction rather than one AWS
+        // applies.
+        if let Some(message) = crate::state::batch_text_size_refusal(
+            input.text_list.iter().map(String::as_str),
+            MAX_DOCUMENT_BYTES,
+        ) {
+            return Err(
+                BatchDetectSyntaxErrorModeled::TextSizeLimitExceededException(
+                    TextSizeLimitExceededException {
+                        message: Some(message),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Membership of the `SyntaxLanguageCode` enum is enforced at the boundary;
+        // whether this emulator's tagger has a lexicon for that language is not. One
+        // `LanguageCode` covers the whole batch ("All documents must be in the same
+        // language"), so a language the tagger cannot read refuses the call rather
+        // than failing each document in turn.
+        if !TAGGABLE_LANGUAGES.contains(&input.language_code.as_str()) {
+            return Err(
+                BatchDetectSyntaxErrorModeled::UnsupportedLanguageException(
+                    UnsupportedLanguageException {
+                        message: Some(format!(
+                            "This emulator's syntax engine cannot process the language \
+                             '{}'. Supported languages: {}.",
+                            input.language_code,
+                            TAGGABLE_LANGUAGES.join(", ")
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Every precondition holds, so the whole batch is analysed: `ResultList` is
+        // built in input order, so it is "sorted in ascending order by the Index
+        // field" and every entry's `Index` is its document's own zero-based position
+        // — the only mapping a caller has back to its input. No document of an
+        // accepted batch is left unanalysed, so `ErrorList` is empty.
+        let result_list = input
+            .text_list
+            .iter()
+            .enumerate()
+            .map(|(position, text)| BatchDetectSyntaxItemResult {
+                index: i32::try_from(position).ok(),
+                syntax_tokens: Some(syntax_tokens(text)),
+            })
+            .collect();
+
+        Ok(BatchDetectSyntaxOutput {
+            result_list,
+            error_list: Vec::new(),
+        })
     }
 }

@@ -57,13 +57,22 @@ pub(crate) fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
 }
 
 /// One HTTP answer, kept as raw bytes so a case can assert on an EMPTY body as well as
-/// on JSON.
+/// on JSON, and with the response headers so a case can assert on the envelope (the
+/// media type the service announces) rather than only on the payload.
 pub(crate) struct Reply {
     pub(crate) status: u16,
     pub(crate) body: Bytes,
+    pub(crate) headers: http::HeaderMap,
 }
 
 impl Reply {
+    /// The media type this answer announces, as the client reads it.
+    pub(crate) fn content_type(&self) -> Option<&str> {
+        self.headers
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+    }
+
     pub(crate) fn json(&self, case: &str) -> Value {
         serde_json::from_slice(&self.body).unwrap_or_else(|e| {
             panic!(
@@ -105,9 +114,11 @@ pub(crate) async fn call_in(
         .expect("a well-formed request");
     let response = router.dispatch(request).await;
     let status = response.status().as_u16();
+    let headers = response.headers().clone();
     Reply {
         status,
         body: response.into_body(),
+        headers,
     }
 }
 

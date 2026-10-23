@@ -3,7 +3,8 @@
 //! Engine state for the com-amazonaws-codedeploy-codedeploy-20141006 service.
 //!
 //! Every record a handler answers from lives here: applications (with their
-//! deployment groups), deployments, and the deployment configurations. Handlers
+//! deployment groups and their registered revisions), deployments, and the
+//! deployment configurations. Handlers
 //! reach it through [`with_state`], which is also where the two things that must
 //! happen before ANY request is served happen: seeding the `CodeDeployDefault.*`
 //! built-in deployment configurations once, and materialising the deployment
@@ -356,6 +357,34 @@ pub const DEFAULT_COMPUTE_PLATFORM: &str = "Server";
 pub const MAX_APPLICATIONS: usize = 1_000;
 /// See [`MAX_APPLICATIONS`].
 pub const MAX_DEPLOYMENT_GROUPS_PER_APPLICATION: usize = 1_000;
+
+/// How long a `description` this service accepts before answering the modelled
+/// `DescriptionTooLongException`, counted in Unicode characters.
+///
+/// The model puts no `@length` on `Description`
+/// (`smithy_query(query="shape",shape="Description")` is a bare string) and AWS
+/// publishes no number for it, so this bound is CHOSEN — but the REFUSAL is not:
+/// `RegisterApplicationRevision` and `CreateDeployment` both model
+/// `DescriptionTooLongException`, which is what a description past the bound is
+/// answered with. Characters, not bytes, so a description of non-ASCII text is
+/// measured the way a caller counts it.
+pub const MAX_DESCRIPTION_CHARS: usize = 512;
+
+/// Whether `description` is past [`MAX_DESCRIPTION_CHARS`].
+pub fn description_too_long(description: &str) -> bool {
+    description.chars().count() > MAX_DESCRIPTION_CHARS
+}
+
+/// The message a `DescriptionTooLongException` carries: how long the comment the
+/// request sent is and how long one may be, both built from the request so the
+/// caller can fix it.
+pub fn description_too_long_message(description: &str) -> String {
+    format!(
+        "The description is too long: it is {} characters and at most {MAX_DESCRIPTION_CHARS} are \
+         allowed",
+        description.chars().count()
+    )
+}
 
 /// How many deployment configurations one account's store holds, counting the
 /// `CodeDeployDefault.*` built-ins.

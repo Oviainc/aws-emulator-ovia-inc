@@ -1154,6 +1154,23 @@ pub const CONFLICT_MESSAGE_PREFIX: &str = "Resource ";
 /// See [`CONFLICT_MESSAGE_PREFIX`].
 pub const CONFLICT_MESSAGE_SUFFIX: &str = " already exists";
 
+/// The media type every RUM response announces for the JSON body it carries.
+///
+/// RECORDED BEHAVIOUR: the model declares `restJson1`, whose serializer stamps
+/// [`JSON_CONTENT_TYPE`] on a JSON body, but every recorded real-RUM response — every
+/// operation, success and failure alike, on 200s and on 404s — carries
+/// `application/x-amz-json-1.1`, which is the media type a client selecting a parser or
+/// asserting on the response reads. The body is the same JSON either way, so nothing but
+/// the announced type changes. Applied in [`crate::service::EmulatedService`], the one
+/// place every response this service produces passes through.
+pub const RESPONSE_CONTENT_TYPE: &str = "application/x-amz-json-1.1";
+
+/// The media type the `restJson1` serializer stamps on a JSON body — the one value
+/// [`RESPONSE_CONTENT_TYPE`] replaces. A response whose body is NOT that JSON envelope
+/// (a `@httpPayload` blob's `application/octet-stream`, a string payload's `text/plain`)
+/// announces the type its own target shape maps to and is left alone.
+pub const JSON_CONTENT_TYPE: &str = "application/json";
+
 /// What separates the components of a continuation token's resume key: a control
 /// character none of the components that precede the last one can contain (an
 /// `AppMonitorName` matches `^(?!\.)[\.\-_#A-Za-z0-9]+$` and a `MetricDestination` is

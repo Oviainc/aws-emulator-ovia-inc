@@ -66,7 +66,8 @@ async fn the_published_catalog_is_what_a_read_reports() {
     );
 
     // Every entry is internally consistent: its family is the family of its own
-    // version, and its description names that version.
+    // version, and its description is the ENGINE BUILD that version runs (pinned
+    // as a rule in the `static_catalog` suite), not a restatement of the version.
     for offered in &published {
         let version = offered.cluster_version.clone().unwrap_or_default();
         assert_eq!(
@@ -75,10 +76,16 @@ async fn the_published_catalog_is_what_a_read_reports() {
             "case catalog entry {version}: expected the family of its own version, got {:?}",
             offered.cluster_parameter_group_family
         );
-        let description = offered.description.clone().unwrap_or_default();
-        assert!(
-            description.contains(&version),
-            "case catalog entry {version}: expected a description naming the version, got {description:?}"
+        let build = state::PUBLISHED_ENGINE_BUILDS
+            .iter()
+            .find(|(offered_version, _)| *offered_version == version)
+            .map(|(_, build)| *build)
+            .unwrap_or_else(|| panic!("case catalog entry {version}: expected a published build"));
+        assert_eq!(
+            offered.description.as_deref(),
+            Some(state::engine_build_description(build).as_str()),
+            "case catalog entry {version}: expected the engine build {build} as the description, got {:?}",
+            offered.description
         );
     }
 
@@ -104,11 +111,10 @@ async fn the_published_catalog_is_what_a_read_reports() {
             "case read an empty emulator: expected the family of {version} on the wire, got {:?}",
             all_text(&answer.body, "ClusterParameterGroupFamily")
         );
+        let description = offered.description.clone().unwrap_or_default();
         assert!(
-            all_text(&answer.body, "Description")
-                .iter()
-                .any(|text| text.contains(&version)),
-            "case read an empty emulator: expected a description naming {version} on the wire, got {:?}",
+            all_text(&answer.body, "Description").contains(&description),
+            "case read an empty emulator: expected the engine build {description:?} of {version} on the wire, got {:?}",
             all_text(&answer.body, "Description")
         );
     }
