@@ -33,6 +33,8 @@ mod bedrock_agent_runtime_session_authorization;
 mod bedrock_signing_name_routing;
 #[path = "all/boot_serve.rs"]
 mod boot_serve;
+#[path = "all/cloudformation_provisions_stack_resources.rs"]
+mod cloudformation_provisions_stack_resources;
 #[path = "all/cloudfront_key_value_store_handshake.rs"]
 mod cloudfront_key_value_store_handshake;
 #[path = "all/connect_signing_name_routing.rs"]

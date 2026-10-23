@@ -168,24 +168,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the same pipeline; the store is keyed by name, so the shared reducer resolves
         // the ARN form the way every other `ArnOrName` reader in this service does.
         let name = crate::state::name_from_arn_or_name(&input.pipeline_name);
-        let now = ::std::time::SystemTime::now();
 
-        let mut store = state.lock();
-        // The one write a report may make: a deletion the clock already owed is
-        // materialised, so a pipeline past its removal instant is reported as gone
-        // whether or not anybody polled in between.
-        store.settle_pipeline_deletions(now);
+        let store = state.lock();
 
         let Some(pipeline) = store.pipelines.get(name) else {
             // Never a 200 with empty fields: a caller cannot tell that from a pipeline
-            // that exists and carries nothing.
+            // that exists and carries nothing, and a deleted pipeline is exactly as
+            // unknown as a name nobody ever created.
             let arn = crate::state::resource_arn(
                 &crate::state::request_region(ctx),
                 "pipeline",
                 name,
             );
             return Err(DescribePipelineErrorModeled::ResourceNotFound(ResourceNotFound {
-                message: Some(format!("Pipeline {arn} does not exist.")),
+                message: Some(crate::state::does_not_exist(
+                    crate::state::PIPELINE_ENTITY,
+                    &arn,
+                )),
             })
             .into());
         };

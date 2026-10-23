@@ -156,21 +156,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let state = crate::state::service_state(&*self.engine)
             .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
 
         let store = state.lock();
         let Some(config) = store.endpoint_configs.get(&input.endpoint_config_name) else {
-            let arn = crate::state::resource_arn(
-                &crate::state::request_region(ctx),
-                "endpoint-config",
-                &input.endpoint_config_name,
-            );
-            return Err(crate::scaffolded::Scaffolded::validation(format!(
-                "Could not find endpoint configuration \"{arn}\"."
-            )));
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::could_not_find(
+                    crate::state::ENDPOINT_CONFIG_KIND_LABEL,
+                    &input.endpoint_config_name,
+                ),
+            ));
         };
 
         Ok(DescribeEndpointConfigOutput {

@@ -73,6 +73,8 @@ mod pipeline_execution;
 mod pipeline_lifecycle;
 #[path = "all/processing_job_lifecycle.rs"]
 mod processing_job_lifecycle;
+#[path = "all/rejection_fidelity.rs"]
+mod rejection_fidelity;
 #[path = "all/servicecatalog_portfolio_status.rs"]
 mod servicecatalog_portfolio_status;
 #[path = "all/state_roundtrip.rs"]

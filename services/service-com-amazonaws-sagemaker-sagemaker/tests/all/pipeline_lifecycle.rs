@@ -11,16 +11,11 @@
 //! pipeline definition is accepted exactly when it declares the published schema
 //! version and a step list whose names are unique and whose `DependsOn` graph resolves
 //! and is acyclic; an accepted pipeline round-trips through `DescribePipeline`; and the
-//! delete is asynchronous, reporting `Deleting` before the record is gone.
-
-use std::time::Duration;
+//! delete removes the pipeline, so the reader refuses it from that call on.
 
 use serde_json::{json, Value};
 
-use super::inference_deployment_lifecycle::{error_code, str_field, Emulator, ACCOUNT};
-
-/// Long enough to pass `state::PIPELINE_DELETED_AFTER` (300 ms).
-const PAST_REMOVAL_DUE: Duration = Duration::from_millis(600);
+use super::inference_deployment_lifecycle::{error_code, message, str_field, Emulator, ACCOUNT};
 
 /// The only pipeline-definition schema version SageMaker Pipelines publishes.
 pub(crate) const DEFINITION_VERSION: &str = "2020-12-01";
@@ -714,17 +709,18 @@ async fn a_repeated_create_is_idempotent_and_a_second_create_is_refused() {
     }
 }
 
-/// RULE: `DeletePipeline` starts an asynchronous removal — the pipeline reports
-/// `Deleting` until the clock owes its disappearance, after which the reader refuses it
-/// and its name is free again — and a delete of a pipeline nobody created is refused
-/// with the modelled not-found.
+/// RULE: `DeletePipeline` removes the pipeline — it answers the ARN the pipeline
+/// carried, and from that call on the reader refuses the name with the modelled
+/// not-found, a second delete of it is refused the same way, and the name is free to
+/// create again — and a delete of a pipeline nobody created is refused with that same
+/// not-found.
 #[tokio::test]
-async fn delete_reports_deleting_before_the_pipeline_is_gone() {
+async fn delete_makes_the_pipeline_unreadable_and_frees_its_name() {
     let emulator = Emulator::new();
     let definition = definition(json!([step("Only", &[])]));
 
-    // Rows differ along how many deletes the caller issues: one, and a repeat while the
-    // removal is still in flight (which must not postpone it).
+    // Rows differ along how many deletes the caller issues: one, and a repeat, which
+    // must be refused rather than succeed a second time.
     for (case, deletes) in [("single-delete", 1_usize), ("repeated-delete", 2)] {
         let created = emulator
             .ok(
@@ -735,8 +731,8 @@ async fn delete_reports_deleting_before_the_pipeline_is_gone() {
         let arn = str_field(&created, "PipelineArn");
 
         for attempt in 0..deletes {
-            let deleted = emulator
-                .ok(
+            let (status, body) = emulator
+                .call(
                     "DeletePipeline",
                     &json!({
                         "PipelineName": case,
@@ -744,48 +740,42 @@ async fn delete_reports_deleting_before_the_pipeline_is_gone() {
                     }),
                 )
                 .await;
-            assert_eq!(
-                str_field(&deleted, "PipelineArn"),
-                arn,
-                "case {case}/attempt {attempt}: DeletePipeline answers the pipeline's ARN, \
-                 got {deleted:?}"
-            );
-            // Straight after the call the removal is not yet due, so the transient
-            // status is observable.
-            let described = emulator
-                .ok("DescribePipeline", &json!({ "PipelineName": case }))
+            if attempt == 0 {
+                assert_eq!(
+                    (status, str_field(&body, "PipelineArn")),
+                    (200, arn.clone()),
+                    "case {case}/attempt {attempt}: DeletePipeline answers the \
+                     pipeline's ARN, got {status} {body:?}"
+                );
+            } else {
+                assert_eq!(
+                    (status, error_code(&body).as_str()),
+                    (400, "ResourceNotFound"),
+                    "case {case}/attempt {attempt}: a pipeline already deleted is gone, \
+                     got {status} {body:?}"
+                );
+            }
+
+            // Straight after the call the record is gone: no transient status, no
+            // readable leftover.
+            let (status, body) = emulator
+                .call("DescribePipeline", &json!({ "PipelineName": case }))
                 .await;
             assert_eq!(
-                str_field(&described, "PipelineStatus"),
-                "Deleting",
-                "case {case}/attempt {attempt}: the pipeline reports Deleting until its \
-                 removal is due, got {described:?}"
+                (status, error_code(&body).as_str()),
+                (400, "ResourceNotFound"),
+                "case {case}/attempt {attempt}: a deleted pipeline is refused by the \
+                 reader, got {status} {body:?}"
+            );
+            assert_eq!(
+                message(&body),
+                format!("Pipeline '{arn}' does not exist."),
+                "case {case}/attempt {attempt}: the reader names the resolved ARN in \
+                 single quotes, got {body:?}"
             );
         }
 
-        // Past the removal instant the record is gone, whoever polled in between.
-        tokio::time::sleep(PAST_REMOVAL_DUE).await;
-        let (status, body) = emulator
-            .call("DescribePipeline", &json!({ "PipelineName": case }))
-            .await;
-        assert_eq!(
-            (status, error_code(&body).as_str()),
-            (400, "ResourceNotFound"),
-            "case {case}: a removed pipeline is refused by the reader, got {status} {body:?}"
-        );
-        let (status, body) = emulator
-            .call(
-                "DeletePipeline",
-                &json!({ "PipelineName": case, "ClientRequestToken": token("after-removal") }),
-            )
-            .await;
-        assert_eq!(
-            (status, error_code(&body).as_str()),
-            (400, "ResourceNotFound"),
-            "case {case}: deleting a removed pipeline is refused, got {status} {body:?}"
-        );
-
-        // And the name is free: a create under it is a first create again.
+        // And the name is free at once: a create under it is a first create again.
         let recreated = emulator
             .ok(
                 "CreatePipeline",
@@ -795,7 +785,8 @@ async fn delete_reports_deleting_before_the_pipeline_is_gone() {
         assert_eq!(
             str_field(&recreated, "PipelineArn"),
             arn,
-            "case {case}: the name is reusable once the removal is due, got {recreated:?}"
+            "case {case}: the name is reusable once the pipeline is deleted, \
+             got {recreated:?}"
         );
         assert_eq!(
             str_field(
@@ -819,6 +810,15 @@ async fn delete_reports_deleting_before_the_pipeline_is_gone() {
         (status, error_code(&body).as_str()),
         (400, "ResourceNotFound"),
         "case unknown-name: expected 400 ResourceNotFound, got {status} {body:?}"
+    );
+    assert_eq!(
+        message(&body),
+        format!(
+            "Pipeline 'arn:aws:sagemaker:us-east-1:{ACCOUNT}:pipeline/never-created' \
+             does not exist."
+        ),
+        "case unknown-name: the delete names the resolved ARN in single quotes, \
+         got {body:?}"
     );
 }
 

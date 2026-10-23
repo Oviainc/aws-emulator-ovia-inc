@@ -336,29 +336,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(crate::scaffolded::Scaffolded::not_implemented("UpdateStack"));
         };
         let now = ::std::time::SystemTime::now();
-        let mut store = state.lock();
-        store.settle(now);
+        // The store is read under the lock and the lock is RELEASED with this block: what
+        // the update computes from the request and the stack's previous values needs no
+        // lock, and the calls that create or delete the stack's resources must not run
+        // under one.
+        let previous = {
+            let mut store = state.lock();
+            store.settle(now);
 
-        let not_found = || {
-            crate::scaffolded::Scaffolded::validation_error(crate::state::stack_does_not_exist(
-                &input.stack_name,
-            ))
+            let not_found = || {
+                crate::scaffolded::Scaffolded::validation_error(
+                    crate::state::stack_does_not_exist(&input.stack_name),
+                )
+            };
+            let previous = store.resolve(&input.stack_name).ok_or_else(not_found)?;
+            // A stack id resolves a deleted stack too, but a deleted stack cannot be
+            // updated.
+            if !previous.is_live() {
+                return Err(not_found());
+            }
+            // An operation still in flight on this stack, or a stack a `CREATE` change set
+            // created that nothing has executed yet (it has no template and no resources to
+            // update — the change set is what brings it into existence): neither can take an
+            // update.
+            if previous.pending.is_some() || previous.status == status::REVIEW_IN_PROGRESS {
+                return Err(crate::scaffolded::Scaffolded::validation_error(
+                    crate::state::stack_cannot_be_updated(&previous.stack_id, &previous.status),
+                ));
+            }
+            PreviousValues::of(previous)
         };
-        let previous = store.resolve(&input.stack_name).ok_or_else(not_found)?;
-        // A stack id resolves a deleted stack too, but a deleted stack cannot be updated.
-        if !previous.is_live() {
-            return Err(not_found());
-        }
-        // An operation still in flight on this stack, or a stack a `CREATE` change set
-        // created that nothing has executed yet (it has no template and no resources to
-        // update — the change set is what brings it into existence): neither can take an
-        // update.
-        if previous.pending.is_some() || previous.status == status::REVIEW_IN_PROGRESS {
-            return Err(crate::scaffolded::Scaffolded::validation_error(
-                crate::state::stack_cannot_be_updated(&previous.stack_id, &previous.status),
-            ));
-        }
-        let previous = PreviousValues::of(previous);
 
         let template_body = match &input.template_body {
             Some(body) => {
@@ -431,51 +438,105 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let operation_id = crate::state::new_operation_id();
-        let stack = store
-            .resolve_mut(&input.stack_name)
-            .expect("the stack resolved immediately above");
-        stack.set_template_body(template_body);
-        stack.parameters = parameters;
-        stack.tags = tags;
-        stack.notification_arns = notification_arns;
-        stack.capabilities = capabilities;
-        stack.role_arn = role_arn;
-        stack.rollback_configuration = rollback_configuration;
-        stack.deployment_config = deployment_config;
-        if let Some(disable_rollback) = input.disable_rollback {
-            stack.disable_rollback = disable_rollback;
+        // The store lock is taken for the write and RELEASED at the end of this block: the
+        // calls that create or delete the stack's resources run after it, and each of
+        // those reaches another service's own handler, which takes that service's lock.
+        //
+        // The preconditions are re-asserted HERE, under the writing lock, rather than
+        // trusted from the read above: between the two, another request may have deleted
+        // the stack or started an operation on it, and only one update may be in flight.
+        let (stack_id, region, declared, previous_resources) = {
+            let mut store = state.lock();
+            let stack = store
+                .resolve_mut(&input.stack_name)
+                .filter(|stack| stack.is_live())
+                .ok_or_else(|| {
+                    crate::scaffolded::Scaffolded::validation_error(
+                        crate::state::stack_does_not_exist(&input.stack_name),
+                    )
+                })?;
+            if stack.pending.is_some() || stack.status == status::REVIEW_IN_PROGRESS {
+                return Err(crate::scaffolded::Scaffolded::validation_error(
+                    crate::state::stack_cannot_be_updated(&stack.stack_id, &stack.status),
+                ));
+            }
+            // What the stack's resources are BEFORE this deployment: what the update has
+            // to keep, replace or delete in the services that own them.
+            let previous_resources = stack.current_resources().to_vec();
+            stack.set_template_body(template_body);
+            stack.parameters = parameters;
+            stack.tags = tags;
+            stack.notification_arns = notification_arns;
+            stack.capabilities = capabilities;
+            stack.role_arn = role_arn;
+            stack.rollback_configuration = rollback_configuration;
+            stack.deployment_config = deployment_config;
+            if let Some(disable_rollback) = input.disable_rollback {
+                stack.disable_rollback = disable_rollback;
+            }
+            if let Some(retain_except_on_create) = input.retain_except_on_create {
+                stack.retain_except_on_create = Some(retain_except_on_create);
+            }
+            if let Some(token) = &input.client_request_token {
+                stack.client_request_token = Some(token.clone());
+            }
+            // "Structure that contains a new stack policy body": present replaces the
+            // stored policy, absent leaves it alone, as for the other restated members.
+            if let Some(policy) = &input.stack_policy_body {
+                stack.stack_policy_body = Some(policy.clone());
+            }
+            if let Some(resource_types) = &input.resource_types {
+                stack.resource_types = resource_types.clone();
+            }
+            stack.last_updated_time = Some(now);
+            // The update deploys the template the stack now carries: its resources and its
+            // outputs are re-evaluated from the new body and the merged parameters, and
+            // reported once the update completes.
+            stack.deploy_template();
+            // The update starts now and settles to UPDATE_COMPLETE once the clock makes
+            // that due; the stack id never changes.
+            stack.begin_transition(
+                now,
+                status::UPDATE_IN_PROGRESS,
+                status::UPDATE_COMPLETE,
+                Some(operation_id.clone()),
+                input.client_request_token.clone(),
+            );
+            (
+                stack.stack_id.clone(),
+                stack.region.clone(),
+                stack.current_resources().to_vec(),
+                previous_resources,
+            )
+        };
+
+        // The update's resources are reconciled with the ones the stack already had: what
+        // the new template declares again is kept, what it declares anew is created in the
+        // service that owns it, and what it no longer declares is deleted there.
+        let materialised = crate::state::provisioning::reconcile(
+            ctx,
+            &region,
+            declared,
+            &previous_resources,
+        )
+        .await;
+
+        let mut store = state.lock();
+        if let Some(stack) = store.resolve_mut(&stack_id) {
+            stack.record_materialised_resources(materialised.resources);
+            if let Some(failure) = materialised.failure {
+                // A resource an owning service refused: the update does not reach
+                // UPDATE_COMPLETE, and the reason reported is the one that service gave.
+                stack.fail_transition(
+                    ::std::time::SystemTime::now(),
+                    status::UPDATE_FAILED,
+                    failure,
+                );
+            }
         }
-        if let Some(retain_except_on_create) = input.retain_except_on_create {
-            stack.retain_except_on_create = Some(retain_except_on_create);
-        }
-        if let Some(token) = &input.client_request_token {
-            stack.client_request_token = Some(token.clone());
-        }
-        // "Structure that contains a new stack policy body": present replaces the stored
-        // policy, absent leaves it alone, as for the other restated members.
-        if let Some(policy) = &input.stack_policy_body {
-            stack.stack_policy_body = Some(policy.clone());
-        }
-        if let Some(resource_types) = &input.resource_types {
-            stack.resource_types = resource_types.clone();
-        }
-        stack.last_updated_time = Some(now);
-        // The update deploys the template the stack now carries: its resources and its
-        // outputs are re-evaluated from the new body and the merged parameters, and
-        // reported once the update completes.
-        stack.deploy_template();
-        // The update starts now and settles to UPDATE_COMPLETE once the clock makes that
-        // due; the stack id never changes.
-        stack.begin_transition(
-            now,
-            status::UPDATE_IN_PROGRESS,
-            status::UPDATE_COMPLETE,
-            Some(operation_id.clone()),
-            input.client_request_token.clone(),
-        );
 
         Ok(UpdateStackOutput {
-            stack_id: Some(stack.stack_id.clone()),
+            stack_id: Some(stack_id),
             operation_id: Some(operation_id),
         })
     }

@@ -220,12 +220,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let thing = store
             .managed_thing_in_mut(&region, &input.identifier)
             .ok_or_else(|| {
+                // A mutation states the reason from the identifier the request carried,
+                // through the one formatter the mutating managed-thing paths share.
                 UpdateManagedThingErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(format!("Managed thing {} was not found", input.identifier)),
-                        resource_id: Some(input.identifier.clone()),
-                        resource_type: Some("ManagedThing".to_string()),
-                    },
+                    crate::state::managed_thing_not_found_on_mutation(&input.identifier),
                 )
             })?;
 

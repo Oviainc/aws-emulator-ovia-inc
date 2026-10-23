@@ -226,15 +226,16 @@ pub const STOPPED: Lifecycle = Lifecycle {
 
 /// How long after the call that starts it the clock owes a resource its next
 /// settled state: an instance's (`pending` -> `running`, `stopping` ->
-/// `stopped`), a block storage disk's (`pending` -> `available`) and a container
+/// `stopped`), a block storage disk's (`pending` -> `available`, and the
+/// `in-use` -> `available` a `DetachDisk` starts) and a container
 /// service's (`PENDING` -> `READY`, and each step of `PENDING` -> `DEPLOYING` ->
 /// `RUNNING`).
 ///
 /// CHOSEN, not an AWS duration: AWS takes tens of seconds to minutes, which no
 /// caller can be made to wait for here. The span is deliberately NON-ZERO, so a
 /// caller that reads straight after `CreateInstances`, `StartInstance`,
-/// `StopInstance`, `CreateDisk` or `CreateContainerService` still observes the
-/// transient state exactly as it does against AWS.
+/// `StopInstance`, `CreateDisk`, `DetachDisk` or `CreateContainerService` still
+/// observes the transient state exactly as it does against AWS.
 pub const STATE_TRANSITION_MILLIS: i64 = 500;
 
 /// A state change the clock already owes an instance.
@@ -345,6 +346,8 @@ pub const OPERATION_TYPE_DELETE_BUCKET: &str = "DeleteBucket";
 pub const OPERATION_TYPE_CREATE_DISK: &str = "CreateDisk";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_ATTACH_DISK: &str = "AttachDisk";
+/// See [`OPERATION_TYPE_CREATE_INSTANCE`].
+pub const OPERATION_TYPE_DETACH_DISK: &str = "DetachDisk";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_CREATE_RELATIONAL_DATABASE: &str = "CreateRelationalDatabase";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
@@ -3081,6 +3084,11 @@ pub struct StoredDisk {
     /// [`DISK_STATE_AVAILABLE`] or [`DISK_STATE_IN_USE`].
     pub state: &'static str,
     /// The state the clock owes this disk, while one is outstanding.
+    ///
+    /// A disk the clock owes [`DISK_STATE_AVAILABLE`] while it is still attached
+    /// is one `DetachDisk` has started detaching: settling into `available` is
+    /// what releases the attachment, because a disk attached to nothing is what
+    /// `available` means (see [`ComAmazonawsLightsailLightsail20161128State::advance_clock`]).
     pub due: Option<DueNamedState>,
     /// The instance this disk is attached to, while one is. `AttachDisk` is what
     /// sets it; a newly created disk is attached to nothing.
@@ -3311,9 +3319,19 @@ pub const RELATIONAL_DATABASE_CA_CERTIFICATE_IDENTIFIER: &str = "rds-ca-rsa2048-
 ///
 /// This emulator serves no MySQL or PostgreSQL wire protocol on it, because the
 /// core's native listener (`engine.listeners().tcp`) is TLS-from-the-first-byte
-/// and neither engine's protocol begins with a TLS handshake. Everything the
-/// control plane owns — resolving the database, its state, its hardware, its
-/// credentials and its windows — is real.
+/// and neither engine's protocol begins with a TLS handshake: a MySQL server
+/// sends its Initial Handshake Packet in the clear and only then upgrades, on
+/// the client's SSL-request packet, and PostgreSQL negotiates the same way
+/// through its SSLRequest message — so the core's `rustls` acceptor fails the
+/// handshake of every real database driver before the connection ever reaches a
+/// handler (`vendor/server/src/listeners.rs`: "TLS-only ... a plaintext/HTTP
+/// preface also fails the handshake here and never reaches the handler"), and a
+/// service may not bind a socket of its own. Serving a database data plane
+/// needs a core seam that hands over a connection WITHOUT terminating TLS first
+/// (so the protocol server can do the in-band upgrade itself); until the core
+/// offers one, no address this service could announce would answer the MySQL or
+/// PostgreSQL protocol. Everything the control plane owns — resolving the
+/// database, its state, its hardware, its credentials and its windows — is real.
 const RELATIONAL_DATABASE_ENDPOINT_SUFFIX: &str = "rds.lightsail.local";
 
 /// The prefix of the RDS DB instance identifier Lightsail gives a managed
@@ -5388,7 +5406,8 @@ impl ComAmazonawsLightsailLightsail20161128State {
     }
 
     /// The block storage disk `name` names, for an operation the spec says
-    /// mutates it — attaching it to an instance, say.
+    /// mutates it — attaching it to an instance, or releasing the attachment it
+    /// holds.
     ///
     /// `name` is this record's store key, so it must not be reassigned through
     /// this handle; no operation in this slice renames a disk.
@@ -5780,6 +5799,20 @@ impl ComAmazonawsLightsailLightsail20161128State {
             if due.at_ms <= now_ms {
                 disk.state = due.state;
                 disk.due = None;
+                // A disk that has settled into `available` is attached to
+                // nothing — that is what the modelled `DiskState` value means
+                // next to `in-use` — so settling there is also what completes
+                // the detachment `DetachDisk` started: the attachment and the
+                // device path it was mounted at are released together. A disk
+                // that reached `available` from `pending` was attached to
+                // nothing already, so the same step is a no-op for it. An
+                // operation that ATTACHES a disk therefore has to put it in
+                // `in-use` and clear the `due` it carries, or the settle it was
+                // owed would release the attachment that operation just made.
+                if disk.state == DISK_STATE_AVAILABLE {
+                    disk.attached_to = None;
+                    disk.path = None;
+                }
             }
         }
         for snapshot in self.disk_snapshots.values_mut() {

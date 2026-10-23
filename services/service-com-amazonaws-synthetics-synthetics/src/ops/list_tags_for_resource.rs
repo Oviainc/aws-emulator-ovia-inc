@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTagsForResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTagsForResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTagsForResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Returns the tags stored on the canary or group a `ResourceArn` names.
 //!
 //! ## Shape of an operation
 //!
@@ -76,6 +68,8 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use crate::state::{STORE_UNAVAILABLE, TAGGED_RESOURCE_NOT_FOUND};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -149,18 +143,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTagsForResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTagsForResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTagsForResource"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(internal_error)?;
+
+        // "Displays the tags associated with a canary or group" — a pure read. A tag is
+        // only ever written by an operation whose caller asked for a write, so there is
+        // no transition the clock owes here and this call changes nothing a later caller
+        // sees.
+        let guard = state.lock();
+        let tags = guard
+            .tags_of_resource(&input.resource_arn)
+            .ok_or_else(not_found)?;
+
+        Ok(ListTagsForResourceOutput {
+            // `TagMap` is modelled `length 1..50`, so a resource carrying no tags is
+            // reported with no map at all rather than an empty one — the same projection
+            // `Canary$Tags` and `Group$Tags` use for the very same stored field.
+            tags: (!tags.is_empty()).then(|| {
+                tags.iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect()
+            }),
+        })
     }
+}
+
+/// The modelled 404 for an ARN this store holds no canary or group for.
+///
+/// One fixed sentence, naming neither the resource kind nor the ARN from the request
+/// (`state::TAGGED_RESOURCE_NOT_FOUND`).
+fn not_found() -> ListTagsForResourceError {
+    ListTagsForResourceErrorModeled::NotFoundException(NotFoundException {
+        message: Some(TAGGED_RESOURCE_NOT_FOUND.to_string()),
+    })
+    .into()
+}
+
+/// The modelled 500 for a store that cannot be reached. Never a fresh engine: a private
+/// store would answer from an empty map.
+fn internal_error() -> ListTagsForResourceError {
+    ListTagsForResourceErrorModeled::InternalFailureException(InternalFailureException {
+        message: Some(STORE_UNAVAILABLE.to_string()),
+    })
+    .into()
 }

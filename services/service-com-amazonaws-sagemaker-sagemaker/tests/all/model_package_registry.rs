@@ -454,10 +454,11 @@ async fn unversioned_create_describe_round_trip_over_optional_members_and_region
 }
 
 /// RULE: a model package identifier is in use once it is registered, so a second
-/// registration under the same identifier is refused with the conflict this operation
-/// models, and the package already stored is left exactly as it was.
+/// registration under the same identifier is refused as a bad request — 400
+/// `ValidationException`, the class AWS answers for an identifier already registered,
+/// not the retryable conflict — and the package already stored is left exactly as it was.
 #[tokio::test]
-async fn a_name_already_in_use_is_refused_with_conflict_exception() {
+async fn a_name_already_in_use_is_refused_with_validation_exception() {
     for name in ["a", "duplicate-package", "Mixed-Case-9"] {
         let case = format!("duplicate {name:?}");
         let emulator = Emulator::new();
@@ -481,8 +482,8 @@ async fn a_name_already_in_use_is_refused_with_conflict_exception() {
         );
         assert_eq!(
             error_code(&refused),
-            "ConflictException",
-            "case {case:?}: expected ConflictException, got {refused}"
+            "ValidationException",
+            "case {case:?}: expected ValidationException, got {refused}"
         );
         assert!(
             message(&refused).contains(name),

@@ -22,6 +22,15 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Signs the in-process call a stack's resource provisioning makes to the service that
+# owns the resource: the emulator verifies every request signature, and the credential
+# scope is what routes the call. The SDK's own signer, as the emulator's verifier uses;
+# `http1` is the feature that carries `apply_to_request_http1x`, which puts the signature
+# on the `http` 1.x request this crate builds.
+aws-sigv4 = { version = "1", features = ["http1"] }
+# The identity (access key pair) that signer signs with, and the provider the emulator's
+# own callback hands out.
+aws-credential-types = "1"
 # Hex-encodes the opaque `NextToken` cursor a paginated read hands out, and the digest
 # behind every minted stack id, event id and operation id.
 hex = { workspace = true }

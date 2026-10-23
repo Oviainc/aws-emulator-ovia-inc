@@ -351,14 +351,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let key = crate::state::model_package_key(&name, version);
         // A name already in use is refused, never overwritten: otherwise the caller reads
         // a 200 for a package it did not create, and the one it did create is gone.
-        // `ConflictException` is the conflict this operation models.
+        // Recorded AWS classifies a re-registration of an identifier already registered
+        // as a REQUEST defect — 400 `ValidationException`, the same class as any other
+        // unusable input — rather than as the retryable `ConflictException` this operation
+        // also models, so a client branching on the code is told "do not retry this".
         if store.model_packages.contains_key(&key) {
-            return Err(CreateModelPackageErrorModeled::ConflictException(ConflictException {
-                message: Some(format!(
-                    "Cannot create already existing model package \"{key}\"."
-                )),
-            })
-            .into());
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "Cannot create already existing model package \"{key}\"."
+            )));
         }
         let arn = crate::state::resource_arn(&region, "model-package", &key);
 

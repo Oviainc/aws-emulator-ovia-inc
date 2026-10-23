@@ -35,11 +35,11 @@
 //!
 //! ## What this does NOT do
 //!
-//! Creating the resource in the service that owns it (an `AWS::SNS::Topic` in Amazon
-//! SNS) is CloudFormation's resource-provisioning layer, which this emulator does not
-//! have: a stack records the resources its template declares and the identifiers
-//! CloudFormation's documented naming rules give them, and nothing here reports a status,
-//! an error or a value for an upstream call that never ran.
+//! CREATING the resource in the service that owns it is
+//! [`super::provisioning`](crate::state::provisioning), which calls that service's own
+//! create API for the resource types this emulator provisions. This module computes only
+//! what CloudFormation's documented naming and return values give a declared resource;
+//! nothing here reports a status, an error or a value for an upstream call that never ran.
 //!
 //! An expression this module cannot evaluate yields NO value rather than a guessed one:
 //! the output is reported with its key and description and without an `OutputValue`,
@@ -843,6 +843,11 @@ pub struct StackScope<'a> {
 /// parameters: the resources are what this function is producing, so a name that refers
 /// to ANOTHER resource is not resolvable here and that resource takes the generated name.
 ///
+/// Every record starts out NOT materialised: this function computes the identity
+/// CloudFormation gives the resource, and
+/// [`super::provisioning`](crate::state::provisioning) is what then creates it in the
+/// service that owns it, where this emulator provisions that type.
+///
 /// A resource the template declares under a `Condition` is materialised only where that
 /// condition HOLDS ("you can … create resources conditionally"); a condition this module
 /// cannot evaluate leaves the resource in place rather than silently dropping it.
@@ -870,6 +875,12 @@ pub fn provision(
             resource_type: declared.resource_type.clone(),
             physical_resource_id,
             attributes,
+            // Filled by [`resolve_properties`], once every resource's identity is
+            // known; `materialised` by
+            // [`super::provisioning`](crate::state::provisioning), once the owning
+            // service has created the resource.
+            properties: Value::Null,
+            materialised: false,
         });
         names.push((declared, name));
     }
@@ -1312,6 +1323,7 @@ pub const IMPLEMENTED_RESOURCE_TYPES: &[&str] = &[
     "AWS::DynamoDB::Table",
     "AWS::EC2::SecurityGroup",
     "AWS::IAM::Role",
+    FIREHOSE_DELIVERY_STREAM,
     "AWS::Lambda::Function",
     "AWS::Logs::LogGroup",
     "AWS::RDS::DBCluster",
@@ -1447,6 +1459,20 @@ fn return_values(
             attributes.insert(
                 "Arn".to_string(),
                 ::emulator_server::emulator_arn("iam", "", &format!("role/{name}")),
+            );
+            (name.to_string(), attributes)
+        }
+        // "Ref returns the delivery stream name"; Fn::GetAtt: Arn. This is the type
+        // `super::provisioning` creates in Amazon Data Firehose itself, which then
+        // reports the stream's own ARN back over this attribute.
+        FIREHOSE_DELIVERY_STREAM => {
+            attributes.insert(
+                "Arn".to_string(),
+                ::emulator_server::emulator_arn(
+                    "firehose",
+                    region,
+                    &format!("deliverystream/{name}"),
+                ),
             );
             (name.to_string(), attributes)
         }
@@ -1631,6 +1657,113 @@ fn return_values(
         }
         _ => (name.to_string(), attributes),
     }
+}
+
+/// The `AWS::<cloudFormationName>::<Resource>` type of an Amazon Data Firehose stream.
+/// The middle segment is the Firehose model's own `awsService.cloudFormationName`
+/// (`smithy_query(query="service_info")` on that service's model).
+pub const FIREHOSE_DELIVERY_STREAM: &str = "AWS::KinesisFirehose::DeliveryStream";
+
+/// Fill in each resource's evaluated `Properties`, against the whole set of resources the
+/// template declares.
+///
+/// This is the request the service that owns a resource is asked to create it with
+/// ([`super::provisioning`](crate::state::provisioning)), so every intrinsic function in
+/// the properties is evaluated here: a property naming another resource (a stream's
+/// `RoleARN` from an `Fn::GetAtt`) carries that resource's value, and one that cannot be
+/// evaluated is DROPPED rather than sent as a guess — which is also what CloudFormation's
+/// own `AWS::NoValue` means ("removes the corresponding resource property").
+///
+/// `resources` is what [`provision`] produced for `template`. A declaration whose
+/// `Condition` excluded it has no record there, so each record is matched to its
+/// declaration by LOGICAL ID rather than by position.
+pub fn resolve_properties(
+    template: &Template,
+    resources: &mut [StoredResource],
+    scope: &Scope<'_>,
+    budget: &mut Budget,
+) {
+    for resource in resources.iter_mut() {
+        let Some(declared) = template
+            .resources
+            .iter()
+            .find(|declared| declared.logical_id == resource.logical_id)
+        else {
+            continue;
+        };
+        resource.properties =
+            resolved_value(&declared.properties, scope, 0, budget).unwrap_or(Value::Null);
+    }
+}
+
+/// One template value with every intrinsic function it carries evaluated, preserving the
+/// objects and arrays around them; `None` for a value that cannot be evaluated at all.
+fn resolved_value(
+    value: &Value,
+    scope: &Scope<'_>,
+    depth: usize,
+    budget: &mut Budget,
+) -> Option<Value> {
+    if depth > MAX_INTRINSIC_DEPTH {
+        return None;
+    }
+    budget.spend(1)?;
+    match value {
+        Value::Object(members) => {
+            // An intrinsic function is a single-member object whose name is the
+            // function's; anything else is a property map.
+            if let Some((name, argument)) = sole_intrinsic(members) {
+                // Through the SAME guard the output path uses: the value's size is held
+                // to `MAX_RESOLVED_TEXT_BYTES` and its bytes are charged against the
+                // deployment's budget, so evaluating a property cannot amplify what
+                // evaluating an output cannot.
+                let resolved = intrinsic(name, argument, scope, depth, budget)?;
+                return match bounded(resolved, budget)? {
+                    Resolved::Text(text) => Some(Value::String(text)),
+                    Resolved::List(items) => {
+                        Some(Value::Array(items.into_iter().map(Value::String).collect()))
+                    }
+                };
+            }
+            Some(Value::Object(
+                members
+                    .iter()
+                    .filter_map(|(key, member)| {
+                        Some((
+                            key.clone(),
+                            resolved_value(member, scope, depth + 1, budget)?,
+                        ))
+                    })
+                    .collect(),
+            ))
+        }
+        Value::Array(items) => {
+            if items.len() > MAX_RESOLVED_LIST_LEN {
+                return None;
+            }
+            Some(Value::Array(
+                items
+                    .iter()
+                    .filter_map(|item| resolved_value(item, scope, depth + 1, budget))
+                    .collect(),
+            ))
+        }
+        scalar => {
+            budget.spend_text(scalar_text(scalar).map_or(1, |text| text.len()))?;
+            Some(scalar.clone())
+        }
+    }
+}
+
+/// The intrinsic function a single-member object names, if it names one: `Ref`, or one of
+/// the `Fn::`-prefixed functions.
+fn sole_intrinsic(members: &Map<String, Value>) -> Option<(&str, &Value)> {
+    let mut entries = members.iter();
+    let (name, argument) = entries.next()?;
+    if entries.next().is_some() {
+        return None;
+    }
+    (name == "Ref" || name.starts_with("Fn::")).then_some((name.as_str(), argument))
 }
 
 /// How many hexadecimal characters the service-assigned label of an Amazon RDS endpoint
@@ -1860,6 +1993,16 @@ fn intrinsic(
             let [delimiter, values] = pair(argument)?;
             let delimiter = text(delimiter, scope, depth + 1, budget)?;
             let values = list(values, scope, depth + 1, budget)?;
+            // The joined length is known before it is built, so a join whose result is
+            // past the bound is never materialised even transiently.
+            let joined = values
+                .iter()
+                .map(String::len)
+                .sum::<usize>()
+                .saturating_add(delimiter.len() * values.len().saturating_sub(1));
+            if joined > MAX_RESOLVED_TEXT_BYTES {
+                return None;
+            }
             Some(Resolved::Text(values.join(&delimiter)))
         }
         // "Fn::Select returns a single object from a list of objects by index":

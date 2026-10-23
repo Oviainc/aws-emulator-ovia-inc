@@ -146,14 +146,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
         if store.models.remove(&input.model_name).is_none() {
-            let arn = crate::state::resource_arn(
-                &crate::state::request_region(ctx),
-                "model",
-                &input.model_name,
-            );
-            return Err(crate::scaffolded::Scaffolded::validation(format!(
-                "Could not find model \"{arn}\"."
-            )));
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::could_not_find(crate::state::MODEL_KIND_LABEL, &input.model_name),
+            ));
         }
         drop(store);
 
