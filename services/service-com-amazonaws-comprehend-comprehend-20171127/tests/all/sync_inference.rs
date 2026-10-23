@@ -4,10 +4,14 @@
 //! `DetectSentiment`.
 //!
 //! Both are pure functions of the submitted document, so each suite asserts the
-//! RULE over a table of documents rather than one recorded request: the dominant
-//! language is the identification engine's top-ranked language over the modelled
-//! `LanguageCode` set, and the sentiment is the arg-max of four confidences that
-//! sum to 1.
+//! RULE over a table of documents rather than one recorded request: `Languages` is
+//! the identification engine's ranked confidence distribution over the modelled
+//! `LanguageCode` set — the dominant language first, the runner-up candidates after
+//! it in descending order of score — and the sentiment is the arg-max of four
+//! confidences that sum to 1.
+//!
+//! The per-document BYTE quota both operations refuse an oversized document with
+//! lives in `realtime_text_quotas.rs`.
 
 use serde_json::json;
 use service_com_amazonaws_comprehend_comprehend_20171127::ops::types::{
@@ -103,38 +107,114 @@ async fn detect_dominant_language_ranks_the_language_of_the_document() {
             "case {case:?}: expected the dominant language {expected:?}, got {top:?} \
              in {languages:?}"
         );
-
-        // Every entry carries a modelled language code and a confidence in (0, 1],
-        // and the array is sorted in descending order of score.
-        let mut previous = f64::INFINITY;
-        for entry in &languages {
-            let code = entry["LanguageCode"].as_str().unwrap_or_default();
-            assert!(
-                LANGUAGE_CODE_VALUES.contains(&code),
-                "case {case:?}: {code:?} is not a modelled LanguageCode value"
-            );
-            let score = entry["Score"].as_f64().unwrap_or(f64::NAN);
-            assert!(
-                score > 0.0 && score <= 1.0,
-                "case {case:?}: expected a Score in (0, 1], got {score} for {code:?}"
-            );
-            assert!(
-                score <= previous,
-                "case {case:?}: Languages is not sorted by descending Score, got \
-                 {score} after {previous} in {languages:?}"
-            );
-            previous = score;
-        }
+        assert_ranked_distribution(case, &languages);
     }
 }
 
-/// Documents the two honest edge answers: the engine ranks a candidate for any
-/// document that carries letters, however weakly, and none at all for one that
-/// carries none — rather than an invented candidate.
+/// Documents that carry MORE than one language, and the language each is
+/// predominantly written in.
+///
+/// The ranked list is observable only on a document with a runner-up, which is what
+/// these rows are: a clause in one language beside shorter material in others. The
+/// first row is the document the issue cited; the others differ along what the rule
+/// generalises over — which language predominates, how many others appear, and
+/// whether the minority material is a greeting or a whole clause.
+const MIXED_DOCUMENTS: &[(&str, &str, &str)] = &[
+    (
+        "english clause beside greetings in five languages",
+        "en",
+        "Hello 你好 Bonjour Hola Ciao Guten Tag Namaste. I am Bob, a software engineer \
+         in Seattle.",
+    ),
+    (
+        "german paragraph beside an english clause",
+        "de",
+        "Das Wetter in Berlin ist heute sehr schön und wir gehen später mit den Kindern \
+         im Park spazieren. The weather is nice.",
+    ),
+    (
+        "french paragraph beside a spanish greeting",
+        "fr",
+        "Il fait très beau à Paris en ce moment et nous allons nous promener dans le \
+         parc cet après-midi avec les enfants. Hola amigo, buenos días.",
+    ),
+];
+
+#[tokio::test]
+async fn detect_dominant_language_ranks_runner_up_candidates_behind_the_dominant_one() {
+    let comprehend = Comprehend::new();
+
+    for (case, expected, text) in MIXED_DOCUMENTS {
+        let output = comprehend
+            .ok("DetectDominantLanguage", &json!({ "Text": text }))
+            .await;
+        let languages = output["Languages"]
+            .as_array()
+            .unwrap_or_else(|| panic!("case {case:?}: expected a Languages array, got {output}"))
+            .clone();
+
+        assert!(
+            languages.len() >= 2,
+            "case {case:?}: a document carrying more than one language has runner-up \
+             candidates, so expected at least 2 ranked entries, got {languages:?}"
+        );
+        let top = languages[0]["LanguageCode"].as_str().unwrap_or_default();
+        assert_eq!(
+            top, *expected,
+            "case {case:?}: expected the dominant language {expected:?} first, got \
+             {top:?} in {languages:?}"
+        );
+        assert_ranked_distribution(case, &languages);
+    }
+}
+
+/// The invariants every `Languages` array carries, whatever the document: each
+/// entry names a modelled `LanguageCode` and carries a score in (0, 1], the array
+/// is sorted in descending order of score (the modelled `Languages` member's own
+/// sentence), no language appears twice, and the scores are a distribution over the
+/// candidates the engine placed, so they never sum past 1.
+fn assert_ranked_distribution(case: &str, languages: &[serde_json::Value]) {
+    let mut previous = f64::INFINITY;
+    let mut seen: Vec<&str> = Vec::new();
+    let mut total = 0.0;
+    for entry in languages {
+        let code = entry["LanguageCode"].as_str().unwrap_or_default();
+        assert!(
+            LANGUAGE_CODE_VALUES.contains(&code),
+            "case {case:?}: {code:?} is not a modelled LanguageCode value"
+        );
+        assert!(
+            !seen.contains(&code),
+            "case {case:?}: {code:?} is ranked twice in {languages:?}"
+        );
+        seen.push(code);
+        let score = entry["Score"].as_f64().unwrap_or(f64::NAN);
+        assert!(
+            score > 0.0 && score <= 1.0,
+            "case {case:?}: expected a Score in (0, 1], got {score} for {code:?}"
+        );
+        assert!(
+            score <= previous,
+            "case {case:?}: Languages is not sorted by descending Score, got \
+             {score} after {previous} in {languages:?}"
+        );
+        previous = score;
+        total += score;
+    }
+    assert!(
+        total <= 1.000_01,
+        "case {case:?}: the scores are a distribution over the ranked candidates, so \
+         they cannot sum past 1, got {total} from {languages:?}"
+    );
+}
+
+/// Documents the two honest edge answers: the engine ranks the candidates it can
+/// place for any document that carries letters, however weakly, and none at all for
+/// one that carries none — rather than an invented candidate.
 ///
 /// A document long enough to carry a language profile always comes back with its
-/// own language — the table above is 11 rows of that — so this pins the other end
-/// of the same rule.
+/// own language first — the table above is 11 rows of that — so this pins the other
+/// end of the same rule.
 #[tokio::test]
 async fn detect_dominant_language_reports_a_candidate_only_when_the_engine_places_one() {
     let comprehend = Comprehend::new();
@@ -151,21 +231,12 @@ async fn detect_dominant_language_reports_a_candidate_only_when_the_engine_place
         let languages = output["Languages"].as_array().cloned().unwrap_or_default();
 
         if expect_candidate {
-            assert_eq!(
-                languages.len(),
-                1,
-                "case {case:?}: the engine ranks one candidate, got {output}"
-            );
-            let score = languages[0]["Score"].as_f64().unwrap_or(f64::NAN);
             assert!(
-                score > 0.0 && score <= 1.0,
-                "case {case:?}: expected a Score in (0, 1], got {score}"
+                !languages.is_empty(),
+                "case {case:?}: the engine places this letter, so expected a ranked \
+                 candidate, got {output}"
             );
-            let code = languages[0]["LanguageCode"].as_str().unwrap_or_default();
-            assert!(
-                LANGUAGE_CODE_VALUES.contains(&code),
-                "case {case:?}: {code:?} is not a modelled LanguageCode value"
-            );
+            assert_ranked_distribution(case, &languages);
         } else {
             assert!(
                 languages.is_empty(),
@@ -340,50 +411,6 @@ async fn a_language_code_outside_the_modelled_enum_is_refused() {
             "case {code:?}: expected 400 for a value outside the LanguageCode enum, \
              got {status}: {body}"
         );
-    }
-}
-
-/// Byte ceilings the modelled member documentation states for synchronous inference:
-/// `DetectSentimentRequest$Text` says "The maximum string size is 5 KB" and
-/// `DetectDominantLanguageRequest$Text` says "The maximum string size is 100 KB".
-const TEXT_CEILINGS: &[(&str, usize)] = &[
-    ("DetectSentiment", 5 * 1024),
-    ("DetectDominantLanguage", 100 * 1024),
-];
-
-#[tokio::test]
-async fn text_at_the_documented_ceiling_is_accepted_and_one_byte_past_it_is_not() {
-    let comprehend = Comprehend::new();
-
-    for (operation, ceiling) in TEXT_CEILINGS {
-        // One byte, the modelled `@length` floor; the ceiling exactly; one past it.
-        for size in [1usize, *ceiling, *ceiling + 1] {
-            let body = match *operation {
-                "DetectSentiment" => {
-                    json!({ "Text": "a".repeat(size), "LanguageCode": "en" })
-                }
-                _ => json!({ "Text": "a".repeat(size) }),
-            };
-            let (status, response) = comprehend.call(operation, &body).await;
-
-            if size > *ceiling {
-                assert_eq!(
-                    status, 400,
-                    "case {operation} with {size} bytes: expected 400, got {status}: {response}"
-                );
-                assert_eq!(
-                    error_code(&response),
-                    "TextSizeLimitExceededException",
-                    "case {operation} with {size} bytes: expected \
-                     TextSizeLimitExceededException, got {response}"
-                );
-            } else {
-                assert_eq!(
-                    status, 200,
-                    "case {operation} with {size} bytes: expected 200, got {status}: {response}"
-                );
-            }
-        }
     }
 }
 
