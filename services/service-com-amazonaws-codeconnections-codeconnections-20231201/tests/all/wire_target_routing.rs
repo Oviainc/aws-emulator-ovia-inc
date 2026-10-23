@@ -71,18 +71,19 @@ pub(crate) async fn call_target(
 }
 
 /// `GetResourceSyncStatus` answers from its own handler under either prefix: the same
-/// modeled refusal for the same request, never the framework's 501 for a target that
-/// named no operation. One row per prefix, and one per refusal the handler can give, so
-/// routing is not keyed to one shape of request.
+/// answer for the same request, never the framework's 501 for a target that named no
+/// operation. One row per prefix, and one per answer the handler can give (its empty
+/// success and the boundary validator's refusal), so routing is not keyed to one shape
+/// of request.
 #[tokio::test]
 async fn get_resource_sync_status_is_reachable_under_either_target_prefix() {
-    // (case, body, expected status, expected error code)
+    // (case, body, expected status, expected error code — empty for a success)
     let rows = [
         (
-            "a resource with no sync configuration",
+            "a resource with no recorded sync state",
             serde_json::json!({ "SyncType": "CFN_STACK_SYNC", "ResourceName": "AbsentStack" }),
-            400,
-            "InvalidInputException",
+            200,
+            "",
         ),
         (
             "a sync type outside the modeled enum",

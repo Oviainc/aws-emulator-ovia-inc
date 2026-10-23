@@ -710,7 +710,7 @@ async fn a_connection_name_is_unique_within_the_account() {
 }
 
 /// A `HostArn` names a host resource. This suite mints no host, so the create is
-/// refused with the modeled `ResourceUnavailableException` (400) rather than storing
+/// refused with the modeled `ResourceNotFoundException` (404) rather than storing
 /// a connection that points at a resource that is not there.
 #[tokio::test]
 async fn a_host_arn_that_names_no_host_is_refused() {
@@ -726,14 +726,14 @@ async fn a_host_arn_that_names_no_host_is_refused() {
     )
     .await;
     assert_eq!(
-        status, 400,
-        "HostArn: expected 400 for a host that does not exist, got {status} {body}"
+        status, 404,
+        "HostArn: expected 404 for a host that does not exist, got {status} {body}"
     );
     assert!(
         body["__type"]
             .as_str()
-            .is_some_and(|t| t.ends_with("ResourceUnavailableException")),
-        "HostArn: expected ResourceUnavailableException, got {body}"
+            .is_some_and(|t| t.ends_with("ResourceNotFoundException")),
+        "HostArn: expected ResourceNotFoundException, got {body}"
     );
 
     // Nothing was persisted by the refused create.

@@ -174,6 +174,16 @@ fn plain_host(name: &str, provider_type: &'static str) -> HostCase {
     }
 }
 
+/// Create one plain host over the wire and return its ARN: what another suite needs
+/// when it only needs a host to BE there (`absent_resource_answers.rs`).
+pub(crate) async fn create_plain_host(
+    router: &MultiServiceRouter,
+    name: &str,
+    provider_type: &'static str,
+) -> String {
+    create_host(router, &plain_host(name, provider_type)).await
+}
+
 /// Assert an ARN satisfies the modeled `HostArn` pattern
 /// `^arn:aws(-[\w]+)*:(codestar-connections|codeconnections):.+:[0-9]{12}:host\/.+$`
 /// and names a host in the region the caller signed for.
@@ -460,8 +470,10 @@ async fn a_connection_resolves_a_host_that_exists() {
 }
 
 /// Only an ARN naming no host is refused, and it is refused the same way wherever it
-/// is named: the modeled `ResourceUnavailableException` (400) from `CreateConnection`
-/// and from `GetHost`. Rows are host-ARN-shaped values the modeled pattern admits —
+/// is named: the modeled `ResourceNotFoundException` (404) from `CreateConnection`, from
+/// `GetHost` and from `ListConnections`' filter, because the host it names is ABSENT —
+/// `ResourceUnavailableException` (400) is this service's "the host is there but is not
+/// usable" signal. Rows are host-ARN-shaped values the modeled pattern admits —
 /// `^arn:aws(-[\w]+)*:(codestar-connections|codeconnections):.+:[0-9]{12}:host\/.+$` —
 /// that this store does not hold.
 #[tokio::test]
@@ -523,14 +535,14 @@ async fn a_host_arn_that_names_no_host_is_refused_wherever_it_is_named() {
         )
         .await;
         assert_eq!(
-            status, 400,
-            "case {label:?}: expected 400 from CreateConnection, got {status} {body}"
+            status, 404,
+            "case {label:?}: expected 404 from CreateConnection, got {status} {body}"
         );
         assert!(
             body["__type"]
                 .as_str()
-                .is_some_and(|kind| kind.ends_with("ResourceUnavailableException")),
-            "case {label:?}: expected ResourceUnavailableException, got {body}"
+                .is_some_and(|kind| kind.ends_with("ResourceNotFoundException")),
+            "case {label:?}: expected ResourceNotFoundException, got {body}"
         );
 
         let (status, body) = call(
@@ -540,20 +552,20 @@ async fn a_host_arn_that_names_no_host_is_refused_wherever_it_is_named() {
         )
         .await;
         assert_eq!(
-            status, 400,
-            "case {label:?}: expected 400 from GetHost, got {status} {body}"
+            status, 404,
+            "case {label:?}: expected 404 from GetHost, got {status} {body}"
         );
         assert!(
             body["__type"]
                 .as_str()
-                .is_some_and(|kind| kind.ends_with("ResourceUnavailableException")),
-            "case {label:?}: expected ResourceUnavailableException, got {body}"
+                .is_some_and(|kind| kind.ends_with("ResourceNotFoundException")),
+            "case {label:?}: expected ResourceNotFoundException, got {body}"
         );
 
         // The same rule where the ARN is a FILTER rather than the addressed resource:
         // `ListConnections` resolves `HostArnFilter` against the host store too, and
-        // refuses one that names no host with the error IT models for that \u2014
-        // `ResourceNotFoundException` (404) \u2014 rather than reporting an empty page.
+        // refuses one that names no host with the same `ResourceNotFoundException`
+        // (404) rather than reporting an empty page.
         let (status, body) = call(
             &router,
             "ListConnections",

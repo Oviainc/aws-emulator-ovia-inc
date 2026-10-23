@@ -162,18 +162,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let store = state.lock();
-        // An ARN naming no host this service holds gets the error the service models
-        // for exactly that — `ResourceUnavailableException` (400, "Resource not found.
-        // Verify the ARN for the host resource and try again."), the same answer
-        // `CreateConnection` gives an unresolvable `HostArn`, so one missing host
-        // reads the same way wherever it is named.
+        // An ARN that resolves to no host this service holds names a resource that is
+        // ABSENT, and absence is reported with `ResourceNotFoundException` (404) — the
+        // code every reader of this service uses for an ARN naming nothing
+        // (`GetConnection` for a connection ARN, `ListConnections` for a
+        // `HostArnFilter`), and the one `CreateConnection` gives an unresolvable
+        // `HostArn`. The operation's other modeled refusal,
+        // `ResourceUnavailableException` (400), is the "the host is there but is not
+        // usable" signal and is reserved for that: a 404 is what lets a caller branch
+        // on "no such host" (create-if-missing, cleanup that tolerates a 404) instead
+        // of reading an absent host as a transient condition.
         let Some(record) = store.hosts.get(&input.host_arn) else {
-            return Err(GetHostErrorModeled::ResourceUnavailableException(
-                ResourceUnavailableException {
-                    message: Some(format!(
-                        "Resource not found. Verify the ARN for the host resource and try again: {}",
-                        input.host_arn
-                    )),
+            return Err(GetHostErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!("No host exists with the ARN: {}", input.host_arn)),
                 },
             )
             .into());
